@@ -32,7 +32,10 @@ def test_simulate_nve_sparse_sampling_counts():
 
     assert np.array(result.sampled_steps).tolist() == [0, 2, 4, 5]
     assert np.array(result.sampled_positions).shape == (4, 4, 3)
+    assert np.array(result.sampled_velocities).shape == (4, 4, 3)
+    np.testing.assert_allclose(np.array(result.sampled_time), [0.0, 0.004, 0.008, 0.01])
     assert np.array(result.total_energy).shape == (6,)
+    assert np.array(result.temperature).shape == (6,)
 
 
 def test_dynamic_neighbor_nve_matches_static_neighbor_for_short_run():
@@ -71,4 +74,11 @@ def test_dynamic_neighbor_nve_matches_static_neighbor_for_short_run():
         rtol=1e-5,
         atol=1e-5,
     )
+    np.testing.assert_allclose(
+        np.array(dynamic.energy_drift),
+        np.array(dynamic.total_energy) - np.array(dynamic.total_energy)[0],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert np.array(dynamic.max_energy_drift) < 1e-4
     assert int(np.array(dynamic.rebuild_count)[-1]) == 1

@@ -185,7 +185,9 @@ class NVEResult:
     """Sparse trajectory and per-step diagnostics from an NVE simulation."""
 
     sampled_positions: mx.array
+    sampled_velocities: mx.array
     sampled_steps: mx.array
+    sampled_time: mx.array
     potential_energy: mx.array
     kinetic_energy: mx.array
     total_energy: mx.array
@@ -193,6 +195,25 @@ class NVEResult:
     pair_count: mx.array
     rebuild_count: mx.array
     final_state: SimulationState
+
+    @property
+    def energy_drift(self) -> mx.array:
+        """Total energy minus the initial total energy for each diagnostic step."""
+
+        return self.total_energy - self.total_energy[0]
+
+    @property
+    def max_energy_drift(self) -> mx.array:
+        """Maximum absolute total-energy drift over the run."""
+
+        return mx.max(mx.abs(self.energy_drift))
+
+    @property
+    def relative_energy_drift(self) -> mx.array:
+        """Energy drift normalized by the absolute initial total energy."""
+
+        denominator = mx.maximum(mx.abs(self.total_energy[0]), 1e-12)
+        return self.energy_drift / denominator
 
 
 def kinetic_energy(velocities: mx.array, masses: mx.array) -> mx.array:
@@ -364,7 +385,11 @@ def simulate_nve(
     neighbor_manager: NeighborListManager | None = None,
     config: SimulationConfig | None = None,
 ) -> NVEResult:
-    """Run NVE molecular dynamics with optional dynamic neighbor-list rebuilds."""
+    """Run NVE molecular dynamics with sparse trajectory and dense diagnostics.
+
+    `sample_interval` controls trajectory storage only. Energy, temperature,
+    pair-count, and rebuild diagnostics are retained for every integration step.
+    """
 
     if config is None:
         config = SimulationConfig()
@@ -390,7 +415,9 @@ def simulate_nve(
     )
 
     sampled_positions = [state.positions]
+    sampled_velocities = [state.velocities]
     sampled_steps = [0]
+    sampled_times = [0.0]
     potential_energies = [potential_energy]
     kinetic_energies = [kinetic_energy(state.velocities, masses)]
     temperatures = [instantaneous_temperature(state.velocities, masses)]
@@ -432,7 +459,9 @@ def simulate_nve(
 
         if step % config.sample_interval == 0 or step == config.steps:
             sampled_positions.append(state.positions)
+            sampled_velocities.append(state.velocities)
             sampled_steps.append(step)
+            sampled_times.append(state.time)
         potential_energies.append(potential_energy)
         kinetic_energies.append(kinetic_energy(state.velocities, masses))
         temperatures.append(instantaneous_temperature(state.velocities, masses))
@@ -443,7 +472,9 @@ def simulate_nve(
     kinetic_energy_series = mx.stack(kinetic_energies)
     return NVEResult(
         sampled_positions=mx.stack(sampled_positions),
+        sampled_velocities=mx.stack(sampled_velocities),
         sampled_steps=mx.array(sampled_steps, dtype=mx.int32),
+        sampled_time=mx.array(sampled_times),
         potential_energy=potential_energy_series,
         kinetic_energy=kinetic_energy_series,
         total_energy=potential_energy_series + kinetic_energy_series,
