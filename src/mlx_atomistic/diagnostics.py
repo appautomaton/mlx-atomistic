@@ -11,12 +11,12 @@ def summarize_md_result(
     result: Any,
     *,
     ensemble: str | None = None,
-) -> dict[str, float | int | str]:
+) -> dict[str, Any]:
     """Return notebook- and CLI-friendly scalar diagnostics for an MD result."""
 
     temperature = np.array(result.temperature)
     total_energy = np.array(result.total_energy)
-    summary: dict[str, float | int | str] = {
+    summary: dict[str, Any] = {
         "ensemble": ensemble or ("nvt" if hasattr(result, "target_temperature") else "nve"),
         "steps": int(total_energy.shape[0] - 1),
         "initial_temperature": float(temperature[0]),
@@ -37,5 +37,14 @@ def summarize_md_result(
         summary["final_pair_count"] = int(np.array(result.pair_count)[-1])
     if hasattr(result, "rebuild_count"):
         summary["final_rebuild_count"] = int(np.array(result.rebuild_count)[-1])
+    if hasattr(result, "potential_energy_by_term"):
+        summary["final_potential_energy_by_term"] = {
+            name: float(np.array(series)[-1])
+            for name, series in result.potential_energy_by_term.items()
+        }
+        summary["mean_potential_energy_by_term"] = {
+            name: float(np.mean(np.array(series)))
+            for name, series in result.potential_energy_by_term.items()
+        }
 
     return summary

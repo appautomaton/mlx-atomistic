@@ -11,6 +11,7 @@ import mlx.core as mx
 
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.neighbors import NeighborListManager
+from mlx_atomistic.topology import Topology
 
 
 class ForceTerm(Protocol):
@@ -33,6 +34,17 @@ class LennardJonesPotential:
     sigma: float = 1.0
     cutoff: float | None = 2.5
     shift: bool = True
+    topology: Topology | None = None
+    one_four_scale: float = 1.0
+    name: str = "lj"
+
+    def __post_init__(self) -> None:
+        if self.cutoff is not None and self.cutoff <= 0.0:
+            msg = "cutoff must be positive"
+            raise ValueError(msg)
+        if self.one_four_scale < 0.0:
+            msg = "one_four_scale must be non-negative"
+            raise ValueError(msg)
 
     def energy_forces(
         self,
@@ -46,6 +58,10 @@ class LennardJonesPotential:
         if positions.ndim != 2 or positions.shape[1] != 3:
             msg = "positions must have shape (n_particles, 3)"
             raise ValueError(msg)
+        if self.topology is not None:
+            pairs = self.topology.nonbonded_pairs(pairs)
+            scales = self.topology.pair_scales(pairs, one_four_scale=self.one_four_scale)
+            return self._pair_energy_forces(positions, pairs, cell, scales=scales)
         if pairs is not None:
             return self._pair_energy_forces(positions, pairs, cell)
 
@@ -83,11 +99,15 @@ class LennardJonesPotential:
         positions: mx.array,
         pairs: mx.array,
         cell: Cell | None,
+        *,
+        scales: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         pairs = mx.array(pairs, dtype=mx.int32)
         forces = mx.zeros_like(positions)
         if pairs.shape[0] == 0:
             return mx.sum(positions[:, 0] * 0.0), forces
+        if scales is None:
+            scales = as_mx_array([1.0] * pairs.shape[0])
 
         i = pairs[:, 0]
         j = pairs[:, 1]
@@ -111,10 +131,10 @@ class LennardJonesPotential:
             inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
             inv_rc12 = inv_rc6 * inv_rc6
             pair_energy = pair_energy - 4.0 * self.epsilon * (inv_rc12 - inv_rc6)
-        pair_energy = mx.where(pair_mask, pair_energy, 0.0)
+        pair_energy = mx.where(pair_mask, pair_energy * scales, 0.0)
 
         scalar = 24.0 * self.epsilon * (2.0 * inv_r12 - inv_r6) / safe_r2
-        scalar = mx.where(pair_mask, scalar, 0.0)
+        scalar = mx.where(pair_mask, scalar * scales, 0.0)
         pair_forces = scalar[:, None] * displacement
         forces = forces.at[i].add(pair_forces).at[j].add(-pair_forces)
 
@@ -193,6 +213,7 @@ class NVEResult:
     potential_energy: mx.array
     kinetic_energy: mx.array
     total_energy: mx.array
+    potential_energy_by_term: dict[str, mx.array]
     temperature: mx.array
     pair_count: mx.array
     rebuild_count: mx.array
@@ -246,6 +267,7 @@ class NVTResult:
     potential_energy: mx.array
     kinetic_energy: mx.array
     total_energy: mx.array
+    potential_energy_by_term: dict[str, mx.array]
     temperature: mx.array
     pair_count: mx.array
     rebuild_count: mx.array
@@ -289,6 +311,18 @@ def _as_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, 
     return (force_terms,)
 
 
+def _named_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...]):
+    terms = _as_force_terms(force_terms)
+    seen: dict[str, int] = {}
+    named_terms = []
+    for term in terms:
+        base_name = str(getattr(term, "name", type(term).__name__))
+        seen[base_name] = seen.get(base_name, 0) + 1
+        name = base_name if seen[base_name] == 1 else f"{base_name}_{seen[base_name]}"
+        named_terms.append((name, term))
+    return tuple(named_terms)
+
+
 def _energy_forces_from_terms(
     positions: mx.array,
     force_terms: tuple[ForceTerm, ...],
@@ -307,6 +341,28 @@ def _energy_forces_from_terms(
         msg = "force_terms must not be empty"
         raise ValueError(msg)
     return total_energy, total_forces
+
+
+def _energy_forces_by_term(
+    positions: mx.array,
+    force_terms: tuple[tuple[str, ForceTerm], ...],
+    *,
+    cell: Cell | None,
+    pairs: mx.array | None,
+) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+    total_energy = None
+    total_forces = mx.zeros_like(positions)
+    energy_by_term = {}
+    for name, term in force_terms:
+        energy, forces = term.energy_forces(positions, cell, pairs=pairs)
+        energy_by_term[name] = energy
+        total_energy = energy if total_energy is None else total_energy + energy
+        total_forces = total_forces + forces
+
+    if total_energy is None:
+        msg = "force_terms must not be empty"
+        raise ValueError(msg)
+    return total_energy, total_forces, energy_by_term
 
 
 def _dense_pair_count(positions: mx.array) -> int:
@@ -444,7 +500,7 @@ def simulate_nve(
         config = SimulationConfig()
     if force_terms is None:
         force_terms = LennardJonesPotential()
-    terms = _as_force_terms(force_terms)
+    terms = _named_force_terms(force_terms)
 
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
@@ -455,7 +511,12 @@ def simulate_nve(
     pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-    potential_energy, forces = _energy_forces_from_terms(positions, terms, cell=cell, pairs=pairs)
+    potential_energy, forces, energy_by_term = _energy_forces_by_term(
+        positions,
+        terms,
+        cell=cell,
+        pairs=pairs,
+    )
     state = SimulationState(
         positions=positions,
         velocities=velocities,
@@ -468,6 +529,7 @@ def simulate_nve(
     sampled_steps = [0]
     sampled_times = [0.0]
     potential_energies = [potential_energy]
+    potential_energy_by_term = {name: [energy] for name, energy in energy_by_term.items()}
     kinetic_energies = [kinetic_energy(state.velocities, masses)]
     temperatures = [instantaneous_temperature(state.velocities, masses)]
     pair_counts = [pair_count]
@@ -489,7 +551,7 @@ def simulate_nve(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        potential_energy, next_forces = _energy_forces_from_terms(
+        potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
             next_positions,
             terms,
             cell=cell,
@@ -512,6 +574,8 @@ def simulate_nve(
             sampled_steps.append(step)
             sampled_times.append(state.time)
         potential_energies.append(potential_energy)
+        for name, energy in energy_by_term.items():
+            potential_energy_by_term[name].append(energy)
         kinetic_energies.append(kinetic_energy(state.velocities, masses))
         temperatures.append(instantaneous_temperature(state.velocities, masses))
         pair_counts.append(pair_count)
@@ -527,6 +591,9 @@ def simulate_nve(
         potential_energy=potential_energy_series,
         kinetic_energy=kinetic_energy_series,
         total_energy=potential_energy_series + kinetic_energy_series,
+        potential_energy_by_term={
+            name: mx.stack(energies) for name, energies in potential_energy_by_term.items()
+        },
         temperature=mx.stack(temperatures),
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
@@ -553,7 +620,7 @@ def simulate_nvt(
         thermostat = LangevinThermostat()
     if force_terms is None:
         force_terms = LennardJonesPotential()
-    terms = _as_force_terms(force_terms)
+    terms = _named_force_terms(force_terms)
 
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
@@ -564,7 +631,12 @@ def simulate_nvt(
     pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-    potential_energy, forces = _energy_forces_from_terms(positions, terms, cell=cell, pairs=pairs)
+    potential_energy, forces, energy_by_term = _energy_forces_by_term(
+        positions,
+        terms,
+        cell=cell,
+        pairs=pairs,
+    )
     state = SimulationState(
         positions=positions,
         velocities=velocities,
@@ -577,6 +649,7 @@ def simulate_nvt(
     sampled_steps = [0]
     sampled_times = [0.0]
     potential_energies = [potential_energy]
+    potential_energy_by_term = {name: [energy] for name, energy in energy_by_term.items()}
     kinetic_energies = [kinetic_energy(state.velocities, masses)]
     temperatures = [instantaneous_temperature(state.velocities, masses)]
     pair_counts = [pair_count]
@@ -612,7 +685,7 @@ def simulate_nvt(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        potential_energy, next_forces = _energy_forces_from_terms(
+        potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
             next_positions,
             terms,
             cell=cell,
@@ -635,6 +708,8 @@ def simulate_nvt(
             sampled_steps.append(step)
             sampled_times.append(state.time)
         potential_energies.append(potential_energy)
+        for name, energy in energy_by_term.items():
+            potential_energy_by_term[name].append(energy)
         kinetic_energies.append(kinetic_energy(state.velocities, masses))
         temperatures.append(instantaneous_temperature(state.velocities, masses))
         pair_counts.append(pair_count)
@@ -650,6 +725,9 @@ def simulate_nvt(
         potential_energy=potential_energy_series,
         kinetic_energy=kinetic_energy_series,
         total_energy=potential_energy_series + kinetic_energy_series,
+        potential_energy_by_term={
+            name: mx.stack(energies) for name, energies in potential_energy_by_term.items()
+        },
         temperature=mx.stack(temperatures),
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),

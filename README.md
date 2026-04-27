@@ -22,7 +22,8 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra viz --
 ## Initial Scope
 
 - MLX-backed arrays and kernels for atomistic/DFT experiments.
-- Lennard-Jones molecular dynamics in reduced units as the first engine slice.
+- Molecular mechanics in reduced units: LJ, Coulomb, harmonic bonds/angles, and periodic torsions.
+- Programmatic topology with exclusions, 1-4 scaling, and partial charges.
 - Jupyter-first visualization of structures, densities, orbitals, and SCF convergence.
 - Small, validated examples before broader chemistry coverage.
 
@@ -33,10 +34,14 @@ frames separately from dense per-step diagnostics. NVE is available for energy
 drift checks, and Langevin NVT is available for seeded temperature-controlled
 experiments.
 
+See `docs/molecular-mechanics.md` for the topology and force-field surface.
+
 ## Benchmarks
 
 ```bash
 uv run python -m mlx_atomistic.benchmarks.lj_md --particles 256 --steps 20
+uv run python -m mlx_atomistic.benchmarks.lj_md --sizes 128,512,2048 --steps 20 --json
+uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 20 --json
 ```
 
 ## Layout

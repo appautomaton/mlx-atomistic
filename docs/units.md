@@ -44,6 +44,8 @@ convert external values at the API boundary.
 - `potential_energy`, `kinetic_energy`, `total_energy`, `temperature`,
   `pair_count`, and `rebuild_count` are dense per-step diagnostics with length
   `steps + 1`.
+- `potential_energy_by_term` stores dense per-term potential-energy series when
+  multiple force terms are composed.
 
 This lets long runs keep a small trajectory while still retaining enough scalar
 diagnostics to judge integrator health.
@@ -86,8 +88,9 @@ same trajectory without changing global random state.
 `mlx_atomistic.diagnostics.summarize_md_result()` converts an MD result into a
 small dictionary of Python scalars for notebooks and CLI output. It reports
 initial/final/mean temperature, total-energy drift, and neighbor-list pair/rebuild
-counts when those fields are present. For NVT results it also reports target
-temperature and final/mean temperature error.
+counts when those fields are present. It also reports per-term potential-energy
+summaries when energy decomposition is available. For NVT results it reports
+target temperature and final/mean temperature error.
 
 ## DFT
 

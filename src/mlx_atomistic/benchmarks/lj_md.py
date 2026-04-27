@@ -21,6 +21,7 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
+from mlx_atomistic.runtime import get_runtime_info
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class BenchmarkResult:
     energy_drift: float
     mean_temperature: float
     final_temperature: float
+    final_potential_energy_by_term: dict[str, float]
 
 
 def run_case(
@@ -105,7 +107,20 @@ def run_case(
         energy_drift=float(summary["max_energy_drift"]),
         mean_temperature=float(summary["mean_temperature"]),
         final_temperature=float(summary["final_temperature"]),
+        final_potential_energy_by_term=dict(summary.get("final_potential_energy_by_term", {})),
     )
+
+
+def parse_sizes(value: str | None, fallback: int) -> list[int]:
+    """Parse a comma-separated particle-size list."""
+
+    if value is None:
+        return [fallback]
+    sizes = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not sizes or any(size <= 0 for size in sizes):
+        msg = "--sizes must contain positive integers"
+        raise ValueError(msg)
+    return sizes
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -115,25 +130,37 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--density", type=float, default=0.8)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--sizes", default=None, help="Comma-separated particle counts.")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
+    sizes = parse_sizes(args.sizes, args.particles)
     results = [
         run_case(
-            particles=args.particles,
+            particles=particles,
             steps=args.steps,
             mode=mode,
             density=args.density,
             temperature=args.temperature,
             seed=args.seed,
         )
+        for particles in sizes
         for mode in ("all-pairs", "static-neighbor", "dynamic-neighbor", "nvt-dynamic-neighbor")
     ]
 
     if args.json:
-        print(json.dumps([asdict(result) for result in results], indent=2))
+        payload = {
+            "runtime": asdict(get_runtime_info()),
+            "cases": [asdict(result) for result in results],
+        }
+        print(json.dumps(payload, indent=2))
         return
 
+    runtime = get_runtime_info()
+    print(
+        f"runtime mlx={runtime.mlx_version} device={runtime.default_device} "
+        f"metal={runtime.metal_available}"
+    )
     for result in results:
         pair_text = "-" if result.pairs is None else str(result.pairs)
         print(
