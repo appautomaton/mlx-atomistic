@@ -310,3 +310,177 @@ class CoulombPotential:
             lambda pos: self.potential_energy(pos, cell=cell, pairs=pairs)
         )(positions)
         return energy, -gradient
+
+
+@dataclass(frozen=True)
+class NonbondedPotential:
+    """Combined Lennard-Jones and Coulomb pair potential."""
+
+    sigma: object
+    epsilon: object
+    charges: object
+    coulomb_constant: float = 1.0
+    cutoff: float | None = 2.5
+    lj_shift: bool = True
+    coulomb_shift: bool = False
+    topology: Topology | None = None
+    lj_one_four_scale: float = 1.0
+    coulomb_one_four_scale: float = 1.0
+    name: str = "nonbonded"
+
+    def __post_init__(self) -> None:
+        sigma = as_mx_array(self.sigma)
+        epsilon = as_mx_array(self.epsilon)
+        charges = as_mx_array(self.charges)
+        if sigma.ndim != 1 or epsilon.ndim != 1 or charges.ndim != 1:
+            msg = "sigma, epsilon, and charges must have shape (n_atoms,)"
+            raise ValueError(msg)
+        if sigma.shape != epsilon.shape or sigma.shape != charges.shape:
+            msg = "sigma, epsilon, and charges must have matching shapes"
+            raise ValueError(msg)
+        if bool(np.any(np.asarray(sigma) <= 0.0)):
+            msg = "sigma values must be positive"
+            raise ValueError(msg)
+        if bool(np.any(np.asarray(epsilon) < 0.0)):
+            msg = "epsilon values must be non-negative"
+            raise ValueError(msg)
+        if self.topology is not None and self.topology.n_atoms != sigma.shape[0]:
+            msg = "topology.n_atoms must match nonbonded parameter length"
+            raise ValueError(msg)
+        if self.cutoff is not None and self.cutoff <= 0.0:
+            msg = "cutoff must be positive"
+            raise ValueError(msg)
+        if self.lj_one_four_scale < 0.0 or self.coulomb_one_four_scale < 0.0:
+            msg = "1-4 scaling factors must be non-negative"
+            raise ValueError(msg)
+        object.__setattr__(self, "sigma", sigma)
+        object.__setattr__(self, "epsilon", epsilon)
+        object.__setattr__(self, "charges", charges)
+
+    def _pairs_and_scales(self, positions: mx.array, pairs) -> tuple[mx.array, mx.array, mx.array]:
+        if self.topology is not None:
+            filtered = self.topology.nonbonded_pairs(pairs)
+            lj_scales = self.topology.pair_scales(
+                filtered,
+                one_four_scale=self.lj_one_four_scale,
+            )
+            coulomb_scales = self.topology.pair_scales(
+                filtered,
+                one_four_scale=self.coulomb_one_four_scale,
+            )
+            return filtered, lj_scales, coulomb_scales
+
+        if pairs is None:
+            n_atoms = positions.shape[0]
+            pairs = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)]
+            if not pairs:
+                empty_pairs = mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
+                return empty_pairs, as_mx_array([]), as_mx_array([])
+            pair_array = mx.array(pairs, dtype=mx.int32)
+        else:
+            pair_array = mx.array(pairs, dtype=mx.int32)
+        scales = as_mx_array([1.0] * pair_array.shape[0])
+        return pair_array, scales, scales
+
+    def mixed_pair_parameters(self, pairs) -> tuple[mx.array, mx.array]:
+        """Return Lorentz-Berthelot mixed sigma and epsilon for pairs."""
+
+        pair_array = mx.array(pairs, dtype=mx.int32)
+        if pair_array.shape[0] == 0:
+            return as_mx_array([]), as_mx_array([])
+        i = pair_array[:, 0]
+        j = pair_array[:, 1]
+        sigma_ij = 0.5 * (self.sigma[i] + self.sigma[j])
+        epsilon_ij = mx.sqrt(self.epsilon[i] * self.epsilon[j])
+        return sigma_ij, epsilon_ij
+
+    def _pair_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+        pairs, lj_scales, coulomb_scales = self._pairs_and_scales(positions, pairs)
+        if pairs.shape[0] == 0:
+            zero = _zero_energy(positions)
+            return pairs, zero, zero, mx.zeros_like(positions), lj_scales, coulomb_scales
+
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = r2 > 0.0
+        if self.cutoff is not None:
+            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
+        safe_r2 = mx.where(pair_mask, r2, 1.0)
+        distance = mx.sqrt(safe_r2)
+
+        sigma_ij, epsilon_ij = self.mixed_pair_parameters(pairs)
+        sigma2_over_r2 = (sigma_ij * sigma_ij) / safe_r2
+        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+        inv_r12 = inv_r6 * inv_r6
+        lj_pair_energy = 4.0 * epsilon_ij * (inv_r12 - inv_r6)
+        if self.lj_shift and self.cutoff is not None:
+            sigma2_over_rc2 = (sigma_ij * sigma_ij) / (self.cutoff * self.cutoff)
+            inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
+            inv_rc12 = inv_rc6 * inv_rc6
+            lj_pair_energy = lj_pair_energy - 4.0 * epsilon_ij * (inv_rc12 - inv_rc6)
+        lj_pair_energy = mx.where(pair_mask, lj_pair_energy * lj_scales, 0.0)
+
+        qij = self.charges[i] * self.charges[j]
+        coulomb_pair_energy = self.coulomb_constant * qij / distance
+        if self.coulomb_shift and self.cutoff is not None:
+            coulomb_pair_energy = coulomb_pair_energy - self.coulomb_constant * qij / self.cutoff
+        coulomb_pair_energy = mx.where(
+            pair_mask,
+            coulomb_pair_energy * coulomb_scales,
+            0.0,
+        )
+
+        lj_scalar = 24.0 * epsilon_ij * (2.0 * inv_r12 - inv_r6) / safe_r2
+        coulomb_scalar = self.coulomb_constant * qij / (safe_r2 * distance)
+        scalar = mx.where(
+            pair_mask,
+            lj_scalar * lj_scales + coulomb_scalar * coulomb_scales,
+            0.0,
+        )
+        pair_forces = scalar[:, None] * displacement
+        forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
+        return (
+            pairs,
+            mx.sum(lj_pair_energy),
+            mx.sum(coulomb_pair_energy),
+            forces,
+            lj_scales,
+            coulomb_scales,
+        )
+
+    def component_energies(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> dict[str, mx.array]:
+        """Return LJ and Coulomb energy components."""
+
+        positions = as_mx_array(positions)
+        _, lj_energy, coulomb_energy, _, _, _ = self._pair_components(positions, cell, pairs)
+        return {"lj": lj_energy, "coulomb": coulomb_energy}
+
+    def energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Return total nonbonded energy and forces."""
+
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+        _, lj_energy, coulomb_energy, forces, _, _ = self._pair_components(positions, cell, pairs)
+        return lj_energy + coulomb_energy, forces

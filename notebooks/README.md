@@ -9,5 +9,6 @@ Planned notebooks:
 - `02-lj-md-performance.ipynb`: compare all-pairs and neighbor-list LJ force paths.
 - `03-molecular-mechanics.ipynb`: inspect bonded terms, charged systems, and energy decomposition.
 - `04-validation-performance.ipynb`: run force validation, stability diagnostics, and benchmark summaries.
-- `05-density-grid.ipynb`: inspect toy charge-density arrays and slices.
-- `06-scf-convergence.ipynb`: plot initial SCF iteration traces.
+- `05-real-mm-core.ipynb`: build typed MM systems, apply constraints, save/load trajectories, and compare force paths.
+- `06-density-grid.ipynb`: inspect toy charge-density arrays and slices.
+- `07-scf-convergence.ipynb`: plot initial SCF iteration traces.

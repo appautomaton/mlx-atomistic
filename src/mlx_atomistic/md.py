@@ -9,6 +9,7 @@ from typing import Protocol
 
 import mlx.core as mx
 
+from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.topology import Topology
@@ -217,6 +218,7 @@ class NVEResult:
     temperature: mx.array
     pair_count: mx.array
     rebuild_count: mx.array
+    constraint_max_error: mx.array
     final_state: SimulationState
 
     @property
@@ -271,6 +273,7 @@ class NVTResult:
     temperature: mx.array
     pair_count: mx.array
     rebuild_count: mx.array
+    constraint_max_error: mx.array
     final_state: SimulationState
     target_temperature: float
 
@@ -355,7 +358,16 @@ def _energy_forces_by_term(
     energy_by_term = {}
     for name, term in force_terms:
         energy, forces = term.energy_forces(positions, cell, pairs=pairs)
-        energy_by_term[name] = energy
+        component_energies = getattr(term, "component_energies", None)
+        if callable(component_energies):
+            for component_name, component_energy in component_energies(
+                positions,
+                cell=cell,
+                pairs=pairs,
+            ).items():
+                energy_by_term[f"{name}.{component_name}"] = component_energy
+        else:
+            energy_by_term[name] = energy
         total_energy = energy if total_energy is None else total_energy + energy
         total_forces = total_forces + forces
 
@@ -368,6 +380,10 @@ def _energy_forces_by_term(
 def _dense_pair_count(positions: mx.array) -> int:
     n_particles = positions.shape[0]
     return n_particles * (n_particles - 1) // 2
+
+
+def _zero_constraint_error(positions: mx.array) -> mx.array:
+    return mx.sum(positions[:, 0] * 0.0)
 
 
 def _local_prng_key(seed: int | None) -> mx.array:
@@ -489,6 +505,7 @@ def simulate_nve(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...] | None = None,
     neighbor_manager: NeighborListManager | None = None,
     config: SimulationConfig | None = None,
+    constraints: DistanceConstraints | None = None,
 ) -> NVEResult:
     """Run NVE molecular dynamics with sparse trajectory and dense diagnostics.
 
@@ -505,6 +522,10 @@ def simulate_nve(
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
     masses = as_mx_array([1.0] * positions.shape[0]) if masses is None else as_mx_array(masses)
+    constraint_error = _zero_constraint_error(positions)
+    if constraints is not None:
+        positions, constraint_error = constraints.apply_positions(positions, masses, cell)
+        velocities = constraints.apply_velocities(positions, velocities, masses, cell)
 
     neighbor_list = neighbor_manager.update(positions) if neighbor_manager is not None else None
     pairs = None if neighbor_list is None else neighbor_list.pairs
@@ -534,6 +555,7 @@ def simulate_nve(
     temperatures = [instantaneous_temperature(state.velocities, masses)]
     pair_counts = [pair_count]
     rebuild_counts = [rebuild_count]
+    constraint_errors = [constraint_error]
 
     for step in range(1, config.steps + 1):
         acceleration = state.forces / masses[:, None]
@@ -541,6 +563,13 @@ def simulate_nve(
         next_positions = state.positions + config.dt * velocities_half
         if cell is not None:
             next_positions = cell.wrap(next_positions)
+        constraint_error = _zero_constraint_error(next_positions)
+        if constraints is not None:
+            next_positions, constraint_error = constraints.apply_positions(
+                next_positions,
+                masses,
+                cell,
+            )
 
         neighbor_list = (
             neighbor_manager.update(next_positions) if neighbor_manager is not None else None
@@ -559,6 +588,13 @@ def simulate_nve(
         )
         next_acceleration = next_forces / masses[:, None]
         next_velocities = velocities_half + 0.5 * config.dt * next_acceleration
+        if constraints is not None:
+            next_velocities = constraints.apply_velocities(
+                next_positions,
+                next_velocities,
+                masses,
+                cell,
+            )
         state = SimulationState(
             positions=next_positions,
             velocities=next_velocities,
@@ -580,6 +616,7 @@ def simulate_nve(
         temperatures.append(instantaneous_temperature(state.velocities, masses))
         pair_counts.append(pair_count)
         rebuild_counts.append(rebuild_count)
+        constraint_errors.append(constraint_error)
 
     potential_energy_series = mx.stack(potential_energies)
     kinetic_energy_series = mx.stack(kinetic_energies)
@@ -597,6 +634,7 @@ def simulate_nve(
         temperature=mx.stack(temperatures),
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
+        constraint_max_error=mx.stack(constraint_errors),
         final_state=state,
     )
 
@@ -611,6 +649,7 @@ def simulate_nvt(
     neighbor_manager: NeighborListManager | None = None,
     config: SimulationConfig | None = None,
     thermostat: LangevinThermostat | None = None,
+    constraints: DistanceConstraints | None = None,
 ) -> NVTResult:
     """Run Langevin NVT molecular dynamics with BAOAB integration."""
 
@@ -625,6 +664,10 @@ def simulate_nvt(
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
     masses = as_mx_array([1.0] * positions.shape[0]) if masses is None else as_mx_array(masses)
+    constraint_error = _zero_constraint_error(positions)
+    if constraints is not None:
+        positions, constraint_error = constraints.apply_positions(positions, masses, cell)
+        velocities = constraints.apply_velocities(positions, velocities, masses, cell)
 
     neighbor_list = neighbor_manager.update(positions) if neighbor_manager is not None else None
     pairs = None if neighbor_list is None else neighbor_list.pairs
@@ -654,6 +697,7 @@ def simulate_nvt(
     temperatures = [instantaneous_temperature(state.velocities, masses)]
     pair_counts = [pair_count]
     rebuild_counts = [rebuild_count]
+    constraint_errors = [constraint_error]
 
     key = _local_prng_key(thermostat.seed)
     velocity_decay = exp(-thermostat.friction * config.dt)
@@ -675,6 +719,13 @@ def simulate_nvt(
         next_positions = next_positions + 0.5 * config.dt * thermostatted_velocities
         if cell is not None:
             next_positions = cell.wrap(next_positions)
+        constraint_error = _zero_constraint_error(next_positions)
+        if constraints is not None:
+            next_positions, constraint_error = constraints.apply_positions(
+                next_positions,
+                masses,
+                cell,
+            )
 
         neighbor_list = (
             neighbor_manager.update(next_positions) if neighbor_manager is not None else None
@@ -693,6 +744,13 @@ def simulate_nvt(
         )
         next_acceleration = next_forces / masses[:, None]
         next_velocities = thermostatted_velocities + 0.5 * config.dt * next_acceleration
+        if constraints is not None:
+            next_velocities = constraints.apply_velocities(
+                next_positions,
+                next_velocities,
+                masses,
+                cell,
+            )
         state = SimulationState(
             positions=next_positions,
             velocities=next_velocities,
@@ -714,6 +772,7 @@ def simulate_nvt(
         temperatures.append(instantaneous_temperature(state.velocities, masses))
         pair_counts.append(pair_count)
         rebuild_counts.append(rebuild_count)
+        constraint_errors.append(constraint_error)
 
     potential_energy_series = mx.stack(potential_energies)
     kinetic_energy_series = mx.stack(kinetic_energies)
@@ -731,6 +790,7 @@ def simulate_nvt(
         temperature=mx.stack(temperatures),
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
+        constraint_max_error=mx.stack(constraint_errors),
         final_state=state,
         target_temperature=thermostat.temperature,
     )

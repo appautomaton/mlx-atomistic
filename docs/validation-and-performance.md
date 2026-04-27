@@ -67,6 +67,8 @@ The MM force-term benchmark separates the current hot-path candidates:
 - neighbor-list construction
 - LJ pair-list evaluation
 - direct cutoff Coulomb evaluation
+- combined mixed LJ+Coulomb nonbonded evaluation
+- distance-constraint projection
 
 ```bash
 uv run python -m mlx_atomistic.benchmarks.mm_force_terms --particles 128 --evaluations 20 --json

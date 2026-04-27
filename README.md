@@ -37,6 +37,8 @@ experiments.
 See `docs/molecular-mechanics.md` for the topology and force-field surface.
 See `docs/validation-and-performance.md` for the force-validation, stability,
 and benchmark workflow.
+See `docs/real-mm-core.md` for typed systems, force-field assignment,
+constraints, trajectory I/O, and the combined nonbonded path.
 
 ## Benchmarks
 

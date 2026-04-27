@@ -26,6 +26,7 @@ Supported terms:
 
 - `LennardJonesPotential`
 - `CoulombPotential`
+- `NonbondedPotential`
 - `HarmonicBondPotential`
 - `HarmonicAnglePotential`
 - `PeriodicDihedralPotential`
@@ -45,6 +46,11 @@ LJ and Coulomb support topology-aware nonbonded pairs:
 
 PME/Ewald and force-field file parsers are intentionally out of scope for this
 milestone.
+
+`NonbondedPotential` is the production-oriented direct pair path. It combines
+mixed LJ and direct Coulomb terms, supports independent LJ/Coulomb 1-4 scaling,
+and reports component energies as `nonbonded.lj` and `nonbonded.coulomb` in MD
+diagnostics.
 
 ## Energy Decomposition
 

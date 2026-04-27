@@ -12,7 +12,12 @@ from time import perf_counter
 import mlx.core as mx
 import numpy as np
 
-from mlx_atomistic.examples import bonded_chain_example, charged_dimer_example
+from mlx_atomistic.examples import (
+    bonded_chain_example,
+    charged_dimer_example,
+    mixed_lj_fluid_example,
+    water_like_constrained_example,
+)
 from mlx_atomistic.forcefields import CoulombPotential
 from mlx_atomistic.initialize import fcc_lattice
 from mlx_atomistic.md import LennardJonesPotential
@@ -89,6 +94,36 @@ def run_neighbor_build(*, particles: int, evaluations: int) -> ForceTermBenchmar
     )
 
 
+def run_constraint_projection(*, evaluations: int) -> ForceTermBenchmarkResult:
+    """Measure constrained position and velocity projection."""
+
+    system, _, constraints = water_like_constrained_example()
+    positions = system.positions
+    velocities = system.velocities
+    error = None
+    start = perf_counter()
+    for _ in range(evaluations):
+        positions, error = constraints.apply_positions(positions, system.masses, system.cell)
+        velocities = constraints.apply_velocities(
+            positions,
+            velocities,
+            system.masses,
+            system.cell,
+        )
+    if error is not None:
+        mx.eval(positions, velocities, error)
+    elapsed = perf_counter() - start
+    return ForceTermBenchmarkResult(
+        category="constraints",
+        term="distance-project",
+        evaluations=evaluations,
+        particles=system.atom_count,
+        pairs=int(constraints.pairs.shape[0]),
+        ms_per_eval=elapsed * 1000.0 / evaluations,
+        energy=0.0 if error is None else float(error),
+    )
+
+
 def run_benchmark(*, evaluations: int, particles: int = 128) -> list[ForceTermBenchmarkResult]:
     """Run the default molecular mechanics force-term benchmark."""
 
@@ -136,6 +171,20 @@ def run_benchmark(*, evaluations: int, particles: int = 128) -> list[ForceTermBe
             pairs=neighbor_list.pairs,
         )
     )
+    mixed_system, mixed_force_field = mixed_lj_fluid_example(particles=particles)
+    combined_nonbonded = mixed_force_field.build_force_terms(mixed_system)[-1]
+    mixed_neighbor_list = build_neighbor_list(mixed_system.positions, mixed_system.cell, cutoff=2.5)
+    results.append(
+        run_term(
+            combined_nonbonded,
+            mixed_system.positions,
+            evaluations=evaluations,
+            category="combined-nonbonded",
+            cell=mixed_system.cell,
+            pairs=mixed_neighbor_list.pairs,
+        )
+    )
+    results.append(run_constraint_projection(evaluations=evaluations))
     return results
 
 

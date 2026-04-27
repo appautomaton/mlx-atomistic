@@ -92,6 +92,9 @@ counts when those fields are present. It also reports per-term potential-energy
 summaries when energy decomposition is available. For NVT results it reports
 target temperature and final/mean temperature error.
 
+When distance constraints are active, NVE/NVT results also include dense
+`constraint_max_error` diagnostics in the same reduced length unit as positions.
+
 ## DFT
 
 The planned DFT prototype will use atomic units internally:

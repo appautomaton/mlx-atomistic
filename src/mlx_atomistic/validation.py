@@ -15,6 +15,7 @@ from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
     HarmonicBondPotential,
+    NonbondedPotential,
     PeriodicDihedralPotential,
 )
 from mlx_atomistic.md import ForceTerm, LennardJonesPotential
@@ -225,6 +226,10 @@ def default_force_validation_cases(
         [[0.0, 0.0, 0.0], [1.15, 0.15, 0.05], [0.35, 1.25, 0.08], [1.5, 1.2, 0.25]],
         dtype=np.float32,
     )
+    base_nonbonded = np.array(
+        [[0.0, 0.0, 0.0], [1.25, 0.1, 0.0], [0.2, 1.35, 0.1], [1.4, 1.25, 0.3]],
+        dtype=np.float32,
+    )
 
     for index in range(cases_per_term):
         bond_seed = _case_seed(rng)
@@ -287,6 +292,28 @@ def default_force_validation_cases(
                 term=CoulombPotential(charges=[1.0, -0.5, 0.25, -0.75], cutoff=None),
                 positions=_jitter(base_coulomb, np.random.default_rng(coulomb_seed), scale=0.02),
                 seed=coulomb_seed,
+                epsilon=epsilon,
+                tolerance=tolerance,
+            )
+        )
+
+        nonbonded_seed = _case_seed(rng)
+        cases.append(
+            ForceValidationCase(
+                name=f"nonbonded-{index}",
+                term=NonbondedPotential(
+                    sigma=[1.0, 0.9, 1.1, 0.95],
+                    epsilon=[1.0, 0.7, 0.5, 0.8],
+                    charges=[1.0, -0.5, 0.25, -0.75],
+                    cutoff=None,
+                    lj_shift=False,
+                ),
+                positions=_jitter(
+                    base_nonbonded,
+                    np.random.default_rng(nonbonded_seed),
+                    scale=0.02,
+                ),
+                seed=nonbonded_seed,
                 epsilon=epsilon,
                 tolerance=tolerance,
             )

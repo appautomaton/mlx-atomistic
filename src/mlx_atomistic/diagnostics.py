@@ -37,6 +37,10 @@ def summarize_md_result(
         summary["final_pair_count"] = int(np.array(result.pair_count)[-1])
     if hasattr(result, "rebuild_count"):
         summary["final_rebuild_count"] = int(np.array(result.rebuild_count)[-1])
+    if hasattr(result, "constraint_max_error"):
+        constraint_error = np.array(result.constraint_max_error)
+        summary["final_constraint_max_error"] = float(constraint_error[-1])
+        summary["max_constraint_error"] = float(np.max(constraint_error))
     if hasattr(result, "potential_energy_by_term"):
         summary["final_potential_energy_by_term"] = {
             name: float(np.array(series)[-1])

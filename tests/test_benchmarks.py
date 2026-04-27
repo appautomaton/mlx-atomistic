@@ -17,9 +17,9 @@ def test_validation_gauntlet_cli_json_and_csv(tmp_path, capsys):
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["summary"]["total_cases"] == 5
+    assert payload["summary"]["total_cases"] == 6
     assert payload["summary"]["all_passed"]
-    assert len(payload["cases"]) == 5
+    assert len(payload["cases"]) == 6
     assert csv_path.read_text().startswith("case_name,term_name")
 
 
@@ -68,3 +68,5 @@ def test_force_term_benchmark_includes_profile_rows():
     assert "neighbor-list" in categories
     assert "lj-pair-eval" in categories
     assert "coulomb-direct" in categories
+    assert "combined-nonbonded" in categories
+    assert "constraints" in categories
