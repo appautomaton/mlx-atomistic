@@ -1,0 +1,60 @@
+# macOS / editor state
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python environments and local config
+.venv/
+.env
+.env.*
+!.env.example
+.python-version.local
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+*.egg
+wheelhouse/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Local generated science/benchmark outputs
+artifacts/
+outputs/
+results/
+scratch/
+tmp/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.xyz
+*.traj
+
+# Reference checkouts only. Keep manifests tracked; fetch sources locally.
+vendors/*
+!vendors/
+!vendors/README.md
+!vendors/vendor-lock.json

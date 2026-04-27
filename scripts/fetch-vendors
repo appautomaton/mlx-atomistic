@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENDORS_DIR="$ROOT/vendors"
+
+clone_or_report() {
+  local name="$1"
+  local url="$2"
+  local branch="$3"
+  local dest="$VENDORS_DIR/$name"
+
+  if [[ -d "$dest/.git" ]]; then
+    printf '%s already exists at %s\n' "$name" "$dest"
+  else
+    git clone --depth 1 --branch "$branch" "$url" "$dest"
+  fi
+
+  printf '%s commit: ' "$name"
+  git -C "$dest" rev-parse HEAD
+}
+
+mkdir -p "$VENDORS_DIR"
+
+clone_or_report "quantum-espresso" "https://github.com/QEF/q-e.git" "develop"
+clone_or_report "cp2k" "https://github.com/cp2k/cp2k.git" "master"

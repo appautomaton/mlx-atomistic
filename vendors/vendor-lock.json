@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "vendors": {
+    "openmm": {
+      "url": "https://github.com/openmm/openmm.git",
+      "branch": "master",
+      "depth": 1,
+      "commit": "46376ea3e4d0ff37cdaa5e55e034dbf5c3296b81",
+      "role": "reference only: MD platform/kernel architecture"
+    },
+    "lammps": {
+      "url": "https://github.com/lammps/lammps.git",
+      "branch": "develop",
+      "depth": 1,
+      "commit": "ee93998fe5b05c75e0640aaa4a3b30316bc959bc",
+      "role": "reference only: MD algorithms, neighbor lists, and force kernels"
+    },
+    "quantum-espresso": {
+      "url": "https://github.com/QEF/q-e.git",
+      "branch": "develop",
+      "depth": 1,
+      "commit": "8b164e93cb8c2efe9ef9500b4a07b1a6e9b3cd6d",
+      "role": "reference only: plane-wave pseudopotential DFT"
+    },
+    "cp2k": {
+      "url": "https://github.com/cp2k/cp2k.git",
+      "branch": "master",
+      "depth": 1,
+      "commit": "3a22a2691016db12eba4d85ea0db39c868212a54",
+      "role": "reference only: DFT/MD workflow and GPW/Quickstep"
+    }
+  }
+}
