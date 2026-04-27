@@ -10,8 +10,16 @@ from time import perf_counter
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.diagnostics import summarize_md_result
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
-from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate, simulate_nve
+from mlx_atomistic.md import (
+    LangevinThermostat,
+    LennardJonesPotential,
+    SimulationConfig,
+    simulate,
+    simulate_nve,
+    simulate_nvt,
+)
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 
 
@@ -24,6 +32,8 @@ class BenchmarkResult:
     rebuilds: int
     ms_per_step: float
     energy_drift: float
+    mean_temperature: float
+    final_temperature: float
 
 
 def run_case(
@@ -48,16 +58,28 @@ def run_case(
         pair_count = neighbor_list.pair_count
 
     start = perf_counter()
-    if mode == "dynamic-neighbor":
+    if mode in {"dynamic-neighbor", "nvt-dynamic-neighbor"}:
         neighbor_manager = NeighborListManager(cell, cutoff=potential.cutoff or 2.5)
-        result = simulate_nve(
-            positions,
-            velocities,
-            cell=cell,
-            force_terms=potential,
-            neighbor_manager=neighbor_manager,
-            config=SimulationConfig(steps=steps, sample_interval=steps),
-        )
+        config = SimulationConfig(steps=steps, sample_interval=steps)
+        if mode == "nvt-dynamic-neighbor":
+            result = simulate_nvt(
+                positions,
+                velocities,
+                cell=cell,
+                force_terms=potential,
+                neighbor_manager=neighbor_manager,
+                config=config,
+                thermostat=LangevinThermostat(temperature=temperature, friction=1.0, seed=seed),
+            )
+        else:
+            result = simulate_nve(
+                positions,
+                velocities,
+                cell=cell,
+                force_terms=potential,
+                neighbor_manager=neighbor_manager,
+                config=config,
+            )
         pair_count = int(np.array(result.pair_count)[-1])
         rebuilds = int(np.array(result.rebuild_count)[-1])
     else:
@@ -72,8 +94,7 @@ def run_case(
     mx.eval(result.total_energy)
     elapsed = perf_counter() - start
 
-    total_energy = np.array(result.total_energy)
-    drift = float(np.max(np.abs(total_energy - total_energy[0])))
+    summary = summarize_md_result(result)
     return BenchmarkResult(
         mode=mode,
         particles=particles,
@@ -81,7 +102,9 @@ def run_case(
         pairs=pair_count,
         rebuilds=rebuilds,
         ms_per_step=elapsed * 1000.0 / steps,
-        energy_drift=drift,
+        energy_drift=float(summary["max_energy_drift"]),
+        mean_temperature=float(summary["mean_temperature"]),
+        final_temperature=float(summary["final_temperature"]),
     )
 
 
@@ -104,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
             temperature=args.temperature,
             seed=args.seed,
         )
-        for mode in ("all-pairs", "static-neighbor", "dynamic-neighbor")
+        for mode in ("all-pairs", "static-neighbor", "dynamic-neighbor", "nvt-dynamic-neighbor")
     ]
 
     if args.json:
@@ -116,7 +139,8 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"{result.mode:9s} particles={result.particles} steps={result.steps} "
             f"pairs={pair_text} rebuilds={result.rebuilds} ms/step={result.ms_per_step:.3f} "
-            f"energy_drift={result.energy_drift:.6g}"
+            f"energy_drift={result.energy_drift:.6g} "
+            f"mean_T={result.mean_temperature:.4g} final_T={result.final_temperature:.4g}"
         )
 
 

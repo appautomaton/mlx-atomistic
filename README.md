@@ -29,8 +29,9 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra viz --
 See `docs/units.md` for the internal unit policy.
 
 The MD path currently uses Lennard-Jones reduced units and keeps sparse trajectory
-frames separately from dense per-step diagnostics, so energy drift can be checked
-without storing every position frame.
+frames separately from dense per-step diagnostics. NVE is available for energy
+drift checks, and Langevin NVT is available for seeded temperature-controlled
+experiments.
 
 ## Benchmarks
 

@@ -60,6 +60,35 @@ Small nonzero drift is expected from finite `dt` and floating-point arithmetic.
 For a stable NVE smoke test, `max(|ΔE|)` should remain small over short runs and
 should improve when `dt` is reduced.
 
+## NVT and Langevin Dynamics
+
+`simulate_nvt()` uses a Langevin thermostat with BAOAB integration. It keeps the
+same sparse trajectory and dense diagnostics contract as `simulate_nve()`, but
+adds `target_temperature` and `temperature_error`.
+
+The v1 thermostat parameters are:
+
+```text
+T = target reduced temperature
+γ = friction in τ⁻¹
+```
+
+`γ = 0` disables stochastic thermostatting, so the NVT integrator reduces to the
+same force/position/velocity updates as NVE. With `γ > 0`, random kicks exchange
+energy with an implicit heat bath. That means total energy is not conserved in
+NVT; use temperature statistics rather than `ΔE(t)` as the primary health check.
+
+Seeded NVT runs use local MLX PRNG keys, so the same seed should reproduce the
+same trajectory without changing global random state.
+
+## Diagnostic Summaries
+
+`mlx_atomistic.diagnostics.summarize_md_result()` converts an MD result into a
+small dictionary of Python scalars for notebooks and CLI output. It reports
+initial/final/mean temperature, total-energy drift, and neighbor-list pair/rebuild
+counts when those fields are present. For NVT results it also reports target
+temperature and final/mean temperature error.
+
 ## DFT
 
 The planned DFT prototype will use atomic units internally:

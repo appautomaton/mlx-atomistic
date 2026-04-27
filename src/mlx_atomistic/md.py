@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from math import exp, sqrt
 from typing import Protocol
 
 import mlx.core as mx
@@ -150,7 +152,7 @@ class SimulationResult:
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    """Configuration for NVE molecular dynamics."""
+    """Configuration for molecular dynamics."""
 
     dt: float = 0.005
     steps: int = 100
@@ -216,6 +218,47 @@ class NVEResult:
         return self.energy_drift / denominator
 
 
+@dataclass(frozen=True)
+class LangevinThermostat:
+    """Langevin thermostat parameters in reduced units."""
+
+    temperature: float = 1.0
+    friction: float = 1.0
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.temperature < 0.0:
+            msg = "temperature must be non-negative"
+            raise ValueError(msg)
+        if self.friction < 0.0:
+            msg = "friction must be non-negative"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class NVTResult:
+    """Sparse trajectory and per-step diagnostics from an NVT simulation."""
+
+    sampled_positions: mx.array
+    sampled_velocities: mx.array
+    sampled_steps: mx.array
+    sampled_time: mx.array
+    potential_energy: mx.array
+    kinetic_energy: mx.array
+    total_energy: mx.array
+    temperature: mx.array
+    pair_count: mx.array
+    rebuild_count: mx.array
+    final_state: SimulationState
+    target_temperature: float
+
+    @property
+    def temperature_error(self) -> mx.array:
+        """Instantaneous temperature minus the target thermostat temperature."""
+
+        return self.temperature - self.target_temperature
+
+
 def kinetic_energy(velocities: mx.array, masses: mx.array) -> mx.array:
     """Return kinetic energy in reduced units."""
 
@@ -269,6 +312,12 @@ def _energy_forces_from_terms(
 def _dense_pair_count(positions: mx.array) -> int:
     n_particles = positions.shape[0]
     return n_particles * (n_particles - 1) // 2
+
+
+def _local_prng_key(seed: int | None) -> mx.array:
+    if seed is None:
+        seed = int.from_bytes(os.urandom(4), "little")
+    return mx.random.key(seed)
 
 
 @dataclass(frozen=True)
@@ -482,4 +531,128 @@ def simulate_nve(
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
         final_state=state,
+    )
+
+
+def simulate_nvt(
+    positions,
+    velocities,
+    *,
+    masses=None,
+    cell: Cell | None = None,
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...] | None = None,
+    neighbor_manager: NeighborListManager | None = None,
+    config: SimulationConfig | None = None,
+    thermostat: LangevinThermostat | None = None,
+) -> NVTResult:
+    """Run Langevin NVT molecular dynamics with BAOAB integration."""
+
+    if config is None:
+        config = SimulationConfig()
+    if thermostat is None:
+        thermostat = LangevinThermostat()
+    if force_terms is None:
+        force_terms = LennardJonesPotential()
+    terms = _as_force_terms(force_terms)
+
+    positions = as_mx_array(positions)
+    velocities = as_mx_array(velocities)
+    masses = as_mx_array([1.0] * positions.shape[0]) if masses is None else as_mx_array(masses)
+
+    neighbor_list = neighbor_manager.update(positions) if neighbor_manager is not None else None
+    pairs = None if neighbor_list is None else neighbor_list.pairs
+    pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
+    rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
+
+    potential_energy, forces = _energy_forces_from_terms(positions, terms, cell=cell, pairs=pairs)
+    state = SimulationState(
+        positions=positions,
+        velocities=velocities,
+        masses=masses,
+        forces=forces,
+    )
+
+    sampled_positions = [state.positions]
+    sampled_velocities = [state.velocities]
+    sampled_steps = [0]
+    sampled_times = [0.0]
+    potential_energies = [potential_energy]
+    kinetic_energies = [kinetic_energy(state.velocities, masses)]
+    temperatures = [instantaneous_temperature(state.velocities, masses)]
+    pair_counts = [pair_count]
+    rebuild_counts = [rebuild_count]
+
+    key = _local_prng_key(thermostat.seed)
+    velocity_decay = exp(-thermostat.friction * config.dt)
+    noise_scale = sqrt((1.0 - velocity_decay * velocity_decay) * thermostat.temperature)
+
+    for step in range(1, config.steps + 1):
+        acceleration = state.forces / masses[:, None]
+        velocities_half = state.velocities + 0.5 * config.dt * acceleration
+        next_positions = state.positions + 0.5 * config.dt * velocities_half
+        if cell is not None:
+            next_positions = cell.wrap(next_positions)
+
+        keys = mx.random.split(key, 2)
+        key = keys[0]
+        noise = mx.random.normal(state.velocities.shape, key=keys[1])
+        thermal_scale = noise_scale / mx.sqrt(masses)[:, None]
+        thermostatted_velocities = velocity_decay * velocities_half + thermal_scale * noise
+
+        next_positions = next_positions + 0.5 * config.dt * thermostatted_velocities
+        if cell is not None:
+            next_positions = cell.wrap(next_positions)
+
+        neighbor_list = (
+            neighbor_manager.update(next_positions) if neighbor_manager is not None else None
+        )
+        pairs = None if neighbor_list is None else neighbor_list.pairs
+        pair_count = (
+            _dense_pair_count(next_positions) if neighbor_list is None else neighbor_list.pair_count
+        )
+        rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
+
+        potential_energy, next_forces = _energy_forces_from_terms(
+            next_positions,
+            terms,
+            cell=cell,
+            pairs=pairs,
+        )
+        next_acceleration = next_forces / masses[:, None]
+        next_velocities = thermostatted_velocities + 0.5 * config.dt * next_acceleration
+        state = SimulationState(
+            positions=next_positions,
+            velocities=next_velocities,
+            masses=masses,
+            forces=next_forces,
+            step=step,
+            time=step * config.dt,
+        )
+
+        if step % config.sample_interval == 0 or step == config.steps:
+            sampled_positions.append(state.positions)
+            sampled_velocities.append(state.velocities)
+            sampled_steps.append(step)
+            sampled_times.append(state.time)
+        potential_energies.append(potential_energy)
+        kinetic_energies.append(kinetic_energy(state.velocities, masses))
+        temperatures.append(instantaneous_temperature(state.velocities, masses))
+        pair_counts.append(pair_count)
+        rebuild_counts.append(rebuild_count)
+
+    potential_energy_series = mx.stack(potential_energies)
+    kinetic_energy_series = mx.stack(kinetic_energies)
+    return NVTResult(
+        sampled_positions=mx.stack(sampled_positions),
+        sampled_velocities=mx.stack(sampled_velocities),
+        sampled_steps=mx.array(sampled_steps, dtype=mx.int32),
+        sampled_time=mx.array(sampled_times),
+        potential_energy=potential_energy_series,
+        kinetic_energy=kinetic_energy_series,
+        total_energy=potential_energy_series + kinetic_energy_series,
+        temperature=mx.stack(temperatures),
+        pair_count=mx.array(pair_counts, dtype=mx.int32),
+        rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
+        final_state=state,
+        target_temperature=thermostat.temperature,
     )
