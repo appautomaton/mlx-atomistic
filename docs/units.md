@@ -97,7 +97,7 @@ When distance constraints are active, NVE/NVT results also include dense
 
 ## DFT
 
-The planned DFT prototype will use atomic units internally:
+The DFT prototype uses atomic units internally:
 
 ```text
 ℏ = 1
@@ -106,4 +106,6 @@ e = 1
 4πε₀ = 1
 ```
 
-DFT user-facing conversion helpers can be added once the first Γ-point plane-wave pseudopotential prototype exists. Until then, examples should state their unit convention explicitly.
+The current Γ-point plane-wave prototype keeps examples explicit about units.
+User-facing conversion helpers can be added once the DFT API grows beyond toy
+systems.

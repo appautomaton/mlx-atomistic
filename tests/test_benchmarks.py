@@ -1,6 +1,6 @@
 import json
 
-from mlx_atomistic.benchmarks import lj_md, mm_force_terms, stability, validation_gauntlet
+from mlx_atomistic.benchmarks import dft_scf, lj_md, mm_force_terms, stability, validation_gauntlet
 
 
 def test_validation_gauntlet_cli_json_and_csv(tmp_path, capsys):
@@ -70,3 +70,16 @@ def test_force_term_benchmark_includes_profile_rows():
     assert "coulomb-direct" in categories
     assert "combined-nonbonded" in categories
     assert "constraints" in categories
+
+
+def test_dft_scf_benchmark_json_smoke(capsys):
+    dft_scf.main(["--grid", "4,4,4", "--iterations", "2", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["grid_shape"] == [4, 4, 4]
+    assert payload["iterations_requested"] == 2
+    assert payload["iterations_completed"] == 2
+    assert payload["solver"] == "dense"
+    assert payload["fft_backend"] in {"mlx", "numpy"}
+    assert "runtime" in payload
+    assert "energy_by_term" in payload

@@ -1,4 +1,4 @@
-"""Small programmatic examples for molecular mechanics workflows."""
+"""Small programmatic examples for molecular mechanics and DFT workflows."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import numpy as np
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell
+from mlx_atomistic.dft import LocalGaussianPseudopotential, RealSpaceGrid, SCFConfig
 from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
@@ -230,3 +231,35 @@ def mixed_lj_fluid_example(
         atom_type_masses=force_field.atom_type_masses,
     )
     return system, force_field
+
+
+def toy_one_electron_dft_example():
+    """Return a compact one-electron Gaussian-well DFT toy system."""
+
+    grid = RealSpaceGrid((6, 6, 6), [8.0, 8.0, 8.0])
+    local = LocalGaussianPseudopotential(
+        centers=[[4.0, 4.0, 4.0]],
+        amplitudes=-2.5,
+        widths=0.9,
+    )
+    config = SCFConfig(max_iterations=8, mixing=0.4, solver="auto", seed=13)
+    return grid, local, 1.0, config
+
+
+def toy_closed_shell_dft_example():
+    """Return a compact two-electron closed-shell Gaussian-well DFT toy system."""
+
+    grid = RealSpaceGrid((8, 8, 8), [8.0, 8.0, 8.0])
+    local = LocalGaussianPseudopotential(
+        centers=[[4.0, 4.0, 4.0]],
+        amplitudes=-3.0,
+        widths=0.9,
+    )
+    config = SCFConfig(
+        max_iterations=12,
+        mixing=0.4,
+        solver="auto",
+        max_dense_grid_points=256,
+        seed=11,
+    )
+    return grid, local, 2.0, config

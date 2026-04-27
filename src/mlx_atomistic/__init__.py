@@ -4,6 +4,18 @@ from importlib.metadata import version
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Atoms, Cell
+from mlx_atomistic.dft import (
+    LocalGaussianPseudopotential,
+    RealSpaceGrid,
+    ReciprocalGrid,
+    SCFConfig,
+    SCFResult,
+    density_from_orbitals,
+    hartree_potential,
+    lda_exchange_energy_potential,
+    normalize_orbitals,
+    run_scf,
+)
 from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
@@ -58,14 +70,24 @@ __all__ = [
     "NonbondedParameter",
     "NonbondedPotential",
     "PeriodicDihedralPotential",
+    "LocalGaussianPseudopotential",
+    "RealSpaceGrid",
+    "ReciprocalGrid",
+    "SCFConfig",
+    "SCFResult",
     "ForceValidationCase",
     "ForceValidationResult",
     "TrajectoryRecord",
     "Topology",
     "__version__",
     "load_npz_trajectory",
+    "density_from_orbitals",
+    "hartree_potential",
+    "lda_exchange_energy_potential",
+    "normalize_orbitals",
     "read_xyz",
     "restart_state_from_trajectory",
+    "run_scf",
     "run_force_validation_suite",
     "save_npz_trajectory",
     "summarize_validation_results",
