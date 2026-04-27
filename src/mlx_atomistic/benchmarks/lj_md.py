@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from time import perf_counter
 
 import mlx.core as mx
@@ -123,6 +125,15 @@ def parse_sizes(value: str | None, fallback: int) -> list[int]:
     return sizes
 
 
+def _write_csv(path: str | Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    with Path(path).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--particles", type=int, default=256)
@@ -131,6 +142,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--sizes", default=None, help="Comma-separated particle counts.")
+    parser.add_argument("--csv", default=None, help="Optional path for per-case CSV output.")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -147,11 +159,14 @@ def main(argv: list[str] | None = None) -> None:
         for particles in sizes
         for mode in ("all-pairs", "static-neighbor", "dynamic-neighbor", "nvt-dynamic-neighbor")
     ]
+    rows = [asdict(result) for result in results]
+    if args.csv is not None:
+        _write_csv(args.csv, rows)
 
     if args.json:
         payload = {
             "runtime": asdict(get_runtime_info()),
-            "cases": [asdict(result) for result in results],
+            "cases": rows,
         }
         print(json.dumps(payload, indent=2))
         return

@@ -56,11 +56,17 @@ def charged_dimer_example():
     return positions, velocities, topology, force_terms
 
 
-def lj_liquid_example(*, particles: int = 32, density: float = 0.8, temperature: float = 1.0):
+def lj_liquid_example(
+    *,
+    particles: int = 32,
+    density: float = 0.8,
+    temperature: float = 1.0,
+    seed: int = 7,
+):
     """Return an LJ liquid starting point."""
 
     positions, cell = fcc_lattice(particles, density=density)
-    velocities = thermal_velocities(particles, temperature=temperature, seed=7)
+    velocities = thermal_velocities(particles, temperature=temperature, seed=seed)
     return positions, velocities, cell, [LennardJonesPotential(cutoff=2.5)]
 
 
@@ -68,4 +74,3 @@ def periodic_cell_example() -> Cell:
     """Return the default reduced-unit demonstration cell."""
 
     return Cell.cubic(8.0)
-

@@ -8,5 +8,6 @@ Planned notebooks:
 - `01-lj-md.ipynb`: run and plot a small Lennard-Jones MD trajectory.
 - `02-lj-md-performance.ipynb`: compare all-pairs and neighbor-list LJ force paths.
 - `03-molecular-mechanics.ipynb`: inspect bonded terms, charged systems, and energy decomposition.
-- `01-density-grid.ipynb`: inspect toy charge-density arrays and slices.
-- `04-scf-convergence.ipynb`: plot initial SCF iteration traces.
+- `04-validation-performance.ipynb`: run force validation, stability diagnostics, and benchmark summaries.
+- `05-density-grid.ipynb`: inspect toy charge-density arrays and slices.
+- `06-scf-convergence.ipynb`: plot initial SCF iteration traces.

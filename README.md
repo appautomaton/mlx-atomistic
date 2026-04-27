@@ -35,6 +35,8 @@ drift checks, and Langevin NVT is available for seeded temperature-controlled
 experiments.
 
 See `docs/molecular-mechanics.md` for the topology and force-field surface.
+See `docs/validation-and-performance.md` for the force-validation, stability,
+and benchmark workflow.
 
 ## Benchmarks
 
@@ -42,6 +44,8 @@ See `docs/molecular-mechanics.md` for the topology and force-field surface.
 uv run python -m mlx_atomistic.benchmarks.lj_md --particles 256 --steps 20
 uv run python -m mlx_atomistic.benchmarks.lj_md --sizes 128,512,2048 --steps 20 --json
 uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 20 --json
+uv run python -m mlx_atomistic.benchmarks.validation_gauntlet --json
+uv run python -m mlx_atomistic.benchmarks.stability --json
 ```
 
 ## Layout

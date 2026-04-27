@@ -11,6 +11,13 @@ from mlx_atomistic.forcefields import (
 )
 from mlx_atomistic.topology import Topology
 from mlx_atomistic.units import LJ_REDUCED_UNITS, LennardJonesReducedUnits
+from mlx_atomistic.validation import (
+    ForceValidationCase,
+    ForceValidationResult,
+    run_force_validation_suite,
+    summarize_validation_results,
+    validate_force_term,
+)
 
 __version__ = version("mlx-atomistic")
 
@@ -23,6 +30,11 @@ __all__ = [
     "LJ_REDUCED_UNITS",
     "LennardJonesReducedUnits",
     "PeriodicDihedralPotential",
+    "ForceValidationCase",
+    "ForceValidationResult",
     "Topology",
     "__version__",
+    "run_force_validation_suite",
+    "summarize_validation_results",
+    "validate_force_term",
 ]
