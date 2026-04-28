@@ -1,6 +1,7 @@
 import json
 
 from mlx_atomistic.benchmarks import (
+    dft_geometry,
     dft_operator,
     dft_pseudopotential,
     dft_scf,
@@ -164,4 +165,29 @@ def test_dft_pseudopotential_benchmark_json_and_csv_smoke(tmp_path, capsys):
         "gth-local",
         "upf-local",
     }
+    assert csv_path.read_text().startswith("case,grid_shape")
+
+
+def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "dft_geometry.csv"
+
+    dft_geometry.main(
+        [
+            "--grid",
+            "4,4,4",
+            "--steps",
+            "1",
+            "--systems",
+            "gaussian-dimer,gth-h2",
+            "--csv",
+            str(csv_path),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["grid_shape"] == [4, 4, 4]
+    assert payload["case_count"] == 2
+    assert {case["case"] for case in payload["cases"]} == {"gaussian-dimer", "gth-h2"}
+    assert all(case["steps_completed"] == 1 for case in payload["cases"])
     assert csv_path.read_text().startswith("case,grid_shape")
