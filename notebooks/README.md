@@ -12,3 +12,6 @@ Planned notebooks:
 - `05-real-mm-core.ipynb`: build typed MM systems, apply constraints, save/load trajectories, and compare force paths.
 - `06-density-grid.ipynb`: inspect toy charge-density arrays and slices.
 - `07-scf-convergence.ipynb`: plot initial SCF iteration traces.
+- `08-xc-and-mixing.ipynb`: compare exchange-only and LDA XC with linear and DIIS mixing.
+- `09-dft-forces.ipynb`: compare local Gaussian pseudopotential forces with finite differences.
+- `10-dft-performance.ipynb`: inspect DFT timing breakdowns and small grid scaling.

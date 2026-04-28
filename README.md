@@ -41,6 +41,8 @@ See `docs/real-mm-core.md` for typed systems, force-field assignment,
 constraints, trajectory I/O, and the combined nonbonded path.
 See `docs/dft-foundations.md` for the spin-unpolarized Γ-point plane-wave DFT
 prototype.
+See `docs/dft-scf-core.md` for the exchange-correlation, SCF mixing, force, and
+DFT benchmark surface.
 
 ## Benchmarks
 
@@ -50,7 +52,7 @@ uv run python -m mlx_atomistic.benchmarks.lj_md --sizes 128,512,2048 --steps 20 
 uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 20 --json
 uv run python -m mlx_atomistic.benchmarks.validation_gauntlet --json
 uv run python -m mlx_atomistic.benchmarks.stability --json
-uv run python -m mlx_atomistic.benchmarks.dft_scf --grid 16,16,16 --iterations 5 --json
+uv run python -m mlx_atomistic.benchmarks.dft_scf --sizes 8,16,24,32 --iterations 5 --mixer both --json
 ```
 
 ## Layout

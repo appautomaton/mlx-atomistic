@@ -8,7 +8,7 @@ import numpy as np
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell
-from mlx_atomistic.dft import LocalGaussianPseudopotential, RealSpaceGrid, SCFConfig
+from mlx_atomistic.dft import DFTSystem, SCFConfig
 from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
@@ -236,21 +236,25 @@ def mixed_lj_fluid_example(
 def toy_one_electron_dft_example():
     """Return a compact one-electron Gaussian-well DFT toy system."""
 
-    grid = RealSpaceGrid((6, 6, 6), [8.0, 8.0, 8.0])
-    local = LocalGaussianPseudopotential(
+    system = DFTSystem(
+        cell=[8.0, 8.0, 8.0],
+        grid_shape=(6, 6, 6),
+        electron_count=1.0,
         centers=[[4.0, 4.0, 4.0]],
         amplitudes=-2.5,
         widths=0.9,
     )
     config = SCFConfig(max_iterations=8, mixing=0.4, solver="auto", seed=13)
-    return grid, local, 1.0, config
+    return system, config
 
 
 def toy_closed_shell_dft_example():
     """Return a compact two-electron closed-shell Gaussian-well DFT toy system."""
 
-    grid = RealSpaceGrid((8, 8, 8), [8.0, 8.0, 8.0])
-    local = LocalGaussianPseudopotential(
+    system = DFTSystem(
+        cell=[8.0, 8.0, 8.0],
+        grid_shape=(8, 8, 8),
+        electron_count=2.0,
         centers=[[4.0, 4.0, 4.0]],
         amplitudes=-3.0,
         widths=0.9,
@@ -262,4 +266,34 @@ def toy_closed_shell_dft_example():
         max_dense_grid_points=256,
         seed=11,
     )
-    return grid, local, 2.0, config
+    return system, config
+
+
+def toy_two_center_dft_example():
+    """Return a two-center closed-shell Gaussian DFT toy system."""
+
+    system = DFTSystem(
+        cell=[10.0, 8.0, 8.0],
+        grid_shape=(8, 6, 6),
+        electron_count=2.0,
+        centers=[[4.0, 4.0, 4.0], [6.0, 4.0, 4.0]],
+        amplitudes=[-2.2, -2.2],
+        widths=[0.8, 0.8],
+    )
+    config = SCFConfig(max_iterations=10, mixing=0.35, mixer="diis", solver="auto", seed=19)
+    return system, config
+
+
+def toy_periodic_cluster_dft_example():
+    """Return a small periodic three-center Gaussian DFT toy system."""
+
+    system = DFTSystem(
+        cell=[10.0, 10.0, 10.0],
+        grid_shape=(8, 8, 8),
+        electron_count=4.0,
+        centers=[[4.0, 4.0, 5.0], [6.0, 4.0, 5.0], [5.0, 6.0, 5.0]],
+        amplitudes=[-2.0, -2.0, -1.5],
+        widths=[0.85, 0.85, 0.95],
+    )
+    config = SCFConfig(max_iterations=12, mixing=0.3, mixer="diis", solver="auto", seed=23)
+    return system, config

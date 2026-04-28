@@ -13,6 +13,11 @@ from mlx_atomistic.core import as_mx_array
 from mlx_atomistic.dft.density import density_from_orbitals
 from mlx_atomistic.dft.fft import fft3, ifft3
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
+from mlx_atomistic.dft.xc import (
+    DiracExchange,
+    ExchangeCorrelationFunctional,
+    LDAExchangeCorrelation,
+)
 
 
 @dataclass(frozen=True)
@@ -79,12 +84,8 @@ def lda_exchange_energy_potential(
 ) -> tuple[mx.array, mx.array]:
     """Return Dirac LDA exchange energy and potential for an unpolarized density."""
 
-    rho = mx.maximum(mx.array(density), density_floor)
-    coefficient = (3.0 / pi) ** (1.0 / 3.0)
-    potential = -coefficient * rho ** (1.0 / 3.0)
-    energy_density = -0.75 * coefficient * rho ** (4.0 / 3.0)
-    dv = 1.0 if grid is None else grid.dv
-    return mx.sum(energy_density) * dv, potential
+    result = DiracExchange().evaluate(density, grid, density_floor=density_floor)
+    return result.total_energy, result.potential
 
 
 def apply_kinetic(orbital: mx.array, grid: RealSpaceGrid) -> mx.array:
@@ -121,26 +122,38 @@ def energy_decomposition(
     *,
     occupations: Sequence[float],
     density_floor: float = 1e-12,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
 ) -> dict[str, mx.array]:
     """Return core toy-DFT energy terms."""
 
+    xc_functional = DiracExchange() if xc_functional is None else xc_functional
     v_hartree = hartree_potential(density, grid)
-    exchange_energy, _ = lda_exchange_energy_potential(
-        density,
-        grid,
-        density_floor=density_floor,
-    )
+    xc = xc_functional.evaluate(density, grid, density_floor=density_floor)
     kinetic = kinetic_energy(orbitals, grid, occupations=occupations)
     local = mx.sum(density * local_potential) * grid.dv
     hartree = 0.5 * mx.sum(density * v_hartree) * grid.dv
-    total = kinetic + local + hartree + exchange_energy
-    return {
+    total = kinetic + local + hartree + xc.total_energy
+    terms = {
         "kinetic": kinetic,
         "local": local,
         "hartree": hartree,
-        "exchange": exchange_energy,
+        "xc": xc.total_energy,
         "total": total,
     }
+    if isinstance(xc_functional, LDAExchangeCorrelation):
+        terms["exchange"] = xc_functional.exchange.evaluate(
+            density,
+            grid,
+            density_floor=density_floor,
+        ).total_energy
+        terms["correlation"] = xc_functional.correlation.evaluate(
+            density,
+            grid,
+            density_floor=density_floor,
+        ).total_energy
+    else:
+        terms["exchange"] = xc.total_energy
+    return terms
 
 
 def electron_count(density: mx.array, grid: RealSpaceGrid) -> mx.array:
@@ -158,3 +171,30 @@ def density_from_normalized_orbitals(
     """Build a density after normalizing orbitals."""
 
     return density_from_orbitals(orbitals, grid, occupations=occupations)
+
+
+def local_pseudopotential_forces(
+    density: mx.array,
+    grid: RealSpaceGrid,
+    pseudopotential: LocalGaussianPseudopotential,
+) -> mx.array:
+    """Return Hellmann-Feynman forces on local Gaussian centers.
+
+    The local energy is ``∫ρ(r)V_loc(r; R_I)dr``. This computes
+    ``-∂E/∂R_I`` for the Gaussian center coordinates.
+    """
+
+    coordinates = grid.coordinates()
+    rho = mx.array(density)
+    forces = []
+    for index in range(int(pseudopotential.centers.shape[0])):
+        center = pseudopotential.centers[index]
+        width = pseudopotential.widths[index]
+        amplitude = pseudopotential.amplitudes[index]
+        displacement = grid.cell.minimum_image(coordinates - center)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        center_field = amplitude * mx.exp(-0.5 * r2 / (width * width))
+        derivative = center_field[..., None] * displacement / (width * width)
+        force = -mx.sum(rho[..., None] * derivative, axis=(0, 1, 2)) * grid.dv
+        forces.append(force)
+    return mx.stack(forces, axis=0)

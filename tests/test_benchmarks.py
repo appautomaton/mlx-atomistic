@@ -83,3 +83,28 @@ def test_dft_scf_benchmark_json_smoke(capsys):
     assert payload["fft_backend"] in {"mlx", "numpy"}
     assert "runtime" in payload
     assert "energy_by_term" in payload
+    assert "timings" in payload
+
+
+def test_dft_scf_benchmark_csv_and_mixer_matrix(tmp_path, capsys):
+    csv_path = tmp_path / "dft.csv"
+
+    dft_scf.main(
+        [
+            "--sizes",
+            "4",
+            "--iterations",
+            "1",
+            "--mixer",
+            "both",
+            "--csv",
+            str(csv_path),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["case_count"] == 2
+    assert {case["mixer"] for case in payload["cases"]} == {"linear", "diis"}
+    assert "fft_probe_ms" in payload["cases"][0]
+    assert csv_path.read_text().startswith("grid_shape,grid_points")

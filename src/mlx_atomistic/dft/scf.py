@@ -1,9 +1,10 @@
-"""Minimal spin-unpolarized Γ-point plane-wave SCF driver."""
+"""Spin-unpolarized Γ-point plane-wave SCF driver."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from time import perf_counter
 from typing import Literal
 
 import mlx.core as mx
@@ -12,14 +13,23 @@ import numpy as np
 from mlx_atomistic.dft.density import density_from_orbitals
 from mlx_atomistic.dft.fft import fft_backend
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
+from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
-    energy_decomposition,
+    apply_kinetic,
     hartree_potential,
-    lda_exchange_energy_potential,
+    local_pseudopotential_forces,
+)
+from mlx_atomistic.dft.system import DFTSystem
+from mlx_atomistic.dft.xc import (
+    DiracExchange,
+    ExchangeCorrelationFunctional,
+    LDAExchangeCorrelation,
 )
 
 SCFSolver = Literal["auto", "dense", "gradient"]
+SCFConvergenceMode = Literal["density", "energy", "either", "both"]
+SCFMixer = Literal["linear", "diis"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,10 @@ class SCFConfig:
     max_dense_grid_points: int = 512
     seed: int = 0
     density_floor: float = 1e-12
+    mixer: SCFMixer | LinearMixer | PulayDIISMixer = "linear"
+    convergence_mode: SCFConvergenceMode = "density"
+    min_iterations: int = 1
+    record_timing: bool = True
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -54,6 +68,15 @@ class SCFConfig:
         if self.max_dense_grid_points <= 0:
             msg = "max_dense_grid_points must be positive"
             raise ValueError(msg)
+        if isinstance(self.mixer, str) and self.mixer not in {"linear", "diis"}:
+            msg = "mixer must be 'linear', 'diis', or a mixer instance"
+            raise ValueError(msg)
+        if self.convergence_mode not in {"density", "energy", "either", "both"}:
+            msg = "convergence_mode must be 'density', 'energy', 'either', or 'both'"
+            raise ValueError(msg)
+        if self.min_iterations <= 0:
+            msg = "min_iterations must be positive"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -71,17 +94,35 @@ class SCFResult:
     orbitals: mx.array
     effective_potential: mx.array
     energy_by_term: dict[str, float]
-    history: list[dict[str, float | int]]
+    history: list[dict[str, float | int | str | None]]
+    status: str
+    convergence_reason: str
+    failure_reason: str | None
+    timings: dict[str, float]
+    forces: mx.array | None = None
+    mixer_metadata: dict | None = None
 
     def to_dict(self) -> dict:
-        """Return a JSON-safe summary without array payloads."""
+        """Return a JSON-safe summary without dense array payloads."""
 
-        payload = asdict(self)
-        payload.pop("density")
-        payload.pop("orbitals")
-        payload.pop("effective_potential")
-        payload["grid_shape"] = list(self.density.shape)
-        return payload
+        return {
+            "converged": self.converged,
+            "status": self.status,
+            "convergence_reason": self.convergence_reason,
+            "failure_reason": self.failure_reason,
+            "iterations": self.iterations,
+            "solver": self.solver,
+            "fft_backend": self.fft_backend,
+            "electron_count": self.electron_count,
+            "total_energy": self.total_energy,
+            "residual": self.residual,
+            "energy_by_term": dict(self.energy_by_term),
+            "history": list(self.history),
+            "timings": dict(self.timings),
+            "mixer": {} if self.mixer_metadata is None else dict(self.mixer_metadata),
+            "grid_shape": list(self.density.shape),
+            "forces": None if self.forces is None else np.array(self.forces).tolist(),
+        }
 
 
 def _occupations(electron_count: float, n_orbitals: int | None = None) -> list[float]:
@@ -173,6 +214,15 @@ def _choose_solver(config: SCFConfig, grid: RealSpaceGrid) -> str:
     return config.solver
 
 
+def _build_mixer(config: SCFConfig) -> LinearMixer | PulayDIISMixer:
+    if isinstance(config.mixer, LinearMixer | PulayDIISMixer):
+        config.mixer.reset()
+        return config.mixer
+    if config.mixer == "diis":
+        return PulayDIISMixer(beta=config.mixing)
+    return LinearMixer(beta=config.mixing)
+
+
 def _dense_lowest_orbitals(
     potential: mx.array,
     grid: RealSpaceGrid,
@@ -221,8 +271,8 @@ def _gradient_step_orbitals(
     return mx.array(_orthonormalize_numpy(np.stack(updated), grid))
 
 
-def _density_residual(old_density: mx.array, new_density: mx.array, grid: RealSpaceGrid) -> float:
-    delta = np.array(new_density - old_density, dtype=np.float64)
+def _field_residual(old_field: mx.array, new_field: mx.array, grid: RealSpaceGrid) -> float:
+    delta = np.array(new_field - old_field, dtype=np.float64)
     return float(np.sqrt(np.sum(delta * delta) * grid.dv))
 
 
@@ -233,71 +283,261 @@ def _assert_finite(*fields: mx.array) -> None:
             raise FloatingPointError(msg)
 
 
+def _empty_timings() -> dict[str, float]:
+    return {
+        "hartree_ms": 0.0,
+        "xc_ms": 0.0,
+        "solver_ms": 0.0,
+        "mixer_ms": 0.0,
+        "kinetic_ms": 0.0,
+        "energy_ms": 0.0,
+        "force_ms": 0.0,
+        "total_scf_ms": 0.0,
+    }
+
+
+def _add_timing(timings: dict[str, float], key: str, start: float, *, enabled: bool) -> None:
+    if enabled:
+        timings[key] += (perf_counter() - start) * 1000.0
+
+
+def _kinetic_energy_timed(
+    orbitals: mx.array,
+    grid: RealSpaceGrid,
+    *,
+    occupations: Sequence[float],
+) -> mx.array:
+    stack = mx.array(orbitals)
+    if stack.shape == grid.shape:
+        stack = mx.reshape(stack, (1, *grid.shape))
+    energy = mx.array(0.0, dtype=mx.float32)
+    for index, occupation in enumerate(occupations):
+        applied = apply_kinetic(stack[index], grid)
+        expectation = mx.real(mx.sum(mx.conjugate(stack[index]) * applied))
+        energy = energy + float(occupation) * expectation * grid.dv
+    return energy
+
+
+def _energy_terms(
+    orbitals: mx.array,
+    density: mx.array,
+    v_local: mx.array,
+    v_hartree: mx.array,
+    xc_energy: mx.array,
+    grid: RealSpaceGrid,
+    *,
+    occupations: Sequence[float],
+    timings: dict[str, float],
+    timing_enabled: bool,
+) -> dict[str, mx.array]:
+    start = perf_counter()
+    kinetic = _kinetic_energy_timed(orbitals, grid, occupations=occupations)
+    _add_timing(timings, "kinetic_ms", start, enabled=timing_enabled)
+    start = perf_counter()
+    local = mx.sum(density * v_local) * grid.dv
+    hartree = 0.5 * mx.sum(density * v_hartree) * grid.dv
+    total = kinetic + local + hartree + xc_energy
+    _add_timing(timings, "energy_ms", start, enabled=timing_enabled)
+    return {
+        "kinetic": kinetic,
+        "local": local,
+        "hartree": hartree,
+        "xc": xc_energy,
+        "total": total,
+    }
+
+
+def _add_xc_components(
+    energy_terms: dict[str, mx.array],
+    xc_functional: ExchangeCorrelationFunctional,
+    density: mx.array,
+    grid: RealSpaceGrid,
+    *,
+    density_floor: float,
+) -> None:
+    if isinstance(xc_functional, LDAExchangeCorrelation):
+        energy_terms["exchange"] = xc_functional.exchange.evaluate(
+            density,
+            grid,
+            density_floor=density_floor,
+        ).total_energy
+        energy_terms["correlation"] = xc_functional.correlation.evaluate(
+            density,
+            grid,
+            density_floor=density_floor,
+        ).total_energy
+    elif isinstance(xc_functional, DiracExchange):
+        energy_terms["exchange"] = energy_terms["xc"]
+
+
+def _converged(
+    *,
+    iteration: int,
+    config: SCFConfig,
+    density_residual: float,
+    energy_delta: float | None,
+) -> bool:
+    if iteration < config.min_iterations:
+        return False
+    density_ok = density_residual <= config.tolerance
+    energy_ok = energy_delta is not None and abs(energy_delta) <= config.tolerance
+    if config.convergence_mode == "density":
+        return density_ok
+    if config.convergence_mode == "energy":
+        return energy_ok
+    if config.convergence_mode == "either":
+        return density_ok or energy_ok
+    return density_ok and energy_ok
+
+
+def _resolve_inputs(
+    system_or_grid: DFTSystem | RealSpaceGrid,
+    local_potential: LocalGaussianPseudopotential | mx.array | Sequence[float] | None,
+    electron_count: float | None,
+) -> tuple[
+    RealSpaceGrid,
+    LocalGaussianPseudopotential | mx.array | Sequence[float],
+    float,
+    DFTSystem | None,
+]:
+    if isinstance(system_or_grid, DFTSystem):
+        if local_potential is not None:
+            msg = "local_potential must not be provided when running a DFTSystem"
+            raise ValueError(msg)
+        return (
+            system_or_grid.grid,
+            system_or_grid.pseudopotential,
+            system_or_grid.electron_count if electron_count is None else electron_count,
+            system_or_grid,
+        )
+    if local_potential is None:
+        msg = "local_potential is required when running from a RealSpaceGrid"
+        raise ValueError(msg)
+    return system_or_grid, local_potential, 2.0 if electron_count is None else electron_count, None
+
+
+def _initial_density_or_default(
+    initial_density: mx.array | None,
+    orbitals: mx.array,
+    grid: RealSpaceGrid,
+    *,
+    occupations: Sequence[float],
+    electron_count: float,
+) -> mx.array:
+    if initial_density is None:
+        return density_from_orbitals(orbitals, grid, occupations=occupations)
+    density = mx.real(mx.array(initial_density))
+    if density.shape != grid.shape:
+        msg = "initial_density must have shape grid.shape"
+        raise ValueError(msg)
+    if not bool(mx.all(density >= 0.0)):
+        msg = "initial_density must be non-negative"
+        raise ValueError(msg)
+    count = float(mx.sum(density) * grid.dv)
+    if count <= 0.0:
+        msg = "initial_density must integrate to a positive electron count"
+        raise ValueError(msg)
+    return density * (electron_count / count)
+
+
 def _history_row(
     iteration: int,
-    residual: float,
+    density_residual: float,
+    potential_residual: float | None,
+    energy_delta: float | None,
     energy_terms: dict[str, mx.array],
     density: mx.array,
     grid: RealSpaceGrid,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str | None]:
     return {
         "iteration": iteration,
-        "residual": residual,
+        "residual": density_residual,
+        "density_residual": density_residual,
+        "potential_residual": potential_residual,
+        "energy_delta": energy_delta,
         "electron_count": float(mx.sum(density) * grid.dv),
         "kinetic": float(energy_terms["kinetic"]),
         "local": float(energy_terms["local"]),
         "hartree": float(energy_terms["hartree"]),
-        "exchange": float(energy_terms["exchange"]),
+        "xc": float(energy_terms["xc"]),
+        "exchange": float(energy_terms.get("exchange", energy_terms["xc"])),
+        "correlation": float(energy_terms.get("correlation", mx.array(0.0))),
         "total": float(energy_terms["total"]),
     }
 
 
 def run_scf(
-    grid: RealSpaceGrid,
-    local_potential: LocalGaussianPseudopotential | mx.array | Sequence[float],
+    system_or_grid: DFTSystem | RealSpaceGrid,
+    local_potential: LocalGaussianPseudopotential | mx.array | Sequence[float] | None = None,
     *,
-    electron_count: float = 2.0,
+    electron_count: float | None = None,
     n_orbitals: int | None = None,
     config: SCFConfig | None = None,
     initial_orbitals: mx.array | None = None,
+    initial_density: mx.array | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
 ) -> SCFResult:
     """Run a minimal spin-unpolarized Γ-point SCF calculation."""
 
     config = SCFConfig() if config is None else config
-    occupation_values = _occupations(electron_count, n_orbitals)
+    grid, local_input, electron_count_value, _system = _resolve_inputs(
+        system_or_grid,
+        local_potential,
+        electron_count,
+    )
+    xc_functional = LDAExchangeCorrelation() if xc_functional is None else xc_functional
+    occupation_values = _occupations(electron_count_value, n_orbitals)
     n_occ_orbitals = len(occupation_values)
     solver = _choose_solver(config, grid)
-    v_local = _local_field(local_potential, grid)
+    mixer = _build_mixer(config)
+    timings = _empty_timings()
+    total_start = perf_counter()
+
+    v_local = _local_field(local_input, grid)
     orbitals = _initial_orbitals(
         grid,
         n_orbitals=n_occ_orbitals,
         seed=config.seed,
         initial_orbitals=initial_orbitals,
     )
-    density = density_from_orbitals(orbitals, grid, occupations=occupation_values)
-    history: list[dict[str, float | int]] = []
-    converged = False
-    residual = float("inf")
-    effective_potential = v_local
-    energy_terms = energy_decomposition(
+    density = _initial_density_or_default(
+        initial_density,
         orbitals,
-        density,
-        v_local,
         grid,
         occupations=occupation_values,
-        density_floor=config.density_floor,
+        electron_count=electron_count_value,
     )
+    history: list[dict[str, float | int | str | None]] = []
+    converged = False
+    convergence_reason = "max_iterations"
+    failure_reason: str | None = None
+    density_residual = float("inf")
+    potential_residual: float | None = None
+    previous_potential: mx.array | None = None
+    previous_energy: float | None = None
+    effective_potential = v_local
+    energy_terms: dict[str, mx.array] = {}
 
     for iteration in range(1, config.max_iterations + 1):
+        start = perf_counter()
         v_hartree = hartree_potential(density, grid)
-        _, v_exchange = lda_exchange_energy_potential(
+        _add_timing(timings, "hartree_ms", start, enabled=config.record_timing)
+
+        start = perf_counter()
+        xc = xc_functional.evaluate(
             density,
             grid,
             density_floor=config.density_floor,
         )
-        effective_potential = v_local + v_hartree + v_exchange
+        _add_timing(timings, "xc_ms", start, enabled=config.record_timing)
+
+        effective_potential = v_local + v_hartree + xc.potential
+        if previous_potential is not None:
+            potential_residual = _field_residual(previous_potential, effective_potential, grid)
+        previous_potential = effective_potential
         _assert_finite(effective_potential)
 
+        start = perf_counter()
         if solver == "dense":
             next_orbitals = _dense_lowest_orbitals(
                 effective_potential,
@@ -311,29 +551,88 @@ def run_scf(
                 grid,
                 step_size=config.step_size,
             )
+        _add_timing(timings, "solver_ms", start, enabled=config.record_timing)
+
         next_density = density_from_orbitals(
             next_orbitals,
             grid,
             occupations=occupation_values,
         )
-        residual = _density_residual(density, next_density, grid)
-        density = (1.0 - config.mixing) * density + config.mixing * next_density
+        density_residual = _field_residual(density, next_density, grid)
+
+        start = perf_counter()
+        density = mixer.mix(density, next_density)
+        _add_timing(timings, "mixer_ms", start, enabled=config.record_timing)
         orbitals = next_orbitals
-        energy_terms = energy_decomposition(
+
+        start = perf_counter()
+        energy_v_hartree = hartree_potential(density, grid)
+        _add_timing(timings, "hartree_ms", start, enabled=config.record_timing)
+        start = perf_counter()
+        energy_xc = xc_functional.evaluate(
+            density,
+            grid,
+            density_floor=config.density_floor,
+        )
+        _add_timing(timings, "xc_ms", start, enabled=config.record_timing)
+        energy_terms = _energy_terms(
             orbitals,
             density,
             v_local,
+            energy_v_hartree,
+            energy_xc.total_energy,
             grid,
             occupations=occupation_values,
+            timings=timings,
+            timing_enabled=config.record_timing,
+        )
+        _add_xc_components(
+            energy_terms,
+            xc_functional,
+            density,
+            grid,
             density_floor=config.density_floor,
         )
+        total_energy = float(energy_terms["total"])
+        energy_delta = None if previous_energy is None else total_energy - previous_energy
+        previous_energy = total_energy
         _assert_finite(density, orbitals, effective_potential, *energy_terms.values())
-        history.append(_history_row(iteration, residual, energy_terms, density, grid))
-        if residual <= config.tolerance:
+        history.append(
+            _history_row(
+                iteration,
+                density_residual,
+                potential_residual,
+                energy_delta,
+                energy_terms,
+                density,
+                grid,
+            )
+        )
+        if _converged(
+            iteration=iteration,
+            config=config,
+            density_residual=density_residual,
+            energy_delta=energy_delta,
+        ):
             converged = True
+            convergence_reason = config.convergence_mode
             break
 
+    forces = None
+    if isinstance(local_input, LocalGaussianPseudopotential):
+        start = perf_counter()
+        forces = local_pseudopotential_forces(density, grid, local_input)
+        _add_timing(timings, "force_ms", start, enabled=config.record_timing)
+
+    if config.record_timing:
+        timings["total_scf_ms"] = (perf_counter() - total_start) * 1000.0
+    if not history:
+        failure_reason = "no_scf_iterations"
+    elif not converged:
+        failure_reason = "max_iterations_reached"
+
     energy_by_term = {name: float(value) for name, value in energy_terms.items()}
+    status = "converged" if converged else "max_iterations"
     return SCFResult(
         converged=converged,
         iterations=len(history),
@@ -341,10 +640,16 @@ def run_scf(
         fft_backend=fft_backend(),
         electron_count=float(mx.sum(density) * grid.dv),
         total_energy=energy_by_term["total"],
-        residual=residual,
+        residual=density_residual,
         density=density,
         orbitals=orbitals,
         effective_potential=effective_potential,
         energy_by_term=energy_by_term,
         history=history,
+        status=status,
+        convergence_reason=convergence_reason,
+        failure_reason=failure_reason,
+        timings=timings,
+        forces=forces,
+        mixer_metadata=mixer.metadata(),
     )
