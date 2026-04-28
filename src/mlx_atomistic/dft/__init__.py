@@ -31,6 +31,17 @@ from mlx_atomistic.dft.potentials import (
     lda_exchange_energy_potential,
     local_pseudopotential_forces,
 )
+from mlx_atomistic.dft.pseudopotentials import (
+    Ion,
+    IonCollection,
+    LocalPseudopotentialField,
+    NonlocalProjectorData,
+    PseudopotentialData,
+    PseudopotentialFormat,
+    RadialGrid,
+    read_gth,
+    read_upf,
+)
 from mlx_atomistic.dft.scf import SCFConfig, SCFResult, run_scf
 from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_center_forces
 from mlx_atomistic.dft.xc import (
@@ -47,12 +58,19 @@ __all__ = [
     "DiagonalizationResult",
     "DiracExchange",
     "ExchangeCorrelationFunctional",
+    "Ion",
+    "IonCollection",
     "LDACorrelationPZ81",
     "LDAExchangeCorrelation",
     "LinearMixer",
     "LocalGaussianPseudopotential",
+    "LocalPseudopotentialField",
     "KohnShamOperator",
+    "NonlocalProjectorData",
     "PulayDIISMixer",
+    "PseudopotentialData",
+    "PseudopotentialFormat",
+    "RadialGrid",
     "RealSpaceGrid",
     "ReciprocalGrid",
     "SCFConfig",
@@ -80,6 +98,8 @@ __all__ = [
     "orthonormality_error",
     "real_to_reciprocal",
     "reciprocal_to_real",
+    "read_gth",
+    "read_upf",
     "run_scf",
     "scf_total_energy_forces",
 ]

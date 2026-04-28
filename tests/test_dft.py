@@ -7,11 +7,15 @@ from mlx_atomistic.dft import (
     DenseHamiltonianReference,
     DFTSystem,
     DiracExchange,
+    Ion,
+    IonCollection,
     KohnShamOperator,
     LDACorrelationPZ81,
     LDAExchangeCorrelation,
     LinearMixer,
     LocalGaussianPseudopotential,
+    LocalPseudopotentialField,
+    PseudopotentialFormat,
     PulayDIISMixer,
     RealSpaceGrid,
     ReciprocalGrid,
@@ -27,6 +31,8 @@ from mlx_atomistic.dft import (
     local_pseudopotential_forces,
     normalize_orbitals,
     orthonormality_error,
+    read_gth,
+    read_upf,
     reciprocal_to_real,
     run_scf,
     scf_total_energy_forces,
@@ -299,6 +305,152 @@ def test_local_pseudopotential_force_zero_for_symmetric_uniform_density():
     force = np.array(local_pseudopotential_forces(density, grid, pseudopotential))[0]
 
     np.testing.assert_allclose(force, [0.0, 0.0, 0.0], atol=1e-5)
+
+
+def test_upf_and_gth_parsers_capture_local_and_nonlocal_metadata():
+    upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
+    single_gth = read_gth("vendors/quantum-espresso/pseudo/C-q4.gth", element="C")
+    database_gth = read_gth(
+        "vendors/cp2k/data/GTH_POTENTIALS",
+        element="H",
+        name="GTH-BLYP-q1",
+    )
+
+    assert upf.format == PseudopotentialFormat.UPF
+    assert upf.element == "Si"
+    assert upf.valence_charge == pytest.approx(4.0)
+    assert upf.local_grid.size == 1528
+    assert upf.nonlocal_available
+    assert len(upf.nonlocal_projectors) == 10
+    assert np.isfinite(upf.local_potential(np.array([0.0, 1.0, 2.0]))).all()
+    assert single_gth.format == PseudopotentialFormat.GTH
+    assert single_gth.element == "C"
+    assert single_gth.valence_charge == pytest.approx(4.0)
+    assert single_gth.nonlocal_available
+    assert database_gth.element == "H"
+    assert database_gth.valence_charge == pytest.approx(1.0)
+
+    with pytest.raises(ValueError, match="requested GTH entry"):
+        read_gth("vendors/cp2k/data/GTH_POTENTIALS", element="Xe", name="missing")
+    with pytest.raises(NotImplementedError, match="nonlocal"):
+        upf.apply_nonlocal(
+            np.ones((2, 2, 2), dtype=np.float32),
+            RealSpaceGrid((2, 2, 2), [2, 2, 2]),
+        )
+
+
+def test_ion_collection_local_fields_are_finite_and_periodic():
+    grid = RealSpaceGrid((4, 4, 4), [6.0, 6.0, 6.0])
+    gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
+    first = LocalPseudopotentialField(IonCollection([Ion("H", [3.0, 3.0, 3.0], gth)]))
+    translated = LocalPseudopotentialField(IonCollection([Ion("H", [9.0, 3.0, 3.0], gth)]))
+
+    first_field = np.array(first.field(grid))
+    translated_field = np.array(translated.field(grid))
+
+    assert np.isfinite(first_field).all()
+    np.testing.assert_allclose(first_field, translated_field, atol=1e-6)
+
+
+def test_dft_system_ions_default_electron_count_and_run_scf_for_gth_and_upf():
+    gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
+    upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
+    gth_system = DFTSystem(
+        cell=[6.0, 6.0, 6.0],
+        grid_shape=(4, 4, 4),
+        ions=IonCollection([Ion("H", [3.0, 3.0, 3.0], gth)]),
+    )
+    upf_system = DFTSystem(
+        cell=[8.0, 8.0, 8.0],
+        grid_shape=(4, 4, 4),
+        ions=IonCollection([Ion("Si", [4.0, 4.0, 4.0], upf)]),
+    )
+
+    assert gth_system.electron_count == pytest.approx(1.0)
+    assert upf_system.electron_count == pytest.approx(4.0)
+
+    config = SCFConfig(max_iterations=1, solver="dense", seed=17)
+    gth_result = run_scf(gth_system, config=config, xc_functional=DiracExchange())
+    upf_result = run_scf(upf_system, config=config, xc_functional=DiracExchange())
+
+    assert np.isfinite(gth_result.total_energy)
+    assert np.isfinite(upf_result.total_energy)
+    assert gth_result.to_dict()["pseudopotential_format"] == "gth"
+    assert upf_result.to_dict()["pseudopotential_format"] == "upf"
+    assert upf_result.to_dict()["nonlocal_available"]
+    assert not upf_result.to_dict()["nonlocal_applied"]
+    assert "local_pseudopotential" in upf_result.energy_by_term
+
+
+def test_ion_local_force_matches_fixed_density_finite_difference():
+    grid = RealSpaceGrid((6, 6, 6), [6.0, 6.0, 6.0])
+    coordinates = np.array(grid.coordinates())
+    density = np.exp(
+        -np.sum((coordinates - np.array([3.4, 3.0, 3.0])) ** 2, axis=-1) / 0.8
+    ).astype(np.float32)
+    density *= 1.0 / (np.sum(density) * grid.dv)
+    gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
+    field = LocalPseudopotentialField(IonCollection([Ion("H", [3.0, 3.0, 3.0], gth)]))
+    force = np.array(field.forces(density, grid))[0]
+
+    def local_energy(center_x: float) -> float:
+        shifted = LocalPseudopotentialField(
+            IonCollection([Ion("H", [center_x, 3.0, 3.0], gth)])
+        )
+        return float(np.sum(density * np.array(shifted.field(grid))) * grid.dv)
+
+    epsilon = 1e-3
+    finite_difference_force = -(
+        local_energy(3.0 + epsilon) - local_energy(3.0 - epsilon)
+    ) / (2.0 * epsilon)
+
+    assert force[0] == pytest.approx(finite_difference_force, abs=5e-3)
+    np.testing.assert_allclose(force[1:], [0.0, 0.0], atol=2e-4)
+
+
+def test_upf_local_force_matches_fixed_density_finite_difference():
+    grid = RealSpaceGrid((6, 6, 6), [8.0, 8.0, 8.0])
+    coordinates = np.array(grid.coordinates())
+    density = np.exp(
+        -np.sum((coordinates - np.array([4.4, 4.0, 4.0])) ** 2, axis=-1) / 1.0
+    ).astype(np.float32)
+    density *= 4.0 / (np.sum(density) * grid.dv)
+    upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
+    field = LocalPseudopotentialField(IonCollection([Ion("Si", [4.0, 4.0, 4.0], upf)]))
+    force = np.array(field.forces(density, grid))[0]
+
+    def local_energy(center_x: float) -> float:
+        shifted = LocalPseudopotentialField(
+            IonCollection([Ion("Si", [center_x, 4.0, 4.0], upf)])
+        )
+        return float(np.sum(density * np.array(shifted.field(grid))) * grid.dv)
+
+    epsilon = 1e-3
+    finite_difference_force = -(
+        local_energy(4.0 + epsilon) - local_energy(4.0 - epsilon)
+    ) / (2.0 * epsilon)
+
+    assert force[0] == pytest.approx(finite_difference_force, abs=5e-3)
+    np.testing.assert_allclose(force[1:], [0.0, 0.0], atol=2e-4)
+
+
+def test_scf_total_energy_force_check_works_for_gth_ion_system():
+    gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
+    system = DFTSystem(
+        cell=[6.0, 6.0, 6.0],
+        grid_shape=(4, 4, 4),
+        ions=IonCollection([Ion("H", [3.0, 3.0, 3.0], gth)]),
+    )
+
+    check = scf_total_energy_forces(
+        system,
+        config=SCFConfig(max_iterations=2, solver="dense", seed=9),
+        xc_functional=DiracExchange(),
+        displacement=1e-3,
+    )
+
+    assert check.max_abs_error < 0.2
+    assert check.result.force_consistency is not None
 
 
 def test_plane_wave_kinetic_operator_has_expected_eigenvalue():

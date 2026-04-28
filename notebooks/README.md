@@ -18,3 +18,5 @@ Planned notebooks:
 - `11-ks-operator.ipynb`: inspect Kohn-Sham operator components on a compact grid.
 - `12-dense-vs-operator.ipynb`: compare dense reference matrix-vector products with operator application.
 - `13-scf-force-consistency.ipynb`: compare SCF total-energy finite-difference forces with reported forces.
+- `14-dft-pseudopotentials.ipynb`: parse UPF/GTH files and run local-pseudopotential SCF checks.
+- `15-dft-ion-forces.ipynb`: validate local ion forces against fixed-density and SCF finite differences.

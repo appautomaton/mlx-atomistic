@@ -2,6 +2,7 @@ import json
 
 from mlx_atomistic.benchmarks import (
     dft_operator,
+    dft_pseudopotential,
     dft_scf,
     lj_md,
     mm_force_terms,
@@ -138,3 +139,29 @@ def test_dft_operator_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert payload["dense_vs_operator_max_error"] < 1e-5
     assert "operator_apply_ms" in payload
     assert csv_path.read_text().startswith("grid_shape,grid_points")
+
+
+def test_dft_pseudopotential_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "dft_pseudo.csv"
+
+    dft_pseudopotential.main(
+        [
+            "--grid",
+            "2,2,2",
+            "--iterations",
+            "1",
+            "--csv",
+            str(csv_path),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["grid_shape"] == [2, 2, 2]
+    assert payload["case_count"] == 3
+    assert {case["case"] for case in payload["cases"]} == {
+        "gaussian",
+        "gth-local",
+        "upf-local",
+    }
+    assert csv_path.read_text().startswith("case,grid_shape")

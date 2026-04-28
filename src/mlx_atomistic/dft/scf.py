@@ -25,6 +25,7 @@ from mlx_atomistic.dft.potentials import (
     hartree_potential,
     local_pseudopotential_forces,
 )
+from mlx_atomistic.dft.pseudopotentials import LocalPseudopotentialField
 from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_center_forces
 from mlx_atomistic.dft.xc import (
     DiracExchange,
@@ -128,6 +129,11 @@ class SCFResult:
     electronic_energy: float | None = None
     center_center_energy: float = 0.0
     force_consistency: dict | None = None
+    pseudopotential_format: str | None = None
+    ion_count: int | None = None
+    valence_electron_count: float | None = None
+    nonlocal_available: bool = False
+    nonlocal_applied: bool = False
 
     def to_dict(self) -> dict:
         """Return a JSON-safe summary without dense array payloads."""
@@ -163,6 +169,11 @@ class SCFResult:
             ),
             "orthonormality_error": self.orthonormality_error,
             "force_consistency": self.force_consistency,
+            "pseudopotential_format": self.pseudopotential_format,
+            "ion_count": self.ion_count,
+            "valence_electron_count": self.valence_electron_count,
+            "nonlocal_available": self.nonlocal_available,
+            "nonlocal_applied": self.nonlocal_applied,
         }
 
 
@@ -233,10 +244,13 @@ def _initial_orbitals(
 
 
 def _local_field(
-    local_potential: LocalGaussianPseudopotential | mx.array | Sequence[float],
+    local_potential: LocalGaussianPseudopotential
+    | LocalPseudopotentialField
+    | mx.array
+    | Sequence[float],
     grid: RealSpaceGrid,
 ) -> mx.array:
-    if isinstance(local_potential, LocalGaussianPseudopotential):
+    if isinstance(local_potential, LocalGaussianPseudopotential | LocalPseudopotentialField):
         field = local_potential.field(grid)
     else:
         field = mx.array(local_potential)
@@ -446,11 +460,15 @@ def _converged(
 
 def _resolve_inputs(
     system_or_grid: DFTSystem | RealSpaceGrid,
-    local_potential: LocalGaussianPseudopotential | mx.array | Sequence[float] | None,
+    local_potential: LocalGaussianPseudopotential
+    | LocalPseudopotentialField
+    | mx.array
+    | Sequence[float]
+    | None,
     electron_count: float | None,
 ) -> tuple[
     RealSpaceGrid,
-    LocalGaussianPseudopotential | mx.array | Sequence[float],
+    LocalGaussianPseudopotential | LocalPseudopotentialField | mx.array | Sequence[float],
     float,
     DFTSystem | None,
 ]:
@@ -518,6 +536,7 @@ def _history_row(
         "electron_count": float(mx.sum(density) * grid.dv),
         "kinetic": float(energy_terms["kinetic"]),
         "local": float(energy_terms["local"]),
+        "local_pseudopotential_energy": float(energy_terms["local"]),
         "hartree": float(energy_terms["hartree"]),
         "xc": float(energy_terms["xc"]),
         "exchange": float(energy_terms.get("exchange", energy_terms["xc"])),
@@ -530,7 +549,11 @@ def _history_row(
 
 def run_scf(
     system_or_grid: DFTSystem | RealSpaceGrid,
-    local_potential: LocalGaussianPseudopotential | mx.array | Sequence[float] | None = None,
+    local_potential: LocalGaussianPseudopotential
+    | LocalPseudopotentialField
+    | mx.array
+    | Sequence[float]
+    | None = None,
     *,
     electron_count: float | None = None,
     n_orbitals: int | None = None,
@@ -584,6 +607,18 @@ def run_scf(
     orbital_residual_values = None
     final_orthonormality_error = 0.0
     max_orbital_residual: float | None = None
+    pseudopotential_format = "array"
+    ion_count = None
+    valence_electron_count = None
+    nonlocal_available = False
+    if isinstance(local_input, LocalGaussianPseudopotential):
+        pseudopotential_format = "gaussian"
+    elif isinstance(local_input, LocalPseudopotentialField):
+        formats = sorted(set(local_input.ions.formats))
+        pseudopotential_format = ",".join(formats)
+        ion_count = len(local_input.ions.ions)
+        valence_electron_count = local_input.ions.valence_electron_count
+        nonlocal_available = local_input.nonlocal_available
 
     for iteration in range(1, config.max_iterations + 1):
         start = perf_counter()
@@ -720,9 +755,12 @@ def run_scf(
             break
 
     forces = None
-    if isinstance(local_input, LocalGaussianPseudopotential):
+    if isinstance(local_input, LocalGaussianPseudopotential | LocalPseudopotentialField):
         start = perf_counter()
-        forces = local_pseudopotential_forces(density, grid, local_input)
+        if isinstance(local_input, LocalGaussianPseudopotential):
+            forces = local_pseudopotential_forces(density, grid, local_input)
+        else:
+            forces = local_input.forces(density, grid)
         if system is not None:
             forces = forces + mx.array(center_center_forces(system), dtype=forces.dtype)
         _add_timing(timings, "force_ms", start, enabled=config.record_timing)
@@ -755,6 +793,7 @@ def run_scf(
     energy_by_term["electronic"] = electronic_energy
     energy_by_term["center_center"] = center_energy
     energy_by_term["total"] = electronic_energy + center_energy
+    energy_by_term["local_pseudopotential"] = energy_by_term["local"]
     if converged:
         status = "converged"
     elif failure_reason == "max_iterations_reached":
@@ -786,4 +825,9 @@ def run_scf(
         electronic_energy=electronic_energy,
         center_center_energy=center_energy,
         force_consistency=None,
+        pseudopotential_format=pseudopotential_format,
+        ion_count=ion_count,
+        valence_electron_count=valence_electron_count,
+        nonlocal_available=nonlocal_available,
+        nonlocal_applied=False,
     )

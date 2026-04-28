@@ -10,6 +10,7 @@ import numpy as np
 from mlx_atomistic.core import Cell
 from mlx_atomistic.dft.grids import RealSpaceGrid
 from mlx_atomistic.dft.potentials import LocalGaussianPseudopotential
+from mlx_atomistic.dft.pseudopotentials import IonCollection, LocalPseudopotentialField
 
 
 def center_center_energy(system: DFTSystem) -> float:
@@ -58,39 +59,59 @@ class DFTSystem:
     grid_shape: tuple[int, int, int]
     cell: Cell
     electron_count: float
-    pseudopotential: LocalGaussianPseudopotential
+    pseudopotential: LocalGaussianPseudopotential | LocalPseudopotentialField
     charges: tuple[float, ...]
+    ions: IonCollection | None
 
     def __init__(
         self,
         *,
         cell: Cell | Sequence[float],
         grid_shape: Sequence[int],
-        electron_count: float,
+        electron_count: float | None = None,
         centers: Sequence[Sequence[float]] | None = None,
         amplitudes: Sequence[float] | float | None = None,
         widths: Sequence[float] | float | None = None,
         charges: Sequence[float] | None = None,
-        pseudopotential: LocalGaussianPseudopotential | None = None,
+        pseudopotential: LocalGaussianPseudopotential | LocalPseudopotentialField | None = None,
+        ions: IonCollection | None = None,
     ):
         parsed_cell = cell if isinstance(cell, Cell) else Cell.orthorhombic(cell)
         shape = tuple(int(item) for item in grid_shape)
         if len(shape) != 3 or any(item <= 0 for item in shape):
             msg = "grid_shape must contain three positive dimensions"
             raise ValueError(msg)
-        if electron_count <= 0.0:
-            msg = "electron_count must be positive"
+        if ions is not None and (
+            pseudopotential is not None
+            or centers is not None
+            or amplitudes is not None
+            or widths is not None
+        ):
+            msg = "ions cannot be combined with explicit pseudopotential or Gaussian parameters"
             raise ValueError(msg)
+        if ions is not None:
+            pseudopotential = LocalPseudopotentialField(ions)
+            if electron_count is None:
+                electron_count = ions.valence_electron_count
         if pseudopotential is None:
             if centers is None or amplitudes is None or widths is None:
                 msg = "centers, amplitudes, and widths are required without pseudopotential"
                 raise ValueError(msg)
             pseudopotential = LocalGaussianPseudopotential(centers, amplitudes, widths)
+        if electron_count is None:
+            msg = "electron_count is required without ions"
+            raise ValueError(msg)
+        if electron_count <= 0.0:
+            msg = "electron_count must be positive"
+            raise ValueError(msg)
         n_centers = int(pseudopotential.centers.shape[0])
         if charges is None:
-            parsed_charges = tuple(
-                float(-amplitude) for amplitude in np.array(pseudopotential.amplitudes)
-            )
+            if ions is None:
+                parsed_charges = tuple(
+                    float(-amplitude) for amplitude in np.array(pseudopotential.amplitudes)
+                )
+            else:
+                parsed_charges = ions.charges
         else:
             if len(charges) != n_centers:
                 msg = "charges length must match number of pseudopotential centers"
@@ -102,6 +123,7 @@ class DFTSystem:
         object.__setattr__(self, "electron_count", float(electron_count))
         object.__setattr__(self, "pseudopotential", pseudopotential)
         object.__setattr__(self, "charges", parsed_charges)
+        object.__setattr__(self, "ions", ions)
 
     @classmethod
     def one_center(
@@ -182,6 +204,14 @@ class DFTSystem:
     def with_centers(self, centers: Sequence[Sequence[float]]) -> DFTSystem:
         """Return a copy with shifted center coordinates."""
 
+        if self.ions is not None:
+            return DFTSystem(
+                cell=self.cell,
+                grid_shape=self.grid_shape,
+                electron_count=self.electron_count,
+                ions=self.ions.with_positions(centers),
+                charges=self.charges,
+            )
         return DFTSystem(
             cell=self.cell,
             grid_shape=self.grid_shape,
