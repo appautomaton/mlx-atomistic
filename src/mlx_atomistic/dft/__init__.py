@@ -8,8 +8,21 @@ from mlx_atomistic.dft.fft import (
     real_to_reciprocal,
     reciprocal_to_real,
 )
+from mlx_atomistic.dft.forces import SCFForceConsistencyResult, scf_total_energy_forces
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.operators import (
+    DenseHamiltonianReference,
+    DiagonalizationResult,
+    KohnShamOperator,
+    SubspaceDiagonalizer,
+    apply_hamiltonian,
+    apply_hartree_xc_potential,
+    apply_kinetic,
+    apply_local_potential,
+    orbital_residuals,
+    orthonormality_error,
+)
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
     electron_count,
@@ -19,7 +32,7 @@ from mlx_atomistic.dft.potentials import (
     local_pseudopotential_forces,
 )
 from mlx_atomistic.dft.scf import SCFConfig, SCFResult, run_scf
-from mlx_atomistic.dft.system import DFTSystem
+from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_center_forces
 from mlx_atomistic.dft.xc import (
     DiracExchange,
     ExchangeCorrelationFunctional,
@@ -30,18 +43,29 @@ from mlx_atomistic.dft.xc import (
 
 __all__ = [
     "DFTSystem",
+    "DenseHamiltonianReference",
+    "DiagonalizationResult",
     "DiracExchange",
     "ExchangeCorrelationFunctional",
     "LDACorrelationPZ81",
     "LDAExchangeCorrelation",
     "LinearMixer",
     "LocalGaussianPseudopotential",
+    "KohnShamOperator",
     "PulayDIISMixer",
     "RealSpaceGrid",
     "ReciprocalGrid",
     "SCFConfig",
+    "SCFForceConsistencyResult",
     "SCFResult",
+    "SubspaceDiagonalizer",
+    "apply_hamiltonian",
     "XCResult",
+    "apply_hartree_xc_potential",
+    "apply_kinetic",
+    "apply_local_potential",
+    "center_center_energy",
+    "center_center_forces",
     "density_from_orbitals",
     "electron_count",
     "energy_decomposition",
@@ -52,7 +76,10 @@ __all__ = [
     "lda_exchange_energy_potential",
     "local_pseudopotential_forces",
     "normalize_orbitals",
+    "orbital_residuals",
+    "orthonormality_error",
     "real_to_reciprocal",
     "reciprocal_to_real",
     "run_scf",
+    "scf_total_energy_forces",
 ]

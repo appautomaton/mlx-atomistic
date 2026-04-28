@@ -4,8 +4,10 @@ import numpy as np
 import pytest
 
 from mlx_atomistic.dft import (
+    DenseHamiltonianReference,
     DFTSystem,
     DiracExchange,
+    KohnShamOperator,
     LDACorrelationPZ81,
     LDAExchangeCorrelation,
     LinearMixer,
@@ -14,14 +16,20 @@ from mlx_atomistic.dft import (
     RealSpaceGrid,
     ReciprocalGrid,
     SCFConfig,
+    SubspaceDiagonalizer,
+    apply_kinetic,
+    apply_local_potential,
+    center_center_energy,
     density_from_orbitals,
     fft3,
     hartree_potential,
     lda_exchange_energy_potential,
     local_pseudopotential_forces,
     normalize_orbitals,
+    orthonormality_error,
     reciprocal_to_real,
     run_scf,
+    scf_total_energy_forces,
 )
 
 
@@ -204,6 +212,12 @@ def test_scf_toy_one_and_two_electron_runs_are_deterministic_and_json_safe():
     assert one.solver == "dense"
     assert np.isfinite(one.total_energy)
     assert np.isfinite(two.total_energy)
+    assert two.electronic_energy == pytest.approx(two.energy_by_term["electronic"])
+    assert two.center_center_energy == pytest.approx(0.0)
+    assert two.orbital_eigenvalues is not None
+    assert two.orbital_residuals is not None
+    assert np.isfinite(np.array(two.orbital_residuals)).all()
+    assert two.orthonormality_error < 1e-5
     assert two.electron_count == pytest.approx(2.0, abs=1e-5)
     assert two.total_energy == pytest.approx(two_repeat.total_energy, abs=1e-7)
     assert two.history == two_repeat.history
@@ -285,3 +299,120 @@ def test_local_pseudopotential_force_zero_for_symmetric_uniform_density():
     force = np.array(local_pseudopotential_forces(density, grid, pseudopotential))[0]
 
     np.testing.assert_allclose(force, [0.0, 0.0, 0.0], atol=1e-5)
+
+
+def test_plane_wave_kinetic_operator_has_expected_eigenvalue():
+    grid = RealSpaceGrid((4, 4, 4), [4.0, 4.0, 4.0])
+    coordinates = np.array(grid.coordinates())
+    wavevector = 2.0 * np.pi / 4.0
+    orbital = np.exp(1j * wavevector * coordinates[..., 0]).astype(np.complex64)
+
+    applied = np.array(apply_kinetic(orbital, grid))
+
+    np.testing.assert_allclose(applied, 0.5 * wavevector**2 * orbital, atol=1e-5)
+
+
+def test_local_operator_multiplication_matches_grid_product():
+    grid = RealSpaceGrid((2, 2, 2), [2.0, 2.0, 2.0])
+    orbital = (np.ones(grid.shape) + 0.25j).astype(np.complex64)
+    potential = np.arange(grid.size, dtype=np.float32).reshape(grid.shape)
+
+    applied = np.array(apply_local_potential(orbital, potential))
+
+    np.testing.assert_allclose(applied, orbital * potential, atol=1e-7)
+
+
+def test_dense_reference_matvec_matches_operator_application():
+    grid = RealSpaceGrid((2, 2, 2), [2.0, 2.0, 2.0])
+    density = np.ones(grid.shape, dtype=np.float32) * 0.5
+    local = np.linspace(-0.2, 0.3, grid.size, dtype=np.float32).reshape(grid.shape)
+    operator = KohnShamOperator.from_density(
+        grid,
+        local,
+        density,
+        xc_functional=DiracExchange(),
+    )
+    reference = DenseHamiltonianReference(operator)
+    coordinates = np.array(grid.coordinates())
+    trial = (1.0 + 0.1j * coordinates[..., 0]).astype(np.complex64)
+
+    dense_applied = np.array(reference.matvec(trial))
+    operator_applied = np.array(operator.apply_hamiltonian(trial))
+
+    np.testing.assert_allclose(dense_applied, operator_applied, atol=1e-5)
+
+
+def test_dense_reference_and_subspace_solver_agree_on_tiny_grid():
+    grid = RealSpaceGrid((2, 2, 2), [2.0, 2.0, 2.0])
+    density = np.ones(grid.shape, dtype=np.float32) * 0.5
+    local = np.zeros(grid.shape, dtype=np.float32)
+    operator = KohnShamOperator.from_density(
+        grid,
+        local,
+        density,
+        xc_functional=DiracExchange(),
+    )
+
+    dense = DenseHamiltonianReference(operator).diagonalize(n_orbitals=1)
+    subspace = SubspaceDiagonalizer(tolerance=1e-5).solve(operator, n_orbitals=1)
+
+    np.testing.assert_allclose(
+        np.array(dense.eigenvalues),
+        np.array(subspace.eigenvalues),
+        atol=1e-6,
+    )
+    assert orthonormality_error(subspace.orbitals, grid) < 1e-6
+    assert np.isfinite(np.array(subspace.residuals)).all()
+
+
+def test_center_center_energy_symmetric_and_added_to_total_energy():
+    system = DFTSystem.two_center(
+        cell=[8.0, 8.0, 8.0],
+        grid_shape=(4, 4, 4),
+        centers=((3.0, 4.0, 4.0), (5.0, 4.0, 4.0)),
+        amplitudes=(-1.0, -1.0),
+        widths=(0.8, 0.8),
+        charges=(1.0, 2.0),
+    )
+    swapped = DFTSystem.two_center(
+        cell=[8.0, 8.0, 8.0],
+        grid_shape=(4, 4, 4),
+        centers=((5.0, 4.0, 4.0), (3.0, 4.0, 4.0)),
+        amplitudes=(-1.0, -1.0),
+        widths=(0.8, 0.8),
+        charges=(2.0, 1.0),
+    )
+
+    assert center_center_energy(system) == pytest.approx(center_center_energy(swapped))
+    result = run_scf(
+        system,
+        config=SCFConfig(max_iterations=1, solver="dense", seed=3),
+        xc_functional=DiracExchange(),
+    )
+
+    assert result.center_center_energy == pytest.approx(center_center_energy(system))
+    assert result.total_energy == pytest.approx(
+        result.electronic_energy + result.center_center_energy,
+        abs=1e-6,
+    )
+
+
+def test_scf_total_energy_force_check_is_json_safe_for_symmetric_one_center():
+    system = DFTSystem.one_center(
+        cell=[6.0, 6.0, 6.0],
+        grid_shape=(4, 4, 4),
+        center=(3.0, 3.0, 3.0),
+        electron_count=2.0,
+        amplitude=-2.0,
+        width=0.8,
+    )
+    check = scf_total_energy_forces(
+        system,
+        config=SCFConfig(max_iterations=2, solver="dense", seed=7),
+        xc_functional=DiracExchange(),
+        displacement=1e-3,
+    )
+
+    assert check.max_abs_error < 5e-2
+    assert check.result.force_consistency is not None
+    json.dumps(check.to_dict())

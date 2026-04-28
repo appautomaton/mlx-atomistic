@@ -14,13 +14,18 @@ from mlx_atomistic.dft.density import density_from_orbitals
 from mlx_atomistic.dft.fft import fft_backend
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.operators import (
+    KohnShamOperator,
+    orbital_residuals,
+    orthonormality_error,
+)
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
     apply_kinetic,
     hartree_potential,
     local_pseudopotential_forces,
 )
-from mlx_atomistic.dft.system import DFTSystem
+from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_center_forces
 from mlx_atomistic.dft.xc import (
     DiracExchange,
     ExchangeCorrelationFunctional,
@@ -48,6 +53,10 @@ class SCFConfig:
     convergence_mode: SCFConvergenceMode = "density"
     min_iterations: int = 1
     record_timing: bool = True
+    potential_tolerance: float | None = None
+    orbital_tolerance: float | None = None
+    max_density_residual: float | None = 1e6
+    max_orthonormality_error: float = 1e-3
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -77,6 +86,18 @@ class SCFConfig:
         if self.min_iterations <= 0:
             msg = "min_iterations must be positive"
             raise ValueError(msg)
+        if self.potential_tolerance is not None and self.potential_tolerance <= 0.0:
+            msg = "potential_tolerance must be positive when provided"
+            raise ValueError(msg)
+        if self.orbital_tolerance is not None and self.orbital_tolerance <= 0.0:
+            msg = "orbital_tolerance must be positive when provided"
+            raise ValueError(msg)
+        if self.max_density_residual is not None and self.max_density_residual <= 0.0:
+            msg = "max_density_residual must be positive when provided"
+            raise ValueError(msg)
+        if self.max_orthonormality_error <= 0.0:
+            msg = "max_orthonormality_error must be positive"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -101,6 +122,12 @@ class SCFResult:
     timings: dict[str, float]
     forces: mx.array | None = None
     mixer_metadata: dict | None = None
+    orbital_eigenvalues: mx.array | None = None
+    orbital_residuals: mx.array | None = None
+    orthonormality_error: float = 0.0
+    electronic_energy: float | None = None
+    center_center_energy: float = 0.0
+    force_consistency: dict | None = None
 
     def to_dict(self) -> dict:
         """Return a JSON-safe summary without dense array payloads."""
@@ -115,6 +142,8 @@ class SCFResult:
             "fft_backend": self.fft_backend,
             "electron_count": self.electron_count,
             "total_energy": self.total_energy,
+            "electronic_energy": self.electronic_energy,
+            "center_center_energy": self.center_center_energy,
             "residual": self.residual,
             "energy_by_term": dict(self.energy_by_term),
             "history": list(self.history),
@@ -122,6 +151,18 @@ class SCFResult:
             "mixer": {} if self.mixer_metadata is None else dict(self.mixer_metadata),
             "grid_shape": list(self.density.shape),
             "forces": None if self.forces is None else np.array(self.forces).tolist(),
+            "orbital_eigenvalues": (
+                None
+                if self.orbital_eigenvalues is None
+                else np.array(self.orbital_eigenvalues).tolist()
+            ),
+            "orbital_residuals": (
+                None
+                if self.orbital_residuals is None
+                else np.array(self.orbital_residuals).tolist()
+            ),
+            "orthonormality_error": self.orthonormality_error,
+            "force_consistency": self.force_consistency,
         }
 
 
@@ -292,6 +333,9 @@ def _empty_timings() -> dict[str, float]:
         "kinetic_ms": 0.0,
         "energy_ms": 0.0,
         "force_ms": 0.0,
+        "operator_ms": 0.0,
+        "orthonormality_ms": 0.0,
+        "diagonalization_ms": 0.0,
         "total_scf_ms": 0.0,
     }
 
@@ -375,19 +419,29 @@ def _converged(
     iteration: int,
     config: SCFConfig,
     density_residual: float,
+    potential_residual: float | None,
     energy_delta: float | None,
+    orbital_residual: float | None,
 ) -> bool:
     if iteration < config.min_iterations:
         return False
     density_ok = density_residual <= config.tolerance
     energy_ok = energy_delta is not None and abs(energy_delta) <= config.tolerance
+    potential_ok = True
+    if config.potential_tolerance is not None:
+        potential_ok = (
+            potential_residual is not None and potential_residual <= config.potential_tolerance
+        )
+    orbital_ok = True
+    if config.orbital_tolerance is not None:
+        orbital_ok = orbital_residual is not None and orbital_residual <= config.orbital_tolerance
     if config.convergence_mode == "density":
-        return density_ok
+        return density_ok and potential_ok and orbital_ok
     if config.convergence_mode == "energy":
-        return energy_ok
+        return energy_ok and potential_ok and orbital_ok
     if config.convergence_mode == "either":
-        return density_ok or energy_ok
-    return density_ok and energy_ok
+        return (density_ok or energy_ok) and potential_ok and orbital_ok
+    return density_ok and energy_ok and potential_ok and orbital_ok
 
 
 def _resolve_inputs(
@@ -448,13 +502,19 @@ def _history_row(
     energy_terms: dict[str, mx.array],
     density: mx.array,
     grid: RealSpaceGrid,
+    center_energy: float,
+    orbital_residual: float | None,
+    orthonormality: float | None,
 ) -> dict[str, float | int | str | None]:
+    electronic = float(energy_terms["total"])
     return {
         "iteration": iteration,
         "residual": density_residual,
         "density_residual": density_residual,
         "potential_residual": potential_residual,
         "energy_delta": energy_delta,
+        "orbital_residual": orbital_residual,
+        "orthonormality_error": orthonormality,
         "electron_count": float(mx.sum(density) * grid.dv),
         "kinetic": float(energy_terms["kinetic"]),
         "local": float(energy_terms["local"]),
@@ -462,7 +522,9 @@ def _history_row(
         "xc": float(energy_terms["xc"]),
         "exchange": float(energy_terms.get("exchange", energy_terms["xc"])),
         "correlation": float(energy_terms.get("correlation", mx.array(0.0))),
-        "total": float(energy_terms["total"]),
+        "electronic": electronic,
+        "center_center": center_energy,
+        "total": electronic + center_energy,
     }
 
 
@@ -480,7 +542,7 @@ def run_scf(
     """Run a minimal spin-unpolarized Γ-point SCF calculation."""
 
     config = SCFConfig() if config is None else config
-    grid, local_input, electron_count_value, _system = _resolve_inputs(
+    grid, local_input, electron_count_value, system = _resolve_inputs(
         system_or_grid,
         local_potential,
         electron_count,
@@ -517,6 +579,11 @@ def run_scf(
     previous_energy: float | None = None
     effective_potential = v_local
     energy_terms: dict[str, mx.array] = {}
+    center_energy = 0.0 if system is None else center_center_energy(system)
+    orbital_eigenvalues = None
+    orbital_residual_values = None
+    final_orthonormality_error = 0.0
+    max_orbital_residual: float | None = None
 
     for iteration in range(1, config.max_iterations + 1):
         start = perf_counter()
@@ -551,7 +618,11 @@ def run_scf(
                 grid,
                 step_size=config.step_size,
             )
-        _add_timing(timings, "solver_ms", start, enabled=config.record_timing)
+        solver_elapsed_ms = (perf_counter() - start) * 1000.0
+        if config.record_timing:
+            timings["solver_ms"] += solver_elapsed_ms
+            if solver == "dense":
+                timings["diagonalization_ms"] += solver_elapsed_ms
 
         next_density = density_from_orbitals(
             next_orbitals,
@@ -575,6 +646,7 @@ def run_scf(
             density_floor=config.density_floor,
         )
         _add_timing(timings, "xc_ms", start, enabled=config.record_timing)
+        effective_potential = v_local + energy_v_hartree + energy_xc.potential
         energy_terms = _energy_terms(
             orbitals,
             density,
@@ -596,6 +668,21 @@ def run_scf(
         total_energy = float(energy_terms["total"])
         energy_delta = None if previous_energy is None else total_energy - previous_energy
         previous_energy = total_energy
+        start = perf_counter()
+        iteration_operator = KohnShamOperator.from_density(
+            grid,
+            v_local,
+            density,
+            xc_functional=xc_functional,
+            density_floor=config.density_floor,
+        )
+        iteration_eigenvalues = iteration_operator.rayleigh_quotients(orbitals)
+        iteration_residuals = orbital_residuals(orbitals, iteration_operator, iteration_eigenvalues)
+        max_orbital_residual = float(mx.max(iteration_residuals))
+        _add_timing(timings, "operator_ms", start, enabled=config.record_timing)
+        start = perf_counter()
+        iteration_orthonormality_error = orthonormality_error(orbitals, grid)
+        _add_timing(timings, "orthonormality_ms", start, enabled=config.record_timing)
         _assert_finite(density, orbitals, effective_potential, *energy_terms.values())
         history.append(
             _history_row(
@@ -606,13 +693,27 @@ def run_scf(
                 energy_terms,
                 density,
                 grid,
+                center_energy,
+                max_orbital_residual,
+                iteration_orthonormality_error,
             )
         )
+        if iteration_orthonormality_error > config.max_orthonormality_error:
+            failure_reason = "orthonormality_loss"
+            break
+        if (
+            config.max_density_residual is not None
+            and density_residual > config.max_density_residual
+        ):
+            failure_reason = "diverged"
+            break
         if _converged(
             iteration=iteration,
             config=config,
             density_residual=density_residual,
+            potential_residual=potential_residual,
             energy_delta=energy_delta,
+            orbital_residual=max_orbital_residual,
         ):
             converged = True
             convergence_reason = config.convergence_mode
@@ -622,17 +723,44 @@ def run_scf(
     if isinstance(local_input, LocalGaussianPseudopotential):
         start = perf_counter()
         forces = local_pseudopotential_forces(density, grid, local_input)
+        if system is not None:
+            forces = forces + mx.array(center_center_forces(system), dtype=forces.dtype)
         _add_timing(timings, "force_ms", start, enabled=config.record_timing)
+
+    start = perf_counter()
+    final_operator = KohnShamOperator.from_density(
+        grid,
+        v_local,
+        density,
+        xc_functional=xc_functional,
+        density_floor=config.density_floor,
+    )
+    orbital_eigenvalues = final_operator.rayleigh_quotients(orbitals)
+    orbital_residual_values = orbital_residuals(orbitals, final_operator, orbital_eigenvalues)
+    _add_timing(timings, "operator_ms", start, enabled=config.record_timing)
+
+    start = perf_counter()
+    final_orthonormality_error = orthonormality_error(orbitals, grid)
+    _add_timing(timings, "orthonormality_ms", start, enabled=config.record_timing)
 
     if config.record_timing:
         timings["total_scf_ms"] = (perf_counter() - total_start) * 1000.0
     if not history:
         failure_reason = "no_scf_iterations"
-    elif not converged:
+    elif not converged and failure_reason is None:
         failure_reason = "max_iterations_reached"
 
     energy_by_term = {name: float(value) for name, value in energy_terms.items()}
-    status = "converged" if converged else "max_iterations"
+    electronic_energy = energy_by_term["total"]
+    energy_by_term["electronic"] = electronic_energy
+    energy_by_term["center_center"] = center_energy
+    energy_by_term["total"] = electronic_energy + center_energy
+    if converged:
+        status = "converged"
+    elif failure_reason == "max_iterations_reached":
+        status = "max_iterations"
+    else:
+        status = "failed"
     return SCFResult(
         converged=converged,
         iterations=len(history),
@@ -652,4 +780,10 @@ def run_scf(
         timings=timings,
         forces=forces,
         mixer_metadata=mixer.metadata(),
+        orbital_eigenvalues=orbital_eigenvalues,
+        orbital_residuals=orbital_residual_values,
+        orthonormality_error=final_orthonormality_error,
+        electronic_energy=electronic_energy,
+        center_center_energy=center_energy,
+        force_consistency=None,
     )

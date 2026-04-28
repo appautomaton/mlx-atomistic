@@ -15,3 +15,6 @@ Planned notebooks:
 - `08-xc-and-mixing.ipynb`: compare exchange-only and LDA XC with linear and DIIS mixing.
 - `09-dft-forces.ipynb`: compare local Gaussian pseudopotential forces with finite differences.
 - `10-dft-performance.ipynb`: inspect DFT timing breakdowns and small grid scaling.
+- `11-ks-operator.ipynb`: inspect Kohn-Sham operator components on a compact grid.
+- `12-dense-vs-operator.ipynb`: compare dense reference matrix-vector products with operator application.
+- `13-scf-force-consistency.ipynb`: compare SCF total-energy finite-difference forces with reported forces.

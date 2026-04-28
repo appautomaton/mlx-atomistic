@@ -12,6 +12,45 @@ from mlx_atomistic.dft.grids import RealSpaceGrid
 from mlx_atomistic.dft.potentials import LocalGaussianPseudopotential
 
 
+def center_center_energy(system: DFTSystem) -> float:
+    """Return pairwise center-center Coulomb energy for toy DFT centers."""
+
+    centers = np.array(system.centers, dtype=np.float64)
+    charges = np.array(system.charges, dtype=np.float64)
+    energy = 0.0
+    for i in range(system.center_count):
+        for j in range(i + 1, system.center_count):
+            displacement = system.cell.minimum_image(centers[i] - centers[j])
+            distance = float(np.linalg.norm(np.array(displacement, dtype=np.float64)))
+            if distance <= 1e-12:
+                msg = "center-center energy is undefined for overlapping centers"
+                raise ValueError(msg)
+            energy += float(charges[i] * charges[j] / distance)
+    return energy
+
+
+def center_center_forces(system: DFTSystem) -> np.ndarray:
+    """Return pairwise Coulomb forces between toy DFT centers."""
+
+    centers = np.array(system.centers, dtype=np.float64)
+    charges = np.array(system.charges, dtype=np.float64)
+    forces = np.zeros_like(centers)
+    for i in range(system.center_count):
+        for j in range(i + 1, system.center_count):
+            displacement = np.array(
+                system.cell.minimum_image(centers[i] - centers[j]),
+                dtype=np.float64,
+            )
+            distance = float(np.linalg.norm(displacement))
+            if distance <= 1e-12:
+                msg = "center-center force is undefined for overlapping centers"
+                raise ValueError(msg)
+            pair_force = charges[i] * charges[j] * displacement / (distance**3)
+            forces[i] += pair_force
+            forces[j] -= pair_force
+    return forces
+
+
 @dataclass(frozen=True)
 class DFTSystem:
     """Minimal spin-unpolarized DFT system with local Gaussian centers."""
@@ -64,6 +103,95 @@ class DFTSystem:
         object.__setattr__(self, "pseudopotential", pseudopotential)
         object.__setattr__(self, "charges", parsed_charges)
 
+    @classmethod
+    def one_center(
+        cls,
+        *,
+        cell: Cell | Sequence[float] = (8.0, 8.0, 8.0),
+        grid_shape: Sequence[int] = (8, 8, 8),
+        center: Sequence[float] = (4.0, 4.0, 4.0),
+        electron_count: float = 2.0,
+        amplitude: float = -3.0,
+        width: float = 0.9,
+        charge: float | None = None,
+    ) -> DFTSystem:
+        """Build a one-center toy DFT system."""
+
+        return cls(
+            cell=cell,
+            grid_shape=grid_shape,
+            electron_count=electron_count,
+            centers=[center],
+            amplitudes=amplitude,
+            widths=width,
+            charges=None if charge is None else [charge],
+        )
+
+    @classmethod
+    def two_center(
+        cls,
+        *,
+        cell: Cell | Sequence[float] = (8.0, 8.0, 8.0),
+        grid_shape: Sequence[int] = (8, 8, 8),
+        centers: Sequence[Sequence[float]] = ((3.4, 4.0, 4.0), (4.6, 4.0, 4.0)),
+        electron_count: float = 2.0,
+        amplitudes: Sequence[float] | float = (-2.0, -2.0),
+        widths: Sequence[float] | float = (0.8, 0.8),
+        charges: Sequence[float] | None = None,
+    ) -> DFTSystem:
+        """Build a two-center toy DFT system."""
+
+        return cls(
+            cell=cell,
+            grid_shape=grid_shape,
+            electron_count=electron_count,
+            centers=centers,
+            amplitudes=amplitudes,
+            widths=widths,
+            charges=charges,
+        )
+
+    @classmethod
+    def cluster(
+        cls,
+        *,
+        cell: Cell | Sequence[float] = (10.0, 10.0, 10.0),
+        grid_shape: Sequence[int] = (8, 8, 8),
+        electron_count: float = 4.0,
+        centers: Sequence[Sequence[float]] = (
+            (4.0, 4.0, 5.0),
+            (6.0, 4.0, 5.0),
+            (5.0, 6.0, 5.0),
+        ),
+        amplitudes: Sequence[float] | float = (-2.0, -2.0, -1.5),
+        widths: Sequence[float] | float = (0.85, 0.85, 0.95),
+        charges: Sequence[float] | None = None,
+    ) -> DFTSystem:
+        """Build a small multi-center toy DFT system."""
+
+        return cls(
+            cell=cell,
+            grid_shape=grid_shape,
+            electron_count=electron_count,
+            centers=centers,
+            amplitudes=amplitudes,
+            widths=widths,
+            charges=charges,
+        )
+
+    def with_centers(self, centers: Sequence[Sequence[float]]) -> DFTSystem:
+        """Return a copy with shifted center coordinates."""
+
+        return DFTSystem(
+            cell=self.cell,
+            grid_shape=self.grid_shape,
+            electron_count=self.electron_count,
+            centers=centers,
+            amplitudes=np.array(self.pseudopotential.amplitudes, dtype=np.float32),
+            widths=np.array(self.pseudopotential.widths, dtype=np.float32),
+            charges=self.charges,
+        )
+
     @property
     def grid(self) -> RealSpaceGrid:
         """Return the real-space grid for this system."""
@@ -81,3 +209,15 @@ class DFTSystem:
         """Number of local pseudopotential centers."""
 
         return int(self.pseudopotential.centers.shape[0])
+
+    @property
+    def center_center_energy(self) -> float:
+        """Pairwise center-center Coulomb energy."""
+
+        return center_center_energy(self)
+
+    @property
+    def center_center_forces(self) -> np.ndarray:
+        """Pairwise center-center Coulomb forces."""
+
+        return center_center_forces(self)
