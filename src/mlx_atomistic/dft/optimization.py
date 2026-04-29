@@ -19,6 +19,7 @@ from mlx_atomistic.dft.system import DFTSystem
 from mlx_atomistic.dft.xc import DiracExchange, ExchangeCorrelationFunctional
 
 GeometryOptimizer = Literal["lbfgs", "steepest_descent"]
+GeometryRelaxationMode = Literal["ions", "cell", "ions_cell"]
 GeometryStatus = Literal[
     "converged",
     "max_steps",
@@ -43,6 +44,9 @@ class GeometryOptimizationConfig:
     optimizer: GeometryOptimizer = "lbfgs"
     scf_config: SCFConfig | None = None
     reuse_scf_state: bool = True
+    relaxation_mode: GeometryRelaxationMode = "ions"
+    stress_tolerance: float = 1e-3
+    cell_step_size: float = 0.02
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -72,6 +76,15 @@ class GeometryOptimizationConfig:
         if self.optimizer not in {"lbfgs", "steepest_descent"}:
             msg = "optimizer must be 'lbfgs' or 'steepest_descent'"
             raise ValueError(msg)
+        if self.relaxation_mode not in {"ions", "cell", "ions_cell"}:
+            msg = "relaxation_mode must be 'ions', 'cell', or 'ions_cell'"
+            raise ValueError(msg)
+        if self.stress_tolerance <= 0.0:
+            msg = "stress_tolerance must be positive"
+            raise ValueError(msg)
+        if self.cell_step_size <= 0.0:
+            msg = "cell_step_size must be positive"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -95,6 +108,8 @@ class GeometryOptimizationStep:
     positions: np.ndarray
     forces: np.ndarray
     status: str = "accepted"
+    stress_norm: float | None = None
+    rejected_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe step summary."""
@@ -117,6 +132,8 @@ class GeometryOptimizationStep:
             "timing_summary": dict(self.timing_summary),
             "positions": self.positions.tolist(),
             "forces": self.forces.tolist(),
+            "stress_norm": self.stress_norm,
+            "rejected_reason": self.rejected_reason,
         }
 
 
@@ -695,6 +712,9 @@ def _config_summary(config: GeometryOptimizationConfig) -> dict[str, Any]:
         "max_line_search_iterations": config.max_line_search_iterations,
         "optimizer": config.optimizer,
         "reuse_scf_state": config.reuse_scf_state,
+        "relaxation_mode": config.relaxation_mode,
+        "stress_tolerance": config.stress_tolerance,
+        "cell_step_size": config.cell_step_size,
         "scf_config": None if config.scf_config is None else _scf_config_summary(config.scf_config),
     }
 
@@ -717,6 +737,13 @@ def _scf_config_summary(config: SCFConfig) -> dict[str, Any]:
         "orbital_tolerance": config.orbital_tolerance,
         "max_density_residual": config.max_density_residual,
         "max_orthonormality_error": config.max_orthonormality_error,
+        "apply_nonlocal": config.apply_nonlocal,
+        "eigensolver_config": {
+            "max_iterations": config.eigensolver_config.max_iterations,
+            "tolerance": config.eigensolver_config.tolerance,
+            "max_subspace_size": config.eigensolver_config.max_subspace_size,
+            "dense_fallback_size": config.eigensolver_config.dense_fallback_size,
+        },
     }
 
 

@@ -222,6 +222,33 @@ class DFTSystem:
             charges=self.charges,
         )
 
+    def with_cell(self, cell: Cell | Sequence[float], *, scale_centers: bool = False) -> DFTSystem:
+        """Return a copy with a new orthorhombic cell."""
+
+        parsed_cell = cell if isinstance(cell, Cell) else Cell.orthorhombic(cell)
+        centers = np.array(self.centers, dtype=np.float64)
+        if scale_centers:
+            old_lengths = np.array(self.cell.lengths, dtype=np.float64)
+            new_lengths = np.array(parsed_cell.lengths, dtype=np.float64)
+            centers = centers / old_lengths * new_lengths
+        if self.ions is not None:
+            return DFTSystem(
+                cell=parsed_cell,
+                grid_shape=self.grid_shape,
+                electron_count=self.electron_count,
+                ions=self.ions.with_positions(centers),
+                charges=self.charges,
+            )
+        return DFTSystem(
+            cell=parsed_cell,
+            grid_shape=self.grid_shape,
+            electron_count=self.electron_count,
+            centers=centers,
+            amplitudes=np.array(self.pseudopotential.amplitudes, dtype=np.float32),
+            widths=np.array(self.pseudopotential.widths, dtype=np.float32),
+            charges=self.charges,
+        )
+
     @property
     def grid(self) -> RealSpaceGrid:
         """Return the real-space grid for this system."""

@@ -10,10 +10,35 @@ from mlx_atomistic.dft.fft import (
 )
 from mlx_atomistic.dft.forces import SCFForceConsistencyResult, scf_total_energy_forces
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
+from mlx_atomistic.dft.kpoints import (
+    BandPath,
+    BandStructureResult,
+    KPoint,
+    KPointMesh,
+    MonkhorstPackGrid,
+    run_band_structure,
+)
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.nonlocal_pseudopotential import (
+    NonlocalPseudopotentialOperator,
+    ProjectorSet,
+    apply_nonlocal_pseudopotential,
+    nonlocal_pseudopotential_energy,
+)
+from mlx_atomistic.dft.occupations import (
+    FermiDiracOccupations,
+    FixedOccupations,
+    OccupationResult,
+    SpinMode,
+    magnetization_density,
+    spin_density_from_orbitals,
+)
 from mlx_atomistic.dft.operators import (
+    DavidsonDiagonalizer,
     DenseHamiltonianReference,
     DiagonalizationResult,
+    EigensolverConfig,
+    KineticPreconditioner,
     KohnShamOperator,
     SubspaceDiagonalizer,
     apply_hamiltonian,
@@ -52,7 +77,18 @@ from mlx_atomistic.dft.pseudopotentials import (
     read_gth,
     read_upf,
 )
+from mlx_atomistic.dft.references import (
+    ReferenceComparisonResult,
+    ReferenceDFTCase,
+    compare_reference_case,
+)
+from mlx_atomistic.dft.restart import (
+    DenseSCFRestart,
+    load_dense_scf_restart,
+    save_dense_scf_restart,
+)
 from mlx_atomistic.dft.scf import SCFConfig, SCFResult, run_scf
+from mlx_atomistic.dft.stress import StressResult, finite_difference_stress
 from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_center_forces
 from mlx_atomistic.dft.xc import (
     DiracExchange,
@@ -63,52 +99,76 @@ from mlx_atomistic.dft.xc import (
 )
 
 __all__ = [
+    "BandPath",
+    "BandStructureResult",
     "DFTSystem",
+    "DavidsonDiagonalizer",
     "DenseHamiltonianReference",
+    "DenseSCFRestart",
     "DiagonalizationResult",
     "DiracExchange",
+    "EigensolverConfig",
     "ExchangeCorrelationFunctional",
+    "FermiDiracOccupations",
+    "FixedOccupations",
     "GeometryOptimizationConfig",
     "GeometryOptimizationRecord",
     "GeometryOptimizationResult",
     "GeometryOptimizationStep",
     "Ion",
     "IonCollection",
+    "KPoint",
+    "KPointMesh",
+    "KineticPreconditioner",
     "LDACorrelationPZ81",
     "LDAExchangeCorrelation",
     "LinearMixer",
     "LocalGaussianPseudopotential",
     "LocalPseudopotentialField",
     "KohnShamOperator",
+    "MonkhorstPackGrid",
+    "NonlocalPseudopotentialOperator",
     "NonlocalProjectorData",
+    "OccupationResult",
+    "ProjectorSet",
     "PulayDIISMixer",
     "PseudopotentialData",
     "PseudopotentialFormat",
     "RadialGrid",
     "RealSpaceGrid",
     "ReciprocalGrid",
+    "ReferenceComparisonResult",
+    "ReferenceDFTCase",
     "SCFConfig",
     "SCFForceConsistencyResult",
     "SCFResult",
+    "SpinMode",
+    "StressResult",
     "SubspaceDiagonalizer",
-    "apply_hamiltonian",
     "XCResult",
+    "apply_hamiltonian",
     "apply_hartree_xc_potential",
     "apply_kinetic",
     "apply_local_potential",
+    "apply_nonlocal_pseudopotential",
     "center_center_energy",
     "center_center_forces",
+    "compare_reference_case",
     "density_from_orbitals",
     "electron_count",
     "energy_decomposition",
     "fft3",
     "fft_backend",
+    "finite_difference_stress",
     "geometry_demo_system",
     "hartree_potential",
     "ifft3",
     "lda_exchange_energy_potential",
+    "load_dense_scf_restart",
     "load_geometry_optimization",
     "local_pseudopotential_forces",
+    "magnetization_density",
+    "nonlocal_pseudopotential_energy",
     "normalize_orbitals",
     "optimize_geometry",
     "orbital_residuals",
@@ -117,7 +177,10 @@ __all__ = [
     "reciprocal_to_real",
     "read_gth",
     "read_upf",
+    "run_band_structure",
     "run_scf",
+    "save_dense_scf_restart",
     "save_geometry_optimization",
     "scf_total_energy_forces",
+    "spin_density_from_orbitals",
 ]

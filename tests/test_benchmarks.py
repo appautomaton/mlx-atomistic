@@ -2,9 +2,13 @@ import json
 
 from mlx_atomistic.benchmarks import (
     dft_geometry,
+    dft_nonlocal,
     dft_operator,
     dft_pseudopotential,
+    dft_relaxation,
     dft_scf,
+    dft_solver,
+    dft_spin_kpoints,
     lj_md,
     mm_force_terms,
     stability,
@@ -191,3 +195,48 @@ def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert {case["case"] for case in payload["cases"]} == {"gaussian-dimer", "gth-h2"}
     assert all(case["steps_completed"] == 1 for case in payload["cases"])
     assert csv_path.read_text().startswith("case,grid_shape")
+
+
+def test_dft_nonlocal_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "dft_nonlocal.csv"
+
+    dft_nonlocal.main(["--grid", "4,4,4", "--iterations", "1", "--csv", str(csv_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["projector_count"] > 0
+    assert payload["nonlocal_applied"]
+    assert payload["dense_vs_operator_max_error"] < 1e-5
+    assert csv_path.read_text().startswith("case,grid_shape")
+
+
+def test_dft_solver_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "dft_solver.csv"
+
+    dft_solver.main(["--grid", "4,4,4", "--iterations", "1", "--csv", str(csv_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["eigenvalue_error"] < 1e-6
+    assert "davidson_metadata" in payload
+    assert csv_path.read_text().startswith("grid_shape,grid_points")
+
+
+def test_dft_spin_kpoints_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "dft_spin_kpoints.csv"
+
+    dft_spin_kpoints.main(["--csv", str(csv_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["band_reused_density"]
+    assert payload["band_shape"] == [3, 1]
+    assert csv_path.read_text().startswith("kpoint_count,occupation_count")
+
+
+def test_dft_relaxation_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "dft_relaxation.csv"
+
+    dft_relaxation.main(["--csv", str(csv_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["steps_completed"] == 1
+    assert "stress" in payload
+    assert csv_path.read_text().startswith("status,steps_completed")

@@ -378,8 +378,10 @@ def test_dft_system_ions_default_electron_count_and_run_scf_for_gth_and_upf():
     assert gth_result.to_dict()["pseudopotential_format"] == "gth"
     assert upf_result.to_dict()["pseudopotential_format"] == "upf"
     assert upf_result.to_dict()["nonlocal_available"]
-    assert not upf_result.to_dict()["nonlocal_applied"]
+    assert upf_result.to_dict()["nonlocal_applied"]
+    assert upf_result.to_dict()["nonlocal_projector_count"] > 0
     assert "local_pseudopotential" in upf_result.energy_by_term
+    assert "nonlocal_pseudopotential" in upf_result.energy_by_term
 
 
 def test_ion_local_force_matches_fixed_density_finite_difference():

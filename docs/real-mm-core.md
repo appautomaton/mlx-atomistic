@@ -84,9 +84,9 @@ Programmatic examples now include:
 - small ionic cluster
 - mixed typed LJ fluid
 
-The notebook `notebooks/05-real-mm-core.ipynb` demonstrates the full workflow:
-system construction, force-field assignment, constraints, I/O round trip,
-restart, diagnostics, and benchmark rows.
+The notebook `notebooks/workflows/01-md-molecular-mechanics.ipynb` demonstrates
+the active MM workflow: system construction, force-field assignment,
+constraints, trajectory diagnostics, and energy decomposition.
 
 ## Remaining Boundaries
 

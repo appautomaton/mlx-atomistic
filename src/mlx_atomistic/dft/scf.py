@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Literal
 
@@ -14,7 +14,10 @@ from mlx_atomistic.dft.density import density_from_orbitals
 from mlx_atomistic.dft.fft import fft_backend
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.nonlocal_pseudopotential import NonlocalPseudopotentialOperator
 from mlx_atomistic.dft.operators import (
+    DavidsonDiagonalizer,
+    EigensolverConfig,
     KohnShamOperator,
     orbital_residuals,
     orthonormality_error,
@@ -33,7 +36,7 @@ from mlx_atomistic.dft.xc import (
     LDAExchangeCorrelation,
 )
 
-SCFSolver = Literal["auto", "dense", "gradient"]
+SCFSolver = Literal["auto", "dense", "gradient", "davidson"]
 SCFConvergenceMode = Literal["density", "energy", "either", "both"]
 SCFMixer = Literal["linear", "diis"]
 
@@ -58,6 +61,8 @@ class SCFConfig:
     orbital_tolerance: float | None = None
     max_density_residual: float | None = 1e6
     max_orthonormality_error: float = 1e-3
+    apply_nonlocal: bool = True
+    eigensolver_config: EigensolverConfig = field(default_factory=EigensolverConfig)
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -72,8 +77,8 @@ class SCFConfig:
         if self.step_size <= 0.0:
             msg = "step_size must be positive"
             raise ValueError(msg)
-        if self.solver not in {"auto", "dense", "gradient"}:
-            msg = "solver must be 'auto', 'dense', or 'gradient'"
+        if self.solver not in {"auto", "dense", "gradient", "davidson"}:
+            msg = "solver must be 'auto', 'dense', 'gradient', or 'davidson'"
             raise ValueError(msg)
         if self.max_dense_grid_points <= 0:
             msg = "max_dense_grid_points must be positive"
@@ -134,6 +139,9 @@ class SCFResult:
     valence_electron_count: float | None = None
     nonlocal_available: bool = False
     nonlocal_applied: bool = False
+    nonlocal_projector_count: int = 0
+    force_provenance: dict | None = None
+    solver_metadata: dict | None = None
 
     def to_dict(self) -> dict:
         """Return a JSON-safe summary without dense array payloads."""
@@ -174,6 +182,9 @@ class SCFResult:
             "valence_electron_count": self.valence_electron_count,
             "nonlocal_available": self.nonlocal_available,
             "nonlocal_applied": self.nonlocal_applied,
+            "nonlocal_projector_count": self.nonlocal_projector_count,
+            "force_provenance": self.force_provenance,
+            "solver_metadata": {} if self.solver_metadata is None else dict(self.solver_metadata),
         }
 
 
@@ -262,7 +273,7 @@ def _local_field(
 
 def _choose_solver(config: SCFConfig, grid: RealSpaceGrid) -> str:
     if config.solver == "auto":
-        return "dense" if grid.size <= config.max_dense_grid_points else "gradient"
+        return "dense" if grid.size <= config.max_dense_grid_points else "davidson"
     if config.solver == "dense" and grid.size > config.max_dense_grid_points:
         msg = "dense SCF solver requested for grid larger than max_dense_grid_points"
         raise ValueError(msg)
@@ -283,6 +294,7 @@ def _dense_lowest_orbitals(
     grid: RealSpaceGrid,
     *,
     n_orbitals: int,
+    nonlocal_operator: NonlocalPseudopotentialOperator | None = None,
 ) -> mx.array:
     v_np = np.array(potential, dtype=np.float64).reshape(-1)
     reciprocal = ReciprocalGrid.from_real_space(grid)
@@ -293,6 +305,11 @@ def _dense_lowest_orbitals(
         basis[index] = 1.0
         basis_grid = basis.reshape(grid.shape)
         kinetic = np.fft.ifftn(0.5 * g2 * np.fft.fftn(basis_grid)).reshape(-1)
+        if nonlocal_operator is not None and nonlocal_operator.available:
+            kinetic = kinetic + np.array(
+                nonlocal_operator.apply(mx.array(basis_grid.astype(np.complex64))),
+                dtype=np.complex128,
+            ).reshape(-1)
         columns.append(kinetic)
     hamiltonian = np.column_stack(columns)
     hamiltonian += np.diag(v_np)
@@ -332,8 +349,8 @@ def _field_residual(old_field: mx.array, new_field: mx.array, grid: RealSpaceGri
 
 
 def _assert_finite(*fields: mx.array) -> None:
-    for field in fields:
-        if not bool(mx.all(mx.isfinite(field))):
+    for array in fields:
+        if not bool(mx.all(mx.isfinite(array))):
             msg = "SCF produced NaN or infinite values"
             raise FloatingPointError(msg)
 
@@ -350,6 +367,8 @@ def _empty_timings() -> dict[str, float]:
         "operator_ms": 0.0,
         "orthonormality_ms": 0.0,
         "diagonalization_ms": 0.0,
+        "preconditioner_ms": 0.0,
+        "nonlocal_ms": 0.0,
         "total_scf_ms": 0.0,
     }
 
@@ -387,6 +406,7 @@ def _energy_terms(
     occupations: Sequence[float],
     timings: dict[str, float],
     timing_enabled: bool,
+    nonlocal_operator: NonlocalPseudopotentialOperator | None = None,
 ) -> dict[str, mx.array]:
     start = perf_counter()
     kinetic = _kinetic_energy_timed(orbitals, grid, occupations=occupations)
@@ -394,11 +414,16 @@ def _energy_terms(
     start = perf_counter()
     local = mx.sum(density * v_local) * grid.dv
     hartree = 0.5 * mx.sum(density * v_hartree) * grid.dv
-    total = kinetic + local + hartree + xc_energy
+    if nonlocal_operator is None or not nonlocal_operator.available:
+        nonlocal_energy = mx.array(0.0, dtype=mx.float32)
+    else:
+        nonlocal_energy = nonlocal_operator.energy(orbitals, occupations=occupations)
+    total = kinetic + local + nonlocal_energy + hartree + xc_energy
     _add_timing(timings, "energy_ms", start, enabled=timing_enabled)
     return {
         "kinetic": kinetic,
         "local": local,
+        "nonlocal_pseudopotential": nonlocal_energy,
         "hartree": hartree,
         "xc": xc_energy,
         "total": total,
@@ -512,6 +537,40 @@ def _initial_density_or_default(
     return density * (electron_count / count)
 
 
+def _nonlocal_force_correction(
+    system: DFTSystem,
+    grid: RealSpaceGrid,
+    orbitals: mx.array,
+    *,
+    occupations: Sequence[float],
+    displacement: float = 1e-3,
+) -> mx.array:
+    """Fixed-orbital finite-difference nonlocal force correction."""
+
+    if system.ions is None:
+        return mx.zeros((system.center_count, 3), dtype=mx.float32)
+    centers = np.array(system.centers, dtype=np.float64)
+    correction = np.zeros_like(centers)
+    for center_index in range(system.center_count):
+        for axis in range(3):
+            plus = centers.copy()
+            minus = centers.copy()
+            plus[center_index, axis] += displacement
+            minus[center_index, axis] -= displacement
+            plus_operator = NonlocalPseudopotentialOperator.from_ions(
+                system.ions.with_positions(plus),
+                grid,
+            )
+            minus_operator = NonlocalPseudopotentialOperator.from_ions(
+                system.ions.with_positions(minus),
+                grid,
+            )
+            e_plus = float(plus_operator.energy(orbitals, occupations=occupations))
+            e_minus = float(minus_operator.energy(orbitals, occupations=occupations))
+            correction[center_index, axis] = -(e_plus - e_minus) / (2.0 * displacement)
+    return mx.array(correction.astype(np.float32))
+
+
 def _history_row(
     iteration: int,
     density_residual: float,
@@ -537,6 +596,9 @@ def _history_row(
         "kinetic": float(energy_terms["kinetic"]),
         "local": float(energy_terms["local"]),
         "local_pseudopotential_energy": float(energy_terms["local"]),
+        "nonlocal_pseudopotential": float(
+            energy_terms.get("nonlocal_pseudopotential", mx.array(0.0))
+        ),
         "hartree": float(energy_terms["hartree"]),
         "xc": float(energy_terms["xc"]),
         "exchange": float(energy_terms.get("exchange", energy_terms["xc"])),
@@ -619,6 +681,19 @@ def run_scf(
         ion_count = len(local_input.ions.ions)
         valence_electron_count = local_input.ions.valence_electron_count
         nonlocal_available = local_input.nonlocal_available
+    nonlocal_operator = None
+    nonlocal_projector_count = 0
+    if (
+        config.apply_nonlocal
+        and isinstance(local_input, LocalPseudopotentialField)
+        and local_input.nonlocal_available
+    ):
+        start = perf_counter()
+        nonlocal_operator = NonlocalPseudopotentialOperator.from_ions(local_input.ions, grid)
+        nonlocal_projector_count = nonlocal_operator.projectors.count
+        _add_timing(timings, "nonlocal_ms", start, enabled=config.record_timing)
+    nonlocal_applied = nonlocal_operator is not None and nonlocal_operator.available
+    solver_metadata: dict = {"solver": solver}
 
     for iteration in range(1, config.max_iterations + 1):
         start = perf_counter()
@@ -645,7 +720,24 @@ def run_scf(
                 effective_potential,
                 grid,
                 n_orbitals=n_occ_orbitals,
+                nonlocal_operator=nonlocal_operator,
             )
+        elif solver == "davidson":
+            iteration_operator = KohnShamOperator.from_density(
+                grid,
+                v_local,
+                density,
+                xc_functional=xc_functional,
+                density_floor=config.density_floor,
+                nonlocal_operator=nonlocal_operator,
+            )
+            diagonalized = DavidsonDiagonalizer(config.eigensolver_config).solve(
+                iteration_operator,
+                n_orbitals=n_occ_orbitals,
+                initial_orbitals=orbitals,
+            )
+            next_orbitals = diagonalized.orbitals
+            solver_metadata = diagonalized.metadata
         else:
             next_orbitals = _gradient_step_orbitals(
                 orbitals,
@@ -658,6 +750,8 @@ def run_scf(
             timings["solver_ms"] += solver_elapsed_ms
             if solver == "dense":
                 timings["diagonalization_ms"] += solver_elapsed_ms
+            elif solver == "davidson":
+                timings["preconditioner_ms"] += solver_elapsed_ms
 
         next_density = density_from_orbitals(
             next_orbitals,
@@ -692,6 +786,7 @@ def run_scf(
             occupations=occupation_values,
             timings=timings,
             timing_enabled=config.record_timing,
+            nonlocal_operator=nonlocal_operator,
         )
         _add_xc_components(
             energy_terms,
@@ -710,6 +805,7 @@ def run_scf(
             density,
             xc_functional=xc_functional,
             density_floor=config.density_floor,
+            nonlocal_operator=nonlocal_operator,
         )
         iteration_eigenvalues = iteration_operator.rayleigh_quotients(orbitals)
         iteration_residuals = orbital_residuals(orbitals, iteration_operator, iteration_eigenvalues)
@@ -759,8 +855,25 @@ def run_scf(
         start = perf_counter()
         if isinstance(local_input, LocalGaussianPseudopotential):
             forces = local_pseudopotential_forces(density, grid, local_input)
+            force_provenance = {
+                "local_analytic": True,
+                "nonlocal_finite_difference": False,
+                "center_center": system is not None,
+            }
         else:
             forces = local_input.forces(density, grid)
+            if nonlocal_applied and system is not None:
+                forces = forces + _nonlocal_force_correction(
+                    system,
+                    grid,
+                    orbitals,
+                    occupations=occupation_values,
+                )
+            force_provenance = {
+                "local_analytic": True,
+                "nonlocal_finite_difference": bool(nonlocal_applied),
+                "center_center": system is not None,
+            }
         if system is not None:
             forces = forces + mx.array(center_center_forces(system), dtype=forces.dtype)
         _add_timing(timings, "force_ms", start, enabled=config.record_timing)
@@ -772,6 +885,7 @@ def run_scf(
         density,
         xc_functional=xc_functional,
         density_floor=config.density_floor,
+        nonlocal_operator=nonlocal_operator,
     )
     orbital_eigenvalues = final_operator.rayleigh_quotients(orbitals)
     orbital_residual_values = orbital_residuals(orbitals, final_operator, orbital_eigenvalues)
@@ -794,6 +908,7 @@ def run_scf(
     energy_by_term["center_center"] = center_energy
     energy_by_term["total"] = electronic_energy + center_energy
     energy_by_term["local_pseudopotential"] = energy_by_term["local"]
+    energy_by_term.setdefault("nonlocal_pseudopotential", 0.0)
     if converged:
         status = "converged"
     elif failure_reason == "max_iterations_reached":
@@ -829,5 +944,8 @@ def run_scf(
         ion_count=ion_count,
         valence_electron_count=valence_electron_count,
         nonlocal_available=nonlocal_available,
-        nonlocal_applied=False,
+        nonlocal_applied=nonlocal_applied,
+        nonlocal_projector_count=nonlocal_projector_count,
+        force_provenance=locals().get("force_provenance"),
+        solver_metadata=solver_metadata,
     )

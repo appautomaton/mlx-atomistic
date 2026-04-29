@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import erf, pi, sqrt
 from pathlib import Path
@@ -102,6 +102,7 @@ class NonlocalProjectorData:
     radial_grid: RadialGrid | None = None
     cutoff_radius: float | None = None
     coefficients: tuple[float, ...] = ()
+    coupling: float = 0.0
     metadata: dict[str, str | int | float] | None = None
 
 
@@ -359,6 +360,24 @@ def read_upf(path: str | Path) -> PseudopotentialData:
                 metadata=metadata,
             )
         )
+    dij_node = root.find("./PP_NONLOCAL/PP_DIJ")
+    if dij_node is not None and projectors:
+        dij = 0.5 * _numbers(dij_node.text)
+        size = int(round(np.sqrt(float(dij.size))))
+        if size * size == dij.size and size >= len(projectors):
+            matrix = dij.reshape((size, size))
+            projectors = [
+                replace(
+                    projector,
+                    coupling=float(matrix[index, index]),
+                    coefficients=(float(matrix[index, index]),),
+                    metadata={
+                        **({} if projector.metadata is None else projector.metadata),
+                        "dij_diagonal_hartree": float(matrix[index, index]),
+                    },
+                )
+                for index, projector in enumerate(projectors)
+            ]
     metadata: dict[str, str | int | float | bool] = {
         "source_path": str(path),
         "version": root.attrib.get("version", ""),
@@ -434,6 +453,7 @@ def read_gth(
                 angular_momentum=angular,
                 cutoff_radius=radius,
                 coefficients=coefficients_line,
+                coupling=_first_nonzero(coefficients_line, default=1.0),
                 metadata={
                     "source": "gth",
                     "n_projectors": n_projectors,
@@ -553,6 +573,13 @@ def _leading_floats(tokens: Sequence[str]) -> list[float]:
         except ValueError:
             break
     return values
+
+
+def _first_nonzero(values: Sequence[float], *, default: float) -> float:
+    for value in values:
+        if abs(value) > 1e-12:
+            return float(value)
+    return default
 
 
 def _required(value: float | None, name: str) -> float:

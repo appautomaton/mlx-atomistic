@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft.fft import fft3, ifft3
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
+from mlx_atomistic.dft.nonlocal_pseudopotential import NonlocalPseudopotentialOperator
 from mlx_atomistic.dft.potentials import hartree_potential
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional, LDAExchangeCorrelation
 
@@ -37,13 +39,24 @@ def _orthonormalize_numpy(orbitals: np.ndarray, grid: RealSpaceGrid) -> np.ndarr
     return (q[:, : stack.shape[0]].T / np.sqrt(grid.dv)).reshape(stack.shape).astype(np.complex64)
 
 
-def apply_kinetic(orbitals: mx.array, grid: RealSpaceGrid) -> mx.array:
+def apply_kinetic(
+    orbitals: mx.array,
+    grid: RealSpaceGrid,
+    *,
+    kpoint: Sequence[float] | None = None,
+) -> mx.array:
     """Apply the plane-wave kinetic operator ``-1/2 ∇²``."""
 
     stack, was_single = _as_orbital_stack(orbitals, grid)
     reciprocal = ReciprocalGrid.from_real_space(grid)
+    if kpoint is None:
+        kinetic_g2 = reciprocal.g2
+    else:
+        k = mx.reshape(mx.array(kpoint, dtype=mx.float32), (1, 1, 1, 3))
+        shifted = reciprocal.vectors + k
+        kinetic_g2 = mx.sum(shifted * shifted, axis=-1)
     applied = mx.stack(
-        [ifft3(0.5 * reciprocal.g2 * fft3(stack[index])) for index in range(stack.shape[0])],
+        [ifft3(0.5 * kinetic_g2 * fft3(stack[index])) for index in range(stack.shape[0])],
         axis=0,
     )
     return _restore_orbital_shape(applied, was_single)
@@ -85,6 +98,8 @@ class KohnShamOperator:
     hartree: mx.array
     xc_potential: mx.array
     effective_potential: mx.array
+    nonlocal_operator: NonlocalPseudopotentialOperator | None = None
+    kpoint: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     @classmethod
     def from_density(
@@ -95,6 +110,8 @@ class KohnShamOperator:
         *,
         xc_functional: ExchangeCorrelationFunctional | None = None,
         density_floor: float = 1e-12,
+        nonlocal_operator: NonlocalPseudopotentialOperator | None = None,
+        kpoint: Sequence[float] | None = None,
     ) -> KohnShamOperator:
         """Build an operator from ``ρ`` and a local potential."""
 
@@ -109,12 +126,16 @@ class KohnShamOperator:
             hartree=hartree,
             xc_potential=xc.potential,
             effective_potential=effective,
+            nonlocal_operator=nonlocal_operator,
+            kpoint=(0.0, 0.0, 0.0)
+            if kpoint is None
+            else tuple(float(value) for value in kpoint),
         )
 
     def apply_kinetic(self, orbitals: mx.array) -> mx.array:
         """Apply only the kinetic part."""
 
-        return apply_kinetic(orbitals, self.grid)
+        return apply_kinetic(orbitals, self.grid, kpoint=self.kpoint)
 
     def apply_local_potential(self, orbitals: mx.array) -> mx.array:
         """Apply only the external local potential."""
@@ -129,10 +150,13 @@ class KohnShamOperator:
     def apply_hamiltonian(self, orbitals: mx.array) -> mx.array:
         """Apply ``H = T + V_eff``."""
 
-        return self.apply_kinetic(orbitals) + apply_local_potential(
+        applied = self.apply_kinetic(orbitals) + apply_local_potential(
             orbitals,
             self.effective_potential,
         )
+        if self.nonlocal_operator is not None and self.nonlocal_operator.available:
+            applied = applied + self.nonlocal_operator.apply(orbitals)
+        return applied
 
     def rayleigh_quotients(self, orbitals: mx.array) -> mx.array:
         """Return ``<ψᵢ|H|ψᵢ>/<ψᵢ|ψᵢ>`` for each orbital."""
@@ -186,6 +210,7 @@ class DiagonalizationResult:
     orthonormality_error: float
     iterations: int
     converged: bool
+    metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """Return a JSON-safe summary."""
@@ -196,6 +221,7 @@ class DiagonalizationResult:
             "orthonormality_error": self.orthonormality_error,
             "iterations": self.iterations,
             "converged": self.converged,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -242,6 +268,7 @@ class DenseHamiltonianReference:
             orthonormality_error=orthonormality_error(orbitals_mx, self.operator.grid),
             iterations=1,
             converged=True,
+            metadata={"solver": "dense-reference"},
         )
 
 
@@ -269,4 +296,127 @@ class SubspaceDiagonalizer:
             orthonormality_error=result.orthonormality_error,
             iterations=1,
             converged=max_residual <= self.tolerance,
+            metadata={"solver": "subspace-dense-reference"},
+        )
+
+
+@dataclass(frozen=True)
+class EigensolverConfig:
+    """Configuration for iterative Kohn-Sham eigensolvers."""
+
+    max_iterations: int = 16
+    tolerance: float = 1e-6
+    max_subspace_size: int = 12
+    dense_fallback_size: int = 512
+
+    def __post_init__(self) -> None:
+        if self.max_iterations <= 0:
+            msg = "max_iterations must be positive"
+            raise ValueError(msg)
+        if self.tolerance <= 0.0:
+            msg = "tolerance must be positive"
+            raise ValueError(msg)
+        if self.max_subspace_size <= 0:
+            msg = "max_subspace_size must be positive"
+            raise ValueError(msg)
+        if self.dense_fallback_size <= 0:
+            msg = "dense_fallback_size must be positive"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class KineticPreconditioner:
+    """Simple reciprocal-space kinetic preconditioner."""
+
+    shift: float = 0.5
+
+    def apply(self, residual: mx.array, operator: KohnShamOperator) -> mx.array:
+        """Apply ``1 / (0.5|G+k|² + shift)`` to a residual."""
+
+        reciprocal = ReciprocalGrid.from_real_space(operator.grid)
+        k = mx.reshape(mx.array(operator.kpoint, dtype=mx.float32), (1, 1, 1, 3))
+        shifted = reciprocal.vectors + k
+        denominator = 0.5 * mx.sum(shifted * shifted, axis=-1) + self.shift
+        return ifft3(fft3(residual) / denominator)
+
+
+@dataclass(frozen=True)
+class DavidsonDiagonalizer:
+    """Small block Davidson-style eigensolver.
+
+    The dense reference path is still used for tiny grids. Above that cutoff,
+    this applies a conservative preconditioned residual iteration that avoids
+    building the dense Hamiltonian.
+    """
+
+    config: EigensolverConfig = field(default_factory=EigensolverConfig)
+    preconditioner: KineticPreconditioner = field(default_factory=KineticPreconditioner)
+
+    def solve(
+        self,
+        operator: KohnShamOperator,
+        *,
+        n_orbitals: int,
+        initial_orbitals: mx.array | None = None,
+    ) -> DiagonalizationResult:
+        """Solve for the lowest occupied orbitals."""
+
+        if operator.grid.size <= self.config.dense_fallback_size:
+            result = DenseHamiltonianReference(operator).diagonalize(n_orbitals)
+            return DiagonalizationResult(
+                eigenvalues=result.eigenvalues,
+                orbitals=result.orbitals,
+                residuals=result.residuals,
+                orthonormality_error=result.orthonormality_error,
+                iterations=result.iterations,
+                converged=result.converged,
+                metadata={
+                    "solver": "davidson-dense-reference",
+                    "subspace_size": operator.grid.size,
+                    "restart_count": 0,
+                },
+            )
+
+        if initial_orbitals is None:
+            rng = np.random.default_rng(17)
+            trial = rng.normal(size=(n_orbitals, *operator.grid.shape)).astype(np.float32)
+            orbitals = mx.array(_orthonormalize_numpy(trial, operator.grid))
+        else:
+            orbitals = mx.array(_orthonormalize_numpy(np.array(initial_orbitals), operator.grid))
+        eigenvalues = operator.rayleigh_quotients(orbitals)
+        converged = False
+        restart_count = 0
+        for iteration in range(1, self.config.max_iterations + 1):
+            applied, _ = _as_orbital_stack(operator.apply_hamiltonian(orbitals), operator.grid)
+            stack, _ = _as_orbital_stack(orbitals, operator.grid)
+            updates = []
+            residual_values = []
+            for index in range(n_orbitals):
+                residual = applied[index] - eigenvalues[index] * stack[index]
+                residual_values.append(mx.sqrt(mx.sum(mx.abs(residual) ** 2) * operator.grid.dv))
+                updates.append(stack[index] - 0.35 * self.preconditioner.apply(residual, operator))
+            orbitals = mx.array(_orthonormalize_numpy(np.array(mx.stack(updates)), operator.grid))
+            eigenvalues = operator.rayleigh_quotients(orbitals)
+            residuals = mx.stack(residual_values)
+            if float(mx.max(residuals)) <= self.config.tolerance:
+                converged = True
+                break
+            if iteration % self.config.max_subspace_size == 0:
+                restart_count += 1
+        residuals = orbital_residuals(orbitals, operator, eigenvalues)
+        return DiagonalizationResult(
+            eigenvalues=eigenvalues,
+            orbitals=orbitals,
+            residuals=residuals,
+            orthonormality_error=orthonormality_error(orbitals, operator.grid),
+            iterations=iteration,
+            converged=converged,
+            metadata={
+                "solver": "davidson-preconditioned-residual",
+                "subspace_size": min(
+                    self.config.max_subspace_size,
+                    self.config.max_iterations,
+                ),
+                "restart_count": restart_count,
+            },
         )
