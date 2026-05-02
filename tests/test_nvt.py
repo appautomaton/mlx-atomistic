@@ -56,6 +56,29 @@ def test_simulate_nvt_sparse_sampling_counts_and_temperature_error():
     )
 
 
+def test_simulate_nvt_sparse_diagnostics_use_diagnostic_axis():
+    positions, velocities, cell, potential = _small_system()
+    result = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        config=SimulationConfig(
+            dt=0.002,
+            steps=5,
+            sample_interval=5,
+            diagnostic_interval=2,
+        ),
+        thermostat=LangevinThermostat(temperature=1.25, friction=0.5, seed=11),
+    )
+
+    assert np.array(result.sampled_steps).tolist() == [0, 5]
+    assert np.array(result.diagnostic_steps).tolist() == [0, 2, 4, 5]
+    np.testing.assert_allclose(np.array(result.diagnostic_time), [0.0, 0.004, 0.008, 0.01])
+    assert np.array(result.total_energy).shape == (4,)
+    assert np.array(result.temperature).shape == (4,)
+
+
 def test_seeded_nvt_runs_are_reproducible():
     positions, velocities, cell, potential = _small_system()
     config = SimulationConfig(dt=0.002, steps=5, sample_interval=5)
@@ -142,4 +165,3 @@ def test_dynamic_neighbor_nvt_reports_rebuilds():
 
     assert int(np.array(result.rebuild_count)[-1]) >= 1
     assert int(np.array(result.pair_count)[-1]) > 0
-

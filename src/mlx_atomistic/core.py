@@ -14,8 +14,9 @@ DEFAULT_DTYPE = mx.float32
 def use_cpu_device() -> None:
     """Route subsequent MLX operations to the CPU device."""
 
-    mx.set_default_device(mx.cpu)
-    mx.set_default_stream(mx.new_stream(mx.cpu))
+    cpu = mx.Device(mx.cpu, 0)
+    mx.set_default_device(cpu)
+    mx.set_default_stream(mx.new_stream(cpu))
 
 
 def as_mx_array(value, *, dtype=DEFAULT_DTYPE) -> mx.array:

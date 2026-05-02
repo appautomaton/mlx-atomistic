@@ -52,6 +52,13 @@ tmp/
 *.hdf5
 *.xyz
 *.traj
+notebooks/ligand-receptor-motion/data/cache/
+notebooks/ligand-receptor-motion/data/gpcrmd-cache/
+notebooks/ligand-receptor-motion/data/gpcrmd-mlx/
+notebooks/ligand-receptor-motion/data/mlx-real-md/
+notebooks/ligand-receptor-motion/data/prepared/
+notebooks/ligand-receptor-motion/data/processed/
+notebooks/archive/atp-pocket-mlx-demo/data/prepared/
 
 # Reference checkouts only. Keep manifests tracked; fetch sources locally.
 vendors/*

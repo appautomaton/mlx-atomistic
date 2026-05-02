@@ -12,6 +12,7 @@ from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.forcefields import (
     HarmonicAnglePotential,
     HarmonicBondPotential,
+    ImproperDihedralPotential,
     NonbondedPotential,
     PeriodicDihedralPotential,
 )
@@ -245,6 +246,11 @@ class DihedralParameter:
 
 
 @dataclass(frozen=True)
+class ImproperParameter(DihedralParameter):
+    """Periodic improper torsion parameter for a reversible atom-type quartet."""
+
+
+@dataclass(frozen=True)
 class ForceField:
     """Small programmatic force-field parameter set."""
 
@@ -253,11 +259,13 @@ class ForceField:
     bonds: Sequence[BondParameter] = ()
     angles: Sequence[AngleParameter] = ()
     dihedrals: Sequence[DihedralParameter] = ()
+    impropers: Sequence[ImproperParameter] = ()
     lj_one_four_scale: float = 1.0
     coulomb_one_four_scale: float = 1.0
     cutoff: float | None = 2.5
     lj_shift: bool = True
     coulomb_shift: bool = False
+    switch_distance: float | None = None
     coulomb_constant: float = 1.0
 
     def __post_init__(self) -> None:
@@ -267,11 +275,19 @@ class ForceField:
         if self.cutoff is not None and self.cutoff <= 0.0:
             msg = "cutoff must be positive"
             raise ValueError(msg)
+        if self.switch_distance is not None:
+            if self.cutoff is None:
+                msg = "switch_distance requires a cutoff"
+                raise ValueError(msg)
+            if self.switch_distance < 0.0 or self.switch_distance >= self.cutoff:
+                msg = "switch_distance must be non-negative and smaller than cutoff"
+                raise ValueError(msg)
         object.__setattr__(self, "atom_types", tuple(self.atom_types))
         object.__setattr__(self, "nonbonded", tuple(self.nonbonded))
         object.__setattr__(self, "bonds", tuple(self.bonds))
         object.__setattr__(self, "angles", tuple(self.angles))
         object.__setattr__(self, "dihedrals", tuple(self.dihedrals))
+        object.__setattr__(self, "impropers", tuple(self.impropers))
 
     @property
     def atom_type_masses(self) -> dict[str, float]:
@@ -316,6 +332,9 @@ class ForceField:
         dihedral_terms = self._dihedral_terms(system)
         if dihedral_terms is not None:
             terms.append(dihedral_terms)
+        improper_terms = self._improper_terms(system)
+        if improper_terms is not None:
+            terms.append(improper_terms)
         terms.append(
             NonbondedPotential(
                 sigma=sigmas,
@@ -325,6 +344,7 @@ class ForceField:
                 cutoff=self.cutoff,
                 lj_shift=self.lj_shift,
                 coulomb_shift=self.coulomb_shift,
+                switch_distance=self.switch_distance,
                 lj_one_four_scale=self.lj_one_four_scale,
                 coulomb_one_four_scale=self.coulomb_one_four_scale,
                 coulomb_constant=self.coulomb_constant,
@@ -407,6 +427,40 @@ class ForceField:
             phase=phases,
         )
 
+    def _improper_terms(self, system: MMSystem):
+        impropers = np.asarray(system.topology.impropers, dtype=np.int32)
+        if impropers.size == 0:
+            return None
+        parameters = {
+            _symmetric_key(parameter.atom_types): parameter for parameter in self.impropers
+        }
+        k_values: list[float] = []
+        periodicities: list[float] = []
+        phases: list[float] = []
+        for atom_i, atom_j, atom_k, atom_m in impropers.tolist():
+            atom_types = (
+                system.atom_types[atom_i],
+                system.atom_types[atom_j],
+                system.atom_types[atom_k],
+                system.atom_types[atom_m],
+            )
+            parameter = parameters.get(_symmetric_key(atom_types))
+            if parameter is None:
+                msg = (
+                    "missing improper parameter for improper "
+                    f"({atom_i}, {atom_j}, {atom_k}, {atom_m}) types {atom_types}"
+                )
+                raise ValueError(msg)
+            k_values.append(float(parameter.k))
+            periodicities.append(float(parameter.periodicity))
+            phases.append(float(parameter.phase))
+        return ImproperDihedralPotential(
+            impropers,
+            k=k_values,
+            periodicity=periodicities,
+            phase=phases,
+        )
+
 
 __all__ = [
     "AngleParameter",
@@ -414,6 +468,7 @@ __all__ = [
     "BondParameter",
     "DihedralParameter",
     "ForceField",
+    "ImproperParameter",
     "MMSystem",
     "NonbondedParameter",
 ]

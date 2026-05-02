@@ -1,0 +1,61 @@
+{
+  "default_dataset": "glp1r-exendin4-wt-partial-unbinding",
+  "datasets": [
+    {
+      "id": "glp1r-exendin4-wt-partial-unbinding",
+      "title": "GLP-1R Exendin-4 partial binding/unbinding trajectory",
+      "source_url": "https://zenodo.org/records/5578864",
+      "doi": "10.5281/zenodo.5578864",
+      "license": "CC-BY-4.0",
+      "description": "Peptide agonist partial binding/unbinding trajectory from GLP-1R simulations. Water, lipids, and ions were removed by the data authors.",
+      "topology": {
+        "filename": "Exe4_WT.psf",
+        "url": "https://zenodo.org/api/records/5578864/files/Exe4_WT.psf/content",
+        "size_bytes": 1768549,
+        "checksum": "md5:375c5d31a27bb7d67a3c828030240fd1"
+      },
+      "trajectory": {
+        "filename": "merged_Exe4-WT.xtc",
+        "url": "https://zenodo.org/api/records/5578864/files/merged_Exe4-WT.xtc/content",
+        "size_bytes": 212129820,
+        "checksum": "md5:2945bf74c36431cb235858d983d62e6d"
+      },
+      "receptor_selection": "protein and not (resid 1:39)",
+      "ligand_selection": "protein and resid 1:39",
+      "align_selection": "protein and not (resid 1:39) and name CA",
+      "motion_gate": {
+        "min_ligand_com_displacement_A": 8.0,
+        "min_contact_count_delta": 10,
+        "contact_cutoff_A": 4.5
+      }
+    },
+    {
+      "id": "sarscov2-mpro-n3-equilibrium",
+      "title": "SARS-CoV-2 main protease with N3 ligand equilibrium trajectory",
+      "source_url": "https://zenodo.org/records/4061192",
+      "doi": "10.5281/zenodo.4061192",
+      "license": "CC-BY-4.0",
+      "description": "Main protease holo trajectory with N3 ligand. This is a fallback candidate and may fail the visible unbinding motion gate.",
+      "topology": {
+        "filename": "6lu7_monomer_with_N3_protein_with_ligand_sim2.pdb",
+        "url": "https://zenodo.org/api/records/4061192/files/6lu7_monomer_with_N3_protein_with_ligand_sim2.pdb/content",
+        "size_bytes": 377752,
+        "checksum": "md5:a559a472a57ce4db05740e082701af43"
+      },
+      "trajectory": {
+        "filename": "6lu7_monomer_with_N3_protein_with_ligand_sim2.xtc",
+        "url": "https://zenodo.org/api/records/4061192/files/6lu7_monomer_with_N3_protein_with_ligand_sim2.xtc/content",
+        "size_bytes": 91111172,
+        "checksum": "md5:5061c4cd8efd0e2f4ebcc4b90127d9c7"
+      },
+      "receptor_selection": "protein",
+      "ligand_selection": "resname N3",
+      "align_selection": "protein and name CA",
+      "motion_gate": {
+        "min_ligand_com_displacement_A": 8.0,
+        "min_contact_count_delta": 10,
+        "contact_cutoff_A": 4.5
+      }
+    }
+  ]
+}

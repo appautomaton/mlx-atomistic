@@ -2,13 +2,19 @@ from math import pi
 
 import numpy as np
 
+from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
     HarmonicBondPotential,
+    ImproperDihedralPotential,
+    NonbondedPotential,
+    PairRestrictedNonbondedPotential,
     PeriodicDihedralPotential,
 )
 from mlx_atomistic.md import LennardJonesPotential
+from mlx_atomistic.nonbonded import EwaldReferenceConfig, ewald_reference_coulomb_energy_forces
+from mlx_atomistic.pme import PMEConfig, pme_coulomb_energy_forces
 from mlx_atomistic.topology import Topology
 
 
@@ -57,6 +63,17 @@ def test_periodic_dihedral_force_matches_finite_difference():
     )
     term = PeriodicDihedralPotential([(0, 1, 2, 3)], k=0.4, periodicity=3.0, phase=0.1)
 
+    assert_force_matches_finite_difference(term, positions, atol=5e-3)
+
+
+def test_improper_dihedral_uses_periodic_form():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.2, 1.0, 0.0], [1.4, 1.1, 0.8]],
+        dtype=np.float32,
+    )
+    term = ImproperDihedralPotential([(0, 1, 2, 3)], k=0.4, periodicity=2.0, phase=0.1)
+
+    assert term.name == "improper"
     assert_force_matches_finite_difference(term, positions, atol=5e-3)
 
 
@@ -136,3 +153,693 @@ def test_coulomb_topology_exclusions_and_one_four_scaling():
 
     expected = (1.0 / 2.0) + (-0.5 / 3.0) + (-1.0 / 1.0) + (1.0 / 2.0) + (-1.0 / 1.0)
     np.testing.assert_allclose(np.array(energy), expected, atol=1e-6)
+
+
+def test_nonbonded_explicit_exception_overrides_regular_pair():
+    positions = np.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=np.float32)
+    excluded = NonbondedPotential(
+        sigma=[1.0, 1.0],
+        epsilon=[1.0, 1.0],
+        charges=[1.0, -1.0],
+        cutoff=None,
+        lj_shift=False,
+        exception_pairs=[(0, 1)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+    )
+    overridden = NonbondedPotential(
+        sigma=[1.0, 1.0],
+        epsilon=[1.0, 1.0],
+        charges=[1.0, -1.0],
+        cutoff=None,
+        lj_shift=False,
+        exception_pairs=[(0, 1)],
+        exception_charge_products=[-0.5],
+        exception_sigma=[1.0],
+        exception_epsilon=[0.25],
+    )
+
+    zero_energy, zero_forces = excluded.energy_forces(positions)
+    override_energy, override_forces = overridden.energy_forces(positions)
+
+    np.testing.assert_allclose(np.array(zero_energy), 0.0, atol=1e-7)
+    np.testing.assert_allclose(np.array(zero_forces), np.zeros_like(positions), atol=1e-7)
+    assert float(np.array(override_energy)) != 0.0
+    assert np.linalg.norm(np.array(override_forces)) > 0.0
+
+
+def test_pair_restricted_nonbonded_matches_explicit_pair_argument():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 1.6, 0.0]],
+        dtype=np.float32,
+    )
+    base = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.2, 0.1, 0.3],
+        charges=[1.0, -0.5, 0.25],
+        cutoff=None,
+        lj_shift=False,
+    )
+    pairs = np.asarray([[0, 2]], dtype=np.int32)
+    restricted = PairRestrictedNonbondedPotential(base, pairs)
+
+    expected_energy, expected_forces = base.energy_forces(positions, pairs=pairs)
+    actual_energy, actual_forces = restricted.energy_forces(positions)
+
+    np.testing.assert_allclose(np.array(actual_energy), np.array(expected_energy), atol=1e-7)
+    np.testing.assert_allclose(np.array(actual_forces), np.array(expected_forces), atol=1e-7)
+
+
+def _bare_coulomb_energy(positions, charges_or_products, pairs):
+    total = 0.0
+    for index, (i, j) in enumerate(pairs):
+        distance = np.linalg.norm(positions[i] - positions[j])
+        if np.asarray(charges_or_products).ndim == 1 and len(charges_or_products) == len(pairs):
+            charge_product = charges_or_products[index]
+        else:
+            charge_product = charges_or_products[i] * charges_or_products[j]
+        total += charge_product / distance
+    return total
+
+
+def _bare_coulomb_energy_forces(positions, charges_or_products, pairs):
+    total = 0.0
+    forces = np.zeros_like(positions, dtype=np.float32)
+    for index, (i, j) in enumerate(pairs):
+        displacement = positions[i] - positions[j]
+        r2 = float(np.sum(displacement * displacement))
+        distance = float(np.sqrt(r2))
+        if np.asarray(charges_or_products).ndim == 1 and len(charges_or_products) == len(pairs):
+            charge_product = float(charges_or_products[index])
+        else:
+            charge_product = float(charges_or_products[i] * charges_or_products[j])
+        total += charge_product / distance
+        pair_force = charge_product / (r2 * distance) * displacement
+        forces[i] += pair_force
+        forces[j] -= pair_force
+    return total, forces
+
+
+def _bare_lj_energy(positions, sigma, epsilon, pairs):
+    total = 0.0
+    for index, (i, j) in enumerate(pairs):
+        distance = np.linalg.norm(positions[i] - positions[j])
+        inv_r = sigma[index] / distance
+        inv_r6 = inv_r**6
+        total += 4.0 * epsilon[index] * (inv_r6 * inv_r6 - inv_r6)
+    return total
+
+
+def test_nonbonded_nbfix_type_pairs_substitute_lj_parameters():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.5, 0.0]],
+        dtype=np.float32,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.2, 1.0],
+        epsilon=[0.2, 0.3, 0.2],
+        charges=[0.0, 0.0, 0.0],
+        atom_types=["H", "O", "H"],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.1],
+        nbfix_type_epsilon=[0.5],
+        cutoff=None,
+        lj_shift=False,
+    )
+
+    energy, forces = term.energy_forces(positions)
+    expected = _bare_lj_energy(
+        positions,
+        sigma=[1.1, 1.0, 1.1],
+        epsilon=[0.5, 0.2, 0.5],
+        pairs=[(0, 1), (0, 2), (1, 2)],
+    )
+
+    np.testing.assert_allclose(np.array(energy), expected, atol=1e-6)
+    assert np.all(np.isfinite(np.array(forces)))
+    assert_force_matches_finite_difference(term, positions, atol=5e-3)
+
+
+def test_nonbonded_nbfix_explicit_pairs_substitute_lj_parameters():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.5, 0.0]],
+        dtype=np.float32,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.2, 1.0],
+        epsilon=[0.2, 0.3, 0.2],
+        charges=[0.0, 0.0, 0.0],
+        nbfix_pairs=[(0, 1)],
+        nbfix_sigma=[1.1],
+        nbfix_epsilon=[0.5],
+        cutoff=None,
+        lj_shift=False,
+    )
+
+    energy, forces = term.energy_forces(positions)
+    expected = _bare_lj_energy(
+        positions,
+        sigma=[1.1, 1.0, 1.1],
+        epsilon=[0.5, 0.2, np.sqrt(0.3 * 0.2)],
+        pairs=[(0, 1), (0, 2), (1, 2)],
+    )
+
+    np.testing.assert_allclose(np.array(energy), expected, atol=1e-6)
+    assert np.all(np.isfinite(np.array(forces)))
+    assert_force_matches_finite_difference(term, positions, atol=5e-3)
+
+
+def test_nonbonded_nbfix_type_pairs_reject_unknown_atom_types():
+    try:
+        NonbondedPotential(
+            sigma=[1.0, 1.2],
+            epsilon=[0.2, 0.3],
+            charges=[0.0, 0.0],
+            atom_types=["H", "O"],
+            nbfix_type_pairs=[("H", "CLGR1")],
+            nbfix_type_sigma=[1.1],
+            nbfix_type_epsilon=[0.5],
+            cutoff=None,
+            lj_shift=False,
+        )
+    except ValueError as err:
+        assert "absent from atom_types" in str(err)
+        assert "CLGR1" in str(err)
+    else:
+        raise AssertionError("NBFIX accepted an unknown atom type")
+
+
+def test_nonbonded_nbfix_respects_topology_exclusions():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.3, 0.0, 0.0], [0.0, 1.6, 0.0]],
+        dtype=np.float32,
+    )
+    topology = Topology.from_sequences(n_atoms=3, bonds=[(0, 1)], exclude_bonds=True)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.2, 1.0],
+        epsilon=[0.2, 0.3, 0.2],
+        charges=[0.0, 0.0, 0.0],
+        topology=topology,
+        atom_types=["H", "O", "H"],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.1],
+        nbfix_type_epsilon=[0.5],
+        cutoff=None,
+        lj_shift=False,
+    )
+
+    energy, _ = term.energy_forces(positions)
+    expected = _bare_lj_energy(
+        positions,
+        sigma=[1.0, 1.1],
+        epsilon=[0.2, 0.5],
+        pairs=[(0, 2), (1, 2)],
+    )
+
+    np.testing.assert_allclose(np.array(energy), expected, atol=1e-6)
+
+
+def test_nonbonded_nbfix_does_not_override_explicit_exceptions():
+    positions = np.array([[0.0, 0.0, 0.0], [1.3, 0.0, 0.0]], dtype=np.float32)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.2],
+        epsilon=[0.2, 0.3],
+        charges=[0.0, 0.0],
+        atom_types=["H", "O"],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.1],
+        nbfix_type_epsilon=[0.5],
+        exception_pairs=[(0, 1)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+        cutoff=None,
+        lj_shift=False,
+    )
+
+    energy, forces = term.energy_forces(positions)
+
+    np.testing.assert_allclose(np.array(energy), 0.0, atol=1e-7)
+    np.testing.assert_allclose(np.array(forces), np.zeros_like(positions), atol=1e-7)
+
+
+def test_nonbonded_ewald_matches_reference_without_lj():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -0.5, -0.5], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = EwaldReferenceConfig(alpha=0.25, real_cutoff=5.0, reciprocal_cutoff=4)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="ewald_reference",
+        ewald_config=config,
+    )
+
+    energy, forces, components = term.energy_forces_with_components(positions, cell)
+    (
+        reference_energy,
+        reference_forces,
+        reference_components,
+    ) = ewald_reference_coulomb_energy_forces(positions, charges, cell, config=config)
+
+    np.testing.assert_allclose(np.array(energy), np.array(reference_energy), atol=1e-6)
+    np.testing.assert_allclose(np.array(forces), np.array(reference_forces), atol=1e-6)
+    for name in ["coulomb_real", "coulomb_reciprocal", "coulomb_self"]:
+        np.testing.assert_allclose(
+            np.array(components[name]),
+            np.array(reference_components[name]),
+            atol=1e-6,
+        )
+
+
+def test_nonbonded_ewald_topology_exclusions_and_exceptions_are_corrections():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.0, 1.0], [2.0, 3.0, 5.0], [7.0, 2.0, 3.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -1.0, 0.5, -0.5], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        nonbonded_exception_pairs=[(0, 2)],
+    )
+    config = EwaldReferenceConfig(alpha=0.25, real_cutoff=5.0, reciprocal_cutoff=4)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="ewald_reference",
+        ewald_config=config,
+        topology=topology,
+        exception_pairs=[(0, 2)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+    )
+
+    energy, _, components = term.energy_forces_with_components(positions, cell)
+    full_ewald, _, _ = ewald_reference_coulomb_energy_forces(
+        positions,
+        charges,
+        cell,
+        config=config,
+    )
+    expected_correction = -_bare_coulomb_energy(positions, charges, [(0, 1), (0, 2)])
+
+    np.testing.assert_allclose(
+        np.array(components["coulomb_exclusion_correction"]),
+        expected_correction,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(np.array(components["coulomb_exception"]), 0.0, atol=1e-7)
+    np.testing.assert_allclose(
+        np.array(energy),
+        np.array(full_ewald) + expected_correction,
+        atol=1e-6,
+    )
+
+
+def test_nonbonded_ewald_one_four_scaling_is_correction_not_double_count():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [3.0, 1.0, 1.0], [4.0, 1.0, 1.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[],
+        dihedrals=[(0, 1, 2, 3)],
+        exclude_bonds=False,
+    )
+    config = EwaldReferenceConfig(alpha=0.25, real_cutoff=5.0, reciprocal_cutoff=4)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="ewald_reference",
+        ewald_config=config,
+        topology=topology,
+        coulomb_one_four_scale=0.5,
+    )
+
+    energy, _, components = term.energy_forces_with_components(positions, cell)
+    full_ewald, _, _ = ewald_reference_coulomb_energy_forces(
+        positions,
+        charges,
+        cell,
+        config=config,
+    )
+    expected_correction = -0.5 * _bare_coulomb_energy(positions, charges, [(0, 3)])
+
+    np.testing.assert_allclose(
+        np.array(components["coulomb_one_four_correction"]),
+        expected_correction,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(energy),
+        np.array(full_ewald) + expected_correction,
+        atol=1e-6,
+    )
+
+
+def test_nonbonded_pme_requires_mesh_config_cell_and_full_system():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -0.5, -0.5], dtype=np.float32)
+
+    try:
+        NonbondedPotential(
+            sigma=[1.0, 1.0, 1.0],
+            epsilon=[0.0, 0.0, 0.0],
+            charges=charges,
+            cutoff=5.0,
+            electrostatics="pme",
+        )
+    except ValueError as err:
+        assert "pme_config" in str(err)
+    else:
+        raise AssertionError("PME nonbonded accepted missing pme_config")
+
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0),
+    )
+    for kwargs, expected in [
+        ({}, "periodic cell"),
+        ({"cell": Cell.orthorhombic([12.0, 0.0, 12.0])}, "positive orthorhombic"),
+        ({"cell": Cell.cubic(12.0), "pairs": np.array([[0, 1]], dtype=np.int32)}, "full-system"),
+    ]:
+        try:
+            term.energy_forces(positions, **kwargs)
+        except ValueError as err:
+            assert expected in str(err)
+        else:
+            raise AssertionError(f"PME nonbonded accepted invalid input: {kwargs}")
+
+
+def test_nonbonded_pme_refuses_non_neutral_background_policy():
+    try:
+        NonbondedPotential(
+            sigma=[1.0, 1.0, 1.0],
+            epsilon=[0.0, 0.0, 0.0],
+            charges=[1.0, -0.5, -0.4],
+            cutoff=5.0,
+            electrostatics="pme",
+            pme_config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0),
+        )
+    except ValueError as err:
+        assert "non-neutral background policy is not implemented" in str(err)
+    else:
+        raise AssertionError("PME nonbonded accepted a non-neutral system")
+
+
+def test_nonbonded_pme_refuses_non_finite_coulomb_constant_and_config_fields():
+    valid_kwargs = {
+        "sigma": [1.0, 1.0],
+        "epsilon": [0.0, 0.0],
+        "charges": [1.0, -1.0],
+        "cutoff": 5.0,
+        "electrostatics": "pme",
+    }
+
+    for value in [np.nan, np.inf, -np.inf]:
+        try:
+            NonbondedPotential(
+                **valid_kwargs,
+                coulomb_constant=value,
+                pme_config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0),
+            )
+        except ValueError as err:
+            assert "coulomb_constant must be finite" in str(err)
+        else:
+            raise AssertionError(f"PME nonbonded accepted coulomb_constant={value}")
+
+    invalid_configs = [
+        (
+            PMEConfig(mesh_shape=(16, 16, 16), alpha=np.nan, real_cutoff=5.0),
+            "pme_config.alpha",
+        ),
+        (
+            PMEConfig(mesh_shape=(16, 16, 16), alpha=np.inf, real_cutoff=5.0),
+            "pme_config.alpha",
+        ),
+        (
+            PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=np.inf),
+            "pme_config.real_cutoff",
+        ),
+        (
+            PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=np.nan),
+            "pme_config.real_cutoff",
+        ),
+        (
+            PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, charge_tolerance=np.nan),
+            "pme_config.charge_tolerance",
+        ),
+    ]
+    negative_tolerance = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35)
+    object.__setattr__(negative_tolerance, "charge_tolerance", -1.0)
+    invalid_configs.append((negative_tolerance, "pme_config.charge_tolerance"))
+
+    for config, expected in invalid_configs:
+        try:
+            NonbondedPotential(**valid_kwargs, pme_config=config)
+        except ValueError as err:
+            assert expected in str(err)
+        else:
+            raise AssertionError(f"PME nonbonded accepted invalid {expected}")
+
+
+def test_nonbonded_pme_matches_standalone_pme_without_lj():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -0.5, -0.5], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=5.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    energy, forces, components = term.energy_forces_with_components(positions, cell)
+    reference_energy, reference_forces, reference_components = pme_coulomb_energy_forces(
+        positions,
+        charges,
+        cell,
+        config=config,
+    )
+
+    np.testing.assert_allclose(np.array(energy), np.array(reference_energy), atol=1e-6)
+    np.testing.assert_allclose(np.array(forces), np.array(reference_forces), atol=1e-6)
+    for name in ["coulomb_real", "coulomb_reciprocal", "coulomb_self"]:
+        np.testing.assert_allclose(
+            np.array(components[name]),
+            np.array(reference_components[name]),
+            atol=1e-6,
+        )
+    assert components["pme_diagnostics"].mesh_shape == (24, 24, 24)
+
+
+def test_nonbonded_pme_allows_nbfix_lj_without_changing_coulomb():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([0.5, -0.5, 0.0], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=5.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.2, 1.0],
+        epsilon=[0.2, 0.3, 0.2],
+        charges=charges,
+        atom_types=["H", "O", "H"],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.1],
+        nbfix_type_epsilon=[0.5],
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+        lj_shift=False,
+    )
+
+    energy, _, components = term.energy_forces_with_components(positions, cell)
+    reference_coulomb, _, _ = pme_coulomb_energy_forces(positions, charges, cell, config=config)
+    expected_lj = _bare_lj_energy(
+        positions,
+        sigma=[1.1, 1.0, 1.1],
+        epsilon=[0.5, 0.2, 0.5],
+        pairs=[(0, 1), (0, 2), (1, 2)],
+    )
+
+    np.testing.assert_allclose(
+        np.array(components["coulomb"]),
+        np.array(reference_coulomb),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(np.array(components["lj"]), expected_lj, atol=1e-6)
+    np.testing.assert_allclose(
+        np.array(energy),
+        np.array(reference_coulomb) + expected_lj,
+        atol=1e-6,
+    )
+
+
+def test_nonbonded_pme_nonzero_exception_override_corrects_energy_and_forces():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0], [6.0, 7.0, 8.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([0.7, -0.2, -0.3, -0.2], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        nonbonded_exception_pairs=[(0, 2)],
+    )
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=5.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+        topology=topology,
+        exception_pairs=[(0, 2)],
+        exception_charge_products=[0.125],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+    )
+
+    energy, forces, components = term.energy_forces_with_components(positions, cell)
+    full_pme, full_pme_forces, _ = pme_coulomb_energy_forces(
+        positions,
+        charges,
+        cell,
+        config=config,
+    )
+    original_energy, original_forces = _bare_coulomb_energy_forces(
+        positions,
+        charges,
+        [(0, 2)],
+    )
+    override_energy, override_forces = _bare_coulomb_energy_forces(
+        positions,
+        [0.125],
+        [(0, 2)],
+    )
+
+    np.testing.assert_allclose(
+        np.array(components["coulomb_exclusion_correction"]),
+        -original_energy,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(components["coulomb_exception"]),
+        override_energy,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(components["coulomb"]),
+        np.array(full_pme) - original_energy + override_energy,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(energy),
+        np.array(full_pme) - original_energy + override_energy,
+        atol=1e-6,
+    )
+    expected_forces = np.array(full_pme_forces) - original_forces + override_forces
+    assert np.all(np.isfinite(np.array(forces)))
+    np.testing.assert_allclose(np.array(forces), expected_forces, atol=1e-6)
+
+
+def test_nonbonded_pme_exclusions_exceptions_and_one_four_are_corrections():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.0, 1.0], [2.0, 3.0, 5.0], [7.0, 2.0, 3.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -1.0, 0.5, -0.5], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        dihedrals=[(0, 1, 2, 3)],
+        nonbonded_exception_pairs=[(0, 2)],
+        exclude_bonds=True,
+    )
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=5.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+        topology=topology,
+        coulomb_one_four_scale=0.5,
+        exception_pairs=[(0, 2)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+    )
+
+    energy, _, components = term.energy_forces_with_components(positions, cell)
+    full_pme, _, _ = pme_coulomb_energy_forces(positions, charges, cell, config=config)
+    excluded_and_exception = _bare_coulomb_energy(positions, charges, [(0, 1), (0, 2)])
+    one_four_delta = -0.5 * _bare_coulomb_energy(positions, charges, [(0, 3)])
+
+    np.testing.assert_allclose(
+        np.array(components["coulomb_exclusion_correction"]),
+        -excluded_and_exception,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(np.array(components["coulomb_exception"]), 0.0, atol=1e-7)
+    np.testing.assert_allclose(
+        np.array(components["coulomb_one_four_correction"]),
+        one_four_delta,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(energy),
+        np.array(full_pme) - excluded_and_exception + one_four_delta,
+        atol=1e-6,
+    )
+
+
+def test_nonbonded_switch_force_matches_finite_difference():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.4, 0.1, 0.0], [0.2, 1.6, 0.0]],
+        dtype=np.float32,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[1.0, 1.0, 1.0],
+        charges=[0.0, 0.0, 0.0],
+        cutoff=2.0,
+        switch_distance=1.5,
+        lj_shift=False,
+    )
+
+    assert_force_matches_finite_difference(term, positions, atol=7e-3)

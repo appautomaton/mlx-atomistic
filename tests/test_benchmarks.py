@@ -9,6 +9,7 @@ from mlx_atomistic.benchmarks import (
     dft_scf,
     dft_solver,
     dft_spin_kpoints,
+    ewald_reference,
     lj_md,
     mm_force_terms,
     stability,
@@ -83,6 +84,37 @@ def test_force_term_benchmark_includes_profile_rows():
     assert "coulomb-direct" in categories
     assert "combined-nonbonded" in categories
     assert "constraints" in categories
+
+
+def test_ewald_reference_benchmark_json_and_csv_smoke(tmp_path, capsys):
+    csv_path = tmp_path / "ewald.csv"
+
+    ewald_reference.main(
+        [
+            "--atoms",
+            "4",
+            "--evaluations",
+            "1",
+            "--reciprocal-cutoff",
+            "1",
+            "--csv",
+            str(csv_path),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["case_count"] == 1
+    assert "correctness backend" in payload["scope_note"]
+    assert "not GPCRmd-scale PME" in payload["scope_note"]
+    row = payload["cases"][0]
+    assert row["atoms"] == 4
+    assert row["evaluations"] == 1
+    assert row["k_vector_count"] == 26
+    assert row["real_shift_count"] == 125
+    assert row["finite"]
+    assert "coulomb_real" in row
+    assert csv_path.read_text().startswith("case,atoms")
 
 
 def test_dft_scf_benchmark_json_smoke(capsys):

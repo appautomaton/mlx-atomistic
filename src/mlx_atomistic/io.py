@@ -21,6 +21,8 @@ class TrajectoryRecord:
     sampled_velocities: np.ndarray
     sampled_steps: np.ndarray
     sampled_time: np.ndarray
+    diagnostic_steps: np.ndarray
+    diagnostic_time: np.ndarray
     potential_energy: np.ndarray
     kinetic_energy: np.ndarray
     total_energy: np.ndarray
@@ -32,6 +34,9 @@ class TrajectoryRecord:
     symbols: tuple[str, ...]
     cell: np.ndarray | None
     metadata: dict[str, Any]
+    virial_tensor: np.ndarray | None = None
+    pressure_tensor: np.ndarray | None = None
+    pressure: np.ndarray | None = None
 
 
 def read_xyz(path: str | Path) -> tuple[tuple[str, ...], np.ndarray, str]:
@@ -94,10 +99,33 @@ def save_npz_trajectory(
         "sampled_velocities": np.asarray(result.sampled_velocities),
         "sampled_steps": np.asarray(result.sampled_steps),
         "sampled_time": np.asarray(result.sampled_time),
+        "diagnostic_steps": np.asarray(
+            getattr(
+                result,
+                "diagnostic_steps",
+                np.arange(len(np.asarray(result.total_energy)), dtype=np.int32),
+            )
+        ),
+        "diagnostic_time": np.asarray(
+            getattr(
+                result,
+                "diagnostic_time",
+                np.arange(len(np.asarray(result.total_energy)), dtype=np.float32),
+            )
+        ),
         "potential_energy": np.asarray(result.potential_energy),
         "kinetic_energy": np.asarray(result.kinetic_energy),
         "total_energy": np.asarray(result.total_energy),
         "temperature": np.asarray(result.temperature),
+        "virial_tensor": np.asarray(
+            getattr(result, "virial_tensor", _zero_diagnostic_tensor(result))
+        ),
+        "pressure_tensor": np.asarray(
+            getattr(result, "pressure_tensor", _zero_diagnostic_tensor(result))
+        ),
+        "pressure": np.asarray(
+            getattr(result, "pressure", _zero_diagnostic_scalar(result))
+        ),
         "pair_count": np.asarray(result.pair_count),
         "rebuild_count": np.asarray(result.rebuild_count),
         "constraint_max_error": np.asarray(
@@ -113,6 +141,18 @@ def save_npz_trajectory(
     }
     for name, values in getattr(result, "potential_energy_by_term", {}).items():
         payload[f"energy_term::{name}"] = np.asarray(values)
+    for name in [
+        "sampled_cv",
+        "sampled_target",
+        "sampled_bias_energy",
+        "sampled_work",
+        "diagnostic_cv",
+        "diagnostic_target",
+        "diagnostic_bias_energy",
+        "diagnostic_work",
+    ]:
+        if hasattr(result, name):
+            payload[name] = np.asarray(getattr(result, name))
     np.savez_compressed(path, **payload)
 
 
@@ -125,11 +165,14 @@ def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
         cell_data = np.asarray(data["cell"], dtype=np.float32)
         symbols = tuple(str(item) for item in data["symbols"].tolist())
         metadata = json.loads(str(np.asarray(data["metadata_json"])))
+        diagnostic_steps, diagnostic_time = _load_diagnostic_axis(data, metadata)
         return TrajectoryRecord(
             sampled_positions=np.asarray(data["sampled_positions"]),
             sampled_velocities=np.asarray(data["sampled_velocities"]),
             sampled_steps=np.asarray(data["sampled_steps"]),
             sampled_time=np.asarray(data["sampled_time"]),
+            diagnostic_steps=diagnostic_steps,
+            diagnostic_time=diagnostic_time,
             potential_energy=np.asarray(data["potential_energy"]),
             kinetic_energy=np.asarray(data["kinetic_energy"]),
             total_energy=np.asarray(data["total_energy"]),
@@ -141,7 +184,47 @@ def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
             symbols=symbols,
             cell=None if cell_data.size == 0 else cell_data,
             metadata=metadata,
+            virial_tensor=_load_diagnostic_tensor(data, "virial_tensor"),
+            pressure_tensor=_load_diagnostic_tensor(data, "pressure_tensor"),
+            pressure=_load_diagnostic_scalar(data, "pressure"),
         )
+
+
+def _load_diagnostic_axis(data, metadata: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    if "diagnostic_steps" in data.files:
+        diagnostic_steps = np.asarray(data["diagnostic_steps"])
+    else:
+        diagnostic_steps = np.arange(len(np.asarray(data["total_energy"])), dtype=np.int32)
+    if "diagnostic_time" in data.files:
+        diagnostic_time = np.asarray(data["diagnostic_time"])
+    else:
+        dt = float(metadata.get("dt", 1.0))
+        diagnostic_time = diagnostic_steps.astype(np.float32) * dt
+    return diagnostic_steps, diagnostic_time
+
+
+def _zero_diagnostic_tensor(result) -> np.ndarray:
+    count = len(np.asarray(result.total_energy))
+    return np.zeros((count, 3, 3), dtype=np.float32)
+
+
+def _zero_diagnostic_scalar(result) -> np.ndarray:
+    count = len(np.asarray(result.total_energy))
+    return np.zeros((count,), dtype=np.float32)
+
+
+def _load_diagnostic_tensor(data, name: str) -> np.ndarray:
+    if name in data.files:
+        return np.asarray(data[name])
+    count = len(np.asarray(data["total_energy"]))
+    return np.zeros((count, 3, 3), dtype=np.float32)
+
+
+def _load_diagnostic_scalar(data, name: str) -> np.ndarray:
+    if name in data.files:
+        return np.asarray(data[name])
+    count = len(np.asarray(data["total_energy"]))
+    return np.zeros((count,), dtype=np.float32)
 
 
 def restart_state_from_trajectory(

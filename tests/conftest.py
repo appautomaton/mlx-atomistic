@@ -1,12 +1,14 @@
 import os
 
+os.environ["MLX_ATOMISTIC_DEVICE"] = "cpu"
+
 import mlx.core as mx
 
-os.environ["MLX_ATOMISTIC_DEVICE"] = "cpu"
-mx.set_default_device(mx.cpu)
-mx.set_default_stream(mx.new_stream(mx.cpu))
+_CPU_DEVICE = mx.Device(mx.cpu, 0)
+mx.set_default_device(_CPU_DEVICE)
+mx.set_default_stream(mx.new_stream(_CPU_DEVICE))
 
 
 def pytest_configure():
-    mx.set_default_device(mx.cpu)
-    mx.set_default_stream(mx.new_stream(mx.cpu))
+    mx.set_default_device(_CPU_DEVICE)
+    mx.set_default_stream(mx.new_stream(_CPU_DEVICE))

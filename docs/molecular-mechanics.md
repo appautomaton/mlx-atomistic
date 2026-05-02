@@ -1,7 +1,7 @@
 # Molecular Mechanics Core
 
 The MD engine now supports a programmatic molecular mechanics surface. It is not
-a full AMBER/CHARMM/OpenMM replacement yet, but it is no longer limited to an LJ
+a complete AMBER/CHARMM feature clone yet, but it is no longer limited to an LJ
 fluid demo.
 
 ## Topology
@@ -12,6 +12,7 @@ fluid demo.
 bonds      shape (n_bonds, 2)
 angles     shape (n_angles, 3)
 dihedrals  shape (n_dihedrals, 4)
+impropers  shape (n_impropers, 4)
 exclusions shape (n_exclusions, 2)
 charges    shape (n_atoms,)
 ```
@@ -30,6 +31,8 @@ Supported terms:
 - `HarmonicBondPotential`
 - `HarmonicAnglePotential`
 - `PeriodicDihedralPotential`
+- `ImproperDihedralPotential`
+- `PositionalRestraintPotential`
 
 All terms implement `energy_forces(positions, cell=None, pairs=None)` and can be
 passed together to `simulate_nve()` or `simulate_nvt()`.
@@ -39,8 +42,8 @@ passed together to `simulate_nve()` or `simulate_nvt()`.
 LJ and Coulomb support topology-aware nonbonded pairs:
 
 - bonded-pair exclusions
-- explicit exclusions
-- optional 1-4 scaling
+- explicit exclusions and nonbonded exception overrides
+- optional 1-4 scaling / overrides
 - direct cutoff support
 - orthorhombic periodic minimum-image behavior
 
@@ -48,9 +51,9 @@ PME/Ewald and force-field file parsers are intentionally out of scope for this
 milestone.
 
 `NonbondedPotential` is the production-oriented direct pair path. It combines
-mixed LJ and direct Coulomb terms, supports independent LJ/Coulomb 1-4 scaling,
-and reports component energies as `nonbonded.lj` and `nonbonded.coulomb` in MD
-diagnostics.
+mixed LJ and direct Coulomb terms, supports explicit nonbonded exceptions and
+independent LJ/Coulomb 1-4 scaling, and reports component energies as
+`nonbonded.lj` and `nonbonded.coulomb` in MD diagnostics.
 
 ## Energy Decomposition
 

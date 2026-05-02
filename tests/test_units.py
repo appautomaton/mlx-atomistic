@@ -1,6 +1,13 @@
 import numpy as np
 
-from mlx_atomistic.units import LJ_REDUCED_UNITS, LennardJonesReducedUnits
+from mlx_atomistic.units import (
+    BOLTZMANN_CONSTANT_KJ_MOL_K,
+    COULOMB_CONSTANT_KJ_MOL_ANGSTROM,
+    DALTON_ANGSTROM2_PER_PS2_TO_KJ_PER_MOL,
+    LJ_REDUCED_UNITS,
+    LennardJonesReducedUnits,
+    MDUnitSystem,
+)
 
 
 def test_default_lj_reduced_units_are_dimensionless():
@@ -24,3 +31,14 @@ def test_lj_reduced_unit_conversions_round_trip():
     assert units.from_reduced_temperature(2.0) == 1.994
     np.testing.assert_allclose(units.time, 3.4 * np.sqrt(39.948 / 0.997))
 
+
+def test_production_unit_constants_are_physical():
+    units = MDUnitSystem()
+
+    np.testing.assert_allclose(units.coulomb_constant, COULOMB_CONSTANT_KJ_MOL_ANGSTROM)
+    np.testing.assert_allclose(units.boltzmann_constant, BOLTZMANN_CONSTANT_KJ_MOL_K)
+    np.testing.assert_allclose(
+        units.kinetic_energy_scale,
+        DALTON_ANGSTROM2_PER_PS2_TO_KJ_PER_MOL,
+    )
+    np.testing.assert_allclose(units.force_to_acceleration_scale, 100.0)

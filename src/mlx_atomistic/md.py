@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import exp, sqrt
 from typing import Protocol
 
@@ -11,7 +11,15 @@ import mlx.core as mx
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.neighbors import NeighborListManager
+from mlx_atomistic.neighbors import NeighborList, NeighborListManager
+from mlx_atomistic.nonbonded import (
+    DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
+    NonbondedBackend,
+    NonbondedExecutionConfig,
+    choose_nonbonded_backend,
+    dense_lj_energy_forces,
+    estimate_dense_nonbonded_bytes,
+)
 from mlx_atomistic.topology import Topology
 
 
@@ -37,7 +45,11 @@ class LennardJonesPotential:
     shift: bool = True
     topology: Topology | None = None
     one_four_scale: float = 1.0
+    backend: NonbondedBackend = "auto"
+    tile_size: int = 512
+    memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
     name: str = "lj"
+    supports_virial: bool = True
 
     def __post_init__(self) -> None:
         if self.cutoff is not None and self.cutoff <= 0.0:
@@ -46,6 +58,14 @@ class LennardJonesPotential:
         if self.one_four_scale < 0.0:
             msg = "one_four_scale must be non-negative"
             raise ValueError(msg)
+        config = NonbondedExecutionConfig(
+            backend=self.backend,
+            tile_size=self.tile_size,
+            memory_budget_bytes=self.memory_budget_bytes,
+        )
+        object.__setattr__(self, "tile_size", config.tile_size)
+        object.__setattr__(self, "memory_budget_bytes", config.memory_budget_bytes)
+        object.__setattr__(self, "_pair_scale_cache", None)
 
     def energy_forces(
         self,
@@ -59,10 +79,41 @@ class LennardJonesPotential:
         if positions.ndim != 2 or positions.shape[1] != 3:
             msg = "positions must have shape (n_particles, 3)"
             raise ValueError(msg)
+        if (
+            self.topology is not None
+            and pairs is None
+            and self.topology.nonbonded_pair_policy == "lazy"
+        ):
+            msg = (
+                "lazy topology requires a runtime nonbonded pair provider; "
+                "full dense pair materialization was not requested"
+            )
+            raise ValueError(msg)
+
+        estimated_bytes = estimate_dense_nonbonded_bytes(positions.shape[0], components="lj")
+        concrete_backend = choose_nonbonded_backend(
+            requested=self.backend,
+            n_atoms=positions.shape[0],
+            pairs_provided=pairs is not None,
+            estimated_dense_bytes=estimated_bytes,
+            memory_budget_bytes=self.memory_budget_bytes,
+        )
+        if concrete_backend in {"mlx_dense", "mlx_tiled"}:
+            return dense_lj_energy_forces(
+                positions,
+                epsilon=self.epsilon,
+                sigma=self.sigma,
+                cutoff=self.cutoff,
+                shift=self.shift,
+                cell=cell,
+                topology=self.topology,
+                one_four_scale=self.one_four_scale,
+                tile_size=self.tile_size if concrete_backend == "mlx_tiled" else None,
+            )
+
         if self.topology is not None:
-            pairs = self.topology.nonbonded_pairs(pairs)
-            scales = self.topology.pair_scales(pairs, one_four_scale=self.one_four_scale)
-            return self._pair_energy_forces(positions, pairs, cell, scales=scales)
+            filtered_pairs, scales = self._topology_pairs_and_scales(pairs)
+            return self._pair_energy_forces(positions, filtered_pairs, cell, scales=scales)
         if pairs is not None:
             return self._pair_energy_forces(positions, pairs, cell)
 
@@ -94,6 +145,34 @@ class LennardJonesPotential:
 
         energy = 0.5 * mx.sum(pair_energy)
         return energy, forces
+
+    def _topology_pairs_and_scales(self, pairs) -> tuple[mx.array, mx.array]:
+        topology = self.topology
+        if topology is None:
+            msg = "topology is required"
+            raise ValueError(msg)
+        if pairs is None and topology.nonbonded_pair_policy == "lazy":
+            msg = (
+                "lazy topology requires a runtime nonbonded pair provider; "
+                "full dense pair materialization was not requested"
+            )
+            raise ValueError(msg)
+        if pairs is not None:
+            cache_key = (id(pairs), self.one_four_scale)
+            cache = self._pair_scale_cache
+            if cache is not None and cache[0] == cache_key:
+                return cache[1]
+        filtered_pairs = topology.nonbonded_pairs(pairs)
+        if float(self.one_four_scale) == 1.0:
+            scales = mx.array(1.0, dtype=mx.float32)
+        else:
+            scales = topology.pair_scales(
+                filtered_pairs,
+                one_four_scale=self.one_four_scale,
+            )
+        if pairs is not None:
+            object.__setattr__(self, "_pair_scale_cache", (cache_key, (filtered_pairs, scales)))
+        return filtered_pairs, scales
 
     def _pair_energy_forces(
         self,
@@ -178,6 +257,13 @@ class SimulationConfig:
     dt: float = 0.005
     steps: int = 100
     sample_interval: int = 1
+    kinetic_energy_scale: float = 1.0
+    force_to_acceleration_scale: float = 1.0
+    boltzmann_constant: float = 1.0
+    evaluation_interval: int = 25
+    diagnostic_interval: int = 1
+    compile_force_evaluator: bool = False
+    pressure_diagnostics: bool = True
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -188,6 +274,21 @@ class SimulationConfig:
             raise ValueError(msg)
         if self.sample_interval <= 0:
             msg = "sample_interval must be positive"
+            raise ValueError(msg)
+        if self.kinetic_energy_scale <= 0.0:
+            msg = "kinetic_energy_scale must be positive"
+            raise ValueError(msg)
+        if self.force_to_acceleration_scale <= 0.0:
+            msg = "force_to_acceleration_scale must be positive"
+            raise ValueError(msg)
+        if self.boltzmann_constant <= 0.0:
+            msg = "boltzmann_constant must be positive"
+            raise ValueError(msg)
+        if self.evaluation_interval <= 0:
+            msg = "evaluation_interval must be positive"
+            raise ValueError(msg)
+        if self.diagnostic_interval <= 0:
+            msg = "diagnostic_interval must be positive"
             raise ValueError(msg)
 
 
@@ -211,15 +312,21 @@ class NVEResult:
     sampled_velocities: mx.array
     sampled_steps: mx.array
     sampled_time: mx.array
+    diagnostic_steps: mx.array
+    diagnostic_time: mx.array
     potential_energy: mx.array
     kinetic_energy: mx.array
     total_energy: mx.array
     potential_energy_by_term: dict[str, mx.array]
     temperature: mx.array
+    virial_tensor: mx.array
+    pressure_tensor: mx.array
+    pressure: mx.array
     pair_count: mx.array
     rebuild_count: mx.array
     constraint_max_error: mx.array
     final_state: SimulationState
+    nonbonded_report: dict[str, int | float | str | None] = field(default_factory=dict)
 
     @property
     def energy_drift(self) -> mx.array:
@@ -266,16 +373,22 @@ class NVTResult:
     sampled_velocities: mx.array
     sampled_steps: mx.array
     sampled_time: mx.array
+    diagnostic_steps: mx.array
+    diagnostic_time: mx.array
     potential_energy: mx.array
     kinetic_energy: mx.array
     total_energy: mx.array
     potential_energy_by_term: dict[str, mx.array]
     temperature: mx.array
+    virial_tensor: mx.array
+    pressure_tensor: mx.array
+    pressure: mx.array
     pair_count: mx.array
     rebuild_count: mx.array
     constraint_max_error: mx.array
     final_state: SimulationState
     target_temperature: float
+    nonbonded_report: dict[str, int | float | str | None] = field(default_factory=dict)
 
     @property
     def temperature_error(self) -> mx.array:
@@ -284,12 +397,17 @@ class NVTResult:
         return self.temperature - self.target_temperature
 
 
-def kinetic_energy(velocities: mx.array, masses: mx.array) -> mx.array:
-    """Return kinetic energy in reduced units."""
+def kinetic_energy(
+    velocities: mx.array,
+    masses: mx.array,
+    *,
+    kinetic_energy_scale: float = 1.0,
+) -> mx.array:
+    """Return kinetic energy using the configured unit conversion."""
 
     velocities = as_mx_array(velocities)
     masses = as_mx_array(masses)
-    return 0.5 * mx.sum(masses[:, None] * velocities * velocities)
+    return kinetic_energy_scale * 0.5 * mx.sum(masses[:, None] * velocities * velocities)
 
 
 def instantaneous_temperature(
@@ -297,12 +415,205 @@ def instantaneous_temperature(
     masses: mx.array,
     *,
     dof: int | None = None,
+    kinetic_energy_scale: float = 1.0,
+    boltzmann_constant: float = 1.0,
 ) -> mx.array:
-    """Return the instantaneous reduced temperature with `k_B = 1`."""
+    """Return the instantaneous temperature for the configured unit system."""
 
     if dof is None:
         dof = velocities.size
-    return 2.0 * kinetic_energy(velocities, masses) / dof
+    return (
+        2.0
+        * kinetic_energy(
+            velocities,
+            masses,
+            kinetic_energy_scale=kinetic_energy_scale,
+        )
+        / (dof * boltzmann_constant)
+    )
+
+
+def virial_tensor(positions: mx.array, forces: mx.array) -> mx.array:
+    """Return the non-periodic configurational virial tensor."""
+
+    positions = as_mx_array(positions)
+    forces = as_mx_array(forces)
+    if positions.shape != forces.shape or positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions and forces must both have shape (n_particles, 3)"
+        raise ValueError(msg)
+    return mx.transpose(positions) @ forces
+
+
+def configurational_virial_tensor(
+    positions: mx.array,
+    forces: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: mx.array | None,
+    strain_epsilon: float = 1e-3,
+) -> mx.array:
+    """Return a configurational virial diagnostic after explicit support validation.
+
+    Periodic orthorhombic cells use diagonal finite differences in cell strain
+    with fractional coordinates held fixed. Off-diagonal strain is not part of
+    this Slice 8 diagnostic convention and is reported as zero.
+    """
+
+    validate_virial_support(force_terms)
+    positions = as_mx_array(positions)
+    if cell is None:
+        return virial_tensor(positions, forces)
+    if strain_epsilon <= 0.0:
+        msg = "strain_epsilon must be positive"
+        raise ValueError(msg)
+    if float(mx.min(cell.lengths)) <= 0.0:
+        msg = "virial diagnostics require positive cell lengths"
+        raise ValueError(msg)
+
+    fractional = positions / cell.lengths
+    fractional = fractional - mx.floor(fractional)
+    diagonal = []
+    for axis in range(3):
+        plus_lengths = _strained_cell_lengths(cell.lengths, axis, strain_epsilon)
+        minus_lengths = _strained_cell_lengths(cell.lengths, axis, -strain_epsilon)
+        plus_energy = _potential_energy_for_virial(
+            fractional * plus_lengths,
+            force_terms,
+            cell=Cell(plus_lengths),
+            pairs=pairs,
+        )
+        minus_energy = _potential_energy_for_virial(
+            fractional * minus_lengths,
+            force_terms,
+            cell=Cell(minus_lengths),
+            pairs=pairs,
+        )
+        diagonal.append(-(plus_energy - minus_energy) / (2.0 * strain_epsilon))
+    return mx.diag(mx.stack(diagonal))
+
+
+def _strained_cell_lengths(lengths: mx.array, axis: int, strain: float) -> mx.array:
+    factors = as_mx_array([1.0 + strain if item == axis else 1.0 for item in range(3)])
+    return lengths * factors
+
+
+def _potential_energy_for_virial(
+    positions: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell,
+    pairs: mx.array | None,
+) -> mx.array:
+    energy, _ = _energy_forces_from_terms(
+        positions,
+        force_terms,
+        cell=cell,
+        pairs=pairs,
+    )
+    return energy
+
+
+def kinetic_pressure_tensor(
+    velocities: mx.array,
+    masses: mx.array,
+    *,
+    kinetic_energy_scale: float = 1.0,
+) -> mx.array:
+    """Return ``sum_i m_i v_i outer v_i`` in the configured kinetic units."""
+
+    velocities = as_mx_array(velocities)
+    masses = as_mx_array(masses)
+    if velocities.ndim != 2 or velocities.shape[1] != 3:
+        msg = "velocities must have shape (n_particles, 3)"
+        raise ValueError(msg)
+    if masses.shape != (velocities.shape[0],):
+        msg = "masses must have shape (n_particles,)"
+        raise ValueError(msg)
+    weighted_velocities = masses[:, None] * velocities
+    return kinetic_energy_scale * mx.transpose(velocities) @ weighted_velocities
+
+
+def pressure_tensor(
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    forces: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: mx.array | None,
+    kinetic_energy_scale: float = 1.0,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Return virial tensor, pressure tensor, and scalar pressure diagnostics.
+
+    The pressure tensor uses the reduced-unit convention
+    ``P = (kinetic tensor + configurational virial) / V``. Periodic virials
+    are diagonal-only orthorhombic cell-strain diagnostics; non-periodic runs
+    report finite zero pressure diagnostics because no volume is defined.
+    """
+
+    virial = configurational_virial_tensor(
+        positions,
+        forces,
+        force_terms,
+        cell=cell,
+        pairs=pairs,
+    )
+    if cell is None:
+        zeros = mx.zeros((3, 3), dtype=virial.dtype)
+        return virial, zeros, mx.sum(virial * 0.0)
+    volume = mx.prod(cell.lengths)
+    if float(mx.min(cell.lengths)) <= 0.0:
+        msg = "pressure diagnostics require positive cell lengths"
+        raise ValueError(msg)
+    kinetic_tensor = kinetic_pressure_tensor(
+        velocities,
+        masses,
+        kinetic_energy_scale=kinetic_energy_scale,
+    )
+    tensor = (kinetic_tensor + virial) / volume
+    scalar = mx.trace(tensor) / 3.0
+    return virial, tensor, scalar
+
+
+def _pressure_diagnostics(
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    forces: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: mx.array | None,
+    kinetic_energy_scale: float,
+    enabled: bool,
+) -> tuple[mx.array, mx.array, mx.array]:
+    if enabled:
+        return pressure_tensor(
+            positions,
+            velocities,
+            masses,
+            forces,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            kinetic_energy_scale=kinetic_energy_scale,
+        )
+    zeros = mx.zeros((3, 3), dtype=positions.dtype)
+    return zeros, zeros, mx.sum(positions[:, 0] * 0.0)
+
+
+def _temperature_degrees_of_freedom(
+    positions: mx.array,
+    constraints: DistanceConstraints | None,
+) -> int:
+    dof = int(positions.size)
+    if constraints is not None:
+        dof -= int(constraints.pairs.shape[0])
+    if positions.shape[0] > 1:
+        dof -= 3
+    return max(1, dof)
 
 
 def _as_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...]):
@@ -326,6 +637,38 @@ def _named_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTer
     return tuple(named_terms)
 
 
+def missing_virial_support(
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
+) -> tuple[str, ...]:
+    """Return exact force-term names without a supported virial diagnostics path."""
+
+    missing = []
+    for name, term in _named_force_terms(force_terms):
+        if not _term_supports_virial(term):
+            missing.append(name)
+    return tuple(missing)
+
+
+def validate_virial_support(
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
+) -> None:
+    """Fail closed when future pressure-coupled runtimes see unsupported terms."""
+
+    missing = missing_virial_support(force_terms)
+    if missing:
+        msg = "missing virial support for force terms: " + ", ".join(missing)
+        raise ValueError(msg)
+
+
+def _term_supports_virial(term: ForceTerm) -> bool:
+    declared = getattr(term, "supports_virial", None)
+    if declared is not None:
+        return bool(declared)
+    return callable(getattr(term, "virial_tensor", None)) or callable(
+        getattr(term, "virial_diagnostics", None)
+    )
+
+
 def _energy_forces_from_terms(
     positions: mx.array,
     force_terms: tuple[ForceTerm, ...],
@@ -333,9 +676,21 @@ def _energy_forces_from_terms(
     cell: Cell | None,
     pairs: mx.array | None,
 ) -> tuple[mx.array, mx.array]:
+    grouped_terms = _groupable_potential_terms(force_terms, pairs)
+    grouped_ids = {id(term) for term in grouped_terms}
     total_energy = None
     total_forces = mx.zeros_like(positions)
+    if grouped_terms:
+        energy, forces = _grouped_potential_energy_forces(
+            positions,
+            grouped_terms,
+            cell=cell,
+        )
+        total_energy = energy
+        total_forces = total_forces + forces
     for term in force_terms:
+        if id(term) in grouped_ids:
+            continue
         energy, forces = term.energy_forces(positions, cell, pairs=pairs)
         total_energy = energy if total_energy is None else total_energy + energy
         total_forces = total_forces + forces
@@ -353,21 +708,44 @@ def _energy_forces_by_term(
     cell: Cell | None,
     pairs: mx.array | None,
 ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+    unnamed_terms = tuple(term for _, term in force_terms)
+    grouped_terms = _groupable_potential_terms(unnamed_terms, pairs)
+    grouped_ids = {id(term) for term in grouped_terms}
     total_energy = None
     total_forces = mx.zeros_like(positions)
     energy_by_term = {}
+    if grouped_terms:
+        energy, forces = _grouped_potential_energy_forces(
+            positions,
+            grouped_terms,
+            cell=cell,
+        )
+        total_energy = energy
+        total_forces = total_forces + forces
     for name, term in force_terms:
-        energy, forces = term.energy_forces(positions, cell, pairs=pairs)
-        component_energies = getattr(term, "component_energies", None)
-        if callable(component_energies):
-            for component_name, component_energy in component_energies(
-                positions,
-                cell=cell,
-                pairs=pairs,
-            ).items():
-                energy_by_term[f"{name}.{component_name}"] = component_energy
+        if id(term) in grouped_ids:
+            energy_by_term[name] = term.potential_energy(positions, cell)
+            continue
+
+        combined_components = getattr(term, "energy_forces_with_components", None)
+        if callable(combined_components):
+            energy, forces, components = combined_components(positions, cell, pairs=pairs)
+            for component_name, component_energy in components.items():
+                if _is_energy_component(component_energy):
+                    energy_by_term[f"{name}.{component_name}"] = component_energy
         else:
-            energy_by_term[name] = energy
+            energy, forces = term.energy_forces(positions, cell, pairs=pairs)
+            component_energies = getattr(term, "component_energies", None)
+            if callable(component_energies):
+                for component_name, component_energy in component_energies(
+                    positions,
+                    cell=cell,
+                    pairs=pairs,
+                ).items():
+                    if _is_energy_component(component_energy):
+                        energy_by_term[f"{name}.{component_name}"] = component_energy
+            else:
+                energy_by_term[name] = energy
         total_energy = energy if total_energy is None else total_energy + energy
         total_forces = total_forces + forces
 
@@ -377,13 +755,187 @@ def _energy_forces_by_term(
     return total_energy, total_forces, energy_by_term
 
 
+def _make_energy_forces_by_term_evaluator(
+    force_terms: tuple[tuple[str, ForceTerm], ...],
+    *,
+    cell: Cell | None,
+    pairs: mx.array | None,
+    compile_evaluator: bool,
+):
+    def evaluate(pos: mx.array):
+        return _energy_forces_by_term(
+            pos,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+        )
+
+    if compile_evaluator and pairs is None:
+        return mx.compile(evaluate)
+    return evaluate
+
+
+def _is_energy_component(value: object) -> bool:
+    return isinstance(value, (mx.array, int, float))
+
+
+def _make_energy_forces_evaluator(
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: mx.array | None,
+    compile_evaluator: bool,
+):
+    def evaluate(pos: mx.array):
+        return _energy_forces_from_terms(
+            pos,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+        )
+
+    if compile_evaluator and pairs is None:
+        return mx.compile(evaluate)
+    return evaluate
+
+
+def _groupable_potential_terms(
+    force_terms: tuple[ForceTerm, ...],
+    pairs: mx.array | None,
+) -> tuple[ForceTerm, ...]:
+    if pairs is not None:
+        return ()
+    # Production force terms provide analytical `energy_forces`; using those is
+    # faster than differentiating summed potential energies each MD step.
+    # Potential-only custom terms may opt into autograd grouping explicitly.
+    return tuple(
+        term
+        for term in force_terms
+        if bool(getattr(term, "use_autograd_forces", False))
+        and callable(getattr(term, "potential_energy", None))
+        and not callable(getattr(term, "energy_forces_with_components", None))
+    )
+
+
+def _grouped_potential_energy_forces(
+    positions: mx.array,
+    terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+) -> tuple[mx.array, mx.array]:
+    def total_potential_energy(pos: mx.array) -> mx.array:
+        total = None
+        for term in terms:
+            energy = term.potential_energy(pos, cell)
+            total = energy if total is None else total + energy
+        if total is None:
+            return _zero_constraint_error(pos)
+        return total
+
+    energy, gradient = mx.value_and_grad(total_potential_energy)(positions)
+    return energy, -gradient
+
+
 def _dense_pair_count(positions: mx.array) -> int:
     n_particles = positions.shape[0]
     return n_particles * (n_particles - 1) // 2
 
 
+def _validate_compact_nonbonded_backend(
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    neighbor_manager: NeighborListManager | None,
+) -> None:
+    for term in force_terms:
+        topology = getattr(term, "topology", None)
+        if topology is None or getattr(topology, "nonbonded_pair_policy", None) != "lazy":
+            continue
+        if neighbor_manager is not None:
+            continue
+        msg = (
+            "large lazy topology requires compact periodic neighbor pairs; "
+            "dense/tiled all-pairs fallback is refused"
+        )
+        raise ValueError(msg)
+
+
+def _nonbonded_runtime_report(
+    positions: mx.array,
+    *,
+    neighbor_manager: NeighborListManager | None,
+    neighbor_list: NeighborList | None,
+) -> dict[str, int | float | str | None]:
+    if neighbor_list is None:
+        return {
+            "backend": "dense_all_pairs",
+            "pair_count": _dense_pair_count(positions),
+            "cutoff": None,
+            "skin": None,
+            "rebuild_count": 0,
+            "estimated_pair_memory_bytes": _dense_pair_count(positions) * 2 * 4,
+        }
+    return {
+        "backend": neighbor_list.backend,
+        "pair_count": neighbor_list.pair_count,
+        "cutoff": neighbor_list.cutoff,
+        "skin": neighbor_list.skin,
+        "rebuild_count": 0 if neighbor_manager is None else neighbor_manager.rebuild_count,
+        "estimated_pair_memory_bytes": neighbor_list.estimated_pair_bytes,
+    }
+
+
+def _eval_step_state(
+    state: SimulationState,
+    potential_energy: mx.array,
+    kinetic_energy_value: mx.array,
+    temperature_value: mx.array,
+    virial_value: mx.array,
+    pressure_tensor_value: mx.array,
+    pressure_value: mx.array,
+    constraint_error: mx.array,
+    energy_by_term: dict[str, mx.array],
+) -> None:
+    mx.eval(
+        state.positions,
+        state.velocities,
+        state.forces,
+        potential_energy,
+        kinetic_energy_value,
+        temperature_value,
+        virial_value,
+        pressure_tensor_value,
+        pressure_value,
+        constraint_error,
+        *energy_by_term.values(),
+    )
+
+
+def _eval_runtime_state(
+    state: SimulationState,
+    potential_energy: mx.array,
+    constraint_error: mx.array,
+) -> None:
+    mx.eval(
+        state.positions,
+        state.velocities,
+        state.forces,
+        potential_energy,
+        constraint_error,
+    )
+
+
+def _is_diagnostic_step(step: int, config: SimulationConfig) -> bool:
+    return step % config.diagnostic_interval == 0 or step == config.steps
+
+
 def _zero_constraint_error(positions: mx.array) -> mx.array:
     return mx.sum(positions[:, 0] * 0.0)
+
+
+def _materialize_sampled_state(state: SimulationState) -> None:
+    # Sampled frames may be retained until trajectory serialization; force
+    # evaluation so long sampled runs do not retain unevaluated step graphs.
+    mx.eval(state.positions, state.velocities)
 
 
 def _local_prng_key(seed: int | None) -> mx.array:
@@ -507,10 +1059,10 @@ def simulate_nve(
     config: SimulationConfig | None = None,
     constraints: DistanceConstraints | None = None,
 ) -> NVEResult:
-    """Run NVE molecular dynamics with sparse trajectory and dense diagnostics.
+    """Run NVE molecular dynamics with sparse trajectory and configurable diagnostics.
 
-    `sample_interval` controls trajectory storage only. Energy, temperature,
-    pair-count, and rebuild diagnostics are retained for every integration step.
+    `sample_interval` controls trajectory storage. `diagnostic_interval`
+    controls energy, temperature, pair-count, and constraint diagnostics.
     """
 
     if config is None:
@@ -518,6 +1070,12 @@ def simulate_nve(
     if force_terms is None:
         force_terms = LennardJonesPotential()
     terms = _named_force_terms(force_terms)
+    unnamed_terms = tuple(term for _, term in terms)
+    validate_virial_support(unnamed_terms)
+    _validate_compact_nonbonded_backend(
+        unnamed_terms,
+        neighbor_manager=neighbor_manager,
+    )
 
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
@@ -526,18 +1084,25 @@ def simulate_nve(
     if constraints is not None:
         positions, constraint_error = constraints.apply_positions(positions, masses, cell)
         velocities = constraints.apply_velocities(positions, velocities, masses, cell)
+    temperature_dof = _temperature_degrees_of_freedom(positions, constraints)
 
     neighbor_list = neighbor_manager.update(positions) if neighbor_manager is not None else None
     pairs = None if neighbor_list is None else neighbor_list.pairs
     pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
-
-    potential_energy, forces, energy_by_term = _energy_forces_by_term(
-        positions,
+    energy_forces_by_term = _make_energy_forces_by_term_evaluator(
         terms,
         cell=cell,
         pairs=pairs,
+        compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
     )
+    energy_forces = _make_energy_forces_evaluator(
+        unnamed_terms,
+        cell=cell,
+        pairs=pairs,
+        compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
+    )
+    potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
     state = SimulationState(
         positions=positions,
         velocities=velocities,
@@ -545,20 +1110,51 @@ def simulate_nve(
         forces=forces,
     )
 
+    _materialize_sampled_state(state)
     sampled_positions = [state.positions]
     sampled_velocities = [state.velocities]
     sampled_steps = [0]
     sampled_times = [0.0]
+    diagnostic_steps = [0]
+    diagnostic_times = [0.0]
     potential_energies = [potential_energy]
     potential_energy_by_term = {name: [energy] for name, energy in energy_by_term.items()}
-    kinetic_energies = [kinetic_energy(state.velocities, masses)]
-    temperatures = [instantaneous_temperature(state.velocities, masses)]
+    kinetic_energies = [
+        kinetic_energy(
+            state.velocities,
+            masses,
+            kinetic_energy_scale=config.kinetic_energy_scale,
+        )
+    ]
+    temperatures = [
+        instantaneous_temperature(
+            state.velocities,
+            masses,
+            dof=temperature_dof,
+            kinetic_energy_scale=config.kinetic_energy_scale,
+            boltzmann_constant=config.boltzmann_constant,
+        )
+    ]
+    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+        state.positions,
+        state.velocities,
+        masses,
+        state.forces,
+        unnamed_terms,
+        cell=cell,
+        pairs=pairs,
+        kinetic_energy_scale=config.kinetic_energy_scale,
+        enabled=config.pressure_diagnostics,
+    )
+    virials = [virial]
+    pressure_tensors = [pressure_tensor_value]
+    pressures = [pressure_value]
     pair_counts = [pair_count]
     rebuild_counts = [rebuild_count]
     constraint_errors = [constraint_error]
 
     for step in range(1, config.steps + 1):
-        acceleration = state.forces / masses[:, None]
+        acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         velocities_half = state.velocities + 0.5 * config.dt * acceleration
         next_positions = state.positions + config.dt * velocities_half
         if cell is not None:
@@ -580,13 +1176,28 @@ def simulate_nve(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
-            next_positions,
-            terms,
-            cell=cell,
-            pairs=pairs,
-        )
-        next_acceleration = next_forces / masses[:, None]
+        diagnostic_step = _is_diagnostic_step(step, config)
+        if neighbor_manager is None and diagnostic_step:
+            potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
+        elif neighbor_manager is None:
+            potential_energy, next_forces = energy_forces(next_positions)
+            energy_by_term = None
+        elif diagnostic_step:
+            potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
+                next_positions,
+                terms,
+                cell=cell,
+                pairs=pairs,
+            )
+        else:
+            potential_energy, next_forces = _energy_forces_from_terms(
+                next_positions,
+                unnamed_terms,
+                cell=cell,
+                pairs=pairs,
+            )
+            energy_by_term = None
+        next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = velocities_half + 0.5 * config.dt * next_acceleration
         if constraints is not None:
             next_velocities = constraints.apply_velocities(
@@ -605,18 +1216,66 @@ def simulate_nve(
         )
 
         if step % config.sample_interval == 0 or step == config.steps:
+            _materialize_sampled_state(state)
             sampled_positions.append(state.positions)
             sampled_velocities.append(state.velocities)
             sampled_steps.append(step)
             sampled_times.append(state.time)
-        potential_energies.append(potential_energy)
-        for name, energy in energy_by_term.items():
-            potential_energy_by_term[name].append(energy)
-        kinetic_energies.append(kinetic_energy(state.velocities, masses))
-        temperatures.append(instantaneous_temperature(state.velocities, masses))
-        pair_counts.append(pair_count)
-        rebuild_counts.append(rebuild_count)
-        constraint_errors.append(constraint_error)
+        if diagnostic_step:
+            diagnostic_steps.append(step)
+            diagnostic_times.append(state.time)
+            potential_energies.append(potential_energy)
+            if energy_by_term is not None:
+                for name, energy in energy_by_term.items():
+                    potential_energy_by_term[name].append(energy)
+            kinetic_energies.append(
+                kinetic_energy(
+                    state.velocities,
+                    masses,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                )
+            )
+            temperatures.append(
+                instantaneous_temperature(
+                    state.velocities,
+                    masses,
+                    dof=temperature_dof,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                    boltzmann_constant=config.boltzmann_constant,
+                )
+            )
+            virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+                state.positions,
+                state.velocities,
+                masses,
+                state.forces,
+                unnamed_terms,
+                cell=cell,
+                pairs=pairs,
+                kinetic_energy_scale=config.kinetic_energy_scale,
+                enabled=config.pressure_diagnostics,
+            )
+            virials.append(virial)
+            pressure_tensors.append(pressure_tensor_value)
+            pressures.append(pressure_value)
+            pair_counts.append(pair_count)
+            rebuild_counts.append(rebuild_count)
+            constraint_errors.append(constraint_error)
+        if step % config.evaluation_interval == 0 or step == config.steps:
+            if diagnostic_step and energy_by_term is not None:
+                _eval_step_state(
+                    state,
+                    potential_energy,
+                    kinetic_energies[-1],
+                    temperatures[-1],
+                    virials[-1],
+                    pressure_tensors[-1],
+                    pressures[-1],
+                    constraint_error,
+                    energy_by_term,
+                )
+            else:
+                _eval_runtime_state(state, potential_energy, constraint_error)
 
     potential_energy_series = mx.stack(potential_energies)
     kinetic_energy_series = mx.stack(kinetic_energies)
@@ -625,6 +1284,8 @@ def simulate_nve(
         sampled_velocities=mx.stack(sampled_velocities),
         sampled_steps=mx.array(sampled_steps, dtype=mx.int32),
         sampled_time=mx.array(sampled_times),
+        diagnostic_steps=mx.array(diagnostic_steps, dtype=mx.int32),
+        diagnostic_time=mx.array(diagnostic_times),
         potential_energy=potential_energy_series,
         kinetic_energy=kinetic_energy_series,
         total_energy=potential_energy_series + kinetic_energy_series,
@@ -632,10 +1293,18 @@ def simulate_nve(
             name: mx.stack(energies) for name, energies in potential_energy_by_term.items()
         },
         temperature=mx.stack(temperatures),
+        virial_tensor=mx.stack(virials),
+        pressure_tensor=mx.stack(pressure_tensors),
+        pressure=mx.stack(pressures),
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
         constraint_max_error=mx.stack(constraint_errors),
         final_state=state,
+        nonbonded_report=_nonbonded_runtime_report(
+            state.positions,
+            neighbor_manager=neighbor_manager,
+            neighbor_list=None if neighbor_manager is None else neighbor_manager.neighbor_list,
+        ),
     )
 
 
@@ -660,6 +1329,12 @@ def simulate_nvt(
     if force_terms is None:
         force_terms = LennardJonesPotential()
     terms = _named_force_terms(force_terms)
+    unnamed_terms = tuple(term for _, term in terms)
+    validate_virial_support(unnamed_terms)
+    _validate_compact_nonbonded_backend(
+        unnamed_terms,
+        neighbor_manager=neighbor_manager,
+    )
 
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
@@ -668,18 +1343,25 @@ def simulate_nvt(
     if constraints is not None:
         positions, constraint_error = constraints.apply_positions(positions, masses, cell)
         velocities = constraints.apply_velocities(positions, velocities, masses, cell)
+    temperature_dof = _temperature_degrees_of_freedom(positions, constraints)
 
     neighbor_list = neighbor_manager.update(positions) if neighbor_manager is not None else None
     pairs = None if neighbor_list is None else neighbor_list.pairs
     pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
-
-    potential_energy, forces, energy_by_term = _energy_forces_by_term(
-        positions,
+    energy_forces_by_term = _make_energy_forces_by_term_evaluator(
         terms,
         cell=cell,
         pairs=pairs,
+        compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
     )
+    energy_forces = _make_energy_forces_evaluator(
+        unnamed_terms,
+        cell=cell,
+        pairs=pairs,
+        compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
+    )
+    potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
     state = SimulationState(
         positions=positions,
         velocities=velocities,
@@ -687,24 +1369,60 @@ def simulate_nvt(
         forces=forces,
     )
 
+    _materialize_sampled_state(state)
     sampled_positions = [state.positions]
     sampled_velocities = [state.velocities]
     sampled_steps = [0]
     sampled_times = [0.0]
+    diagnostic_steps = [0]
+    diagnostic_times = [0.0]
     potential_energies = [potential_energy]
     potential_energy_by_term = {name: [energy] for name, energy in energy_by_term.items()}
-    kinetic_energies = [kinetic_energy(state.velocities, masses)]
-    temperatures = [instantaneous_temperature(state.velocities, masses)]
+    kinetic_energies = [
+        kinetic_energy(
+            state.velocities,
+            masses,
+            kinetic_energy_scale=config.kinetic_energy_scale,
+        )
+    ]
+    temperatures = [
+        instantaneous_temperature(
+            state.velocities,
+            masses,
+            dof=temperature_dof,
+            kinetic_energy_scale=config.kinetic_energy_scale,
+            boltzmann_constant=config.boltzmann_constant,
+        )
+    ]
+    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+        state.positions,
+        state.velocities,
+        masses,
+        state.forces,
+        unnamed_terms,
+        cell=cell,
+        pairs=pairs,
+        kinetic_energy_scale=config.kinetic_energy_scale,
+        enabled=config.pressure_diagnostics,
+    )
+    virials = [virial]
+    pressure_tensors = [pressure_tensor_value]
+    pressures = [pressure_value]
     pair_counts = [pair_count]
     rebuild_counts = [rebuild_count]
     constraint_errors = [constraint_error]
 
     key = _local_prng_key(thermostat.seed)
     velocity_decay = exp(-thermostat.friction * config.dt)
-    noise_scale = sqrt((1.0 - velocity_decay * velocity_decay) * thermostat.temperature)
+    noise_scale = sqrt(
+        (1.0 - velocity_decay * velocity_decay)
+        * thermostat.temperature
+        * config.boltzmann_constant
+        / config.kinetic_energy_scale
+    )
 
     for step in range(1, config.steps + 1):
-        acceleration = state.forces / masses[:, None]
+        acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         velocities_half = state.velocities + 0.5 * config.dt * acceleration
         next_positions = state.positions + 0.5 * config.dt * velocities_half
         if cell is not None:
@@ -736,13 +1454,28 @@ def simulate_nvt(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
-            next_positions,
-            terms,
-            cell=cell,
-            pairs=pairs,
-        )
-        next_acceleration = next_forces / masses[:, None]
+        diagnostic_step = _is_diagnostic_step(step, config)
+        if neighbor_manager is None and diagnostic_step:
+            potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
+        elif neighbor_manager is None:
+            potential_energy, next_forces = energy_forces(next_positions)
+            energy_by_term = None
+        elif diagnostic_step:
+            potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
+                next_positions,
+                terms,
+                cell=cell,
+                pairs=pairs,
+            )
+        else:
+            potential_energy, next_forces = _energy_forces_from_terms(
+                next_positions,
+                unnamed_terms,
+                cell=cell,
+                pairs=pairs,
+            )
+            energy_by_term = None
+        next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = thermostatted_velocities + 0.5 * config.dt * next_acceleration
         if constraints is not None:
             next_velocities = constraints.apply_velocities(
@@ -761,18 +1494,66 @@ def simulate_nvt(
         )
 
         if step % config.sample_interval == 0 or step == config.steps:
+            _materialize_sampled_state(state)
             sampled_positions.append(state.positions)
             sampled_velocities.append(state.velocities)
             sampled_steps.append(step)
             sampled_times.append(state.time)
-        potential_energies.append(potential_energy)
-        for name, energy in energy_by_term.items():
-            potential_energy_by_term[name].append(energy)
-        kinetic_energies.append(kinetic_energy(state.velocities, masses))
-        temperatures.append(instantaneous_temperature(state.velocities, masses))
-        pair_counts.append(pair_count)
-        rebuild_counts.append(rebuild_count)
-        constraint_errors.append(constraint_error)
+        if diagnostic_step:
+            diagnostic_steps.append(step)
+            diagnostic_times.append(state.time)
+            potential_energies.append(potential_energy)
+            if energy_by_term is not None:
+                for name, energy in energy_by_term.items():
+                    potential_energy_by_term[name].append(energy)
+            kinetic_energies.append(
+                kinetic_energy(
+                    state.velocities,
+                    masses,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                )
+            )
+            temperatures.append(
+                instantaneous_temperature(
+                    state.velocities,
+                    masses,
+                    dof=temperature_dof,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                    boltzmann_constant=config.boltzmann_constant,
+                )
+            )
+            virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+                state.positions,
+                state.velocities,
+                masses,
+                state.forces,
+                unnamed_terms,
+                cell=cell,
+                pairs=pairs,
+                kinetic_energy_scale=config.kinetic_energy_scale,
+                enabled=config.pressure_diagnostics,
+            )
+            virials.append(virial)
+            pressure_tensors.append(pressure_tensor_value)
+            pressures.append(pressure_value)
+            pair_counts.append(pair_count)
+            rebuild_counts.append(rebuild_count)
+            constraint_errors.append(constraint_error)
+        if step % config.evaluation_interval == 0 or step == config.steps:
+            if diagnostic_step and energy_by_term is not None:
+                _eval_step_state(
+                    state,
+                    potential_energy,
+                    kinetic_energies[-1],
+                    temperatures[-1],
+                    virials[-1],
+                    pressure_tensors[-1],
+                    pressures[-1],
+                    constraint_error,
+                    energy_by_term,
+                )
+            else:
+                _eval_runtime_state(state, potential_energy, constraint_error)
 
     potential_energy_series = mx.stack(potential_energies)
     kinetic_energy_series = mx.stack(kinetic_energies)
@@ -781,6 +1562,8 @@ def simulate_nvt(
         sampled_velocities=mx.stack(sampled_velocities),
         sampled_steps=mx.array(sampled_steps, dtype=mx.int32),
         sampled_time=mx.array(sampled_times),
+        diagnostic_steps=mx.array(diagnostic_steps, dtype=mx.int32),
+        diagnostic_time=mx.array(diagnostic_times),
         potential_energy=potential_energy_series,
         kinetic_energy=kinetic_energy_series,
         total_energy=potential_energy_series + kinetic_energy_series,
@@ -788,9 +1571,17 @@ def simulate_nvt(
             name: mx.stack(energies) for name, energies in potential_energy_by_term.items()
         },
         temperature=mx.stack(temperatures),
+        virial_tensor=mx.stack(virials),
+        pressure_tensor=mx.stack(pressure_tensors),
+        pressure=mx.stack(pressures),
         pair_count=mx.array(pair_counts, dtype=mx.int32),
         rebuild_count=mx.array(rebuild_counts, dtype=mx.int32),
         constraint_max_error=mx.stack(constraint_errors),
         final_state=state,
         target_temperature=thermostat.temperature,
+        nonbonded_report=_nonbonded_runtime_report(
+            state.positions,
+            neighbor_manager=neighbor_manager,
+            neighbor_list=None if neighbor_manager is None else neighbor_manager.neighbor_list,
+        ),
     )

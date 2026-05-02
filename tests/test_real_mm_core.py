@@ -319,6 +319,8 @@ def test_xyz_and_npz_trajectory_roundtrip_and_restart(tmp_path):
     assert record.symbols == system.symbols
     assert record.metadata == {"case": "water"}
     np.testing.assert_allclose(record.sampled_positions, np.array(result.sampled_positions))
+    np.testing.assert_array_equal(record.diagnostic_steps, np.array(result.diagnostic_steps))
+    np.testing.assert_allclose(record.diagnostic_time, np.array(result.diagnostic_time))
     restart = restart_state_from_trajectory(record, system.masses, terms)
     assert restart.step == 2
     assert np.array(restart.forces).shape == (system.atom_count, 3)

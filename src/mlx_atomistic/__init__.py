@@ -2,6 +2,13 @@
 
 from importlib.metadata import version
 
+from mlx_atomistic.artifacts import (
+    MLXCompatibilityError,
+    PreparedMLXArtifact,
+    build_mlx_system_from_artifact,
+    load_prepared_mlx_artifact,
+    validate_mlx_compatibility,
+)
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Atoms, Cell
 from mlx_atomistic.dft import (
@@ -85,8 +92,11 @@ from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
     HarmonicBondPotential,
+    ImproperDihedralPotential,
     NonbondedPotential,
+    PairRestrictedNonbondedPotential,
     PeriodicDihedralPotential,
+    PositionalRestraintPotential,
 )
 from mlx_atomistic.io import (
     TrajectoryRecord,
@@ -96,17 +106,47 @@ from mlx_atomistic.io import (
     save_npz_trajectory,
     write_xyz,
 )
+from mlx_atomistic.minimize import MinimizationResult, minimize_energy
 from mlx_atomistic.mm import (
     AngleParameter,
     AtomType,
     BondParameter,
     DihedralParameter,
     ForceField,
+    ImproperParameter,
     MMSystem,
     NonbondedParameter,
 )
+from mlx_atomistic.nonbonded import (
+    EwaldReferenceConfig,
+    NonbondedBackend,
+    NonbondedElectrostatics,
+    NonbondedExecutionConfig,
+    estimate_dense_nonbonded_bytes,
+    ewald_reference_coulomb_energy,
+    ewald_reference_coulomb_energy_forces,
+    normalize_nonbonded_electrostatics,
+    validate_nonbonded_electrostatics,
+)
+from mlx_atomistic.protocols import (
+    MinimizeThenNVTProtocol,
+    ProtocolResult,
+    run_minimize_then_nvt,
+)
+from mlx_atomistic.steering import (
+    SteeredCOMBiasPotential,
+    SteeredNVTResult,
+    simulate_steered_nvt,
+)
 from mlx_atomistic.topology import Topology
-from mlx_atomistic.units import LJ_REDUCED_UNITS, LennardJonesReducedUnits
+from mlx_atomistic.trajectory_adapters import (
+    OptionalTrajectoryDependencyError,
+    load_mdanalysis_universe,
+    mdanalysis_universe_from_arrays,
+    trajectory_record_to_mdanalysis,
+    trajectory_record_to_mdtraj,
+)
+from mlx_atomistic.units import LJ_REDUCED_UNITS, LennardJonesReducedUnits, MDUnitSystem
 from mlx_atomistic.validation import (
     ForceValidationCase,
     ForceValidationResult,
@@ -133,6 +173,7 @@ __all__ = [
     "EigensolverConfig",
     "AngleParameter",
     "ExchangeCorrelationFunctional",
+    "EwaldReferenceConfig",
     "FermiDiracOccupations",
     "FixedOccupations",
     "GeometryOptimizationConfig",
@@ -141,6 +182,8 @@ __all__ = [
     "GeometryOptimizationStep",
     "HarmonicAnglePotential",
     "HarmonicBondPotential",
+    "ImproperDihedralPotential",
+    "ImproperParameter",
     "Ion",
     "IonCollection",
     "KPoint",
@@ -155,16 +198,28 @@ __all__ = [
     "LDAExchangeCorrelation",
     "LennardJonesReducedUnits",
     "LinearMixer",
+    "MLXCompatibilityError",
     "MMSystem",
+    "MDUnitSystem",
+    "MinimizationResult",
+    "MinimizeThenNVTProtocol",
     "KohnShamOperator",
     "MonkhorstPackGrid",
     "NonbondedParameter",
+    "NonbondedBackend",
+    "NonbondedElectrostatics",
+    "NonbondedExecutionConfig",
     "NonbondedPotential",
     "NonlocalPseudopotentialOperator",
     "NonlocalProjectorData",
     "OccupationResult",
+    "OptionalTrajectoryDependencyError",
+    "PairRestrictedNonbondedPotential",
     "ProjectorSet",
     "PeriodicDihedralPotential",
+    "PositionalRestraintPotential",
+    "PreparedMLXArtifact",
+    "ProtocolResult",
     "LocalGaussianPseudopotential",
     "LocalPseudopotentialField",
     "PulayDIISMixer",
@@ -180,6 +235,8 @@ __all__ = [
     "SCFResult",
     "SpinMode",
     "StressResult",
+    "SteeredCOMBiasPotential",
+    "SteeredNVTResult",
     "SubspaceDiagonalizer",
     "ForceValidationCase",
     "ForceValidationResult",
@@ -191,10 +248,17 @@ __all__ = [
     "apply_kinetic",
     "apply_local_potential",
     "apply_nonlocal_pseudopotential",
+    "build_mlx_system_from_artifact",
     "center_center_energy",
     "compare_reference_case",
+    "load_mdanalysis_universe",
     "load_npz_trajectory",
+    "load_prepared_mlx_artifact",
+    "mdanalysis_universe_from_arrays",
     "density_from_orbitals",
+    "estimate_dense_nonbonded_bytes",
+    "ewald_reference_coulomb_energy",
+    "ewald_reference_coulomb_energy_forces",
     "finite_difference_stress",
     "geometry_demo_system",
     "hartree_potential",
@@ -203,7 +267,9 @@ __all__ = [
     "load_geometry_optimization",
     "local_pseudopotential_forces",
     "magnetization_density",
+    "minimize_energy",
     "nonlocal_pseudopotential_energy",
+    "normalize_nonbonded_electrostatics",
     "normalize_orbitals",
     "optimize_geometry",
     "orbital_residuals",
@@ -213,14 +279,20 @@ __all__ = [
     "read_xyz",
     "restart_state_from_trajectory",
     "run_band_structure",
+    "run_minimize_then_nvt",
     "run_scf",
     "run_force_validation_suite",
     "save_dense_scf_restart",
     "save_geometry_optimization",
     "save_npz_trajectory",
     "scf_total_energy_forces",
+    "simulate_steered_nvt",
     "spin_density_from_orbitals",
     "summarize_validation_results",
+    "trajectory_record_to_mdanalysis",
+    "trajectory_record_to_mdtraj",
     "validate_force_term",
+    "validate_nonbonded_electrostatics",
+    "validate_mlx_compatibility",
     "write_xyz",
 ]

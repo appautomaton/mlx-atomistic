@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
-from itertools import product
 
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.cell_list import PairListStats, build_periodic_pair_list
 from mlx_atomistic.core import Cell, as_mx_array
 
 
@@ -19,12 +18,33 @@ class NeighborList:
     pairs: mx.array
     cutoff: float
     skin: float = 0.0
+    stats: PairListStats | None = None
 
     @property
     def pair_count(self) -> int:
         """Number of unique pairs."""
 
         return self.pairs.shape[0]
+
+    @property
+    def backend(self) -> str:
+        """Pair-construction backend name."""
+
+        return "periodic_cell_list" if self.stats is None else self.stats.backend
+
+    @property
+    def estimated_pair_bytes(self) -> int:
+        """Estimated bytes for the compact int32 pair array."""
+
+        if self.stats is None:
+            return int(self.pair_count) * 2 * np.dtype(np.int32).itemsize
+        return self.stats.estimated_pair_bytes
+
+    @property
+    def estimated_cell_list_bytes(self) -> int:
+        """Estimated bytes for cell-list construction arrays."""
+
+        return 0 if self.stats is None else self.stats.estimated_cell_list_bytes
 
 
 @dataclass
@@ -34,10 +54,19 @@ class NeighborListManager:
     cell: Cell
     cutoff: float
     skin: float = 0.3
+    check_interval: int = 1
+    sort_pairs: bool = True
+    max_workers: int | None = None
     neighbor_list: NeighborList | None = None
     reference_positions: mx.array | None = None
     rebuild_count: int = 0
     last_max_displacement: float = 0.0
+    updates_since_check: int = 0
+
+    def __post_init__(self) -> None:
+        if self.check_interval <= 0:
+            msg = "check_interval must be positive"
+            raise ValueError(msg)
 
     @property
     def rebuild_threshold(self) -> float:
@@ -48,12 +77,26 @@ class NeighborListManager:
     def needs_rebuild(self, positions) -> bool:
         """Return true when positions have moved too far from the reference frame."""
 
+        positions_np = np.asarray(positions, dtype=np.float32)
+        if positions_np.ndim != 2 or positions_np.shape[1] != 3:
+            msg = "positions must have shape (n_particles, 3)"
+            raise ValueError(msg)
+        if not np.all(np.isfinite(positions_np)):
+            msg = "positions must be finite"
+            raise ValueError(msg)
+
         if self.neighbor_list is None or self.reference_positions is None:
             self.last_max_displacement = float("inf")
             return True
+        self.updates_since_check += 1
+        if self.updates_since_check < self.check_interval:
+            return False
+        self.updates_since_check = 0
 
-        positions_np = np.asarray(positions, dtype=np.float32)
         reference_np = np.asarray(self.reference_positions, dtype=np.float32)
+        if reference_np.shape != positions_np.shape:
+            msg = "positions must match the neighbor-list reference shape"
+            raise ValueError(msg)
         lengths = np.asarray(self.cell.lengths, dtype=np.float32)
         displacement = positions_np - reference_np
         displacement -= lengths * np.round(displacement / lengths)
@@ -69,10 +112,13 @@ class NeighborListManager:
             self.cell,
             cutoff=self.cutoff,
             skin=self.skin,
+            sort_pairs=self.sort_pairs,
+            max_workers=self.max_workers,
         )
         self.reference_positions = as_mx_array(positions)
         self.rebuild_count += 1
         self.last_max_displacement = 0.0
+        self.updates_since_check = 0
         return self.neighbor_list
 
     def update(self, positions) -> NeighborList:
@@ -92,51 +138,33 @@ def build_neighbor_list(
     *,
     cutoff: float,
     skin: float = 0.3,
+    sort_pairs: bool = True,
+    max_workers: int | None = None,
 ) -> NeighborList:
     """Build a periodic cell-list neighbor list with unique `i < j` pairs."""
 
-    if cutoff <= 0.0:
-        msg = "cutoff must be positive"
+    if not np.isfinite(cutoff) or cutoff <= 0.0:
+        msg = "cutoff must be finite and positive"
         raise ValueError(msg)
-    if skin < 0.0:
-        msg = "skin must be non-negative"
+    if not np.isfinite(skin) or skin < 0.0:
+        msg = "skin must be finite and non-negative"
         raise ValueError(msg)
 
     positions_np = np.asarray(positions, dtype=np.float32)
     if positions_np.ndim != 2 or positions_np.shape[1] != 3:
         msg = "positions must have shape (n_particles, 3)"
         raise ValueError(msg)
-
-    lengths = np.asarray(cell.lengths, dtype=np.float32)
     search_radius = cutoff + skin
-    n_cells = np.maximum(np.floor(lengths / search_radius).astype(np.int32), 1)
-    wrapped = positions_np - np.floor(positions_np / lengths) * lengths
-    cell_indices = np.floor(wrapped / lengths * n_cells).astype(np.int32)
-    cell_indices = np.minimum(cell_indices, n_cells - 1)
-
-    bins: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-    for particle_index, index in enumerate(cell_indices):
-        bins[tuple(int(x) for x in index)].append(particle_index)
-
-    pairs: set[tuple[int, int]] = set()
-    search_radius2 = search_radius * search_radius
-    offsets = list(product((-1, 0, 1), repeat=3))
-    for cell_index, members in bins.items():
-        for offset in offsets:
-            neighbor_index = tuple(
-                (cell_index[axis] + offset[axis]) % n_cells[axis] for axis in range(3)
-            )
-            neighbors = bins.get(neighbor_index)
-            if not neighbors:
-                continue
-            for i in members:
-                for j in neighbors:
-                    if i >= j:
-                        continue
-                    displacement = positions_np[i] - positions_np[j]
-                    displacement -= lengths * np.round(displacement / lengths)
-                    if float(np.dot(displacement, displacement)) < search_radius2:
-                        pairs.add((i, j))
-
-    pair_array = np.array(sorted(pairs), dtype=np.int32).reshape((-1, 2))
-    return NeighborList(mx.array(pair_array, dtype=mx.int32), cutoff=cutoff, skin=skin)
+    pair_array, stats = build_periodic_pair_list(
+        positions_np,
+        cell,
+        search_radius=search_radius,
+        sort_pairs=sort_pairs,
+        max_workers=max_workers,
+    )
+    return NeighborList(
+        mx.array(pair_array, dtype=mx.int32),
+        cutoff=cutoff,
+        skin=skin,
+        stats=stats,
+    )

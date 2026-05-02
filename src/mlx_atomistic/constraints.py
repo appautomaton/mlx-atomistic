@@ -44,8 +44,10 @@ class DistanceConstraints:
         if self.max_iterations <= 0:
             msg = "max_iterations must be positive"
             raise ValueError(msg)
+        max_pair_index = int(np.max(pairs)) if pairs.size else -1
         object.__setattr__(self, "pairs", mx.array(pairs, dtype=mx.int32))
         object.__setattr__(self, "distances", as_mx_array(distances))
+        object.__setattr__(self, "_max_pair_index", max_pair_index)
 
     def _displacements(self, positions: mx.array, cell: Cell | None) -> mx.array:
         i = self.pairs[:, 0]
@@ -77,7 +79,7 @@ class DistanceConstraints:
         masses = as_mx_array(masses)
         if self.pairs.shape[0] == 0:
             return constrained, self.max_error(constrained, cell)
-        if np.max(np.asarray(self.pairs)) >= constrained.shape[0]:
+        if self._max_pair_index >= constrained.shape[0]:
             msg = "constraint pair index outside positions"
             raise ValueError(msg)
 
@@ -112,7 +114,7 @@ class DistanceConstraints:
         masses = as_mx_array(masses)
         if self.pairs.shape[0] == 0:
             return constrained
-        if np.max(np.asarray(self.pairs)) >= positions.shape[0]:
+        if self._max_pair_index >= positions.shape[0]:
             msg = "constraint pair index outside positions"
             raise ValueError(msg)
 

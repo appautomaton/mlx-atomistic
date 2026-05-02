@@ -38,6 +38,30 @@ def test_simulate_nve_sparse_sampling_counts():
     assert np.array(result.temperature).shape == (6,)
 
 
+def test_simulate_nve_sparse_diagnostics_use_diagnostic_axis():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [2.2, 1.0, 1.0], [1.0, 2.2, 1.0], [2.2, 2.2, 1.0]],
+        dtype=np.float32,
+    )
+    velocities = np.zeros_like(positions)
+    result = simulate_nve(
+        positions,
+        velocities,
+        cell=Cell.cubic(6.0),
+        force_terms=LennardJonesPotential(cutoff=2.5),
+        config=SimulationConfig(
+            dt=0.002,
+            steps=5,
+            sample_interval=5,
+            diagnostic_interval=2,
+        ),
+    )
+
+    assert np.array(result.sampled_steps).tolist() == [0, 5]
+    assert np.array(result.diagnostic_steps).tolist() == [0, 2, 4, 5]
+    assert np.array(result.total_energy).shape == (4,)
+
+
 def test_dynamic_neighbor_nve_matches_static_neighbor_for_short_run():
     positions = np.array(
         [[1.0, 1.0, 1.0], [2.2, 1.0, 1.0], [1.0, 2.2, 1.0], [2.2, 2.2, 1.0]],

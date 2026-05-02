@@ -7,9 +7,15 @@ uv sync --extra notebook --extra viz --group dev
 uv run jupyter lab
 ```
 
-The active notebooks live under `notebooks/workflows/`. They are meant to be
-read as compact lab workbooks: narrative first, equations where useful, then
-small executable cells with plots and diagnostics.
+The active workflow notebooks live under `notebooks/workflows/`. They are meant
+to be compact lab workbooks: narrative first, equations where useful, then small
+executable cells with plots and diagnostics.
+
+`notebooks/ligand-receptor-motion/` is the active macromolecular visualization
+workflow. Its primary path imports or loads a strict GPCRmd prepared artifact,
+runs the short NVT proof with `mlx_atomistic`, then visualizes and analyzes only
+that MLX-generated trajectory. GPCRmd reference trajectories are comparison
+context only.
 
 ## Workflow Notebooks
 
@@ -38,6 +44,10 @@ small executable cells with plots and diagnostics.
   static reference comparison plumbing.
 
 ## Archive
+
+`archive/atp-pocket-mlx-demo/` contains the old ATP/P2X4 pocket notebook as
+historical reference. It is no longer the active macromolecule visualization
+workflow.
 
 `archive/milestone-trace/` contains the old numbered notebooks from earlier
 milestone development. They are retained as provenance, not as the recommended
