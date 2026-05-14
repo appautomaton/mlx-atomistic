@@ -35,6 +35,8 @@ class MDAccelerationBenchmarkResult:
     tile_size: int | None
     estimated_pair_bytes: int
     estimated_dense_bytes: int
+    neighbor_rebuild_ms_per_eval: float
+    force_eval_ms_per_eval: float
     ms_per_eval: float
     ns_per_day_at_dt_0_002: float
     energy: float
@@ -111,8 +113,12 @@ def _time_backend(
     neighbor_list = None
     rebuild_count = 0
     estimated_pair_bytes = 0
+    neighbor_rebuild_elapsed = 0.0
+    force_eval_elapsed = 0.0
     if backend == "mlx_pairs":
+        rebuild_start = perf_counter()
         neighbor_list = build_neighbor_list(positions, cell, cutoff=2.5, skin=0.4)
+        neighbor_rebuild_elapsed += perf_counter() - rebuild_start
         pair_count = neighbor_list.pair_count
         rebuild_count = 1
         estimated_pair_bytes = neighbor_list.estimated_pair_bytes
@@ -120,25 +126,33 @@ def _time_backend(
     start = perf_counter()
     if backend == "python_neighbor":
         for _ in range(evaluations):
+            rebuild_start = perf_counter()
             dynamic_neighbors = build_neighbor_list(positions, cell, cutoff=2.5, skin=0.4)
+            neighbor_rebuild_elapsed += perf_counter() - rebuild_start
             pair_count = dynamic_neighbors.pair_count
             rebuild_count += 1
             estimated_pair_bytes = dynamic_neighbors.estimated_pair_bytes
+            force_start = perf_counter()
             energy, forces = _evaluate(
                 timed_potential,
                 positions,
                 cell,
                 pairs=dynamic_neighbors.pairs,
             )
+            force_eval_elapsed += perf_counter() - force_start
     elif backend == "mlx_pairs":
         if neighbor_list is None:
             msg = "mlx_pairs benchmark requires a prebuilt neighbor list"
             raise RuntimeError(msg)
         for _ in range(evaluations):
+            force_start = perf_counter()
             energy, forces = _evaluate(timed_potential, positions, cell, pairs=neighbor_list.pairs)
+            force_eval_elapsed += perf_counter() - force_start
     else:
         for _ in range(evaluations):
+            force_start = perf_counter()
             energy, forces = _evaluate(timed_potential, positions, cell)
+            force_eval_elapsed += perf_counter() - force_start
     elapsed = perf_counter() - start
     ms_per_eval = elapsed * 1000.0 / evaluations
     ns_per_day = 0.002 * (1000.0 / ms_per_eval) * 86400.0 if ms_per_eval > 0.0 else 0.0
@@ -154,6 +168,8 @@ def _time_backend(
             int(positions.shape[0]),
             components="combined",
         ),
+        neighbor_rebuild_ms_per_eval=neighbor_rebuild_elapsed * 1000.0 / evaluations,
+        force_eval_ms_per_eval=force_eval_elapsed * 1000.0 / evaluations,
         ms_per_eval=ms_per_eval,
         ns_per_day_at_dt_0_002=ns_per_day,
         energy=energy,

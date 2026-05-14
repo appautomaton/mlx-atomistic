@@ -384,9 +384,9 @@ def run_atp_case(
     diagnostic_interval: int,
     constraint_max_iterations: int,
 ) -> MDPerformanceResult:
-    """Run the prepared ATP-pocket benchmark through atomistic_prep."""
+    """Run the prepared ATP-pocket benchmark through mlx_atomistic.prep."""
 
-    from atomistic_prep.runner import run_mlx
+    from mlx_atomistic.prep.runner import run_mlx
 
     with tempfile.TemporaryDirectory(prefix="mlx-atp-perf-") as temp_dir:
         out = Path(temp_dir) / "trajectory.npz"

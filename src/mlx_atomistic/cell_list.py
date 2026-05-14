@@ -52,6 +52,11 @@ class PairListStats:
     estimated_pair_bytes: int
     estimated_cell_list_bytes: int
     backend: str = "periodic_cell_list"
+    representation_kind: str = "pairs"
+    candidate_count: int | None = None
+    estimated_candidate_bytes: int = 0
+    compaction_backend: str | None = None
+    fallback_reason: str | None = None
 
 
 def estimate_pair_list_bytes(pair_count: int) -> int:

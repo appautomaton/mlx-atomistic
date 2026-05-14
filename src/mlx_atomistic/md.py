@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from math import exp, sqrt
+from time import perf_counter
 from typing import Protocol
 
 import mlx.core as mx
@@ -864,6 +865,7 @@ def _nonbonded_runtime_report(
     *,
     neighbor_manager: NeighborListManager | None,
     neighbor_list: NeighborList | None,
+    force_evaluation_wall_seconds: float = 0.0,
 ) -> dict[str, int | float | str | None]:
     if neighbor_list is None:
         return {
@@ -873,6 +875,15 @@ def _nonbonded_runtime_report(
             "skin": None,
             "rebuild_count": 0,
             "estimated_pair_memory_bytes": _dense_pair_count(positions) * 2 * 4,
+            "estimated_cell_list_memory_bytes": 0,
+            "representation_kind": "pairs",
+            "candidate_count": _dense_pair_count(positions),
+            "estimated_candidate_memory_bytes": 0,
+            "compaction_backend": None,
+            "fallback_reason": None,
+            "neighbor_update_wall_seconds": 0.0,
+            "neighbor_rebuild_wall_seconds": 0.0,
+            "force_evaluation_wall_seconds": force_evaluation_wall_seconds,
         }
     return {
         "backend": neighbor_list.backend,
@@ -881,6 +892,19 @@ def _nonbonded_runtime_report(
         "skin": neighbor_list.skin,
         "rebuild_count": 0 if neighbor_manager is None else neighbor_manager.rebuild_count,
         "estimated_pair_memory_bytes": neighbor_list.estimated_pair_bytes,
+        "estimated_cell_list_memory_bytes": neighbor_list.estimated_cell_list_bytes,
+        "representation_kind": neighbor_list.representation_kind,
+        "candidate_count": neighbor_list.candidate_count,
+        "estimated_candidate_memory_bytes": neighbor_list.estimated_candidate_bytes,
+        "compaction_backend": neighbor_list.compaction_backend,
+        "fallback_reason": neighbor_list.fallback_reason,
+        "neighbor_update_wall_seconds": (
+            0.0 if neighbor_manager is None else neighbor_manager.update_wall_seconds
+        ),
+        "neighbor_rebuild_wall_seconds": (
+            0.0 if neighbor_manager is None else neighbor_manager.rebuild_wall_seconds
+        ),
+        "force_evaluation_wall_seconds": force_evaluation_wall_seconds,
     }
 
 
@@ -1090,6 +1114,7 @@ def simulate_nve(
     pairs = None if neighbor_list is None else neighbor_list.pairs
     pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
+    force_evaluation_wall_seconds = 0.0
     energy_forces_by_term = _make_energy_forces_by_term_evaluator(
         terms,
         cell=cell,
@@ -1102,7 +1127,9 @@ def simulate_nve(
         pairs=pairs,
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
     )
+    force_start = perf_counter()
     potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
+    force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
         velocities=velocities,
@@ -1177,6 +1204,7 @@ def simulate_nve(
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
         diagnostic_step = _is_diagnostic_step(step, config)
+        force_start = perf_counter()
         if neighbor_manager is None and diagnostic_step:
             potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
         elif neighbor_manager is None:
@@ -1197,6 +1225,7 @@ def simulate_nve(
                 pairs=pairs,
             )
             energy_by_term = None
+        force_evaluation_wall_seconds += perf_counter() - force_start
         next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = velocities_half + 0.5 * config.dt * next_acceleration
         if constraints is not None:
@@ -1304,6 +1333,7 @@ def simulate_nve(
             state.positions,
             neighbor_manager=neighbor_manager,
             neighbor_list=None if neighbor_manager is None else neighbor_manager.neighbor_list,
+            force_evaluation_wall_seconds=force_evaluation_wall_seconds,
         ),
     )
 
@@ -1349,6 +1379,7 @@ def simulate_nvt(
     pairs = None if neighbor_list is None else neighbor_list.pairs
     pair_count = _dense_pair_count(positions) if neighbor_list is None else neighbor_list.pair_count
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
+    force_evaluation_wall_seconds = 0.0
     energy_forces_by_term = _make_energy_forces_by_term_evaluator(
         terms,
         cell=cell,
@@ -1361,7 +1392,9 @@ def simulate_nvt(
         pairs=pairs,
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
     )
+    force_start = perf_counter()
     potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
+    force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
         velocities=velocities,
@@ -1455,6 +1488,7 @@ def simulate_nvt(
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
         diagnostic_step = _is_diagnostic_step(step, config)
+        force_start = perf_counter()
         if neighbor_manager is None and diagnostic_step:
             potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
         elif neighbor_manager is None:
@@ -1475,6 +1509,7 @@ def simulate_nvt(
                 pairs=pairs,
             )
             energy_by_term = None
+        force_evaluation_wall_seconds += perf_counter() - force_start
         next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = thermostatted_velocities + 0.5 * config.dt * next_acceleration
         if constraints is not None:
@@ -1583,5 +1618,6 @@ def simulate_nvt(
             state.positions,
             neighbor_manager=neighbor_manager,
             neighbor_list=None if neighbor_manager is None else neighbor_manager.neighbor_list,
+            force_evaluation_wall_seconds=force_evaluation_wall_seconds,
         ),
     )

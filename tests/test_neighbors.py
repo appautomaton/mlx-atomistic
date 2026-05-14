@@ -22,6 +22,151 @@ def test_neighbor_list_has_unique_expected_pairs():
     assert pairs.tolist() == [[0, 1]]
     assert neighbors.backend == "periodic_cell_list"
     assert neighbors.estimated_pair_bytes == 8
+    assert neighbors.estimated_cell_list_bytes > 0
+
+
+def test_neighbor_backend_validation_rejects_unknown_backend():
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(4.0)
+
+    with pytest.raises(ValueError, match="unknown neighbor backend"):
+        build_neighbor_list(positions, cell, cutoff=1.5, backend="bad")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unknown neighbor backend"):
+        NeighborListManager(cell, cutoff=1.5, backend="bad")  # type: ignore[arg-type]
+
+
+def test_mlx_dense_pairs_matches_periodic_cell_list_pairs_ignoring_order():
+    positions = np.array(
+        [
+            [0.05, 0.05, 0.05],
+            [0.35, 0.05, 0.05],
+            [1.85, 0.05, 0.05],
+            [1.85, 1.85, 1.85],
+            [1.1, 1.1, 0.05],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(2.0)
+
+    oracle = build_neighbor_list(positions, cell, cutoff=0.45, skin=0.0)
+    candidate = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=0.45,
+        skin=0.0,
+        backend="mlx_dense_pairs",
+    )
+
+    assert {tuple(pair) for pair in np.asarray(candidate.pairs).tolist()} == {
+        tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
+    }
+    assert candidate.backend == "mlx_dense_pairs"
+    assert candidate.representation_kind == "pairs"
+    assert candidate.candidate_count == positions.shape[0] * (positions.shape[0] - 1) // 2
+    assert candidate.estimated_pair_bytes == candidate.pair_count * 8
+    assert candidate.estimated_candidate_bytes > 0
+    assert candidate.estimated_cell_list_bytes == 0
+    assert candidate.compaction_backend == "cpu_argwhere"
+    assert candidate.fallback_reason == "mlx_argwhere_or_nonzero_unavailable"
+
+
+def test_mlx_cell_pairs_matches_periodic_cell_list_pairs_ignoring_order():
+    rng = np.random.default_rng(7)
+    positions = rng.uniform(0.0, 8.0, size=(96, 3)).astype(np.float32)
+    cell = Cell.cubic(8.0)
+
+    oracle = build_neighbor_list(positions, cell, cutoff=1.4, skin=0.2)
+    candidate = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.4,
+        skin=0.2,
+        backend="mlx_cell_pairs",
+    )
+
+    assert {tuple(pair) for pair in np.asarray(candidate.pairs).tolist()} == {
+        tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
+    }
+    assert candidate.backend == "mlx_cell_pairs"
+    assert candidate.representation_kind == "pairs"
+    assert candidate.candidate_count is not None
+    assert candidate.candidate_count < positions.shape[0] * (positions.shape[0] - 1) // 2
+    assert candidate.estimated_pair_bytes == candidate.pair_count * 8
+    assert candidate.estimated_candidate_bytes > 0
+    assert candidate.estimated_cell_list_bytes > 0
+    assert candidate.compaction_backend == "cpu_argwhere"
+    assert candidate.fallback_reason is None
+
+
+def test_mlx_dense_pairs_fails_closed_for_large_candidate_sets():
+    positions = np.zeros((5, 3), dtype=np.float32)
+    cell = Cell.cubic(4.0)
+
+    with pytest.raises(ValueError, match="use periodic_cell_list"):
+        build_neighbor_list(
+            positions,
+            cell,
+            cutoff=1.5,
+            backend="mlx_dense_pairs",
+            max_mlx_dense_atoms=4,
+        )
+
+
+def test_neighbor_list_manager_selects_mlx_dense_pairs_backend():
+    positions = np.array(
+        [
+            [0.05, 0.05, 0.05],
+            [0.35, 0.05, 0.05],
+            [1.85, 0.05, 0.05],
+        ],
+        dtype=np.float32,
+    )
+    manager = NeighborListManager(
+        Cell.cubic(2.0),
+        cutoff=0.45,
+        skin=0.0,
+        backend="mlx_dense_pairs",
+    )
+
+    neighbors = manager.update(positions)
+
+    assert neighbors.backend == "mlx_dense_pairs"
+    assert neighbors.representation_kind == "pairs"
+    assert manager.rebuild_count == 1
+
+
+def test_neighbor_list_manager_auto_selects_mlx_cell_pairs_above_dense_limit():
+    rng = np.random.default_rng(9)
+    positions = rng.uniform(0.0, 8.0, size=(16, 3)).astype(np.float32)
+    cell = Cell.cubic(8.0)
+    manager = NeighborListManager(
+        cell,
+        cutoff=1.5,
+        skin=0.2,
+        max_mlx_dense_atoms=8,
+    )
+
+    neighbors = manager.update(positions)
+    oracle = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.5,
+        skin=0.2,
+        backend="periodic_cell_list",
+    )
+
+    assert neighbors.backend == "mlx_cell_pairs"
+    assert {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()} == {
+        tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
+    }
+    assert manager.rebuild_count == 1
 
 
 def test_neighbor_list_is_deterministic_when_periodic_offsets_alias():
@@ -75,6 +220,7 @@ def test_neighbor_list_large_periodic_fixture_uses_compact_pair_storage():
 
     assert neighbors.pair_count == 3000
     assert tuple(neighbors.stats.n_cells) == (9, 9, 9)
+    assert neighbors.backend == "periodic_cell_list"
     assert neighbors.estimated_pair_bytes == neighbors.pair_count * 8
     assert neighbors.estimated_pair_bytes < estimate_dense_nonbonded_bytes(
         positions.shape[0],

@@ -428,6 +428,76 @@ class CHARMMForceSwitchNonbondedPotential:
         coulomb_pair_energy = mx.where(pair_mask, coulomb_pair_energy, 0.0)
         return {"lj": mx.sum(lj_pair_energy), "coulomb": mx.sum(coulomb_pair_energy)}
 
+    def _components_and_forces_for_pairs(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array,
+    ) -> tuple[dict[str, mx.array], mx.array]:
+        if pairs.shape[0] == 0:
+            zero = _zero_energy(positions)
+            return {"lj": zero, "coulomb": zero}, mx.zeros_like(positions)
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = (r2 > 0.0) & (r2 < self.cutoff * self.cutoff)
+        safe_r2 = mx.where(pair_mask, r2, 1.0)
+        distance = mx.sqrt(safe_r2)
+
+        sigma_ij = 0.5 * (self.sigma[i] + self.sigma[j])
+        epsilon_ij = mx.sqrt(self.epsilon[i] * self.epsilon[j])
+        inv_r = 1.0 / distance
+        inv_r2 = 1.0 / safe_r2
+        inv_r3 = inv_r * inv_r * inv_r
+        inv_r6 = inv_r3 * inv_r3
+        sigma6 = sigma_ij**6
+        sigma12 = sigma6 * sigma6
+        c12 = 4.0 * epsilon_ij * sigma12
+        c6 = 4.0 * epsilon_ij * sigma6
+
+        rc = self.cutoff
+        ri = self.switch_distance
+        rc3 = rc**3
+        rc6 = rc3 * rc3
+        ri3 = ri**3
+        ri6 = ri3 * ri3
+        rc3_inv = 1.0 / rc3
+        rc6_inv = 1.0 / rc6
+        ri3_inv = 1.0 / ri3
+        ri6_inv = 1.0 / ri6
+
+        inner_lj = c12 * (inv_r6 * inv_r6 - ri6_inv * rc6_inv) - c6 * (
+            inv_r6 - ri3_inv * rc3_inv
+        )
+        switched_lj = c12 * rc6 / (rc6 - ri6) * (inv_r6 - rc6_inv) ** 2 - c6 * rc3 / (
+            rc3 - ri3
+        ) * (inv_r3 - rc3_inv) ** 2
+        use_inner = distance <= ri
+        lj_pair_energy = mx.where(use_inner, inner_lj, switched_lj)
+        lj_pair_energy = mx.where(pair_mask, lj_pair_energy, 0.0)
+
+        inner_lj_scalar = 12.0 * c12 * inv_r6 * inv_r6 * inv_r2 - 6.0 * c6 * inv_r6 * inv_r2
+        switched_lj_scalar = (
+            12.0 * c12 * rc6 / (rc6 - ri6) * (inv_r6 - rc6_inv) * inv_r6 * inv_r2
+            - 6.0 * c6 * rc3 / (rc3 - ri3) * (inv_r3 - rc3_inv) * inv_r3 * inv_r2
+        )
+        lj_scalar = mx.where(use_inner, inner_lj_scalar, switched_lj_scalar)
+
+        qij = self.charges[i] * self.charges[j]
+        coulomb_pair_energy = self.coulomb_constant * qij / distance
+        if self.coulomb_shift:
+            coulomb_pair_energy = coulomb_pair_energy - self.coulomb_constant * qij / self.cutoff
+        coulomb_pair_energy = mx.where(pair_mask, coulomb_pair_energy, 0.0)
+        coulomb_scalar = self.coulomb_constant * qij / (safe_r2 * distance)
+
+        scalar = mx.where(pair_mask, lj_scalar + coulomb_scalar, 0.0)
+        pair_forces = scalar[:, None] * displacement
+        forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
+        return {"lj": mx.sum(lj_pair_energy), "coulomb": mx.sum(coulomb_pair_energy)}, forces
+
     def potential_energy(
         self,
         positions: mx.array,
@@ -456,13 +526,8 @@ class CHARMMForceSwitchNonbondedPotential:
     ) -> tuple[mx.array, mx.array]:
         positions = as_mx_array(positions)
         pair_array = self._pairs(pairs)
-
-        def energy_fn(current_positions: mx.array) -> mx.array:
-            components = self._component_energies_for_pairs(current_positions, cell, pair_array)
-            return components["lj"] + components["coulomb"]
-
-        energy = energy_fn(positions)
-        forces = -mx.grad(energy_fn)(positions)
+        components, forces = self._components_and_forces_for_pairs(positions, cell, pair_array)
+        energy = components["lj"] + components["coulomb"]
         return energy, forces
 
     def energy_forces_with_components(
@@ -471,8 +536,10 @@ class CHARMMForceSwitchNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
-        energy, forces = self.energy_forces(positions, cell=cell, pairs=pairs)
-        components = self.component_energies(positions, cell=cell, pairs=pairs)
+        positions = as_mx_array(positions)
+        pair_array = self._pairs(pairs)
+        components, forces = self._components_and_forces_for_pairs(positions, cell, pair_array)
+        energy = components["lj"] + components["coulomb"]
         return energy, forces, components
 
 

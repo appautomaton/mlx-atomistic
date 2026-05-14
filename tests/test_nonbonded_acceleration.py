@@ -209,6 +209,61 @@ def test_lazy_topology_neighbor_pairs_filter_exclusions_and_exceptions_without_d
     assert np.all(np.isfinite(np.asarray(forces)))
 
 
+def test_mlx_dense_pairs_preserve_lazy_topology_pair_semantics():
+    positions = as_mx_array(
+        [
+            [0.1, 0.1, 0.1],
+            [1.1, 0.1, 0.1],
+            [0.1, 1.1, 0.1],
+            [1.2, 1.1, 0.1],
+        ]
+    )
+    cell = Cell.cubic(4.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        one_four_pairs=[(0, 3)],
+        nonbonded_exception_pairs=[(1, 3)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.1, 1.2, 1.0],
+        epsilon=[0.2, 0.25, 0.3, 0.2],
+        charges=[0.25, -0.25, 0.1, -0.1],
+        atom_types=["H", "C", "O", "H"],
+        topology=topology,
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.75,
+        exception_pairs=[(1, 3)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.35],
+        nbfix_type_epsilon=[0.6],
+        cutoff=2.0,
+        lj_shift=False,
+        backend="auto",
+    )
+    oracle = build_neighbor_list(positions, cell, cutoff=2.0, skin=0.0)
+    mlx_pairs = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.0,
+        skin=0.0,
+        backend="mlx_dense_pairs",
+    )
+
+    oracle_energy, oracle_forces = term.energy_forces(positions, cell, pairs=oracle.pairs)
+    mlx_energy, mlx_forces = term.energy_forces(positions, cell, pairs=mlx_pairs.pairs)
+
+    mx.eval(oracle_energy, oracle_forces, mlx_energy, mlx_forces)
+    assert topology._nonbonded_pairs is None
+    assert mlx_pairs.fallback_reason == "mlx_argwhere_or_nonzero_unavailable"
+    np.testing.assert_allclose(np.asarray(mlx_energy), np.asarray(oracle_energy), rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(mlx_forces), np.asarray(oracle_forces), rtol=1e-5)
+
+
 def test_nbfix_type_pair_substitution_works_on_neighbor_pairs():
     positions = as_mx_array(
         [[0.1, 0.1, 0.1], [1.4, 0.1, 0.1], [0.1, 1.5, 0.1]]
@@ -279,7 +334,8 @@ def test_lazy_large_periodic_nonbonded_refuses_dense_fallback_and_reports_compac
         config=SimulationConfig(steps=1, diagnostic_interval=1),
     )
 
-    assert result.nonbonded_report["backend"] == "periodic_cell_list"
+    assert result.nonbonded_report["backend"] == "mlx_dense_pairs"
+    assert result.nonbonded_report["representation_kind"] == "pairs"
     assert result.nonbonded_report["pair_count"] == int(result.pair_count[-1])
     assert result.nonbonded_report["cutoff"] == 1.6
     assert result.nonbonded_report["skin"] == 0.2
@@ -288,6 +344,99 @@ def test_lazy_large_periodic_nonbonded_refuses_dense_fallback_and_reports_compac
         result.nonbonded_report["estimated_pair_memory_bytes"]
         == manager.neighbor_list.estimated_pair_bytes
     )
+    assert (
+        result.nonbonded_report["estimated_cell_list_memory_bytes"]
+        == manager.neighbor_list.estimated_cell_list_bytes
+    )
+    assert result.nonbonded_report["neighbor_rebuild_wall_seconds"] >= 0.0
+    assert result.nonbonded_report["force_evaluation_wall_seconds"] >= 0.0
+
+
+def test_auto_neighbor_backend_selects_mlx_cell_pairs_above_dense_limit():
+    positions = as_mx_array(
+        [
+            [0.1, 0.1, 0.1],
+            [1.1, 0.1, 0.1],
+            [0.1, 1.1, 0.1],
+            [1.1, 1.1, 0.1],
+        ]
+    )
+    velocities = mx.zeros_like(positions)
+    masses = mx.ones((4,), dtype=mx.float32)
+    cell = Cell.cubic(5.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.2, 0.2, 0.2, 0.2],
+        charges=[0.0, 0.0, 0.0, 0.0],
+        topology=topology,
+        cutoff=1.6,
+        backend="auto",
+    )
+    manager = NeighborListManager(cell, cutoff=1.6, skin=0.2, max_mlx_dense_atoms=3)
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=(term,),
+        neighbor_manager=manager,
+        config=SimulationConfig(steps=1, diagnostic_interval=1),
+    )
+
+    assert result.nonbonded_report["backend"] == "mlx_cell_pairs"
+    assert result.nonbonded_report["representation_kind"] == "pairs"
+    assert result.nonbonded_report["candidate_count"] is not None
+    assert result.nonbonded_report["fallback_reason"] is None
+    assert result.nonbonded_report["neighbor_update_wall_seconds"] >= 0.0
+    assert result.nonbonded_report["neighbor_rebuild_wall_seconds"] >= 0.0
+    assert result.nonbonded_report["force_evaluation_wall_seconds"] >= 0.0
+
+
+def test_mlx_dense_pairs_neighbor_manager_drives_lazy_nonbonded_md_report():
+    positions = as_mx_array(
+        [[0.1, 0.1, 0.1], [1.1, 0.1, 0.1], [0.1, 1.1, 0.1], [1.1, 1.1, 0.1]]
+    )
+    velocities = mx.zeros_like(positions)
+    masses = mx.ones((4,), dtype=mx.float32)
+    cell = Cell.cubic(5.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.2, 0.2, 0.2, 0.2],
+        charges=[0.0, 0.0, 0.0, 0.0],
+        topology=topology,
+        cutoff=1.6,
+        backend="auto",
+    )
+    manager = NeighborListManager(cell, cutoff=1.6, skin=0.2, backend="mlx_dense_pairs")
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=(term,),
+        neighbor_manager=manager,
+        config=SimulationConfig(steps=1, diagnostic_interval=1),
+    )
+
+    assert result.nonbonded_report["backend"] == "mlx_dense_pairs"
+    assert result.nonbonded_report["representation_kind"] == "pairs"
+    assert result.nonbonded_report["pair_count"] == int(result.pair_count[-1])
+    assert result.nonbonded_report["candidate_count"] == 6
+    assert result.nonbonded_report["estimated_candidate_memory_bytes"] > 0
+    assert result.nonbonded_report["compaction_backend"] == "cpu_argwhere"
+    assert result.nonbonded_report["fallback_reason"] == "mlx_argwhere_or_nonzero_unavailable"
 
 
 def test_dense_nonbonded_respects_topology_exclusions_and_one_four_scaling():
@@ -437,6 +586,8 @@ def test_md_acceleration_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert all(case["estimated_dense_bytes"] > 0 for case in payload["cases"])
     assert all("rebuild_count" in case for case in payload["cases"])
     assert all("estimated_pair_bytes" in case for case in payload["cases"])
+    assert all("neighbor_rebuild_ms_per_eval" in case for case in payload["cases"])
+    assert all("force_eval_ms_per_eval" in case for case in payload["cases"])
     assert csv_path.read_text().startswith("backend,particles")
 
 
