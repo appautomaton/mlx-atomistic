@@ -41,8 +41,8 @@ The old ATP/P2X4 notebook has moved to
 reference for the internal 4DW1 pocket artifact, but it is no longer the active
 macromolecule visualization workflow. For that archived example:
 
-1. build `prepare-p2x4-atp --backend production_mlx` if the artifact is missing
-   or stale;
+1. build the prepared artifact with `prepare_p2x4_atp(..., backend="production_mlx")`
+   and `save_prepared_system(...)` if the artifact is missing or stale;
 2. validate the generated artifact with `require_production=True`;
 3. run MLX minimization, restrained NVT warmup, and production NVT if
    `trajectory.npz` is missing or stale;

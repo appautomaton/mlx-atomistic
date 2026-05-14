@@ -30,9 +30,9 @@
 
 ## Commands That Work Today
 
-- install: `uv sync --extra notebook --extra viz --group dev` is the documented full notebook/viz setup (`README.md`, `notebooks/README.md`).
+- install: `uv sync --extra notebook --extra prep --extra viz --group dev` is the documented full notebook/prep/viz setup (`README.md`, `notebooks/README.md`).
 - dev: `uv run jupyter lab` is the documented notebook runtime (`README.md`, `notebooks/README.md`).
-- test: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest` was verified and passed with `162 passed`.
+- targeted regression: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_runtime_boundaries.py tests/test_mlx_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py tests/test_ligand_receptor_motion.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py` was verified and passed with `154 passed`.
 - source lint: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src tests scripts` was verified and passed.
 - full lint: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check .` was verified and currently fails on notebook Ruff issues, including archived notebooks and a few active workflow notebooks.
 
@@ -68,7 +68,9 @@
 
 ## Verification and Release Surfaces
 
-- Pytest is the main regression gate and is currently green (`pyproject.toml`, verified `uv run pytest`).
+- Targeted Pytest coverage for runtime-boundary, prep, GPCRmd, production-artifact,
+  ligand-receptor, neighbor, and nonbonded surfaces is currently green
+  (`pyproject.toml`, verified targeted command).
 - Ruff is the style gate for source/tests/scripts, but full-repo Ruff is not green because notebooks are linted too (`pyproject.toml`, verified Ruff commands).
 - Console scripts declared in `pyproject.toml` expose only the benchmark API; prep workflows use Python APIs.
 
@@ -80,8 +82,7 @@
 
 ## Sources Read
 
-- `.agent/.automaton/state/current.json` - active `bootstrap` / `frame` state.
-- `.agent/steering/STATUS.md` - scaffold-level steering status before refresh.
+- `.agent/steering/STATUS.md` - current steering status.
 - `README.md` - purpose, setup, initial scope, benchmark examples, and layout.
 - `pyproject.toml` - package metadata, dependencies, extras, scripts, tests, and lint config.
 - `.python-version` - Python version pin.
@@ -92,7 +93,6 @@
 ## Open Questions
 
 - Should archived notebooks be excluded from full-repo Ruff, or should they be auto-normalized so `uv run ruff check .` is green?
-- What is the first user-facing slice after bootstrap: notebook hygiene, preparation workflow hardening, benchmark reporting, or DFT/MD capability expansion?
 
 ## Import Verdict
 

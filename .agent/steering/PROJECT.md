@@ -39,9 +39,9 @@
 
 ## Commands
 
-- install: `uv sync --extra notebook --extra viz --group dev` (`README.md`, `notebooks/README.md`).
+- install: `uv sync --extra notebook --extra prep --extra viz --group dev` (`README.md`, `notebooks/README.md`).
 - notebook dev: `uv run jupyter lab` (`README.md`, `notebooks/README.md`).
-- test: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest` was verified and passed with `162 passed`.
+- targeted regression: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_runtime_boundaries.py tests/test_mlx_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py tests/test_ligand_receptor_motion.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py` was verified and passed with `154 passed`.
 - source lint: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src tests scripts` was verified and passed.
 - full lint: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check .` was verified and currently fails on notebook Ruff findings.
 

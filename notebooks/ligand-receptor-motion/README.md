@@ -33,7 +33,7 @@ Local cache paths can point at a GPCRmd manifest, package directory, or a direct
 ## Run
 
 ```bash
-uv sync --extra viz --group dev
+uv sync --extra notebook --extra prep --extra viz --group dev
 uv run jupyter lab notebooks/ligand-receptor-motion
 ```
 

@@ -16,7 +16,6 @@
 
 ### Needs Confirmation
 
-- The next primary user-facing slice after bootstrap has not been selected (`.agent/.automaton/state/current.json`, `.agent/wiki/REPO-MAP.md`).
 - Full-repo Ruff policy for archived notebooks is unresolved because `uv run ruff check .` currently fails on notebook findings (`pyproject.toml`, `notebooks/README.md`).
 
 ## Technical Constraints and Invariants
@@ -41,7 +40,7 @@
 
 ## Quality and Operational Expectations
 
-- testing bar: `uv run pytest` is the main regression gate and currently passes with `162 passed` (`pyproject.toml`, verified command).
+- testing bar: the targeted runtime-boundary/prep/neighbor regression suite currently passes with `154 passed` (`pyproject.toml`, verified command).
 - source lint bar: `uv run ruff check src tests scripts` currently passes (`pyproject.toml`, verified command).
 - full lint state: `uv run ruff check .` currently fails on notebook lint findings and should not be claimed green until policy or notebooks change (`pyproject.toml`, verified command).
 - sandbox reliability: use `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache` when the default home `uv` cache is not writable (`README.md`, verified commands).
@@ -61,7 +60,6 @@
 ## Open Risks and Unknowns
 
 - Notebook lint policy is inconsistent with a green full-repo Ruff command today (`pyproject.toml`, `notebooks/README.md`, verified command).
-- The first post-bootstrap feature/change is not yet framed (`.agent/.automaton/state/current.json`, `.agent/wiki/REPO-MAP.md`).
 - Optional preparation and visualization extras are intentionally broad; dependency expansion should stay justified by specific workflow needs (`pyproject.toml`, `AGENTS.md`).
 
 ## Evidence Anchors
@@ -73,4 +71,3 @@
 - `src/mlx_atomistic/__init__.py`
 - `src/mlx_atomistic/prep/`
 - `notebooks/README.md`
-- `.agent/.automaton/state/current.json`

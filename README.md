@@ -17,7 +17,7 @@ OpenMM/LAMMPS provenance.
 
 ```bash
 uv venv --python 3.13
-uv sync --extra notebook --extra viz --group dev
+uv sync --extra notebook --extra prep --extra viz --group dev
 uv run python -m ipykernel install --user --name mlx-atomistic --display-name "mlx-atomistic"
 uv run jupyter lab
 ```
@@ -25,7 +25,7 @@ uv run jupyter lab
 If `uv` cannot use the home cache in a sandboxed run, use a writable cache:
 
 ```bash
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra viz --group dev
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra prep --extra viz --group dev
 ```
 
 ## Initial Scope

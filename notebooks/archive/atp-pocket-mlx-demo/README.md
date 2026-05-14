@@ -4,10 +4,10 @@ Historical notebook-first example for the ATP/P2X4 pocket MLX demo. The active
 macromolecular visualization workflow now lives in
 `notebooks/ligand-receptor-motion/`.
 
-Use the optional notebook and visualization extras:
+Use the optional notebook, preparation, and visualization extras:
 
 ```bash
-uv sync --extra notebook --extra viz
+uv sync --extra notebook --extra prep --extra viz
 uv run jupyter lab notebooks/archive/atp-pocket-mlx-demo
 ```
 
