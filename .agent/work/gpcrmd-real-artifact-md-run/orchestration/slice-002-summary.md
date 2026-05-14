@@ -15,9 +15,9 @@
 
 ## Verification
 
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_charmm_terms.py tests/test_production_artifacts.py tests/test_atomistic_prep.py tests/test_gpcrmd_registry.py -k "charmm or cmap or urey or nbfix or gpcrmd"`: 71 passed, 53 deselected.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/topology_import.py src/atomistic_prep/gpcrmd.py src/atomistic_prep/runner.py src/mlx_atomistic/artifacts.py tests/test_atomistic_prep.py tests/test_production_artifacts.py tests/test_gpcrmd_registry.py`: passed.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run atomistic-prep gpcrmd-import --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --out /tmp/mlx-atomistic-gpcrmd-729-slice2 --json`: command completed, exported no artifact, and reported blocker `rejected_terms:nbfix_pair_overrides`.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_charmm_terms.py tests/test_production_artifacts.py tests/test_mlx_prep.py tests/test_gpcrmd_registry.py -k "charmm or cmap or urey or nbfix or gpcrmd"`: 71 passed, 53 deselected.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/topology_import.py src/mlx_atomistic/prep/gpcrmd.py src/mlx_atomistic/prep/runner.py src/mlx_atomistic/artifacts.py tests/test_mlx_prep.py tests/test_production_artifacts.py tests/test_gpcrmd_registry.py`: passed.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run mlx_atomistic.prep Python API gpcrmd-import --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --out /tmp/mlx-atomistic-gpcrmd-729-slice2 --json`: command completed, exported no artifact, and reported blocker `rejected_terms:nbfix_pair_overrides`.
 - Real GPCRmd 729 report includes prepared force-term counts: `charmm_cmap_terms=317`, `urey_bradley_terms=49223`, and `nbfix_pair_overrides=37`.
 
 ## Reviews

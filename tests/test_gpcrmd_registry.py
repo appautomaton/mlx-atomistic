@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from atomistic_prep.gpcrmd import (
+from mlx_atomistic.prep.gpcrmd import (
     GPCRMD_DATA_DOWNLOAD_DOCS_URL,
     GPCRMD_IMPORT_REPORT_NAME,
     GPCRmdTargetError,
@@ -21,7 +20,7 @@ from atomistic_prep.gpcrmd import (
     select_gpcrmd_target,
     write_gpcrmd_targets,
 )
-from atomistic_prep.io import load_prepared_system
+from mlx_atomistic.prep.io import load_prepared_system
 
 
 def _write_tiny_charmm_psf(path: Path) -> None:
@@ -417,44 +416,6 @@ def test_gpcrmd_manifest_requires_existing_paths_for_required_inputs(tmp_path: P
     assert report.next_engine_slice == "download_or_mount_complete_gpcrmd_package_before_import"
 
 
-def test_gpcrmd_inspect_cli_prints_json_and_require_complete_fails(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-
-    target = default_gpcrmd_targets()[0]
-    cache = tmp_path / "empty-cache"
-    cache.mkdir()
-
-    result = main(
-        [
-            "gpcrmd-inspect",
-            "--target",
-            target.target_id,
-            "--cache",
-            str(cache),
-            "--json",
-        ]
-    )
-    output = capsys.readouterr().out
-
-    assert result == 0
-    assert '"complete": false' in output
-    assert str(target.files[0].file_id) in output
-    with pytest.raises(SystemExit, match="missing expected file IDs"):
-        main(
-            [
-                "gpcrmd-inspect",
-                "--target",
-                target.target_id,
-                "--cache",
-                str(cache),
-                "--require-complete",
-            ]
-        )
-
-
 def test_gpcrmd_compatibility_report_fails_closed_for_current_gpcr_target(tmp_path: Path):
     target = default_gpcrmd_targets()[0]
     cache = tmp_path / "complete-cache"
@@ -537,35 +498,6 @@ def test_gpcrmd_missing_reference_trajectory_is_optional_for_mlx_readiness(
     )
 
 
-def test_gpcrmd_inspect_cli_can_include_compatibility_json(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-
-    target = default_gpcrmd_targets()[0]
-    cache = tmp_path / "complete-cache"
-    _write_complete_cache(cache, target)
-
-    result = main(
-        [
-            "gpcrmd-inspect",
-            "--target",
-            target.target_id,
-            "--cache",
-            str(cache),
-            "--json",
-            "--compatibility",
-        ]
-    )
-    output = capsys.readouterr().out
-
-    assert result == 0
-    assert '"mlx_compatibility"' in output
-    assert '"runnable_now": false' in output
-    assert "pme_mesh_periodic_electrostatics" in output
-
-
 def test_gpcrmd_inventory_fixes_target_and_splits_required_from_optional_analysis(
     tmp_path: Path,
 ):
@@ -626,36 +558,6 @@ def test_gpcrmd_inventory_names_terms_protocol_and_exact_first_blockers(
     assert "generic" not in blocker_text
 
 
-def test_gpcrmd_inventory_is_in_compatibility_cli_json(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-
-    target = default_gpcrmd_targets()[0]
-    cache = tmp_path / "complete-cache"
-    _write_complete_cache(cache, target)
-
-    result = main(
-        [
-            "gpcrmd-inspect",
-            "--target",
-            target.target_id,
-            "--cache",
-            str(cache),
-            "--compatibility",
-            "--json",
-        ]
-    )
-    payload = capsys.readouterr().out
-
-    assert result == 0
-    assert '"mlx_readiness_inventory"' in payload
-    assert '"required_files"' in payload
-    assert '"optional_analysis_features"' in payload
-    assert '"first_engine_blockers"' in payload
-
-
 def test_gpcrmd_import_attempt_reports_unparseable_cache_precisely(tmp_path: Path):
     target = default_gpcrmd_targets()[0]
     cache = tmp_path / "complete-cache"
@@ -681,100 +583,12 @@ def test_gpcrmd_import_attempt_reports_unparseable_cache_precisely(tmp_path: Pat
     assert attempt.compatibility_report.runnable_now is False
 
 
-def test_gpcrmd_import_cli_writes_report_without_prepared_artifact_for_unparseable_cache(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-
-    target = default_gpcrmd_targets()[0]
-    cache = tmp_path / "complete-cache"
-    out = tmp_path / "out"
-    _write_complete_cache(cache, target)
-
-    result = main(
-        [
-            "gpcrmd-import",
-            "--target",
-            target.target_id,
-            "--cache",
-            str(cache),
-            "--out",
-            str(out),
-        ]
-    )
-    output = capsys.readouterr().out
-
-    assert result == 0
-    assert (out / GPCRMD_IMPORT_REPORT_NAME).exists()
-    assert "Exported prepared artifact: False" in output
-    assert not (out / "prepared_system.json").exists()
-    with pytest.raises(SystemExit, match="not exported"):
-        main(
-            [
-                "gpcrmd-import",
-                "--target",
-                target.target_id,
-                "--cache",
-                str(cache),
-                "--out",
-                str(out),
-                "--require-export",
-            ]
-        )
-
-
-def test_gpcrmd_import_reports_unsupported_charmm_terms_without_export(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep import gpcrmd
-    from atomistic_prep.cli import main
-    from atomistic_prep.topology_import import TopologyImportError
-
-    target = default_gpcrmd_targets()[0]
-    cache = tmp_path / "complete-cache"
-    out = tmp_path / "out"
-    _write_complete_cache(cache, target)
-
-    def fail_charmm_import(**kwargs):
-        raise TopologyImportError(
-            "unsupported_terms:"
-            "charmm_cmap_terms,urey_bradley_terms,nbfix_pair_overrides"
-        )
-
-    monkeypatch.setattr(gpcrmd, "find_spec", lambda name: object())
-    monkeypatch.setattr(gpcrmd, "import_charmm_with_parmed", fail_charmm_import)
-
-    result = main(
-        [
-            "gpcrmd-import",
-            "--target",
-            target.target_id,
-            "--cache",
-            str(cache),
-            "--out",
-            str(out),
-            "--json",
-        ]
-    )
-    payload = capsys.readouterr().out
-
-    assert result == 0
-    assert '"exported": false' in payload
-    assert "unsupported_terms:charmm_cmap_terms" in payload
-    assert "unsupported_terms:urey_bradley_terms" in payload
-    assert "unsupported_terms:nbfix_pair_overrides" in payload
-    assert not (out / "prepared_system.json").exists()
-
-
 def test_gpcrmd_charmm_import_receives_psf_mass_prelude_and_protocol_box(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from atomistic_prep import gpcrmd
-    from atomistic_prep.io import synthetic_prepared_system
+    from mlx_atomistic.prep import gpcrmd
+    from mlx_atomistic.prep.io import synthetic_prepared_system
 
     target = default_gpcrmd_targets()[0]
     cache = tmp_path / "cache"
@@ -843,8 +657,8 @@ def test_gpcrmd_blocked_import_surfaces_prepared_force_term_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from atomistic_prep import gpcrmd
-    from atomistic_prep.io import synthetic_prepared_system
+    from mlx_atomistic.prep import gpcrmd
+    from mlx_atomistic.prep.io import synthetic_prepared_system
 
     target = default_gpcrmd_targets()[0]
     cache = tmp_path / "cache"
@@ -926,55 +740,6 @@ def test_gpcrmd_blocked_import_surfaces_prepared_force_term_report(
     assert compatibility["term_counts"]["nbfix_pair_overrides"] == 2
 
 
-def test_gpcrmd_import_failure_removes_stale_prepared_artifact_files(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-
-    amber_target, registry, manifest = _write_tiny_gpcrmd_amber_cache(tmp_path)
-    out = tmp_path / "out"
-    attempt = attempt_gpcrmd_prepared_artifact_import(
-        manifest,
-        out,
-        target_id=amber_target.target_id,
-        registry_path=registry,
-    )
-    unrelated = out / "keep.txt"
-    unrelated.write_text("not a prepared artifact\n")
-
-    assert attempt.exported is True
-    assert (out / "prepared_system.json").exists()
-    assert (out / "prepared_system.npz").exists()
-    assert (out / "view.pdb").exists()
-
-    charmm_target = default_gpcrmd_targets()[0]
-    failing_cache = tmp_path / "failing-charmm-cache"
-    _write_complete_cache(failing_cache, charmm_target)
-
-    result = main(
-        [
-            "gpcrmd-import",
-            "--target",
-            charmm_target.target_id,
-            "--cache",
-            str(failing_cache),
-            "--out",
-            str(out),
-            "--json",
-        ]
-    )
-    payload = json.loads(capsys.readouterr().out)
-
-    assert result == 0
-    assert payload["exported"] is False
-    assert (out / GPCRMD_IMPORT_REPORT_NAME).exists()
-    assert not (out / "prepared_system.json").exists()
-    assert not (out / "prepared_system.npz").exists()
-    assert not (out / "view.pdb").exists()
-    assert unrelated.exists()
-
-
 def test_gpcrmd_import_exports_tiny_amber_fixture(tmp_path: Path):
     from mlx_atomistic.artifacts import load_prepared_mlx_artifact
 
@@ -1017,40 +782,9 @@ def test_gpcrmd_import_exports_tiny_amber_fixture(tmp_path: Path):
     assert "distance_constraint" in report["required_terms"]
 
 
-def test_gpcrmd_import_cli_json_exports_tiny_amber_fixture(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-
-    target, registry, manifest = _write_tiny_gpcrmd_amber_cache(tmp_path)
-    out = tmp_path / "cli-out"
-
-    result = main(
-        [
-            "gpcrmd-import",
-            "--target",
-            target.target_id,
-            "--registry",
-            str(registry),
-            "--cache",
-            str(manifest),
-            "--out",
-            str(out),
-            "--json",
-        ]
-    )
-    payload = capsys.readouterr().out
-
-    assert result == 0
-    assert '"exported": true' in payload
-    assert f'"prepared_artifact_path": "{out}"' in payload
-    assert (out / "prepared_system.json").exists()
-
-
 def test_gpcrmd_run_mlx_exports_tiny_amber_fixture_trajectory(tmp_path: Path):
-    from atomistic_prep.runner import GPCRMD_RUN_REPORT_NAME, TRAJECTORY_NAME, run_gpcrmd_mlx
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.runner import GPCRMD_RUN_REPORT_NAME, TRAJECTORY_NAME, run_gpcrmd_mlx
 
     target, registry, manifest = _write_tiny_gpcrmd_amber_cache(tmp_path)
     out = tmp_path / "run-out"
@@ -1100,8 +834,8 @@ def test_gpcrmd_run_mlx_exports_tiny_amber_fixture_trajectory(tmp_path: Path):
 def test_gpcrmd_run_mlx_blocks_existing_trajectory_before_reimporting_different_target(
     tmp_path: Path,
 ):
-    from atomistic_prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
 
     first_root = tmp_path / "first"
     first_root.mkdir()
@@ -1176,53 +910,8 @@ def test_gpcrmd_run_mlx_blocks_existing_trajectory_before_reimporting_different_
     assert record.metadata["gpcrmd_target_id"] == first_target.target_id
 
 
-def test_gpcrmd_run_mlx_cli_json_blocks_incomplete_cache_without_trajectory(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-    from atomistic_prep.runner import GPCRMD_RUN_REPORT_NAME, TRAJECTORY_NAME
-
-    target = default_gpcrmd_targets()[0]
-    cache = tmp_path / "empty-cache"
-    out = tmp_path / "blocked-out"
-    cache.mkdir()
-
-    result = main(
-        [
-            "run-gpcrmd-mlx",
-            "--target",
-            target.target_id,
-            "--cache",
-            str(cache),
-            "--out",
-            str(out),
-            "--json",
-        ]
-    )
-    payload = json.loads(capsys.readouterr().out)
-    written_payload = json.loads((out / GPCRMD_RUN_REPORT_NAME).read_text())
-
-    assert result == 1
-    assert payload == written_payload
-    assert payload["status"] == "blocked"
-    assert payload["target_id"] == target.target_id
-    assert payload["trajectory_written"] is False
-    assert payload["trajectory_path"] is None
-    assert payload["planned_trajectory_path"] == str(out / TRAJECTORY_NAME)
-    assert payload["blockers"] == [
-        "missing_input:file:topology:15286",
-        "missing_input:file:model:17686",
-        "missing_input:file:parameters:15290",
-        "missing_input:file:protocol:17687",
-        "missing_input:box_vectors:requires_model_or_coordinate_file",
-    ]
-    assert not (out / TRAJECTORY_NAME).exists()
-    assert not (out / "prepared_system.json").exists()
-
-
 def test_gpcrmd_runtime_benchmark_writes_json_csv_for_tiny_fixture(tmp_path: Path):
-    from atomistic_prep.gpcrmd_benchmark import (
+    from mlx_atomistic.prep.gpcrmd_benchmark import (
         GPCRMD_BENCHMARK_CSV_NAME,
         GPCRMD_BENCHMARK_JSON_NAME,
         benchmark_gpcrmd_mlx,
@@ -1268,7 +957,7 @@ def test_gpcrmd_runtime_benchmark_writes_json_csv_for_tiny_fixture(tmp_path: Pat
 
 
 def test_gpcrmd_runtime_benchmark_blocks_without_timing_placeholders(tmp_path: Path):
-    from atomistic_prep.gpcrmd_benchmark import benchmark_gpcrmd_mlx
+    from mlx_atomistic.prep.gpcrmd_benchmark import benchmark_gpcrmd_mlx
 
     target = default_gpcrmd_targets()[0]
     cache = tmp_path / "empty-cache"
@@ -1292,54 +981,3 @@ def test_gpcrmd_runtime_benchmark_blocks_without_timing_placeholders(tmp_path: P
     assert row["integration_steps_per_s"] is None
     assert row["ps_per_s"] is None
     assert row["atom_count"] is None
-
-
-def test_gpcrmd_runtime_benchmark_cli_json_smoke(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-):
-    from atomistic_prep.cli import main
-    from atomistic_prep.gpcrmd_benchmark import GPCRMD_BENCHMARK_CSV_NAME
-
-    target, registry, manifest = _write_tiny_gpcrmd_amber_cache(tmp_path)
-    out = tmp_path / "gpcrmd-benchmark-cli"
-
-    result = main(
-        [
-            "benchmark-gpcrmd-mlx",
-            "--target",
-            target.target_id,
-            "--registry",
-            str(registry),
-            "--cache",
-            str(manifest),
-            "--out",
-            str(out),
-            "--durations-ps",
-            "0.001",
-            "--dt",
-            "0.0005",
-            "--sample-interval",
-            "1",
-            "--temperature",
-            "0.0",
-            "--restraint-k",
-            "0.0",
-            "--minimize-steps",
-            "0",
-            "--equilibration-steps",
-            "0",
-            "--constraint-max-iterations",
-            "8",
-            "--diagnostic-interval",
-            "1",
-            "--force",
-            "--json",
-        ]
-    )
-    payload = json.loads(capsys.readouterr().out)
-
-    assert result == 0
-    assert payload["cases"][0]["status"] == "ran"
-    assert payload["cases"][0]["target_id"] == target.target_id
-    assert (out / GPCRMD_BENCHMARK_CSV_NAME).exists()

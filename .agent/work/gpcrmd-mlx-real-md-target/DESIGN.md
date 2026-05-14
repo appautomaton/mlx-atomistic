@@ -4,7 +4,7 @@
 
 The workflow has three layers:
 
-1. `atomistic_prep` handles GPCRmd dataset metadata, cache inspection, topology/parameter import attempts, and prepared-artifact export.
+1. `mlx_atomistic.prep` handles GPCRmd dataset metadata, cache inspection, topology/parameter import attempts, and prepared-artifact export.
 2. `mlx_atomistic` handles compatibility validation and simulation only.
 3. `notebooks/ligand-receptor-motion/` visualizes and analyzes MLX-generated trajectories, or displays the exact capability blockers.
 
@@ -57,4 +57,4 @@ The active notebook must never substitute GPCRmd reference frames for an MLX res
 
 ## Testing Shape
 
-Network-heavy and large-file paths stay outside default tests. Default tests use tiny manifests, small cached fixtures, and mocked package indexes. Real GPCRmd download/inspection is an explicit CLI or skipped integration path.
+Network-heavy and large-file paths stay outside default tests. Default tests use tiny manifests, small cached fixtures, and mocked package indexes. Real GPCRmd download/inspection is an explicit API or skipped integration path.

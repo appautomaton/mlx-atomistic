@@ -15,9 +15,9 @@ from typing import Any
 
 import numpy as np
 
-from atomistic_prep.io import JSON_NAME, load_prepared_system, save_prepared_system
-from atomistic_prep.schema import ARTIFACT_VERSION, PreparedSystem, PreparedSystemMetadata
-from atomistic_prep.t4l_benzene import prepare_t4l_benzene
+from mlx_atomistic.prep.io import JSON_NAME, load_prepared_system, save_prepared_system
+from mlx_atomistic.prep.schema import ARTIFACT_VERSION, PreparedSystem, PreparedSystemMetadata
+from mlx_atomistic.prep.t4l_benzene import prepare_t4l_benzene
 
 SOLVATED_LIGAND_RECEPTOR_PARAMETER_SOURCE = (
     "mlx_internal_t4l_benzene_solvated_short_range_v1"
@@ -91,7 +91,7 @@ def ensure_solvated_ligand_receptor_example(
 ) -> dict[str, Any]:
     """Create the prepared artifact and run the MLX trajectory if needed."""
 
-    from atomistic_prep.runner import TRAJECTORY_NAME, run_mlx
+    from mlx_atomistic.prep.runner import TRAJECTORY_NAME, run_mlx
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)

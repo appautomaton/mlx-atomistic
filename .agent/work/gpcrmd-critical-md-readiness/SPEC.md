@@ -15,7 +15,7 @@ Implement the GPCRmd-critical missing engine and import capabilities so a comple
 - `mlx_atomistic` remains the only trajectory generator; OpenMM, LAMMPS, GROMACS, Quantum ESPRESSO, and other engines may be used only as reference material.
 - Scope is limited to GPCRmd-critical readiness: PME mesh electrostatics, CHARMM/GPCR force-field terms, lipid/membrane support, scalable periodic nonbonded execution, constraints, virial/pressure, NPT or membrane barostat if required, and GPCRmd import/validation.
 - Implementations must be complete enough for the selected GPCRmd target path, not placeholder APIs or silent approximations.
-- `atomistic_prep` owns topology/parameter/protocol import and complete-system validation; `mlx_atomistic` owns simulation, force terms, integration, diagnostics, and fail-closed unsupported-term reporting.
+- `mlx_atomistic.prep` owns topology/parameter/protocol import and complete-system validation; `mlx_atomistic` owns simulation, force terms, integration, diagnostics, and fail-closed unsupported-term reporting.
 - Each capability must be gated by focused correctness/performance tests before being used in a full GPCRmd run.
 
 ## Blocking Questions Or Assumptions

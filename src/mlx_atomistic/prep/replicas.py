@@ -12,18 +12,6 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from atomistic_prep.runner import (
-    TRAJECTORY_NAME,
-    _project_and_rescale_velocities,
-    initialize_velocities,
-)
-from atomistic_prep.schema import PreparedSystem
-from atomistic_prep.solvated_example import (
-    ELECTROSTATICS_MODEL,
-    SOLVATED_LIGAND_RECEPTOR_WORKFLOW,
-    ensure_solvated_ligand_receptor_prepared,
-    validate_complete_solvated_ligand_receptor_system,
-)
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.io import save_npz_trajectory
@@ -37,6 +25,18 @@ from mlx_atomistic.md import (
     _temperature_degrees_of_freedom,
 )
 from mlx_atomistic.minimize import minimize_energy
+from mlx_atomistic.prep.runner import (
+    TRAJECTORY_NAME,
+    _project_and_rescale_velocities,
+    initialize_velocities,
+)
+from mlx_atomistic.prep.schema import PreparedSystem
+from mlx_atomistic.prep.solvated_example import (
+    ELECTROSTATICS_MODEL,
+    SOLVATED_LIGAND_RECEPTOR_WORKFLOW,
+    ensure_solvated_ligand_receptor_prepared,
+    validate_complete_solvated_ligand_receptor_system,
+)
 from mlx_atomistic.units import MDUnitSystem
 
 ALL_REPLICAS_TRAJECTORY_NAME = "replicas_trajectory.npz"
@@ -990,7 +990,7 @@ def _replica_metadata(
     if steps % diagnostic_interval != 0:
         diagnostic_points += 1
     return {
-        "kind": "atomistic_prep_mlx_nvt_replicas_selected",
+        "kind": "mlx_atomistic.prep_nvt_replicas_selected",
         "engine": "mlx_atomistic",
         "source": "mlx_atomistic",
         "workflow": REPLICA_WORKFLOW,

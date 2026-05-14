@@ -21,14 +21,14 @@ or fake motion as an MLX result.
 - GPCRmd MLX runtime command:
 
   ```bash
-  uv run atomistic-prep run-gpcrmd-mlx --target <id> --cache <gpcrmd-cache> --out <out> --json
+  uv run mlx_atomistic.prep Python API run-gpcrmd-mlx --target <id> --cache <gpcrmd-cache> --out <out> --json
   ```
 
 - Notebook main path that consumes only the MLX-generated GPCRmd trajectory.
 - GPCRmd benchmark command:
 
   ```bash
-  uv run atomistic-prep benchmark-gpcrmd-mlx --target <id> --cache <gpcrmd-cache> --out <bench> --json
+  uv run mlx_atomistic.prep Python API benchmark-gpcrmd-mlx --target <id> --cache <gpcrmd-cache> --out <bench> --json
   ```
 
 ## Verification
@@ -37,9 +37,9 @@ or fake motion as an MLX result.
   - `308 passed`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src tests scripts`
   - `All checks passed!`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run atomistic-prep gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache /tmp/mlx-gpcrmd-readiness-empty-cache --compatibility --json`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run mlx_atomistic.prep Python API gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache /tmp/mlx-gpcrmd-readiness-empty-cache --compatibility --json`
   - completed and reported exact missing inputs.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run atomistic-prep run-gpcrmd-mlx --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache /tmp/mlx-gpcrmd-readiness-empty-cache --out /tmp/mlx-gpcrmd-readiness-run --steps 2 --sample-interval 1 --dt 0.0005 --json`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run mlx_atomistic.prep Python API run-gpcrmd-mlx --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache /tmp/mlx-gpcrmd-readiness-empty-cache --out /tmp/mlx-gpcrmd-readiness-run --steps 2 --sample-interval 1 --dt 0.0005 --json`
   - exited blocked with exact blocker JSON and no trajectory.
 
 ## Selected Target Status
@@ -75,7 +75,7 @@ not been provided for import and MLX simulation.
 Once the GPCRmd package files are downloaded or mounted locally:
 
 ```bash
-uv run atomistic-prep run-gpcrmd-mlx \
+uv run mlx_atomistic.prep Python API run-gpcrmd-mlx \
   --target gpcrmd-729-beta1-5f8u-cyanopindolol \
   --cache <path-to-complete-gpcrmd-package-or-manifest> \
   --out notebooks/ligand-receptor-motion/data/gpcrmd-mlx/5f8u-cyanopindolol \

@@ -15,19 +15,19 @@
 
 ## Files Changed
 
-- `src/atomistic_prep/schema.py`: compact NBFIX schema fields and validation.
-- `src/atomistic_prep/io.py`: JSON/NPZ save-load defaults for compact NBFIX arrays.
-- `src/atomistic_prep/topology_import.py`: ParmEd NBFIX type-pair extraction and reporting.
-- `src/atomistic_prep/gpcrmd.py`: GPCRmd report propagation for concrete NBFIX values.
+- `src/mlx_atomistic/prep/schema.py`: compact NBFIX schema fields and validation.
+- `src/mlx_atomistic/prep/io.py`: JSON/NPZ save-load defaults for compact NBFIX arrays.
+- `src/mlx_atomistic/prep/topology_import.py`: ParmEd NBFIX type-pair extraction and reporting.
+- `src/mlx_atomistic/prep/gpcrmd.py`: GPCRmd report propagation for concrete NBFIX values.
 - `src/mlx_atomistic/artifacts.py`: undeclared-array guard for compact NBFIX arrays.
-- `tests/test_atomistic_prep.py`: NBFIX export, round-trip, and fail-closed cases.
+- `tests/test_mlx_prep.py`: NBFIX export, round-trip, and fail-closed cases.
 - `tests/test_production_artifacts.py`: compact NBFIX metadata-hiding regression coverage.
 
 ## Implementer Verification
 
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_atomistic_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py -k "nbfix or charmm or gpcrmd"`: 41 passed, 53 deselected before follow-up; 43 passed, 53 deselected after follow-up.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_mlx_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py -k "nbfix or charmm or gpcrmd"`: 41 passed, 53 deselected before follow-up; 43 passed, 53 deselected after follow-up.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_production_artifacts.py -k "nbfix or undeclared"`: 3 passed, 35 deselected.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/schema.py src/atomistic_prep/io.py src/atomistic_prep/topology_import.py src/atomistic_prep/gpcrmd.py tests/test_atomistic_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py`: passed.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/schema.py src/mlx_atomistic/prep/io.py src/mlx_atomistic/prep/topology_import.py src/mlx_atomistic/prep/gpcrmd.py tests/test_mlx_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py`: passed.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/artifacts.py tests/test_production_artifacts.py`: passed.
 - Real GPCRmd 729 import probe exported `/tmp/mlx-atomistic-gpcrmd-729-slice3` with 92,001 atoms, 37 compact NBFIX type pairs, and 0 legacy explicit NBFIX pairs.
 

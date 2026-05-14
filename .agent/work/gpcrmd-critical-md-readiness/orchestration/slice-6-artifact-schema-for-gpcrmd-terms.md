@@ -7,8 +7,8 @@
 - Route: subagent implementation with spec review and focused re-review
 - Files in scope:
   - `src/mlx_atomistic/artifacts.py`
-  - `src/atomistic_prep/schema.py`
-  - `src/atomistic_prep/io.py`
+  - `src/mlx_atomistic/prep/schema.py`
+  - `src/mlx_atomistic/prep/io.py`
   - `tests/test_production_artifacts.py`
 
 ## Implementation
@@ -33,11 +33,11 @@
 
 ## Verification
 
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_production_artifacts.py tests/test_atomistic_prep.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_production_artifacts.py tests/test_mlx_prep.py`
   - Result: `55 passed`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "artifacts or schema or pme or charmm"`
   - Result: `83 passed, 192 deselected`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/artifacts.py src/atomistic_prep/schema.py src/atomistic_prep/io.py tests/test_production_artifacts.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/artifacts.py src/mlx_atomistic/prep/schema.py src/mlx_atomistic/prep/io.py tests/test_production_artifacts.py`
   - Result: `All checks passed`
 
 ## Notes

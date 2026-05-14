@@ -14,7 +14,9 @@ executable cells with plots and diagnostics.
 `notebooks/ligand-receptor-motion/` is the active macromolecular visualization
 workflow. Its primary path imports or loads a strict GPCRmd prepared artifact,
 runs the short NVT proof with `mlx_atomistic`, then visualizes and analyzes only
-that MLX-generated trajectory. GPCRmd reference trajectories are comparison
+that `mlx_atomistic` trajectory. OpenMM preview notebooks in that directory are
+`openmm-reference` workflows for comparison and visualization smoke checks; they
+are not production runtime output. GPCRmd reference trajectories are comparison
 context only.
 
 ## Workflow Notebooks

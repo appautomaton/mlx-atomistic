@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from atomistic_prep.io import load_prepared_system, save_prepared_system, synthetic_prepared_system
 from mlx_atomistic.artifacts import (
     MLXCompatibilityError,
     PreparedMLXArtifact,
@@ -14,6 +13,11 @@ from mlx_atomistic.artifacts import (
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.minimize import minimize_energy
+from mlx_atomistic.prep.io import (
+    load_prepared_system,
+    save_prepared_system,
+    synthetic_prepared_system,
+)
 from mlx_atomistic.topology import Topology
 
 
@@ -237,7 +241,7 @@ def test_artifact_required_pme_term_requires_config():
 
 
 def test_gpcrmd_electrostatics_gate_blocks_default_pme_without_executable_backend(tmp_path):
-    from atomistic_prep.runner import _gpcrmd_electrostatics_report
+    from mlx_atomistic.prep.runner import _gpcrmd_electrostatics_report
 
     prepared = replace(
         _pme_fixture_with_config_arrays(),
@@ -257,7 +261,7 @@ def test_gpcrmd_electrostatics_gate_blocks_default_pme_without_executable_backen
 
 
 def test_gpcrmd_short_range_prototype_report_is_explicitly_non_production(tmp_path):
-    from atomistic_prep.runner import _gpcrmd_electrostatics_report
+    from mlx_atomistic.prep.runner import _gpcrmd_electrostatics_report
 
     prepared = replace(
         _production_fixture(),
@@ -282,7 +286,7 @@ def test_gpcrmd_short_range_prototype_report_is_explicitly_non_production(tmp_pa
 
 
 def test_gpcrmd_production_neighbor_manager_requires_optimized_cutoff_route():
-    from atomistic_prep.runner import GPCRMD_NEIGHBOR_SKIN, _production_neighbor_manager
+    from mlx_atomistic.prep.runner import GPCRMD_NEIGHBOR_SKIN, _production_neighbor_manager
 
     system = SimpleNamespace(cell=Cell.cubic(4.0))
     topology = Topology.from_sequences(n_atoms=4, eager_nonbonded_pair_limit=0)
@@ -306,8 +310,8 @@ def test_gpcrmd_production_neighbor_manager_requires_optimized_cutoff_route():
 
 
 def test_gpcrmd_short_range_prototype_pme_artifact_runs_cutoff_not_pme(tmp_path):
-    from atomistic_prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
 
     prepared = _pme_fixture_with_config_arrays()
     prepared = replace(
@@ -736,7 +740,7 @@ def test_charmm_arrays_cannot_be_hidden_by_metadata_only(tmp_path):
 
 
 def test_in_memory_runner_rejects_hidden_charmm_arrays():
-    from atomistic_prep.runner import build_mlx_system
+    from mlx_atomistic.prep.runner import build_mlx_system
 
     prepared = _charmm_artifact_fixture()
     report = {

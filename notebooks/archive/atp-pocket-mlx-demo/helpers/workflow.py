@@ -7,10 +7,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-import atomistic_prep.io as prep_io
-import atomistic_prep.notebook as prep_notebook
-import atomistic_prep.prepare as prep_prepare
-import atomistic_prep.runner as prep_runner
+import mlx_atomistic.prep.io as prep_io
+import mlx_atomistic.prep.notebook as prep_notebook
+import mlx_atomistic.prep.prepare as prep_prepare
+import mlx_atomistic.prep.runner as prep_runner
 from helpers.config import MDProtocol, NotebookPaths, PreviewSettings
 from mlx_atomistic.artifacts import MLXCompatibilityError, load_prepared_mlx_artifact
 
@@ -138,25 +138,35 @@ def trajectory_needs_run(paths: NotebookPaths, artifact, protocol: MDProtocol):
     return False, None
 
 
-def production_commands(paths: NotebookPaths, protocol: MDProtocol) -> str:
-    """Return reproducible CLI commands for the bundled production path."""
+def production_api_snippet(paths: NotebookPaths, protocol: MDProtocol) -> str:
+    """Return a reproducible Python snippet for the bundled production path."""
 
     return "\n".join(
         [
-            "uv sync --extra prep --extra viz",
-            "uv run atomistic-prep prepare-p2x4-atp "
-            f"--backend production_mlx --pdb {paths.atp_receptor_pdb} "
-            f"--out {paths.prepared_dir} --force",
-            f"uv run atomistic-prep validate --prepared {paths.prepared_dir} --require-production",
-            "uv run atomistic-prep run-mlx "
-            f"--prepared {paths.prepared_dir} --require-production --steps {protocol.steps} "
-            f"--sample-interval {protocol.sample_interval} --dt {protocol.dt_ps} "
-            f"--temperature {protocol.temperature_k:g} --friction {protocol.friction_per_ps:g} "
-            f"--restraint-k {protocol.restraint_k:g} "
-            f"--minimize-steps {protocol.minimize_steps} "
-            f"--equilibration-steps {protocol.equilibration_steps} "
-            f"--constraint-max-iterations {protocol.constraint_max_iterations} "
-            f"--diagnostic-interval {protocol.diagnostic_interval} --force",
+            "from mlx_atomistic.prep.io import save_prepared_system",
+            "from mlx_atomistic.prep.prepare import prepare_p2x4_atp",
+            "from mlx_atomistic.prep.runner import run_mlx",
+            "",
+            f"prepared_dir = {str(paths.prepared_dir)!r}",
+            "prepared = prepare_p2x4_atp(",
+            f"    pdb_path={str(paths.atp_receptor_pdb)!r},",
+            "    backend='production_mlx',",
+            ")",
+            "save_prepared_system(prepared, prepared_dir)",
+            "run_mlx(",
+            "    prepared_dir,",
+            "    require_production=True,",
+            f"    steps={protocol.steps},",
+            f"    sample_interval={protocol.sample_interval},",
+            f"    dt={protocol.dt_ps},",
+            f"    temperature={protocol.temperature_k:g},",
+            f"    friction={protocol.friction_per_ps:g},",
+            f"    restraint_k={protocol.restraint_k:g},",
+            f"    minimize_steps={protocol.minimize_steps},",
+            f"    equilibration_steps={protocol.equilibration_steps},",
+            f"    constraint_max_iterations={protocol.constraint_max_iterations},",
+            f"    diagnostic_interval={protocol.diagnostic_interval},",
+            ")",
         ]
     )
 
@@ -297,5 +307,5 @@ def production_status_markdown(
         f"Reason: `{result.production_error}`\n\n"
         "The notebook does not fall back to fake motion. "
         "Reproduce the same build/run path with:\n\n"
-        f"```bash\n{production_commands(paths, protocol)}\n```"
+        f"```python\n{production_api_snippet(paths, protocol)}\n```"
     )

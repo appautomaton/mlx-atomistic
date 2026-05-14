@@ -11,21 +11,6 @@ from typing import Any
 
 import numpy as np
 
-from atomistic_prep.gpcrmd import (
-    GPCRMD_IMPORT_REPORT_NAME,
-    GPCRmdInspectionError,
-    GPCRmdTargetError,
-    attempt_gpcrmd_prepared_artifact_import,
-    write_gpcrmd_import_report,
-)
-from atomistic_prep.io import (
-    JSON_NAME,
-    NPZ_ARRAY_NAMES,
-    NPZ_NAME,
-    OPTIONAL_NPZ_ARRAY_DEFAULTS,
-    load_prepared_system,
-)
-from atomistic_prep.schema import PreparedSystem
 from mlx_atomistic.artifacts import (
     MLXCompatibilityError,
     PreparedMLXArtifact,
@@ -37,6 +22,21 @@ from mlx_atomistic.io import TrajectoryRecord, load_npz_trajectory, save_npz_tra
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import pme_readiness_report
+from mlx_atomistic.prep.gpcrmd import (
+    GPCRMD_IMPORT_REPORT_NAME,
+    GPCRmdInspectionError,
+    GPCRmdTargetError,
+    attempt_gpcrmd_prepared_artifact_import,
+    write_gpcrmd_import_report,
+)
+from mlx_atomistic.prep.io import (
+    JSON_NAME,
+    NPZ_ARRAY_NAMES,
+    NPZ_NAME,
+    OPTIONAL_NPZ_ARRAY_DEFAULTS,
+    load_prepared_system,
+)
+from mlx_atomistic.prep.schema import PreparedSystem
 from mlx_atomistic.protocols import (
     MinimizeThenNVTProtocol,
     ProtocolCompatibilityError,
@@ -183,6 +183,8 @@ def _production_neighbor_manager(
     force_terms,
     *,
     require_production: bool,
+    neighbor_skin: float = GPCRMD_NEIGHBOR_SKIN,
+    neighbor_check_interval: int = 1,
 ) -> NeighborListManager | None:
     if not require_production:
         return None
@@ -207,7 +209,8 @@ def _production_neighbor_manager(
         return NeighborListManager(
             system.cell,
             cutoff=float(cutoff),
-            skin=GPCRMD_NEIGHBOR_SKIN,
+            skin=neighbor_skin,
+            check_interval=neighbor_check_interval,
             sort_pairs=False,
             max_workers=GPCRMD_NEIGHBOR_WORKERS,
         )
@@ -233,6 +236,8 @@ def run_mlx(
     equilibration_steps: int = 100,
     constraint_max_iterations: int = 4,
     diagnostic_interval: int | None = None,
+    neighbor_skin: float = GPCRMD_NEIGHBOR_SKIN,
+    neighbor_check_interval: int = 1,
     metadata_overrides: dict[str, Any] | None = None,
     runtime_electrostatics_model: str | None = None,
 ):
@@ -260,6 +265,12 @@ def run_mlx(
         prepared_system.metadata.protocol_metadata,
         raise_on_blockers=True,
     )
+    if not np.isfinite(neighbor_skin) or neighbor_skin < 0.0:
+        msg = "neighbor_skin must be finite and non-negative"
+        raise ValueError(msg)
+    if neighbor_check_interval <= 0:
+        msg = "neighbor_check_interval must be positive"
+        raise ValueError(msg)
     if runtime_electrostatics_model is not None:
         artifact = _artifact_with_runtime_electrostatics(
             artifact,
@@ -303,6 +314,8 @@ def run_mlx(
         system,
         force_terms,
         require_production=require_production,
+        neighbor_skin=neighbor_skin,
+        neighbor_check_interval=neighbor_check_interval,
     )
 
     run_started = time.perf_counter()
@@ -366,7 +379,7 @@ def run_mlx(
         out = prepared_dir / TRAJECTORY_NAME
     if out is not None:
         metadata: dict[str, Any] = {
-            "kind": "atomistic_prep_mlx_nvt",
+            "kind": "mlx_atomistic.prep_nvt",
             "engine": "mlx_atomistic",
             "source": "mlx_atomistic",
             "prepared_artifact_version": prepared_system.metadata.artifact_version,
@@ -389,6 +402,8 @@ def run_mlx(
             "constraint_max_iterations": constraint_max_iterations,
             "diagnostic_interval": diagnostic_interval,
             "pressure_diagnostics": pressure_diagnostics,
+            "neighbor_skin": neighbor_skin,
+            "neighbor_check_interval": neighbor_check_interval,
             "pressure_diagnostics_reason": (
                 None
                 if pressure_diagnostics
@@ -441,6 +456,8 @@ def run_gpcrmd_mlx(
     equilibration_steps: int = 100,
     constraint_max_iterations: int = 4,
     diagnostic_interval: int | None = None,
+    neighbor_skin: float = GPCRMD_NEIGHBOR_SKIN,
+    neighbor_check_interval: int = 1,
     force: bool = False,
     electrostatics: str = "pme",
 ) -> dict[str, Any]:
@@ -707,6 +724,8 @@ def run_gpcrmd_mlx(
             equilibration_steps=equilibration_steps,
             constraint_max_iterations=constraint_max_iterations,
             diagnostic_interval=diagnostic_interval,
+            neighbor_skin=neighbor_skin,
+            neighbor_check_interval=neighbor_check_interval,
             runtime_electrostatics_model=(
                 "cutoff"
                 if electrostatics_report["route"] == "short-range-prototype"

@@ -8,7 +8,7 @@ GPCRmd trajectory as the main result path.
 ## Scope
 
 - Added a GPCRmd-specific notebook helper that runs or loads
-  `atomistic_prep.runner.run_gpcrmd_mlx`.
+  `mlx_atomistic.prep.runner.run_gpcrmd_mlx`.
 - Kept `ensure_mlx_ligand_receptor_bundle(...)` as a compatibility alias while
   routing it to the GPCRmd MLX workflow.
 - Updated the ligand-receptor notebook and README copy so GPCRmd reference
@@ -27,7 +27,7 @@ GPCRmd trajectory as the main result path.
 - `notebooks/ligand-receptor-motion/README.md`
 - `notebooks/README.md`
 - `tests/test_ligand_receptor_motion.py`
-- `tests/test_atomistic_prep.py`
+- `tests/test_mlx_prep.py`
 - `.gitignore`
 
 ## Review
@@ -44,7 +44,7 @@ GPCRmd trajectory as the main result path.
   - `47 passed, 258 deselected`
 - `rg -n "downloaded.*main|fake|benzene|steered" notebooks/ligand-receptor-motion notebooks/README.md`
   - no matches
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check notebooks/ligand-receptor-motion/helpers/mlx_real_md.py tests/test_ligand_receptor_motion.py tests/test_atomistic_prep.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check notebooks/ligand-receptor-motion/helpers/mlx_real_md.py tests/test_ligand_receptor_motion.py tests/test_mlx_prep.py`
   - `All checks passed!`
 - Notebook code cells parse with `ast.parse`.
 

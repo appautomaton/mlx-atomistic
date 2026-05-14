@@ -8,7 +8,7 @@ from itertools import combinations
 
 import numpy as np
 
-from atomistic_prep.schema import (
+from mlx_atomistic.prep.schema import (
     ARTIFACT_VERSION,
     PreparedSystem,
     PreparedSystemMetadata,

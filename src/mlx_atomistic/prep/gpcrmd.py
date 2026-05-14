@@ -17,9 +17,9 @@ from typing import Any
 
 import numpy as np
 
-from atomistic_prep.io import JSON_NAME, NPZ_NAME, VIEW_PDB_NAME, save_prepared_system
-from atomistic_prep.schema import PreparedSystem
-from atomistic_prep.topology_import import (
+from mlx_atomistic.prep.io import JSON_NAME, NPZ_NAME, VIEW_PDB_NAME, save_prepared_system
+from mlx_atomistic.prep.schema import PreparedSystem
+from mlx_atomistic.prep.topology_import import (
     TopologyImportError,
     build_charmm_psf_mass_prelude,
     import_amber_prmtop,

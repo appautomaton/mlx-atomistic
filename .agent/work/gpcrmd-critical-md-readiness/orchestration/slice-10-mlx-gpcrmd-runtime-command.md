@@ -12,8 +12,8 @@ Added the `run-gpcrmd-mlx` runtime path. The command imports or loads a GPCRmd p
 
 ## Files Changed
 
-- `src/atomistic_prep/runner.py`: added `run_gpcrmd_mlx`, `GPCRMD_RUN_REPORT_NAME`, run-report payload helpers, finite diagnostic summary, and stale-output guards.
-- `src/atomistic_prep/cli.py`: added `run-gpcrmd-mlx` parser and command handler.
+- `src/mlx_atomistic/prep/runner.py`: added `run_gpcrmd_mlx`, `GPCRMD_RUN_REPORT_NAME`, run-report payload helpers, finite diagnostic summary, and stale-output guards.
+- `src/mlx_atomistic/prep/`: added `run-gpcrmd-mlx` parser and command handler.
 - `tests/test_gpcrmd_registry.py`: added GPCRmd runtime tests for runnable tiny AMBER fixtures, blocked incomplete caches, and reused-output stale artifact prevention.
 
 ## Review Loop
@@ -32,10 +32,10 @@ Added the `run-gpcrmd-mlx` runtime path. The command imports or loads a GPCRmd p
   - Result: `3 passed, 296 deselected`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py`
   - Result: `25 passed`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/runner.py src/atomistic_prep/cli.py tests/test_gpcrmd_registry.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/runner.py src/mlx_atomistic/prep/ tests/test_gpcrmd_registry.py`
   - Result: `All checks passed!`
-- Fixture CLI smoke:
-  - `uv run atomistic-prep run-gpcrmd-mlx ... --json`
+- Fixture API smoke:
+  - `uv run mlx_atomistic.prep Python API run-gpcrmd-mlx ... --json`
   - Result: `status=ran`, `trajectory_written=True`, `blockers=[]`, finite positions, and `trajectory.npz` written.
 - External-engine/process scan over touched runtime sources:
   - Result: no external MD engine or process-spawn calls found.

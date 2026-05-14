@@ -29,7 +29,7 @@ Use the downloaded GPCRmd 729 artifacts to produce a strict MLX-ready prepared a
 
 ## Required Outcome
 
-- `atomistic-prep run-gpcrmd-mlx --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 ...` either writes a real MLX `trajectory.npz` or returns precise blockers.
+- `mlx_atomistic.prep Python API run-gpcrmd-mlx --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 ...` either writes a real MLX `trajectory.npz` or returns precise blockers.
 - On success, `prepared_system.json`, `prepared_system.npz`, `view.pdb`, `gpcrmd_import_report.json`, `gpcrmd_mlx_run_report.json`, and `trajectory.npz` describe the same GPCRmd target.
 - The notebook loads that trajectory, labels it as `mlx_atomistic`, displays frame/time metadata, and runs PBC-aware ligand/receptor analysis.
 

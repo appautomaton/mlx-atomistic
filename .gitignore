@@ -15,6 +15,12 @@
 !.env.example
 .python-version.local
 
+# Local agent/tool runtime payloads
+.agent/.automaton/
+.claude/
+.codex/
+.opencode/
+
 # Python caches and tooling
 __pycache__/
 *.py[cod]
@@ -40,7 +46,8 @@ wheelhouse/
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 
-# Local generated science/benchmark outputs
+# Local generated science/benchmark outputs. generated MLX and OpenMM reference outputs are ignored.
+# Keep only small fixtures that a future spec approves.
 artifacts/
 outputs/
 results/
@@ -56,6 +63,8 @@ notebooks/ligand-receptor-motion/data/cache/
 notebooks/ligand-receptor-motion/data/gpcrmd-cache/
 notebooks/ligand-receptor-motion/data/gpcrmd-mlx/
 notebooks/ligand-receptor-motion/data/mlx-real-md/
+notebooks/ligand-receptor-motion/data/openmm-md/
+notebooks/ligand-receptor-motion/data/openmm-preview/
 notebooks/ligand-receptor-motion/data/prepared/
 notebooks/ligand-receptor-motion/data/processed/
 notebooks/archive/atp-pocket-mlx-demo/data/prepared/

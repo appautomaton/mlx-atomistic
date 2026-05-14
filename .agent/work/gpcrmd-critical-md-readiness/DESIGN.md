@@ -2,7 +2,7 @@
 
 ## Boundary
 
-This change turns GPCRmd from a compatibility target into an MLX runtime target. External engines remain reference material only. `atomistic_prep` imports and validates complete GPCRmd systems; `mlx_atomistic` runs the simulation and refuses unsupported physics.
+This change turns GPCRmd from a compatibility target into an MLX runtime target. External engines remain reference material only. `mlx_atomistic.prep` imports and validates complete GPCRmd systems; `mlx_atomistic` runs the simulation and refuses unsupported physics.
 
 ## Data Flow
 
@@ -43,7 +43,7 @@ Broader OpenMM/LAMMPS features stay out of scope unless the GPCRmd target requir
 
 ## Prep Surface
 
-`atomistic_prep` owns GPCRmd import:
+`mlx_atomistic.prep` owns GPCRmd import:
 
 - inspect the actual cached topology/parameter/protocol files;
 - parse atom names/types, residues, water/ions/lipids, box vectors, masks, constraints, exclusions, exceptions, and CHARMM-specific parameters;

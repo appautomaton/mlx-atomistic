@@ -24,8 +24,8 @@
 
 ## Evidence
 
-- `src/atomistic_prep/runner.py`: blocks GPCRmd runs when electrostatics readiness has blockers.
-- `src/atomistic_prep/runner.py`: forces runtime cutoff only for `short-range-prototype` and records non-production metadata.
+- `src/mlx_atomistic/prep/runner.py`: blocks GPCRmd runs when electrostatics readiness has blockers.
+- `src/mlx_atomistic/prep/runner.py`: forces runtime cutoff only for `short-range-prototype` and records non-production metadata.
 - `src/mlx_atomistic/pme.py`: reports `pme_backend_not_production_executable:current_backend=numpy_reference`.
 - `tests/test_production_artifacts.py`: verifies a PME artifact prototype run emits cutoff terms, not PME terms.
 - `tests/test_gpcrmd_registry.py`: verifies benchmark rows label actual prototype execution.

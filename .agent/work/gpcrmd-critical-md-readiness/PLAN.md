@@ -15,14 +15,14 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Objective:** Inspect the selected GPCRmd target package and produce the exact MLX readiness inventory.
 **Execution:** subagent recommended
 **Depends on:** none
-**Touches:** `src/atomistic_prep/gpcrmd.py`, `src/atomistic_prep/cli.py`, `tests/test_gpcrmd_registry.py`, `.agent/work/gpcrmd-critical-md-readiness/`
+**Touches:** `src/mlx_atomistic/prep/gpcrmd.py`, `src/mlx_atomistic/prep/`, `tests/test_gpcrmd_registry.py`, `.agent/work/gpcrmd-critical-md-readiness/`
 **Context budget:** ~8% of context window
 **Produces:** A target inventory/report naming files, force terms, water/lipid models, box, constraints, exceptions, protocol requirements, and blockers.
 **Acceptance criteria:**
 - The selected target is fixed or replaced with a documented lower-blocker GPCRmd target.
 - The report distinguishes required terms from optional analysis features.
 - The report lists exact first engine blockers instead of generic “production validation”.
-**Verification:** `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and inventory"` plus a fixture `uv run atomistic-prep gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache <fixture-cache> --compatibility --json`
+**Verification:** `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and inventory"` plus a fixture `uv run mlx_atomistic.prep Python API gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache <fixture-cache> --compatibility --json`
 **Auto-continue:** no
 
 **Status:** completed. Evidence: `.agent/work/gpcrmd-critical-md-readiness/SLICE-1-GPCRMD-INVENTORY.md` and `.agent/work/gpcrmd-critical-md-readiness/orchestration/slice-1-gpcrmd-target-inventory-gate.md`.
@@ -110,7 +110,7 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Objective:** Extend strict prepared artifacts to represent PME, CHARMM terms, lipids, constraints, exceptions, and protocol metadata without silent drops.
 **Execution:** subagent recommended
 **Depends on:** Slices 3-5
-**Touches:** `src/mlx_atomistic/artifacts.py`, `src/atomistic_prep/schema.py`, `src/atomistic_prep/io.py`, `tests/test_production_artifacts.py`
+**Touches:** `src/mlx_atomistic/artifacts.py`, `src/mlx_atomistic/prep/schema.py`, `src/mlx_atomistic/prep/io.py`, `tests/test_production_artifacts.py`
 **Context budget:** ~12% of context window
 **Produces:** Versioned artifact schema and loader support for the GPCRmd-critical terms implemented so far.
 **Acceptance criteria:**
@@ -121,7 +121,7 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Auto-continue:** yes
 
 **Status:** completed. Evidence: `.agent/work/gpcrmd-critical-md-readiness/orchestration/slice-6-artifact-schema-for-gpcrmd-terms.md`.
-**Verified:** `tests/test_production_artifacts.py tests/test_atomistic_prep.py` passed (`55 passed`), `tests -k "artifacts or schema or pme or charmm"` passed (`83 passed, 192 deselected`), and targeted Ruff passed.
+**Verified:** `tests/test_production_artifacts.py tests/test_mlx_prep.py` passed (`55 passed`), `tests -k "artifacts or schema or pme or charmm"` passed (`83 passed, 192 deselected`), and targeted Ruff passed.
 **Correction recorded:** PME scalar and mesh settings now fail at artifact validation/save time before lossy casts or later build-time errors.
 
 ### Slice 7: GPCRmd Topology/Parameter Import
@@ -129,18 +129,18 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Objective:** Import the selected GPCRmd topology, parameters, coordinates, box, masks, and protocol metadata into strict MLX artifacts.
 **Execution:** subagent recommended
 **Depends on:** Slice 6
-**Touches:** `src/atomistic_prep/gpcrmd.py`, `src/atomistic_prep/topology_import.py`, `src/atomistic_prep/cli.py`, `tests/test_gpcrmd_registry.py`, `tests/test_atomistic_prep.py`
+**Touches:** `src/mlx_atomistic/prep/gpcrmd.py`, `src/mlx_atomistic/prep/topology_import.py`, `src/mlx_atomistic/prep/`, `tests/test_gpcrmd_registry.py`, `tests/test_mlx_prep.py`
 **Context budget:** ~14% of context window
-**Produces:** `atomistic-prep gpcrmd-import` path that writes `prepared_system.json`, `prepared_system.npz`, and `view.pdb` or blocks exactly.
+**Produces:** `mlx_atomistic.prep Python API gpcrmd-import` path that writes `prepared_system.json`, `prepared_system.npz`, and `view.pdb` or blocks exactly.
 **Acceptance criteria:**
 - Water, ions, lipids, receptor, ligand, box, constraints, exclusions, exceptions, and masks are exported.
 - Parameter counts match topology counts and unsupported terms are not dropped.
 - The selected GPCRmd target either imports or produces a precise remaining blocker report.
-**Verification:** `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd or topology_import or atomistic_prep"` plus a fixture `uv run atomistic-prep gpcrmd-import ... --json`
+**Verification:** `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd or topology_import or mlx_atomistic.prep"` plus a fixture `uv run mlx_atomistic.prep Python API gpcrmd-import ... --json`
 **Auto-continue:** no
 
 **Status:** completed. Evidence: `.agent/work/gpcrmd-critical-md-readiness/orchestration/slice-7-gpcrmd-topology-parameter-import.md`.
-**Verified:** `tests/test_gpcrmd_registry.py tests/test_atomistic_prep.py` passed (`44 passed`), `tests -k "gpcrmd or topology_import or atomistic_prep"` passed (`44 passed, 236 deselected`), targeted Ruff passed, fixture `gpcrmd-import --json` exported prepared artifacts, and selected-target missing-cache import emitted exact blockers.
+**Verified:** `tests/test_gpcrmd_registry.py tests/test_mlx_prep.py` passed (`44 passed`), `tests -k "gpcrmd or topology_import or mlx_atomistic.prep"` passed (`44 passed, 236 deselected`), targeted Ruff passed, fixture `gpcrmd-import --json` exported prepared artifacts, and selected-target missing-cache import emitted exact blockers.
 **Correction recorded:** CHARMM/ParmEd imports now fail closed for unexported CHARMM-specific terms instead of silently dropping CMAP/Urey-Bradley/NBFIX-style terms, and blocked imports remove stale generated prepared artifacts from reused output directories.
 
 ### Slice 8: Virial And Pressure Diagnostics
@@ -186,14 +186,14 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Objective:** Add one runtime command that imports or loads the selected GPCRmd artifact and runs the short MLX protocol.
 **Execution:** subagent recommended
 **Depends on:** Slices 7-9
-**Touches:** `src/atomistic_prep/cli.py`, `src/atomistic_prep/runner.py`, `src/mlx_atomistic/protocols.py`, `tests/`
+**Touches:** `src/mlx_atomistic/prep/`, `src/mlx_atomistic/prep/runner.py`, `src/mlx_atomistic/protocols.py`, `tests/`
 **Context budget:** ~10% of context window
-**Produces:** `uv run atomistic-prep run-gpcrmd-mlx --target <id> --out <dir> ...` with artifact, trajectory, diagnostics, and blocker outputs.
+**Produces:** `uv run mlx_atomistic.prep Python API run-gpcrmd-mlx --target <id> --out <dir> ...` with artifact, trajectory, diagnostics, and blocker outputs.
 **Acceptance criteria:**
 - The command never calls external MD engines.
 - Runnable fixtures produce `trajectory.npz` with finite diagnostics.
 - Blocked GPCRmd targets exit with exact blocker JSON and no fake trajectory.
-**Verification:** `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and run"` plus one fixture CLI smoke command.
+**Verification:** `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and run"` plus one fixture API smoke command.
 **Auto-continue:** yes
 
 **Status:** completed. Evidence: `.agent/work/gpcrmd-critical-md-readiness/orchestration/slice-10-mlx-gpcrmd-runtime-command.md`.
@@ -224,7 +224,7 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Objective:** Add repeatable performance gates for the selected GPCRmd run path.
 **Execution:** direct
 **Depends on:** Slice 10
-**Touches:** `src/mlx_atomistic/benchmarks/`, `src/atomistic_prep/`, `tests/`
+**Touches:** `src/mlx_atomistic/benchmarks/`, `src/mlx_atomistic/prep/`, `tests/`
 **Context budget:** ~8% of context window
 **Produces:** JSON/CSV benchmark for import time, atom count, PME mesh size, pair count, wall time, steps/s, ps/s, memory, and artifact size.
 **Acceptance criteria:**
@@ -235,7 +235,7 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 **Auto-continue:** yes
 
 **Status:** completed. Evidence: `.agent/work/gpcrmd-critical-md-readiness/orchestration/slice-12-gpcrmd-performance-and-scale-gate.md`.
-**Verified:** `tests/test_gpcrmd_registry.py -k "benchmark"` passed (`3 passed, 25 deselected`), `tests -k "benchmark or performance or gpcrmd"` passed (`60 passed, 248 deselected`), `tests/test_gpcrmd_registry.py` passed (`28 passed`), targeted Ruff passed, and a blocked CLI smoke emitted blocker JSON for an unknown target.
+**Verified:** `tests/test_gpcrmd_registry.py -k "benchmark"` passed (`3 passed, 25 deselected`), `tests -k "benchmark or performance or gpcrmd"` passed (`60 passed, 248 deselected`), `tests/test_gpcrmd_registry.py` passed (`28 passed`), targeted Ruff passed, and a blocked API smoke emitted blocker JSON for an unknown target.
 **Correction recorded:** Benchmark rows now use actual MLX run metadata for runnable systems and explicit blocker rows for missing/unsupported systems. Electrostatics comparison requests do not mutate artifacts; cutoff/Ewald/PME variants block unless they match the prepared artifact.
 
 ### Slice 13: Readiness Verification And Handoff
@@ -262,7 +262,7 @@ Build readiness as gated engine capabilities, not broad MD feature parity. First
 - Slice 1: subagent recommended; checkpoint before engine work because it fixes the real target requirements.
 - Parallel-safe group A after Slice 1: Slices 2, 3, and 4 may run in parallel if workers keep disjoint ownership: PME standalone worker owns `pme.py`/PME tests, CHARMM worker owns `charmm_terms.py`/CHARMM tests, neighbor worker owns cell-list/neighbor files.
 - Slice 5 is a serial integration checkpoint that wires PME into `NonbondedPotential` before artifacts or runtime can request `pme`.
-- Slices 6-11 are serial integration work because they share schemas, artifact loading, CLI/protocol surfaces, and notebook behavior.
+- Slices 6-11 are serial integration work because they share schemas, artifact loading, API/protocol surfaces, and notebook behavior.
 - Slice 12 may run in parallel with Slice 11 after Slice 10 if benchmark files and notebook files remain disjoint.
 - Slice 13 is the final direct verification checkpoint.
 
@@ -276,7 +276,7 @@ Use subagents for Slices 1-11 when the user authorizes multi-agent execution. Ea
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "charmm or cmap or nbfix"`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "neighbor or nonbonded_acceleration"`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "artifacts or schema or pme or charmm"`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd or topology_import or atomistic_prep"`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd or topology_import or mlx_atomistic.prep"`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "virial or pressure or trajectory"`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "npt or barostat or protocol"`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and run"`

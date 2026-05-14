@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,11 +23,11 @@ def test_core_source_does_not_import_external_md_engines():
     assert "pdbfixer" not in source.lower()
 
 
-def test_atomistic_prep_import_and_dependency_report():
-    import atomistic_prep
-    from atomistic_prep.prepare import MissingPrepDependencyError
+def test_mlx_prep_import_and_dependency_report():
+    import mlx_atomistic.prep
+    from mlx_atomistic.prep.prepare import MissingPrepDependencyError
 
-    status = atomistic_prep.optional_prep_dependency_status()
+    status = mlx_atomistic.prep.optional_prep_dependency_status()
     assert {"gemmi", "parmed", "rdkit"} <= set(status)
     assert "openmm" not in status
     assert "pdbfixer" not in status
@@ -35,11 +36,11 @@ def test_atomistic_prep_import_and_dependency_report():
             MissingPrepDependencyError,
             match="Production biomolecular preparation needs optional parsing",
         ):
-            atomistic_prep.require_production_prep_dependencies()
+            mlx_atomistic.prep.require_production_prep_dependencies()
 
 
 def test_prepared_artifact_round_trip(tmp_path: Path):
-    from atomistic_prep.io import (
+    from mlx_atomistic.prep.io import (
         load_prepared_system,
         save_prepared_system,
         synthetic_prepared_system,
@@ -56,8 +57,8 @@ def test_prepared_artifact_round_trip(tmp_path: Path):
 
 
 def test_build_mlx_system_matches_artifact_counts():
-    from atomistic_prep.io import synthetic_prepared_system
-    from atomistic_prep.runner import build_mlx_system
+    from mlx_atomistic.prep.io import synthetic_prepared_system
+    from mlx_atomistic.prep.runner import build_mlx_system
 
     prepared = synthetic_prepared_system()
     system, terms = build_mlx_system(prepared, receptor_mass_scale=1.0)
@@ -68,9 +69,9 @@ def test_build_mlx_system_matches_artifact_counts():
 
 
 def test_tiny_prepared_system_runs_mlx_nvt(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system, synthetic_prepared_system
-    from atomistic_prep.runner import run_mlx
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
+    from mlx_atomistic.prep.runner import run_mlx
 
     trajectory_path = tmp_path / "trajectory.npz"
     prepared = synthetic_prepared_system()
@@ -88,15 +89,15 @@ def test_tiny_prepared_system_runs_mlx_nvt(tmp_path: Path):
 
     assert np.asarray(result.sampled_positions).shape == (3, 2, 3)
     assert record.sampled_positions.shape == (3, 2, 3)
-    assert record.metadata["kind"] == "atomistic_prep_mlx_nvt"
+    assert record.metadata["kind"] == "mlx_atomistic.prep_nvt"
 
 
 def test_run_mlx_rejects_npt_barostat_protocol_metadata_before_system_build(
     tmp_path: Path,
     monkeypatch,
 ):
-    from atomistic_prep import runner
-    from atomistic_prep.io import save_prepared_system, synthetic_prepared_system
+    from mlx_atomistic.prep import runner
+    from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
     from mlx_atomistic.protocols import ProtocolCompatibilityError
 
     prepared = synthetic_prepared_system()
@@ -130,9 +131,9 @@ def test_run_mlx_rejects_npt_barostat_protocol_metadata_before_system_build(
 
 
 def test_run_mlx_persists_normalized_nvt_protocol_metadata(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system, synthetic_prepared_system
-    from atomistic_prep.runner import run_mlx
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
+    from mlx_atomistic.prep.runner import run_mlx
 
     trajectory_path = tmp_path / "trajectory.npz"
     prepared = synthetic_prepared_system()
@@ -164,8 +165,8 @@ def test_run_mlx_persists_normalized_nvt_protocol_metadata(tmp_path: Path):
 
 
 def test_solvated_ligand_receptor_replicas_write_selected_and_all_outputs(tmp_path: Path):
-    from atomistic_prep.replicas import run_ligand_receptor_replicas
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.replicas import run_ligand_receptor_replicas
 
     summary = run_ligand_receptor_replicas(
         tmp_path / "replicas",
@@ -195,7 +196,7 @@ def test_solvated_ligand_receptor_replicas_write_selected_and_all_outputs(tmp_pa
 
 
 def test_ligand_receptor_performance_profile_emits_aggregate_rows(tmp_path: Path):
-    from atomistic_prep.replicas import profile_ligand_receptor_performance
+    from mlx_atomistic.prep.replicas import profile_ligand_receptor_performance
 
     rows = profile_ligand_receptor_performance(
         tmp_path / "profile",
@@ -223,8 +224,8 @@ def test_ligand_receptor_performance_profile_emits_aggregate_rows(tmp_path: Path
 
 
 def test_ligand_receptor_replicas_rerun_when_constraint_iterations_change(tmp_path: Path):
-    from atomistic_prep.replicas import run_ligand_receptor_replicas
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.replicas import run_ligand_receptor_replicas
 
     out_dir = tmp_path / "replicas"
     run_ligand_receptor_replicas(
@@ -257,12 +258,12 @@ def test_ligand_receptor_replicas_rerun_when_constraint_iterations_change(tmp_pa
 
 def test_notebook_bundle_loader_uses_full_prepared_artifact(tmp_path: Path):
     pytest.importorskip("MDAnalysis")
-    from atomistic_prep.io import save_prepared_system, synthetic_prepared_system
-    from atomistic_prep.notebook import (
+    from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
+    from mlx_atomistic.prep.notebook import (
         load_prepared_trajectory_bundle,
         make_mdanalysis_universe,
     )
-    from atomistic_prep.runner import run_mlx
+    from mlx_atomistic.prep.runner import run_mlx
 
     prepared = synthetic_prepared_system()
     save_prepared_system(prepared, tmp_path)
@@ -291,8 +292,8 @@ def test_notebook_bundle_loader_uses_full_prepared_artifact(tmp_path: Path):
 
 
 def test_notebook_multimodel_pdb_export_has_ordered_frames():
-    from atomistic_prep.io import synthetic_prepared_system
-    from atomistic_prep.notebook import PreparedTrajectoryRecord, trajectory_to_multimodel_pdb
+    from mlx_atomistic.prep.io import synthetic_prepared_system
+    from mlx_atomistic.prep.notebook import PreparedTrajectoryRecord, trajectory_to_multimodel_pdb
 
     prepared = synthetic_prepared_system()
     positions = np.stack(
@@ -318,7 +319,7 @@ def test_notebook_multimodel_pdb_export_has_ordered_frames():
 
 
 def test_py3dmol_frame_player_html_has_visible_controls():
-    from atomistic_prep.notebook import py3dmol_frame_player_html
+    from mlx_atomistic.prep.notebook import py3dmol_frame_player_html
 
     class FakeView:
         uniqueid = "test123"
@@ -341,7 +342,7 @@ def test_py3dmol_frame_player_html_has_visible_controls():
 
 
 def test_4dw1_pocket_preparation_smoke():
-    from atomistic_prep.prepare import prepare_p2x4_atp
+    from mlx_atomistic.prep.prepare import prepare_p2x4_atp
 
     pdb_path = Path("notebooks/archive/atp-pocket-mlx-demo/data/4dw1_atp_bound_p2x4.pdb")
     if not pdb_path.exists():
@@ -359,9 +360,9 @@ def test_4dw1_pocket_preparation_smoke():
 
 
 def test_4dw1_production_builder_exports_explicit_h_mlx_artifact(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system
-    from atomistic_prep.prepare import prepare_p2x4_atp
     from mlx_atomistic.artifacts import load_prepared_mlx_artifact
+    from mlx_atomistic.prep.io import save_prepared_system
+    from mlx_atomistic.prep.prepare import prepare_p2x4_atp
 
     pdb_path = Path("notebooks/archive/atp-pocket-mlx-demo/data/4dw1_atp_bound_p2x4.pdb")
     if not pdb_path.exists():
@@ -389,9 +390,9 @@ def test_4dw1_production_builder_exports_explicit_h_mlx_artifact(tmp_path: Path)
 
 
 def test_4dw1_production_builder_runs_short_mlx_nvt(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system
-    from atomistic_prep.prepare import prepare_p2x4_atp
-    from atomistic_prep.runner import run_mlx
+    from mlx_atomistic.prep.io import save_prepared_system
+    from mlx_atomistic.prep.prepare import prepare_p2x4_atp
+    from mlx_atomistic.prep.runner import run_mlx
 
     pdb_path = Path("notebooks/archive/atp-pocket-mlx-demo/data/4dw1_atp_bound_p2x4.pdb")
     if not pdb_path.exists():
@@ -420,12 +421,12 @@ def test_4dw1_production_builder_runs_short_mlx_nvt(tmp_path: Path):
 
 
 def test_t4l_benzene_fixture_exports_complete_internal_smd_artifact(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system
-    from atomistic_prep.t4l_benzene import (
+    from mlx_atomistic.artifacts import MLXCompatibilityError, load_prepared_mlx_artifact
+    from mlx_atomistic.prep.io import save_prepared_system
+    from mlx_atomistic.prep.t4l_benzene import (
         T4L_BENZENE_PARAMETER_SOURCE,
         prepare_t4l_benzene,
     )
-    from mlx_atomistic.artifacts import MLXCompatibilityError, load_prepared_mlx_artifact
 
     prepared = prepare_t4l_benzene()
     save_prepared_system(prepared, tmp_path)
@@ -447,9 +448,9 @@ def test_t4l_benzene_fixture_exports_complete_internal_smd_artifact(tmp_path: Pa
 
 
 def test_t4l_benzene_steered_run_writes_cv_trace(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system
-    from atomistic_prep.runner import run_steered_mlx
-    from atomistic_prep.t4l_benzene import prepare_t4l_benzene
+    from mlx_atomistic.prep.io import save_prepared_system
+    from mlx_atomistic.prep.runner import run_steered_mlx
+    from mlx_atomistic.prep.t4l_benzene import prepare_t4l_benzene
 
     save_prepared_system(prepare_t4l_benzene(), tmp_path)
     out = tmp_path / "steered_trajectory.npz"
@@ -497,7 +498,7 @@ def test_ligand_receptor_motion_notebook_uses_gpcrmd_mlx_main_path():
     assert "mlx_steered_md" not in source
     assert "ensure_gpcrmd_mlx_bundle" in source
     assert "run_gpcrmd_mlx" in source
-    assert "run-gpcrmd-mlx" in readme
+    assert "run_gpcrmd_mlx" in readme
     assert "run-ligand-receptor-example" not in readme
     assert "run-steered-mlx" not in readme
     assert "make_ligand_motion_figure" in source
@@ -511,15 +512,46 @@ def test_ligand_receptor_motion_notebook_uses_gpcrmd_mlx_main_path():
     assert "notebooks/ligand-receptor-motion/data/cache/" in gitignore
 
 
+def test_gpcrmd_production_neighbor_manager_uses_auto_backend_policy():
+    from mlx_atomistic.core import Cell
+    from mlx_atomistic.prep.runner import GPCRMD_NEIGHBOR_SKIN, _production_neighbor_manager
+    from mlx_atomistic.topology import Topology
+
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        eager_nonbonded_pair_limit=0,
+    )
+    system = SimpleNamespace(cell=Cell.cubic(5.0))
+    term = SimpleNamespace(topology=topology, cutoff=1.6, electrostatics="cutoff")
+
+    manager = _production_neighbor_manager(system, (term,), require_production=True)
+
+    assert manager is not None
+    assert manager.backend == "auto"
+    assert manager.skin == GPCRMD_NEIGHBOR_SKIN
+
+    tuned_manager = _production_neighbor_manager(
+        system,
+        (term,),
+        require_production=True,
+        neighbor_skin=1.25,
+        neighbor_check_interval=4,
+    )
+    assert tuned_manager is not None
+    assert tuned_manager.skin == 1.25
+    assert tuned_manager.check_interval == 4
+
+
 def test_solvated_ligand_receptor_builder_exports_complete_runtime_artifact(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system
-    from atomistic_prep.solvated_example import (
+    from mlx_atomistic.artifacts import load_prepared_mlx_artifact
+    from mlx_atomistic.prep.io import save_prepared_system
+    from mlx_atomistic.prep.solvated_example import (
         ELECTROSTATICS_MODEL,
         SOLVATED_LIGAND_RECEPTOR_PARAMETER_SOURCE,
         prepare_solvated_ligand_receptor_example,
         validate_complete_solvated_ligand_receptor_system,
     )
-    from mlx_atomistic.artifacts import load_prepared_mlx_artifact
 
     prepared = prepare_solvated_ligand_receptor_example(water_count=4)
     validate_complete_solvated_ligand_receptor_system(prepared)
@@ -540,8 +572,8 @@ def test_solvated_ligand_receptor_builder_exports_complete_runtime_artifact(tmp_
 
 
 def test_run_ligand_receptor_example_writes_mlx_trajectory(tmp_path: Path):
-    from atomistic_prep.solvated_example import ensure_solvated_ligand_receptor_example
     from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.solvated_example import ensure_solvated_ligand_receptor_example
 
     status = ensure_solvated_ligand_receptor_example(
         tmp_path / "example",
@@ -563,10 +595,10 @@ def test_run_ligand_receptor_example_writes_mlx_trajectory(tmp_path: Path):
 
 
 def test_import_amber_tiny_topology_runs_mlx(tmp_path: Path):
-    from atomistic_prep.io import save_prepared_system
-    from atomistic_prep.runner import run_mlx
-    from atomistic_prep.topology_import import import_amber_prmtop
     from mlx_atomistic.artifacts import load_prepared_mlx_artifact
+    from mlx_atomistic.prep.io import save_prepared_system
+    from mlx_atomistic.prep.runner import run_mlx
+    from mlx_atomistic.prep.topology_import import import_amber_prmtop
 
     prmtop = tmp_path / "tiny.prmtop"
     coords = tmp_path / "tiny.inpcrd"
@@ -640,7 +672,7 @@ LIG
 
 
 def test_charmm_psf_mass_prelude_is_derived_from_psf_atom_masses(tmp_path: Path):
-    from atomistic_prep.topology_import import build_charmm_psf_mass_prelude
+    from mlx_atomistic.prep.topology_import import build_charmm_psf_mass_prelude
 
     psf = tmp_path / "tiny.psf"
     prm = tmp_path / "tiny.prm"
@@ -663,8 +695,8 @@ def test_charmm_psf_mass_prelude_is_derived_from_psf_atom_masses(tmp_path: Path)
 
 
 def test_charmm_parmed_import_exports_cmap_urey_and_nbfix_type_overrides(tmp_path: Path):
-    from atomistic_prep.io import load_prepared_system, save_prepared_system
-    from atomistic_prep.topology_import import (
+    from mlx_atomistic.prep.io import load_prepared_system, save_prepared_system
+    from mlx_atomistic.prep.topology_import import (
         _prepared_from_parmed_structure,
     )
 
@@ -752,7 +784,7 @@ def test_charmm_parmed_import_exports_cmap_urey_and_nbfix_type_overrides(tmp_pat
 
 
 def test_charmm_parmed_nbfix_distinct_14_values_fail_closed():
-    from atomistic_prep.topology_import import (
+    from mlx_atomistic.prep.topology_import import (
         TopologyImportError,
         _prepared_from_parmed_structure,
     )
@@ -797,7 +829,7 @@ def test_charmm_parmed_nbfix_distinct_14_values_fail_closed():
 
 
 def test_gpcrmd_729_ligand_residue_is_masked_as_ligand():
-    from atomistic_prep.topology_import import _ligand_mask_from_residues
+    from mlx_atomistic.prep.topology_import import _ligand_mask_from_residues
 
     mask = _ligand_mask_from_residues(np.asarray(["SER", "P32", "TIP3"], dtype=str))
 

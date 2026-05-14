@@ -81,7 +81,7 @@ Introduce electrostatics mode as a first-class engine setting. Keep the existing
 **Objective:** Let prepared artifacts request `ewald_reference` and update GPCRmd blocker reports to show PME/Ewald progress without overclaiming full GPCR support.
 **Execution:** direct
 **Depends on:** Slice 4
-**Touches:** `src/mlx_atomistic/artifacts.py`, `src/atomistic_prep/gpcrmd.py`, `tests/`
+**Touches:** `src/mlx_atomistic/artifacts.py`, `src/mlx_atomistic/prep/gpcrmd.py`, `tests/`
 **Context budget:** ~10% of context window
 **Produces:** Artifact metadata parsing and compatibility reports that distinguish `ewald_reference` from mesh `pme`.
 **Acceptance criteria:**

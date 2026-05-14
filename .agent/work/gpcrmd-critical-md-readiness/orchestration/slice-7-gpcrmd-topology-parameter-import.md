@@ -13,10 +13,10 @@ Implemented the `gpcrmd-import` path that either writes strict MLX prepared arti
 
 ## Files Changed
 
-- `src/atomistic_prep/gpcrmd.py`: added prepared-artifact import attempt flow, AMBER/CHARMM import routing, GPCRmd metadata enrichment, unsupported-term blocker mapping, and stale prepared-artifact cleanup on blocked imports.
-- `src/atomistic_prep/topology_import.py`: extended topology imports with water/ion/lipid/receptor/ligand masks, inferred X-H constraints, term-count metadata, and fail-closed CHARMM unsupported-term detection.
-- `tests/test_gpcrmd_registry.py`: added tiny GPCRmd AMBER export coverage, unsupported CHARMM blocker coverage, CLI JSON coverage, and stale-artifact cleanup regression coverage.
-- `tests/test_atomistic_prep.py`: added CHARMM/ParmEd-shaped unsupported-term rejection coverage.
+- `src/mlx_atomistic/prep/gpcrmd.py`: added prepared-artifact import attempt flow, AMBER/CHARMM import routing, GPCRmd metadata enrichment, unsupported-term blocker mapping, and stale prepared-artifact cleanup on blocked imports.
+- `src/mlx_atomistic/prep/topology_import.py`: extended topology imports with water/ion/lipid/receptor/ligand masks, inferred X-H constraints, term-count metadata, and fail-closed CHARMM unsupported-term detection.
+- `tests/test_gpcrmd_registry.py`: added tiny GPCRmd AMBER export coverage, unsupported CHARMM blocker coverage, API JSON coverage, and stale-artifact cleanup regression coverage.
+- `tests/test_mlx_prep.py`: added CHARMM/ParmEd-shaped unsupported-term rejection coverage.
 
 ## Review Loop
 
@@ -32,17 +32,17 @@ Implemented the `gpcrmd-import` path that either writes strict MLX prepared arti
 
 ## Verification
 
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py tests/test_atomistic_prep.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py tests/test_mlx_prep.py`
   - Result: `44 passed`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd or topology_import or atomistic_prep"`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd or topology_import or mlx_atomistic.prep"`
   - Result: `44 passed, 236 deselected`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/gpcrmd.py src/atomistic_prep/topology_import.py src/atomistic_prep/cli.py tests/test_gpcrmd_registry.py tests/test_atomistic_prep.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/gpcrmd.py src/mlx_atomistic/prep/topology_import.py src/mlx_atomistic/prep/ tests/test_gpcrmd_registry.py tests/test_mlx_prep.py`
   - Result: `All checks passed!`
-- Fixture CLI smoke with generated tiny GPCRmd AMBER cache:
-  - `uv run atomistic-prep gpcrmd-import ... --json`
+- Fixture API smoke with generated tiny GPCRmd AMBER cache:
+  - `uv run mlx_atomistic.prep Python API gpcrmd-import ... --json`
   - Result: `"exported": true`, empty blockers, and `prepared_system.json`, `prepared_system.npz`, `view.pdb` were written.
-- Selected target missing-cache CLI smoke:
-  - `uv run atomistic-prep gpcrmd-import --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache <missing> --out <tmp> --json`
+- Selected target missing-cache API smoke:
+  - `uv run mlx_atomistic.prep Python API gpcrmd-import --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache <missing> --out <tmp> --json`
   - Result: `"exported": false` with exact missing cache/topology/model/parameters/protocol/box-vector blockers.
 
 ## Remaining Risks

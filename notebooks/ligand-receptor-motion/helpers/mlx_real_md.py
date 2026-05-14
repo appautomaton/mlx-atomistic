@@ -17,6 +17,9 @@ from .motion_analysis import ProcessedTrajectory
 
 GPCRMD_FAST_RUNTIME_ATOM_LIMIT = 50_000
 GPCRMD_MIN_NEIGHBOR_SKIN = 1.0
+GPCRMD_ALLOWED_LARGE_SYSTEM_BACKENDS = frozenset(
+    {"periodic_cell_list", "mlx_cell_pairs"}
+)
 
 
 @dataclass(frozen=True)
@@ -295,9 +298,9 @@ def ensure_mlx_ligand_receptor_bundle(**kwargs) -> GPCRmdMLXBundle:
 
 
 def _reload_active_prep_modules():
-    import atomistic_prep.io as prep_io
-    import atomistic_prep.runner as prep_runner
-    import atomistic_prep.schema as prep_schema
+    import mlx_atomistic.prep.io as prep_io
+    import mlx_atomistic.prep.runner as prep_runner
+    import mlx_atomistic.prep.schema as prep_schema
 
     importlib.reload(prep_schema)
     prep_io = importlib.reload(prep_io)
@@ -593,7 +596,7 @@ def _runtime_route_blockers(
         return ("runtime_nonbonded_route_missing",)
     blockers: list[str] = []
     backend = runtime.get("backend")
-    if backend != "periodic_cell_list":
+    if backend not in GPCRMD_ALLOWED_LARGE_SYSTEM_BACKENDS:
         blockers.append(f"runtime_nonbonded_backend:{backend!r}")
     try:
         skin = float(runtime.get("skin"))

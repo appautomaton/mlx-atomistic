@@ -25,7 +25,7 @@
 
 - Use Python 3.13 through `.python-version` and `requires-python = ">=3.13,<3.14"` (`.python-version`, `pyproject.toml`).
 - Use `uv run ...` and `uv sync ...` for Python environment and command execution (`AGENTS.md`, `README.md`).
-- Keep package source under `src/mlx_atomistic/` unless the task explicitly targets the peer `atomistic_prep` package (`AGENTS.md`, `pyproject.toml`).
+- Keep package source under `src/mlx_atomistic/`, including the canonical `prep/` subpackage (`AGENTS.md`, `pyproject.toml`).
 - Keep notebooks under `notebooks/` and import package code through the `uv` environment (`AGENTS.md`, `notebooks/README.md`).
 - Treat `vendors/` as reference material only (`AGENTS.md`, `README.md`).
 - Do not add heavyweight chemistry or ML helper packages without concrete need (`AGENTS.md`, `pyproject.toml`).
@@ -33,11 +33,11 @@
 ### Inferred
 
 - Optional extras should remain the boundary for notebook, visualization, and preparation dependencies (`pyproject.toml`).
-- Console scripts should remain stable because they are declared package entry points (`pyproject.toml`, `src/atomistic_prep/cli.py`).
+- Declared console scripts should remain stable; preparation workflows currently use Python APIs rather than a prep command (`pyproject.toml`, `src/mlx_atomistic/prep/`).
 
 ### Needs Confirmation
 
-- Whether `atomistic_prep` remains a separate installable package long-term or becomes an internal workflow layer (`pyproject.toml`, `src/atomistic_prep/cli.py`).
+- Whether a future prep API should be reintroduced or the Python API should remain the only preparation surface (`pyproject.toml`, `src/mlx_atomistic/prep/`).
 
 ## Quality and Operational Expectations
 
@@ -49,7 +49,7 @@
 ## Integration Boundaries
 
 - upstream or downstream systems: MLX/Metal for Apple Silicon execution, optional scientific Python packages for notebooks/prep/viz, and local Jupyter for notebook workflows (`README.md`, `pyproject.toml`, `notebooks/README.md`).
-- external contracts that cannot break: package imports from `mlx_atomistic`, console scripts `atomistic-prep` and `mlx-atomistic-benchmark`, notebook workflow locations, and vendor reference boundary (`src/mlx_atomistic/__init__.py`, `pyproject.toml`, `notebooks/README.md`, `AGENTS.md`).
+- external contracts that cannot break: package imports from `mlx_atomistic`, the `mlx-atomistic-benchmark` console script, notebook workflow locations, and vendor reference boundary (`src/mlx_atomistic/__init__.py`, `pyproject.toml`, `notebooks/README.md`, `AGENTS.md`).
 
 ## Non-Goals
 
@@ -71,6 +71,6 @@
 - `.python-version`
 - `pyproject.toml`
 - `src/mlx_atomistic/__init__.py`
-- `src/atomistic_prep/cli.py`
+- `src/mlx_atomistic/prep/`
 - `notebooks/README.md`
 - `.agent/.automaton/state/current.json`

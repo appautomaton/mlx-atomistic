@@ -16,9 +16,9 @@
 ## Files Changed
 
 - `src/mlx_atomistic/pme.py`: PME readiness reporting and validation.
-- `src/atomistic_prep/runner.py`: GPCRmd electrostatics pre-run gate, runtime prototype cutoff override, and report metadata.
-- `src/atomistic_prep/cli.py`: explicit `--electrostatics` option and runner forwarding.
-- `src/atomistic_prep/gpcrmd_benchmark.py`: benchmark rows label actual prototype execution.
+- `src/mlx_atomistic/prep/runner.py`: GPCRmd electrostatics pre-run gate, runtime prototype cutoff override, and report metadata.
+- `src/mlx_atomistic/prep/`: explicit `--electrostatics` option and runner forwarding.
+- `src/mlx_atomistic/prep/gpcrmd_benchmark.py`: benchmark rows label actual prototype execution.
 - `tests/test_pme.py`: PME readiness blocker coverage.
 - `tests/test_production_artifacts.py`: GPCRmd PME blocker, prototype metadata, and PME-artifact cutoff runtime regression coverage.
 - `tests/test_gpcrmd_registry.py`: explicit prototype callers and benchmark-label assertions.
@@ -29,7 +29,7 @@
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py::test_gpcrmd_run_mlx_cli_json_blocks_incomplete_cache_without_trajectory`: passed.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py::test_gpcrmd_run_mlx_exports_tiny_amber_fixture_trajectory tests/test_gpcrmd_registry.py::test_gpcrmd_run_mlx_blocks_existing_trajectory_before_reimporting_different_target tests/test_gpcrmd_registry.py::test_gpcrmd_runtime_benchmark_writes_json_csv_for_tiny_fixture`: 3 passed.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_production_artifacts.py::test_gpcrmd_short_range_prototype_pme_artifact_runs_cutoff_not_pme tests/test_gpcrmd_registry.py::test_gpcrmd_runtime_benchmark_writes_json_csv_for_tiny_fixture`: 2 passed.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/pme.py src/mlx_atomistic/forcefields.py src/mlx_atomistic/nonbonded.py src/mlx_atomistic/artifacts.py src/atomistic_prep/runner.py src/atomistic_prep/cli.py src/atomistic_prep/gpcrmd_benchmark.py tests/test_pme.py tests/test_production_artifacts.py tests/test_gpcrmd_registry.py`: passed.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/pme.py src/mlx_atomistic/forcefields.py src/mlx_atomistic/nonbonded.py src/mlx_atomistic/artifacts.py src/mlx_atomistic/prep/runner.py src/mlx_atomistic/prep/ src/mlx_atomistic/prep/gpcrmd_benchmark.py tests/test_pme.py tests/test_production_artifacts.py tests/test_gpcrmd_registry.py`: passed.
 
 ## Residual Concern
 

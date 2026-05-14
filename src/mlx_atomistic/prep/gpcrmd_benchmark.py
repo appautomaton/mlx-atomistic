@@ -12,8 +12,6 @@ from typing import Any
 
 import numpy as np
 
-from atomistic_prep.io import JSON_NAME, NPZ_NAME, VIEW_PDB_NAME, load_prepared_system
-from atomistic_prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
 from mlx_atomistic.benchmarks.gpcrmd_runtime import (
     directory_size_bytes,
     last_int,
@@ -22,6 +20,8 @@ from mlx_atomistic.benchmarks.gpcrmd_runtime import (
     pme_mesh_summary,
 )
 from mlx_atomistic.io import load_npz_trajectory
+from mlx_atomistic.prep.io import JSON_NAME, NPZ_NAME, VIEW_PDB_NAME, load_prepared_system
+from mlx_atomistic.prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
 from mlx_atomistic.runtime import get_runtime_info
 
 GPCRMD_BENCHMARK_JSON_NAME = "gpcrmd_performance.json"

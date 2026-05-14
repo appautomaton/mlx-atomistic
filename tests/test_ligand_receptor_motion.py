@@ -46,12 +46,12 @@ def test_notebook_source_uses_gpcrmd_mlx_without_old_active_result_wording():
 
     assert re.search(r"downloaded.*main|fake|benzene|steered", combined, re.I) is None
     assert "run_gpcrmd_mlx" in combined
-    assert "run-gpcrmd-mlx" in combined
+    assert "run_gpcrmd_mlx" in combined
     assert "ensure_solvated_ligand_receptor_example" not in helper_source
 
 
 def _write_gpcrmd_prepared_fixture(out_dir: Path) -> str:
-    from atomistic_prep.io import save_prepared_system, synthetic_prepared_system
+    from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
 
     target_id = "tiny-gpcrmd-notebook-fixture"
     prepared = synthetic_prepared_system()

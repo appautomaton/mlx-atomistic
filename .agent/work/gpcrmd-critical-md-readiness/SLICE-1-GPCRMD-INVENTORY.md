@@ -75,5 +75,5 @@ No generic `production validation` blocker is used for this gate.
 - Manifest entries now require an existing path to count as present. Pathless or nonexistent required inputs remain visible in inspection JSON but appear as `present: false` and contribute `mlx_compatibility.missing_input`; optional reference trajectories remain optional.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py`: `18 passed`.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and inventory"`: `3 passed, 194 deselected`.
-- Fixture CLI smoke: `uv run atomistic-prep gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache <fixture-cache> --compatibility --json` emitted `complete: true`, `mlx_readiness_inventory`, `pme_mesh_periodic_electrostatics`, and `reference_trajectory_comparison`.
-- Targeted Ruff: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/gpcrmd.py tests/test_gpcrmd_registry.py`: passed.
+- Fixture API smoke: `uv run mlx_atomistic.prep Python API gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache <fixture-cache> --compatibility --json` emitted `complete: true`, `mlx_readiness_inventory`, `pme_mesh_periodic_electrostatics`, and `reference_trajectory_comparison`.
+- Targeted Ruff: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/gpcrmd.py tests/test_gpcrmd_registry.py`: passed.

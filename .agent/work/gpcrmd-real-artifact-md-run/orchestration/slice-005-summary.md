@@ -15,7 +15,7 @@ Slice 5 was a no-code execution probe. It verified that the real GPCRmd 729 cach
 Command:
 
 ```bash
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run atomistic-prep gpcrmd-import \
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run mlx_atomistic.prep Python API gpcrmd-import \
   --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 \
   --out /tmp/mlx-atomistic-gpcrmd-729-prepared \
   --json

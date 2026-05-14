@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from atomistic_prep.schema import (
+from mlx_atomistic.prep.schema import (
     ARTIFACT_VERSION,
     PreparedSystem,
     PreparedSystemMetadata,
@@ -254,7 +254,7 @@ def prepare_p2x4_atp_production(
 ) -> PreparedSystem:
     """Build a production-gated all-atom MLX artifact for bundled 4DW1 ATP pocket."""
 
-    from atomistic_prep.prepare import parse_pdb
+    from mlx_atomistic.prep.prepare import parse_pdb
 
     atoms, conect_pairs = parse_pdb(pdb_path)
     selected_atoms, selected_residue_keys = _select_pocket_atoms(

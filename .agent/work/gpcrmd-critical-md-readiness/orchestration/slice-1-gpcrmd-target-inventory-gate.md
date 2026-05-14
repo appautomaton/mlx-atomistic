@@ -27,9 +27,9 @@
 
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py`: `18 passed`.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests -k "gpcrmd and inventory"`: `3 passed, 194 deselected`.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/gpcrmd.py src/atomistic_prep/cli.py tests/test_gpcrmd_registry.py`: passed.
-- Fixture CLI smoke:
-  - `uv run atomistic-prep gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache /tmp/mlx-atomistic-gpcrmd-slice1-fixture --compatibility --json`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/gpcrmd.py src/mlx_atomistic/prep/ tests/test_gpcrmd_registry.py`: passed.
+- Fixture API smoke:
+  - `uv run mlx_atomistic.prep Python API gpcrmd-inspect --target gpcrmd-729-beta1-5f8u-cyanopindolol --cache /tmp/mlx-atomistic-gpcrmd-slice1-fixture --compatibility --json`
   - emitted `complete: true`, `missing_input: []`, `mlx_readiness_inventory`, `pme_mesh_periodic_electrostatics`, and `reference_trajectory_comparison`.
 
 ## Stop Reason

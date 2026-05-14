@@ -17,16 +17,16 @@
 - `src/mlx_atomistic/forcefields.py`: lazy-topology guard before `NonbondedPotential` backend selection and existing runtime-pair filtering/NBFIX path coverage.
 - `src/mlx_atomistic/minimize.py`: minimization force evaluations can use neighbor-manager pairs.
 - `src/mlx_atomistic/protocols.py`: minimization, equilibration, and production NVT pass the neighbor manager.
-- `src/atomistic_prep/runner.py`: creates compact neighbor manager for lazy periodic cutoff nonbonded systems and records runtime metadata.
+- `src/mlx_atomistic/prep/runner.py`: creates compact neighbor manager for lazy periodic cutoff nonbonded systems and records runtime metadata.
 - `tests/test_nonbonded_acceleration.py`: focused Slice 7 regression coverage.
 
 ## Implementer Verification
 
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_neighbors.py tests/test_nonbonded_acceleration.py tests/test_forcefields.py -k "neighbor or periodic or large or nbfix or exception"`: 24 passed, 25 deselected before the follow-up fix; 24 passed, 27 deselected after coordinator cleanup.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -c 'import atomistic_prep.runner; import mlx_atomistic.protocols; import mlx_atomistic.minimize'`: passed.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -c 'import mlx_atomistic.prep.runner; import mlx_atomistic.protocols; import mlx_atomistic.minimize'`: passed.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_protocols.py -q`: 6 passed.
 - Follow-up fix verification: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_nonbonded_acceleration.py -q`: 17 passed.
-- Coordinator style verification: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/nonbonded.py src/mlx_atomistic/neighbors.py src/mlx_atomistic/forcefields.py src/mlx_atomistic/md.py src/mlx_atomistic/minimize.py src/mlx_atomistic/protocols.py src/atomistic_prep/runner.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py`: passed.
+- Coordinator style verification: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/nonbonded.py src/mlx_atomistic/neighbors.py src/mlx_atomistic/forcefields.py src/mlx_atomistic/md.py src/mlx_atomistic/minimize.py src/mlx_atomistic/protocols.py src/mlx_atomistic/prep/runner.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py`: passed.
 
 ## Residual Concern
 

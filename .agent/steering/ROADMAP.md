@@ -23,10 +23,10 @@
 
 ## Phase 3: Stabilize User-Facing Workflow Surfaces
 
-- objective: harden the surfaces users actually run: `atomistic-prep`, `mlx-atomistic-benchmark`, active notebooks, and setup commands.
-- why now: these are declared entry points and documented workflows, so they are the highest-leverage operational surfaces (`pyproject.toml`, `README.md`, `src/atomistic_prep/cli.py`, `notebooks/README.md`).
-- likely outputs: focused CLI tests, workflow smoke checks, benchmark output contracts, and notebook regeneration checks where needed.
-- evidence: `pyproject.toml`, `src/atomistic_prep/cli.py`, `notebooks/README.md`
+- objective: harden the surfaces users actually run: `mlx_atomistic.prep` APIs, `mlx-atomistic-benchmark`, active notebooks, and setup commands.
+- why now: these are documented workflows, so they are the highest-leverage operational surfaces (`pyproject.toml`, `README.md`, `src/mlx_atomistic/prep/`, `notebooks/README.md`).
+- likely outputs: focused API tests, workflow smoke checks, benchmark output contracts, and notebook regeneration checks where needed.
+- evidence: `pyproject.toml`, `src/mlx_atomistic/prep/`, `notebooks/README.md`
 - exit signal: the chosen workflow can be run from a fresh `uv sync` with documented commands and no hidden manual steps.
 
 ## Phase 4: Deepen Scientific Capability Behind Existing Boundaries

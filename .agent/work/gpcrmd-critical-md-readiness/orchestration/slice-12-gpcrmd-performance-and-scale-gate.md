@@ -8,11 +8,11 @@ for blocked systems.
 
 ## Scope
 
-- Added `atomistic_prep.gpcrmd_benchmark.benchmark_gpcrmd_mlx(...)`.
-- Added CLI command:
+- Added `mlx_atomistic.prep.gpcrmd_benchmark.benchmark_gpcrmd_mlx(...)`.
+- Added API command:
 
   ```bash
-  uv run atomistic-prep benchmark-gpcrmd-mlx \
+  uv run mlx_atomistic.prep Python API benchmark-gpcrmd-mlx \
     --target <id> \
     --cache <gpcrmd-cache-or-manifest> \
     --out <benchmark-dir> \
@@ -36,8 +36,8 @@ for blocked systems.
 
 ## Files Changed
 
-- `src/atomistic_prep/gpcrmd_benchmark.py`
-- `src/atomistic_prep/cli.py`
+- `src/mlx_atomistic/prep/gpcrmd_benchmark.py`
+- `src/mlx_atomistic/prep/`
 - `src/mlx_atomistic/benchmarks/gpcrmd_runtime.py`
 - `tests/test_gpcrmd_registry.py`
 
@@ -49,9 +49,9 @@ for blocked systems.
   - `60 passed, 248 deselected`
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py`
   - `28 passed`
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/gpcrmd_benchmark.py src/mlx_atomistic/benchmarks/gpcrmd_runtime.py src/atomistic_prep/cli.py tests/test_gpcrmd_registry.py tests/test_benchmarks.py`
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/gpcrmd_benchmark.py src/mlx_atomistic/benchmarks/gpcrmd_runtime.py src/mlx_atomistic/prep/ tests/test_gpcrmd_registry.py tests/test_benchmarks.py`
   - `All checks passed!`
-- Blocked CLI smoke emitted blocker JSON and exited nonzero as expected for an
+- Blocked API smoke emitted blocker JSON and exited nonzero as expected for an
   unknown target.
 - External-engine scan over touched runtime benchmark files found no OpenMM,
   GROMACS, LAMMPS, subprocess, or shell simulation calls.

@@ -11,6 +11,6 @@ The reviewer confirmed that the implementation preserves CHARMM Urey-Bradley and
 
 ## Evidence
 
-- Reviewed `src/atomistic_prep/topology_import.py`, `src/atomistic_prep/gpcrmd.py`, `src/atomistic_prep/runner.py`, `src/mlx_atomistic/artifacts.py`, and related tests.
+- Reviewed `src/mlx_atomistic/prep/topology_import.py`, `src/mlx_atomistic/prep/gpcrmd.py`, `src/mlx_atomistic/prep/runner.py`, `src/mlx_atomistic/artifacts.py`, and related tests.
 - Focused pytest and Ruff checks passed.
 - Real GPCRmd 729 probe reported `exported=false`, blocker `rejected_terms:nbfix_pair_overrides`, and compatibility report fields for supported, required, and rejected terms.

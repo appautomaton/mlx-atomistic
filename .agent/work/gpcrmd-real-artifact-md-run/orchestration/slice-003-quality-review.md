@@ -15,6 +15,6 @@ The first quality review found that `src/mlx_atomistic/artifacts.py::_validate_d
 ## Final Evidence
 
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_production_artifacts.py -k "nbfix or undeclared"`: 3 passed, 35 deselected.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_atomistic_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py -k "nbfix or charmm or gpcrmd"`: 43 passed, 53 deselected.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_mlx_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py -k "nbfix or charmm or gpcrmd"`: 43 passed, 53 deselected.
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/artifacts.py tests/test_production_artifacts.py`: passed.
 - Re-review approved with no remaining issues.

@@ -15,7 +15,7 @@ Make GPCRmd the first real-system target for `notebooks/ligand-receptor-motion/`
 - `mlx_atomistic` is the only runtime trajectory generator; OpenMM, LAMMPS, GROMACS, and other MD engines may not run simulations for this workflow.
 - `vendors/` remains reference-only and must not become a package input, runtime dependency, or build source.
 - GPCRmd trajectories may be used as reference data for system selection, import checks, observables, and comparison, but not as the main claimed MLX result.
-- `atomistic_prep` owns complete-system import/build responsibilities; `mlx_atomistic` owns simulation capabilities and must fail closed on unsupported physics or missing terms.
+- `mlx_atomistic.prep` owns complete-system import/build responsibilities; `mlx_atomistic` owns simulation capabilities and must fail closed on unsupported physics or missing terms.
 - Performance probing must use short, repeatable runs before any long notebook run; the workflow should expose wall time, steps/s, constraint error, and artifact size.
 
 ## Blocking Questions Or Assumptions
@@ -38,4 +38,4 @@ Make GPCRmd the first real-system target for `notebooks/ligand-receptor-motion/`
 - The active workflow has one named GPCRmd target candidate or a short list with a clear selection gate.
 - The repo can inspect/cache the target metadata and report whether the system is MLX-runnable today.
 - If runnable, the notebook uses an MLX-generated trajectory and labels GPCRmd as reference context.
-- If not runnable, the notebook and CLI state the exact missing capabilities instead of falling back to fake or downloaded motion.
+- If not runnable, the notebook and API state the exact missing capabilities instead of falling back to fake or downloaded motion.

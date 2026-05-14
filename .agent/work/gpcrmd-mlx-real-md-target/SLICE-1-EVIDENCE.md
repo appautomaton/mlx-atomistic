@@ -8,7 +8,7 @@
 
 ## Slice Output
 
-- Added `atomistic_prep.gpcrmd` for offline registry loading, writing, selection reports, and fail-closed target selection.
+- Added `mlx_atomistic.prep.gpcrmd` for offline registry loading, writing, selection reports, and fail-closed target selection.
 - Added tests for the built-in GPCRmd target, offline fixture round-trip, exact missing-requirement errors, and unknown-target errors.
 
 ## Scope Boundary

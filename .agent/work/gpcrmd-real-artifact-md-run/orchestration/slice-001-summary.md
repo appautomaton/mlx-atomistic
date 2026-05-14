@@ -15,9 +15,9 @@
 
 ## Verification
 
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py tests/test_atomistic_prep.py -k "gpcrmd or charmm"`: 33 passed, 22 deselected.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/atomistic_prep/gpcrmd.py src/atomistic_prep/topology_import.py tests/test_gpcrmd_registry.py tests/test_atomistic_prep.py`: passed.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run atomistic-prep gpcrmd-import --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --out /tmp/mlx-atomistic-gpcrmd-slice1-probe --json`: command completed and returned expected blockers `unsupported_terms:charmm_cmap_terms`, `unsupported_terms:nbfix_pair_overrides`, and `unsupported_terms:urey_bradley_terms`.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_gpcrmd_registry.py tests/test_mlx_prep.py -k "gpcrmd or charmm"`: 33 passed, 22 deselected.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/prep/gpcrmd.py src/mlx_atomistic/prep/topology_import.py tests/test_gpcrmd_registry.py tests/test_mlx_prep.py`: passed.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run mlx_atomistic.prep Python API gpcrmd-import --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --out /tmp/mlx-atomistic-gpcrmd-slice1-probe --json`: command completed and returned expected blockers `unsupported_terms:charmm_cmap_terms`, `unsupported_terms:nbfix_pair_overrides`, and `unsupported_terms:urey_bradley_terms`.
 - Temporary probe output under `/tmp/mlx-atomistic-gpcrmd-slice1-probe` was removed.
 - `git ls-files notebooks/ligand-receptor-motion/data`: no tracked files.
 - `git status --ignored --short notebooks/ligand-receptor-motion/data`: data directory is ignored.

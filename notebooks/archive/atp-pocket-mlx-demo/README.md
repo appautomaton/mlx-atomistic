@@ -33,25 +33,26 @@ The checked-in example data includes:
 - `data/4dw1_atp_bound_p2x4.pdb`: ATP-bound P2X4 receptor coordinates from RCSB.
 - `data/atp_pubchem_5957_3d.sdf`: real 3D ATP ligand from PubChem CID 5957.
 
-The same path can be reproduced from the CLI:
+The same path can be reproduced from Python:
 
-```bash
-uv run atomistic-prep prepare-p2x4-atp --backend production_mlx \
-  --pdb notebooks/archive/atp-pocket-mlx-demo/data/4dw1_atp_bound_p2x4.pdb \
-  --out notebooks/archive/atp-pocket-mlx-demo/data/prepared/4dw1-atp --force
-uv run atomistic-prep validate --prepared notebooks/archive/atp-pocket-mlx-demo/data/prepared/4dw1-atp --require-production
-uv run atomistic-prep run-mlx --prepared notebooks/archive/atp-pocket-mlx-demo/data/prepared/4dw1-atp \
-  --require-production --steps 10000 --sample-interval 25 --dt 0.002 \
-  --temperature 300 --friction 10 --restraint-k 5 \
-  --minimize-steps 50 --equilibration-steps 100 \
-  --constraint-max-iterations 4 --diagnostic-interval 25 --force
-uv run atomistic-prep benchmark-p2x4-atp \
-  --prepared notebooks/archive/atp-pocket-mlx-demo/data/prepared/4dw1-atp \
-  --durations-ps 1 10 20
+```python
+from pathlib import Path
+
+from mlx_atomistic.prep.io import save_prepared_system
+from mlx_atomistic.prep.prepare import prepare_p2x4_atp
+from mlx_atomistic.prep.runner import run_mlx
+
+prepared_dir = Path("notebooks/archive/atp-pocket-mlx-demo/data/prepared/4dw1-atp")
+prepared = prepare_p2x4_atp(
+    pdb_path=Path("notebooks/archive/atp-pocket-mlx-demo/data/4dw1_atp_bound_p2x4.pdb"),
+    backend="production_mlx",
+)
+save_prepared_system(prepared, prepared_dir)
+run_mlx(prepared_dir, require_production=True, steps=10000, sample_interval=25)
 ```
 
 Raw PDB coordinates are not general production MD input. The bundled 4DW1
-example works because `atomistic_prep` has versioned internal templates for that
+example works because `mlx_atomistic.prep` has versioned internal templates for that
 specific ATP pocket: explicit hydrogens, atom types, charges, bonded terms,
 constraints, and nonbonded exceptions. Other systems should come from AMBER or
 CHARMM topology/parameter import.

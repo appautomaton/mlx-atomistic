@@ -16,7 +16,7 @@
 ## Verification
 
 - `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_neighbors.py tests/test_nonbonded_acceleration.py tests/test_forcefields.py -k "neighbor or periodic or large or nbfix or exception"`: 24 passed, 27 deselected.
-- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/nonbonded.py src/mlx_atomistic/neighbors.py src/mlx_atomistic/forcefields.py src/mlx_atomistic/md.py src/mlx_atomistic/minimize.py src/mlx_atomistic/protocols.py src/atomistic_prep/runner.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py`: passed.
+- `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src/mlx_atomistic/nonbonded.py src/mlx_atomistic/neighbors.py src/mlx_atomistic/forcefields.py src/mlx_atomistic/md.py src/mlx_atomistic/minimize.py src/mlx_atomistic/protocols.py src/mlx_atomistic/prep/runner.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py`: passed.
 - Follow-up regression verification: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_nonbonded_acceleration.py -q`: 17 passed.
 - Protocol verification: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_protocols.py -q`: 6 passed.
 

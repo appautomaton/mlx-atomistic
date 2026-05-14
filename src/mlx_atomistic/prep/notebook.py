@@ -9,8 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from atomistic_prep.io import VIEW_PDB_NAME, load_prepared_system
-from atomistic_prep.schema import PreparedSystem
+from mlx_atomistic.prep.io import VIEW_PDB_NAME, load_prepared_system
+from mlx_atomistic.prep.schema import PreparedSystem
 
 TRAJECTORY_NAME = "trajectory.npz"
 

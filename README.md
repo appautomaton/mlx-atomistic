@@ -4,6 +4,15 @@ Apple Silicon-native atomistic simulation experiments built on MLX and Metal.
 
 This project targets Python 3.13 through `uv` and uses MLX for local GPU execution on Apple Silicon. The first milestones are lightweight DFT building blocks, validation notebooks, and visualization utilities rather than a heavy production DFT engine.
 
+## Runtime Boundary
+
+`mlx_atomistic` is the primary trajectory generator and product runtime in this
+repo. OpenMM, LAMMPS, and the source trees under `vendors/` are reference or
+validation surfaces; they do not replace the MLX runtime path.
+
+See `docs/runtime-boundaries.md` for the dependency roles and current
+OpenMM/LAMMPS provenance.
+
 ## Setup
 
 ```bash
@@ -57,7 +66,8 @@ uv run python -m mlx_atomistic.benchmarks.dft_scf --sizes 8,16,24,32 --iteration
 
 ## Layout
 
-- `src/mlx_atomistic/`: package code.
+- `src/mlx_atomistic/`: core MLX/Metal simulation package code.
+- `src/mlx_atomistic/prep/`: preparation/import tooling for MLX-ready artifacts.
 - `notebooks/`: exploratory notebooks and visual validation.
 - `tests/`: focused unit tests.
 - `vendors/`: reference source trees; not imported as project code.

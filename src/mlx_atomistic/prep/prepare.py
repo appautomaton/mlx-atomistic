@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from atomistic_prep.schema import (
+from mlx_atomistic.prep.schema import (
     ARTIFACT_VERSION,
     PreparedSystem,
     PreparedSystemMetadata,
@@ -225,8 +225,8 @@ def prepare_p2x4_atp(
     internal residue/ATP templates, explicit hydrogens, fixed-topology
     parameters, real units, constraints, and MLX-compatible force terms. General
     user systems still start from topology/parameter files imported through
-    `atomistic-prep import-amber` or `atomistic-prep import-charmm`. `generic_mlx`
-    remains available only for tests and explicit developer diagnostics.
+    `mlx_atomistic.prep.topology_import` helpers. `generic_mlx` remains
+    available only for tests and explicit developer diagnostics.
     """
 
     if cutoff_angstrom <= 0.0:
@@ -235,7 +235,7 @@ def prepare_p2x4_atp(
     if backend == "production":
         backend = "production_mlx"
     if backend == "production_mlx":
-        from atomistic_prep.production_pocket import prepare_p2x4_atp_production
+        from mlx_atomistic.prep.production_pocket import prepare_p2x4_atp_production
 
         return prepare_p2x4_atp_production(
             pdb_path=pdb_path,

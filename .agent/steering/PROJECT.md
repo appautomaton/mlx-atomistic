@@ -12,12 +12,12 @@
 ## Current Users or Operators
 
 - Primary operators are developers and notebook users working from the repo-local `uv` environment (`README.md`, `notebooks/README.md`, `AGENTS.md`).
-- Secondary operators are CLI users preparing ligand-receptor artifacts or running benchmark surfaces through installed console scripts (`pyproject.toml`, `src/atomistic_prep/cli.py`).
+- Secondary operators are Python API users preparing ligand-receptor artifacts or running benchmark surfaces through installed console scripts (`pyproject.toml`, `src/mlx_atomistic/prep/`).
 
 ## Current System Model
 
-- request or event flow: users run `uv` commands, import `mlx_atomistic`, execute notebooks, run `atomistic-prep`, or run benchmark modules/scripts (`README.md`, `pyproject.toml`, `src/atomistic_prep/cli.py`).
-- primary surfaces: package API, preparation CLI, benchmark CLI/modules, notebooks, tests, and lint (`src/mlx_atomistic/__init__.py`, `pyproject.toml`, `notebooks/README.md`).
+- request or event flow: users run `uv` commands, import `mlx_atomistic`, execute notebooks, call `mlx_atomistic.prep` APIs, or run benchmark modules/scripts (`README.md`, `pyproject.toml`, `src/mlx_atomistic/prep/`).
+- primary surfaces: package API, preparation APIs, benchmark API/modules, notebooks, tests, and lint (`src/mlx_atomistic/__init__.py`, `pyproject.toml`, `notebooks/README.md`).
 - critical dependencies: Python 3.13, MLX, NumPy, SciPy, optional notebook/prep/viz extras, Pytest, Ruff, and Hatchling (`.python-version`, `pyproject.toml`).
 
 ## Major Surfaces
@@ -25,7 +25,7 @@
 | Surface | Path | Responsibility |
 |---------|------|----------------|
 | Core package | `src/mlx_atomistic/` | MD, DFT, force fields, validation, topology, runtime, trajectory, visualization, and benchmark APIs. |
-| Preparation package | `src/atomistic_prep/` | Prepared-artifact import/build/run workflows exposed through `atomistic-prep`. |
+| Preparation package | `src/mlx_atomistic/prep/` | Prepared-artifact import/build/run workflows exposed through Python APIs. |
 | Notebooks | `notebooks/` | Jupyter-first workflows, active ligand-receptor visualization, and archived provenance. |
 | Tests | `tests/` | Regression coverage for MD, DFT, topology, validation, prep, runtime, visualization, and artifacts. |
 | Vendor references | `vendors/` | Reference source trees only, not dependencies or package inputs. |
@@ -60,5 +60,5 @@
 - `.python-version`
 - `pyproject.toml`
 - `src/mlx_atomistic/__init__.py`
-- `src/atomistic_prep/cli.py`
+- `src/mlx_atomistic/prep/`
 - `notebooks/README.md`

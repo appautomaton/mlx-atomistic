@@ -19,7 +19,6 @@ dependencies = [
 ]
 
 [project.scripts]
-atomistic-prep = "atomistic_prep.cli:main"
 mlx-atomistic-benchmark = "mlx_atomistic.benchmarks.md_performance:main"
 
 [project.optional-dependencies]
@@ -49,16 +48,24 @@ viz = [
 ]
 
 [dependency-groups]
+# Dev/reference engines stay out of project.dependencies. OpenMM is a PyPI
+# reference wheel; LAMMPS is locally built from the upstream source package with
+# GPU/OpenCL enabled by the tool.uv settings below.
 dev = [
+  "lammps>=2025.7.22.4.0",
+  "mpich>=5.0.1",
+  "openmm>=8.5.1",
   "pytest>=8.3",
   "ruff>=0.8",
 ]
 
 [tool.uv]
 package = true
+no-binary-package = ["lammps"]
+config-settings-package = { lammps = { "cmake.define.PKG_GPU" = "ON", "cmake.define.GPU_API" = "opencl", "cmake.define.GPU_PREC" = "single" } }
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mlx_atomistic", "src/atomistic_prep"]
+packages = ["src/mlx_atomistic"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

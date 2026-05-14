@@ -1,6 +1,6 @@
 """Optional preparation layer for MLX-compatible atomistic systems."""
 
-from atomistic_prep.gpcrmd import (
+from mlx_atomistic.prep.gpcrmd import (
     GPCRMD_IMPORT_REPORT_NAME,
     GPCRmdCacheFileStatus,
     GPCRmdCacheInspection,
@@ -20,24 +20,28 @@ from atomistic_prep.gpcrmd import (
     write_gpcrmd_import_report,
     write_gpcrmd_targets,
 )
-from atomistic_prep.io import load_prepared_system, save_prepared_system, synthetic_prepared_system
-from atomistic_prep.prepare import (
+from mlx_atomistic.prep.io import (
+    load_prepared_system,
+    save_prepared_system,
+    synthetic_prepared_system,
+)
+from mlx_atomistic.prep.prepare import (
     MissingPrepDependencyError,
     ProductionPrepNotImplementedError,
     optional_prep_dependency_status,
     prepare_p2x4_atp,
     require_production_prep_dependencies,
 )
-from atomistic_prep.schema import ARTIFACT_VERSION, PreparedSystem, PreparedSystemMetadata
-from atomistic_prep.solvated_example import (
+from mlx_atomistic.prep.schema import ARTIFACT_VERSION, PreparedSystem, PreparedSystemMetadata
+from mlx_atomistic.prep.solvated_example import (
     SOLVATED_LIGAND_RECEPTOR_PARAMETER_SOURCE,
     SolvatedExampleError,
     ensure_solvated_ligand_receptor_example,
     prepare_solvated_ligand_receptor_example,
     validate_complete_solvated_ligand_receptor_system,
 )
-from atomistic_prep.t4l_benzene import T4L_BENZENE_PARAMETER_SOURCE, prepare_t4l_benzene
-from atomistic_prep.topology_import import (
+from mlx_atomistic.prep.t4l_benzene import T4L_BENZENE_PARAMETER_SOURCE, prepare_t4l_benzene
+from mlx_atomistic.prep.topology_import import (
     TopologyImportError,
     import_amber_prmtop,
     import_charmm_with_parmed,
@@ -47,7 +51,7 @@ from atomistic_prep.topology_import import (
 def build_mlx_system(*args, **kwargs):
     """Lazily import the MLX runner so prep inspection does not initialize Metal."""
 
-    from atomistic_prep.runner import build_mlx_system as _build_mlx_system
+    from mlx_atomistic.prep.runner import build_mlx_system as _build_mlx_system
 
     return _build_mlx_system(*args, **kwargs)
 
@@ -55,7 +59,7 @@ def build_mlx_system(*args, **kwargs):
 def run_mlx(*args, **kwargs):
     """Lazily import the MLX runner so prep inspection does not initialize Metal."""
 
-    from atomistic_prep.runner import run_mlx as _run_mlx
+    from mlx_atomistic.prep.runner import run_mlx as _run_mlx
 
     return _run_mlx(*args, **kwargs)
 
@@ -63,7 +67,7 @@ def run_mlx(*args, **kwargs):
 def run_steered_mlx(*args, **kwargs):
     """Lazily import the MLX SMD runner so prep inspection does not initialize Metal."""
 
-    from atomistic_prep.runner import run_steered_mlx as _run_steered_mlx
+    from mlx_atomistic.prep.runner import run_steered_mlx as _run_steered_mlx
 
     return _run_steered_mlx(*args, **kwargs)
 
