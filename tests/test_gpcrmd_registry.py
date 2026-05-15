@@ -431,7 +431,7 @@ def test_gpcrmd_compatibility_report_fails_closed_for_current_gpcr_target(tmp_pa
     assert "pme_mesh_periodic_electrostatics" not in report.unsupported_physics
     assert "membrane_lipid_force_field_terms" not in report.unsupported_physics
     assert "charmm_cmap_terms" not in report.unsupported_physics
-    assert "virtual_sites_or_hydrogen_mass_repartitioning_not_checked" in report.unsupported_physics
+    assert "hmr_or_virtual_site_policy_required" in report.unsupported_physics
     assert "ewald_reference_small_system_oracle" in report.supported_now
     assert report.runtime_risk["total_atoms"] == 92001
     assert payload["next_engine_slice"] == "parse_gpcrmd_constraints_hmr_or_virtual_sites_policy"
@@ -553,7 +553,7 @@ def test_gpcrmd_inventory_names_terms_protocol_and_exact_first_blockers(
     assert "4_fs_constraint_or_hmr_policy" in payload["protocol_requirements"]["requirements"]
     assert "pme_mesh_periodic_electrostatics" not in blocker_names
     assert "large_periodic_system_neighbor_list_scaling" not in blocker_names
-    assert "virtual_sites_or_hydrogen_mass_repartitioning_not_checked" in blocker_names
+    assert "hmr_or_virtual_site_policy_required" in blocker_names
     assert "production validation" not in blocker_text
     assert "generic" not in blocker_text
 

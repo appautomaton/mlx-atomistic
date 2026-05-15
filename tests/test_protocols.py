@@ -47,7 +47,7 @@ def test_gpcrmd_protocol_gate_accepts_short_nvt_metadata():
 @pytest.mark.parametrize(
     ("protocol_request", "blockers"),
     [
-        ({"ensemble": "NPT"}, ("npt_barostat",)),
+        ({"ensemble": "NPT"}, ("barostat",)),
         ({"ensemble": "NVT", "barostat": "monte_carlo"}, ("barostat",)),
         ({"ensemble": "NVT", "membrane_barostat": "semiisotropic"}, ("membrane_barostat",)),
     ],
@@ -82,7 +82,7 @@ def test_run_minimize_then_nvt_fails_closed_before_npt_force_evaluation():
             cell=cell,
         )
 
-    assert exc_info.value.blockers == ("npt_barostat",)
+    assert exc_info.value.blockers == ("barostat",)
 
 
 def test_run_minimize_then_nvt_exposes_nvt_protocol_metadata():

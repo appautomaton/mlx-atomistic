@@ -112,6 +112,9 @@ def test_prep_canonical_import_works():
 
 def test_external_engine_imports_stay_in_documented_reference_scripts():
     allowed = {
+        Path("scripts/benchmark_openmm_opencl.py"),
+        Path("scripts/openmm_mlx_parity.py"),
+        Path("scripts/run_openmm_mlx_npt_parity.py"),
         Path("scripts/run_openmm_gpcrmd_preview.py"),
         Path("scripts/run_openmm_gpcrmd_charmm_md.py"),
     }

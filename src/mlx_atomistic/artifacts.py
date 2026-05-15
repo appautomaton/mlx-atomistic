@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 PREPARED_JSON_NAME = "prepared_system.json"
 PREPARED_NPZ_NAME = "prepared_system.npz"
-DEFAULT_COULOMB_CONSTANT_KJ_MOL_ANGSTROM = 13.893545764438198
+DEFAULT_COULOMB_CONSTANT_KJ_MOL_ANGSTROM = 1389.3545764438198
 
 SUPPORTED_FORCE_TERMS = frozenset(
     {
@@ -67,6 +67,8 @@ FAIL_CLOSED_TERMS = frozenset(
         "npt_barostat",
         "virtual_site",
         "virtual_sites",
+        "hmr_or_virtual_site_policy_required",
+        "hydrogen_mass_repartitioning",
         "virtual_sites_or_hydrogen_mass_repartitioning_not_checked",
         "drude",
         "polarizable",
@@ -109,6 +111,8 @@ TERM_ALIASES = {
     "receptor_mask": "receptor",
     "ligand_mask": "ligand",
     "constraints": "distance_constraint",
+    "hmr": "hydrogen_mass_repartitioning",
+    "hydrogen_mass_repartitioning": "hydrogen_mass_repartitioning",
     "exceptions": "nonbonded_exception",
     "nonbonded_exceptions": "nonbonded_exception",
 }
@@ -738,6 +742,48 @@ def _validate_production_arrays(metadata: dict[str, Any], arrays: dict[str, np.n
             raise MLXCompatibilityError(msg)
     if np.any(np.asarray(arrays["masses"], dtype=np.float32) <= 0.0):
         msg = "production artifact masses must be positive"
+        raise MLXCompatibilityError(msg)
+    _validate_hmr_and_virtual_site_policy(metadata, arrays, symbols)
+
+
+def _validate_hmr_and_virtual_site_policy(
+    metadata: dict[str, Any],
+    arrays: dict[str, np.ndarray],
+    symbols: np.ndarray,
+) -> None:
+    report = dict(metadata.get("compatibility_report", {}))
+    water_model = str(
+        metadata.get("water_model")
+        or report.get("water_model")
+        or report.get("solvent_model")
+        or ""
+    ).lower()
+    if bool(report.get("virtual_sites_present", False)):
+        msg = "virtual_site artifacts are not supported by mlx_atomistic"
+        raise MLXCompatibilityError(msg)
+    if any(model in water_model for model in ("tip4p", "tip5p", "opc")):
+        msg = f"virtual_site water model is not supported: {water_model}"
+        raise MLXCompatibilityError(msg)
+
+    masses = np.asarray(arrays["masses"], dtype=np.float32)
+    hydrogen_masses = masses[symbols == "H"]
+    if hydrogen_masses.size == 0:
+        return
+    hmr_status = str(report.get("hydrogen_mass_repartitioning", "")).lower()
+    hmr_represented = hmr_status in {
+        "represented_by_masses",
+        "static_masses",
+        "present_represented_by_masses",
+    }
+    hidden_hmr = bool(np.any(hydrogen_masses > 1.25))
+    if hidden_hmr and not hmr_represented:
+        msg = (
+            "hydrogen_mass_repartitioning detected from hydrogen masses but not "
+            "declared as represented_by_masses"
+        )
+        raise MLXCompatibilityError(msg)
+    if hmr_represented and "distance_constraint" not in _metadata_terms(metadata):
+        msg = "hydrogen_mass_repartitioning production artifacts require distance_constraint"
         raise MLXCompatibilityError(msg)
 
 

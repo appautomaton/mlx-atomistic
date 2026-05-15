@@ -104,6 +104,7 @@ from mlx_atomistic.io import (
     read_xyz,
     restart_state_from_trajectory,
     save_npz_trajectory,
+    trajectory_record_from_result,
     write_xyz,
 )
 from mlx_atomistic.minimize import MinimizationResult, minimize_energy
@@ -145,6 +146,7 @@ from mlx_atomistic.trajectory_adapters import (
     mdanalysis_universe_from_arrays,
     trajectory_record_to_mdanalysis,
     trajectory_record_to_mdtraj,
+    write_mdtraj_trajectory,
 )
 from mlx_atomistic.units import LJ_REDUCED_UNITS, LennardJonesReducedUnits, MDUnitSystem
 from mlx_atomistic.validation import (
@@ -291,8 +293,10 @@ __all__ = [
     "summarize_validation_results",
     "trajectory_record_to_mdanalysis",
     "trajectory_record_to_mdtraj",
+    "trajectory_record_from_result",
     "validate_force_term",
     "validate_nonbonded_electrostatics",
     "validate_mlx_compatibility",
+    "write_mdtraj_trajectory",
     "write_xyz",
 ]

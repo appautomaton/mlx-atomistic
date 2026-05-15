@@ -36,6 +36,10 @@ def test_production_unit_constants_are_physical():
     units = MDUnitSystem()
 
     np.testing.assert_allclose(units.coulomb_constant, COULOMB_CONSTANT_KJ_MOL_ANGSTROM)
+    np.testing.assert_allclose(
+        COULOMB_CONSTANT_KJ_MOL_ANGSTROM,
+        10.0 * 138.93545764438198,
+    )
     np.testing.assert_allclose(units.boltzmann_constant, BOLTZMANN_CONSTANT_KJ_MOL_K)
     np.testing.assert_allclose(
         units.kinetic_energy_scale,

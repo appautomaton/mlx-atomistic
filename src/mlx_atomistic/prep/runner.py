@@ -18,8 +18,22 @@ from mlx_atomistic.artifacts import (
     load_prepared_mlx_artifact,
     validate_mlx_compatibility,
 )
-from mlx_atomistic.io import TrajectoryRecord, load_npz_trajectory, save_npz_trajectory
-from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
+from mlx_atomistic.io import (
+    TrajectoryRecord,
+    load_npz_trajectory,
+    load_simulation_checkpoint,
+    save_npz_trajectory,
+    save_simulation_checkpoint,
+    trajectory_record_from_result,
+)
+from mlx_atomistic.md import (
+    LangevinThermostat,
+    MonteCarloBarostat,
+    RuntimeReporter,
+    SimulationConfig,
+    simulate_npt,
+    simulate_nvt,
+)
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import pme_readiness_report
 from mlx_atomistic.prep.gpcrmd import (
@@ -34,7 +48,9 @@ from mlx_atomistic.prep.io import (
     NPZ_ARRAY_NAMES,
     NPZ_NAME,
     OPTIONAL_NPZ_ARRAY_DEFAULTS,
+    VIEW_PDB_NAME,
     load_prepared_system,
+    write_view_pdb,
 )
 from mlx_atomistic.prep.schema import PreparedSystem
 from mlx_atomistic.protocols import (
@@ -44,7 +60,8 @@ from mlx_atomistic.protocols import (
     validate_gpcrmd_protocol_request,
 )
 from mlx_atomistic.steering import SteeredCOMBiasPotential, simulate_steered_nvt
-from mlx_atomistic.units import MDUnitSystem
+from mlx_atomistic.trajectory_adapters import write_mdtraj_trajectory
+from mlx_atomistic.units import ATM_TO_KJ_PER_MOL_ANGSTROM3, MDUnitSystem
 
 TRAJECTORY_NAME = "trajectory.npz"
 STEERED_TRAJECTORY_NAME = "steered_trajectory.npz"
@@ -217,6 +234,14 @@ def _production_neighbor_manager(
     return None
 
 
+def _compile_force_evaluator_safe(force_terms) -> bool:
+    return not any(
+        getattr(term, "electrostatics", None) == "pme"
+        or getattr(term, "pme_config", None) is not None
+        for term in force_terms
+    )
+
+
 def run_mlx(
     prepared: str | Path | PreparedSystem,
     *,
@@ -240,6 +265,12 @@ def run_mlx(
     neighbor_check_interval: int = 1,
     metadata_overrides: dict[str, Any] | None = None,
     runtime_electrostatics_model: str | None = None,
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
+    checkpoint_out: str | Path | None = None,
+    resume_checkpoint: str | Path | None = None,
+    dcd_out: str | Path | None = None,
+    xtc_out: str | Path | None = None,
+    topology_out: str | Path | None = None,
 ):
     """Run an MLX NVT trajectory and optionally save `trajectory.npz`."""
 
@@ -285,6 +316,7 @@ def run_mlx(
         restraint_k=restraint_k,
         constraint_max_iterations=constraint_max_iterations,
     )
+    compile_force_evaluator = _compile_force_evaluator_safe(force_terms)
     masses = np.asarray(system.masses, dtype=np.float32)
     unit_system = artifact.unit_system
     kinetic_energy_scale = 1.0 if unit_system is None else unit_system.kinetic_energy_scale
@@ -292,24 +324,39 @@ def run_mlx(
         1.0 if unit_system is None else unit_system.force_to_acceleration_scale
     )
     boltzmann_constant = 1.0 if unit_system is None else unit_system.boltzmann_constant
-    velocities = initialize_velocities(
-        prepared_system,
-        masses,
-        temperature=temperature,
-        seed=seed,
-        kinetic_energy_scale=kinetic_energy_scale,
-        boltzmann_constant=boltzmann_constant,
-    )
-    velocities = _project_and_rescale_velocities(
-        velocities,
-        positions=np.asarray(system.positions, dtype=np.float32),
-        masses=masses,
-        constraints=constraints,
-        cell=system.cell,
-        temperature=temperature,
-        kinetic_energy_scale=kinetic_energy_scale,
-        boltzmann_constant=boltzmann_constant,
-    )
+    checkpoint = None
+    run_positions = np.asarray(system.positions, dtype=np.float32)
+    initial_step = 0
+    initial_time = 0.0
+    rng_step_offset = None
+    if resume_checkpoint is not None:
+        checkpoint = load_simulation_checkpoint(resume_checkpoint)
+        run_positions = np.asarray(checkpoint.positions, dtype=np.float32)
+        velocities = np.asarray(checkpoint.velocities, dtype=np.float32)
+        initial_step = checkpoint.step
+        initial_time = checkpoint.time
+        rng_step_offset = int(checkpoint.thermostat.get("rng_step_offset", checkpoint.step))
+        minimize_steps = 0
+        equilibration_steps = 0
+    else:
+        velocities = initialize_velocities(
+            prepared_system,
+            masses,
+            temperature=temperature,
+            seed=seed,
+            kinetic_energy_scale=kinetic_energy_scale,
+            boltzmann_constant=boltzmann_constant,
+        )
+        velocities = _project_and_rescale_velocities(
+            velocities,
+            positions=run_positions,
+            masses=masses,
+            constraints=constraints,
+            cell=system.cell,
+            temperature=temperature,
+            kinetic_energy_scale=kinetic_energy_scale,
+            boltzmann_constant=boltzmann_constant,
+        )
     neighbor_manager = _production_neighbor_manager(
         system,
         force_terms,
@@ -319,9 +366,50 @@ def run_mlx(
     )
 
     run_started = time.perf_counter()
-    if minimize_steps > 0 or equilibration_steps > 0:
+    use_npt = protocol_report.metadata["ensemble"] == "NPT"
+    pressure_internal = (
+        ATM_TO_KJ_PER_MOL_ANGSTROM3
+        if unit_system is not None and unit_system.coordinates == "angstrom"
+        else 1.0
+    )
+    if use_npt:
+        result = simulate_npt(
+            run_positions,
+            velocities,
+            masses=masses,
+            cell=system.cell,
+            force_terms=force_terms,
+            config=SimulationConfig(
+                dt=dt,
+                steps=steps,
+                sample_interval=sample_interval,
+                kinetic_energy_scale=kinetic_energy_scale,
+                force_to_acceleration_scale=force_to_acceleration_scale,
+                boltzmann_constant=boltzmann_constant,
+                diagnostic_interval=diagnostic_interval,
+                compile_force_evaluator=compile_force_evaluator,
+                pressure_diagnostics=pressure_diagnostics,
+                initial_step=initial_step,
+                initial_time=initial_time,
+            ),
+            thermostat=LangevinThermostat(
+                temperature=temperature,
+                friction=friction,
+                seed=seed,
+                rng_step_offset=rng_step_offset,
+            ),
+            barostat=MonteCarloBarostat(
+                pressure=pressure_internal,
+                temperature=temperature,
+                seed=seed,
+            ),
+            constraints=constraints,
+            neighbor_manager=neighbor_manager,
+            reporters=reporters,
+        )
+    elif minimize_steps > 0 or equilibration_steps > 0:
         protocol_result = run_minimize_then_nvt(
-            np.asarray(system.positions, dtype=np.float32),
+            run_positions,
             velocities,
             masses=masses,
             force_terms=force_terms,
@@ -335,7 +423,7 @@ def run_mlx(
                 friction=friction,
                 seed=seed,
                 diagnostic_interval=diagnostic_interval,
-                compile_force_evaluator=True,
+                compile_force_evaluator=compile_force_evaluator,
                 ensemble=protocol_report.metadata["ensemble"],
                 proof_mode=protocol_report.metadata["proof_mode"],
                 barostat=protocol_report.metadata["barostat"],
@@ -346,11 +434,12 @@ def run_mlx(
             constraints=constraints,
             unit_system=unit_system,
             neighbor_manager=neighbor_manager,
+            reporters=reporters,
         )
         result = protocol_result.production
     else:
         result = simulate_nvt(
-            np.asarray(system.positions, dtype=np.float32),
+            run_positions,
             velocities,
             masses=masses,
             cell=system.cell,
@@ -363,16 +452,20 @@ def run_mlx(
                 force_to_acceleration_scale=force_to_acceleration_scale,
                 boltzmann_constant=boltzmann_constant,
                 diagnostic_interval=diagnostic_interval,
-                compile_force_evaluator=True,
+                compile_force_evaluator=compile_force_evaluator,
                 pressure_diagnostics=pressure_diagnostics,
+                initial_step=initial_step,
+                initial_time=initial_time,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
                 friction=friction,
                 seed=seed,
+                rng_step_offset=rng_step_offset,
             ),
             constraints=constraints,
             neighbor_manager=neighbor_manager,
+            reporters=reporters,
         )
     elapsed_wall_seconds = time.perf_counter() - run_started
     if out is None and prepared_dir is not None:
@@ -425,18 +518,107 @@ def run_mlx(
             ),
             "warnings": prepared_system.metadata.warnings,
             "nonbonded_runtime": result.nonbonded_report,
+            "resume_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
         }
+        if use_npt:
+            metadata["kind"] = "mlx_atomistic.prep_npt"
+            metadata["barostat_attempts"] = result.barostat_attempts
+            metadata["barostat_accepted"] = result.barostat_accepted
+            metadata["pressure_atm"] = 1.0
+            metadata["barostat_pressure_internal"] = pressure_internal
         if metadata_overrides:
             metadata.update(metadata_overrides)
         metadata.update(protocol_report.metadata)
+        trajectory_cell = result.final_cell if use_npt else system.cell
         save_npz_trajectory(
             out,
             result,
             symbols=tuple(str(item) for item in prepared_system.symbols.tolist()),
-            cell=system.cell,
+            cell=trajectory_cell,
             metadata=metadata,
         )
+    else:
+        metadata = {}
+        trajectory_cell = result.final_cell if use_npt else system.cell
+    auxiliary_outputs = [(dcd_out, "dcd"), (xtc_out, "xtc")]
+    if any(path is not None for path, _ in auxiliary_outputs):
+        symbols = tuple(str(item) for item in prepared_system.symbols.tolist())
+        record = trajectory_record_from_result(
+            result,
+            symbols=symbols,
+            cell=trajectory_cell,
+            metadata=metadata,
+        )
+        topology_path = _trajectory_topology_path(
+            prepared_system,
+            prepared_dir=prepared_dir,
+            out=out,
+            topology_out=topology_out,
+            auxiliary_outputs=auxiliary_outputs,
+        )
+        for output_path, output_format in auxiliary_outputs:
+            if output_path is not None:
+                write_mdtraj_trajectory(
+                    topology_path,
+                    record,
+                    output_path,
+                    file_format=output_format,
+                )
+    if checkpoint_out is not None:
+        save_simulation_checkpoint(
+            checkpoint_out,
+            result.final_state,
+            cell=result.final_cell if use_npt else system.cell,
+            thermostat={
+                "temperature": temperature,
+                "friction": friction,
+                "seed": seed,
+                "rng_step_offset": int(result.final_state.step),
+            },
+            neighbor_policy={
+                "skin": neighbor_skin,
+                "check_interval": neighbor_check_interval,
+                "backend": result.nonbonded_report.get("backend"),
+            },
+            force_terms=tuple(
+                str(getattr(term, "name", type(term).__name__)) for term in force_terms
+            ),
+            diagnostic_cursor=int(np.asarray(result.diagnostic_steps)[-1]),
+            metadata={
+                "kind": "mlx_atomistic.checkpoint",
+                "source": "prep.run_mlx",
+                "resumed_from": None if checkpoint is None else str(resume_checkpoint),
+            },
+        )
     return result
+
+
+def _trajectory_topology_path(
+    prepared_system: PreparedSystem,
+    *,
+    prepared_dir: Path | None,
+    out: str | Path | None,
+    topology_out: str | Path | None,
+    auxiliary_outputs: list[tuple[str | Path | None, str]],
+) -> Path:
+    if topology_out is not None:
+        path = Path(topology_out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_view_pdb(path, prepared_system)
+        return path
+    if prepared_dir is not None:
+        path = prepared_dir / VIEW_PDB_NAME
+        if not path.exists():
+            write_view_pdb(path, prepared_system)
+        return path
+    if out is not None:
+        path = Path(out).parent / VIEW_PDB_NAME
+    else:
+        first_output = next(Path(item) for item, _ in auxiliary_outputs if item is not None)
+        path = first_output.parent / VIEW_PDB_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_view_pdb(path, prepared_system)
+    return path
 
 
 def run_gpcrmd_mlx(

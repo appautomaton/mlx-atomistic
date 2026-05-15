@@ -896,7 +896,7 @@ def _box_inventory(
 def _constraint_inventory(target: GPCRmdTarget) -> dict[str, Any]:
     blockers: list[str] = []
     if target.time_step_fs >= 3.0:
-        blockers.append("virtual_sites_or_hydrogen_mass_repartitioning_not_checked")
+        blockers.append("hmr_or_virtual_site_policy_required")
     return {
         "required": True,
         "source_files": ["topology", "protocol"],
@@ -931,7 +931,7 @@ def _protocol_inventory(target: GPCRmdTarget) -> dict[str, Any]:
         blockers.append("npt_barostat")
     if target.time_step_fs >= 3.0:
         requirements.append("4_fs_constraint_or_hmr_policy")
-        blockers.append("virtual_sites_or_hydrogen_mass_repartitioning_not_checked")
+        blockers.append("hmr_or_virtual_site_policy_required")
     return {
         "ensemble": target.ensemble,
         "time_step_fs": target.time_step_fs,
@@ -980,7 +980,7 @@ def _first_engine_blockers(
             "first_slice": "Slice 4",
             "reason": "92001 atoms make dense all-pairs nonbonded execution infeasible",
         },
-        "virtual_sites_or_hydrogen_mass_repartitioning_not_checked": {
+        "hmr_or_virtual_site_policy_required": {
             "first_slice": "Slice 6 plus Slice 7",
             "reason": (
                 "4 fs GPCRmd timestep requires parsing constraints/HMR/virtual-site "
@@ -1008,7 +1008,7 @@ def _unsupported_physics_items(target: GPCRmdTarget) -> list[str]:
     if "npt" in target.ensemble.lower():
         unsupported.append("npt_barostat")
     if target.time_step_fs >= 3.0:
-        unsupported.append("virtual_sites_or_hydrogen_mass_repartitioning_not_checked")
+        unsupported.append("hmr_or_virtual_site_policy_required")
     return unsupported
 
 
@@ -1062,7 +1062,7 @@ def _next_engine_slice(missing_input: Sequence[str], unsupported_physics: Sequen
         return "implement_charmm_cmap_terms"
     if "large_periodic_system_neighbor_list_scaling" in unsupported_physics:
         return "implement_scalable_periodic_neighbor_lists"
-    if "virtual_sites_or_hydrogen_mass_repartitioning_not_checked" in unsupported_physics:
+    if "hmr_or_virtual_site_policy_required" in unsupported_physics:
         return "parse_gpcrmd_constraints_hmr_or_virtual_sites_policy"
     if unsupported_physics:
         return "resolve_unsupported_gpcrmd_physics"

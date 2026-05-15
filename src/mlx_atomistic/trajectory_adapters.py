@@ -118,10 +118,40 @@ def trajectory_record_to_mdtraj(
     return trajectory
 
 
+def write_mdtraj_trajectory(
+    topology_path: str | Path,
+    record: TrajectoryRecord,
+    trajectory_path: str | Path,
+    *,
+    file_format: str | None = None,
+) -> Path:
+    """Write a native MLX trajectory record through MDTraj.
+
+    Supported first-class runner formats are DCD and XTC. MLX stores
+    coordinates in Angstrom; `trajectory_record_to_mdtraj` handles MDTraj's
+    nanometer convention before writing.
+    """
+
+    output_path = Path(trajectory_path)
+    suffix = output_path.suffix.lower().lstrip(".")
+    selected_format = (file_format or suffix).lower()
+    trajectory = trajectory_record_to_mdtraj(topology_path, record)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if selected_format == "dcd":
+        trajectory.save_dcd(str(output_path))
+    elif selected_format == "xtc":
+        trajectory.save_xtc(str(output_path))
+    else:
+        msg = f"unsupported trajectory output format {selected_format!r}; expected dcd or xtc"
+        raise ValueError(msg)
+    return output_path
+
+
 __all__ = [
     "OptionalTrajectoryDependencyError",
     "load_mdanalysis_universe",
     "mdanalysis_universe_from_arrays",
     "trajectory_record_to_mdanalysis",
     "trajectory_record_to_mdtraj",
+    "write_mdtraj_trajectory",
 ]

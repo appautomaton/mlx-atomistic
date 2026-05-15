@@ -14,6 +14,7 @@ from mlx_atomistic.md import (
     ForceTerm,
     LangevinThermostat,
     NVTResult,
+    RuntimeReporter,
     SimulationConfig,
     kinetic_energy,
     simulate_nvt,
@@ -23,6 +24,7 @@ from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.units import MDUnitSystem
 
 NVT_PROOF_MODE = "short_nvt"
+NPT_PROOF_MODE = "short_npt"
 SUPPORTED_GPCRMD_PROOF_ENSEMBLE = "nvt"
 
 
@@ -116,8 +118,7 @@ def validate_gpcrmd_protocol_request(
 ) -> ProtocolCompatibilityReport:
     """Validate the current GPCRmd proof protocol gate.
 
-    The first selected GPCRmd proof is deliberately NVT-only. Pressure-coupled
-    requests fail before integration with exact blocker names.
+    The proof gate accepts NVT and the first orthorhombic Monte Carlo NPT path.
     """
 
     metadata = dict(protocol_metadata or {})
@@ -150,41 +151,53 @@ def validate_gpcrmd_protocol_request(
     )
     barostat_requested = _is_requested(requested_barostat)
     membrane_barostat_requested = _is_requested(requested_membrane_barostat)
+    requested_barostat_name = str(requested_barostat).strip().lower().replace("-", "_")
+    monte_carlo_npt = npt_barostat_requested and (
+        requested_barostat is True
+        or requested_barostat_name in {"monte_carlo", "montecarlo", "mc"}
+    )
     blockers: list[str] = []
 
     if npt_barostat_requested:
-        blockers.append("npt_barostat")
+        if not monte_carlo_npt:
+            blockers.append("barostat")
     elif normalized_ensemble != SUPPORTED_GPCRMD_PROOF_ENSEMBLE:
         blockers.append("unsupported_ensemble")
-    if normalized_proof_mode != NVT_PROOF_MODE:
+    expected_proof_mode = NPT_PROOF_MODE if npt_barostat_requested else NVT_PROOF_MODE
+    if normalized_proof_mode not in {NVT_PROOF_MODE, expected_proof_mode}:
         blockers.append("unsupported_proof_mode")
-    if barostat_requested:
+    if barostat_requested and not npt_barostat_requested:
         blockers.append("barostat")
     if membrane_barostat_requested:
         blockers.append("membrane_barostat")
 
     blocker_tuple = tuple(dict.fromkeys(blockers))
     barostat_value = "none"
-    if barostat_requested:
+    if monte_carlo_npt:
+        barostat_value = "monte_carlo"
+    elif barostat_requested:
         barostat_value = str(requested_barostat)
     elif npt_barostat_requested:
-        barostat_value = "requested_by_npt_ensemble"
+        barostat_value = "missing"
     elif membrane_barostat_requested:
         barostat_value = "membrane"
     barostat_status = (
-        "unsupported_requested"
-        if npt_barostat_requested or barostat_requested or membrane_barostat_requested
+        "supported_monte_carlo"
+        if monte_carlo_npt and not blocker_tuple
+        else "unsupported_requested"
+        if barostat_requested or membrane_barostat_requested or npt_barostat_requested
         else "not_required_for_nvt_proof"
     )
+    normalized_output_ensemble = "NPT" if npt_barostat_requested else "NVT"
     report = ProtocolCompatibilityReport(
         accepted=not blocker_tuple,
-        ensemble="NVT" if normalized_ensemble == "nvt" else requested_ensemble,
-        proof_mode=NVT_PROOF_MODE,
+        ensemble=normalized_output_ensemble,
+        proof_mode=expected_proof_mode,
         barostat=barostat_value,
         blockers=blocker_tuple,
         metadata={
-            "ensemble": "NVT" if normalized_ensemble == "nvt" else requested_ensemble,
-            "proof_mode": NVT_PROOF_MODE,
+            "ensemble": normalized_output_ensemble,
+            "proof_mode": expected_proof_mode,
             "barostat": barostat_value,
             "barostat_status": barostat_status,
             "npt_barostat": npt_barostat_requested,
@@ -208,6 +221,7 @@ def run_minimize_then_nvt(
     constraints: DistanceConstraints | None = None,
     unit_system: MDUnitSystem | None = None,
     neighbor_manager: NeighborListManager | None = None,
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> ProtocolResult:
     """Run minimization, optional NVT equilibration, and NVT production in MLX."""
 
@@ -302,6 +316,7 @@ def run_minimize_then_nvt(
         thermostat=thermostat,
         constraints=constraints,
         neighbor_manager=neighbor_manager,
+        reporters=reporters,
     )
     return ProtocolResult(
         minimization=minimized,

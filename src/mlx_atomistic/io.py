@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.md import ForceTerm, SimulationState
+from mlx_atomistic.md import ForceTerm, ReporterEvent, SimulationState
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,80 @@ class TrajectoryRecord:
     virial_tensor: np.ndarray | None = None
     pressure_tensor: np.ndarray | None = None
     pressure: np.ndarray | None = None
+
+
+@dataclass
+class RuntimeTraceReporter:
+    """Collect scalar runtime reporter events for parity and diagnostics traces."""
+
+    include_samples: bool = True
+    include_diagnostics: bool = True
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    def __call__(self, event: ReporterEvent) -> None:
+        if event.event_type == "sample" and not self.include_samples:
+            return
+        if event.event_type == "diagnostic" and not self.include_diagnostics:
+            return
+        self.events.append(
+            {
+                "ensemble": event.ensemble,
+                "event_type": event.event_type,
+                "step": int(event.step),
+                "time": float(event.time),
+                "potential_energy": _scalar_or_none(event.potential_energy),
+                "kinetic_energy": _scalar_or_none(event.kinetic_energy),
+                "total_energy": _scalar_or_none(event.total_energy),
+                "temperature": _scalar_or_none(event.temperature),
+                "pressure": _scalar_or_none(event.pressure),
+                "pair_count": _scalar_or_none(event.pair_count),
+                "rebuild_count": _scalar_or_none(event.rebuild_count),
+                "constraint_max_error": _scalar_or_none(event.constraint_max_error),
+            }
+        )
+
+    def to_jsonable(self) -> list[dict[str, Any]]:
+        return list(self.events)
+
+
+@dataclass(frozen=True)
+class SimulationCheckpoint:
+    """Serializable boundary for resuming a production MD run."""
+
+    positions: np.ndarray
+    velocities: np.ndarray
+    masses: np.ndarray
+    forces: np.ndarray
+    step: int
+    time: float
+    cell: np.ndarray | None
+    thermostat: dict[str, Any]
+    neighbor_policy: dict[str, Any]
+    force_terms: tuple[str, ...]
+    diagnostic_cursor: int
+    metadata: dict[str, Any]
+
+    def state(self) -> SimulationState:
+        return SimulationState(
+            positions=as_mx_array(self.positions),
+            velocities=as_mx_array(self.velocities),
+            masses=as_mx_array(self.masses),
+            forces=as_mx_array(self.forces),
+            step=self.step,
+            time=self.time,
+        )
+
+
+def _scalar_or_none(value: Any) -> float | int | None:
+    if value is None:
+        return None
+    array = np.asarray(value)
+    if array.shape != ():
+        return None
+    scalar = array.item()
+    if isinstance(scalar, int | np.integer):
+        return int(scalar)
+    return float(scalar)
 
 
 def read_xyz(path: str | Path) -> tuple[tuple[str, ...], np.ndarray, str]:
@@ -156,6 +230,58 @@ def save_npz_trajectory(
     np.savez_compressed(path, **payload)
 
 
+def trajectory_record_from_result(
+    result,
+    *,
+    symbols: list[str] | tuple[str, ...] | None = None,
+    cell: Cell | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> TrajectoryRecord:
+    """Create a native loaded-record view from an in-memory simulation result."""
+
+    return TrajectoryRecord(
+        sampled_positions=np.asarray(result.sampled_positions),
+        sampled_velocities=np.asarray(result.sampled_velocities),
+        sampled_steps=np.asarray(result.sampled_steps),
+        sampled_time=np.asarray(result.sampled_time),
+        diagnostic_steps=np.asarray(
+            getattr(
+                result,
+                "diagnostic_steps",
+                np.arange(len(np.asarray(result.total_energy)), dtype=np.int32),
+            )
+        ),
+        diagnostic_time=np.asarray(
+            getattr(
+                result,
+                "diagnostic_time",
+                np.arange(len(np.asarray(result.total_energy)), dtype=np.float32),
+            )
+        ),
+        potential_energy=np.asarray(result.potential_energy),
+        kinetic_energy=np.asarray(result.kinetic_energy),
+        total_energy=np.asarray(result.total_energy),
+        potential_energy_by_term={
+            name: np.asarray(values)
+            for name, values in getattr(result, "potential_energy_by_term", {}).items()
+        },
+        temperature=np.asarray(result.temperature),
+        pair_count=np.asarray(result.pair_count),
+        rebuild_count=np.asarray(result.rebuild_count),
+        constraint_max_error=np.asarray(
+            getattr(result, "constraint_max_error", np.zeros_like(np.asarray(result.total_energy)))
+        ),
+        symbols=tuple() if symbols is None else tuple(str(item) for item in symbols),
+        cell=None if cell is None else np.asarray(cell.lengths, dtype=np.float32),
+        metadata=dict(metadata or {}),
+        virial_tensor=np.asarray(getattr(result, "virial_tensor", _zero_diagnostic_tensor(result))),
+        pressure_tensor=np.asarray(
+            getattr(result, "pressure_tensor", _zero_diagnostic_tensor(result))
+        ),
+        pressure=np.asarray(getattr(result, "pressure", _zero_diagnostic_scalar(result))),
+    )
+
+
 def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
     """Load a native trajectory record."""
 
@@ -187,6 +313,65 @@ def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
             virial_tensor=_load_diagnostic_tensor(data, "virial_tensor"),
             pressure_tensor=_load_diagnostic_tensor(data, "pressure_tensor"),
             pressure=_load_diagnostic_scalar(data, "pressure"),
+        )
+
+
+def save_simulation_checkpoint(
+    path: str | Path,
+    state: SimulationState,
+    *,
+    cell: Cell | None = None,
+    thermostat: dict[str, Any] | None = None,
+    neighbor_policy: dict[str, Any] | None = None,
+    force_terms: tuple[str, ...] | list[str] | None = None,
+    diagnostic_cursor: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Write a restart checkpoint for a runner-level continuation."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    thermostat_payload = dict(thermostat or {})
+    if "rng_step_offset" not in thermostat_payload:
+        thermostat_payload["rng_step_offset"] = int(state.step)
+    payload = {
+        "positions": np.asarray(state.positions),
+        "velocities": np.asarray(state.velocities),
+        "masses": np.asarray(state.masses),
+        "forces": np.asarray(state.forces),
+        "step": np.asarray([int(state.step)], dtype=np.int64),
+        "time": np.asarray([float(state.time)], dtype=np.float64),
+        "cell": np.asarray([] if cell is None else np.asarray(cell.lengths), dtype=np.float32),
+        "thermostat_json": np.asarray(json.dumps(thermostat_payload)),
+        "neighbor_policy_json": np.asarray(json.dumps(neighbor_policy or {})),
+        "force_terms": np.asarray([] if force_terms is None else list(force_terms), dtype=str),
+        "diagnostic_cursor": np.asarray(
+            [int(state.step if diagnostic_cursor is None else diagnostic_cursor)],
+            dtype=np.int64,
+        ),
+        "metadata_json": np.asarray(json.dumps(metadata or {})),
+    }
+    np.savez_compressed(path, **payload)
+
+
+def load_simulation_checkpoint(path: str | Path) -> SimulationCheckpoint:
+    """Load a restart checkpoint written by `save_simulation_checkpoint`."""
+
+    with np.load(path, allow_pickle=False) as data:
+        cell = np.asarray(data["cell"], dtype=np.float32)
+        return SimulationCheckpoint(
+            positions=np.asarray(data["positions"]),
+            velocities=np.asarray(data["velocities"]),
+            masses=np.asarray(data["masses"]),
+            forces=np.asarray(data["forces"]),
+            step=int(np.asarray(data["step"])[0]),
+            time=float(np.asarray(data["time"])[0]),
+            cell=None if cell.size == 0 else cell,
+            thermostat=json.loads(str(np.asarray(data["thermostat_json"]))),
+            neighbor_policy=json.loads(str(np.asarray(data["neighbor_policy_json"]))),
+            force_terms=tuple(str(item) for item in data["force_terms"].tolist()),
+            diagnostic_cursor=int(np.asarray(data["diagnostic_cursor"])[0]),
+            metadata=json.loads(str(np.asarray(data["metadata_json"]))),
         )
 
 
@@ -259,10 +444,15 @@ def restart_state_from_trajectory(
 
 
 __all__ = [
+    "RuntimeTraceReporter",
+    "SimulationCheckpoint",
     "TrajectoryRecord",
+    "load_simulation_checkpoint",
     "load_npz_trajectory",
     "read_xyz",
     "restart_state_from_trajectory",
     "save_npz_trajectory",
+    "save_simulation_checkpoint",
+    "trajectory_record_from_result",
     "write_xyz",
 ]

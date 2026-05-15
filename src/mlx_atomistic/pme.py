@@ -7,12 +7,12 @@ from math import ceil
 
 import mlx.core as mx
 import numpy as np
-from scipy.special import erfc
 
 from mlx_atomistic.core import Cell
 
-PME_EXECUTION_BACKEND = "numpy_reference"
-PME_PRODUCTION_EXECUTABLE = False
+PME_EXECUTION_BACKEND = "mlx_fft_cic"
+PME_PRODUCTION_EXECUTABLE = True
+PME_PRODUCTION_MAX_ATOMS = 4096
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,13 @@ def pme_readiness_report(
     checks["production_executable_backend"] = PME_PRODUCTION_EXECUTABLE
     if not PME_PRODUCTION_EXECUTABLE:
         blockers.append(
-            "pme_backend_not_production_executable:current_backend=numpy_reference"
+            f"pme_backend_not_production_executable:current_backend={PME_EXECUTION_BACKEND}"
+        )
+    checks["atom_count"] = 0 <= int(atom_count) <= PME_PRODUCTION_MAX_ATOMS
+    if not checks["atom_count"]:
+        blockers.append(
+            "atom_count:outside_pme_runtime_envelope:"
+            f"atom_count={int(atom_count)},max_atoms={PME_PRODUCTION_MAX_ATOMS}"
         )
 
     if config is None:
@@ -157,6 +163,15 @@ def pme_readiness_report(
         "exclusion_count": int(exclusion_count),
         "one_four_count": int(one_four_count),
         "explicit_exception_count": int(explicit_exception_count),
+        "runtime_envelope": {
+            "max_atoms": PME_PRODUCTION_MAX_ATOMS,
+            "cell": "orthorhombic",
+            "assignment": "cloud-in-cell",
+        },
+        "virial": {
+            "status": "finite_difference_cell_strain",
+            "analytic_supported": False,
+        },
         "checks": checks,
         "blockers": tuple(blockers),
     }
@@ -173,7 +188,7 @@ def pme_coulomb_energy_forces(
     """Evaluate neutral orthorhombic Coulomb energy and forces with PME."""
 
     config = PMEConfig() if config is None else config
-    positions_np, charges_np, cell_lengths = _validate_inputs(
+    positions_mx, charges_mx, cell_lengths_mx, cell_lengths_np = _validate_inputs_mx(
         positions,
         charges,
         cell,
@@ -181,20 +196,22 @@ def pme_coulomb_energy_forces(
     )
     real_cutoff = config.real_cutoff
     if real_cutoff is None:
-        real_cutoff = 0.5 * float(np.min(cell_lengths))
+        real_cutoff = 0.5 * float(np.min(cell_lengths_np))
 
-    real_energy, real_forces = _real_space_energy_forces(
-        positions_np,
-        charges_np,
-        cell_lengths,
+    real_energy, real_forces = _real_space_energy_forces_mx(
+        positions_mx,
+        charges_mx,
+        cell_lengths_mx,
+        cell_lengths_np,
         alpha=config.alpha,
         cutoff=real_cutoff,
         coulomb_constant=coulomb_constant,
     )
-    reciprocal_energy, reciprocal_forces, mesh_info = _mesh_reciprocal_energy_forces(
-        positions_np,
-        charges_np,
-        cell_lengths,
+    reciprocal_energy, reciprocal_forces, mesh_info = _mesh_reciprocal_energy_forces_mx(
+        positions_mx,
+        charges_mx,
+        cell_lengths_mx,
+        cell_lengths_np,
         config=config,
         coulomb_constant=coulomb_constant,
     )
@@ -202,29 +219,30 @@ def pme_coulomb_energy_forces(
         -float(coulomb_constant)
         * config.alpha
         / float(np.sqrt(np.pi))
-        * float(np.sum(charges_np * charges_np, dtype=np.float64))
+        * mx.sum(charges_mx * charges_mx)
     )
 
     total_energy = real_energy + reciprocal_energy + self_energy
     forces = real_forces + reciprocal_forces
+    mx.eval(total_energy, forces, real_energy, reciprocal_energy, self_energy)
     diagnostics = PMEDiagnostics(
         mesh_shape=config.mesh_shape,
         assignment_order=config.assignment_order,
         alpha=config.alpha,
         real_cutoff=real_cutoff,
-        net_charge=float(np.sum(charges_np, dtype=np.float64)),
-        volume=float(np.prod(cell_lengths, dtype=np.float64)),
+        net_charge=float(np.asarray(mx.sum(charges_mx))),
+        volume=float(np.prod(cell_lengths_np, dtype=np.float64)),
         charge_grid_sum=mesh_info["charge_grid_sum"],
         reciprocal_modes=int(mesh_info["reciprocal_modes"]),
         max_charge_grid_abs=mesh_info["max_charge_grid_abs"],
     )
     return (
-        mx.array(total_energy, dtype=mx.float32),
-        mx.array(forces.astype(np.float32)),
+        total_energy.astype(mx.float32),
+        forces.astype(mx.float32),
         {
-            "coulomb_real": mx.array(real_energy, dtype=mx.float32),
-            "coulomb_reciprocal": mx.array(reciprocal_energy, dtype=mx.float32),
-            "coulomb_self": mx.array(self_energy, dtype=mx.float32),
+            "coulomb_real": real_energy.astype(mx.float32),
+            "coulomb_reciprocal": reciprocal_energy.astype(mx.float32),
+            "coulomb_self": self_energy.astype(mx.float32),
             "diagnostics": diagnostics,
         },
     )
@@ -238,56 +256,57 @@ def assign_charges_cic(
 ) -> mx.array:
     """Assign charges to a periodic mesh with cloud-in-cell weights."""
 
-    positions_np, charges_np, cell_lengths = _validate_inputs(
+    positions_mx, charges_mx, cell_lengths_mx, _ = _validate_inputs_mx(
         positions,
         charges,
         cell,
         charge_tolerance=np.inf,
     )
     mesh_shape = _validate_mesh_shape(mesh_shape)
-    grid = _assign_charges_cic_np(positions_np, charges_np, cell_lengths, mesh_shape)
-    return mx.array(grid.astype(np.float32))
+    return _assign_charges_cic_mx(positions_mx, charges_mx, cell_lengths_mx, mesh_shape)
 
 
-def _validate_inputs(
+def _validate_inputs_mx(
     positions: mx.array,
     charges: mx.array,
     cell: Cell,
     *,
     charge_tolerance: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[mx.array, mx.array, mx.array, np.ndarray]:
     if not isinstance(cell, Cell):
         msg = "PME requires an orthorhombic Cell"
         raise ValueError(msg)
-    positions_np = np.asarray(positions, dtype=np.float64)
-    charges_np = np.asarray(charges, dtype=np.float64)
-    if positions_np.ndim != 2 or positions_np.shape[1] != 3:
+    positions_mx = mx.array(positions, dtype=mx.float32)
+    charges_mx = mx.array(charges, dtype=mx.float32)
+    if positions_mx.ndim != 2 or positions_mx.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
         raise ValueError(msg)
-    if charges_np.shape != (positions_np.shape[0],):
+    if charges_mx.shape != (positions_mx.shape[0],):
         msg = "charges must have shape (n_atoms,)"
         raise ValueError(msg)
-    if not np.all(np.isfinite(positions_np)):
+    if not bool(np.asarray(mx.all(mx.isfinite(positions_mx)))):
         msg = "positions must be finite"
         raise ValueError(msg)
-    if not np.all(np.isfinite(charges_np)):
+    if not bool(np.asarray(mx.all(mx.isfinite(charges_mx)))):
         msg = "charges must be finite"
         raise ValueError(msg)
-    cell_lengths = np.asarray(cell.lengths, dtype=np.float64)
-    if cell_lengths.shape != (3,) or not np.all(np.isfinite(cell_lengths)):
+    cell_lengths_mx = mx.array(cell.lengths, dtype=mx.float32)
+    cell_lengths_np = np.asarray(cell_lengths_mx, dtype=np.float64)
+    if cell_lengths_np.shape != (3,) or not np.all(np.isfinite(cell_lengths_np)):
         msg = "PME requires finite orthorhombic cell lengths with shape (3,)"
         raise ValueError(msg)
-    if np.any(cell_lengths <= 0.0):
+    if np.any(cell_lengths_np <= 0.0):
         msg = "PME requires positive orthorhombic cell lengths"
         raise ValueError(msg)
-    net_charge = float(np.sum(charges_np, dtype=np.float64))
+    net_charge = float(np.asarray(mx.sum(charges_mx)))
     if abs(net_charge) > charge_tolerance:
         msg = (
             "PME requires a neutral system; non-neutral background policy is not "
             f"implemented: net_charge={net_charge:g}"
         )
         raise ValueError(msg)
-    return np.mod(positions_np, cell_lengths), charges_np, cell_lengths
+    wrapped_positions = positions_mx - mx.floor(positions_mx / cell_lengths_mx) * cell_lengths_mx
+    return wrapped_positions, charges_mx, cell_lengths_mx, cell_lengths_np
 
 
 def _validate_mesh_shape(mesh_shape: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -299,39 +318,6 @@ def _validate_mesh_shape(mesh_shape: tuple[int, int, int]) -> tuple[int, int, in
         raise ValueError(msg)
     normalized = tuple(int(size) for size in mesh_shape)
     return normalized
-
-
-def _real_space_energy_forces(
-    positions: np.ndarray,
-    charges: np.ndarray,
-    cell_lengths: np.ndarray,
-    *,
-    alpha: float,
-    cutoff: float,
-    coulomb_constant: float,
-) -> tuple[float, np.ndarray]:
-    shifts = _real_space_shifts(cell_lengths, cutoff)
-    displacement = positions[:, None, None, :] - positions[None, :, None, :] + shifts
-    r2 = np.sum(displacement * displacement, axis=-1)
-    distance = np.sqrt(np.where(r2 > 0.0, r2, 1.0))
-    zero_shift = np.sum(shifts * shifts, axis=-1) == 0.0
-    atom_index = np.arange(positions.shape[0])
-    self_image = (atom_index[:, None, None] == atom_index[None, :, None]) & zero_shift
-    pair_mask = (r2 > 0.0) & (distance < cutoff) & ~self_image
-    qij = charges[:, None, None] * charges[None, :, None]
-    erfc_term = erfc(alpha * distance)
-    pair_energy = float(coulomb_constant) * qij * erfc_term / distance
-    pair_energy = np.where(pair_mask, pair_energy, 0.0)
-
-    safe_r2 = np.where(pair_mask, r2, 1.0)
-    safe_distance = np.sqrt(safe_r2)
-    scalar = float(coulomb_constant) * qij * (
-        erfc_term / (safe_r2 * safe_distance)
-        + (2.0 * alpha / float(np.sqrt(np.pi))) * np.exp(-(alpha * alpha) * safe_r2) / safe_r2
-    )
-    scalar = np.where(pair_mask, scalar, 0.0)
-    forces = np.sum(scalar[:, :, :, None] * displacement, axis=(1, 2))
-    return 0.5 * float(np.sum(pair_energy, dtype=np.float64)), forces
 
 
 def _real_space_shifts(cell_lengths: np.ndarray, cutoff: float) -> np.ndarray:
@@ -357,18 +343,60 @@ def _real_space_shifts(cell_lengths: np.ndarray, cutoff: float) -> np.ndarray:
     )
 
 
-def _mesh_reciprocal_energy_forces(
-    positions: np.ndarray,
-    charges: np.ndarray,
-    cell_lengths: np.ndarray,
+def _real_space_energy_forces_mx(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
+    cell_lengths_np: np.ndarray,
+    *,
+    alpha: float,
+    cutoff: float,
+    coulomb_constant: float,
+) -> tuple[mx.array, mx.array]:
+    shifts = _real_space_shifts(cell_lengths_np, cutoff)
+    n_atoms = int(positions.shape[0])
+    atom_index = mx.arange(n_atoms)
+    cutoff2 = float(cutoff) * float(cutoff)
+    total_energy = mx.array(0.0, dtype=mx.float32)
+    forces = mx.zeros_like(positions)
+    qij = charges[:, None] * charges[None, :]
+    for shift in shifts:
+        shift_value = mx.array(shift, dtype=mx.float32)
+        displacement = positions[:, None, :] - positions[None, :, :] + shift_value
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = (r2 > 0.0) & (r2 < cutoff2)
+        if bool(np.sum(shift * shift) == 0.0):
+            pair_mask = pair_mask & (atom_index[:, None] != atom_index[None, :])
+        safe_r2 = mx.where(pair_mask, r2, 1.0)
+        distance = mx.sqrt(safe_r2)
+        erfc_term = 1.0 - mx.erf(float(alpha) * distance)
+        pair_energy = float(coulomb_constant) * qij * erfc_term / distance
+        pair_energy = mx.where(pair_mask, pair_energy, 0.0)
+        scalar = float(coulomb_constant) * qij * (
+            erfc_term / (safe_r2 * distance)
+            + (2.0 * float(alpha) / float(np.sqrt(np.pi)))
+            * mx.exp(-(float(alpha) * float(alpha)) * safe_r2)
+            / safe_r2
+        )
+        scalar = mx.where(pair_mask, scalar, 0.0)
+        forces = forces + mx.sum(scalar[:, :, None] * displacement, axis=1)
+        total_energy = total_energy + 0.5 * mx.sum(pair_energy)
+    return total_energy, forces
+
+
+def _mesh_reciprocal_energy_forces_mx(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
+    cell_lengths_np: np.ndarray,
     *,
     config: PMEConfig,
     coulomb_constant: float,
-) -> tuple[float, np.ndarray, dict[str, float | int]]:
-    charge_grid = _assign_charges_cic_np(positions, charges, cell_lengths, config.mesh_shape)
-    rho_hat = np.fft.fftn(charge_grid)
-    influence, k_components, mode_count = _influence_function(
-        cell_lengths,
+) -> tuple[mx.array, mx.array, dict[str, float | int]]:
+    charge_grid = _assign_charges_cic_mx(positions, charges, cell_lengths, config.mesh_shape)
+    rho_hat = mx.fft.fftn(charge_grid)
+    influence, k_components, mode_count = _influence_function_mx(
+        cell_lengths_np,
         config.mesh_shape,
         alpha=config.alpha,
         coulomb_constant=coulomb_constant,
@@ -376,115 +404,129 @@ def _mesh_reciprocal_energy_forces(
     )
     phi_hat = influence * rho_hat
     grid_size = int(np.prod(config.mesh_shape))
-    potential_grid = np.fft.ifftn(phi_hat).real * grid_size
+    potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
     field_grids = [
-        np.fft.ifftn((-1j * k_axis) * phi_hat).real * grid_size
+        mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
         for k_axis in k_components
     ]
-    field_grid = np.stack(field_grids, axis=-1)
-    potential_at_atoms = _interpolate_cic_np(positions, potential_grid, cell_lengths)
-    field_at_atoms = _interpolate_cic_np(positions, field_grid, cell_lengths)
-    energy = 0.5 * float(np.sum(charges * potential_at_atoms, dtype=np.float64))
+    field_grid = mx.stack(field_grids, axis=-1)
+    potential_at_atoms = _interpolate_cic_mx(positions, potential_grid, cell_lengths)
+    field_at_atoms = _interpolate_cic_mx(positions, field_grid, cell_lengths)
+    energy = 0.5 * mx.sum(charges * potential_at_atoms)
     forces = charges[:, None] * field_at_atoms
+    mx.eval(energy, forces, charge_grid)
     return energy, forces, {
-        "charge_grid_sum": float(np.sum(charge_grid, dtype=np.float64)),
-        "max_charge_grid_abs": float(np.max(np.abs(charge_grid))) if charge_grid.size else 0.0,
+        "charge_grid_sum": float(np.asarray(mx.sum(charge_grid))),
+        "max_charge_grid_abs": float(np.asarray(mx.max(mx.abs(charge_grid))))
+        if int(np.prod(config.mesh_shape)) > 0
+        else 0.0,
         "reciprocal_modes": mode_count,
     }
 
 
-def _influence_function(
+def _influence_function_mx(
     cell_lengths: np.ndarray,
     mesh_shape: tuple[int, int, int],
     *,
     alpha: float,
     coulomb_constant: float,
     deconvolve_assignment: bool,
-) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray, np.ndarray], int]:
+) -> tuple[mx.array, tuple[mx.array, mx.array, mx.array], int]:
     k_components = []
-    window = np.ones(mesh_shape, dtype=np.float64)
+    window = mx.ones(mesh_shape, dtype=mx.float32)
     for axis, (length, size) in enumerate(zip(cell_lengths, mesh_shape, strict=True)):
-        frequencies = np.fft.fftfreq(size, d=float(length) / size)
-        k_axis = 2.0 * np.pi * frequencies
+        frequencies = mx.fft.fftfreq(size, d=float(length) / float(size))
+        k_axis = 2.0 * float(np.pi) * frequencies
         shape = [1, 1, 1]
-        shape[axis] = size
-        k_grid = k_axis.reshape(shape)
-        k_components.append(np.broadcast_to(k_grid, mesh_shape))
+        shape[axis] = int(size)
+        k_grid = mx.reshape(k_axis, tuple(shape))
+        k_components.append(mx.broadcast_to(k_grid, mesh_shape))
         if deconvolve_assignment:
-            window_axis = np.sinc(k_axis * float(length) / (2.0 * np.pi * size)) ** 2
-            window *= np.broadcast_to(window_axis.reshape(shape), mesh_shape)
+            window_axis = _sinc_mx(
+                k_axis * float(length) / (2.0 * float(np.pi) * float(size))
+            ) ** 2
+            window = window * mx.broadcast_to(mx.reshape(window_axis, tuple(shape)), mesh_shape)
 
     kx, ky, kz = k_components
     k2 = kx * kx + ky * ky + kz * kz
     mask = k2 > 0.0
-    volume = float(np.prod(cell_lengths, dtype=np.float64))
-    influence = np.zeros(mesh_shape, dtype=np.float64)
-    denominator = k2.copy()
+    denominator = k2
     if deconvolve_assignment:
-        denominator = denominator * np.maximum(window * window, 1e-12)
-    influence[mask] = (
+        denominator = denominator * mx.maximum(window * window, mx.array(1e-12))
+    safe_denominator = mx.where(mask, denominator, 1.0)
+    volume = float(np.prod(cell_lengths, dtype=np.float64))
+    influence = (
         float(coulomb_constant)
         * 4.0
-        * np.pi
+        * float(np.pi)
         / volume
-        * np.exp(-k2[mask] / (4.0 * alpha * alpha))
-        / denominator[mask]
+        * mx.exp(-k2 / (4.0 * float(alpha) * float(alpha)))
+        / safe_denominator
     )
-    return influence, (kx, ky, kz), int(np.count_nonzero(mask))
+    influence = mx.where(mask, influence, 0.0)
+    return influence, (kx, ky, kz), int(np.prod(mesh_shape) - 1)
 
 
-def _assign_charges_cic_np(
-    positions: np.ndarray,
-    charges: np.ndarray,
-    cell_lengths: np.ndarray,
+def _sinc_mx(values: mx.array) -> mx.array:
+    argument = float(np.pi) * values
+    near_zero = mx.abs(argument) < 1e-7
+    safe_argument = mx.where(near_zero, 1.0, argument)
+    return mx.where(near_zero, 1.0, mx.sin(argument) / safe_argument)
+
+
+def _assign_charges_cic_mx(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
     mesh_shape: tuple[int, int, int],
-) -> np.ndarray:
-    grid = np.zeros(mesh_shape, dtype=np.float64)
-    scaled = np.mod(positions, cell_lengths) / cell_lengths * np.asarray(mesh_shape)
-    base = np.floor(scaled).astype(np.int64)
-    fraction = scaled - base
-    for atom_index, charge in enumerate(charges):
-        for dx in (0, 1):
-            wx = (1.0 - fraction[atom_index, 0]) if dx == 0 else fraction[atom_index, 0]
-            ix = (base[atom_index, 0] + dx) % mesh_shape[0]
-            for dy in (0, 1):
-                wy = (1.0 - fraction[atom_index, 1]) if dy == 0 else fraction[atom_index, 1]
-                iy = (base[atom_index, 1] + dy) % mesh_shape[1]
-                for dz in (0, 1):
-                    wz = (
-                        (1.0 - fraction[atom_index, 2])
-                        if dz == 0
-                        else fraction[atom_index, 2]
-                    )
-                    iz = (base[atom_index, 2] + dz) % mesh_shape[2]
-                    grid[ix, iy, iz] += charge * wx * wy * wz
-    return grid
+) -> mx.array:
+    mesh = mx.array(mesh_shape, dtype=mx.float32)
+    scaled = (positions - mx.floor(positions / cell_lengths) * cell_lengths) / cell_lengths * mesh
+    base = mx.floor(scaled).astype(mx.int32)
+    fraction = scaled - base.astype(mx.float32)
+    nx, ny, nz = mesh_shape
+    grid = mx.zeros((nx * ny * nz,), dtype=mx.float32)
+    for dx in (0, 1):
+        wx = (1.0 - fraction[:, 0]) if dx == 0 else fraction[:, 0]
+        ix = (base[:, 0] + dx) % nx
+        for dy in (0, 1):
+            wy = (1.0 - fraction[:, 1]) if dy == 0 else fraction[:, 1]
+            iy = (base[:, 1] + dy) % ny
+            for dz in (0, 1):
+                wz = (1.0 - fraction[:, 2]) if dz == 0 else fraction[:, 2]
+                iz = (base[:, 2] + dz) % nz
+                flat_index = (ix * ny + iy) * nz + iz
+                grid = grid.at[flat_index].add(charges * wx * wy * wz)
+    return mx.reshape(grid, mesh_shape)
 
 
-def _interpolate_cic_np(
-    positions: np.ndarray,
-    grid: np.ndarray,
-    cell_lengths: np.ndarray,
-) -> np.ndarray:
+def _interpolate_cic_mx(
+    positions: mx.array,
+    grid: mx.array,
+    cell_lengths: mx.array,
+) -> mx.array:
     mesh_shape = grid.shape[:3]
     trailing_shape = grid.shape[3:]
-    values = np.zeros((positions.shape[0], *trailing_shape), dtype=np.float64)
-    scaled = np.mod(positions, cell_lengths) / cell_lengths * np.asarray(mesh_shape)
-    base = np.floor(scaled).astype(np.int64)
-    fraction = scaled - base
-    for atom_index in range(positions.shape[0]):
-        for dx in (0, 1):
-            wx = (1.0 - fraction[atom_index, 0]) if dx == 0 else fraction[atom_index, 0]
-            ix = (base[atom_index, 0] + dx) % mesh_shape[0]
-            for dy in (0, 1):
-                wy = (1.0 - fraction[atom_index, 1]) if dy == 0 else fraction[atom_index, 1]
-                iy = (base[atom_index, 1] + dy) % mesh_shape[1]
-                for dz in (0, 1):
-                    wz = (
-                        (1.0 - fraction[atom_index, 2])
-                        if dz == 0
-                        else fraction[atom_index, 2]
-                    )
-                    iz = (base[atom_index, 2] + dz) % mesh_shape[2]
-                    values[atom_index] += wx * wy * wz * grid[ix, iy, iz]
+    n_atoms = int(positions.shape[0])
+    mesh = mx.array(mesh_shape, dtype=mx.float32)
+    scaled = (positions - mx.floor(positions / cell_lengths) * cell_lengths) / cell_lengths * mesh
+    base = mx.floor(scaled).astype(mx.int32)
+    fraction = scaled - base.astype(mx.float32)
+    values = mx.zeros((n_atoms, *trailing_shape), dtype=grid.dtype)
+    nx, ny, nz = mesh_shape
+    for dx in (0, 1):
+        wx = (1.0 - fraction[:, 0]) if dx == 0 else fraction[:, 0]
+        ix = (base[:, 0] + dx) % nx
+        for dy in (0, 1):
+            wy = (1.0 - fraction[:, 1]) if dy == 0 else fraction[:, 1]
+            iy = (base[:, 1] + dy) % ny
+            for dz in (0, 1):
+                wz = (1.0 - fraction[:, 2]) if dz == 0 else fraction[:, 2]
+                iz = (base[:, 2] + dz) % nz
+                weight = wx * wy * wz
+                corner_values = grid[ix, iy, iz]
+                if trailing_shape:
+                    weight = mx.reshape(weight, (n_atoms, *([1] * len(trailing_shape))))
+                values = values + weight * corner_values
     return values
+

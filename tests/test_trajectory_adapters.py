@@ -69,6 +69,29 @@ def test_mdanalysis_missing_dependency_error(monkeypatch: pytest.MonkeyPatch):
         load_mdanalysis_universe("missing.pdb")
 
 
+def test_mdtraj_writer_missing_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    from mlx_atomistic.trajectory_adapters import (
+        OptionalTrajectoryDependencyError,
+        write_mdtraj_trajectory,
+    )
+
+    topology = tmp_path / "tiny.pdb"
+    _tiny_pdb(topology)
+    original_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "mdtraj":
+            raise ImportError("blocked for test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    with pytest.raises(OptionalTrajectoryDependencyError, match="uv sync --extra viz"):
+        write_mdtraj_trajectory(topology, _tiny_record(), tmp_path / "tiny.dcd")
+
+
 def test_trajectory_record_to_mdanalysis_preserves_shape(tmp_path: Path):
     pytest.importorskip("MDAnalysis")
     from mlx_atomistic.trajectory_adapters import trajectory_record_to_mdanalysis
@@ -93,3 +116,21 @@ def test_trajectory_record_to_mdtraj_converts_angstrom_to_nm(tmp_path: Path):
     assert trajectory.n_atoms == 2
     assert trajectory.n_frames == 2
     np.testing.assert_allclose(trajectory.xyz[1, 1], [0.12, 0.0, 0.0])
+
+
+def test_write_mdtraj_trajectory_writes_dcd_and_xtc(tmp_path: Path):
+    md = pytest.importorskip("mdtraj")
+    from mlx_atomistic.trajectory_adapters import write_mdtraj_trajectory
+
+    topology = tmp_path / "tiny.pdb"
+    _tiny_pdb(topology)
+    dcd_path = write_mdtraj_trajectory(topology, _tiny_record(), tmp_path / "tiny.dcd")
+    xtc_path = write_mdtraj_trajectory(topology, _tiny_record(), tmp_path / "tiny.xtc")
+
+    dcd = md.load(str(dcd_path), top=str(topology))
+    xtc = md.load(str(xtc_path), top=str(topology))
+
+    assert dcd.n_atoms == 2
+    assert dcd.n_frames == 2
+    assert xtc.n_atoms == 2
+    assert xtc.n_frames == 2

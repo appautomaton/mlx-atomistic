@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Protocol
 
 import mlx.core as mx
+import numpy as np
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
@@ -265,6 +266,8 @@ class SimulationConfig:
     diagnostic_interval: int = 1
     compile_force_evaluator: bool = False
     pressure_diagnostics: bool = True
+    initial_step: int = 0
+    initial_time: float = 0.0
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -291,6 +294,12 @@ class SimulationConfig:
         if self.diagnostic_interval <= 0:
             msg = "diagnostic_interval must be positive"
             raise ValueError(msg)
+        if self.initial_step < 0:
+            msg = "initial_step must be non-negative"
+            raise ValueError(msg)
+        if self.initial_time < 0.0:
+            msg = "initial_time must be non-negative"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -303,6 +312,35 @@ class SimulationState:
     forces: mx.array
     step: int = 0
     time: float = 0.0
+
+
+@dataclass(frozen=True)
+class ReporterEvent:
+    """State exposed to runtime reporter callbacks."""
+
+    ensemble: str
+    event_type: str
+    step: int
+    time: float
+    state: SimulationState
+    potential_energy: mx.array | None = None
+    kinetic_energy: mx.array | None = None
+    total_energy: mx.array | None = None
+    temperature: mx.array | None = None
+    energy_by_term: dict[str, mx.array] = field(default_factory=dict)
+    virial_tensor: mx.array | None = None
+    pressure_tensor: mx.array | None = None
+    pressure: mx.array | None = None
+    pair_count: int | mx.array | None = None
+    rebuild_count: int | mx.array | None = None
+    constraint_max_error: mx.array | None = None
+
+
+class RuntimeReporter(Protocol):
+    """Callable observer for sampled frames and diagnostic state."""
+
+    def __call__(self, event: ReporterEvent) -> None:
+        """Observe one runtime event."""
 
 
 @dataclass(frozen=True)
@@ -356,6 +394,7 @@ class LangevinThermostat:
     temperature: float = 1.0
     friction: float = 1.0
     seed: int | None = None
+    rng_step_offset: int | None = None
 
     def __post_init__(self) -> None:
         if self.temperature < 0.0:
@@ -363,6 +402,9 @@ class LangevinThermostat:
             raise ValueError(msg)
         if self.friction < 0.0:
             msg = "friction must be non-negative"
+            raise ValueError(msg)
+        if self.rng_step_offset is not None and self.rng_step_offset < 0:
+            msg = "rng_step_offset must be non-negative when provided"
             raise ValueError(msg)
 
 
@@ -396,6 +438,48 @@ class NVTResult:
         """Instantaneous temperature minus the target thermostat temperature."""
 
         return self.temperature - self.target_temperature
+
+
+@dataclass(frozen=True)
+class MonteCarloBarostat:
+    """Minimal isotropic Monte Carlo barostat for orthorhombic cells."""
+
+    pressure: float = 1.0
+    temperature: float = 1.0
+    interval: int = 25
+    max_log_volume_scale: float = 0.02
+    seed: int | None = 11
+
+    def __post_init__(self) -> None:
+        if self.pressure < 0.0:
+            msg = "pressure must be non-negative"
+            raise ValueError(msg)
+        if self.temperature <= 0.0:
+            msg = "temperature must be positive"
+            raise ValueError(msg)
+        if self.interval <= 0:
+            msg = "barostat interval must be positive"
+            raise ValueError(msg)
+        if self.max_log_volume_scale <= 0.0:
+            msg = "max_log_volume_scale must be positive"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class NPTResult:
+    """NPT production result with delegated NVT trajectory fields."""
+
+    production: NVTResult
+    final_state: SimulationState
+    final_cell: Cell
+    cell_lengths: mx.array
+    volume: mx.array
+    target_pressure: float
+    barostat_attempts: int
+    barostat_accepted: int
+
+    def __getattr__(self, name: str):
+        return getattr(self.production, name)
 
 
 def kinetic_energy(
@@ -948,8 +1032,26 @@ def _eval_runtime_state(
     )
 
 
-def _is_diagnostic_step(step: int, config: SimulationConfig) -> bool:
-    return step % config.diagnostic_interval == 0 or step == config.steps
+def _is_diagnostic_step(step: int, config: SimulationConfig, *, final: bool = False) -> bool:
+    return step % config.diagnostic_interval == 0 or final
+
+
+def _normalize_reporters(
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None,
+) -> tuple[RuntimeReporter, ...]:
+    if reporters is None:
+        return ()
+    if isinstance(reporters, (list, tuple)):
+        return tuple(reporters)
+    return (reporters,)
+
+
+def _notify_reporters(
+    reporters: tuple[RuntimeReporter, ...],
+    event: ReporterEvent,
+) -> None:
+    for reporter in reporters:
+        reporter(event)
 
 
 def _zero_constraint_error(positions: mx.array) -> mx.array:
@@ -966,6 +1068,12 @@ def _local_prng_key(seed: int | None) -> mx.array:
     if seed is None:
         seed = int.from_bytes(os.urandom(4), "little")
     return mx.random.key(seed)
+
+
+def _advance_prng_key(key: mx.array, steps: int) -> mx.array:
+    for _ in range(int(steps)):
+        key = mx.random.split(key, 2)[0]
+    return key
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1190,7 @@ def simulate_nve(
     neighbor_manager: NeighborListManager | None = None,
     config: SimulationConfig | None = None,
     constraints: DistanceConstraints | None = None,
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> NVEResult:
     """Run NVE molecular dynamics with sparse trajectory and configurable diagnostics.
 
@@ -1091,6 +1200,7 @@ def simulate_nve(
 
     if config is None:
         config = SimulationConfig()
+    reporters_tuple = _normalize_reporters(reporters)
     if force_terms is None:
         force_terms = LennardJonesPotential()
     terms = _named_force_terms(force_terms)
@@ -1135,15 +1245,17 @@ def simulate_nve(
         velocities=velocities,
         masses=masses,
         forces=forces,
+        step=config.initial_step,
+        time=config.initial_time,
     )
 
     _materialize_sampled_state(state)
     sampled_positions = [state.positions]
     sampled_velocities = [state.velocities]
-    sampled_steps = [0]
-    sampled_times = [0.0]
-    diagnostic_steps = [0]
-    diagnostic_times = [0.0]
+    sampled_steps = [config.initial_step]
+    sampled_times = [config.initial_time]
+    diagnostic_steps = [config.initial_step]
+    diagnostic_times = [config.initial_time]
     potential_energies = [potential_energy]
     potential_energy_by_term = {name: [energy] for name, energy in energy_by_term.items()}
     kinetic_energies = [
@@ -1179,8 +1291,41 @@ def simulate_nve(
     pair_counts = [pair_count]
     rebuild_counts = [rebuild_count]
     constraint_errors = [constraint_error]
+    _notify_reporters(
+        reporters_tuple,
+        ReporterEvent(
+            ensemble="nve",
+            event_type="sample",
+            step=config.initial_step,
+            time=config.initial_time,
+            state=state,
+        ),
+    )
+    _notify_reporters(
+        reporters_tuple,
+        ReporterEvent(
+            ensemble="nve",
+            event_type="diagnostic",
+            step=config.initial_step,
+            time=config.initial_time,
+            state=state,
+            potential_energy=potential_energy,
+            kinetic_energy=kinetic_energies[-1],
+            total_energy=potential_energy + kinetic_energies[-1],
+            temperature=temperatures[-1],
+            energy_by_term=energy_by_term,
+            virial_tensor=virial,
+            pressure_tensor=pressure_tensor_value,
+            pressure=pressure_value,
+            pair_count=pair_count,
+            rebuild_count=rebuild_count,
+            constraint_max_error=constraint_error,
+        ),
+    )
 
-    for step in range(1, config.steps + 1):
+    for local_step in range(1, config.steps + 1):
+        current_step = config.initial_step + local_step
+        current_time = config.initial_time + local_step * config.dt
         acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         velocities_half = state.velocities + 0.5 * config.dt * acceleration
         next_positions = state.positions + config.dt * velocities_half
@@ -1203,7 +1348,11 @@ def simulate_nve(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        diagnostic_step = _is_diagnostic_step(step, config)
+        diagnostic_step = _is_diagnostic_step(
+            current_step,
+            config,
+            final=local_step == config.steps,
+        )
         force_start = perf_counter()
         if neighbor_manager is None and diagnostic_step:
             potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
@@ -1240,18 +1389,28 @@ def simulate_nve(
             velocities=next_velocities,
             masses=masses,
             forces=next_forces,
-            step=step,
-            time=step * config.dt,
+            step=current_step,
+            time=current_time,
         )
 
-        if step % config.sample_interval == 0 or step == config.steps:
+        if current_step % config.sample_interval == 0 or local_step == config.steps:
             _materialize_sampled_state(state)
             sampled_positions.append(state.positions)
             sampled_velocities.append(state.velocities)
-            sampled_steps.append(step)
+            sampled_steps.append(current_step)
             sampled_times.append(state.time)
+            _notify_reporters(
+                reporters_tuple,
+                ReporterEvent(
+                    ensemble="nve",
+                    event_type="sample",
+                    step=current_step,
+                    time=state.time,
+                    state=state,
+                ),
+            )
         if diagnostic_step:
-            diagnostic_steps.append(step)
+            diagnostic_steps.append(current_step)
             diagnostic_times.append(state.time)
             potential_energies.append(potential_energy)
             if energy_by_term is not None:
@@ -1290,7 +1449,28 @@ def simulate_nve(
             pair_counts.append(pair_count)
             rebuild_counts.append(rebuild_count)
             constraint_errors.append(constraint_error)
-        if step % config.evaluation_interval == 0 or step == config.steps:
+            _notify_reporters(
+                reporters_tuple,
+                ReporterEvent(
+                    ensemble="nve",
+                    event_type="diagnostic",
+                    step=current_step,
+                    time=state.time,
+                    state=state,
+                    potential_energy=potential_energy,
+                    kinetic_energy=kinetic_energies[-1],
+                    total_energy=potential_energy + kinetic_energies[-1],
+                    temperature=temperatures[-1],
+                    energy_by_term={} if energy_by_term is None else energy_by_term,
+                    virial_tensor=virial,
+                    pressure_tensor=pressure_tensor_value,
+                    pressure=pressure_value,
+                    pair_count=pair_count,
+                    rebuild_count=rebuild_count,
+                    constraint_max_error=constraint_error,
+                ),
+            )
+        if current_step % config.evaluation_interval == 0 or local_step == config.steps:
             if diagnostic_step and energy_by_term is not None:
                 _eval_step_state(
                     state,
@@ -1349,11 +1529,13 @@ def simulate_nvt(
     config: SimulationConfig | None = None,
     thermostat: LangevinThermostat | None = None,
     constraints: DistanceConstraints | None = None,
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> NVTResult:
     """Run Langevin NVT molecular dynamics with BAOAB integration."""
 
     if config is None:
         config = SimulationConfig()
+    reporters_tuple = _normalize_reporters(reporters)
     if thermostat is None:
         thermostat = LangevinThermostat()
     if force_terms is None:
@@ -1400,15 +1582,17 @@ def simulate_nvt(
         velocities=velocities,
         masses=masses,
         forces=forces,
+        step=config.initial_step,
+        time=config.initial_time,
     )
 
     _materialize_sampled_state(state)
     sampled_positions = [state.positions]
     sampled_velocities = [state.velocities]
-    sampled_steps = [0]
-    sampled_times = [0.0]
-    diagnostic_steps = [0]
-    diagnostic_times = [0.0]
+    sampled_steps = [config.initial_step]
+    sampled_times = [config.initial_time]
+    diagnostic_steps = [config.initial_step]
+    diagnostic_times = [config.initial_time]
     potential_energies = [potential_energy]
     potential_energy_by_term = {name: [energy] for name, energy in energy_by_term.items()}
     kinetic_energies = [
@@ -1444,8 +1628,45 @@ def simulate_nvt(
     pair_counts = [pair_count]
     rebuild_counts = [rebuild_count]
     constraint_errors = [constraint_error]
+    _notify_reporters(
+        reporters_tuple,
+        ReporterEvent(
+            ensemble="nvt",
+            event_type="sample",
+            step=config.initial_step,
+            time=config.initial_time,
+            state=state,
+        ),
+    )
+    _notify_reporters(
+        reporters_tuple,
+        ReporterEvent(
+            ensemble="nvt",
+            event_type="diagnostic",
+            step=config.initial_step,
+            time=config.initial_time,
+            state=state,
+            potential_energy=potential_energy,
+            kinetic_energy=kinetic_energies[-1],
+            total_energy=potential_energy + kinetic_energies[-1],
+            temperature=temperatures[-1],
+            energy_by_term=energy_by_term,
+            virial_tensor=virial,
+            pressure_tensor=pressure_tensor_value,
+            pressure=pressure_value,
+            pair_count=pair_count,
+            rebuild_count=rebuild_count,
+            constraint_max_error=constraint_error,
+        ),
+    )
 
     key = _local_prng_key(thermostat.seed)
+    rng_step_offset = (
+        config.initial_step
+        if thermostat.rng_step_offset is None
+        else thermostat.rng_step_offset
+    )
+    key = _advance_prng_key(key, rng_step_offset)
     velocity_decay = exp(-thermostat.friction * config.dt)
     noise_scale = sqrt(
         (1.0 - velocity_decay * velocity_decay)
@@ -1454,7 +1675,9 @@ def simulate_nvt(
         / config.kinetic_energy_scale
     )
 
-    for step in range(1, config.steps + 1):
+    for local_step in range(1, config.steps + 1):
+        current_step = config.initial_step + local_step
+        current_time = config.initial_time + local_step * config.dt
         acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         velocities_half = state.velocities + 0.5 * config.dt * acceleration
         next_positions = state.positions + 0.5 * config.dt * velocities_half
@@ -1487,7 +1710,11 @@ def simulate_nvt(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        diagnostic_step = _is_diagnostic_step(step, config)
+        diagnostic_step = _is_diagnostic_step(
+            current_step,
+            config,
+            final=local_step == config.steps,
+        )
         force_start = perf_counter()
         if neighbor_manager is None and diagnostic_step:
             potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
@@ -1524,18 +1751,28 @@ def simulate_nvt(
             velocities=next_velocities,
             masses=masses,
             forces=next_forces,
-            step=step,
-            time=step * config.dt,
+            step=current_step,
+            time=current_time,
         )
 
-        if step % config.sample_interval == 0 or step == config.steps:
+        if current_step % config.sample_interval == 0 or local_step == config.steps:
             _materialize_sampled_state(state)
             sampled_positions.append(state.positions)
             sampled_velocities.append(state.velocities)
-            sampled_steps.append(step)
+            sampled_steps.append(current_step)
             sampled_times.append(state.time)
+            _notify_reporters(
+                reporters_tuple,
+                ReporterEvent(
+                    ensemble="nvt",
+                    event_type="sample",
+                    step=current_step,
+                    time=state.time,
+                    state=state,
+                ),
+            )
         if diagnostic_step:
-            diagnostic_steps.append(step)
+            diagnostic_steps.append(current_step)
             diagnostic_times.append(state.time)
             potential_energies.append(potential_energy)
             if energy_by_term is not None:
@@ -1574,7 +1811,28 @@ def simulate_nvt(
             pair_counts.append(pair_count)
             rebuild_counts.append(rebuild_count)
             constraint_errors.append(constraint_error)
-        if step % config.evaluation_interval == 0 or step == config.steps:
+            _notify_reporters(
+                reporters_tuple,
+                ReporterEvent(
+                    ensemble="nvt",
+                    event_type="diagnostic",
+                    step=current_step,
+                    time=state.time,
+                    state=state,
+                    potential_energy=potential_energy,
+                    kinetic_energy=kinetic_energies[-1],
+                    total_energy=potential_energy + kinetic_energies[-1],
+                    temperature=temperatures[-1],
+                    energy_by_term={} if energy_by_term is None else energy_by_term,
+                    virial_tensor=virial,
+                    pressure_tensor=pressure_tensor_value,
+                    pressure=pressure_value,
+                    pair_count=pair_count,
+                    rebuild_count=rebuild_count,
+                    constraint_max_error=constraint_error,
+                ),
+            )
+        if current_step % config.evaluation_interval == 0 or local_step == config.steps:
             if diagnostic_step and energy_by_term is not None:
                 _eval_step_state(
                     state,
@@ -1620,4 +1878,138 @@ def simulate_nvt(
             neighbor_list=None if neighbor_manager is None else neighbor_manager.neighbor_list,
             force_evaluation_wall_seconds=force_evaluation_wall_seconds,
         ),
+    )
+
+
+def simulate_npt(
+    positions,
+    velocities,
+    *,
+    masses=None,
+    cell: Cell | None = None,
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...] | None = None,
+    neighbor_manager: NeighborListManager | None = None,
+    config: SimulationConfig | None = None,
+    thermostat: LangevinThermostat | None = None,
+    barostat: MonteCarloBarostat | None = None,
+    constraints: DistanceConstraints | None = None,
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
+) -> NPTResult:
+    """Run NVT dynamics followed by isotropic Monte Carlo volume attempts."""
+
+    if cell is None:
+        msg = "NPT simulation requires an orthorhombic periodic cell"
+        raise ValueError(msg)
+    if config is None:
+        config = SimulationConfig()
+    if thermostat is None:
+        thermostat = LangevinThermostat()
+    if barostat is None:
+        barostat = MonteCarloBarostat(temperature=thermostat.temperature)
+    if force_terms is None:
+        force_terms = LennardJonesPotential()
+    terms = tuple(force_terms) if isinstance(force_terms, (list, tuple)) else (force_terms,)
+
+    production = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=terms,
+        neighbor_manager=neighbor_manager,
+        config=config,
+        thermostat=thermostat,
+        constraints=constraints,
+        reporters=reporters,
+    )
+    final_state, final_cell, accepted = _attempt_isotropic_barostat_move(
+        production.final_state,
+        terms,
+        cell,
+        barostat=barostat,
+        constraints=constraints,
+        boltzmann_constant=config.boltzmann_constant,
+    )
+    volumes = mx.array(
+        [float(np.prod(np.asarray(cell.lengths))), float(np.prod(np.asarray(final_cell.lengths)))],
+        dtype=mx.float32,
+    )
+    return NPTResult(
+        production=production,
+        final_state=final_state,
+        final_cell=final_cell,
+        cell_lengths=mx.stack([cell.lengths, final_cell.lengths]),
+        volume=volumes,
+        target_pressure=barostat.pressure,
+        barostat_attempts=1,
+        barostat_accepted=int(accepted),
+    )
+
+
+def _attempt_isotropic_barostat_move(
+    state: SimulationState,
+    force_terms: tuple[ForceTerm, ...],
+    cell: Cell,
+    *,
+    barostat: MonteCarloBarostat,
+    constraints: DistanceConstraints | None,
+    boltzmann_constant: float,
+) -> tuple[SimulationState, Cell, bool]:
+    rng = np.random.default_rng(barostat.seed)
+    log_volume_scale = rng.uniform(
+        -barostat.max_log_volume_scale,
+        barostat.max_log_volume_scale,
+    )
+    volume_scale = float(np.exp(log_volume_scale))
+    length_scale = volume_scale ** (1.0 / 3.0)
+    proposed_lengths = cell.lengths * length_scale
+    proposed_cell = Cell(proposed_lengths)
+    fractional = state.positions / cell.lengths
+    proposed_positions = fractional * proposed_cell.lengths
+    proposed_velocities = state.velocities
+    constraint_error = _zero_constraint_error(proposed_positions)
+    if constraints is not None:
+        proposed_positions, constraint_error = constraints.apply_positions(
+            proposed_positions,
+            state.masses,
+            proposed_cell,
+        )
+        proposed_velocities = constraints.apply_velocities(
+            proposed_positions,
+            proposed_velocities,
+            state.masses,
+            proposed_cell,
+        )
+
+    old_energy, _ = _energy_forces_from_terms(state.positions, force_terms, cell=cell, pairs=None)
+    new_energy, new_forces = _energy_forces_from_terms(
+        proposed_positions,
+        force_terms,
+        cell=proposed_cell,
+        pairs=None,
+    )
+    old_volume = float(np.prod(np.asarray(cell.lengths)))
+    new_volume = float(np.prod(np.asarray(proposed_cell.lengths)))
+    beta = 1.0 / (boltzmann_constant * barostat.temperature)
+    atom_count = int(state.positions.shape[0])
+    delta = (
+        float(np.asarray(new_energy - old_energy))
+        + barostat.pressure * (new_volume - old_volume)
+        - atom_count / beta * float(np.log(new_volume / old_volume))
+    )
+    accepted = delta <= 0.0 or rng.random() < float(np.exp(-beta * delta))
+    if not accepted:
+        return state, cell, False
+    mx.eval(proposed_positions, proposed_velocities, new_forces, constraint_error)
+    return (
+        SimulationState(
+            positions=proposed_positions,
+            velocities=proposed_velocities,
+            masses=state.masses,
+            forces=new_forces,
+            step=state.step,
+            time=state.time,
+        ),
+        proposed_cell,
+        True,
     )

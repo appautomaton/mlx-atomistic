@@ -240,7 +240,74 @@ def test_artifact_required_pme_term_requires_config():
         validate_mlx_compatibility(metadata, require_production=True)
 
 
-def test_gpcrmd_electrostatics_gate_blocks_default_pme_without_executable_backend(tmp_path):
+def test_virtual_site_water_model_fails_closed(tmp_path):
+    prepared = _production_fixture()
+    metadata = replace(
+        prepared.metadata,
+        compatibility_report={
+            **prepared.metadata.compatibility_report,
+            "water_model": "TIP4P-Ew",
+        },
+    )
+    save_prepared_system(replace(prepared, metadata=metadata), tmp_path)
+
+    with pytest.raises(MLXCompatibilityError, match="virtual_site water model"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_hidden_hmr_masses_fail_closed_without_policy(tmp_path):
+    prepared = replace(
+        _production_fixture(),
+        masses=np.asarray([3.024, 13.983], dtype=np.float32),
+    )
+    save_prepared_system(prepared, tmp_path)
+
+    with pytest.raises(MLXCompatibilityError, match="hydrogen_mass_repartitioning detected"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_declared_hmr_masses_are_represented_by_artifact_masses(tmp_path):
+    prepared = _production_fixture()
+    metadata = replace(
+        prepared.metadata,
+        compatibility_report={
+            **prepared.metadata.compatibility_report,
+            "hydrogen_mass_repartitioning": "represented_by_masses",
+        },
+    )
+    prepared = replace(
+        prepared,
+        metadata=metadata,
+        masses=np.asarray([3.024, 13.983], dtype=np.float32),
+    )
+    save_prepared_system(prepared, tmp_path)
+
+    artifact = load_prepared_mlx_artifact(tmp_path, require_production=True)
+    system, _, constraints = build_mlx_system_from_artifact(artifact)
+
+    assert constraints is not None
+    np.testing.assert_allclose(np.asarray(system.masses), [3.024, 13.983])
+
+
+def test_hmr_force_term_request_fails_closed(tmp_path):
+    prepared = _production_fixture()
+    report = {
+        **prepared.metadata.compatibility_report,
+        "required_terms": [
+            *prepared.metadata.compatibility_report["required_terms"],
+            "hydrogen_mass_repartitioning",
+        ],
+    }
+    save_prepared_system(
+        replace(prepared, metadata=replace(prepared.metadata, compatibility_report=report)),
+        tmp_path,
+    )
+
+    with pytest.raises(MLXCompatibilityError, match="hydrogen_mass_repartitioning"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_gpcrmd_electrostatics_gate_accepts_ready_pme_artifact(tmp_path):
     from mlx_atomistic.prep.runner import _gpcrmd_electrostatics_report
 
     prepared = replace(
@@ -254,10 +321,11 @@ def test_gpcrmd_electrostatics_gate_blocks_default_pme_without_executable_backen
 
     report = _gpcrmd_electrostatics_report(tmp_path, requested_electrostatics="pme")
 
-    assert report["status"] == "blocked"
+    assert report["status"] == "ready"
     assert report["route"] == "pme"
-    assert report["production_ready"] is False
-    assert "pme_backend_not_production_executable" in report["blockers"][0]
+    assert report["production_ready"] is True
+    assert report["backend"] == "mlx_fft_cic"
+    assert report["blockers"] == ()
 
 
 def test_gpcrmd_short_range_prototype_report_is_explicitly_non_production(tmp_path):

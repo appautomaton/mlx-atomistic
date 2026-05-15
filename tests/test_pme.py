@@ -132,7 +132,7 @@ def test_pme_refuses_invalid_mesh_settings_and_cells():
         )
 
 
-def test_pme_readiness_report_blocks_numpy_reference_backend_for_production():
+def test_pme_readiness_report_accepts_mlx_fft_backend_for_production():
     report = pme_readiness_report(
         atom_count=4,
         charges=np.asarray(_charges()),
@@ -144,17 +144,20 @@ def test_pme_readiness_report_blocks_numpy_reference_backend_for_production():
         explicit_exception_count=1,
     )
 
-    assert report["status"] == "blocked"
-    assert report["production_executable"] is False
+    assert report["status"] == "ready"
+    assert report["backend"] == "mlx_fft_cic"
+    assert report["production_executable"] is True
     assert report["checks"]["neutrality"] is True
     assert report["checks"]["box"] is True
     assert report["checks"]["mesh_shape"] is True
     assert report["checks"]["alpha"] is True
     assert report["checks"]["cutoff"] is True
+    assert report["checks"]["atom_count"] is True
     assert report["checks"]["exclusions"] is True
     assert report["checks"]["one_four_corrections"] is True
     assert report["checks"]["explicit_exceptions"] is True
-    assert "pme_backend_not_production_executable" in report["blockers"][0]
+    assert report["blockers"] == ()
+    assert report["virial"]["status"] == "finite_difference_cell_strain"
 
 
 def test_ewald_benchmark_payload_includes_pme_comparison():

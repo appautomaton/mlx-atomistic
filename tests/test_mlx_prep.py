@@ -92,7 +92,7 @@ def test_tiny_prepared_system_runs_mlx_nvt(tmp_path: Path):
     assert record.metadata["kind"] == "mlx_atomistic.prep_nvt"
 
 
-def test_run_mlx_rejects_npt_barostat_protocol_metadata_before_system_build(
+def test_run_mlx_rejects_npt_without_supported_barostat_before_system_build(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -105,7 +105,6 @@ def test_run_mlx_rejects_npt_barostat_protocol_metadata_before_system_build(
         prepared.metadata,
         protocol_metadata={
             "ensemble": "NPT",
-            "barostat": "monte_carlo",
         },
     )
     prepared = replace(prepared, metadata=metadata)
@@ -126,7 +125,7 @@ def test_run_mlx_rejects_npt_barostat_protocol_metadata_before_system_build(
             equilibration_steps=0,
         )
 
-    assert exc_info.value.blockers == ("npt_barostat", "barostat")
+    assert exc_info.value.blockers == ("barostat",)
     assert not (tmp_path / "trajectory.npz").exists()
 
 
