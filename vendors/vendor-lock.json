@@ -15,6 +15,13 @@
       "commit": "ee93998fe5b05c75e0640aaa4a3b30316bc959bc",
       "role": "reference only: MD algorithms, neighbor lists, and force kernels"
     },
+    "gromacs": {
+      "url": "https://gitlab.com/gromacs/gromacs.git",
+      "branch": "main",
+      "depth": 1,
+      "commit": "2220f6d92f44ebca031654fcc4c7ac251b08d061",
+      "role": "reference only: biomolecular MD production pipeline, OpenCL/SYCL GPU paths, and PME implementation"
+    },
     "quantum-espresso": {
       "url": "https://github.com/QEF/q-e.git",
       "branch": "develop",
