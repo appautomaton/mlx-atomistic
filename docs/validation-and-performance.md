@@ -90,3 +90,26 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmar
 
 For serious local performance work on Apple Silicon, run the larger benchmark
 matrix outside the fast test loop and keep the JSON/CSV artifacts for comparison.
+
+## OpenMM/OpenCL Reference
+
+OpenMM is not a product runtime dependency, but it is useful as a reference
+ceiling for local GPU/OpenCL throughput. The standalone showcase script keeps
+that comparison under `scripts/`:
+
+```bash
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_opencl.py --json
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_opencl.py --particles 4096 --steps 1000 --platform OpenCL --csv openmm-opencl.csv
+```
+
+The script emits OpenMM version, available platforms, selected platform
+properties, steps/s, ns/day, and final energy/finite-state diagnostics.
+
+## Benchmark Reports
+
+Per-run benchmark write-ups live under [`docs/benchmarks/`](./benchmarks/),
+indexed by `docs/benchmarks/README.md`. Each report records hardware,
+engine version, config, the reproducer command, and external reference
+numbers (e.g. `openmm.org/benchmarks`, HECBioSim) so a future result can be
+compared without re-deriving context. Raw JSON output is written to the
+gitignored `results/` directory.
