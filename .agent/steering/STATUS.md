@@ -7,8 +7,8 @@ stage: complete
 
 ## Current Change
 
-- active change: `docs-hygiene-follow-up`
-- current stage: `complete`
+- active change: `lean-runtime-boundary-cleanup`
+- current stage: `verify`
 
 ## What Is True Now
 
