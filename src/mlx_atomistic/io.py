@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -66,6 +67,8 @@ class RuntimeTraceReporter:
                 "pair_count": _scalar_or_none(event.pair_count),
                 "rebuild_count": _scalar_or_none(event.rebuild_count),
                 "constraint_max_error": _scalar_or_none(event.constraint_max_error),
+                "thermostat": dict(event.thermostat),
+                "barostat": dict(event.barostat),
             }
         )
 
@@ -100,6 +103,27 @@ class SimulationCheckpoint:
             time=self.time,
         )
 
+    @property
+    def hmr_state(self) -> dict[str, Any]:
+        return _hmr_state_from_metadata(self.metadata)
+
+
+def _hmr_state_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    raw_state = metadata.get("hydrogen_mass_repartitioning") or metadata.get("hmr")
+    if isinstance(raw_state, dict):
+        state = dict(raw_state)
+        state.setdefault("status", "represented_by_masses")
+        state.setdefault("provenance_available", True)
+        policy = dict(state.get("policy", {}))
+        policy.setdefault("virtual_sites_supported", False)
+        state["policy"] = policy
+        return state
+    return {
+        "status": "absent",
+        "provenance_available": False,
+        "policy": {"virtual_sites_supported": False},
+    }
+
 
 def _scalar_or_none(value: Any) -> float | int | None:
     if value is None:
@@ -111,6 +135,14 @@ def _scalar_or_none(value: Any) -> float | int | None:
     if isinstance(scalar, int | np.integer):
         return int(scalar)
     return float(scalar)
+
+
+def _cell_payload(cell: Cell | None) -> np.ndarray:
+    if cell is None:
+        return np.asarray([], dtype=np.float32)
+    if cell.is_orthorhombic:
+        return np.asarray(cell.lengths, dtype=np.float32)
+    return np.asarray(cell.matrix, dtype=np.float32)
 
 
 def read_xyz(path: str | Path) -> tuple[tuple[str, ...], np.ndarray, str]:
@@ -206,7 +238,7 @@ def save_npz_trajectory(
             getattr(result, "constraint_max_error", np.zeros_like(np.asarray(result.total_energy)))
         ),
         "symbols": np.asarray([] if symbols is None else list(symbols), dtype=str),
-        "cell": np.asarray([] if cell is None else np.asarray(cell.lengths), dtype=np.float32),
+        "cell": _cell_payload(cell),
         "metadata_json": np.asarray(json.dumps(metadata or {})),
         "energy_term_names": np.asarray(
             list(getattr(result, "potential_energy_by_term", {}).keys()),
@@ -272,7 +304,7 @@ def trajectory_record_from_result(
             getattr(result, "constraint_max_error", np.zeros_like(np.asarray(result.total_energy)))
         ),
         symbols=tuple() if symbols is None else tuple(str(item) for item in symbols),
-        cell=None if cell is None else np.asarray(cell.lengths, dtype=np.float32),
+        cell=None if cell is None else _cell_payload(cell),
         metadata=dict(metadata or {}),
         virial_tensor=np.asarray(getattr(result, "virial_tensor", _zero_diagnostic_tensor(result))),
         pressure_tensor=np.asarray(
@@ -326,22 +358,36 @@ def save_simulation_checkpoint(
     force_terms: tuple[str, ...] | list[str] | None = None,
     diagnostic_cursor: int | None = None,
     metadata: dict[str, Any] | None = None,
+    runtime_sync_report: dict[str, int | float] | None = None,
+    runtime_nonbonded_report: dict[str, int | float | str | None] | None = None,
 ) -> None:
     """Write a restart checkpoint for a runner-level continuation."""
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     thermostat_payload = dict(thermostat or {})
-    if "rng_step_offset" not in thermostat_payload:
+    if thermostat_payload.get("family") == "nose_hoover":
+        thermostat_payload.setdefault("deterministic_state", True)
+    elif "rng_step_offset" not in thermostat_payload:
         thermostat_payload["rng_step_offset"] = int(state.step)
-    payload = {
+    materialization_start = perf_counter()
+    checkpoint_arrays = {
         "positions": np.asarray(state.positions),
         "velocities": np.asarray(state.velocities),
         "masses": np.asarray(state.masses),
         "forces": np.asarray(state.forces),
+    }
+    materialization_elapsed = perf_counter() - materialization_start
+    _record_checkpoint_runtime_attribution(
+        runtime_sync_report,
+        runtime_nonbonded_report,
+        elapsed=materialization_elapsed,
+    )
+    payload = {
+        **checkpoint_arrays,
         "step": np.asarray([int(state.step)], dtype=np.int64),
         "time": np.asarray([float(state.time)], dtype=np.float64),
-        "cell": np.asarray([] if cell is None else np.asarray(cell.lengths), dtype=np.float32),
+        "cell": _cell_payload(cell),
         "thermostat_json": np.asarray(json.dumps(thermostat_payload)),
         "neighbor_policy_json": np.asarray(json.dumps(neighbor_policy or {})),
         "force_terms": np.asarray([] if force_terms is None else list(force_terms), dtype=str),
@@ -352,6 +398,51 @@ def save_simulation_checkpoint(
         "metadata_json": np.asarray(json.dumps(metadata or {})),
     }
     np.savez_compressed(path, **payload)
+
+
+def _record_checkpoint_runtime_attribution(
+    *reports: dict[str, int | float | str | None] | None,
+    elapsed: float,
+) -> None:
+    seen: set[int] = set()
+    for report in reports:
+        if report is None:
+            continue
+        report_id = id(report)
+        if report_id in seen:
+            continue
+        seen.add(report_id)
+        _increment_runtime_count(report, "runtime_sync_total_count")
+        _increment_runtime_wall_seconds(report, "runtime_sync_total_wall_seconds", elapsed)
+        _increment_runtime_count(report, "runtime_sync_checkpoint_count")
+        _increment_runtime_wall_seconds(report, "runtime_sync_checkpoint_wall_seconds", elapsed)
+        _increment_runtime_count(report, "runtime_materialization_total_count")
+        _increment_runtime_wall_seconds(
+            report,
+            "runtime_materialization_total_wall_seconds",
+            elapsed,
+        )
+        _increment_runtime_count(report, "runtime_materialization_checkpoint_count")
+        _increment_runtime_wall_seconds(
+            report,
+            "runtime_materialization_checkpoint_wall_seconds",
+            elapsed,
+        )
+
+
+def _increment_runtime_count(
+    report: dict[str, int | float | str | None],
+    key: str,
+) -> None:
+    report[key] = int(report.get(key) or 0) + 1
+
+
+def _increment_runtime_wall_seconds(
+    report: dict[str, int | float | str | None],
+    key: str,
+    elapsed: float,
+) -> None:
+    report[key] = float(report.get(key) or 0.0) + elapsed
 
 
 def load_simulation_checkpoint(path: str | Path) -> SimulationCheckpoint:

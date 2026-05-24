@@ -49,6 +49,7 @@ class MMSystem:
     topology: Topology
     velocities: object | None = None
     cell: Cell | None = None
+    virtual_sites: object | None = None
 
     @classmethod
     def from_sequences(
@@ -64,6 +65,7 @@ class MMSystem:
         velocities: Sequence[Sequence[float]] | None = None,
         cell: Cell | None = None,
         atom_type_masses: Mapping[str, float] | None = None,
+        virtual_sites: object | None = None,
     ) -> MMSystem:
         """Create an MM system from Python data."""
 
@@ -93,6 +95,7 @@ class MMSystem:
             topology=topology,
             velocities=velocities,
             cell=cell,
+            virtual_sites=virtual_sites,
         )
 
     def __post_init__(self) -> None:

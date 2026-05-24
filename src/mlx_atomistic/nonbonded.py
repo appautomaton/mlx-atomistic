@@ -14,9 +14,18 @@ from mlx_atomistic.topology import Topology
 
 NonbondedBackend = Literal["auto", "mlx_dense", "mlx_tiled", "mlx_pairs", "python_neighbor"]
 NonbondedElectrostatics = Literal["cutoff", "ewald_reference", "pme"]
+ForceEvaluationScope = Literal["total", "components", "direct_space", "reciprocal_space"]
+FullLoopNonbondedMode = Literal["auto", "dense", "dynamic-neighbor"]
 
 DEFAULT_DENSE_MEMORY_BUDGET_BYTES = 32 * 1024**3
+DEFAULT_FULL_LOOP_DENSE_THRESHOLD = 1536
 _FLOAT_BYTES = 4
+FORCE_EVALUATION_SCOPES: tuple[ForceEvaluationScope, ...] = (
+    "total",
+    "components",
+    "direct_space",
+    "reciprocal_space",
+)
 _ELECTROSTATICS_ALIASES = {
     "direct": "cutoff",
     "direct_cutoff": "cutoff",
@@ -30,6 +39,59 @@ _ELECTROSTATICS_ALIASES = {
     "pme_ewald": "pme",
     "pme_ewald_periodic_electrostatics": "pme",
 }
+_FORCE_SCOPE_ALIASES = {
+    "production": "total",
+    "production_total": "total",
+    "production_total_only": "total",
+    "total_only": "total",
+    "diagnostic": "components",
+    "diagnostics": "components",
+    "component": "components",
+    "component_energy": "components",
+    "component_energies": "components",
+    "real": "direct_space",
+    "real_space": "direct_space",
+    "direct": "direct_space",
+    "direct_space": "direct_space",
+    "reciprocal": "reciprocal_space",
+    "mesh": "reciprocal_space",
+    "fft": "reciprocal_space",
+    "reciprocal_space": "reciprocal_space",
+}
+
+
+@dataclass(frozen=True)
+class ForceScopeReport:
+    """Metadata for a requested force-evaluation scope."""
+
+    scope: ForceEvaluationScope
+    supported: bool
+    execution_path: str
+    backend: str | None = None
+    electrostatics: str | None = None
+    production_total_only: bool = False
+    diagnostic_components: bool = False
+    direct_space: bool = False
+    reciprocal_space: bool = False
+    component_work: bool = False
+    requires_full_system: bool = False
+    unsupported_reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "scope": self.scope,
+            "supported": self.supported,
+            "execution_path": self.execution_path,
+            "backend": self.backend,
+            "electrostatics": self.electrostatics,
+            "production_total_only": self.production_total_only,
+            "diagnostic_components": self.diagnostic_components,
+            "direct_space": self.direct_space,
+            "reciprocal_space": self.reciprocal_space,
+            "component_work": self.component_work,
+            "requires_full_system": self.requires_full_system,
+            "unsupported_reason": self.unsupported_reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -54,6 +116,20 @@ class NonbondedExecutionConfig:
         if self.memory_budget_bytes is not None and self.memory_budget_bytes <= 0:
             msg = "memory_budget_bytes must be positive when provided"
             raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class FullLoopNonbondedPolicy:
+    """Evidence-backed nonbonded policy for full MD loops."""
+
+    mode: FullLoopNonbondedMode
+    use_neighbor_list: bool
+    potential_backend: NonbondedBackend
+    selected_backend: str
+    selected_policy: str
+    evidence: str
+    neighbor_backend: str | None = None
+    blocker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +166,16 @@ def validate_nonbonded_backend(backend: str) -> NonbondedBackend:
     return backend  # type: ignore[return-value]
 
 
+def validate_full_loop_nonbonded_mode(mode: str) -> FullLoopNonbondedMode:
+    """Validate a full-loop nonbonded policy mode."""
+
+    allowed = {"auto", "dense", "dynamic-neighbor"}
+    if mode not in allowed:
+        msg = f"unknown full-loop nonbonded mode {mode!r}; expected one of {sorted(allowed)}"
+        raise ValueError(msg)
+    return mode  # type: ignore[return-value]
+
+
 def normalize_nonbonded_electrostatics(mode: str) -> NonbondedElectrostatics:
     """Normalize an electrostatics mode or known metadata alias."""
 
@@ -106,6 +192,17 @@ def validate_nonbonded_electrostatics(mode: str) -> NonbondedElectrostatics:
     """Validate an electrostatics mode for executable nonbonded evaluation."""
 
     return normalize_nonbonded_electrostatics(mode)
+
+
+def normalize_force_scope(scope: str) -> ForceEvaluationScope:
+    """Validate and normalize a force-evaluation scope name."""
+
+    normalized = scope.strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = _FORCE_SCOPE_ALIASES.get(normalized, normalized)
+    if normalized not in FORCE_EVALUATION_SCOPES:
+        msg = f"unknown force scope {scope!r}; expected one of {list(FORCE_EVALUATION_SCOPES)}"
+        raise ValueError(msg)
+    return normalized  # type: ignore[return-value]
 
 
 def ewald_reference_coulomb_energy(
@@ -131,6 +228,12 @@ def ewald_reference_coulomb_energy(
         raise ValueError(msg)
     if charges.shape != (positions.shape[0],):
         msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if not cell.is_orthorhombic:
+        msg = (
+            "Ewald reference currently supports orthorhombic cells only; "
+            "triclinic cells are not supported"
+        )
         raise ValueError(msg)
     cell_lengths = np.asarray(cell.lengths, dtype=np.float32)
     if cell_lengths.shape != (3,) or np.any(cell_lengths <= 0.0):
@@ -190,6 +293,50 @@ def ewald_reference_coulomb_energy_forces(
 ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
     """Evaluate neutral orthorhombic Ewald Coulomb energy and analytical forces."""
 
+    total, forces, components = _ewald_reference_coulomb_energy_forces_impl(
+        positions,
+        charges,
+        cell,
+        coulomb_constant=coulomb_constant,
+        config=config,
+        include_components=True,
+    )
+    if components is None:
+        msg = "Ewald component evaluation did not produce components"
+        raise RuntimeError(msg)
+    return total, forces, components
+
+
+def ewald_reference_coulomb_total_energy_forces(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float = 1.0,
+    config: EwaldReferenceConfig | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Evaluate neutral orthorhombic Ewald Coulomb total energy and forces."""
+
+    total, forces, _ = _ewald_reference_coulomb_energy_forces_impl(
+        positions,
+        charges,
+        cell,
+        coulomb_constant=coulomb_constant,
+        config=config,
+        include_components=False,
+    )
+    return total, forces
+
+
+def _ewald_reference_coulomb_energy_forces_impl(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float,
+    config: EwaldReferenceConfig | None,
+    include_components: bool,
+) -> tuple[mx.array, mx.array, dict[str, mx.array] | None]:
     config = EwaldReferenceConfig() if config is None else config
     positions = mx.array(positions, dtype=mx.float32)
     charges = mx.array(charges, dtype=mx.float32)
@@ -198,6 +345,12 @@ def ewald_reference_coulomb_energy_forces(
         raise ValueError(msg)
     if charges.shape != (positions.shape[0],):
         msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if not cell.is_orthorhombic:
+        msg = (
+            "Ewald reference currently supports orthorhombic cells only; "
+            "triclinic cells are not supported"
+        )
         raise ValueError(msg)
     cell_lengths = np.asarray(cell.lengths, dtype=np.float32)
     if cell_lengths.shape != (3,) or np.any(cell_lengths <= 0.0):
@@ -240,11 +393,14 @@ def ewald_reference_coulomb_energy_forces(
         * mx.sum(charges * charges)
     )
     total = real_energy + reciprocal_energy + self_energy
-    return total, real_forces + reciprocal_forces, {
-        "coulomb_real": real_energy,
-        "coulomb_reciprocal": reciprocal_energy,
-        "coulomb_self": self_energy,
-    }
+    components = None
+    if include_components:
+        components = {
+            "coulomb_real": real_energy,
+            "coulomb_reciprocal": reciprocal_energy,
+            "coulomb_self": self_energy,
+        }
+    return total, real_forces + reciprocal_forces, components
 
 
 def estimate_dense_nonbonded_bytes(n_atoms: int, *, components: str = "combined") -> int:
@@ -286,6 +442,95 @@ def choose_nonbonded_backend(
         )
         raise MemoryError(msg)
     return requested
+
+
+def choose_full_loop_nonbonded_policy(
+    *,
+    mode: str,
+    n_atoms: int,
+    cutoff: float | None,
+    cell_provided: bool,
+    dense_threshold: int = DEFAULT_FULL_LOOP_DENSE_THRESHOLD,
+) -> FullLoopNonbondedPolicy:
+    """Choose the default nonbonded policy for a complete MD loop.
+
+    The default is based on S1/S2 full-loop and staged-neighbor evidence: use
+    dynamic fixed-shape neighbor blocks when periodic cutoff semantics make
+    that path safe, while preserving explicit dense and fallback modes.
+    """
+
+    concrete_mode = validate_full_loop_nonbonded_mode(mode)
+    if n_atoms < 0:
+        msg = "n_atoms must be non-negative"
+        raise ValueError(msg)
+    if dense_threshold < 0:
+        msg = "dense_threshold must be non-negative"
+        raise ValueError(msg)
+
+    if concrete_mode == "dense":
+        return FullLoopNonbondedPolicy(
+            mode=concrete_mode,
+            use_neighbor_list=False,
+            potential_backend="mlx_dense",
+            selected_backend="mlx_dense",
+            selected_policy="mode:dense",
+            evidence="explicit-user-mode",
+        )
+
+    finite_positive_cutoff = cutoff is not None and bool(np.isfinite(cutoff)) and cutoff > 0.0
+    periodic_cutoff_available = cell_provided and finite_positive_cutoff
+    if concrete_mode == "dynamic-neighbor":
+        if not cell_provided:
+            msg = "dynamic-neighbor mode requires a periodic cell"
+            raise ValueError(msg)
+        if not finite_positive_cutoff:
+            msg = "dynamic-neighbor mode requires a finite positive cutoff"
+            raise ValueError(msg)
+
+    if periodic_cutoff_available and (
+        concrete_mode == "dynamic-neighbor" or n_atoms > dense_threshold
+    ):
+        policy = (
+            "mode:dynamic-neighbor"
+            if concrete_mode == "dynamic-neighbor"
+            else f"auto:evidence_dynamic_neighbor; dense_threshold:{dense_threshold}"
+        )
+        evidence = (
+            "s1_s2_s3_full_loop_policy_evidence"
+            if concrete_mode == "auto"
+            else "explicit-user-mode"
+        )
+        return FullLoopNonbondedPolicy(
+            mode=concrete_mode,
+            use_neighbor_list=True,
+            potential_backend="mlx_pairs",
+            selected_backend="dynamic-neighbor+mlx_cell_blocks",
+            selected_policy=policy,
+            evidence=evidence,
+            neighbor_backend="mlx_cell_blocks",
+        )
+
+    blocker = None
+    selected_policy = f"auto:evidence_dense_below_threshold; dense_threshold:{dense_threshold}"
+    evidence = "s3_small_system_dense_threshold"
+    if not periodic_cutoff_available:
+        blocker = (
+            "dynamic_neighbor_requires_periodic_cutoff"
+            if not cell_provided or cutoff is None
+            else "dynamic_neighbor_requires_finite_positive_cutoff"
+        )
+        selected_policy = f"auto:fallback_dense_{blocker}"
+        evidence = "safety-fallback"
+
+    return FullLoopNonbondedPolicy(
+        mode=concrete_mode,
+        use_neighbor_list=False,
+        potential_backend="auto",
+        selected_backend="mlx_dense",
+        selected_policy=selected_policy,
+        evidence=evidence,
+        blocker=blocker,
+    )
 
 
 def _within_budget(estimated_dense_bytes: int, memory_budget_bytes: int | None) -> bool:

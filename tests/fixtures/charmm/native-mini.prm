@@ -1,0 +1,50 @@
+* Minimal CHARMM-style parameter subset for native parser tests.
+*
+MASS     1 NH1       14.0070
+MASS     2 H          1.0080
+MASS     3 CT1       12.0110
+MASS     4 HB1        1.0080
+MASS     5 C         12.0110
+MASS     6 O         15.9990
+MASS     7 CT3       12.0110
+MASS     8 HA3        1.0080
+
+BONDS
+NH1  H      440.0  1.010
+NH1  CT1    337.0  1.450
+CT1  HB1    309.0  1.111
+CT1  C      320.0  1.520
+C    O      620.0  1.230
+CT1  CT3    222.0  1.530
+CT3  HA3    309.0  1.111
+
+ANGLES
+NH1  CT1  C       50.0  110.0  5.0  2.300
+NH1  CT1  CT3     45.0  109.5
+CT1  CT3  HA3     35.0  109.5
+
+DIHEDRALS
+H    NH1  CT1  C      0.200  3  180.0
+
+CMAP
+NH1 H CT1 C H CT1 C O 4
+0.0 0.1 0.2 0.3
+0.4 0.5 0.6 0.7
+0.8 0.9 1.0 1.1
+1.2 1.3 1.4 1.5
+
+NONBONDED nbxmod 5 atom cdiel shift vatom vdistance vswitch -
+cutnb 12.0 ctofnb 10.0 ctonnb 8.0 eps 1.0 e14fac 1.0 wmin 1.5
+NH1    0.0  -0.2000  1.8500
+H      0.0  -0.0300  0.2245
+CT1    0.0  -0.1100  2.0000
+HB1    0.0  -0.0200  1.3400
+C      0.0  -0.1200  2.0000
+O      0.0  -0.1500  1.7000
+CT3    0.0  -0.0800  2.0600
+HA3    0.0  -0.0200  1.3200
+
+NBFIX
+NH1 O -0.1000 3.0000
+
+END

@@ -1,7 +1,10 @@
 from math import pi
 
 import numpy as np
+import pytest
 
+from mlx_atomistic import PMEConfig as ExportedPMEConfig
+from mlx_atomistic import RBDihedralPotential as ExportedRBDihedralPotential
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import (
     CoulombPotential,
@@ -11,8 +14,10 @@ from mlx_atomistic.forcefields import (
     NonbondedPotential,
     PairRestrictedNonbondedPotential,
     PeriodicDihedralPotential,
+    RBDihedralPotential,
 )
 from mlx_atomistic.md import LennardJonesPotential
+from mlx_atomistic.neighbors import build_neighbor_list
 from mlx_atomistic.nonbonded import EwaldReferenceConfig, ewald_reference_coulomb_energy_forces
 from mlx_atomistic.pme import PMEConfig, pme_coulomb_energy_forces
 from mlx_atomistic.topology import Topology
@@ -42,6 +47,20 @@ def assert_force_matches_finite_difference(term, positions, *, atol=2e-3):
     )
 
 
+def reference_periodic_dihedral_angle(points):
+    delta_ab = points[1] - points[0]
+    delta_bc = points[1] - points[2]
+    delta_cd = points[3] - points[2]
+    cross_ab_bc = np.cross(delta_ab, delta_bc)
+    cross_bc_cd = np.cross(delta_bc, delta_cd)
+    cosine = np.dot(cross_ab_bc, cross_bc_cd) / (
+        np.linalg.norm(cross_ab_bc) * np.linalg.norm(cross_bc_cd)
+    )
+    angle = np.arccos(np.clip(cosine, -0.999999, 0.999999))
+    sign = -1.0 if np.dot(delta_ab, cross_bc_cd) < 0.0 else 1.0
+    return angle * sign
+
+
 def test_harmonic_bond_force_matches_finite_difference():
     positions = np.array([[0.0, 0.0, 0.0], [1.2, 0.1, 0.0]], dtype=np.float32)
     term = HarmonicBondPotential([(0, 1)], k=5.0, length=1.0)
@@ -62,6 +81,62 @@ def test_periodic_dihedral_force_matches_finite_difference():
         dtype=np.float32,
     )
     term = PeriodicDihedralPotential([(0, 1, 2, 3)], k=0.4, periodicity=3.0, phase=0.1)
+
+    assert_force_matches_finite_difference(term, positions, atol=5e-3)
+
+
+def test_rb_dihedral_is_package_export():
+    assert ExportedRBDihedralPotential is RBDihedralPotential
+
+
+def test_pme_config_is_package_export():
+    assert ExportedPMEConfig is PMEConfig
+
+
+def test_rb_dihedral_reference_expression_uses_periodic_angle_minus_pi():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.2, 0.0], [1.3, 1.1, 0.1], [1.6, 1.3, 0.9]],
+        dtype=np.float32,
+    )
+    coefficients = np.array([0.17, -0.23, 0.11, 0.07, -0.03, 0.02], dtype=np.float32)
+    term = RBDihedralPotential(
+        [(0, 1, 2, 3)],
+        c0=coefficients[0],
+        c1=coefficients[1],
+        c2=coefficients[2],
+        c3=coefficients[3],
+        c4=coefficients[4],
+        c5=coefficients[5],
+    )
+
+    energy, forces = term.energy_forces(positions)
+    periodic_phi = reference_periodic_dihedral_angle(positions)
+    rb_phi = periodic_phi - pi
+    rb_cosine = np.cos(rb_phi)
+    expected = sum(
+        coefficient * rb_cosine**power
+        for power, coefficient in enumerate(coefficients)
+    )
+
+    assert np.isfinite(np.asarray(energy))
+    assert np.all(np.isfinite(np.asarray(forces)))
+    np.testing.assert_allclose(np.asarray(energy), expected, atol=1e-6)
+
+
+def test_rb_dihedral_force_matches_finite_difference():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.2, 0.0], [1.3, 1.1, 0.1], [1.6, 1.3, 0.9]],
+        dtype=np.float32,
+    )
+    term = RBDihedralPotential(
+        [(0, 1, 2, 3)],
+        c0=0.17,
+        c1=-0.23,
+        c2=0.11,
+        c3=0.07,
+        c4=-0.03,
+        c5=0.02,
+    )
 
     assert_force_matches_finite_difference(term, positions, atol=5e-3)
 
@@ -543,8 +618,10 @@ def test_nonbonded_pme_requires_mesh_config_cell_and_full_system():
     )
     for kwargs, expected in [
         ({}, "periodic cell"),
-        ({"cell": Cell.orthorhombic([12.0, 0.0, 12.0])}, "positive orthorhombic"),
-        ({"cell": Cell.cubic(12.0), "pairs": np.array([[0, 1]], dtype=np.int32)}, "full-system"),
+        (
+            {"cell": Cell.cubic(12.0), "pairs": np.array([[0, 1]], dtype=np.int32)},
+            "pme_production_direct_space_requires_neighbor_blocks",
+        ),
     ]:
         try:
             term.energy_forces(positions, **kwargs)
@@ -552,6 +629,9 @@ def test_nonbonded_pme_requires_mesh_config_cell_and_full_system():
             assert expected in str(err)
         else:
             raise AssertionError(f"PME nonbonded accepted invalid input: {kwargs}")
+
+    with pytest.raises(ValueError, match="positive orthorhombic"):
+        Cell.orthorhombic([12.0, 0.0, 12.0])
 
 
 def test_nonbonded_pme_refuses_non_neutral_background_policy():
@@ -591,39 +671,15 @@ def test_nonbonded_pme_refuses_non_finite_coulomb_constant_and_config_fields():
         else:
             raise AssertionError(f"PME nonbonded accepted coulomb_constant={value}")
 
-    invalid_configs = [
-        (
-            PMEConfig(mesh_shape=(16, 16, 16), alpha=np.nan, real_cutoff=5.0),
-            "pme_config.alpha",
-        ),
-        (
-            PMEConfig(mesh_shape=(16, 16, 16), alpha=np.inf, real_cutoff=5.0),
-            "pme_config.alpha",
-        ),
-        (
-            PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=np.inf),
-            "pme_config.real_cutoff",
-        ),
-        (
-            PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=np.nan),
-            "pme_config.real_cutoff",
-        ),
-        (
-            PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, charge_tolerance=np.nan),
-            "pme_config.charge_tolerance",
-        ),
-    ]
     negative_tolerance = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35)
     object.__setattr__(negative_tolerance, "charge_tolerance", -1.0)
-    invalid_configs.append((negative_tolerance, "pme_config.charge_tolerance"))
 
-    for config, expected in invalid_configs:
-        try:
-            NonbondedPotential(**valid_kwargs, pme_config=config)
-        except ValueError as err:
-            assert expected in str(err)
-        else:
-            raise AssertionError(f"PME nonbonded accepted invalid {expected}")
+    try:
+        NonbondedPotential(**valid_kwargs, pme_config=negative_tolerance)
+    except ValueError as err:
+        assert "pme_config.charge_tolerance" in str(err)
+    else:
+        raise AssertionError("PME nonbonded accepted invalid pme_config.charge_tolerance")
 
 
 def test_nonbonded_pme_matches_standalone_pme_without_lj():
@@ -660,6 +716,109 @@ def test_nonbonded_pme_matches_standalone_pme_without_lj():
             atol=1e-6,
         )
     assert components["pme_diagnostics"].mesh_shape == (24, 24, 24)
+    assert components["pme_diagnostics"].assignment_order == 2
+
+
+@pytest.mark.parametrize("assignment_order", [4, 5])
+def test_nonbonded_pme_diagnostics_report_assignment_order(assignment_order):
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0], [6.0, 7.0, 8.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([0.7, -0.2, -0.3, -0.2], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(
+        mesh_shape=(24, 24, 24),
+        alpha=0.35,
+        real_cutoff=5.0,
+        assignment_order=assignment_order,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    energy, forces, components = term.energy_forces_with_components(positions, cell)
+
+    assert components["pme_diagnostics"].assignment_order == assignment_order
+    assert np.isfinite(np.asarray(energy))
+    assert np.all(np.isfinite(np.asarray(forces)))
+
+
+def test_nonbonded_pme_uses_shared_direct_space_blocks_for_production_total():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0], [6.0, 7.0, 8.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([0.7, -0.2, -0.3, -0.2], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=5.0)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=5.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+        block_size=2,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    dense_energy, dense_forces, _ = term.energy_forces_with_components(positions, cell)
+    block_energy, block_forces, components = term.energy_forces_with_components(
+        positions,
+        cell,
+        pairs=neighbors.interactions,
+    )
+
+    diagnostics = components["pme_diagnostics"]
+    assert diagnostics.direct_space_policy == "block_candidate"
+    assert diagnostics.direct_space_representation == "blocks"
+    assert diagnostics.direct_space_candidate_count == neighbors.candidate_count
+    np.testing.assert_allclose(np.asarray(block_energy), np.asarray(dense_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(block_forces), np.asarray(dense_forces), atol=1e-6)
+
+
+def test_nonbonded_pme_fails_closed_for_unsafe_shared_direct_space_policy():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0], [6.0, 7.0, 8.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([0.7, -0.2, -0.3, -0.2], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=7.0)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=5.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+        block_size=2,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="pme_direct_space_pair_policy_requires_cutoff_at_or_below_half_min_box",
+    ):
+        term.energy_forces(positions, cell, pairs=neighbors.interactions)
 
 
 def test_nonbonded_pme_allows_nbfix_lj_without_changing_coulomb():

@@ -22,6 +22,7 @@ from mlx_atomistic.md import (
     LennardJonesPotential,
     SimulationConfig,
     missing_virial_support,
+    pressure_tensor,
     simulate_nve,
     simulate_nvt,
     validate_virial_support,
@@ -160,6 +161,44 @@ def test_periodic_virial_is_invariant_to_equivalent_wrapped_positions():
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_triclinic_pressure_uses_matrix_volume():
+    class ZeroVirialTerm:
+        supports_virial = True
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            del cell, pairs
+            return positions[:, 0].sum() * 0.0, positions * 0.0
+
+    matrix = np.asarray(
+        [
+            [4.0, 0.0, 0.0],
+            [1.0, 3.0, 0.0],
+            [0.5, 0.25, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.triclinic(matrix)
+    positions = np.asarray([[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]], dtype=np.float32)
+    velocities = np.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float32)
+    masses = np.asarray([2.0, 3.0], dtype=np.float32)
+    forces = np.zeros_like(positions)
+
+    _, tensor, scalar = pressure_tensor(
+        positions,
+        velocities,
+        masses,
+        forces,
+        (ZeroVirialTerm(),),
+        cell=cell,
+        pairs=None,
+    )
+
+    kinetic = np.asarray([[2.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 0.0]])
+    expected_tensor = kinetic / np.linalg.det(matrix)
+    np.testing.assert_allclose(np.asarray(tensor), expected_tensor, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(scalar), np.trace(expected_tensor) / 3.0, atol=1e-5)
 
 
 def test_old_trajectory_without_pressure_fields_loads_zero_defaults(tmp_path):

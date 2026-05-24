@@ -85,6 +85,8 @@ class Topology:
     exclude_bonds: bool = True
     nonbonded_cutoff: float | None = None
     eager_nonbonded_pair_limit: int | None = DEFAULT_EAGER_NONBONDED_PAIR_LIMIT
+    virtual_sites: object = ()
+    virtual_site_types: object = ()
 
     @classmethod
     def from_sequences(
@@ -102,6 +104,8 @@ class Topology:
         exclude_bonds: bool = True,
         nonbonded_cutoff: float | None = None,
         eager_nonbonded_pair_limit: int | None = DEFAULT_EAGER_NONBONDED_PAIR_LIMIT,
+        virtual_sites: Sequence[object] = (),
+        virtual_site_types: Sequence[str] = (),
     ) -> Topology:
         """Create a topology from Python sequences."""
 
@@ -120,6 +124,8 @@ class Topology:
             exclude_bonds=exclude_bonds,
             nonbonded_cutoff=nonbonded_cutoff,
             eager_nonbonded_pair_limit=eager_nonbonded_pair_limit,
+            virtual_sites=virtual_sites,
+            virtual_site_types=virtual_site_types,
         )
 
     def __post_init__(self) -> None:
@@ -208,11 +214,20 @@ class Topology:
         object.__setattr__(self, "_nonbonded_pairs", nonbonded_pair_array)
         object.__setattr__(self, "_nonbonded_one_four_mask", nonbonded_one_four_mask)
         object.__setattr__(self, "_nonbonded_pair_count", nonbonded_pair_count)
-        object.__setattr__(
-            self,
-            "_nonbonded_pair_policy",
+        object.__setattr__(self, "_nonbonded_pair_policy",
             "eager" if should_materialize else "lazy",
         )
+        virtual_sites_tuple = tuple(self.virtual_sites)
+        virtual_site_types_tuple = tuple(
+            str(t) for t in self.virtual_site_types
+        )
+        if virtual_site_types_tuple and len(virtual_site_types_tuple) != len(
+            virtual_sites_tuple
+        ):
+            msg = "virtual_site_types must have same length as virtual_sites"
+            raise ValueError(msg)
+        object.__setattr__(self, "virtual_sites", virtual_sites_tuple)
+        object.__setattr__(self, "virtual_site_types", virtual_site_types_tuple)
 
     def _materialize_nonbonded_pairs(
         self,

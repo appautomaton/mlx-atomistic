@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from math import pi
 from typing import Any
@@ -19,6 +19,7 @@ from mlx_atomistic.forcefields import (
     PeriodicDihedralPotential,
 )
 from mlx_atomistic.md import ForceTerm, LennardJonesPotential
+from mlx_atomistic.runtime import get_platform_boundary_report
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,77 @@ class ForceValidationResult:
             "finite": self.finite,
             "passed": self.passed,
         }
+
+
+@dataclass(frozen=True)
+class PlatformValidationEvidence:
+    """Traceable platform proof or reference-validation evidence."""
+
+    name: str
+    status: str
+    fixture: str
+    product_runtime: str
+    runtime: dict[str, Any]
+    platform_sections: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    gap_ids: tuple[str, ...]
+    finite_outputs: bool
+    reference_engine: str | None = None
+    reference_role: str | None = None
+    readiness: dict[str, Any] | None = None
+    metrics: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe evidence payload."""
+
+        return {
+            "name": self.name,
+            "status": self.status,
+            "fixture": self.fixture,
+            "product_runtime": self.product_runtime,
+            "runtime": dict(self.runtime),
+            "platform_sections": list(self.platform_sections),
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "gap_ids": list(self.gap_ids),
+            "finite_outputs": self.finite_outputs,
+            "reference_engine": self.reference_engine,
+            "reference_role": self.reference_role,
+            "readiness": {} if self.readiness is None else dict(self.readiness),
+            "metrics": {} if self.metrics is None else dict(self.metrics),
+        }
+
+
+def build_platform_validation_evidence(
+    *,
+    name: str,
+    status: str,
+    fixture: str,
+    acceptance_criteria: Iterable[str],
+    gap_ids: Iterable[str],
+    finite_outputs: bool,
+    reference_engine: str | None = None,
+    reference_role: str | None = None,
+    readiness: Mapping[str, Any] | None = None,
+    metrics: Mapping[str, Any] | None = None,
+) -> PlatformValidationEvidence:
+    """Bind a proof or reference-validation result to the platform boundary."""
+
+    boundary = get_platform_boundary_report()
+    return PlatformValidationEvidence(
+        name=name,
+        status=status,
+        fixture=fixture,
+        product_runtime=boundary.product_runtime,
+        runtime=boundary.runtime.to_dict(),
+        platform_sections=tuple(section.name for section in boundary.sections),
+        acceptance_criteria=tuple(str(item) for item in acceptance_criteria),
+        gap_ids=tuple(str(item) for item in gap_ids),
+        finite_outputs=bool(finite_outputs),
+        reference_engine=reference_engine,
+        reference_role=reference_role,
+        readiness={} if readiness is None else dict(readiness),
+        metrics={} if metrics is None else dict(metrics),
+    )
 
 
 def _energy_scalar(
@@ -381,6 +453,8 @@ def summarize_validation_results(results: Iterable[ForceValidationResult]) -> di
 __all__ = [
     "ForceValidationCase",
     "ForceValidationResult",
+    "PlatformValidationEvidence",
+    "build_platform_validation_evidence",
     "default_force_validation_cases",
     "run_force_validation_suite",
     "summarize_validation_results",

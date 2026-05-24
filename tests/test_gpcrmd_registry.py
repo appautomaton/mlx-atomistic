@@ -99,6 +99,19 @@ def _write_tiny_gpcrmd_amber_cache(tmp_path: Path):
     return target, registry, manifest
 
 
+def test_gpcrmd_import_style_distinguishes_gromacs_top_from_amber_top(tmp_path: Path):
+    from mlx_atomistic.prep.gpcrmd import _gpcrmd_import_style
+
+    target = default_gpcrmd_targets()[0]
+    gromacs_top = tmp_path / "gromacs.top"
+    amber_top = tmp_path / "amber.top"
+    gromacs_top.write_text("[ defaults ]\n1 2 yes 0.5 0.8333333333\n")
+    amber_top.write_text("%VERSION VERSION_STAMP = V0001.000\n%FLAG POINTERS\n")
+
+    assert _gpcrmd_import_style(target, {"topology": [gromacs_top]}) == "gromacs"
+    assert _gpcrmd_import_style(target, {"topology": [amber_top]}) == "amber"
+
+
 def _amber_text_values(values: list[str], *, per_line: int = 5, width: int = 16) -> str:
     lines = []
     for start in range(0, len(values), per_line):
@@ -117,6 +130,10 @@ def _write_tiny_amber_prmtop(path: Path) -> None:
     atom_names = ["C1", "H1", "O1", "H2", "O", "H3", "H4", "NA", "CL", "C2", "H5"]
     residues = ["ALA", "LIG", "WAT", "NA", "CL", "POPC"]
     residue_pointers = [1, 3, 5, 8, 9, 10]
+    pointers = ["0"] * 28
+    pointers[0] = "11"
+    pointers[1] = "1"
+    pointers[27] = "1"
     bond_records = [
         (0, 3, 1),
         (6, 9, 1),
@@ -128,7 +145,7 @@ def _write_tiny_amber_prmtop(path: Path) -> None:
         "%VERSION  VERSION_STAMP = V0001.000\n"
         "%FLAG POINTERS\n"
         "%FORMAT(10I8)\n"
-        f"{_amber_text_values(['11', '1'], per_line=10, width=8)}"
+        f"{_amber_text_values(pointers, per_line=10, width=8)}"
         "%FLAG ATOM_NAME\n"
         "%FORMAT(20a4)\n"
         f"{_amber_atom_names(atom_names)}"

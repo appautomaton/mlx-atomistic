@@ -1,0 +1,359 @@
+"""Benchmark a small synthetic LAMMPS OpenCL/GPU MD run.
+
+This is an opt-in reference-engine path. It keeps LAMMPS outside the product
+runtime while giving the benchmark harness a fail-soft OpenCL smoke command.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import platform as platform_module
+import time
+from contextlib import suppress
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from mlx_atomistic.benchmarks import normalize_benchmark_payload
+
+BENCHMARK_NAME = "lammps_opencl_reference"
+ENGINE = "lammps-reference"
+FIXTURE = "synthetic_lj_periodic"
+TIMING_METRIC = "steps_per_s"
+COMMAND = "uv run python scripts/benchmark_lammps_opencl.py"
+
+
+def main() -> None:
+    args = _parse_args()
+    payload = build_payload(args)
+    if args.csv is not None:
+        _write_csv(args.csv, payload)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(_format_human_payload(payload))
+
+
+def build_payload(args: argparse.Namespace) -> dict[str, Any]:
+    """Build a normalized LAMMPS benchmark payload or blocked payload."""
+
+    try:
+        payload = run_benchmark(
+            particles=args.particles,
+            steps=args.steps,
+            warmup_steps=args.warmup_steps,
+            dt=args.dt,
+            temperature=args.temperature,
+            spacing=args.spacing,
+            fixture=args.fixture,
+            opencl_platform=args.opencl_platform,
+            opencl_device=args.opencl_device,
+            seed=args.seed,
+        )
+    except ValueError:
+        raise
+    except Exception as exc:  # pragma: no cover - depends on optional reference stack.
+        payload = _blocked_payload(args, blocker=f"{type(exc).__name__}: {exc}")
+    return _normalize_reference_payload(payload, args)
+
+
+def run_benchmark(
+    *,
+    particles: int,
+    steps: int,
+    warmup_steps: int,
+    dt: float,
+    temperature: float,
+    spacing: float,
+    fixture: str,
+    opencl_platform: str,
+    opencl_device: str,
+    seed: int,
+) -> dict[str, Any]:
+    """Run one synthetic LJ benchmark through LAMMPS GPU/OpenCL."""
+
+    if fixture != FIXTURE:
+        msg = f"unsupported fixture {fixture!r}; only {FIXTURE!r} is available"
+        raise RuntimeError(msg)
+    if particles <= 0:
+        msg = "particles must be positive"
+        raise ValueError(msg)
+    if steps <= 0:
+        msg = "steps must be positive"
+        raise ValueError(msg)
+    if warmup_steps < 0:
+        msg = "warmup_steps must be non-negative"
+        raise ValueError(msg)
+    if dt <= 0.0:
+        msg = "dt must be positive"
+        raise ValueError(msg)
+    if spacing <= 0.0:
+        msg = "spacing must be positive"
+        raise ValueError(msg)
+
+    lammps_class, lammps_version = _load_lammps()
+    positions, box_length = _lattice_positions(particles, spacing)
+    lmp = lammps_class(cmdargs=["-screen", "none", "-log", "none", "-nocite"])
+    try:
+        _configure_lammps(
+            lmp,
+            positions=positions,
+            box_length=box_length,
+            dt=dt,
+            temperature=temperature,
+            opencl_platform=opencl_platform,
+            opencl_device=opencl_device,
+            seed=seed,
+        )
+        if warmup_steps:
+            lmp.command(f"run {warmup_steps} post no")
+        start = time.perf_counter()
+        lmp.command(f"run {steps} post no")
+        wall_s = time.perf_counter() - start
+        potential_energy = _extract_lammps_value(lmp, "pe")
+        kinetic_energy = _extract_lammps_value(lmp, "ke")
+    finally:
+        with suppress(Exception):
+            lmp.close()
+
+    steps_per_s = steps / wall_s if wall_s > 0.0 else 0.0
+    simulated_time = steps * dt
+    return {
+        "status": "ok",
+        "engine": ENGINE,
+        "benchmark_name": BENCHMARK_NAME,
+        "fixture": FIXTURE,
+        "hardware": _hardware_info(),
+        "runtime": {
+            "python_version": platform_module.python_version(),
+            "reference_engine_version": lammps_version,
+            "opencl_platform": opencl_platform,
+            "opencl_device": None,
+            "requested_opencl_device": opencl_device,
+            "opencl_device_applied": False,
+            "pair_style": "lj/cut/gpu",
+        },
+        "lammps_version": lammps_version,
+        "particles": particles,
+        "atom_count": particles,
+        "steps": steps,
+        "step_count": steps,
+        "warmup_steps": warmup_steps,
+        "dt": dt,
+        "simulated_time_lj": simulated_time,
+        "wall_s": wall_s,
+        "steps_per_s": steps_per_s,
+        "opencl_platform": opencl_platform,
+        "opencl_device": None,
+        "requested_opencl_device": opencl_device,
+        "opencl_device_applied": False,
+        "temperature_lj": temperature,
+        "spacing_lj": spacing,
+        "box_length_lj": box_length,
+        "potential_energy_lj": potential_energy,
+        "kinetic_energy_lj": kinetic_energy,
+        "finite": bool(
+            math.isfinite(steps_per_s)
+            and math.isfinite(potential_energy)
+            and math.isfinite(kinetic_energy)
+        ),
+        "blocker": None,
+    }
+
+
+def _load_lammps() -> tuple[Any, str]:
+    try:
+        from lammps import __version__ as lammps_version
+        from lammps import lammps
+    except Exception as exc:  # pragma: no cover - depends on optional reference package.
+        msg = f"LAMMPS import unavailable: {exc}"
+        raise RuntimeError(msg) from exc
+    return lammps, str(lammps_version)
+
+
+def _configure_lammps(
+    lmp: Any,
+    *,
+    positions: np.ndarray,
+    box_length: float,
+    dt: float,
+    temperature: float,
+    opencl_platform: str,
+    opencl_device: str,
+    seed: int,
+) -> None:
+    commands = [
+        "clear",
+        "units lj",
+        "atom_style atomic",
+        "boundary p p p",
+        f"package gpu 1 platform {opencl_platform}",
+        "suffix gpu",
+        f"region box block 0 {box_length:.12g} 0 {box_length:.12g} 0 {box_length:.12g}",
+        "create_box 1 box",
+        "mass 1 1.0",
+    ]
+    for command in commands:
+        lmp.command(command)
+    for x, y, z in positions:
+        lmp.command(f"create_atoms 1 single {x:.12g} {y:.12g} {z:.12g} units box")
+    for command in (
+        "pair_style lj/cut/gpu 2.5",
+        "pair_coeff 1 1 1.0 1.0 2.5",
+        "neighbor 0.3 bin",
+        "neigh_modify every 1 delay 0 check yes",
+        f"velocity all create {temperature:.12g} {seed} mom yes rot no dist gaussian",
+        "fix integrate all nve",
+        f"timestep {dt:.12g}",
+        "thermo 0",
+    ):
+        lmp.command(command)
+
+
+def _lattice_positions(particles: int, spacing: float) -> tuple[np.ndarray, float]:
+    side = int(np.ceil(particles ** (1.0 / 3.0)))
+    box_length = side * spacing
+    coords = []
+    for z in range(side):
+        for y in range(side):
+            for x in range(side):
+                coords.append(
+                    (
+                        (x + 0.5) * spacing,
+                        (y + 0.5) * spacing,
+                        (z + 0.5) * spacing,
+                    )
+                )
+                if len(coords) == particles:
+                    return np.asarray(coords, dtype=np.float64), box_length
+    raise RuntimeError("failed to generate lattice positions")
+
+
+def _extract_lammps_value(lmp: Any, name: str) -> float:
+    try:
+        return float(lmp.get_thermo(name))
+    except Exception:
+        lmp.command(f"variable benchmark_{name} equal {name}")
+        return float(lmp.extract_variable("benchmark_" + name, None, 0))
+
+
+def _blocked_payload(args: argparse.Namespace, *, blocker: str) -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "engine": ENGINE,
+        "benchmark_name": BENCHMARK_NAME,
+        "fixture": args.fixture,
+        "hardware": _hardware_info(),
+        "runtime": {
+            "python_version": platform_module.python_version(),
+            "reference_engine_version": None,
+            "opencl_platform": args.opencl_platform,
+            "opencl_device": None,
+            "requested_opencl_device": args.opencl_device,
+            "opencl_device_applied": False,
+            "pair_style": "lj/cut/gpu",
+        },
+        "lammps_version": None,
+        "particles": args.particles,
+        "atom_count": args.particles,
+        "steps": args.steps,
+        "step_count": args.steps,
+        "warmup_steps": args.warmup_steps,
+        "dt": args.dt,
+        "simulated_time_lj": args.steps * args.dt,
+        "wall_s": None,
+        "steps_per_s": None,
+        "opencl_platform": args.opencl_platform,
+        "opencl_device": None,
+        "requested_opencl_device": args.opencl_device,
+        "opencl_device_applied": False,
+        "temperature_lj": args.temperature,
+        "spacing_lj": args.spacing,
+        "box_length_lj": None,
+        "potential_energy_lj": None,
+        "kinetic_energy_lj": None,
+        "finite": False,
+        "blocker": blocker,
+    }
+
+
+def _normalize_reference_payload(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    payload = dict(payload)
+    payload["timing_value"] = payload.get(TIMING_METRIC)
+    return normalize_benchmark_payload(
+        payload,
+        benchmark_name=BENCHMARK_NAME,
+        fixture=args.fixture,
+        timing_metric=TIMING_METRIC,
+        hardware=payload.get("hardware") or _hardware_info(),
+        runtime=payload.get("runtime") or {},
+        engine=ENGINE,
+        atom_count=args.particles,
+        step_count=args.steps,
+        evaluation_count=args.steps,
+        finite=bool(payload.get("finite")),
+        status=payload.get("status"),
+        blocker=payload.get("blocker"),
+        command=COMMAND,
+        raw_output_path=None,
+    )
+
+
+def _hardware_info() -> dict[str, str]:
+    return {
+        "system": platform_module.system(),
+        "release": platform_module.release(),
+        "machine": platform_module.machine(),
+        "processor": platform_module.processor(),
+        "python_version": platform_module.python_version(),
+        "platform": platform_module.platform(),
+    }
+
+
+def _format_human_payload(payload: dict[str, Any]) -> str:
+    if payload.get("status") == "blocked":
+        return (
+            f"LAMMPS OpenCL {payload['particles']} atoms: blocked; "
+            f"blocker={payload.get('blocker')}"
+        )
+    return "LAMMPS OpenCL {particles} atoms: {steps_per_s:.1f} steps/s".format(**payload)
+
+
+def _write_csv(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        key: json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else value
+        for key, value in payload.items()
+    }
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--particles", type=int, default=4096)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--dt", type=float, default=0.005)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--spacing", type=float, default=1.2)
+    parser.add_argument("--fixture", default=FIXTURE)
+    parser.add_argument("--opencl-platform", default="0")
+    parser.add_argument("--opencl-device", default="0")
+    parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--csv", type=Path)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    main()

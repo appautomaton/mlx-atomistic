@@ -1,4 +1,5 @@
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,6 +8,7 @@ import pytest
 from mlx_atomistic.artifacts import (
     MLXCompatibilityError,
     PreparedMLXArtifact,
+    artifact_readiness_report,
     build_mlx_system_from_artifact,
     load_prepared_mlx_artifact,
     validate_mlx_compatibility,
@@ -69,6 +71,200 @@ def _production_fixture():
     )
 
 
+def _rb_production_fixture():
+    prepared = synthetic_prepared_system()
+    n_atoms = 4
+    positions = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    metadata = replace(
+        prepared.metadata,
+        units={
+            "coordinates": "angstrom",
+            "mass": "dalton",
+            "charge": "elementary_charge",
+            "energy": "kilojoule_per_mole",
+            "time": "picosecond",
+            "temperature": "kelvin",
+        },
+        compatibility_report={
+            "production_force_field": True,
+            "hydrogens_present": True,
+            "hydrogen_count": n_atoms,
+            "supported_terms": ["nonbonded_lj_coulomb", "rb_dihedral"],
+            "required_terms": ["nonbonded_lj_coulomb", "rb_dihedral"],
+            "unsupported_terms": [],
+        },
+        parameter_source="rb_production_fixture",
+    )
+    return replace(
+        prepared,
+        metadata=metadata,
+        symbols=np.asarray(["H"] * n_atoms, dtype=str),
+        atom_names=np.asarray([f"H{index + 1}" for index in range(n_atoms)], dtype=str),
+        atom_types=np.asarray(["H"] * n_atoms, dtype=str),
+        residue_names=np.asarray(["LIG"] * n_atoms, dtype=str),
+        residue_ids=np.ones((n_atoms,), dtype=np.int32),
+        chain_ids=np.asarray(["A"] * n_atoms, dtype=str),
+        positions=positions,
+        velocities=np.zeros((n_atoms, 3), dtype=np.float32),
+        masses=np.full((n_atoms,), 1.008, dtype=np.float32),
+        charges=np.zeros((n_atoms,), dtype=np.float32),
+        sigma=np.ones((n_atoms,), dtype=np.float32),
+        epsilon=np.zeros((n_atoms,), dtype=np.float32),
+        bonds=np.empty((0, 2), dtype=np.int32),
+        bond_k=np.asarray([], dtype=np.float32),
+        bond_length=np.asarray([], dtype=np.float32),
+        angles=np.empty((0, 3), dtype=np.int32),
+        angle_k=np.asarray([], dtype=np.float32),
+        angle_theta=np.asarray([], dtype=np.float32),
+        dihedrals=np.empty((0, 4), dtype=np.int32),
+        dihedral_k=np.asarray([], dtype=np.float32),
+        dihedral_periodicity=np.asarray([], dtype=np.float32),
+        dihedral_phase=np.asarray([], dtype=np.float32),
+        nonbonded_pairs=np.empty((0, 2), dtype=np.int32),
+        ligand_mask=np.ones((n_atoms,), dtype=bool),
+        receptor_mask=np.zeros((n_atoms,), dtype=bool),
+        restraint_mask=np.zeros((n_atoms,), dtype=bool),
+        reference_positions=positions.copy(),
+        rb_dihedrals=np.asarray([[0, 1, 2, 3]], dtype=np.int32),
+        rb_c0=np.asarray([0.1], dtype=np.float32),
+        rb_c1=np.asarray([0.2], dtype=np.float32),
+        rb_c2=np.asarray([0.3], dtype=np.float32),
+        rb_c3=np.asarray([0.4], dtype=np.float32),
+        rb_c4=np.asarray([0.5], dtype=np.float32),
+        rb_c5=np.asarray([0.6], dtype=np.float32),
+    )
+
+
+def _amber_import_fixture():
+    from mlx_atomistic.prep.topology_import import import_amber_prmtop
+
+    return import_amber_prmtop(
+        prmtop_path=Path("tests/fixtures/amber/alanine-dipeptide-implicit.prmtop"),
+        coords_path=Path("tests/fixtures/amber/alanine-dipeptide-implicit.inpcrd"),
+    )
+
+
+def _charmm_import_fixture():
+    from mlx_atomistic.prep import import_charmm_psf
+
+    fixture_root = Path("tests/fixtures/charmm")
+    return import_charmm_psf(
+        psf_path=fixture_root / "native-mini.psf",
+        params=[fixture_root / "native-mini.prm"],
+        coords_path=fixture_root / "native-mini.pdb",
+    )
+
+
+def _gromacs_import_fixture():
+    from mlx_atomistic.prep import import_gromacs_top_gro
+
+    fixture_root = Path("tests/fixtures/gromacs")
+    return import_gromacs_top_gro(
+        top_path=fixture_root / "native-mini.top",
+        gro_path=fixture_root / "native-mini.gro",
+    )
+
+
+def _expected_runtime_term_names(prepared):
+    names = []
+    if np.asarray(prepared.bonds).shape[0]:
+        names.append("bond")
+    if np.asarray(prepared.angles).shape[0]:
+        names.append("angle")
+    if np.asarray(prepared.dihedrals).shape[0]:
+        names.append("dihedral")
+    if np.asarray(prepared.rb_dihedrals).shape[0]:
+        names.append("rb_dihedral")
+    if np.asarray(prepared.impropers).shape[0]:
+        names.append("improper")
+    report_terms = set(prepared.metadata.compatibility_report["required_terms_normalized"])
+    if "urey_bradley" in report_terms:
+        names.append("urey_bradley")
+    if "charmm_cmap" in report_terms:
+        names.append("charmm_cmap_terms")
+    names.append("nonbonded")
+    return names
+
+
+def _expected_array_term_counts(prepared):
+    counts = {
+        "harmonic_bond": int(np.asarray(prepared.bonds).shape[0]),
+        "harmonic_angle": int(np.asarray(prepared.angles).shape[0]),
+        "periodic_dihedral": int(np.asarray(prepared.dihedrals).shape[0]),
+        "periodic_improper": int(np.asarray(prepared.impropers).shape[0]),
+        "rb_dihedral": int(np.asarray(prepared.rb_dihedrals).shape[0]),
+        "distance_constraint": int(np.asarray(prepared.constraints).shape[0]),
+        "nonbonded_exception": int(np.asarray(prepared.nonbonded_exception_pairs).shape[0]),
+        "charmm_cmap": int(np.asarray(prepared.charmm_cmap_terms).shape[0]),
+        "urey_bradley": int(np.asarray(prepared.urey_bradley_terms).shape[0]),
+        "nbfix_pair_overrides": int(np.asarray(prepared.nbfix_pairs).shape[0])
+        + int(np.asarray(prepared.nbfix_type_pairs).shape[0]),
+    }
+    return {key: value for key, value in counts.items() if value > 0}
+
+
+def _prepared_arrays(prepared):
+    return {
+        name: np.asarray(getattr(prepared, name))
+        for name in (
+            "symbols",
+            "atom_names",
+            "atom_types",
+            "positions",
+            "velocities",
+            "masses",
+            "charges",
+            "sigma",
+            "epsilon",
+            "bonds",
+            "bond_k",
+            "bond_length",
+            "angles",
+            "angle_k",
+            "angle_theta",
+            "dihedrals",
+            "dihedral_k",
+            "dihedral_periodicity",
+            "dihedral_phase",
+            "rb_dihedrals",
+            "rb_c0",
+            "rb_c1",
+            "rb_c2",
+            "rb_c3",
+            "rb_c4",
+            "rb_c5",
+            "constraints",
+            "constraint_distance",
+            "impropers",
+            "nonbonded_pairs",
+            "nonbonded_exception_pairs",
+            "nonbonded_exception_charge_product",
+            "nonbonded_exception_sigma",
+            "nonbonded_exception_epsilon",
+            "charmm_cmap_terms",
+            "charmm_cmap_grid_indices",
+            "charmm_cmap_grids",
+            "urey_bradley_terms",
+            "urey_bradley_k",
+            "urey_bradley_distance",
+            "nbfix_pairs",
+            "nbfix_sigma",
+            "nbfix_epsilon",
+            "nbfix_type_pairs",
+            "nbfix_type_sigma",
+            "nbfix_type_epsilon",
+        )
+    }
+
+
 def test_core_artifact_loader_rejects_non_production_when_required(tmp_path):
     save_prepared_system(synthetic_prepared_system(), tmp_path)
 
@@ -121,6 +317,93 @@ def test_core_artifact_loader_builds_production_system_terms_and_constraints(tmp
     )
     assert tuned_constraints is not None
     assert tuned_constraints.max_iterations == 4
+
+
+def test_rb_artifact_round_trips_and_builds_runtime_term(tmp_path):
+    prepared = _rb_production_fixture()
+    save_prepared_system(prepared, tmp_path)
+
+    loaded = load_prepared_system(tmp_path)
+    artifact = load_prepared_mlx_artifact(tmp_path, require_production=True)
+    system, terms, constraints = build_mlx_system_from_artifact(artifact)
+
+    assert constraints is None
+    np.testing.assert_array_equal(loaded.rb_dihedrals, prepared.rb_dihedrals)
+    np.testing.assert_allclose(loaded.rb_c5, prepared.rb_c5)
+    assert "rb_dihedral" in artifact.metadata["compatibility_report"]["required_terms"]
+    assert [term.name for term in terms] == ["rb_dihedral", "nonbonded"]
+    assert [0, 3] in np.asarray(system.topology.one_four_pairs).tolist()
+    rb_term = terms[0]
+    energy, forces = rb_term.energy_forces(system.positions, system.cell)
+    assert np.isfinite(float(np.asarray(energy)))
+    assert np.all(np.isfinite(np.asarray(forces)))
+
+
+@pytest.mark.parametrize(
+    ("format_name", "prepared_factory", "parser_name"),
+    [
+        ("amber", _amber_import_fixture, "native_amber_prmtop"),
+        ("charmm", _charmm_import_fixture, "native_charmm_psf"),
+        ("gromacs", _gromacs_import_fixture, "native_gromacs_top_gro"),
+    ],
+)
+def test_cross_format_artifact_reports_normalized_compatibility_metadata(
+    tmp_path,
+    format_name,
+    prepared_factory,
+    parser_name,
+):
+    prepared = prepared_factory()
+    artifact_dir = tmp_path / format_name
+    save_prepared_system(prepared, artifact_dir)
+
+    reloaded = load_prepared_system(artifact_dir)
+    artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
+
+    expected_counts = _expected_array_term_counts(prepared)
+    for report in (
+        reloaded.metadata.compatibility_report,
+        artifact.metadata["compatibility_report"],
+    ):
+        normalized_required = set(report["required_terms_normalized"])
+        assert set(report["supported_terms_normalized"]) <= normalized_required
+        assert report["unsupported_terms_normalized"] == []
+        assert report["rejected_terms_normalized"] == []
+        assert report["blockers"] == []
+        assert report["parser_provenance"]["parser"] == parser_name
+        for term_name, count in expected_counts.items():
+            assert report["term_counts_normalized"][term_name] == count
+            assert report["array_term_counts"][term_name] == count
+
+    np.testing.assert_array_equal(
+        artifact.arrays["nonbonded_exception_pairs"],
+        prepared.nonbonded_exception_pairs,
+    )
+    np.testing.assert_array_equal(artifact.arrays["constraints"], prepared.constraints)
+
+
+@pytest.mark.parametrize(
+    ("format_name", "prepared_factory"),
+    [
+        ("amber", _amber_import_fixture),
+        ("charmm", _charmm_import_fixture),
+        ("gromacs", _gromacs_import_fixture),
+    ],
+)
+def test_cross_format_artifact_builds_expected_runtime_terms(
+    tmp_path,
+    format_name,
+    prepared_factory,
+):
+    prepared = prepared_factory()
+    artifact_dir = tmp_path / format_name
+    save_prepared_system(prepared, artifact_dir)
+
+    artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
+    _, terms, constraints = build_mlx_system_from_artifact(artifact)
+
+    assert [term.name for term in terms] == _expected_runtime_term_names(prepared)
+    assert (constraints is not None) == (prepared.constraints.shape[0] > 0)
 
 
 def test_large_artifact_build_defers_dense_topology_pairs(tmp_path):
@@ -224,6 +507,21 @@ def test_artifact_electrostatics_modes_are_validated():
     }
     assert validate_mlx_compatibility(metadata, require_production=True) is not None
 
+    for assignment_order in (4, 5):
+        metadata["pme_config"] = {
+            **metadata["pme_config"],
+            "assignment_order": assignment_order,
+        }
+        assert validate_mlx_compatibility(metadata, require_production=True) is not None
+
+    for assignment_order in (3, 2.5):
+        metadata["pme_config"] = {
+            **metadata["pme_config"],
+            "assignment_order": assignment_order,
+        }
+        with pytest.raises(MLXCompatibilityError, match="pme_assignment_order"):
+            validate_mlx_compatibility(metadata, require_production=True)
+
     metadata["compatibility_report"]["electrostatics_model"] = "reaction_field"
     with pytest.raises(MLXCompatibilityError, match="unknown electrostatics mode"):
         validate_mlx_compatibility(metadata, require_production=True)
@@ -253,6 +551,82 @@ def test_virtual_site_water_model_fails_closed(tmp_path):
 
     with pytest.raises(MLXCompatibilityError, match="virtual_site water model"):
         load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_artifact_round_trip_preserves_blockers_and_blocks_advanced_water(tmp_path):
+    prepared = _production_fixture()
+    metadata = replace(
+        prepared.metadata,
+        source={"kind": "amber", "parser": "native_amber_prmtop"},
+        compatibility_report={
+            **prepared.metadata.compatibility_report,
+            "unsupported_terms": ["virtual_sites"],
+            "rejected_terms": ["advanced_water"],
+            "blockers": ["parser:advanced_water"],
+        },
+    )
+    save_prepared_system(replace(prepared, metadata=metadata), tmp_path)
+
+    reloaded = load_prepared_system(tmp_path)
+    report = reloaded.metadata.compatibility_report
+
+    assert report["unsupported_terms_normalized"] == ["virtual_site"]
+    assert report["rejected_terms_normalized"] == ["virtual_site"]
+    assert "parser:advanced_water" in report["blockers"]
+    assert "unsupported_terms:virtual_site" in report["blockers"]
+    assert "rejected_terms:virtual_site" in report["blockers"]
+    assert report["parser_provenance"]["parser"] == "native_amber_prmtop"
+    with pytest.raises(MLXCompatibilityError, match="unsupported force-field terms"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_artifact_loader_rejects_term_count_metadata_mismatch(tmp_path):
+    prepared = _production_fixture()
+    metadata = replace(
+        prepared.metadata,
+        compatibility_report={
+            **prepared.metadata.compatibility_report,
+            "term_counts": {"bonds": 999},
+        },
+    )
+    save_prepared_system(replace(prepared, metadata=metadata), tmp_path)
+
+    with pytest.raises(MLXCompatibilityError, match="term_counts metadata"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_validate_mlx_compatibility_rejects_term_count_metadata_mismatch():
+    prepared = _production_fixture()
+    metadata = prepared.metadata.to_json_dict()
+    metadata["compatibility_report"] = {
+        **metadata["compatibility_report"],
+        "term_counts": {"bonds": 999},
+    }
+
+    with pytest.raises(MLXCompatibilityError, match="term_counts metadata"):
+        validate_mlx_compatibility(
+            metadata,
+            require_production=True,
+            arrays=_prepared_arrays(prepared),
+        )
+
+
+def test_artifact_readiness_report_blocks_term_count_metadata_mismatch():
+    prepared = _production_fixture()
+    metadata = prepared.metadata.to_json_dict()
+    metadata["compatibility_report"] = {
+        **metadata["compatibility_report"],
+        "term_counts": {"bonds": 999},
+    }
+
+    report = artifact_readiness_report(
+        metadata,
+        require_production=True,
+        arrays=_prepared_arrays(prepared),
+    )
+
+    assert report.status == "blocked"
+    assert any("term_counts metadata" in blocker for blocker in report.blockers)
 
 
 def test_hidden_hmr_masses_fail_closed_without_policy(tmp_path):
@@ -287,6 +661,11 @@ def test_declared_hmr_masses_are_represented_by_artifact_masses(tmp_path):
 
     assert constraints is not None
     np.testing.assert_allclose(np.asarray(system.masses), [3.024, 13.983])
+    assert artifact.hmr_state == {
+        "status": "represented_by_masses",
+        "provenance_available": False,
+        "policy": {"virtual_sites_supported": False},
+    }
 
 
 def test_hmr_force_term_request_fails_closed(tmp_path):
@@ -471,7 +850,33 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
     assert "pme_diagnostics" in components
 
 
-def _pme_fixture_with_config_arrays():
+@pytest.mark.parametrize("assignment_order", [2, 4, 5])
+def test_prepared_system_validate_accepts_supported_pme_assignment_orders(assignment_order):
+    _pme_fixture_with_config_arrays(assignment_order=assignment_order).validate()
+
+
+@pytest.mark.parametrize("assignment_order", [4, 5])
+def test_pme_artifact_round_trips_and_builds_supported_assignment_order(
+    tmp_path,
+    assignment_order,
+):
+    prepared = _pme_fixture_with_config_arrays(assignment_order=assignment_order)
+    save_prepared_system(prepared, tmp_path)
+
+    loaded = load_prepared_system(tmp_path)
+    artifact = load_prepared_mlx_artifact(tmp_path, require_production=True)
+    _, terms, _ = build_mlx_system_from_artifact(artifact)
+    nonbonded = terms[-1]
+
+    assert loaded.metadata.pme_config["assignment_order"] == assignment_order
+    assert int(loaded.pme_assignment_order[0]) == assignment_order
+    assert artifact.metadata["pme_config"]["assignment_order"] == assignment_order
+    assert int(artifact.arrays["pme_assignment_order"][0]) == assignment_order
+    assert nonbonded.electrostatics == "pme"
+    assert nonbonded.pme_config.assignment_order == assignment_order
+
+
+def _pme_fixture_with_config_arrays(assignment_order=2):
     prepared = _production_fixture()
     metadata = replace(
         prepared.metadata,
@@ -479,7 +884,7 @@ def _pme_fixture_with_config_arrays():
             "mesh_shape": [8, 8, 8],
             "alpha": 0.35,
             "real_cutoff": 5.0,
-            "assignment_order": 2,
+            "assignment_order": assignment_order,
             "charge_tolerance": 1e-5,
         },
         compatibility_report={
@@ -502,7 +907,7 @@ def _pme_fixture_with_config_arrays():
         pme_mesh_shape=np.asarray([8, 8, 8], dtype=np.int32),
         pme_alpha=np.asarray([0.35], dtype=np.float32),
         pme_real_cutoff=np.asarray([5.0], dtype=np.float32),
-        pme_assignment_order=np.asarray([2], dtype=np.int32),
+        pme_assignment_order=np.asarray([assignment_order], dtype=np.int32),
         pme_charge_tolerance=np.asarray([1e-5], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([True], dtype=bool),
     )
@@ -514,6 +919,109 @@ def _replace_npz_array(artifact_dir, name, value):
         payload = {array_name: np.asarray(data[array_name]) for array_name in data.files}
     payload[name] = np.asarray(value)
     np.savez_compressed(npz_path, **payload)
+
+
+def _drop_npz_array(artifact_dir, name):
+    npz_path = artifact_dir / "prepared_system.npz"
+    with np.load(npz_path, allow_pickle=False) as data:
+        payload = {
+            array_name: np.asarray(data[array_name])
+            for array_name in data.files
+            if array_name != name
+        }
+    np.savez_compressed(npz_path, **payload)
+
+
+def test_required_rb_artifact_fails_when_coefficient_array_missing(tmp_path):
+    save_prepared_system(_rb_production_fixture(), tmp_path)
+    _drop_npz_array(tmp_path, "rb_c5")
+
+    with pytest.raises(MLXCompatibilityError, match="rb_c5"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+@pytest.mark.parametrize(
+    ("array_name", "value", "match"),
+    [
+        ("rb_dihedrals", np.asarray([0, 1, 2, 3], dtype=np.int32), "rb_dihedrals"),
+        ("rb_dihedrals", np.asarray([[0, 1, 2, 8]], dtype=np.int32), "rb_dihedrals"),
+        ("rb_c3", np.asarray([0.3, 0.4], dtype=np.float32), "rb_c3"),
+        ("rb_c2", np.asarray([np.nan], dtype=np.float32), "rb_c2"),
+    ],
+)
+def test_rb_artifact_load_rejects_invalid_arrays(tmp_path, array_name, value, match):
+    save_prepared_system(_rb_production_fixture(), tmp_path)
+    _replace_npz_array(tmp_path, array_name, value)
+
+    with pytest.raises(MLXCompatibilityError, match=match):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_rb_arrays_cannot_be_hidden_by_metadata_only(tmp_path):
+    prepared = _rb_production_fixture()
+    report = {
+        **prepared.metadata.compatibility_report,
+        "supported_terms": ["nonbonded_lj_coulomb"],
+        "required_terms": ["nonbonded_lj_coulomb"],
+        "rejected_terms": [],
+    }
+    save_prepared_system(
+        replace(prepared, metadata=replace(prepared.metadata, compatibility_report=report)),
+        tmp_path,
+    )
+
+    with pytest.raises(
+        MLXCompatibilityError,
+        match="undeclared force-field arrays: rb_dihedral",
+    ):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_supported_only_rb_arrays_fail_when_required_terms_skip_runtime(tmp_path):
+    prepared = _rb_production_fixture()
+    report = {
+        **prepared.metadata.compatibility_report,
+        "supported_terms": ["nonbonded_lj_coulomb", "rb_dihedral"],
+        "required_terms": ["nonbonded_lj_coulomb"],
+        "rejected_terms": [],
+    }
+    save_prepared_system(
+        replace(prepared, metadata=replace(prepared.metadata, compatibility_report=report)),
+        tmp_path,
+    )
+
+    with pytest.raises(
+        MLXCompatibilityError,
+        match="undeclared force-field arrays: rb_dihedral",
+    ):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_rb_artifact_fails_closed_with_charmm_force_switch_nonbonded(tmp_path):
+    prepared = _rb_production_fixture()
+    report = {
+        **prepared.metadata.compatibility_report,
+        "supported_terms": [
+            "nonbonded_lj_coulomb",
+            "rb_dihedral",
+            "charmm_force_switch_nonbonded",
+        ],
+        "required_terms": [
+            "nonbonded_lj_coulomb",
+            "rb_dihedral",
+            "charmm_force_switch_nonbonded",
+        ],
+        "rejected_terms": [],
+    }
+    save_prepared_system(
+        replace(prepared, metadata=replace(prepared.metadata, compatibility_report=report)),
+        tmp_path,
+    )
+    artifact = load_prepared_mlx_artifact(tmp_path, require_production=True)
+    artifact.metadata["switch_distance"] = 0.8
+
+    with pytest.raises(MLXCompatibilityError, match="charmm_force_switch_nonbonded"):
+        build_mlx_system_from_artifact(artifact)
 
 
 @pytest.mark.parametrize(
@@ -543,6 +1051,14 @@ def test_pme_artifact_load_rejects_invalid_config_arrays(
     _replace_npz_array(tmp_path, array_name, value)
 
     with pytest.raises(MLXCompatibilityError, match=match):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_pme_artifact_array_config_requires_complete_arrays(tmp_path):
+    save_prepared_system(_pme_fixture_with_config_arrays(), tmp_path)
+    _drop_npz_array(tmp_path, "pme_mesh_shape")
+
+    with pytest.raises(MLXCompatibilityError, match="pme_mesh_shape"):
         load_prepared_mlx_artifact(tmp_path, require_production=True)
 
 
@@ -804,6 +1320,28 @@ def test_charmm_arrays_cannot_be_hidden_by_metadata_only(tmp_path):
     )
 
     with pytest.raises(MLXCompatibilityError, match="undeclared force-field arrays"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
+def test_supported_only_charmm_arrays_fail_when_required_terms_skip_runtime(tmp_path):
+    prepared = _charmm_artifact_fixture()
+    report = {
+        **prepared.metadata.compatibility_report,
+        "supported_terms": [
+            "nonbonded_lj_coulomb",
+            "charmm_cmap_terms",
+            "urey_bradley",
+            "nbfix_pair_overrides",
+        ],
+        "required_terms": ["nonbonded_lj_coulomb"],
+        "rejected_terms": [],
+    }
+    save_prepared_system(
+        replace(prepared, metadata=replace(prepared.metadata, compatibility_report=report)),
+        tmp_path,
+    )
+
+    with pytest.raises(MLXCompatibilityError, match="charmm_cmap"):
         load_prepared_mlx_artifact(tmp_path, require_production=True)
 
 

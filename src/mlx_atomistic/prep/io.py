@@ -14,6 +14,7 @@ from mlx_atomistic.prep.schema import (
     PreparedSystemMetadata,
     empty_indices,
     empty_string_pairs,
+    normalize_compatibility_report,
 )
 
 JSON_NAME = "prepared_system.json"
@@ -52,6 +53,14 @@ NPZ_ARRAY_NAMES = (
 
 OPTIONAL_NPZ_ARRAY_DEFAULTS = {
     "cell_lengths": lambda: np.asarray([], dtype=np.float32),
+    "cell_matrix": lambda: np.asarray([], dtype=np.float32),
+    "rb_dihedrals": lambda: empty_indices(4),
+    "rb_c0": lambda: np.asarray([], dtype=np.float32),
+    "rb_c1": lambda: np.asarray([], dtype=np.float32),
+    "rb_c2": lambda: np.asarray([], dtype=np.float32),
+    "rb_c3": lambda: np.asarray([], dtype=np.float32),
+    "rb_c4": lambda: np.asarray([], dtype=np.float32),
+    "rb_c5": lambda: np.asarray([], dtype=np.float32),
     "constraints": lambda: empty_indices(2),
     "constraint_distance": lambda: np.asarray([], dtype=np.float32),
     "impropers": lambda: empty_indices(4),
@@ -65,6 +74,8 @@ OPTIONAL_NPZ_ARRAY_DEFAULTS = {
     "water_mask": lambda: np.asarray([], dtype=bool),
     "ion_mask": lambda: np.asarray([], dtype=bool),
     "lipid_mask": lambda: np.asarray([], dtype=bool),
+    "gbsa_radius": lambda: np.asarray([], dtype=np.float32),
+    "gbsa_scale": lambda: np.asarray([], dtype=np.float32),
     "pme_mesh_shape": lambda: np.asarray([], dtype=np.int32),
     "pme_alpha": lambda: np.asarray([], dtype=np.float32),
     "pme_real_cutoff": lambda: np.asarray([], dtype=np.float32),
@@ -83,6 +94,9 @@ OPTIONAL_NPZ_ARRAY_DEFAULTS = {
     "nbfix_type_pairs": empty_string_pairs,
     "nbfix_type_sigma": lambda: np.asarray([], dtype=np.float32),
     "nbfix_type_epsilon": lambda: np.asarray([], dtype=np.float32),
+    "virtual_site_parent_atoms": lambda: empty_indices(4),
+    "virtual_site_weights": lambda: np.empty((0, 4), dtype=np.float32),
+    "virtual_site_types": lambda: np.asarray([], dtype=str),
 }
 
 
@@ -107,14 +121,22 @@ def save_prepared_system(prepared: PreparedSystem, out_dir: str | Path) -> None:
     prepared.validate()
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    metadata = _as_jsonable(prepared.metadata.to_json_dict())
+    array_payload = {
+        name: np.asarray(getattr(prepared, name))
+        for name in (*NPZ_ARRAY_NAMES, *OPTIONAL_NPZ_ARRAY_DEFAULTS)
+    }
+    metadata = prepared.metadata.to_json_dict()
+    metadata["compatibility_report"] = normalize_compatibility_report(
+        metadata.get("compatibility_report", {}),
+        source=metadata.get("source", {}),
+        parameter_source=str(metadata.get("parameter_source", "")),
+        arrays=array_payload,
+    )
+    metadata = _as_jsonable(metadata)
     (out_path / JSON_NAME).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     np.savez_compressed(
         out_path / NPZ_NAME,
-        **{
-            name: np.asarray(getattr(prepared, name))
-            for name in (*NPZ_ARRAY_NAMES, *OPTIONAL_NPZ_ARRAY_DEFAULTS)
-        },
+        **array_payload,
     )
     write_view_pdb(out_path / VIEW_PDB_NAME, prepared)
 

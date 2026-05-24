@@ -7,6 +7,9 @@ from typing import Any
 
 import numpy as np
 
+from mlx_atomistic.compatibility import normalize_compatibility_report
+from mlx_atomistic.pme import PME_SUPPORTED_ASSIGNMENT_ORDERS
+
 ARTIFACT_VERSION = 2
 SUPPORTED_ARTIFACT_VERSIONS = frozenset({1, ARTIFACT_VERSION})
 
@@ -25,6 +28,23 @@ class PreparedSystemMetadata:
     created_at: str | None = None
     pme_config: dict[str, Any] = field(default_factory=dict)
     protocol_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", dict(self.source))
+        object.__setattr__(self, "selections", dict(self.selections))
+        object.__setattr__(self, "units", dict(self.units))
+        object.__setattr__(self, "warnings", [str(item) for item in self.warnings])
+        object.__setattr__(self, "pme_config", dict(self.pme_config))
+        object.__setattr__(self, "protocol_metadata", dict(self.protocol_metadata))
+        object.__setattr__(
+            self,
+            "compatibility_report",
+            normalize_compatibility_report(
+                self.compatibility_report,
+                source=self.source,
+                parameter_source=self.parameter_source,
+            ),
+        )
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +111,14 @@ class PreparedSystem:
     cell_lengths: np.ndarray = field(
         default_factory=lambda: np.asarray([], dtype=np.float32)
     )
+    cell_matrix: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    rb_dihedrals: np.ndarray = field(default_factory=lambda: empty_indices(4))
+    rb_c0: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    rb_c1: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    rb_c2: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    rb_c3: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    rb_c4: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    rb_c5: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
     constraints: np.ndarray = field(default_factory=lambda: empty_indices(2))
     constraint_distance: np.ndarray = field(
         default_factory=lambda: np.asarray([], dtype=np.float32)
@@ -114,6 +142,8 @@ class PreparedSystem:
     water_mask: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
     ion_mask: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
     lipid_mask: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
+    gbsa_radius: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    gbsa_scale: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
     pme_mesh_shape: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int32))
     pme_alpha: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
     pme_real_cutoff: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
@@ -144,6 +174,13 @@ class PreparedSystem:
     nbfix_type_pairs: np.ndarray = field(default_factory=lambda: empty_string_pairs())
     nbfix_type_sigma: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
     nbfix_type_epsilon: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.float32))
+    virtual_site_parent_atoms: np.ndarray = field(default_factory=lambda: empty_indices(4))
+    virtual_site_weights: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 4), dtype=np.float32)
+    )
+    virtual_site_types: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=str)
+    )
 
     @property
     def atom_count(self) -> int:
@@ -191,9 +228,11 @@ class PreparedSystem:
             if array.size != 0 and array.shape != (n_atoms,):
                 msg = f"{name} must be empty or have shape ({n_atoms},)"
                 raise ValueError(msg)
+        self._validate_gbsa_arrays()
         self._validate_index_array("bonds", 2)
         self._validate_index_array("angles", 3)
         self._validate_index_array("dihedrals", 4)
+        self._validate_index_array("rb_dihedrals", 4)
         self._validate_index_array("impropers", 4)
         self._validate_index_array("nonbonded_pairs", 2)
         self._validate_index_array("constraints", 2)
@@ -209,6 +248,9 @@ class PreparedSystem:
         self._validate_parameter_length("dihedral_k", "dihedrals")
         self._validate_parameter_length("dihedral_periodicity", "dihedrals")
         self._validate_parameter_length("dihedral_phase", "dihedrals")
+        for name in ("rb_c0", "rb_c1", "rb_c2", "rb_c3", "rb_c4", "rb_c5"):
+            self._validate_parameter_length(name, "rb_dihedrals")
+            self._validate_finite_parameter(name)
         self._validate_parameter_length("improper_k", "impropers")
         self._validate_parameter_length("improper_periodicity", "impropers")
         self._validate_parameter_length("improper_phase", "impropers")
@@ -229,6 +271,7 @@ class PreparedSystem:
         self._validate_nbfix_parameters()
         self._validate_pme_arrays()
         self._validate_charmm_cmap_grids()
+        self._validate_virtual_site_arrays()
         cell_lengths = np.asarray(self.cell_lengths, dtype=np.float32)
         if cell_lengths.size not in {0, 3}:
             msg = "cell_lengths must be empty or have shape (3,)"
@@ -236,6 +279,23 @@ class PreparedSystem:
         if cell_lengths.size == 3 and cell_lengths.shape != (3,):
             msg = "cell_lengths must be empty or have shape (3,)"
             raise ValueError(msg)
+        cell_matrix = np.asarray(self.cell_matrix, dtype=np.float32)
+        if cell_matrix.size not in {0, 9}:
+            msg = "cell_matrix must be empty or have shape (3, 3)"
+            raise ValueError(msg)
+        if cell_matrix.size == 9:
+            if cell_matrix.shape != (3, 3):
+                msg = "cell_matrix must be empty or have shape (3, 3)"
+                raise ValueError(msg)
+            determinant = float(np.linalg.det(cell_matrix.astype(np.float64)))
+            if not np.isfinite(determinant) or determinant <= 0.0:
+                msg = "cell_matrix must have a positive non-singular determinant"
+                raise ValueError(msg)
+            if cell_lengths.size == 3:
+                matrix_lengths = np.linalg.norm(cell_matrix, axis=1).astype(np.float32)
+                if not np.allclose(cell_lengths, matrix_lengths, rtol=1e-5, atol=1e-5):
+                    msg = "cell_lengths must match cell_matrix vector lengths"
+                    raise ValueError(msg)
         if self.metadata.artifact_version not in SUPPORTED_ARTIFACT_VERSIONS:
             msg = (
                 f"unsupported artifact version {self.metadata.artifact_version}; "
@@ -261,6 +321,16 @@ class PreparedSystem:
             msg = f"{parameter_name} must have shape ({index_count},)"
             raise ValueError(msg)
 
+    def _validate_finite_parameter(self, parameter_name: str) -> None:
+        try:
+            values = np.asarray(getattr(self, parameter_name), dtype=np.float32)
+        except (TypeError, ValueError) as err:
+            msg = f"{parameter_name} values must be finite"
+            raise ValueError(msg) from err
+        if values.size and not np.all(np.isfinite(values)):
+            msg = f"{parameter_name} values must be finite"
+            raise ValueError(msg)
+
     def _validate_string_pair_array(self, name: str) -> None:
         array = np.asarray(getattr(self, name), dtype=str)
         if array.ndim != 2 or array.shape[1] != 2:
@@ -283,6 +353,24 @@ class PreparedSystem:
             if epsilon.size and (not np.all(np.isfinite(epsilon)) or np.any(epsilon < 0.0)):
                 msg = f"{epsilon_name} values must be finite and non-negative"
                 raise ValueError(msg)
+
+    def _validate_gbsa_arrays(self) -> None:
+        radius = np.asarray(self.gbsa_radius, dtype=np.float32)
+        scale = np.asarray(self.gbsa_scale, dtype=np.float32)
+        if radius.size == 0 and scale.size == 0:
+            return
+        if radius.shape != (self.atom_count,):
+            msg = f"gbsa_radius must be empty or have shape ({self.atom_count},)"
+            raise ValueError(msg)
+        if scale.shape != (self.atom_count,):
+            msg = f"gbsa_scale must be empty or have shape ({self.atom_count},)"
+            raise ValueError(msg)
+        if not np.all(np.isfinite(radius)) or np.any(radius <= 0.0):
+            msg = "gbsa_radius values must be finite and positive"
+            raise ValueError(msg)
+        if not np.all(np.isfinite(scale)) or np.any(scale < 0.0):
+            msg = "gbsa_scale values must be finite and non-negative"
+            raise ValueError(msg)
 
     def _validate_pme_arrays(self) -> None:
         mesh_shape = np.asarray(self.pme_mesh_shape)
@@ -320,7 +408,7 @@ class PreparedSystem:
                 raise ValueError(msg)
         alpha = float(np.asarray(self.pme_alpha, dtype=np.float32)[0])
         real_cutoff = float(np.asarray(self.pme_real_cutoff, dtype=np.float32)[0])
-        assignment_order = float(np.asarray(self.pme_assignment_order, dtype=np.float32)[0])
+        assignment_order = float(np.asarray(self.pme_assignment_order, dtype=np.float64)[0])
         charge_tolerance = float(np.asarray(self.pme_charge_tolerance, dtype=np.float32)[0])
         if not np.isfinite(alpha) or alpha <= 0.0:
             msg = "pme_alpha must be finite and positive"
@@ -331,9 +419,9 @@ class PreparedSystem:
         if (
             not np.isfinite(assignment_order)
             or assignment_order != np.floor(assignment_order)
-            or int(assignment_order) != 2
+            or int(assignment_order) not in PME_SUPPORTED_ASSIGNMENT_ORDERS
         ):
-            msg = "pme_assignment_order must be 2"
+            msg = "pme_assignment_order must be one of 2, 4, or 5"
             raise ValueError(msg)
         if not np.isfinite(charge_tolerance) or charge_tolerance < 0.0:
             msg = "pme_charge_tolerance must be finite and non-negative"
@@ -356,6 +444,32 @@ class PreparedSystem:
         indices = np.asarray(self.charmm_cmap_grid_indices, dtype=np.int32)
         if indices.size and (np.any(indices < 0) or np.any(indices >= grids.shape[0])):
             msg = "charmm_cmap_grid_indices contain indices outside charmm_cmap_grids"
+            raise ValueError(msg)
+
+    def _validate_virtual_site_arrays(self) -> None:
+        parent_atoms = np.asarray(self.virtual_site_parent_atoms, dtype=np.int32)
+        weights = np.asarray(self.virtual_site_weights, dtype=np.float32)
+        types = np.asarray(self.virtual_site_types, dtype=str)
+        if parent_atoms.size == 0:
+            return
+        n_sites = parent_atoms.shape[0]
+        if parent_atoms.ndim != 2 or parent_atoms.shape[1] != 4:
+            msg = "virtual_site_parent_atoms must have shape (n, 4)"
+            raise ValueError(msg)
+        if np.any(parent_atoms < -1) or np.any(parent_atoms >= self.atom_count):
+            msg = "virtual_site_parent_atoms contain atom indices outside [0, atom_count)"
+            raise ValueError(msg)
+        if np.any(np.all(parent_atoms < 0, axis=1)):
+            msg = "virtual_site_parent_atoms rows must contain at least one parent atom"
+            raise ValueError(msg)
+        if weights.ndim != 2 or weights.shape != (n_sites, 4):
+            msg = f"virtual_site_weights must have shape ({n_sites}, 4)"
+            raise ValueError(msg)
+        if not np.all(np.isfinite(weights)):
+            msg = "virtual_site_weights must be finite"
+            raise ValueError(msg)
+        if types.shape != (n_sites,):
+            msg = f"virtual_site_types must have shape ({n_sites},)"
             raise ValueError(msg)
 
 

@@ -78,9 +78,13 @@ from mlx_atomistic.dft.pseudopotentials import (
     read_upf,
 )
 from mlx_atomistic.dft.references import (
+    DFTQMScopeEntry,
+    DFTQMScopeReport,
     ReferenceComparisonResult,
     ReferenceDFTCase,
     compare_reference_case,
+    dft_qm_scope_readiness_report,
+    get_dft_qm_scope_report,
 )
 from mlx_atomistic.dft.restart import (
     DenseSCFRestart,
@@ -101,6 +105,8 @@ from mlx_atomistic.dft.xc import (
 __all__ = [
     "BandPath",
     "BandStructureResult",
+    "DFTQMScopeEntry",
+    "DFTQMScopeReport",
     "DFTSystem",
     "DavidsonDiagonalizer",
     "DenseHamiltonianReference",
@@ -155,12 +161,14 @@ __all__ = [
     "center_center_forces",
     "compare_reference_case",
     "density_from_orbitals",
+    "dft_qm_scope_readiness_report",
     "electron_count",
     "energy_decomposition",
     "fft3",
     "fft_backend",
     "finite_difference_stress",
     "geometry_demo_system",
+    "get_dft_qm_scope_report",
     "hartree_potential",
     "ifft3",
     "lda_exchange_energy_potential",

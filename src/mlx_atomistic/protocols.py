@@ -21,6 +21,7 @@ from mlx_atomistic.md import (
 )
 from mlx_atomistic.minimize import MinimizationResult, minimize_energy
 from mlx_atomistic.neighbors import NeighborListManager
+from mlx_atomistic.runtime import ReadinessReport
 from mlx_atomistic.units import MDUnitSystem
 
 NVT_PROOF_MODE = "short_nvt"
@@ -125,9 +126,7 @@ def validate_gpcrmd_protocol_request(
     requested_ensemble = str(
         _first_present(ensemble, metadata.get("ensemble"), "NVT")
     ).strip()
-    requested_proof_mode = str(
-        _first_present(proof_mode, metadata.get("proof_mode"), NVT_PROOF_MODE)
-    ).strip()
+    requested_proof_mode = _first_present(proof_mode, metadata.get("proof_mode"))
     requested_barostat = _first_present(
         barostat,
         metadata.get("barostat"),
@@ -145,16 +144,29 @@ def validate_gpcrmd_protocol_request(
     )
 
     normalized_ensemble = requested_ensemble.lower()
-    normalized_proof_mode = requested_proof_mode.lower()
+    normalized_proof_mode = (
+        "" if requested_proof_mode is None else str(requested_proof_mode).strip().lower()
+    )
     npt_barostat_requested = (
         "npt" in normalized_ensemble or _is_requested(requested_npt_barostat)
     )
     barostat_requested = _is_requested(requested_barostat)
     membrane_barostat_requested = _is_requested(requested_membrane_barostat)
     requested_barostat_name = str(requested_barostat).strip().lower().replace("-", "_")
+    supported_mc_names = {
+        "monte_carlo",
+        "montecarlo",
+        "mc",
+        "isotropic",
+        "anisotropic",
+        "membrane",
+        "semi_isotropic",
+        "semiisotropic",
+    }
     monte_carlo_npt = npt_barostat_requested and (
         requested_barostat is True
-        or requested_barostat_name in {"monte_carlo", "montecarlo", "mc"}
+        or requested_barostat_name in supported_mc_names
+        or membrane_barostat_requested
     )
     blockers: list[str] = []
 
@@ -164,16 +176,20 @@ def validate_gpcrmd_protocol_request(
     elif normalized_ensemble != SUPPORTED_GPCRMD_PROOF_ENSEMBLE:
         blockers.append("unsupported_ensemble")
     expected_proof_mode = NPT_PROOF_MODE if npt_barostat_requested else NVT_PROOF_MODE
-    if normalized_proof_mode not in {NVT_PROOF_MODE, expected_proof_mode}:
+    if not normalized_proof_mode:
+        normalized_proof_mode = expected_proof_mode
+    if normalized_proof_mode != expected_proof_mode:
         blockers.append("unsupported_proof_mode")
     if barostat_requested and not npt_barostat_requested:
         blockers.append("barostat")
-    if membrane_barostat_requested:
+    if membrane_barostat_requested and not npt_barostat_requested:
         blockers.append("membrane_barostat")
 
     blocker_tuple = tuple(dict.fromkeys(blockers))
     barostat_value = "none"
-    if monte_carlo_npt:
+    if monte_carlo_npt and membrane_barostat_requested:
+        barostat_value = "monte_carlo_membrane"
+    elif monte_carlo_npt:
         barostat_value = "monte_carlo"
     elif barostat_requested:
         barostat_value = str(requested_barostat)
@@ -202,12 +218,46 @@ def validate_gpcrmd_protocol_request(
             "barostat_status": barostat_status,
             "npt_barostat": npt_barostat_requested,
             "membrane_barostat": membrane_barostat_requested,
+            "barostat_mode": "membrane"
+            if membrane_barostat_requested
+            else requested_barostat_name
+            if requested_barostat_name in {"anisotropic", "membrane", "semi_isotropic"}
+            else "isotropic"
+            if monte_carlo_npt
+            else "none",
             "unsupported_protocol_blockers": list(blocker_tuple),
         },
     )
     if blocker_tuple and raise_on_blockers:
         raise ProtocolCompatibilityError(report)
     return report
+
+
+def protocol_readiness_report(
+    protocol_metadata: Mapping[str, Any] | None = None,
+    *,
+    ensemble: str | None = None,
+    proof_mode: str | None = None,
+    barostat: str | bool | None = None,
+    npt_barostat: bool | None = None,
+    membrane_barostat: str | bool | None = None,
+) -> ReadinessReport:
+    """Return the protocol gate as a shared readiness report."""
+
+    report = validate_gpcrmd_protocol_request(
+        protocol_metadata,
+        ensemble=ensemble,
+        proof_mode=proof_mode,
+        barostat=barostat,
+        npt_barostat=npt_barostat,
+        membrane_barostat=membrane_barostat,
+    )
+    return ReadinessReport(
+        name="protocol",
+        status="proof-level" if report.accepted else "blocked",
+        blockers=report.blockers,
+        metadata=report.metadata,
+    )
 
 
 def run_minimize_then_nvt(
@@ -395,6 +445,7 @@ __all__ = [
     "ProtocolCompatibilityError",
     "ProtocolCompatibilityReport",
     "ProtocolResult",
+    "protocol_readiness_report",
     "run_minimize_then_nvt",
     "validate_gpcrmd_protocol_request",
 ]

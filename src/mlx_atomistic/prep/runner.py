@@ -7,13 +7,16 @@ import os
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.artifacts import (
     MLXCompatibilityError,
     PreparedMLXArtifact,
+    artifact_readiness_report,
     build_mlx_system_from_artifact,
     load_prepared_mlx_artifact,
     validate_mlx_compatibility,
@@ -34,6 +37,7 @@ from mlx_atomistic.md import (
     simulate_npt,
     simulate_nvt,
 )
+from mlx_atomistic.minimize import minimize_energy
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import pme_readiness_report
 from mlx_atomistic.prep.gpcrmd import (
@@ -56,9 +60,11 @@ from mlx_atomistic.prep.schema import PreparedSystem
 from mlx_atomistic.protocols import (
     MinimizeThenNVTProtocol,
     ProtocolCompatibilityError,
+    protocol_readiness_report,
     run_minimize_then_nvt,
     validate_gpcrmd_protocol_request,
 )
+from mlx_atomistic.runtime import get_platform_boundary_report
 from mlx_atomistic.steering import SteeredCOMBiasPotential, simulate_steered_nvt
 from mlx_atomistic.trajectory_adapters import write_mdtraj_trajectory
 from mlx_atomistic.units import ATM_TO_KJ_PER_MOL_ANGSTROM3, MDUnitSystem
@@ -158,6 +164,160 @@ def initialize_velocities(
     )
     velocities[dynamic_mask] -= com_velocity
     return velocities.astype(np.float32)
+
+
+def _initialize_system_velocities(
+    system,
+    masses: np.ndarray,
+    *,
+    temperature: float,
+    seed: int | None,
+    kinetic_energy_scale: float = 1.0,
+    boltzmann_constant: float = 1.0,
+) -> np.ndarray:
+    velocities = np.asarray(system.velocities, dtype=np.float32).copy()
+    if not np.allclose(velocities, 0.0) or temperature <= 0.0:
+        return velocities
+
+    rng = np.random.default_rng(seed)
+    dynamic_mask = np.ones((len(masses),), dtype=bool)
+    variance = (
+        boltzmann_constant
+        * temperature
+        / (kinetic_energy_scale * np.maximum(masses[dynamic_mask], 1e-6))
+    )
+    random_velocities = rng.normal(
+        0.0,
+        1.0,
+        size=(int(np.count_nonzero(dynamic_mask)), 3),
+    )
+    velocities[dynamic_mask] = random_velocities * np.sqrt(variance)[:, None]
+    total_mass = float(np.sum(masses[dynamic_mask]))
+    com_velocity = (
+        np.sum(velocities[dynamic_mask] * masses[dynamic_mask, None], axis=0) / total_mass
+    )
+    velocities[dynamic_mask] -= com_velocity
+    return velocities.astype(np.float32)
+
+
+def _simulation_config_with_virtual_sites(*, virtual_sites=None, **kwargs) -> SimulationConfig:
+    return SimulationConfig(virtual_sites=virtual_sites, **kwargs)
+
+
+class _VirtualSiteForceAdapter:
+    name = "virtual_site_force_adapter"
+    supports_virial = True
+
+    def __init__(self, force_terms, virtual_sites):
+        self.force_terms = tuple(force_terms)
+        self.virtual_sites = virtual_sites
+
+    def energy_forces(self, positions, cell=None, pairs=None):
+        del pairs
+        eval_positions = self.virtual_sites.extend_positions(positions)
+        total = mx.array(0.0, dtype=mx.float32)
+        total_forces = mx.zeros_like(eval_positions)
+        for term in self.force_terms:
+            energy, forces = term.energy_forces(eval_positions, cell=cell, pairs=None)
+            total = total + energy
+            total_forces = total_forces + forces
+        return total, self.virtual_sites.redistribute_forces(total_forces, eval_positions)
+
+
+def _run_virtual_site_minimize_then_nvt(
+    positions,
+    velocities,
+    masses,
+    force_terms,
+    *,
+    protocol: MinimizeThenNVTProtocol,
+    virtual_sites,
+    cell,
+    constraints,
+    unit_system,
+    reporters=None,
+):
+    simulation_units = {}
+    if unit_system is not None:
+        simulation_units = {
+            "kinetic_energy_scale": unit_system.kinetic_energy_scale,
+            "force_to_acceleration_scale": unit_system.force_to_acceleration_scale,
+            "boltzmann_constant": unit_system.boltzmann_constant,
+        }
+    minimized = minimize_energy(
+        positions,
+        _VirtualSiteForceAdapter(force_terms, virtual_sites),
+        cell=cell,
+        max_steps=protocol.minimize_steps,
+        step_size=protocol.minimize_step_size,
+        force_tolerance=protocol.force_tolerance,
+    )
+    thermostat = LangevinThermostat(
+        temperature=protocol.temperature,
+        friction=protocol.friction,
+        seed=protocol.seed,
+    )
+    start_positions = minimized.positions
+    start_velocities = velocities
+    if constraints is not None:
+        start_positions, _ = constraints.apply_positions(start_positions, masses, cell)
+        start_velocities = constraints.apply_velocities(
+            start_positions,
+            start_velocities,
+            masses,
+            cell,
+        )
+    start_velocities = _project_and_rescale_velocities(
+        np.asarray(start_velocities, dtype=np.float32),
+        positions=np.asarray(start_positions, dtype=np.float32),
+        masses=masses,
+        constraints=None,
+        cell=cell,
+        temperature=protocol.temperature,
+        kinetic_energy_scale=simulation_units.get("kinetic_energy_scale", 1.0),
+        boltzmann_constant=simulation_units.get("boltzmann_constant", 1.0),
+    )
+    if protocol.equilibration_steps > 0:
+        equilibration = simulate_nvt(
+            start_positions,
+            start_velocities,
+            masses=masses,
+            cell=cell,
+            force_terms=force_terms,
+            config=SimulationConfig(
+                dt=protocol.dt,
+                steps=protocol.equilibration_steps,
+                sample_interval=max(1, protocol.equilibration_steps),
+                diagnostic_interval=max(1, protocol.equilibration_steps),
+                compile_force_evaluator=protocol.compile_force_evaluator,
+                virtual_sites=virtual_sites,
+                **simulation_units,
+            ),
+            thermostat=thermostat,
+            constraints=constraints,
+        )
+        start_positions = equilibration.final_state.positions
+        start_velocities = equilibration.final_state.velocities
+    production = simulate_nvt(
+        start_positions,
+        start_velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=force_terms,
+        config=SimulationConfig(
+            dt=protocol.dt,
+            steps=protocol.production_steps,
+            sample_interval=protocol.sample_interval,
+            diagnostic_interval=protocol.diagnostic_interval,
+            compile_force_evaluator=protocol.compile_force_evaluator,
+            virtual_sites=virtual_sites,
+            **simulation_units,
+        ),
+        thermostat=thermostat,
+        constraints=constraints,
+        reporters=reporters,
+    )
+    return SimpleNamespace(minimization=minimized, equilibration=None, production=production)
 
 
 def _temperature_degrees_of_freedom(atom_count: int, constraint_count: int) -> int:
@@ -307,6 +467,15 @@ def run_mlx(
             artifact,
             runtime_electrostatics_model,
         )
+    artifact_readiness = artifact_readiness_report(
+        artifact.metadata,
+        require_production=require_production,
+        arrays=artifact.arrays,
+    )
+    protocol_readiness = protocol_readiness_report(
+        prepared_system.metadata.protocol_metadata,
+    )
+    platform_boundary = _platform_boundary_metadata()
     if diagnostic_interval is None:
         diagnostic_interval = sample_interval if require_production else 1
     pressure_diagnostics = artifact.atom_count <= PRESSURE_DIAGNOSTIC_ATOM_LIMIT
@@ -316,6 +485,7 @@ def run_mlx(
         restraint_k=restraint_k,
         constraint_max_iterations=constraint_max_iterations,
     )
+    hmr_state = artifact.hmr_state
     compile_force_evaluator = _compile_force_evaluator_safe(force_terms)
     masses = np.asarray(system.masses, dtype=np.float32)
     unit_system = artifact.unit_system
@@ -339,8 +509,8 @@ def run_mlx(
         minimize_steps = 0
         equilibration_steps = 0
     else:
-        velocities = initialize_velocities(
-            prepared_system,
+        velocities = _initialize_system_velocities(
+            system,
             masses,
             temperature=temperature,
             seed=seed,
@@ -379,7 +549,7 @@ def run_mlx(
             masses=masses,
             cell=system.cell,
             force_terms=force_terms,
-            config=SimulationConfig(
+            config=_simulation_config_with_virtual_sites(
                 dt=dt,
                 steps=steps,
                 sample_interval=sample_interval,
@@ -391,6 +561,7 @@ def run_mlx(
                 pressure_diagnostics=pressure_diagnostics,
                 initial_step=initial_step,
                 initial_time=initial_time,
+                virtual_sites=system.virtual_sites,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
@@ -408,34 +579,49 @@ def run_mlx(
             reporters=reporters,
         )
     elif minimize_steps > 0 or equilibration_steps > 0:
-        protocol_result = run_minimize_then_nvt(
-            run_positions,
-            velocities,
-            masses=masses,
-            force_terms=force_terms,
-            protocol=MinimizeThenNVTProtocol(
-                minimize_steps=minimize_steps,
-                equilibration_steps=equilibration_steps,
-                production_steps=steps,
-                dt=dt,
-                sample_interval=sample_interval,
-                temperature=temperature,
-                friction=friction,
-                seed=seed,
-                diagnostic_interval=diagnostic_interval,
-                compile_force_evaluator=compile_force_evaluator,
-                ensemble=protocol_report.metadata["ensemble"],
-                proof_mode=protocol_report.metadata["proof_mode"],
-                barostat=protocol_report.metadata["barostat"],
-                npt_barostat=protocol_report.metadata["npt_barostat"],
-                membrane_barostat=protocol_report.metadata["membrane_barostat"],
-            ),
-            cell=system.cell,
-            constraints=constraints,
-            unit_system=unit_system,
-            neighbor_manager=neighbor_manager,
-            reporters=reporters,
+        protocol = MinimizeThenNVTProtocol(
+            minimize_steps=minimize_steps,
+            equilibration_steps=equilibration_steps,
+            production_steps=steps,
+            dt=dt,
+            sample_interval=sample_interval,
+            temperature=temperature,
+            friction=friction,
+            seed=seed,
+            diagnostic_interval=diagnostic_interval,
+            compile_force_evaluator=compile_force_evaluator,
+            ensemble=protocol_report.metadata["ensemble"],
+            proof_mode=protocol_report.metadata["proof_mode"],
+            barostat=protocol_report.metadata["barostat"],
+            npt_barostat=protocol_report.metadata["npt_barostat"],
+            membrane_barostat=protocol_report.metadata["membrane_barostat"],
         )
+        if system.virtual_sites is None:
+            protocol_result = run_minimize_then_nvt(
+                run_positions,
+                velocities,
+                masses=masses,
+                force_terms=force_terms,
+                protocol=protocol,
+                cell=system.cell,
+                constraints=constraints,
+                unit_system=unit_system,
+                neighbor_manager=neighbor_manager,
+                reporters=reporters,
+            )
+        else:
+            protocol_result = _run_virtual_site_minimize_then_nvt(
+                run_positions,
+                velocities,
+                masses=masses,
+                force_terms=force_terms,
+                protocol=protocol,
+                virtual_sites=system.virtual_sites,
+                cell=system.cell,
+                constraints=constraints,
+                unit_system=unit_system,
+                reporters=reporters,
+            )
         result = protocol_result.production
     else:
         result = simulate_nvt(
@@ -444,7 +630,7 @@ def run_mlx(
             masses=masses,
             cell=system.cell,
             force_terms=force_terms,
-            config=SimulationConfig(
+            config=_simulation_config_with_virtual_sites(
                 dt=dt,
                 steps=steps,
                 sample_interval=sample_interval,
@@ -456,6 +642,7 @@ def run_mlx(
                 pressure_diagnostics=pressure_diagnostics,
                 initial_step=initial_step,
                 initial_time=initial_time,
+                virtual_sites=system.virtual_sites,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
@@ -470,6 +657,40 @@ def run_mlx(
     elapsed_wall_seconds = time.perf_counter() - run_started
     if out is None and prepared_dir is not None:
         out = prepared_dir / TRAJECTORY_NAME
+    if checkpoint_out is not None:
+        save_simulation_checkpoint(
+            checkpoint_out,
+            result.final_state,
+            cell=result.final_cell if use_npt else system.cell,
+            thermostat={
+                "temperature": temperature,
+                "friction": friction,
+                "seed": seed,
+                "rng_step_offset": int(result.final_state.step),
+            },
+            neighbor_policy={
+                "skin": neighbor_skin,
+                "check_interval": neighbor_check_interval,
+                "backend": result.nonbonded_report.get("backend"),
+            },
+            force_terms=tuple(
+                str(getattr(term, "name", type(term).__name__)) for term in force_terms
+            ),
+            diagnostic_cursor=int(np.asarray(result.diagnostic_steps)[-1]),
+            metadata={
+                "kind": "mlx_atomistic.checkpoint",
+                "source": "prep.run_mlx",
+                "resumed_from": None if checkpoint is None else str(resume_checkpoint),
+                "platform_readiness": {
+                    "artifact": artifact_readiness.to_dict(),
+                    "protocol": protocol_readiness.to_dict(),
+                },
+                "platform_boundary": platform_boundary,
+                "hydrogen_mass_repartitioning": hmr_state,
+            },
+            runtime_sync_report=result.runtime_sync_report,
+            runtime_nonbonded_report=result.nonbonded_report,
+        )
     if out is not None:
         metadata: dict[str, Any] = {
             "kind": "mlx_atomistic.prep_nvt",
@@ -519,6 +740,7 @@ def run_mlx(
             "warnings": prepared_system.metadata.warnings,
             "nonbonded_runtime": result.nonbonded_report,
             "resume_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
+            "hydrogen_mass_repartitioning": hmr_state,
         }
         if use_npt:
             metadata["kind"] = "mlx_atomistic.prep_npt"
@@ -529,6 +751,11 @@ def run_mlx(
         if metadata_overrides:
             metadata.update(metadata_overrides)
         metadata.update(protocol_report.metadata)
+        metadata["platform_readiness"] = {
+            "artifact": artifact_readiness.to_dict(),
+            "protocol": protocol_readiness.to_dict(),
+        }
+        metadata["platform_boundary"] = platform_boundary
         trajectory_cell = result.final_cell if use_npt else system.cell
         save_npz_trajectory(
             out,
@@ -564,32 +791,6 @@ def run_mlx(
                     output_path,
                     file_format=output_format,
                 )
-    if checkpoint_out is not None:
-        save_simulation_checkpoint(
-            checkpoint_out,
-            result.final_state,
-            cell=result.final_cell if use_npt else system.cell,
-            thermostat={
-                "temperature": temperature,
-                "friction": friction,
-                "seed": seed,
-                "rng_step_offset": int(result.final_state.step),
-            },
-            neighbor_policy={
-                "skin": neighbor_skin,
-                "check_interval": neighbor_check_interval,
-                "backend": result.nonbonded_report.get("backend"),
-            },
-            force_terms=tuple(
-                str(getattr(term, "name", type(term).__name__)) for term in force_terms
-            ),
-            diagnostic_cursor=int(np.asarray(result.diagnostic_steps)[-1]),
-            metadata={
-                "kind": "mlx_atomistic.checkpoint",
-                "source": "prep.run_mlx",
-                "resumed_from": None if checkpoint is None else str(resume_checkpoint),
-            },
-        )
     return result
 
 
@@ -1016,6 +1217,16 @@ def _artifact_with_runtime_electrostatics(
     return replace(artifact, metadata=metadata)
 
 
+def _platform_boundary_metadata() -> dict[str, Any]:
+    report = get_platform_boundary_report()
+    return {
+        "product_runtime": report.product_runtime,
+        "runtime": report.runtime.to_dict(),
+        "sections": [section.name for section in report.sections],
+        "reference_engine_policy": dict(report.reference_engine_policy),
+    }
+
+
 def _prepared_artifact_files_exist(out_dir: Path) -> bool:
     return all(path.exists() for path in (out_dir / JSON_NAME, out_dir / NPZ_NAME))
 
@@ -1250,8 +1461,8 @@ def run_steered_mlx(
     kinetic_energy_scale = unit_system.kinetic_energy_scale
     force_to_acceleration_scale = unit_system.force_to_acceleration_scale
     boltzmann_constant = unit_system.boltzmann_constant
-    velocities = initialize_velocities(
-        prepared_system,
+    velocities = _initialize_system_velocities(
+        system,
         masses,
         temperature=temperature,
         seed=seed,
@@ -1299,32 +1510,46 @@ def run_steered_mlx(
 
     run_started = time.perf_counter()
     if minimize_steps > 0 or equilibration_steps > 0:
-        protocol_result = run_minimize_then_nvt(
-            np.asarray(system.positions, dtype=np.float32),
-            velocities,
-            masses=masses,
-            force_terms=force_terms,
-            protocol=MinimizeThenNVTProtocol(
-                minimize_steps=minimize_steps,
-                equilibration_steps=equilibration_steps,
-                production_steps=0,
-                dt=dt,
-                sample_interval=1,
-                temperature=temperature,
-                friction=friction,
-                seed=seed,
-                diagnostic_interval=1,
-                compile_force_evaluator=False,
-                ensemble=protocol_report.metadata["ensemble"],
-                proof_mode=protocol_report.metadata["proof_mode"],
-                barostat=protocol_report.metadata["barostat"],
-                npt_barostat=protocol_report.metadata["npt_barostat"],
-                membrane_barostat=protocol_report.metadata["membrane_barostat"],
-            ),
-            cell=system.cell,
-            constraints=constraints,
-            unit_system=unit_system,
+        protocol = MinimizeThenNVTProtocol(
+            minimize_steps=minimize_steps,
+            equilibration_steps=equilibration_steps,
+            production_steps=0,
+            dt=dt,
+            sample_interval=1,
+            temperature=temperature,
+            friction=friction,
+            seed=seed,
+            diagnostic_interval=1,
+            compile_force_evaluator=False,
+            ensemble=protocol_report.metadata["ensemble"],
+            proof_mode=protocol_report.metadata["proof_mode"],
+            barostat=protocol_report.metadata["barostat"],
+            npt_barostat=protocol_report.metadata["npt_barostat"],
+            membrane_barostat=protocol_report.metadata["membrane_barostat"],
         )
+        if system.virtual_sites is None:
+            protocol_result = run_minimize_then_nvt(
+                np.asarray(system.positions, dtype=np.float32),
+                velocities,
+                masses=masses,
+                force_terms=force_terms,
+                protocol=protocol,
+                cell=system.cell,
+                constraints=constraints,
+                unit_system=unit_system,
+            )
+        else:
+            protocol_result = _run_virtual_site_minimize_then_nvt(
+                np.asarray(system.positions, dtype=np.float32),
+                velocities,
+                masses=masses,
+                force_terms=force_terms,
+                protocol=protocol,
+                virtual_sites=system.virtual_sites,
+                cell=system.cell,
+                constraints=constraints,
+                unit_system=unit_system,
+            )
         start_state = protocol_result.production.final_state
         start_positions = start_state.positions
         start_velocities = start_state.velocities
@@ -1354,7 +1579,7 @@ def run_steered_mlx(
         k=bias_k,
         cell=system.cell,
         force_terms=force_terms,
-        config=SimulationConfig(
+        config=_simulation_config_with_virtual_sites(
             dt=dt,
             steps=steps,
             sample_interval=sample_interval,
@@ -1363,6 +1588,7 @@ def run_steered_mlx(
             boltzmann_constant=boltzmann_constant,
             diagnostic_interval=diagnostic_interval,
             compile_force_evaluator=False,
+            virtual_sites=system.virtual_sites,
         ),
         thermostat=LangevinThermostat(
             temperature=temperature,

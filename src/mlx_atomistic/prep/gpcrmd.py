@@ -24,6 +24,7 @@ from mlx_atomistic.prep.topology_import import (
     build_charmm_psf_mass_prelude,
     import_amber_prmtop,
     import_charmm_with_parmed,
+    import_gromacs_top_gro,
 )
 
 GPCRMD_DATA_DOWNLOAD_DOCS_URL = "https://gpcrmd-docs.readthedocs.io/en/latest/data-download.html"
@@ -1151,6 +1152,11 @@ def _import_prepared_system_from_inspection(
                 prmtop_path=role_paths["topology"][0],
                 coords_path=role_paths["model"][0],
             )
+        elif import_style == "gromacs":
+            prepared = import_gromacs_top_gro(
+                top_path=role_paths["topology"][0],
+                gro_path=role_paths["model"][0],
+            )
         elif import_style == "charmm":
             if find_spec("parmed") is None:
                 return None, ["parser_missing:parmed"], import_details
@@ -1250,12 +1256,49 @@ def _gpcrmd_import_style(
     role_paths: Mapping[str, Sequence[Path]],
 ) -> str:
     force_field = target.force_field.lower()
-    topology_suffixes = {path.suffix.lower() for path in role_paths.get("topology", [])}
-    if "amber" in force_field or topology_suffixes & {".prmtop", ".parm7", ".top"}:
+    topology_paths = list(role_paths.get("topology", []))
+    topology_suffixes = {path.suffix.lower() for path in topology_paths}
+    if "gromacs" in force_field or any(
+        _looks_like_gromacs_topology(path) for path in topology_paths
+    ):
+        return "gromacs"
+    if "amber" in force_field or topology_suffixes & {".prmtop", ".parm7"}:
+        return "amber"
+    if any(
+        path.suffix.lower() == ".top" and _looks_like_amber_topology(path)
+        for path in topology_paths
+    ):
         return "amber"
     if "charmm" in force_field or topology_suffixes & {".psf"}:
         return "charmm"
     return "unknown"
+
+
+def _looks_like_gromacs_topology(path: Path) -> bool:
+    if path.suffix.lower() != ".top":
+        return False
+    try:
+        text = path.read_text(errors="replace")[:65536].lower()
+    except OSError:
+        return False
+    if "%flag" in text or "%version" in text:
+        return False
+    return (
+        "[ defaults ]" in text
+        or "[defaults]" in text
+        or "[ moleculetype ]" in text
+        or "[moleculetype]" in text
+    )
+
+
+def _looks_like_amber_topology(path: Path) -> bool:
+    if path.suffix.lower() != ".top":
+        return False
+    try:
+        text = path.read_text(errors="replace")[:65536].lower()
+    except OSError:
+        return False
+    return "%flag" in text or "%version" in text
 
 
 def _parse_failure_role(message: str) -> str:
@@ -1434,7 +1477,10 @@ def _apply_gpcrmd_protocol_box(
     cell_lengths = np.asarray(box_metadata["cell_lengths"], dtype=np.float32)
     if cell_lengths.shape != (3,):
         return prepared
-    return replace(prepared, cell_lengths=cell_lengths)
+    cell_matrix = np.asarray(box_metadata.get("box_vectors", np.asarray([])), dtype=np.float32)
+    if cell_matrix.shape != (3, 3):
+        return replace(prepared, cell_lengths=cell_lengths)
+    return replace(prepared, cell_lengths=cell_lengths, cell_matrix=cell_matrix)
 
 
 def _gpcrmd_protocol_box_metadata(
@@ -1503,6 +1549,9 @@ def _read_gpcrmd_xsc_box(path: Path) -> dict[str, Any]:
         box_vectors = np.asarray(vector_values, dtype=np.float32).reshape((3, 3))
         cell_lengths = np.linalg.norm(box_vectors, axis=1).astype(np.float32)
         if not np.all(np.isfinite(cell_lengths)) or np.any(cell_lengths <= 0.0):
+            continue
+        determinant = float(np.linalg.det(box_vectors.astype(np.float64)))
+        if not np.isfinite(determinant) or determinant <= 0.0:
             continue
         return {
             "source_path": str(path),

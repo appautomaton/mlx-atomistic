@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import mlx.core as mx
 import numpy as np
@@ -20,9 +20,15 @@ from mlx_atomistic.charmm_terms import (
     CHARMMUreyBradleyPotential as CHARMMUreyBradleyPotential,
 )
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.custom_force import (
+    CustomForcePotential as CustomForcePotential,
+)
+from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
+from mlx_atomistic.neighbors import NeighborBlocks
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
     EwaldReferenceConfig,
+    ForceScopeReport,
     NonbondedBackend,
     NonbondedElectrostatics,
     NonbondedExecutionConfig,
@@ -30,8 +36,17 @@ from mlx_atomistic.nonbonded import (
     dense_combined_energy_forces,
     estimate_dense_nonbonded_bytes,
     ewald_reference_coulomb_energy_forces,
+    ewald_reference_coulomb_total_energy_forces,
+    normalize_force_scope,
 )
-from mlx_atomistic.pme import PMEConfig, pme_coulomb_energy_forces
+from mlx_atomistic.pme import (
+    PMEConfig,
+    pme_coulomb_direct_space_energy_forces,
+    pme_coulomb_energy_forces,
+    pme_coulomb_reciprocal_space_energy_forces,
+    pme_coulomb_total_energy_forces,
+    pme_direct_space_policy_report,
+)
 from mlx_atomistic.topology import Topology
 
 
@@ -423,6 +438,123 @@ class PeriodicDihedralPotential:
 
 
 @dataclass(frozen=True)
+class RBDihedralPotential:
+    """Ryckaert-Bellemans torsion potential.
+
+    Uses the OpenMM RB convention: E = sum(Cn * cos(phi - pi)^n), where phi is
+    the package/OpenMM-style periodic dihedral angle.
+    """
+
+    dihedrals: object
+    c0: object
+    c1: object
+    c2: object
+    c3: object
+    c4: object
+    c5: object
+    name: str = "rb_dihedral"
+    supports_virial: bool = True
+
+    def __post_init__(self) -> None:
+        dihedrals = np.asarray(self.dihedrals, dtype=np.int32)
+        if dihedrals.size == 0:
+            dihedrals = np.empty((0, 4), dtype=np.int32)
+        if dihedrals.ndim != 2 or dihedrals.shape[1] != 4:
+            msg = "dihedrals must have shape (n, 4)"
+            raise ValueError(msg)
+        count = dihedrals.shape[0]
+        object.__setattr__(self, "dihedrals", mx.array(dihedrals, dtype=mx.int32))
+        for name in ("c0", "c1", "c2", "c3", "c4", "c5"):
+            object.__setattr__(
+                self,
+                name,
+                _parameter_array(getattr(self, name), count=count, name=name),
+            )
+
+    def _energy_from_cosine(self, cosine: mx.array) -> mx.array:
+        energy = self.c5 * cosine + self.c4
+        energy = energy * cosine + self.c3
+        energy = energy * cosine + self.c2
+        energy = energy * cosine + self.c1
+        return energy * cosine + self.c0
+
+    def _energy_derivative_from_cosine(self, cosine: mx.array) -> mx.array:
+        derivative = 5.0 * self.c5 * cosine + 4.0 * self.c4
+        derivative = derivative * cosine + 3.0 * self.c3
+        derivative = derivative * cosine + 2.0 * self.c2
+        return derivative * cosine + self.c1
+
+    def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        positions = as_mx_array(positions)
+        if self.dihedrals.shape[0] == 0:
+            return _zero_energy(positions)
+        phi, _, _, _ = PeriodicDihedralPotential._openmm_dihedral_components(
+            self,
+            positions,
+            cell,
+        )
+        cosine = mx.cos(phi - np.pi)
+        return mx.sum(self._energy_from_cosine(cosine))
+
+    def energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        del pairs
+        positions = as_mx_array(positions)
+        if self.dihedrals.shape[0] == 0:
+            return _zero_energy(positions), mx.zeros_like(positions)
+        i = self.dihedrals[:, 0]
+        j = self.dihedrals[:, 1]
+        k = self.dihedrals[:, 2]
+        m = self.dihedrals[:, 3]
+
+        phi, delta_ab, delta_bc, delta_cd = PeriodicDihedralPotential._openmm_dihedral_components(
+            self,
+            positions,
+            cell,
+        )
+        rb_angle = phi - np.pi
+        cosine = mx.cos(rb_angle)
+        energy = self._energy_from_cosine(cosine)
+        d_energy_d_cosine = self._energy_derivative_from_cosine(cosine)
+        d_energy_d_phi = mx.sin(rb_angle) * d_energy_d_cosine
+
+        cross_ab_bc = _cross(delta_ab, delta_bc)
+        cross_bc_cd = _cross(delta_bc, delta_cd)
+        norm_cross_1 = _norm2(cross_ab_bc)
+        norm_cross_2 = _norm2(cross_bc_cd)
+        norm_bc = _norm(delta_bc)
+        norm_bc2 = _norm2(delta_bc)
+
+        factor_i = (-d_energy_d_phi * norm_bc / norm_cross_1)[:, None]
+        factor_m = (d_energy_d_phi * norm_bc / norm_cross_2)[:, None]
+        force_i = factor_i * cross_ab_bc
+        force_m = factor_m * cross_bc_cd
+
+        factor_j = (mx.sum(delta_ab * delta_bc, axis=-1) / norm_bc2)[:, None]
+        factor_k = (mx.sum(delta_cd * delta_bc, axis=-1) / norm_bc2)[:, None]
+        shared = factor_j * force_i - factor_k * force_m
+        force_j = -(force_i - shared)
+        force_k = -(force_m + shared)
+
+        forces = (
+            mx.zeros_like(positions)
+            .at[i]
+            .add(force_i)
+            .at[j]
+            .add(force_j)
+            .at[k]
+            .add(force_k)
+            .at[m]
+            .add(force_m)
+        )
+        return mx.sum(energy), forces
+
+
+@dataclass(frozen=True)
 class ImproperDihedralPotential(PeriodicDihedralPotential):
     """Periodic improper torsion potential using the same functional form."""
 
@@ -592,6 +724,8 @@ class NonbondedPotential:
     pme_config: PMEConfig | None = None
     tile_size: int = 512
     memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
+    lambda_lj: float = 1.0
+    lambda_electrostatics: float = 1.0
     name: str = "nonbonded"
     supports_virial: bool = True
 
@@ -630,6 +764,13 @@ class NonbondedPotential:
         if self.lj_one_four_scale < 0.0 or self.coulomb_one_four_scale < 0.0:
             msg = "1-4 scaling factors must be non-negative"
             raise ValueError(msg)
+        for name, value in [
+            ("lambda_lj", self.lambda_lj),
+            ("lambda_electrostatics", self.lambda_electrostatics),
+        ]:
+            if not np.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                msg = f"{name} must be finite and in [0, 1]"
+                raise ValueError(msg)
         exception_pairs = np.asarray(self.exception_pairs, dtype=np.int32)
         if exception_pairs.size == 0:
             exception_pairs = np.empty((0, 2), dtype=np.int32)
@@ -807,6 +948,12 @@ class NonbondedPotential:
             tile_size=self.tile_size,
             memory_budget_bytes=self.memory_budget_bytes,
         )
+        if (
+            (float(self.lambda_lj) < 1.0 or float(self.lambda_electrostatics) < 1.0)
+            and config.electrostatics != "cutoff"
+        ):
+            msg = "soft-core lambda scaling currently supports cutoff electrostatics only"
+            raise ValueError(msg)
         if config.electrostatics == "pme":
             if self.pme_config is None:
                 msg = "PME electrostatics requires pme_config"
@@ -870,7 +1017,10 @@ class NonbondedPotential:
         object.__setattr__(self, "electrostatics", config.electrostatics)
         object.__setattr__(self, "tile_size", config.tile_size)
         object.__setattr__(self, "memory_budget_bytes", config.memory_budget_bytes)
+        object.__setattr__(self, "lambda_lj", float(self.lambda_lj))
+        object.__setattr__(self, "lambda_electrostatics", float(self.lambda_electrostatics))
         object.__setattr__(self, "_pair_scale_cache", None)
+        object.__setattr__(self, "_block_scale_cache", None)
 
     @property
     def has_exceptions(self) -> bool:
@@ -883,6 +1033,12 @@ class NonbondedPotential:
         """Whether NBFIX LJ overrides are active."""
 
         return int(self.nbfix_pairs.shape[0]) > 0 or int(self.nbfix_type_pairs.shape[0]) > 0
+
+    @property
+    def has_soft_core(self) -> bool:
+        """Whether lambda-scaled soft-core pair evaluation is active."""
+
+        return self.lambda_lj < 1.0 or self.lambda_electrostatics < 1.0
 
     def _pairs_and_scales(self, positions: mx.array, pairs) -> tuple[mx.array, mx.array, mx.array]:
         if self.topology is not None:
@@ -936,9 +1092,9 @@ class NonbondedPotential:
                 return empty_pairs, as_mx_array([]), as_mx_array([])
             pair_array = mx.array(pairs, dtype=mx.int32)
         else:
-            pair_array = mx.array(pairs, dtype=mx.int32)
+            pair_array = as_mx_array(pairs, dtype=mx.int32)
         pair_array = self._remove_exception_pairs(pair_array)
-        scales = as_mx_array([1.0] * pair_array.shape[0])
+        scales = _unit_pair_scale()
         return pair_array, scales, scales
 
     def _remove_exception_pairs(self, pairs: mx.array) -> mx.array:
@@ -969,7 +1125,7 @@ class NonbondedPotential:
     def mixed_pair_parameters(self, pairs) -> tuple[mx.array, mx.array]:
         """Return mixed sigma and epsilon, with NBFIX LJ overrides substituted."""
 
-        pair_array = mx.array(pairs, dtype=mx.int32)
+        pair_array = as_mx_array(pairs, dtype=mx.int32)
         if pair_array.shape[0] == 0:
             return as_mx_array([]), as_mx_array([])
         i = pair_array[:, 0]
@@ -1000,80 +1156,137 @@ class NonbondedPotential:
                 epsilon_ij = mx.where(matched, self.nbfix_epsilon[index], epsilon_ij)
         return sigma_ij, epsilon_ij
 
-    def _pair_components(
+    def _mixed_block_parameters(
+        self,
+        left: mx.array,
+        right: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        sigma_ij = 0.5 * (self.sigma[left] + self.sigma[right])
+        epsilon_ij = mx.sqrt(self.epsilon[left] * self.epsilon[right])
+        if not self.has_nbfix:
+            return sigma_ij, epsilon_ij
+        if self.nbfix_type_pairs.shape[0] > 0:
+            type_i = self._atom_type_ids[left]
+            type_j = self._atom_type_ids[right]
+            for index in range(int(self._nbfix_type_pair_ids.shape[0])):
+                nbfix_left = self._nbfix_type_pair_ids[index, 0]
+                nbfix_right = self._nbfix_type_pair_ids[index, 1]
+                known_types = (nbfix_left >= 0) & (nbfix_right >= 0)
+                matched = known_types & (
+                    ((type_i == nbfix_left) & (type_j == nbfix_right))
+                    | ((type_i == nbfix_right) & (type_j == nbfix_left))
+                )
+                sigma_ij = mx.where(matched, self.nbfix_type_sigma[index], sigma_ij)
+                epsilon_ij = mx.where(matched, self.nbfix_type_epsilon[index], epsilon_ij)
+        if self.nbfix_pairs.shape[0] > 0:
+            for index in range(int(self.nbfix_pairs.shape[0])):
+                nbfix_left = self.nbfix_pairs[index, 0]
+                nbfix_right = self.nbfix_pairs[index, 1]
+                matched = (
+                    ((left == nbfix_left) & (right == nbfix_right))
+                    | ((left == nbfix_right) & (right == nbfix_left))
+                )
+                sigma_ij = mx.where(matched, self.nbfix_sigma[index], sigma_ij)
+                epsilon_ij = mx.where(matched, self.nbfix_epsilon[index], epsilon_ij)
+        return sigma_ij, epsilon_ij
+
+    def _block_masks_and_scales(
+        self,
+        blocks: NeighborBlocks,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        cache_key = (
+            id(blocks),
+            self.lj_one_four_scale,
+            self.coulomb_one_four_scale,
+            id(self.topology),
+        )
+        cache = self._block_scale_cache
+        if cache is not None and cache[0] == cache_key:
+            return cache[1]
+
+        left = np.asarray(blocks.left, dtype=np.int32).reshape(-1)
+        right = np.asarray(blocks.right, dtype=np.int32).reshape(-1)
+        valid = np.asarray(blocks.valid_mask, dtype=bool).reshape(-1)
+        n_atoms = int(self.sigma.shape[0])
+        if np.any(left[valid] < 0) or np.any(right[valid] < 0):
+            msg = "pairs contain atom indices outside [0, n_atoms)"
+            raise ValueError(msg)
+        if np.any(left[valid] >= n_atoms) or np.any(right[valid] >= n_atoms):
+            msg = "pairs contain atom indices outside [0, n_atoms)"
+            raise ValueError(msg)
+
+        normalized_left = np.minimum(left, right).astype(np.int64, copy=False)
+        normalized_right = np.maximum(left, right).astype(np.int64, copy=False)
+        codes = normalized_left * np.int64(n_atoms) + normalized_right
+        keep = valid.copy()
+        one_four_codes = np.empty((0,), dtype=np.int64)
+        if self.topology is not None:
+            keep &= ~_isin_sorted_codes(codes, self.topology._exclusion_codes)
+            one_four_codes = self.topology._one_four_codes
+        if self.has_exceptions and (
+            self.topology is None or not self._exceptions_excluded_by_topology
+        ):
+            keep &= ~_isin_sorted_codes(codes, self._exception_pair_codes)
+
+        mask = mx.array(keep.reshape(blocks.left.shape))
+        if float(self.lj_one_four_scale) == 1.0 or one_four_codes.size == 0:
+            lj_scales = _unit_pair_scale()
+        else:
+            one_four = _isin_sorted_codes(codes, one_four_codes)
+            lj_scales_np = np.where(one_four, float(self.lj_one_four_scale), 1.0).astype(
+                np.float32
+            )
+            lj_scales = mx.array(lj_scales_np.reshape(blocks.left.shape), dtype=mx.float32)
+        if float(self.coulomb_one_four_scale) == 1.0 or one_four_codes.size == 0:
+            coulomb_scales = _unit_pair_scale()
+        else:
+            one_four = _isin_sorted_codes(codes, one_four_codes)
+            coulomb_scales_np = np.where(
+                one_four,
+                float(self.coulomb_one_four_scale),
+                1.0,
+            ).astype(np.float32)
+            coulomb_scales = mx.array(
+                coulomb_scales_np.reshape(blocks.left.shape),
+                dtype=mx.float32,
+            )
+        result = (mask, lj_scales, coulomb_scales)
+        object.__setattr__(self, "_block_scale_cache", (cache_key, result))
+        return result
+
+    def _block_components(
         self,
         positions: mx.array,
         cell: Cell | None,
-        pairs,
+        blocks: NeighborBlocks,
     ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
-        if (
-            self.topology is not None
-            and pairs is None
-            and self.topology.nonbonded_pair_policy == "lazy"
-        ):
-            msg = (
-                "lazy topology requires a runtime nonbonded pair provider; "
-                "full dense pair materialization was not requested"
-            )
-            raise ValueError(msg)
-
-        estimated_bytes = estimate_dense_nonbonded_bytes(
-            positions.shape[0],
-            components="combined",
-        )
-        concrete_backend = choose_nonbonded_backend(
-            requested=self.backend,
-            n_atoms=positions.shape[0],
-            pairs_provided=pairs is not None,
-            estimated_dense_bytes=estimated_bytes,
-            memory_budget_bytes=self.memory_budget_bytes,
-        )
-        if (
-            self.switch_distance is not None
-            or self.has_exceptions
-            and not self._exceptions_excluded_by_topology
-            or self.has_nbfix
-        ):
-            concrete_backend = "mlx_pairs"
-        if concrete_backend in {"mlx_dense", "mlx_tiled"}:
-            lj_energy, coulomb_energy, forces = dense_combined_energy_forces(
-                positions,
-                sigma=self.sigma,
-                epsilon=self.epsilon,
-                charges=self.charges,
-                coulomb_constant=self.coulomb_constant,
-                cutoff=self.cutoff,
-                lj_shift=self.lj_shift,
-                coulomb_shift=self.coulomb_shift,
-                cell=cell,
-                topology=self.topology,
-                lj_one_four_scale=self.lj_one_four_scale,
-                coulomb_one_four_scale=self.coulomb_one_four_scale,
-                tile_size=self.tile_size if concrete_backend == "mlx_tiled" else None,
-            )
-            empty_pairs = mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
-            empty_scales = as_mx_array([])
-            return empty_pairs, lj_energy, coulomb_energy, forces, empty_scales, empty_scales
-
-        pairs, lj_scales, coulomb_scales = self._pairs_and_scales(positions, pairs)
-        if pairs.shape[0] == 0:
+        empty_pairs = mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
+        if blocks.candidate_count == 0:
             zero = _zero_energy(positions)
-            return pairs, zero, zero, mx.zeros_like(positions), lj_scales, coulomb_scales
+            return (
+                empty_pairs,
+                zero,
+                zero,
+                mx.zeros_like(positions),
+                _unit_pair_scale(),
+                _unit_pair_scale(),
+            )
 
-        i = pairs[:, 0]
-        j = pairs[:, 1]
+        i = blocks.left
+        j = blocks.right
         displacement = positions[i] - positions[j]
         if cell is not None:
             displacement = cell.minimum_image(displacement)
 
+        topology_mask, lj_scales, coulomb_scales = self._block_masks_and_scales(blocks)
         r2 = mx.sum(displacement * displacement, axis=-1)
-        pair_mask = r2 > 0.0
+        pair_mask = topology_mask & (r2 > 0.0)
         if self.cutoff is not None:
             pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
         safe_r2 = mx.where(pair_mask, r2, 1.0)
         distance = mx.sqrt(safe_r2)
 
-        sigma_ij, epsilon_ij = self.mixed_pair_parameters(pairs)
+        sigma_ij, epsilon_ij = self._mixed_block_parameters(i, j)
         sigma2_over_r2 = (sigma_ij * sigma_ij) / safe_r2
         inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
         inv_r12 = inv_r6 * inv_r6
@@ -1108,6 +1321,327 @@ class NonbondedPotential:
             lj_scalar * lj_scales + coulomb_scalar * coulomb_scales,
             0.0,
         )
+        pair_forces = scalar[..., None] * displacement
+        flat_i = mx.reshape(i, (-1,))
+        flat_j = mx.reshape(j, (-1,))
+        flat_forces = mx.reshape(pair_forces, (-1, 3))
+        forces = mx.zeros_like(positions).at[flat_i].add(flat_forces).at[flat_j].add(
+            -flat_forces
+        )
+        return (
+            empty_pairs,
+            mx.sum(lj_pair_energy),
+            mx.sum(coulomb_pair_energy),
+            forces,
+            lj_scales,
+            coulomb_scales,
+        )
+
+    def _soft_core_pair_terms(
+        self,
+        r2: mx.array,
+        pair_mask: mx.array,
+        *,
+        sigma_ij: mx.array,
+        epsilon_ij: mx.array,
+        qij: mx.array,
+        lj_scales: mx.array,
+        coulomb_scales: mx.array,
+        switch: mx.array,
+        switch_derivative: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+        lambda_lj = self.lambda_lj
+        lambda_coulomb = self.lambda_electrostatics
+        safe_r2 = mx.where(pair_mask, r2, 0.0)
+        sigma_safe = mx.maximum(sigma_ij, 1e-12)
+        sigma2 = sigma_safe * sigma_safe
+        sigma6 = sigma2 * sigma2 * sigma2
+        r4 = safe_r2 * safe_r2
+        r6 = r4 * safe_r2
+
+        lj_alpha = 0.5
+        lj_x = r6 / sigma6 + lj_alpha * (1.0 - lambda_lj) * (1.0 - lambda_lj)
+        lj_x = mx.maximum(lj_x, 1e-12)
+        inv_x = 1.0 / lj_x
+        lj_shape = inv_x * inv_x - inv_x
+        lj_pair_energy = lambda_lj * 4.0 * epsilon_ij * lj_shape
+        lj_dshape_dx = -2.0 * inv_x * inv_x * inv_x + inv_x * inv_x
+        dlj_x_dlambda = -2.0 * lj_alpha * (1.0 - lambda_lj)
+        dlj_dlambda = 4.0 * epsilon_ij * (
+            lj_shape + lambda_lj * lj_dshape_dx * dlj_x_dlambda
+        )
+        lj_scalar = (
+            lambda_lj
+            * 24.0
+            * epsilon_ij
+            * (2.0 * inv_x * inv_x * inv_x - inv_x * inv_x)
+            * r4
+            / sigma6
+        )
+        if self.lj_shift and self.cutoff is not None:
+            rc2 = self.cutoff * self.cutoff
+            rc6 = rc2 * rc2 * rc2
+            cutoff_x = rc6 / sigma6 + lj_alpha * (1.0 - lambda_lj) * (1.0 - lambda_lj)
+            cutoff_inv_x = 1.0 / mx.maximum(cutoff_x, 1e-12)
+            cutoff_shape = cutoff_inv_x * cutoff_inv_x - cutoff_inv_x
+            cutoff_dshape_dx = -2.0 * cutoff_inv_x**3 + cutoff_inv_x * cutoff_inv_x
+            lj_pair_energy = lj_pair_energy - lambda_lj * 4.0 * epsilon_ij * cutoff_shape
+            dlj_dlambda = dlj_dlambda - 4.0 * epsilon_ij * (
+                cutoff_shape + lambda_lj * cutoff_dshape_dx * dlj_x_dlambda
+            )
+        unswitched_lj_pair_energy = lj_pair_energy
+        lj_pair_energy = lj_pair_energy * switch
+        dlj_dlambda = dlj_dlambda * switch
+        lj_scalar = lj_scalar * switch - unswitched_lj_pair_energy * switch_derivative / mx.sqrt(
+            mx.maximum(safe_r2, 1e-12)
+        )
+
+        coulomb_alpha = 0.5
+        soft_r2 = safe_r2 + coulomb_alpha * (1.0 - lambda_coulomb) * (1.0 - lambda_coulomb)
+        soft_r2 = mx.maximum(soft_r2, 1e-12)
+        soft_r = mx.sqrt(soft_r2)
+        coulomb_base = self.coulomb_constant * qij / soft_r
+        coulomb_pair_energy = lambda_coulomb * coulomb_base
+        dcoulomb_dlambda = self.coulomb_constant * qij * (
+            1.0 / soft_r
+            + lambda_coulomb * coulomb_alpha * (1.0 - lambda_coulomb) / (soft_r2 * soft_r)
+        )
+        coulomb_scalar = lambda_coulomb * self.coulomb_constant * qij / (soft_r2 * soft_r)
+        if self.coulomb_shift and self.cutoff is not None:
+            rc_soft2 = self.cutoff * self.cutoff + coulomb_alpha * (1.0 - lambda_coulomb) ** 2
+            rc_soft = mx.sqrt(rc_soft2)
+            coulomb_pair_energy = (
+                coulomb_pair_energy - lambda_coulomb * self.coulomb_constant * qij / rc_soft
+            )
+            dcoulomb_dlambda = dcoulomb_dlambda - self.coulomb_constant * qij * (
+                1.0 / rc_soft
+                + lambda_coulomb * coulomb_alpha * (1.0 - lambda_coulomb) / (rc_soft2 * rc_soft)
+            )
+
+        lj_pair_energy = mx.where(pair_mask, lj_pair_energy * lj_scales, 0.0)
+        coulomb_pair_energy = mx.where(pair_mask, coulomb_pair_energy * coulomb_scales, 0.0)
+        dlj_dlambda = mx.where(pair_mask, dlj_dlambda * lj_scales, 0.0)
+        dcoulomb_dlambda = mx.where(pair_mask, dcoulomb_dlambda * coulomb_scales, 0.0)
+        scalar = mx.where(pair_mask, lj_scalar * lj_scales + coulomb_scalar * coulomb_scales, 0.0)
+        return lj_pair_energy, coulomb_pair_energy, scalar, dlj_dlambda, dcoulomb_dlambda
+
+    def _neighbor_blocks_to_pairs(self, blocks: NeighborBlocks) -> mx.array:
+        left = np.asarray(blocks.left, dtype=np.int32).reshape(-1)
+        right = np.asarray(blocks.right, dtype=np.int32).reshape(-1)
+        valid = np.asarray(blocks.valid_mask, dtype=bool).reshape(-1)
+        if not np.any(valid):
+            return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
+        return mx.array(np.stack((left[valid], right[valid]), axis=1), dtype=mx.int32)
+
+    def _pair_lambda_derivatives(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs,
+    ) -> tuple[mx.array, mx.array]:
+        if self.electrostatics != "cutoff":
+            msg = "dU/dlambda is currently available for cutoff electrostatics only"
+            raise ValueError(msg)
+        if isinstance(pairs, NeighborBlocks):
+            pairs = self._neighbor_blocks_to_pairs(pairs)
+        pairs, lj_scales, coulomb_scales = self._pairs_and_scales(positions, pairs)
+        if pairs.shape[0] == 0:
+            return self._exception_lambda_derivatives(positions, cell)
+
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = r2 >= 0.0 if self.has_soft_core else r2 > 0.0
+        if self.cutoff is not None:
+            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
+        distance = mx.sqrt(mx.where(pair_mask, r2, 1.0))
+        switch, switch_derivative = self._switch(distance)
+        sigma_ij, epsilon_ij = self.mixed_pair_parameters(pairs)
+        qij = self.charges[i] * self.charges[j]
+        _, _, _, dlj_dlambda, dcoulomb_dlambda = self._soft_core_pair_terms(
+            r2,
+            pair_mask,
+            sigma_ij=sigma_ij,
+            epsilon_ij=epsilon_ij,
+            qij=qij,
+            lj_scales=lj_scales,
+            coulomb_scales=coulomb_scales,
+            switch=switch,
+            switch_derivative=switch_derivative,
+        )
+        exception_lj, exception_coulomb = self._exception_lambda_derivatives(positions, cell)
+        return mx.sum(dlj_dlambda) + exception_lj, mx.sum(dcoulomb_dlambda) + exception_coulomb
+
+    def _exception_lambda_derivatives(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+    ) -> tuple[mx.array, mx.array]:
+        if not self.has_exceptions:
+            zero = _zero_energy(positions)
+            return zero, zero
+        pairs = self.exception_pairs
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = r2 >= 0.0 if self.has_soft_core else r2 > 0.0
+        distance = mx.sqrt(mx.where(pair_mask, r2, 1.0))
+        switch = mx.ones_like(distance)
+        switch_derivative = mx.zeros_like(distance)
+        _, _, _, dlj_dlambda, dcoulomb_dlambda = self._soft_core_pair_terms(
+            r2,
+            pair_mask,
+            sigma_ij=self.exception_sigma,
+            epsilon_ij=self.exception_epsilon,
+            qij=self.exception_charge_products,
+            lj_scales=_unit_pair_scale(),
+            coulomb_scales=_unit_pair_scale(),
+            switch=switch,
+            switch_derivative=switch_derivative,
+        )
+        return mx.sum(dlj_dlambda), mx.sum(dcoulomb_dlambda)
+
+    def _pair_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+        if (
+            self.topology is not None
+            and pairs is None
+            and self.topology.nonbonded_pair_policy == "lazy"
+        ):
+            msg = (
+                "lazy topology requires a runtime nonbonded pair provider; "
+                "full dense pair materialization was not requested"
+            )
+            raise ValueError(msg)
+        if isinstance(pairs, NeighborBlocks) and self.has_soft_core:
+            pairs = self._neighbor_blocks_to_pairs(pairs)
+        if isinstance(pairs, NeighborBlocks):
+            return self._block_components(positions, cell, pairs)
+
+        estimated_bytes = estimate_dense_nonbonded_bytes(
+            positions.shape[0],
+            components="combined",
+        )
+        concrete_backend = choose_nonbonded_backend(
+            requested=self.backend,
+            n_atoms=positions.shape[0],
+            pairs_provided=pairs is not None,
+            estimated_dense_bytes=estimated_bytes,
+            memory_budget_bytes=self.memory_budget_bytes,
+        )
+        if (
+            self.switch_distance is not None
+            or self.has_exceptions
+            and not self._exceptions_excluded_by_topology
+            or self.has_nbfix
+            or self.has_soft_core
+        ):
+            concrete_backend = "mlx_pairs"
+        if concrete_backend in {"mlx_dense", "mlx_tiled"}:
+            lj_energy, coulomb_energy, forces = dense_combined_energy_forces(
+                positions,
+                sigma=self.sigma,
+                epsilon=self.epsilon,
+                charges=self.charges,
+                coulomb_constant=self.coulomb_constant,
+                cutoff=self.cutoff,
+                lj_shift=self.lj_shift,
+                coulomb_shift=self.coulomb_shift,
+                cell=cell,
+                topology=self.topology,
+                lj_one_four_scale=self.lj_one_four_scale,
+                coulomb_one_four_scale=self.coulomb_one_four_scale,
+                tile_size=self.tile_size if concrete_backend == "mlx_tiled" else None,
+            )
+            empty_pairs = mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
+            empty_scales = as_mx_array([])
+            return empty_pairs, lj_energy, coulomb_energy, forces, empty_scales, empty_scales
+
+        pairs, lj_scales, coulomb_scales = self._pairs_and_scales(positions, pairs)
+        if pairs.shape[0] == 0:
+            zero = _zero_energy(positions)
+            return pairs, zero, zero, mx.zeros_like(positions), lj_scales, coulomb_scales
+
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = r2 >= 0.0 if self.has_soft_core else r2 > 0.0
+        if self.cutoff is not None:
+            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
+        safe_r2 = mx.where(pair_mask, r2, 1.0)
+        distance = mx.sqrt(safe_r2)
+
+        sigma_ij, epsilon_ij = self.mixed_pair_parameters(pairs)
+        switch, switch_derivative = self._switch(distance)
+        qij = self.charges[i] * self.charges[j]
+        if self.has_soft_core:
+            lj_pair_energy, coulomb_pair_energy, scalar, _, _ = self._soft_core_pair_terms(
+                r2,
+                pair_mask,
+                sigma_ij=sigma_ij,
+                epsilon_ij=epsilon_ij,
+                qij=qij,
+                lj_scales=lj_scales,
+                coulomb_scales=coulomb_scales,
+                switch=switch,
+                switch_derivative=switch_derivative,
+            )
+            pair_forces = scalar[:, None] * displacement
+            forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
+            return (
+                pairs,
+                mx.sum(lj_pair_energy),
+                mx.sum(coulomb_pair_energy),
+                forces,
+                lj_scales,
+                coulomb_scales,
+            )
+        sigma2_over_r2 = (sigma_ij * sigma_ij) / safe_r2
+        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+        inv_r12 = inv_r6 * inv_r6
+        lj_pair_energy = 4.0 * epsilon_ij * (inv_r12 - inv_r6)
+        if self.lj_shift and self.cutoff is not None:
+            sigma2_over_rc2 = (sigma_ij * sigma_ij) / (self.cutoff * self.cutoff)
+            inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
+            inv_rc12 = inv_rc6 * inv_rc6
+            lj_pair_energy = lj_pair_energy - 4.0 * epsilon_ij * (inv_rc12 - inv_rc6)
+        unswitched_lj_pair_energy = lj_pair_energy
+        lj_pair_energy = lj_pair_energy * switch
+        lj_pair_energy = mx.where(pair_mask, lj_pair_energy * lj_scales, 0.0)
+
+        coulomb_pair_energy = self.coulomb_constant * qij / distance
+        if self.coulomb_shift and self.cutoff is not None:
+            coulomb_pair_energy = coulomb_pair_energy - self.coulomb_constant * qij / self.cutoff
+        coulomb_pair_energy = mx.where(
+            pair_mask,
+            coulomb_pair_energy * coulomb_scales,
+            0.0,
+        )
+
+        lj_scalar = (
+            24.0 * epsilon_ij * (2.0 * inv_r12 - inv_r6) / safe_r2 * switch
+            - unswitched_lj_pair_energy * switch_derivative / distance
+        )
+        coulomb_scalar = self.coulomb_constant * qij / (safe_r2 * distance)
+        scalar = mx.where(
+            pair_mask,
+            lj_scalar * lj_scales + coulomb_scalar * coulomb_scales,
+            0.0,
+        )
         pair_forces = scalar[:, None] * displacement
         forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
         return (
@@ -1123,8 +1657,12 @@ class NonbondedPotential:
         self,
         positions: mx.array,
         cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None = None,
     ) -> tuple[mx.array, mx.array]:
-        pairs, lj_scales, _ = self._pairs_and_scales(positions, None)
+        if isinstance(pairs, NeighborBlocks):
+            return self._regular_lj_block_components(positions, cell, pairs)
+
+        pairs, lj_scales, _ = self._pairs_and_scales(positions, pairs)
         if pairs.shape[0] == 0:
             return _zero_energy(positions), mx.zeros_like(positions)
 
@@ -1165,6 +1703,58 @@ class NonbondedPotential:
         forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
         return mx.sum(pair_energy), forces
 
+    def _regular_lj_block_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        blocks: NeighborBlocks,
+    ) -> tuple[mx.array, mx.array]:
+        if blocks.candidate_count == 0:
+            return _zero_energy(positions), mx.zeros_like(positions)
+
+        i = blocks.left
+        j = blocks.right
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+
+        topology_mask, lj_scales, _ = self._block_masks_and_scales(blocks)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        pair_mask = topology_mask & (r2 > 0.0)
+        if self.cutoff is not None:
+            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
+        safe_r2 = mx.where(pair_mask, r2, 1.0)
+        distance = mx.sqrt(safe_r2)
+
+        sigma_ij, epsilon_ij = self._mixed_block_parameters(i, j)
+        sigma2_over_r2 = (sigma_ij * sigma_ij) / safe_r2
+        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+        inv_r12 = inv_r6 * inv_r6
+        pair_energy = 4.0 * epsilon_ij * (inv_r12 - inv_r6)
+        if self.lj_shift and self.cutoff is not None:
+            sigma2_over_rc2 = (sigma_ij * sigma_ij) / (self.cutoff * self.cutoff)
+            inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
+            inv_rc12 = inv_rc6 * inv_rc6
+            pair_energy = pair_energy - 4.0 * epsilon_ij * (inv_rc12 - inv_rc6)
+        switch, switch_derivative = self._switch(distance)
+        unswitched_pair_energy = pair_energy
+        pair_energy = pair_energy * switch
+        pair_energy = mx.where(pair_mask, pair_energy * lj_scales, 0.0)
+
+        scalar = (
+            24.0 * epsilon_ij * (2.0 * inv_r12 - inv_r6) / safe_r2 * switch
+            - unswitched_pair_energy * switch_derivative / distance
+        )
+        scalar = mx.where(pair_mask, scalar * lj_scales, 0.0)
+        pair_forces = scalar[..., None] * displacement
+        flat_i = mx.reshape(i, (-1,))
+        flat_j = mx.reshape(j, (-1,))
+        flat_forces = mx.reshape(pair_forces, (-1, 3))
+        forces = mx.zeros_like(positions).at[flat_i].add(flat_forces).at[flat_j].add(
+            -flat_forces
+        )
+        return mx.sum(pair_energy), forces
+
     def _exception_components(
         self,
         positions: mx.array,
@@ -1180,9 +1770,27 @@ class NonbondedPotential:
         if cell is not None:
             displacement = cell.minimum_image(displacement)
         r2 = mx.sum(displacement * displacement, axis=-1)
-        mask = r2 > 0.0
+        mask = r2 >= 0.0 if self.has_soft_core else r2 > 0.0
         safe_r2 = mx.where(mask, r2, 1.0)
         distance = mx.sqrt(safe_r2)
+
+        if self.has_soft_core:
+            switch = mx.ones_like(distance)
+            switch_derivative = mx.zeros_like(distance)
+            lj_pair_energy, coulomb_pair_energy, scalar, _, _ = self._soft_core_pair_terms(
+                r2,
+                mask,
+                sigma_ij=self.exception_sigma,
+                epsilon_ij=self.exception_epsilon,
+                qij=self.exception_charge_products,
+                lj_scales=_unit_pair_scale(),
+                coulomb_scales=_unit_pair_scale(),
+                switch=switch,
+                switch_derivative=switch_derivative,
+            )
+            pair_forces = scalar[:, None] * displacement
+            forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
+            return mx.sum(lj_pair_energy), mx.sum(coulomb_pair_energy), forces
 
         sigma2_over_r2 = (self.exception_sigma * self.exception_sigma) / safe_r2
         inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
@@ -1275,116 +1883,11 @@ class NonbondedPotential:
             return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
         return mx.array(tuple(sorted(pairs)), dtype=mx.int32)
 
-    def _ewald_energy_forces_with_components(
+    def _periodic_coulomb_corrections(
         self,
         positions: mx.array,
-        cell: Cell | None,
-        pairs: mx.array | None,
+        cell: Cell,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
-        if cell is None:
-            msg = "Ewald reference electrostatics requires a periodic cell"
-            raise ValueError(msg)
-        if pairs is not None:
-            msg = "Ewald reference electrostatics requires full-system evaluation"
-            raise ValueError(msg)
-
-        lj_energy, lj_forces = self._regular_lj_components(positions, cell)
-        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
-        lj_energy = lj_energy + exception_lj
-        lj_forces = lj_forces + exception_lj_forces
-
-        ewald_energy, ewald_forces, ewald_components = ewald_reference_coulomb_energy_forces(
-            positions,
-            self.charges,
-            cell,
-            coulomb_constant=self.coulomb_constant,
-            config=self.ewald_config,
-        )
-        correction_pairs = self._ewald_correction_pairs()
-        if correction_pairs.shape[0] == 0:
-            zero = _zero_energy(positions)
-            correction_energy = zero
-            correction_forces = mx.zeros_like(positions)
-        else:
-            i = correction_pairs[:, 0]
-            j = correction_pairs[:, 1]
-            original_charge_products = self.charges[i] * self.charges[j]
-            correction_energy, correction_forces = self._bare_coulomb_components(
-                positions,
-                cell,
-                correction_pairs,
-                -original_charge_products,
-            )
-
-        exception_coulomb, exception_coulomb_forces = self._bare_coulomb_components(
-            positions,
-            cell,
-            self.exception_pairs,
-            self.exception_charge_products,
-        )
-        one_four_pairs = self._ewald_one_four_pairs()
-        if one_four_pairs.shape[0] == 0:
-            one_four_energy = _zero_energy(positions)
-            one_four_forces = mx.zeros_like(positions)
-        else:
-            i = one_four_pairs[:, 0]
-            j = one_four_pairs[:, 1]
-            one_four_charge_products = (
-                (self.coulomb_one_four_scale - 1.0) * self.charges[i] * self.charges[j]
-            )
-            one_four_energy, one_four_forces = self._bare_coulomb_components(
-                positions,
-                cell,
-                one_four_pairs,
-                one_four_charge_products,
-            )
-        coulomb_energy = ewald_energy + correction_energy + exception_coulomb + one_four_energy
-        coulomb_forces = (
-            ewald_forces
-            + correction_forces
-            + exception_coulomb_forces
-            + one_four_forces
-        )
-        components = {
-            "lj": lj_energy,
-            "coulomb": coulomb_energy,
-            "coulomb_real": ewald_components["coulomb_real"],
-            "coulomb_reciprocal": ewald_components["coulomb_reciprocal"],
-            "coulomb_self": ewald_components["coulomb_self"],
-            "coulomb_exclusion_correction": correction_energy,
-            "coulomb_exception": exception_coulomb,
-            "coulomb_one_four_correction": one_four_energy,
-        }
-        return lj_energy + coulomb_energy, lj_forces + coulomb_forces, components
-
-    def _pme_energy_forces_with_components(
-        self,
-        positions: mx.array,
-        cell: Cell | None,
-        pairs: mx.array | None,
-    ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
-        if cell is None:
-            msg = "PME electrostatics requires a periodic cell"
-            raise ValueError(msg)
-        if pairs is not None:
-            msg = "PME electrostatics requires full-system evaluation"
-            raise ValueError(msg)
-        if self.pme_config is None:
-            msg = "PME electrostatics requires pme_config"
-            raise ValueError(msg)
-
-        lj_energy, lj_forces = self._regular_lj_components(positions, cell)
-        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
-        lj_energy = lj_energy + exception_lj
-        lj_forces = lj_forces + exception_lj_forces
-
-        pme_energy, pme_forces, pme_components = pme_coulomb_energy_forces(
-            positions,
-            self.charges,
-            cell,
-            coulomb_constant=self.coulomb_constant,
-            config=self.pme_config,
-        )
         correction_pairs = self._ewald_correction_pairs()
         if correction_pairs.shape[0] == 0:
             correction_energy = _zero_energy(positions)
@@ -1422,25 +1925,361 @@ class NonbondedPotential:
                 one_four_pairs,
                 one_four_charge_products,
             )
-        coulomb_energy = pme_energy + correction_energy + exception_coulomb + one_four_energy
-        coulomb_forces = (
-            pme_forces
-            + correction_forces
-            + exception_coulomb_forces
-            + one_four_forces
+        energy = correction_energy + exception_coulomb + one_four_energy
+        forces = correction_forces + exception_coulomb_forces + one_four_forces
+        components = {
+            "coulomb_exclusion_correction": correction_energy,
+            "coulomb_exception": exception_coulomb,
+            "coulomb_one_four_correction": one_four_energy,
+        }
+        return energy, forces, components
+
+    def _ewald_energy_forces_with_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | None,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+        if cell is None:
+            msg = "Ewald reference electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if pairs is not None:
+            msg = "Ewald reference electrostatics requires full-system evaluation"
+            raise ValueError(msg)
+
+        lj_energy, lj_forces = self._regular_lj_components(positions, cell)
+        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        lj_energy = lj_energy + exception_lj
+        lj_forces = lj_forces + exception_lj_forces
+
+        ewald_energy, ewald_forces, ewald_components = ewald_reference_coulomb_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.ewald_config,
         )
+        correction_energy, correction_forces, correction_components = (
+            self._periodic_coulomb_corrections(positions, cell)
+        )
+        coulomb_energy = ewald_energy + correction_energy
+        coulomb_forces = ewald_forces + correction_forces
+        components = {
+            "lj": lj_energy,
+            "coulomb": coulomb_energy,
+            "coulomb_real": ewald_components["coulomb_real"],
+            "coulomb_reciprocal": ewald_components["coulomb_reciprocal"],
+            "coulomb_self": ewald_components["coulomb_self"],
+            **correction_components,
+        }
+        return lj_energy + coulomb_energy, lj_forces + coulomb_forces, components
+
+    def _ewald_energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | None,
+    ) -> tuple[mx.array, mx.array]:
+        if cell is None:
+            msg = "Ewald reference electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if pairs is not None:
+            msg = "Ewald reference electrostatics requires full-system evaluation"
+            raise ValueError(msg)
+
+        lj_energy, lj_forces = self._regular_lj_components(positions, cell)
+        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        ewald_energy, ewald_forces = ewald_reference_coulomb_total_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.ewald_config,
+        )
+        correction_energy, correction_forces, _ = self._periodic_coulomb_corrections(
+            positions,
+            cell,
+        )
+        coulomb_energy = ewald_energy + correction_energy
+        coulomb_forces = ewald_forces + correction_forces
+        return (
+            lj_energy + exception_lj + coulomb_energy,
+            lj_forces + exception_lj_forces + coulomb_forces,
+        )
+
+    def _pme_energy_forces_with_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
+        if cell is None:
+            msg = "PME electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if self.pme_config is None:
+            msg = "PME electrostatics requires pme_config"
+            raise ValueError(msg)
+
+        direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
+        lj_energy, lj_forces = self._regular_lj_components(
+            positions,
+            cell,
+            direct_space_pairs,
+        )
+        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        lj_energy = lj_energy + exception_lj
+        lj_forces = lj_forces + exception_lj_forces
+
+        pme_energy, pme_forces, pme_components = pme_coulomb_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            direct_space_pairs=direct_space_pairs,
+        )
+        correction_energy, correction_forces, correction_components = (
+            self._periodic_coulomb_corrections(positions, cell)
+        )
+        coulomb_energy = pme_energy + correction_energy
+        coulomb_forces = pme_forces + correction_forces
         components = {
             "lj": lj_energy,
             "coulomb": coulomb_energy,
             "coulomb_real": pme_components["coulomb_real"],
             "coulomb_reciprocal": pme_components["coulomb_reciprocal"],
             "coulomb_self": pme_components["coulomb_self"],
-            "coulomb_exclusion_correction": correction_energy,
-            "coulomb_exception": exception_coulomb,
-            "coulomb_one_four_correction": one_four_energy,
+            **correction_components,
             "pme_diagnostics": pme_components["diagnostics"],
         }
         return lj_energy + coulomb_energy, lj_forces + coulomb_forces, components
+
+    def _pme_energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> tuple[mx.array, mx.array]:
+        if cell is None:
+            msg = "PME electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if self.pme_config is None:
+            msg = "PME electrostatics requires pme_config"
+            raise ValueError(msg)
+
+        direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
+        lj_energy, lj_forces = self._regular_lj_components(
+            positions,
+            cell,
+            direct_space_pairs,
+        )
+        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        pme_energy, pme_forces = pme_coulomb_total_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            direct_space_pairs=direct_space_pairs,
+        )
+        correction_energy, correction_forces, _ = self._periodic_coulomb_corrections(
+            positions,
+            cell,
+        )
+        coulomb_energy = pme_energy + correction_energy
+        coulomb_forces = pme_forces + correction_forces
+        return (
+            lj_energy + exception_lj + coulomb_energy,
+            lj_forces + exception_lj_forces + coulomb_forces,
+        )
+
+    def _pme_direct_space_energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> tuple[mx.array, mx.array]:
+        if cell is None:
+            msg = "PME electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if self.pme_config is None:
+            msg = "PME electrostatics requires pme_config"
+            raise ValueError(msg)
+
+        direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
+        lj_energy, lj_forces = self._regular_lj_components(
+            positions,
+            cell,
+            direct_space_pairs,
+        )
+        exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        direct_energy, direct_forces = pme_coulomb_direct_space_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            pairs=direct_space_pairs,
+        )
+        correction_energy, correction_forces, _ = self._periodic_coulomb_corrections(
+            positions,
+            cell,
+        )
+        return (
+            lj_energy + exception_lj + direct_energy + correction_energy,
+            lj_forces + exception_lj_forces + direct_forces + correction_forces,
+        )
+
+    def _pme_reciprocal_space_energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> tuple[mx.array, mx.array]:
+        if cell is None:
+            msg = "PME electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if pairs is not None:
+            msg = "PME electrostatics requires full-system evaluation"
+            raise ValueError(msg)
+        if self.pme_config is None:
+            msg = "PME electrostatics requires pme_config"
+            raise ValueError(msg)
+        return pme_coulomb_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+        )
+
+    def _validated_pme_direct_space_pairs(
+        self,
+        cell: Cell,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> mx.array | NeighborBlocks | None:
+        if pairs is None:
+            return None
+        if self.pme_config is None:
+            msg = "PME electrostatics requires pme_config"
+            raise ValueError(msg)
+        if not isinstance(pairs, NeighborBlocks):
+            msg = (
+                "PME production direct-space shared pair policy unsupported: "
+                "pme_production_direct_space_requires_neighbor_blocks"
+            )
+            raise ValueError(msg)
+        report = pme_direct_space_policy_report(cell, config=self.pme_config, pairs=pairs)
+        if report["uses_shared_neighbor_policy"]:
+            return pairs
+        reason = report.get("fallback_reason") or "pme_direct_space_shared_policy_unsupported"
+        msg = f"PME production direct-space shared pair policy unsupported: {reason}"
+        raise ValueError(msg)
+
+    def force_scope_report(self, scope: str = "total") -> dict[str, object]:
+        """Return support metadata for a force-evaluation scope."""
+
+        normalized = normalize_force_scope(scope)
+        requires_full_system = self.electrostatics in {"ewald_reference", "pme"}
+        if normalized == "total":
+            return ForceScopeReport(
+                scope=normalized,
+                supported=True,
+                execution_path="nonbonded_total",
+                backend=self.backend,
+                electrostatics=self.electrostatics,
+                production_total_only=True,
+                requires_full_system=requires_full_system,
+            ).to_dict()
+        if normalized == "components":
+            return ForceScopeReport(
+                scope=normalized,
+                supported=True,
+                execution_path="nonbonded_components",
+                backend=self.backend,
+                electrostatics=self.electrostatics,
+                diagnostic_components=True,
+                component_work=True,
+                requires_full_system=requires_full_system,
+            ).to_dict()
+        if normalized == "direct_space" and self.electrostatics in {"cutoff", "pme"}:
+            execution_path = (
+                "nonbonded_cutoff_direct_space"
+                if self.electrostatics == "cutoff"
+                else "nonbonded_pme_direct_space"
+            )
+            return ForceScopeReport(
+                scope=normalized,
+                supported=True,
+                execution_path=execution_path,
+                backend=self.backend,
+                electrostatics=self.electrostatics,
+                direct_space=True,
+                requires_full_system=requires_full_system,
+            ).to_dict()
+        if normalized == "reciprocal_space" and self.electrostatics == "pme":
+            return ForceScopeReport(
+                scope=normalized,
+                supported=True,
+                execution_path="nonbonded_pme_reciprocal_space",
+                backend=self.backend,
+                electrostatics=self.electrostatics,
+                reciprocal_space=True,
+                requires_full_system=True,
+            ).to_dict()
+
+        if self.electrostatics == "ewald_reference":
+            reason = (
+                "ewald_reference exposes real/reciprocal energies through the "
+                "diagnostic component scope, but standalone scoped forces are not exposed"
+            )
+        elif normalized == "reciprocal_space":
+            reason = "reciprocal-space force scope is only available for PME electrostatics"
+        else:
+            reason = "direct-space force scope is not available for this electrostatics mode"
+        return ForceScopeReport(
+            scope=normalized,
+            supported=False,
+            execution_path="unsupported",
+            backend=self.backend,
+            electrostatics=self.electrostatics,
+            requires_full_system=requires_full_system,
+            unsupported_reason=reason,
+        ).to_dict()
+
+    def energy_forces_for_scope(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+        *,
+        scope: str = "total",
+    ) -> tuple[mx.array, mx.array]:
+        """Evaluate energy and forces through an explicit force scope."""
+
+        normalized = normalize_force_scope(scope)
+        report = self.force_scope_report(normalized)
+        if not report["supported"]:
+            msg = (
+                f"force scope {normalized!r} is unsupported for "
+                f"{self.electrostatics!r}: {report['unsupported_reason']}"
+            )
+            raise ValueError(msg)
+
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+        if normalized == "total":
+            return self.energy_forces(positions, cell, pairs)
+        if normalized == "components":
+            energy, forces, _ = self.energy_forces_with_components(positions, cell, pairs)
+            return energy, forces
+        if normalized == "direct_space":
+            if self.electrostatics == "pme":
+                return self._pme_direct_space_energy_forces(positions, cell, pairs)
+            return self.energy_forces(positions, cell, pairs)
+        return self._pme_reciprocal_space_energy_forces(positions, cell, pairs)
 
     def component_energies(
         self,
@@ -1493,6 +2332,28 @@ class NonbondedPotential:
             {"lj": lj_energy, "coulomb": coulomb_energy},
         )
 
+    def energy_forces_dlambda(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+        """Return energy, forces, and analytic lambda derivatives."""
+
+        if self.electrostatics != "cutoff":
+            msg = "dU/dlambda is currently available for cutoff electrostatics only"
+            raise ValueError(msg)
+        energy, forces = self.energy_forces(positions, cell, pairs)
+        dlj_dlambda, dcoulomb_dlambda = self._pair_lambda_derivatives(
+            as_mx_array(positions),
+            cell,
+            pairs,
+        )
+        return energy, forces, {
+            "lambda_lj": dlj_dlambda,
+            "lambda_electrostatics": dcoulomb_dlambda,
+        }
+
     def energy_forces(
         self,
         positions: mx.array,
@@ -1505,8 +2366,26 @@ class NonbondedPotential:
         if positions.ndim != 2 or positions.shape[1] != 3:
             msg = "positions must have shape (n_atoms, 3)"
             raise ValueError(msg)
-        energy, forces, _ = self.energy_forces_with_components(positions, cell, pairs)
-        return energy, forces
+        if self.electrostatics == "ewald_reference":
+            return self._ewald_energy_forces(
+                positions,
+                cell,
+                pairs,
+            )
+        if self.electrostatics == "pme":
+            return self._pme_energy_forces(positions, cell, pairs)
+        _, lj_energy, coulomb_energy, forces, _, _ = self._pair_components(
+            positions,
+            cell,
+            pairs,
+        )
+        exception_lj, exception_coulomb, exception_forces = self._exception_components(
+            positions,
+            cell,
+        )
+        return lj_energy + exception_lj + coulomb_energy + exception_coulomb, (
+            forces + exception_forces
+        )
 
 
 @dataclass(frozen=True)
@@ -1531,6 +2410,15 @@ class PairRestrictedNonbondedPotential:
             raise ValueError(msg)
         object.__setattr__(self, "pairs", mx.array(pairs, dtype=mx.int32))
 
+    def _validate_scope_is_pair_restricted(self) -> None:
+        if self.potential.electrostatics not in {"ewald_reference", "pme"}:
+            return
+        msg = (
+            "pair-restricted nonbonded evaluation is unsupported for "
+            f"{self.potential.electrostatics!r}; full-system evaluation is required"
+        )
+        raise ValueError(msg)
+
     def component_energies(
         self,
         positions: mx.array,
@@ -1538,7 +2426,29 @@ class PairRestrictedNonbondedPotential:
         pairs: mx.array | None = None,
     ) -> dict[str, mx.array]:
         del pairs
+        self._validate_scope_is_pair_restricted()
         return self.potential.component_energies(positions, cell=cell, pairs=self.pairs)
+
+    def force_scope_report(self, scope: str = "total") -> dict[str, object]:
+        report = dict(self.potential.force_scope_report(scope))
+        if report["supported"] and report["requires_full_system"]:
+            report.update(
+                {
+                    "supported": False,
+                    "execution_path": "pair_restricted_unsupported",
+                    "production_total_only": False,
+                    "diagnostic_components": False,
+                    "direct_space": False,
+                    "reciprocal_space": False,
+                    "component_work": False,
+                    "unsupported_reason": (
+                        "pair-restricted nonbonded evaluation supplies explicit pairs, "
+                        f"but {self.potential.electrostatics!r} scopes require full-system "
+                        "evaluation"
+                    ),
+                }
+            )
+        return report
 
     def energy_forces(
         self,
@@ -1547,7 +2457,31 @@ class PairRestrictedNonbondedPotential:
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         del pairs
+        self._validate_scope_is_pair_restricted()
         return self.potential.energy_forces(positions, cell=cell, pairs=self.pairs)
+
+    def energy_forces_for_scope(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+        *,
+        scope: str = "total",
+    ) -> tuple[mx.array, mx.array]:
+        del pairs
+        report = self.force_scope_report(scope)
+        if not report["supported"]:
+            msg = (
+                f"force scope {report['scope']!r} is unsupported for pair-restricted "
+                f"{self.potential.electrostatics!r}: {report['unsupported_reason']}"
+            )
+            raise ValueError(msg)
+        return self.potential.energy_forces_for_scope(
+            positions,
+            cell=cell,
+            pairs=self.pairs,
+            scope=scope,
+        )
 
     def energy_forces_with_components(
         self,
@@ -1556,8 +2490,89 @@ class PairRestrictedNonbondedPotential:
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
         del pairs
+        self._validate_scope_is_pair_restricted()
         return self.potential.energy_forces_with_components(
             positions,
             cell=cell,
             pairs=self.pairs,
         )
+
+
+@dataclass(frozen=True)
+class SoftCoreNonbondedPotential:
+    """Lambda-scaled wrapper around a combined nonbonded potential."""
+
+    potential: NonbondedPotential
+    lambda_lj: float = 1.0
+    lambda_electrostatics: float = 1.0
+    name: str = "soft_core_nonbonded"
+    supports_virial: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "potential",
+            replace(
+                self.potential,
+                lambda_lj=self.lambda_lj,
+                lambda_electrostatics=self.lambda_electrostatics,
+            ),
+        )
+
+    @property
+    def sigma(self) -> mx.array:
+        return self.potential.sigma
+
+    @property
+    def electrostatics(self) -> NonbondedElectrostatics:
+        return self.potential.electrostatics
+
+    def component_energies(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> dict[str, mx.array | object]:
+        return self.potential.component_energies(positions, cell=cell, pairs=pairs)
+
+    def energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        return self.potential.energy_forces(positions, cell=cell, pairs=pairs)
+
+    def energy_forces_with_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
+        return self.potential.energy_forces_with_components(positions, cell=cell, pairs=pairs)
+
+    def force_scope_report(self, scope: str = "total") -> dict[str, object]:
+        return self.potential.force_scope_report(scope)
+
+    def energy_forces_for_scope(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+        *,
+        scope: str = "total",
+    ) -> tuple[mx.array, mx.array]:
+        return self.potential.energy_forces_for_scope(
+            positions,
+            cell=cell,
+            pairs=pairs,
+            scope=scope,
+        )
+
+    def energy_forces_dlambda(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+        return self.potential.energy_forces_dlambda(positions, cell=cell, pairs=pairs)

@@ -5,6 +5,7 @@ from mlx_atomistic.core import Cell
 from mlx_atomistic.md import (
     LangevinThermostat,
     LennardJonesPotential,
+    NoseHooverThermostat,
     SimulationConfig,
     simulate_nve,
     simulate_nvt,
@@ -29,6 +30,35 @@ def test_langevin_thermostat_validation():
         LangevinThermostat(temperature=-1.0)
     with pytest.raises(ValueError, match="friction"):
         LangevinThermostat(friction=-1.0)
+
+
+def test_nose_hoover_thermostat_validation():
+    with pytest.raises(ValueError, match="temperature"):
+        NoseHooverThermostat(temperature=0.0)
+    with pytest.raises(ValueError, match="relaxation_time"):
+        NoseHooverThermostat(relaxation_time=0.0)
+    with pytest.raises(ValueError, match="thermal_mass"):
+        NoseHooverThermostat(thermal_mass=-1.0)
+
+
+def test_nose_hoover_nvt_produces_finite_state_and_metadata():
+    positions, velocities, cell, potential = _small_system()
+    result = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        config=SimulationConfig(dt=0.001, steps=8, sample_interval=4),
+        thermostat=NoseHooverThermostat(temperature=1.0, relaxation_time=0.2),
+    )
+
+    assert result.thermostat_metadata["family"] == "nose_hoover"
+    assert result.thermostat_metadata["integrator"] == "nose_hoover_velocity_verlet"
+    assert result.thermostat_metadata["deterministic_state"] is True
+    assert np.isfinite(np.asarray(result.sampled_positions)).all()
+    assert np.isfinite(np.asarray(result.sampled_velocities)).all()
+    assert np.isfinite(np.asarray(result.total_energy)).all()
+    assert np.isfinite(np.asarray(result.temperature)).all()
 
 
 def test_simulate_nvt_sparse_sampling_counts_and_temperature_error():

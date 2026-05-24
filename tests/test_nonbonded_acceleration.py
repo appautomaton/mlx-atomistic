@@ -10,7 +10,9 @@ from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate_nvt
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 from mlx_atomistic.nonbonded import (
+    DEFAULT_FULL_LOOP_DENSE_THRESHOLD,
     NonbondedExecutionConfig,
+    choose_full_loop_nonbonded_policy,
     choose_nonbonded_backend,
     estimate_dense_nonbonded_bytes,
     normalize_nonbonded_electrostatics,
@@ -169,6 +171,55 @@ def test_periodic_neighbor_pairs_match_dense_cutoff_nonbonded():
     np.testing.assert_allclose(np.asarray(pair_forces), np.asarray(dense_forces), rtol=1e-5)
 
 
+def test_triclinic_nonbonded_displacements_use_minimum_image():
+    matrix = np.array(
+        [
+            [4.0, 0.0, 0.0],
+            [1.0, 3.0, 0.0],
+            [0.5, 0.25, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.triclinic(matrix)
+    positions = as_mx_array(
+        np.array(
+            [
+                [0.95, 0.5, 0.5],
+                [0.05, 0.5, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        @ matrix
+    )
+    term = NonbondedPotential(
+        sigma=[0.3, 0.3],
+        epsilon=[1.0, 1.0],
+        charges=[0.0, 0.0],
+        cutoff=0.6,
+        lj_shift=False,
+        backend="mlx_dense",
+    )
+    pairs_term = NonbondedPotential(
+        sigma=[0.3, 0.3],
+        epsilon=[1.0, 1.0],
+        charges=[0.0, 0.0],
+        cutoff=0.6,
+        lj_shift=False,
+        backend="mlx_pairs",
+    )
+    pairs = as_mx_array([[0, 1]], dtype=mx.int32)
+
+    dense_energy, dense_forces = term.energy_forces(positions, cell)
+    pair_energy, pair_forces = pairs_term.energy_forces(positions, cell, pairs=pairs)
+    unwrapped_energy, _ = term.energy_forces(positions, None)
+
+    mx.eval(dense_energy, dense_forces, pair_energy, pair_forces, unwrapped_energy)
+    assert float(np.asarray(dense_energy)) != pytest.approx(0.0)
+    np.testing.assert_allclose(np.asarray(unwrapped_energy), 0.0, atol=1e-7)
+    np.testing.assert_allclose(np.asarray(pair_energy), np.asarray(dense_energy), rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(pair_forces), np.asarray(dense_forces), rtol=1e-5)
+
+
 def test_lazy_topology_neighbor_pairs_filter_exclusions_and_exceptions_without_dense_cache():
     positions = as_mx_array(
         [
@@ -264,6 +315,67 @@ def test_mlx_dense_pairs_preserve_lazy_topology_pair_semantics():
     np.testing.assert_allclose(np.asarray(mlx_forces), np.asarray(oracle_forces), rtol=1e-5)
 
 
+def test_mlx_cell_blocks_preserve_lazy_topology_pair_semantics():
+    positions = as_mx_array(
+        [
+            [0.1, 0.1, 0.1],
+            [1.1, 0.1, 0.1],
+            [0.1, 1.1, 0.1],
+            [1.2, 1.1, 0.1],
+        ]
+    )
+    cell = Cell.cubic(4.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        one_four_pairs=[(0, 3)],
+        nonbonded_exception_pairs=[(1, 3)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.1, 1.2, 1.0],
+        epsilon=[0.2, 0.25, 0.3, 0.2],
+        charges=[0.25, -0.25, 0.1, -0.1],
+        atom_types=["H", "C", "O", "H"],
+        topology=topology,
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.75,
+        exception_pairs=[(1, 3)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.35],
+        nbfix_type_epsilon=[0.6],
+        cutoff=2.0,
+        lj_shift=False,
+        backend="auto",
+    )
+    oracle = build_neighbor_list(positions, cell, cutoff=2.0, skin=0.0)
+    blocks = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+        block_size=2,
+    )
+
+    oracle_energy, oracle_forces = term.energy_forces(positions, cell, pairs=oracle.pairs)
+    block_energy, block_forces = term.energy_forces(
+        positions,
+        cell,
+        pairs=blocks.interactions,
+    )
+
+    mx.eval(oracle_energy, oracle_forces, block_energy, block_forces)
+    assert topology._nonbonded_pairs is None
+    assert blocks.representation_kind == "blocks"
+    assert blocks.compaction_backend is None
+    np.testing.assert_allclose(np.asarray(block_energy), np.asarray(oracle_energy), rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(block_forces), np.asarray(oracle_forces), rtol=1e-5)
+
+
 def test_nbfix_type_pair_substitution_works_on_neighbor_pairs():
     positions = as_mx_array(
         [[0.1, 0.1, 0.1], [1.4, 0.1, 0.1], [0.1, 1.5, 0.1]]
@@ -352,7 +464,7 @@ def test_lazy_large_periodic_nonbonded_refuses_dense_fallback_and_reports_compac
     assert result.nonbonded_report["force_evaluation_wall_seconds"] >= 0.0
 
 
-def test_auto_neighbor_backend_selects_mlx_cell_pairs_above_dense_limit():
+def test_auto_neighbor_backend_selects_mlx_cell_blocks_above_dense_limit():
     positions = as_mx_array(
         [
             [0.1, 0.1, 0.1],
@@ -389,12 +501,63 @@ def test_auto_neighbor_backend_selects_mlx_cell_pairs_above_dense_limit():
         config=SimulationConfig(steps=1, diagnostic_interval=1),
     )
 
-    assert result.nonbonded_report["backend"] == "mlx_cell_pairs"
-    assert result.nonbonded_report["representation_kind"] == "pairs"
+    assert result.nonbonded_report["backend"] == "mlx_cell_blocks"
+    assert result.nonbonded_report["representation_kind"] == "blocks"
     assert result.nonbonded_report["candidate_count"] is not None
+    assert result.nonbonded_report["compaction_backend"] is None
     assert result.nonbonded_report["fallback_reason"] is None
     assert result.nonbonded_report["neighbor_update_wall_seconds"] >= 0.0
     assert result.nonbonded_report["neighbor_rebuild_wall_seconds"] >= 0.0
+    assert result.nonbonded_report["force_evaluation_wall_seconds"] >= 0.0
+
+
+def test_explicit_block_neighbor_backend_reports_block_representation():
+    positions = as_mx_array(
+        [[0.1, 0.1, 0.1], [1.1, 0.1, 0.1], [0.1, 1.1, 0.1], [1.1, 1.1, 0.1]]
+    )
+    velocities = mx.zeros_like(positions)
+    masses = mx.ones((4,), dtype=mx.float32)
+    cell = Cell.cubic(5.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.2, 0.2, 0.2, 0.2],
+        charges=[0.0, 0.0, 0.0, 0.0],
+        topology=topology,
+        cutoff=1.6,
+        backend="auto",
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=1.6,
+        skin=0.2,
+        backend="mlx_cell_blocks",
+        block_size=2,
+    )
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=(term,),
+        neighbor_manager=manager,
+        config=SimulationConfig(steps=1, diagnostic_interval=1),
+    )
+
+    assert result.nonbonded_report["backend"] == "mlx_cell_blocks"
+    assert result.nonbonded_report["representation_kind"] == "blocks"
+    assert result.nonbonded_report["pair_count"] == int(result.pair_count[-1])
+    assert result.nonbonded_report["compact_pair_count"] <= result.nonbonded_report["pair_count"]
+    assert result.nonbonded_report["candidate_count"] == int(result.pair_count[-1])
+    assert result.nonbonded_report["candidate_waste_count"] is not None
+    assert result.nonbonded_report["candidate_waste_fraction"] is not None
+    assert result.nonbonded_report["compaction_backend"] is None
+    assert result.nonbonded_report["fallback_reason"] is None
     assert result.nonbonded_report["force_evaluation_wall_seconds"] >= 0.0
 
 
@@ -433,7 +596,10 @@ def test_mlx_dense_pairs_neighbor_manager_drives_lazy_nonbonded_md_report():
     assert result.nonbonded_report["backend"] == "mlx_dense_pairs"
     assert result.nonbonded_report["representation_kind"] == "pairs"
     assert result.nonbonded_report["pair_count"] == int(result.pair_count[-1])
+    assert result.nonbonded_report["compact_pair_count"] == int(result.pair_count[-1])
     assert result.nonbonded_report["candidate_count"] == 6
+    assert result.nonbonded_report["candidate_waste_count"] == 6 - int(result.pair_count[-1])
+    assert result.nonbonded_report["candidate_waste_fraction"] is not None
     assert result.nonbonded_report["estimated_candidate_memory_bytes"] > 0
     assert result.nonbonded_report["compaction_backend"] == "cpu_argwhere"
     assert result.nonbonded_report["fallback_reason"] == "mlx_argwhere_or_nonzero_unavailable"
@@ -491,6 +657,69 @@ def test_backend_validation_and_memory_policy():
             backend="mlx_dense",
             memory_budget_bytes=1,
         ).energy_forces(as_mx_array([[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]]), Cell.cubic(4.0))
+
+
+def test_full_loop_auto_policy_selects_dynamic_neighbor_from_evidence():
+    assert DEFAULT_FULL_LOOP_DENSE_THRESHOLD == 1536
+
+    policy = choose_full_loop_nonbonded_policy(
+        mode="auto",
+        n_atoms=512,
+        cutoff=2.5,
+        cell_provided=True,
+    )
+    assert policy.use_neighbor_list is False
+    assert policy.potential_backend == "auto"
+    assert policy.selected_backend == "mlx_dense"
+    assert policy.neighbor_backend is None
+    assert policy.selected_policy == "auto:evidence_dense_below_threshold; dense_threshold:1536"
+    assert policy.evidence == "s3_small_system_dense_threshold"
+    assert policy.blocker is None
+
+    large = choose_full_loop_nonbonded_policy(
+        mode="auto",
+        n_atoms=2000,
+        cutoff=2.5,
+        cell_provided=True,
+    )
+    assert large.use_neighbor_list is True
+    assert large.potential_backend == "mlx_pairs"
+    assert large.selected_backend == "dynamic-neighbor+mlx_cell_blocks"
+    assert large.neighbor_backend == "mlx_cell_blocks"
+    assert large.selected_policy == "auto:evidence_dynamic_neighbor; dense_threshold:1536"
+    assert large.evidence == "s1_s2_s3_full_loop_policy_evidence"
+    assert large.blocker is None
+
+    fallback = choose_full_loop_nonbonded_policy(
+        mode="auto",
+        n_atoms=512,
+        cutoff=None,
+        cell_provided=False,
+    )
+    assert fallback.use_neighbor_list is False
+    assert fallback.selected_backend == "mlx_dense"
+    assert fallback.blocker == "dynamic_neighbor_requires_periodic_cutoff"
+
+
+@pytest.mark.parametrize("bad_cutoff", [float("nan"), float("inf"), 0.0, -1.0])
+def test_full_loop_policy_rejects_invalid_dynamic_neighbor_cutoff(bad_cutoff):
+    with pytest.raises(ValueError, match="finite positive cutoff"):
+        choose_full_loop_nonbonded_policy(
+            mode="dynamic-neighbor",
+            n_atoms=512,
+            cutoff=bad_cutoff,
+            cell_provided=True,
+        )
+
+    fallback = choose_full_loop_nonbonded_policy(
+        mode="auto",
+        n_atoms=512,
+        cutoff=bad_cutoff,
+        cell_provided=True,
+    )
+    assert fallback.use_neighbor_list is False
+    assert fallback.selected_backend == "mlx_dense"
+    assert fallback.blocker == "dynamic_neighbor_requires_finite_positive_cutoff"
 
 
 def test_electrostatics_mode_contract():
@@ -619,6 +848,110 @@ def test_md_performance_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert case["estimated_dense_bytes"] > 0
     assert case["finite"] is True
     assert csv_path.read_text().startswith("case,mode,particles")
+
+
+def test_md_performance_neighbor_policy_knobs_are_reported():
+    payload = md_performance.build_payload(
+        sizes=(64,),
+        steps=1,
+        dt=0.002,
+        mode="dynamic-neighbor",
+        dense_threshold=1536,
+        sample_interval=1,
+        diagnostic_interval=1,
+        neighbor_check_interval=20,
+        neighbor_skin=1.0,
+    )
+
+    case = payload["cases"][0]
+    assert case["backend"] == "dynamic-neighbor+mlx_cell_blocks"
+    assert case["finite"] is True
+    assert payload["config"]["neighbor_check_interval"] == 20
+    assert payload["config"]["neighbor_skin"] == 1.0
+
+
+def test_md_performance_include_large_adds_documented_s5_large_case_once():
+    assert md_performance._with_large_sizes((16,)) == (16, 5000)
+    assert md_performance._with_large_sizes((2000, 5000)) == (2000, 5000)
+
+
+def test_md_performance_auto_default_routes_2000_to_dynamic_neighbor():
+    result = md_performance.run_synthetic_case(
+        particles=2000,
+        steps=1,
+        dt=0.002,
+        mode="auto",
+        sample_interval=1,
+        diagnostic_interval=1,
+        neighbor_check_interval=1,
+    )
+
+    assert result.backend == "dynamic-neighbor+mlx_cell_blocks"
+    assert result.selected_policy == "auto:evidence_dynamic_neighbor; dense_threshold:1536"
+    assert result.selected_representation == "blocks"
+    assert result.compaction_backend is None
+    assert result.neighbor_candidate_count is not None
+    assert result.candidate_waste_count is not None
+    assert result.candidate_waste_fraction is not None
+    assert result.final_pair_count < 2000 * 1999 // 2
+    assert result.rebuild_count >= 1
+    assert result.finite is True
+
+
+def test_md_performance_auto_threshold_override_can_keep_dense_for_small_system():
+    result = md_performance.run_synthetic_case(
+        particles=128,
+        steps=1,
+        dt=0.002,
+        mode="auto",
+        dense_threshold=256,
+        sample_interval=1,
+        diagnostic_interval=1,
+        neighbor_check_interval=1,
+    )
+
+    assert result.backend == "mlx_dense"
+    assert result.selected_policy == "auto:evidence_dense_below_threshold; dense_threshold:256"
+    assert result.neighbor_backend is None
+    assert result.candidate_waste_count == 0
+    assert result.rebuild_count == 0
+    assert result.finite is True
+
+
+def test_md_performance_auto_default_keeps_512_dense():
+    result = md_performance.run_synthetic_case(
+        particles=512,
+        steps=1,
+        dt=0.002,
+        mode="auto",
+        sample_interval=1,
+        diagnostic_interval=1,
+        neighbor_check_interval=1,
+    )
+
+    assert result.backend == "mlx_dense"
+    assert result.selected_policy == "auto:evidence_dense_below_threshold; dense_threshold:1536"
+    assert result.selected_representation == "pairs"
+    assert result.neighbor_backend is None
+    assert result.rebuild_count == 0
+    assert result.finite is True
+
+
+def test_md_performance_dynamic_neighbor_mode_smoke():
+    result = md_performance.run_synthetic_case(
+        particles=128,
+        steps=1,
+        dt=0.002,
+        mode="dynamic-neighbor",
+        sample_interval=1,
+        diagnostic_interval=1,
+        neighbor_check_interval=1,
+    )
+
+    assert result.backend == "dynamic-neighbor+mlx_cell_blocks"
+    assert result.final_pair_count > 0
+    assert result.rebuild_count >= 1
+    assert result.finite is True
 
 
 def test_md_performance_batched_replicas_smoke():

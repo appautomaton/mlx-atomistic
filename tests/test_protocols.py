@@ -6,6 +6,7 @@ from mlx_atomistic.md import LennardJonesPotential
 from mlx_atomistic.protocols import (
     MinimizeThenNVTProtocol,
     ProtocolCompatibilityError,
+    protocol_readiness_report,
     run_minimize_then_nvt,
     validate_gpcrmd_protocol_request,
 )
@@ -42,6 +43,20 @@ def test_gpcrmd_protocol_gate_accepts_short_nvt_metadata():
     assert report.metadata["barostat_status"] == "not_required_for_nvt_proof"
     assert report.metadata["npt_barostat"] is False
     assert report.metadata["membrane_barostat"] is False
+
+
+def test_protocol_readiness_report_uses_shared_schema():
+    report = protocol_readiness_report({"ensemble": "NPT", "barostat": "monte_carlo"})
+    payload = report.to_dict()
+
+    assert payload["name"] == "protocol"
+    assert payload["status"] == "proof-level"
+    assert payload["blockers"] == []
+    assert payload["metadata"]["proof_mode"] == "short_npt"
+
+    blocked = protocol_readiness_report({"ensemble": "NPT", "proof_mode": "short_nvt"})
+    assert blocked.status == "blocked"
+    assert blocked.blockers == ("barostat", "unsupported_proof_mode")
 
 
 @pytest.mark.parametrize(
@@ -82,7 +97,7 @@ def test_run_minimize_then_nvt_fails_closed_before_npt_force_evaluation():
             cell=cell,
         )
 
-    assert exc_info.value.blockers == ("barostat",)
+    assert exc_info.value.blockers == ("barostat", "unsupported_proof_mode")
 
 
 def test_run_minimize_then_nvt_exposes_nvt_protocol_metadata():

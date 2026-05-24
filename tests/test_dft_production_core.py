@@ -20,7 +20,9 @@ from mlx_atomistic.dft import (
     ReferenceDFTCase,
     SCFConfig,
     compare_reference_case,
+    dft_qm_scope_readiness_report,
     finite_difference_stress,
+    get_dft_qm_scope_report,
     load_dense_scf_restart,
     magnetization_density,
     read_upf,
@@ -147,3 +149,33 @@ def test_stress_restart_and_reference_comparison(tmp_path):
     json.dumps(stress.to_dict())
     json.dumps(restart.to_dict())
     json.dumps(comparison.to_dict())
+
+
+def test_dft_qm_scope_report_classifies_cp2k_qe_boundaries():
+    report = get_dft_qm_scope_report()
+    payload = report.to_dict()
+    entries = {entry["feature"]: entry for entry in payload["entries"]}
+
+    assert payload["product_runtime"] == "mlx_atomistic"
+    assert "cp2k" in payload["reference_policy"]
+    assert "quantum_espresso" in payload["reference_policy"]
+    assert entries["plane_wave_scf"]["status"] == "proof-level"
+    assert entries["static_reference_comparison"]["status"] == "supported"
+    assert entries["qmmm_orchestration"]["status"] == "deferred"
+    assert entries["external_runtime_execution"]["status"] == "anti-goal"
+    assert "CP2K Quickstep" in entries["plane_wave_scf"]["reference_families"]
+    assert "Quantum ESPRESSO PWscf" in entries["plane_wave_scf"]["reference_families"]
+    json.dumps(payload)
+
+    ready = dft_qm_scope_readiness_report("pwscf").to_dict()
+    assert ready["name"] == "dft_qm_scope"
+    assert ready["status"] == "proof-level"
+    assert ready["blockers"] == []
+
+    deferred = dft_qm_scope_readiness_report("qmmm").to_dict()
+    assert deferred["status"] == "deferred"
+    assert deferred["blockers"] == ["qmmm_orchestration:deferred"]
+
+    unknown = dft_qm_scope_readiness_report("cp2k-runtime-wrapper").to_dict()
+    assert unknown["status"] == "fail-closed"
+    assert unknown["blockers"] == ["unknown_dft_qm_feature:cp2k_runtime_wrapper"]

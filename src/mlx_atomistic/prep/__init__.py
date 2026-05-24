@@ -20,6 +20,10 @@ from mlx_atomistic.prep.gpcrmd import (
     write_gpcrmd_import_report,
     write_gpcrmd_targets,
 )
+from mlx_atomistic.prep.hmr import (
+    DEFAULT_HMR_TARGET_HYDROGEN_MASS,
+    apply_hydrogen_mass_repartitioning,
+)
 from mlx_atomistic.prep.io import (
     load_prepared_system,
     save_prepared_system,
@@ -44,7 +48,9 @@ from mlx_atomistic.prep.t4l_benzene import T4L_BENZENE_PARAMETER_SOURCE, prepare
 from mlx_atomistic.prep.topology_import import (
     TopologyImportError,
     import_amber_prmtop,
+    import_charmm_psf,
     import_charmm_with_parmed,
+    import_gromacs_top_gro,
 )
 
 
@@ -74,6 +80,7 @@ def run_steered_mlx(*args, **kwargs):
 
 __all__ = [
     "ARTIFACT_VERSION",
+    "DEFAULT_HMR_TARGET_HYDROGEN_MASS",
     "GPCRMD_IMPORT_REPORT_NAME",
     "GPCRmdCacheFileStatus",
     "GPCRmdCacheInspection",
@@ -92,13 +99,16 @@ __all__ = [
     "T4L_BENZENE_PARAMETER_SOURCE",
     "TopologyImportError",
     "attempt_gpcrmd_prepared_artifact_import",
+    "apply_hydrogen_mass_repartitioning",
     "build_mlx_system",
     "default_gpcrmd_targets",
     "ensure_solvated_ligand_receptor_example",
     "gpcrmd_mlx_compatibility_report",
     "gpcrmd_selection_reports",
     "import_amber_prmtop",
+    "import_charmm_psf",
     "import_charmm_with_parmed",
+    "import_gromacs_top_gro",
     "inspect_gpcrmd_cache",
     "load_gpcrmd_targets",
     "load_prepared_system",

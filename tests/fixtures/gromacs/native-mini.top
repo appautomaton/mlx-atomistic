@@ -1,0 +1,50 @@
+[ defaults ]
+; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ
+1 2 yes 0.5 0.8333333333
+
+[ atomtypes ]
+; name  mass    charge  ptype  sigma   epsilon
+C       12.011  0.0     A      0.3400  0.276144
+H       1.008   0.0     A      0.2500  0.125520
+O       15.999  0.0     A      0.3000  0.210000
+
+[ moleculetype ]
+; name  nrexcl
+MOL 3
+
+[ atoms ]
+; nr  type  resnr  residue  atom  cgnr  charge  mass
+1 C 1 LIG C1 1  0.10 12.011
+2 H 1 LIG H1 1  0.05  1.008
+3 O 1 LIG O1 1 -0.20 15.999
+4 H 1 LIG H2 1  0.05  1.008
+
+[ bonds ]
+; ai aj funct b0(nm) kb(kJ mol-1 nm-2)
+1 2 1 0.109 284512.0
+2 3 1 0.143 320000.0
+3 4 1 0.096 300000.0
+
+[ angles ]
+; ai aj ak funct theta(deg) k(kJ mol-1 rad-2)
+1 2 3 1 109.5 460.0
+2 3 4 1 104.5 450.0
+
+[ dihedrals ]
+; ai aj ak al funct phi0(deg) k periodicity
+1 2 3 4 1 0.0 1.5 3
+; ai aj ak al funct c0 c1 c2 c3 c4 c5
+1 2 3 4 3 0.10 -0.20 0.30 -0.40 0.50 -0.60
+
+[ pairs ]
+1 4 1
+
+[ exclusions ]
+1 3
+2 4
+
+[ system ]
+Native GROMACS mini fixture
+
+[ molecules ]
+MOL 2

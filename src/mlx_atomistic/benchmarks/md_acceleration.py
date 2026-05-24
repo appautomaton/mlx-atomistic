@@ -12,6 +12,12 @@ from time import perf_counter
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.benchmarks import (
+    default_benchmark_command,
+    get_hardware_info,
+    normalize_benchmark_payload,
+    normalize_benchmark_row,
+)
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.initialize import fcc_lattice
 from mlx_atomistic.neighbors import build_neighbor_list
@@ -42,6 +48,21 @@ class MDAccelerationBenchmarkResult:
     energy: float
     energy_abs_delta: float
     max_force_abs_delta: float
+    benchmark_name: str = "md_acceleration"
+    fixture: str = "synthetic_mixed_lj_coulomb_fcc"
+    atom_count: int = 0
+    evaluation_count: int = 0
+    selected_backend: str = ""
+    selected_policy: str = ""
+    neighbor_backend: str | None = None
+    representation_kind: str = ""
+    candidate_count: int | None = None
+    compact_pair_count: int = 0
+    candidate_waste_count: int | None = None
+    candidate_waste_fraction: float | None = None
+    compaction_backend: str | None = None
+    fallback_reason: str | None = None
+    neighbor_build_ms_per_eval: float = 0.0
 
     def to_dict(self) -> dict:
         """Return a JSON- and CSV-safe row."""
@@ -85,6 +106,59 @@ def _evaluate(
     return float(energy), np.asarray(forces)
 
 
+def _candidate_waste(
+    *,
+    candidate_count: int | None,
+    pair_count: int,
+) -> tuple[int | None, float | None]:
+    if candidate_count is None:
+        return None, None
+    waste = max(0, int(candidate_count) - int(pair_count))
+    fraction = waste / float(candidate_count) if candidate_count > 0 else 0.0
+    return waste, fraction
+
+
+def _dense_candidate_count(particles: int) -> int:
+    return int(particles) * max(int(particles) - 1, 0) // 2
+
+
+def _neighbor_fields(neighbor_list, *, particles: int, fallback_backend: str) -> dict:
+    if neighbor_list is None:
+        candidate_count = _dense_candidate_count(particles)
+        pair_count = candidate_count
+        waste, waste_fraction = _candidate_waste(
+            candidate_count=candidate_count,
+            pair_count=pair_count,
+        )
+        return {
+            "neighbor_backend": None,
+            "representation_kind": "dense_all_pairs",
+            "candidate_count": candidate_count,
+            "compact_pair_count": pair_count,
+            "candidate_waste_count": waste,
+            "candidate_waste_fraction": waste_fraction,
+            "compaction_backend": None,
+            "fallback_reason": None,
+        }
+
+    candidate_count = neighbor_list.candidate_count
+    pair_count = int(neighbor_list.pair_count)
+    waste, waste_fraction = _candidate_waste(
+        candidate_count=candidate_count,
+        pair_count=pair_count,
+    )
+    return {
+        "neighbor_backend": neighbor_list.backend or fallback_backend,
+        "representation_kind": neighbor_list.representation_kind,
+        "candidate_count": None if candidate_count is None else int(candidate_count),
+        "compact_pair_count": pair_count,
+        "candidate_waste_count": waste,
+        "candidate_waste_fraction": waste_fraction,
+        "compaction_backend": neighbor_list.compaction_backend,
+        "fallback_reason": neighbor_list.fallback_reason,
+    }
+
+
 def _time_backend(
     backend: NonbondedBackend,
     *,
@@ -111,15 +185,23 @@ def _time_backend(
     energy = reference_energy
     forces = reference_forces
     neighbor_list = None
+    latest_neighbor_list = None
     rebuild_count = 0
     estimated_pair_bytes = 0
     neighbor_rebuild_elapsed = 0.0
     force_eval_elapsed = 0.0
     if backend == "mlx_pairs":
         rebuild_start = perf_counter()
-        neighbor_list = build_neighbor_list(positions, cell, cutoff=2.5, skin=0.4)
+        neighbor_list = build_neighbor_list(
+            positions,
+            cell,
+            cutoff=2.5,
+            skin=0.4,
+            backend="mlx_cell_pairs",
+        )
         neighbor_rebuild_elapsed += perf_counter() - rebuild_start
         pair_count = neighbor_list.pair_count
+        latest_neighbor_list = neighbor_list
         rebuild_count = 1
         estimated_pair_bytes = neighbor_list.estimated_pair_bytes
 
@@ -130,6 +212,7 @@ def _time_backend(
             dynamic_neighbors = build_neighbor_list(positions, cell, cutoff=2.5, skin=0.4)
             neighbor_rebuild_elapsed += perf_counter() - rebuild_start
             pair_count = dynamic_neighbors.pair_count
+            latest_neighbor_list = dynamic_neighbors
             rebuild_count += 1
             estimated_pair_bytes = dynamic_neighbors.estimated_pair_bytes
             force_start = perf_counter()
@@ -156,9 +239,15 @@ def _time_backend(
     elapsed = perf_counter() - start
     ms_per_eval = elapsed * 1000.0 / evaluations
     ns_per_day = 0.002 * (1000.0 / ms_per_eval) * 86400.0 if ms_per_eval > 0.0 else 0.0
+    particles = int(positions.shape[0])
+    neighbor_fields = _neighbor_fields(
+        latest_neighbor_list,
+        particles=particles,
+        fallback_backend=backend,
+    )
     return MDAccelerationBenchmarkResult(
         backend=backend,
-        particles=int(positions.shape[0]),
+        particles=particles,
         evaluations=evaluations,
         pairs=int(pair_count),
         rebuild_count=rebuild_count,
@@ -175,7 +264,19 @@ def _time_backend(
         energy=energy,
         energy_abs_delta=abs(energy - reference_energy),
         max_force_abs_delta=float(np.max(np.abs(forces - reference_forces))),
+        atom_count=particles,
+        evaluation_count=evaluations,
+        selected_backend=backend,
+        selected_policy=f"requested:{backend}",
+        neighbor_build_ms_per_eval=neighbor_rebuild_elapsed * 1000.0 / evaluations,
+        **neighbor_fields,
     )
+
+
+def _apply_include_large(sizes: tuple[int, ...], *, include_large: bool) -> tuple[int, ...]:
+    if include_large and 5000 not in sizes:
+        sizes = (*sizes, 5000)
+    return tuple(dict.fromkeys(sizes))
 
 
 def run_benchmark(
@@ -193,8 +294,7 @@ def run_benchmark(
 ) -> list[MDAccelerationBenchmarkResult]:
     """Run the MD acceleration benchmark matrix."""
 
-    if include_large and 8192 not in sizes:
-        sizes = (*sizes, 8192)
+    sizes = _apply_include_large(sizes, include_large=include_large)
     results: list[MDAccelerationBenchmarkResult] = []
     for particles in sizes:
         positions, cell = fcc_lattice(particles, density=0.8)
@@ -245,17 +345,30 @@ def build_payload(
 ) -> dict:
     """Build the JSON payload for the benchmark CLI."""
 
+    sizes = _apply_include_large(sizes, include_large=include_large)
     results = run_benchmark(
         sizes=sizes,
         backends=backends,
         evaluations=evaluations,
         tile_size=tile_size,
-        include_large=include_large,
+        include_large=False,
     )
-    rows = [result.to_dict() for result in results]
+    rows = [
+        normalize_benchmark_row(
+            result.to_dict(),
+            benchmark_name="md_acceleration",
+            timing_metric="ms_per_eval",
+        )
+        for result in results
+    ]
     fastest = min(rows, key=lambda row: row["ms_per_eval"]) if rows else None
-    return {
-        "runtime": asdict(get_runtime_info()),
+    hardware = get_hardware_info()
+    runtime = asdict(get_runtime_info())
+    payload = {
+        "benchmark_name": "md_acceleration",
+        "fixture": "synthetic_mixed_lj_coulomb_fcc",
+        "hardware": hardware,
+        "runtime": runtime,
         "sizes": list(sizes),
         "backends": list(backends),
         "evaluations": evaluations,
@@ -265,6 +378,17 @@ def build_payload(
         "fastest_case": fastest,
         "cases": rows,
     }
+    return normalize_benchmark_payload(
+        payload,
+        benchmark_name="md_acceleration",
+        fixture="synthetic_mixed_lj_coulomb_fcc",
+        timing_metric="ms_per_eval",
+        hardware=hardware,
+        runtime=runtime,
+        evaluation_count=evaluations,
+        finite=all(bool(row["finite"]) for row in rows),
+        command=default_benchmark_command("md_acceleration"),
+    )
 
 
 def _write_csv(path: str | Path, rows: list[dict]) -> None:

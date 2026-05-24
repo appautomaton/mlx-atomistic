@@ -415,7 +415,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fixture",
         default=DEFAULT_AMBER_FIXTURE,
-        help="fixture label; default uses the small vendored OpenMM AMBER fixture",
+        help="fixture label; default uses the tracked small AMBER fixture",
     )
     parser.add_argument("--prmtop", type=Path, help="custom AMBER prmtop path")
     parser.add_argument("--coords", type=Path, help="custom AMBER inpcrd/rst7 path")
