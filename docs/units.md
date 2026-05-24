@@ -4,8 +4,9 @@
 
 ## Molecular Dynamics
 
-The v1 MD engine uses Lennard-Jones reduced units. Inputs passed to MD kernels are
-dimensionless unless a caller explicitly converts them before calling the API:
+Low-level MD kernels use Lennard-Jones reduced units. Inputs passed directly to
+those kernels are dimensionless unless a caller explicitly converts them before
+calling the API:
 
 ```text
 σ = 1
@@ -33,6 +34,11 @@ The code exposes this convention as `mlx_atomistic.units.LJ_REDUCED_UNITS`.
 For material-specific reduced-unit experiments, create a `LennardJonesReducedUnits`
 instance with explicit `sigma`, `epsilon`, `mass`, and `boltzmann` values, then
 convert external values at the API boundary.
+
+Prepared-system artifacts are the physical-unit path. Their metadata records
+coordinate, mass, charge, energy, time, and temperature units, and the artifact
+gate converts accepted AMBER, CHARMM, and GROMACS subsets into runtime force
+terms that preserve that declared unit contract.
 
 ## NVE Output Contract
 

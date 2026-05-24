@@ -32,6 +32,7 @@ Supported terms:
 - `HarmonicAnglePotential`
 - `PeriodicDihedralPotential`
 - `ImproperDihedralPotential`
+- `RBDihedralPotential`
 - `PositionalRestraintPotential`
 
 All terms implement `energy_forces(positions, cell=None, pairs=None)` and can be
@@ -47,13 +48,31 @@ LJ and Coulomb support topology-aware nonbonded pairs:
 - direct cutoff support
 - orthorhombic periodic minimum-image behavior
 
-PME/Ewald and force-field file parsers are intentionally out of scope for this
-milestone.
+`PMEConfig` supports PME assignment orders `2`, `4`, and `5`. Prepared artifacts
+must carry explicit PME arrays/metadata before the runtime PME path is accepted;
+unsupported or partial PME requests still fail closed.
 
 `NonbondedPotential` is the production-oriented direct pair path. It combines
 mixed LJ and direct Coulomb terms, supports explicit nonbonded exceptions and
 independent LJ/Coulomb 1-4 scaling, and reports component energies as
 `nonbonded.lj` and `nonbonded.coulomb` in MD diagnostics.
+
+## Force-Field Imports
+
+The optional prep layer exposes native accepted-subset importers:
+
+```python
+from mlx_atomistic.prep import (
+    import_amber_prmtop,
+    import_charmm_psf,
+    import_gromacs_top_gro,
+)
+```
+
+These importers produce prepared-system artifacts for AMBER `prmtop`/`inpcrd`,
+CHARMM PSF/parameter, and GROMACS `.top`/`.gro` inputs. The production artifact
+gate remains fail-closed for unsupported terms such as virtual sites, advanced
+water models, polarizable terms, or incomplete PME metadata.
 
 ## Energy Decomposition
 

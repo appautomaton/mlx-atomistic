@@ -92,9 +92,9 @@ constraints, trajectory diagnostics, and energy decomposition.
 
 Still out of scope:
 
-- PME/Ewald
-- NPT/barostat
-- full AMBER/CHARMM/GROMACS parser
+- unrestricted PME/Ewald production coverage beyond the accepted artifact gate
+- mature production NPT/barostat certification
+- unrestricted AMBER/CHARMM/GROMACS parsing beyond the accepted native subsets
 - DFT
 - custom Metal kernels
 

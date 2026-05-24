@@ -31,27 +31,38 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra prep -
 ## Initial Scope
 
 - MLX-backed arrays and kernels for atomistic/DFT experiments.
-- Molecular mechanics in reduced units: LJ, Coulomb, harmonic bonds/angles, and periodic torsions.
+- Molecular mechanics in reduced and physical units: LJ, Coulomb, harmonic
+  bonds/angles, periodic torsions, Ryckaert-Bellemans torsions, and bounded PME.
 - Programmatic topology with exclusions, 1-4 scaling, and partial charges.
+- Native prepared-system imports for accepted AMBER `prmtop`/`inpcrd`, CHARMM
+  PSF/parameter, and GROMACS `.top`/`.gro` subsets.
 - Jupyter-first visualization of structures, densities, orbitals, and SCF convergence.
 - Small, validated examples before broader chemistry coverage.
 
 See `docs/units.md` for the internal unit policy.
 
-The MD path currently uses Lennard-Jones reduced units and keeps sparse trajectory
-frames separately from dense per-step diagnostics. NVE is available for energy
-drift checks, and Langevin NVT is available for seeded temperature-controlled
-experiments.
+Low-level MD kernels still accept Lennard-Jones reduced-unit inputs unless a
+caller converts values at the API boundary. Prepared-system artifacts use
+explicit physical-unit metadata for imported force-field systems. Both paths keep
+sparse trajectory frames separately from dense per-step diagnostics. NVE is
+available for energy drift checks, and Langevin NVT is available for seeded
+temperature-controlled experiments.
 
-See `docs/molecular-mechanics.md` for the topology and force-field surface.
-See `docs/validation-and-performance.md` for the force-validation, stability,
-and benchmark workflow.
-See `docs/real-mm-core.md` for typed systems, force-field assignment,
-constraints, trajectory I/O, and the combined nonbonded path.
-See `docs/dft-foundations.md` for the spin-unpolarized Γ-point plane-wave DFT
-prototype.
-See `docs/dft-scf-core.md` for the exchange-correlation, SCF mixing, force, and
-DFT benchmark surface.
+## Documentation
+
+- `docs/molecular-mechanics.md`: topology, force-field terms, virtual sites,
+  custom forces, GBSA/OBC, soft-core lambda scaling, and replica exchange.
+- `docs/production-md.md`: prepared-system artifacts, accepted parser paths,
+  TIP4P-Ew, PME, runtime readiness, and production MD gates.
+- `docs/real-mm-core.md`: typed systems, force-field assignment, constraints,
+  trajectory I/O, and the combined nonbonded path.
+- `docs/validation-and-performance.md`: force validation, stability checks, and
+  benchmark workflow.
+- `docs/runtime-boundaries.md`: MLX runtime boundary and reference-engine policy.
+- `docs/units.md`: internal unit policy.
+- `docs/dft-foundations.md`: spin-unpolarized Γ-point plane-wave DFT prototype.
+- `docs/dft-scf-core.md`: exchange-correlation, SCF mixing, force, and DFT
+  benchmark surface.
 
 ## Benchmarks
 

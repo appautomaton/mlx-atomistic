@@ -41,6 +41,26 @@ Dense SCF restart files store density, orbitals, ion positions, cell lengths, sp
 
 Reference comparison is intentionally static and lightweight. Fixtures are JSON summaries; QE/CP2K are not imported, built, or required in CI. The comparison helper records observed energy, expected energy, error, and pass/fail against a documented tolerance.
 
+## DFT/QM Platform Scope
+
+`get_dft_qm_scope_report()` classifies local DFT/QM capability against CP2K and
+Quantum ESPRESSO reference families without changing the runtime dependency
+boundary.
+
+| Feature | Local Status | Reference Family |
+| --- | --- | --- |
+| Plane-wave SCF core | proof-level | CP2K Quickstep, QE PWscf |
+| UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
+| Geometry relaxation and finite-difference stress | proof-level | CP2K MOTION/GEO_OPT, QE relax |
+| Static reference comparison | supported | static CP2K/QE fixture summaries |
+| QM/MM force-environment orchestration | deferred | CP2K FORCE_EVAL/QMMM |
+| PH/EPW/NEB/TDDFT/MPI/offload suite breadth | deferred | QE and CP2K production suites |
+| Importing, wrapping, building, or running CP2K/QE | anti-goal | external executables |
+
+`dft_qm_scope_readiness_report()` returns a shared readiness payload for these
+features. Deferred, anti-goal, and unknown features report blockers before any
+production-suite claim can be emitted.
+
 ## Hot-Path Recommendation
 
 The first future custom Metal kernel should target **Hamiltonian application**, specifically the combined kinetic + local + nonlocal application path used by Davidson and band calculations.
