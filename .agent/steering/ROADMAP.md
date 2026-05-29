@@ -1,56 +1,24 @@
 # Roadmap
 
-## Direction
+## No Active Roadmap
 
-Make `mlx_atomistic` credible for production-oriented biomolecular MD on Apple
-Silicon while keeping the repo lean. MLX is the runtime; OpenMM and LAMMPS are
-reference and validation surfaces, not runtime dependencies.
+- current roadmap status: none active
+- current standalone change: `2026-05-22-performance-audit-harness-hardening`
+- next step: frame the standalone benchmark/performance-audit change before adding any new roadmap phases
 
-## Current Evidence
+## Completed Work
 
-- `run_mlx` can produce finite short NVT trajectories for local proof fixtures:
-  113-atom T4L-benzene and 259-atom solvated ligand-receptor.
-- Those proof fixtures are intentionally not production systems:
-  `production_force_field=false`, and `require_production=True` rejects them.
-- The solvated proof fixture uses `short_range_electrostatics_prototype`, not
-  production PME.
-- No committed production prepared artifact is currently available for a repeatable
-  roadmap baseline.
+- `2026-05-20-md-integrator-constraint-parity`: MD integrator and constraint parity completed.
+- `2026-05-20-force-field-completeness-file-parsers`: force-field completeness and file parser work completed.
+- `2026-05-20-physics-completeness`: physics completeness and production hardening completed.
 
-## Capability Ladder
+## Deferred or Not Now
 
-1. **Evidence Baseline**
-   Keep local `results/gap-discovery/` runs reproducible and add one
-   production-marked fixed-topology artifact when available.
-
-2. **PME Production Readiness**
-   Turn periodic long-range electrostatics from gated/prototype behavior into a
-   validated production path with OpenMM force and energy parity.
-
-3. **OpenMM Parity Harness**
-   Compare MLX and OpenMM on the same fixed-topology system using matched timestep,
-   temperature, friction, cutoff, constraints, and force-field inputs. Add only the
-   minimal reporter hooks needed to capture parity diagnostics.
-
-4. **Real-System Coverage**
-   Validate AMBER/CHARMM artifact imports, close box-shape limits such as triclinic
-   support where needed, and define the TIP4P/virtual-site/HMR policy.
-
-5. **NPT / Barostat**
-   Add pressure coupling after PME and virial diagnostics are credible.
-
-6. **Runner Usability**
-   Add runner-level checkpoint/restart and DCD/XTC-facing output once the physics
-   path is worth preserving.
-
-7. **Performance**
-   Profile against OpenMM OpenCL on Apple Silicon and optimize the confirmed hot
-   paths only after correctness targets are fixed.
-
-## Deferred
-
-- DFT needs its own capability audit before being mixed into this MD roadmap.
-- AMOEBA/Drude, FEP/TI/BAR, REMD, GBSA, arbitrary custom forces, and broad raw-PDB
-  workflow ergonomics are demand-driven follow-ons.
-- Vendor checkouts remain reference-only unless a future spec explicitly changes
-  that boundary.
+- Polarizable force fields: Drude, AMOEBA.
+- Machine-learned interatomic potentials: GAP, ACE, NequIP, MACE.
+- Reactive force fields: ReaxFF.
+- Materials science potentials: EAM, MEAM, Tersoff, Stillinger-Weber.
+- Non-Apple-Silicon GPU support: CUDA, ROCm.
+- Production deployment/serving: the library is experiment-first, not a service.
+- Heavyweight chemistry package integrations beyond the `prep` extra.
+- 1.0 version target: current releases remain pre-1.0 minor increments.

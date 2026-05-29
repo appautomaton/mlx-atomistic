@@ -4,70 +4,74 @@
 
 ### Observed
 
-- The project targets Apple Silicon-native atomistic simulation experiments built on MLX and Metal (`README.md`, `pyproject.toml`).
-- Initial scope is lightweight DFT building blocks, molecular mechanics, validation notebooks, and visualization utilities rather than a heavyweight production DFT engine (`README.md`).
-- Notebook workflows are first-class and should run from the project `uv` environment (`README.md`, `notebooks/README.md`, `AGENTS.md`).
-- Active ligand-receptor visualization should use MLX-generated trajectory outputs, not stale public trajectory analysis as active results (`notebooks/README.md`).
+- MLX/Metal is the sole GPU compute backend; CUDA is not a target — `README.md:3`, `pyproject.toml:16` (`mlx>=0.31.1`)
+- MD uses Lennard-Jones reduced units by default; unit policy documented in `docs/units.md` — `README.md:42`
+- Sparse trajectory frames are stored separately from dense per-step diagnostics — `README.md:42`
+- Jupyter-first visualization for structures, densities, orbitals, and SCF convergence — `README.md:36`
+- Public API is re-exported through `__init__.py` with an explicit `__all__` — `src/mlx_atomistic/__init__.py`
+- DFT path provides spin-unpolarized Γ-point plane-wave SCF with geometry optimization and band structure — `README.md:52-53`
 
 ### Inferred
 
-- User-facing work should preserve a scientific, validation-oriented posture and avoid implying production chemistry coverage beyond the implemented surfaces (`README.md`, `docs/` references in `README.md`).
-- Roadmap items should improve correctness, visibility, and workflow reliability before widening package dependencies (`README.md`, `pyproject.toml`, `AGENTS.md`).
+- The package aims to serve both interactive notebook users (experiment-driven) and programmatic API users (protocol-driven)
+- Production MD against real molecular systems (GPCRMD) is a quality gate, not just unit tests
 
 ### Needs Confirmation
 
-- Full-repo Ruff policy for archived notebooks is unresolved because `uv run ruff check .` currently fails on notebook findings (`pyproject.toml`, `notebooks/README.md`).
+- Whether the CLI entry point (`mlx-atomistic-benchmark`) is intended to grow into a full user-facing CLI or remains internal
 
 ## Technical Constraints and Invariants
 
 ### Observed
 
-- Use Python 3.13 through `.python-version` and `requires-python = ">=3.13,<3.14"` (`.python-version`, `pyproject.toml`).
-- Use `uv run ...` and `uv sync ...` for Python environment and command execution (`AGENTS.md`, `README.md`).
-- Keep package source under `src/mlx_atomistic/`, including the canonical `prep/` subpackage (`AGENTS.md`, `pyproject.toml`).
-- Keep notebooks under `notebooks/` and import package code through the `uv` environment (`AGENTS.md`, `notebooks/README.md`).
-- Treat `vendors/` as reference material only (`AGENTS.md`, `README.md`).
-- Do not add heavyweight chemistry or ML helper packages without concrete need (`AGENTS.md`, `pyproject.toml`).
+- Python 3.13 only (pinned `>=3.13,<3.14`) — `pyproject.toml:10`
+- `uv` is the only supported environment and package manager — `AGENTS.md`, `CLAUDE.md`
+- Source code lives under `src/mlx_atomistic/` (hatchling src layout) — `pyproject.toml:68`
+- `vendors/` is reference material only, not imported as project code — `CLAUDE.md:9`
+- No heavyweight chemistry or ML helper packages without concrete need — `CLAUDE.md:10`
+- Ruff is the linter with rules E, F, I, UP, B, SIM; line-length 100, target py313 — `pyproject.toml:74-80`
+- LAMMPS is built from source with GPU/OpenCL enabled via `uv` config-settings — `pyproject.toml:63-65`
 
 ### Inferred
 
-- Optional extras should remain the boundary for notebook, visualization, and preparation dependencies (`pyproject.toml`).
-- Declared console scripts should remain stable; preparation workflows currently use Python APIs rather than a prep command (`pyproject.toml`, `src/mlx_atomistic/prep/`).
+- MLX array operations must stay on-device to preserve GPU performance; unnecessary host transfers are a correctness concern
+- Test coverage of DFT is advancing rapidly (test_dft.py, test_dft_optimization.py, test_dft_production_core.py, etc.)
 
 ### Needs Confirmation
 
-- Whether a future prep API should be reintroduced or the Python API should remain the only preparation surface (`pyproject.toml`, `src/mlx_atomistic/prep/`).
+- Type checking enforcement level (no mypy/pyright config found)
 
 ## Quality and Operational Expectations
 
-- testing bar: the targeted runtime-boundary/prep/neighbor regression suite currently passes with `154 passed` (`pyproject.toml`, verified command).
-- source lint bar: `uv run ruff check src tests scripts` currently passes (`pyproject.toml`, verified command).
-- full lint state: `uv run ruff check .` currently fails on notebook lint findings and should not be claimed green until policy or notebooks change (`pyproject.toml`, verified command).
-- sandbox reliability: use `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache` when the default home `uv` cache is not writable (`README.md`, verified commands).
+- testing bar: `uv run pytest` across 47 test files; validation gauntlet (`benchmarks.validation_gauntlet`) and stability checks (`benchmarks.stability`) for numerical correctness
+- release or deployment constraint: no CI, no release automation observed; currently `0.1.0` pre-release
+- security or reliability expectation: no secrets in repo; `.gitignore` excludes `.env`, `.env.*`; data artifacts (`*.npy`, `*.npz`, `*.h5`, etc.) are gitignored
 
 ## Integration Boundaries
 
-- upstream or downstream systems: MLX/Metal for Apple Silicon execution, optional scientific Python packages for notebooks/prep/viz, and local Jupyter for notebook workflows (`README.md`, `pyproject.toml`, `notebooks/README.md`).
-- external contracts that cannot break: package imports from `mlx_atomistic`, the `mlx-atomistic-benchmark` console script, notebook workflow locations, and vendor reference boundary (`src/mlx_atomistic/__init__.py`, `pyproject.toml`, `notebooks/README.md`, `AGENTS.md`).
+- upstream systems: MLX (Apple), NumPy, SciPy
+- downstream consumers: Jupyter notebooks, Python scripts
+- external contracts that cannot break: public API exports in `__init__.py` `__all__`; `TrajectoryRecord` I/O format; force validation parity with OpenMM and LAMMPS
+- reference engines (dev-only): OpenMM ≥8.5, LAMMPS (GPU/OpenCL), CP2K, GROMACS, Quantum ESPRESSO — `vendors/vendor-lock.json`, `vendors/README.md`
 
 ## Non-Goals
 
-- Do not turn `vendors/` into package dependencies or build inputs without an explicit task changing that boundary (`AGENTS.md`, `README.md`).
-- Do not add broad/heavy chemistry or ML helper packages without a concrete implementation need (`AGENTS.md`, `pyproject.toml`).
-- Do not treat archived notebooks as active workflow truth (`notebooks/README.md`).
-- Do not present this as a broad production DFT engine beyond the lightweight validated scope in the README (`README.md`).
+- CUDA or non-Apple-Silicon GPU support (inferred from MLX dependency and README framing)
+- Heavyweight chemistry/ML packages as core dependencies (explicit: `CLAUDE.md:10`)
+- Importing or building against vendor source trees (explicit: `CLAUDE.md:9`)
+- CI/CD or automated release pipeline (no config found, not currently in scope)
 
 ## Open Risks and Unknowns
 
-- Notebook lint policy is inconsistent with a green full-repo Ruff command today (`pyproject.toml`, `notebooks/README.md`, verified command).
-- Optional preparation and visualization extras are intentionally broad; dependency expansion should stay justified by specific workflow needs (`pyproject.toml`, `AGENTS.md`).
+- DFT subpackage is expanding fast; API surface may still be stabilizing
+- Production MD benchmarking against GPCRMD reference is actively being developed (many new test fixtures)
+- No CI pipeline; correctness relies on local test runs
+- Typecheck is not enforced in the toolchain
 
 ## Evidence Anchors
 
-- `README.md`
-- `AGENTS.md`
-- `.python-version`
-- `pyproject.toml`
-- `src/mlx_atomistic/__init__.py`
-- `src/mlx_atomistic/prep/`
-- `notebooks/README.md`
+- `pyproject.toml` — dependency pins, build config, test/lint config
+- `src/mlx_atomistic/__init__.py` — public API contract
+- `tests/` — 47 test files across MM, MD, DFT, validation, I/O, protocols
+- `CLAUDE.md` / `AGENTS.md` — project guidance rules
+- `.gitignore` — excluded artifacts and vendor policy

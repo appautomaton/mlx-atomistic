@@ -1,0 +1,179 @@
+{
+  "artifact_policy": {
+    "allowed_committed_outputs": [
+      "candidate-fixture.json",
+      "openmm-reference.json",
+      "mlx-probe.json",
+      "blocker-matrix.json",
+      "final-readiness-report.md"
+    ],
+    "committed_evidence_only": true,
+    "do_not_commit": [
+      "raw GPCRmd downloads",
+      "trajectory files",
+      "prepared_system.npz",
+      "binary checkpoints",
+      "local cache directories"
+    ]
+  },
+  "blockers": [],
+  "change": "production-md-readiness-fixture-probe",
+  "components": {
+    "chloride_count": 74,
+    "ligands": [
+      "4-{[(2s)-3-(tert-butylamino)-2-hydroxypropyl]oxy}-3h-indole-2-carbonitrile"
+    ],
+    "membrane": "POPC",
+    "membrane_count": 200,
+    "receptor": "Beta-1 adrenergic receptor",
+    "sodium_count": 57,
+    "water_count": 19944,
+    "water_model": "TIP3P"
+  },
+  "downstream": {
+    "mlx_probe": "attempt_or_record_mlx_blocker",
+    "openmm_reference": "attempt_or_record_reference_blocker",
+    "parallel_safe_after_this_record": true
+  },
+  "fixture": {
+    "dynamics_id": 729,
+    "id": "gpcrmd-729-beta1-5f8u-cyanopindolol",
+    "name": "Beta-1 adrenergic receptor in complex with cyanopindolol-like ligand",
+    "prep_reproduction_command": "UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run mlx_atomistic.prep Python API gpcrmd-import --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --out <ignored-output-dir> --json",
+    "source_kind": "ignored_local_cache",
+    "source_path": "notebooks/ligand-receptor-motion/data/gpcrmd-cache/729",
+    "source_reproduction_command": "UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/select_production_md_fixture.py --out .agent/work/production-md-readiness-fixture-probe/evidence/candidate-fixture.json",
+    "source_url": "https://www.gpcrmd.org/dynadb/dynamics/id/729/"
+  },
+  "known_pre_execution_blockers": [
+    {
+      "category": "preparation",
+      "command": "mlx_atomistic.prep Python API gpcrmd-import",
+      "next_implementation_decision": "route through S3 MLX probe and blocker matrix",
+      "observed_result": "parse_failed:parameters:could not parse CHARMM topology/parameters with ParmEd: Could not find atom type for CT3",
+      "status": "blocked"
+    },
+    {
+      "category": "constraints_hmr_virtual_sites",
+      "command": "read existing gpcrmd import report",
+      "next_implementation_decision": "verify in S3 whether this remains blocking",
+      "observed_result": "virtual_sites_or_hydrogen_mass_repartitioning_not_checked",
+      "status": "partial"
+    },
+    {
+      "category": "electrostatics_pme",
+      "command": "inspect selected fixture protocol",
+      "next_implementation_decision": "compare OpenMM reference and MLX readiness in S2/S3",
+      "observed_result": "periodic explicit membrane system requires PME-scale electrostatics",
+      "status": "partial"
+    }
+  ],
+  "periodic_box": {
+    "periodic_box_expected": true,
+    "source_files": [
+      "model",
+      "protocol"
+    ],
+    "status": "expected_from_gpcrmd_protocol"
+  },
+  "protocol_relevance": {
+    "constraints_hmr_virtual_sites_relevance": "required_to_explain_4_fs_protocol",
+    "ensemble": "NVT",
+    "frame_stride_ns": 0.2,
+    "npt_barostat_relevance": "not_protocol_required; target ensemble is NVT",
+    "pme_electrostatics_relevance": "required_for_periodic_explicit_membrane",
+    "time_step_fs": 4.0
+  },
+  "readiness_questions": [
+    "artifact_source",
+    "preparation",
+    "topology_terms",
+    "forcefield_terms",
+    "constraints_hmr_virtual_sites",
+    "electrostatics_pme",
+    "integrator_protocol",
+    "performance_runtime",
+    "dependency_boundary"
+  ],
+  "scale": {
+    "accumulated_time_us": 1.5,
+    "atom_count": 92001,
+    "dense_pair_count": 4232046000,
+    "replicates": 3,
+    "system_size": "large"
+  },
+  "schema_version": 1,
+  "selected": true,
+  "status": "selected",
+  "topology_and_force_field": {
+    "expected_file_statuses": [
+      {
+        "file_id": 15286,
+        "format_hint": "topology",
+        "label": "Topology file",
+        "path": "notebooks/ligand-receptor-motion/data/gpcrmd-cache/729/15286_dyn_729.psf",
+        "present": true,
+        "role": "topology",
+        "size_bytes": 17137863
+      },
+      {
+        "file_id": 15287,
+        "format_hint": "trajectory",
+        "label": "Trajectory file replica 1",
+        "path": null,
+        "present": false,
+        "role": "trajectory",
+        "size_bytes": null
+      },
+      {
+        "file_id": 15288,
+        "format_hint": "trajectory",
+        "label": "Trajectory file replica 2",
+        "path": null,
+        "present": false,
+        "role": "trajectory",
+        "size_bytes": null
+      },
+      {
+        "file_id": 15289,
+        "format_hint": "trajectory",
+        "label": "Trajectory file replica 3",
+        "path": null,
+        "present": false,
+        "role": "trajectory",
+        "size_bytes": null
+      },
+      {
+        "file_id": 17686,
+        "format_hint": "coordinates",
+        "label": "Model file",
+        "path": "notebooks/ligand-receptor-motion/data/gpcrmd-cache/729/17686_dyn_729.pdb",
+        "present": true,
+        "role": "model",
+        "size_bytes": 7268129
+      },
+      {
+        "file_id": 15290,
+        "format_hint": "parameters",
+        "label": "Parameters file",
+        "path": "notebooks/ligand-receptor-motion/data/gpcrmd-cache/729/15290_prm_729.prm",
+        "present": true,
+        "role": "parameters",
+        "size_bytes": 1186094
+      },
+      {
+        "file_id": 17687,
+        "format_hint": "starting files",
+        "label": "Others file",
+        "path": "notebooks/ligand-receptor-motion/data/gpcrmd-cache/729/17687_oth_729",
+        "present": true,
+        "role": "protocol",
+        "size_bytes": null
+      }
+    ],
+    "force_field_family": "CHARMM c36 Jul 2020",
+    "missing_required_roles": [],
+    "software": "ACEMD3, GPUGRID",
+    "topology_source": "CHARMM PSF/PDB/parameter package"
+  }
+}

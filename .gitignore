@@ -69,8 +69,5 @@ notebooks/ligand-receptor-motion/data/prepared/
 notebooks/ligand-receptor-motion/data/processed/
 notebooks/archive/atp-pocket-mlx-demo/data/prepared/
 
-# Reference checkouts only. Keep manifests tracked; fetch sources locally.
-vendors/*
-!vendors/
-!vendors/README.md
-!vendors/vendor-lock.json
+# Reference checkouts only — fetched locally, never tracked.
+vendors/

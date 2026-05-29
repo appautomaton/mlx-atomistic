@@ -2,63 +2,68 @@
 
 ## One-Liner
 
-`mlx-atomistic` is a Python 3.13 `uv` package for Apple Silicon-native atomistic simulation experiments built on MLX and Metal (`README.md`, `pyproject.toml`).
+Apple Silicon-native atomistic simulation library: MLX/Metal-accelerated molecular mechanics, MD integrators, and plane-wave DFT with validation against established engines.
 
 ## Why This Repo Exists
 
-- The repository exists to explore lightweight, validated MD and DFT building blocks on local Apple Silicon rather than to ship a heavyweight production DFT engine (`README.md`).
-- It prioritizes small examples, validation notebooks, visualization utilities, and benchmarkable kernels before broader chemistry coverage (`README.md`, `notebooks/README.md`).
+- Provide a GPU-native simulation library that runs entirely on Apple Silicon via MLX, without depending on CUDA or x86 HPC clusters — `README.md:3-5`
+- Validate simulation correctness against established engines (OpenMM, LAMMPS, CP2K, Quantum ESPRESSO) rather than reimplementing from scratch — `README.md:10-14`, `tests/test_openmm_mlx_parity.py`, `scripts/openmm_mlx_parity.py`
+- Offer an experiment-first, Jupyter-friendly surface for atomistic simulations with incremental milestones — `README.md:36-37`
 
 ## Current Users or Operators
 
-- Primary operators are developers and notebook users working from the repo-local `uv` environment (`README.md`, `notebooks/README.md`, `AGENTS.md`).
-- Secondary operators are Python API users preparing ligand-receptor artifacts or running benchmark surfaces through installed console scripts (`pyproject.toml`, `src/mlx_atomistic/prep/`).
+- Researchers running MD and DFT experiments on Apple Silicon machines
+- Developers benchmarking MLX MD implementations against OpenMM and LAMMPS references
+- Notebook users exploring structures, densities, orbitals, and SCF convergence
 
 ## Current System Model
 
-- request or event flow: users run `uv` commands, import `mlx_atomistic`, execute notebooks, call `mlx_atomistic.prep` APIs, or run benchmark modules/scripts (`README.md`, `pyproject.toml`, `src/mlx_atomistic/prep/`).
-- primary surfaces: package API, preparation APIs, benchmark API/modules, notebooks, tests, and lint (`src/mlx_atomistic/__init__.py`, `pyproject.toml`, `notebooks/README.md`).
-- critical dependencies: Python 3.13, MLX, NumPy, SciPy, optional notebook/prep/viz extras, Pytest, Ruff, and Hatchling (`.python-version`, `pyproject.toml`).
+- request or event flow: Python API call → MLX array construction → Metal kernel dispatch → result arrays back to Python
+- primary surfaces: `mlx_atomistic` package (MM forces, MD integrators, DFT/SCF, protocols, I/O, validation)
+- critical dependencies: MLX (GPU compute), NumPy/SciPy (fallback和支持), OpenMM + LAMMPS (dev-only reference validation)
 
 ## Major Surfaces
 
 | Surface | Path | Responsibility |
 |---------|------|----------------|
-| Core package | `src/mlx_atomistic/` | MD, DFT, force fields, validation, topology, runtime, trajectory, visualization, and benchmark APIs. |
-| Preparation package | `src/mlx_atomistic/prep/` | Prepared-artifact import/build/run workflows exposed through Python APIs. |
-| Notebooks | `notebooks/` | Jupyter-first workflows, active ligand-receptor visualization, and archived provenance. |
-| Tests | `tests/` | Regression coverage for MD, DFT, topology, validation, prep, runtime, visualization, and artifacts. |
-| Vendor references | `vendors/` | Reference source trees only, not dependencies or package inputs. |
+| Core (Atoms, Cell, units) | `src/mlx_atomistic/core.py`, `units.py` | Primitive types and unit system |
+| MM force fields | `src/mlx_atomistic/mm.py`, `forcefields.py`, `charmm_terms.py` | Force field definitions, bonded/nonbonded terms |
+| Topology | `src/mlx_atomistic/topology.py` | Programmatic topology with exclusions, 1-4 scaling, partial charges |
+| Nonbonded + PME | `src/mlx_atomistic/nonbonded.py`, `pme.py`, `neighbors.py`, `cell_list.py` | Neighbor lists, Ewald/PME electrostatics |
+| MD integrators | `src/mlx_atomistic/md.py`, `minimize.py`, `steering.py` | NVE, Langevin NVT, energy minimization, steered MD |
+| DFT engine | `src/mlx_atomistic/dft/` (21 modules) | Plane-wave DFT: SCF, XC, pseudopotentials, geometry optimization, band structure, stress |
+| Protocols | `src/mlx_atomistic/protocols.py`, `initialize.py` | Higher-level MD workflows (MinimizeThenNVT) |
+| I/O + trajectories | `src/mlx_atomistic/io.py`, `trajectory_adapters.py`, `artifacts.py` | Trajectory I/O, MDTraj/MDAnalysis adapters, artifact prep |
+| Validation | `src/mlx_atomistic/validation.py`, `diagnostics.py` | Force validation, platform validation, energy drift checks |
+| Visualization | `src/mlx_atomistic/visualization.py`, `examples.py` | Jupyter-first structure/density/orbital rendering |
+| Prep pipeline | `src/mlx_atomistic/prep/` (14 modules) | GPCRMD import, PDB, topology import, replica setup |
+| Benchmarks | `src/mlx_atomistic/benchmarks/` (18 modules) | Performance and validation CLI scripts |
 
 ## Stack Summary
 
-- Python 3.13 is pinned by `.python-version` and `pyproject.toml` (`.python-version`, `pyproject.toml`).
-- `uv` is the project execution and environment manager (`README.md`, `AGENTS.md`).
-- MLX is the local GPU execution dependency; NumPy and SciPy are the core scientific dependencies (`pyproject.toml`).
-- Hatchling builds the package, Pytest runs tests, and Ruff covers style/linting (`pyproject.toml`).
+- Python 3.13, MLX (Metal GPU), NumPy, SciPy
+- Build: hatchling, managed by `uv`
+- Test: pytest, Lint: ruff
+- Dev reference engines: OpenMM 8.5+, LAMMPS (built from source with GPU/OpenCL)
 
 ## Commands
 
-- install: `uv sync --extra notebook --extra prep --extra viz --group dev` (`README.md`, `notebooks/README.md`).
-- notebook dev: `uv run jupyter lab` (`README.md`, `notebooks/README.md`).
-- targeted regression: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run pytest tests/test_runtime_boundaries.py tests/test_mlx_prep.py tests/test_gpcrmd_registry.py tests/test_production_artifacts.py tests/test_ligand_receptor_motion.py tests/test_neighbors.py tests/test_nonbonded_acceleration.py` was verified and passed with `154 passed`.
-- source lint: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check src tests scripts` was verified and passed.
-- full lint: `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run ruff check .` was verified and currently fails on notebook Ruff findings.
+- install: `uv sync --extra notebook --extra prep --extra viz --group dev`
+- test: `uv run pytest`
+- lint: `uv run ruff check src/mlx_atomistic/ tests/`
 
 ## Decision Principles Already Visible In The Repo
 
-- Prefer repo-local `uv` execution over global Python tools (`AGENTS.md`, `README.md`).
-- Keep source under `src/mlx_atomistic/` and notebooks under `notebooks/` (`AGENTS.md`, `README.md`).
-- Treat `vendors/` as reference material unless a task explicitly changes that boundary (`AGENTS.md`, `README.md`).
-- Avoid heavyweight chemistry or ML helper packages without concrete need (`AGENTS.md`, `pyproject.toml`).
-- Keep active notebooks focused and archive old milestone/provenance notebooks separately (`notebooks/README.md`).
+- Apple Silicon first: MLX/Metal is the compute path; no CUDA dependency — `README.md:3`
+- Reduced units for MD: LJ reduced units as default unit system — `README.md:42`, `docs/units.md`
+- Validation against established engines: every force term and integrator has an OpenMM or LAMMPS parity check — `tests/test_openmm_mlx_parity.py`, `tests/test_force_scopes.py`
+- Incremental milestones: small validated examples before broader coverage — `README.md:37`
+- Vendor reference only: `vendors/` trees are comparison targets, not import dependencies — `CLAUDE.md:9`
+- No heavyweight chemistry packages without concrete need — `CLAUDE.md:10`
 
 ## Evidence Anchors
 
-- `README.md`
-- `AGENTS.md`
-- `.python-version`
-- `pyproject.toml`
-- `src/mlx_atomistic/__init__.py`
-- `src/mlx_atomistic/prep/`
-- `notebooks/README.md`
+- `src/mlx_atomistic/__init__.py` — 332-line public API surface defining the contract
+- `pyproject.toml` — single installable package, pinned Python, MLX dependency
+- `tests/` — 47 test files covering MM, MD, DFT, validation, I/O, protocols
+- `README.md` — scope, runtime boundary, benchmarks, layout
