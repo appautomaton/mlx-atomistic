@@ -1,5 +1,6 @@
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mlx_atomistic.constraints import SettleWaterConstraints
 from mlx_atomistic.core import Cell
@@ -12,6 +13,8 @@ from mlx_atomistic.md import (
 )
 from mlx_atomistic.minimize import minimize_energy
 from mlx_atomistic.protocols import validate_gpcrmd_protocol_request
+
+pytestmark = [pytest.mark.slow, pytest.mark.integration]
 
 
 class _AnchoredWaterFixture:

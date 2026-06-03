@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 
 def test_run_mlx_writes_dcd_and_xtc_outputs(tmp_path: Path):
     md = pytest.importorskip("mdtraj")

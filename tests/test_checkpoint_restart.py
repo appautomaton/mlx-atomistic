@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.io import (
@@ -17,6 +18,8 @@ from mlx_atomistic.md import (
     simulate_npt,
     simulate_nvt,
 )
+
+pytestmark = pytest.mark.integration
 
 
 def _run_nvt(positions, velocities, *, steps, initial_step=0, initial_time=0.0):

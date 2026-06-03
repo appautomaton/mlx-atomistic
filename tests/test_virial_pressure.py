@@ -64,6 +64,7 @@ def _periodic_fixture():
     return positions, velocities, Cell.cubic(6.0), terms
 
 
+@pytest.mark.slow
 def test_nve_reports_finite_periodic_virial_and_pressure_with_pme_terms():
     positions, velocities, cell, terms = _periodic_fixture()
 
@@ -84,6 +85,7 @@ def test_nve_reports_finite_periodic_virial_and_pressure_with_pme_terms():
     assert "nonbonded.pme_diagnostics" not in result.potential_energy_by_term
 
 
+@pytest.mark.slow
 def test_nvt_pressure_diagnostics_follow_sparse_diagnostic_axis():
     positions, velocities, cell, terms = _periodic_fixture()
 
@@ -105,6 +107,7 @@ def test_nvt_pressure_diagnostics_follow_sparse_diagnostic_axis():
     assert np.isfinite(np.asarray(result.pressure_tensor)).all()
 
 
+@pytest.mark.slow
 def test_trajectory_round_trips_virial_and_pressure_diagnostics(tmp_path):
     positions, velocities, cell, terms = _periodic_fixture()
     result = simulate_nve(

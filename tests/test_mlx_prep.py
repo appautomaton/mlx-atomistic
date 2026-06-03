@@ -266,6 +266,7 @@ def test_build_mlx_system_matches_artifact_counts():
     assert len(terms) >= 1
 
 
+@pytest.mark.slow
 def test_tiny_prepared_system_runs_mlx_nvt(tmp_path: Path):
     from mlx_atomistic.io import load_npz_trajectory
     from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
@@ -385,6 +386,7 @@ def test_artifact_readiness_report_blocks_unsupported_terms():
     assert any("barostat" in blocker for blocker in report.blockers)
 
 
+@pytest.mark.slow
 def test_solvated_ligand_receptor_replicas_write_selected_and_all_outputs(tmp_path: Path):
     from mlx_atomistic.io import load_npz_trajectory
     from mlx_atomistic.prep.replicas import run_ligand_receptor_replicas
@@ -416,6 +418,7 @@ def test_solvated_ligand_receptor_replicas_write_selected_and_all_outputs(tmp_pa
     assert float(np.max(record.constraint_max_error)) < 5e-4
 
 
+@pytest.mark.slow
 def test_ligand_receptor_performance_profile_emits_aggregate_rows(tmp_path: Path):
     from mlx_atomistic.prep.replicas import profile_ligand_receptor_performance
 
@@ -444,6 +447,7 @@ def test_ligand_receptor_performance_profile_emits_aggregate_rows(tmp_path: Path
     assert rows[0]["constraint_max_iterations"] == 40
 
 
+@pytest.mark.slow
 def test_ligand_receptor_replicas_rerun_when_constraint_iterations_change(tmp_path: Path):
     from mlx_atomistic.io import load_npz_trajectory
     from mlx_atomistic.prep.replicas import run_ligand_receptor_replicas
@@ -477,6 +481,7 @@ def test_ligand_receptor_replicas_rerun_when_constraint_iterations_change(tmp_pa
     assert record.metadata["constraint_max_iterations"] == 12
 
 
+@pytest.mark.slow
 def test_notebook_bundle_loader_uses_full_prepared_artifact(tmp_path: Path):
     pytest.importorskip("MDAnalysis")
     from mlx_atomistic.prep.io import save_prepared_system, synthetic_prepared_system
@@ -668,6 +673,7 @@ def test_t4l_benzene_fixture_exports_complete_internal_smd_artifact(tmp_path: Pa
         load_prepared_mlx_artifact(tmp_path, require_production=True)
 
 
+@pytest.mark.slow
 def test_t4l_benzene_steered_run_writes_cv_trace(tmp_path: Path):
     from mlx_atomistic.prep.io import save_prepared_system
     from mlx_atomistic.prep.runner import run_steered_mlx
@@ -792,6 +798,7 @@ def test_solvated_ligand_receptor_builder_exports_complete_runtime_artifact(tmp_
     assert prepared.nonbonded_exception_pairs.shape[0] > 0
 
 
+@pytest.mark.slow
 def test_run_ligand_receptor_example_writes_mlx_trajectory(tmp_path: Path):
     from mlx_atomistic.io import load_npz_trajectory
     from mlx_atomistic.prep.solvated_example import ensure_solvated_ligand_receptor_example
@@ -815,6 +822,7 @@ def test_run_ligand_receptor_example_writes_mlx_trajectory(tmp_path: Path):
     assert np.isfinite(record.sampled_positions).all()
 
 
+@pytest.mark.slow
 def test_import_amber_tiny_topology_runs_mlx(tmp_path: Path):
     from mlx_atomistic.artifacts import load_prepared_mlx_artifact
     from mlx_atomistic.prep.io import save_prepared_system

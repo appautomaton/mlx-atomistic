@@ -32,6 +32,7 @@ def test_geometry_optimization_config_validation():
         GeometryOptimizationConfig(optimizer="bad")  # type: ignore[arg-type]
 
 
+@pytest.mark.slow
 def test_gaussian_dimer_one_step_lowers_or_preserves_energy():
     result = optimize_geometry(
         geometry_demo_system("gaussian-dimer", grid_shape=(4, 4, 4)),
@@ -48,6 +49,7 @@ def test_gaussian_dimer_one_step_lowers_or_preserves_energy():
     json.dumps(result.to_dict())
 
 
+@pytest.mark.slow
 def test_gth_relaxation_reduces_force_and_preserves_electron_count():
     system = geometry_demo_system("gth-h2", grid_shape=(4, 4, 4))
 
@@ -62,6 +64,7 @@ def test_gth_relaxation_reduces_force_and_preserves_electron_count():
         assert step.electron_count == pytest.approx(system.electron_count, abs=1e-5)
 
 
+@pytest.mark.slow
 def test_line_search_failure_is_structured_for_too_large_step():
     result = optimize_geometry(
         geometry_demo_system("gth-h2", grid_shape=(4, 4, 4)),
@@ -79,6 +82,7 @@ def test_line_search_failure_is_structured_for_too_large_step():
     assert result.steps == ()
 
 
+@pytest.mark.slow
 def test_geometry_positions_are_wrapped_into_periodic_cell():
     system = geometry_demo_system("gth-h2", grid_shape=(4, 4, 4)).with_centers(
         ((11.15, 4.0, 4.0), (-3.15, 4.0, 4.0))
@@ -95,6 +99,7 @@ def test_geometry_positions_are_wrapped_into_periodic_cell():
     assert np.all(positions < lengths)
 
 
+@pytest.mark.slow
 def test_geometry_optimization_npz_round_trip(tmp_path):
     path = tmp_path / "relaxation.npz"
     result = optimize_geometry(
@@ -114,6 +119,7 @@ def test_geometry_optimization_npz_round_trip(tmp_path):
     json.dumps(record.to_dict())
 
 
+@pytest.mark.slow
 def test_geometry_optimization_cli_json_smoke(capsys):
     optimize_main(
         [

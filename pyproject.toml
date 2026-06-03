@@ -48,15 +48,26 @@ viz = [
 ]
 
 [dependency-groups]
-# Dev/reference engines stay out of project.dependencies. OpenMM is a PyPI
-# reference wheel; LAMMPS is locally built from the upstream source package with
-# GPU/OpenCL enabled by the tool.uv settings below.
-dev = [
+# Test tooling only — light, no reference engines. Used by the fast CI lane so it
+# never has to build LAMMPS. pytest-xdist powers the parallel fast lane.
+test = [
+  "pytest>=8.3",
+  "pytest-cov>=5",
+  "pytest-xdist>=3",
+  "ruff>=0.8",
+]
+# Reference engines stay out of project.dependencies. OpenMM is a PyPI reference
+# wheel; LAMMPS is locally built from the upstream source package with GPU/OpenCL
+# enabled by the tool.uv settings below. Heavy — only needed for reference/full runs.
+reference = [
   "lammps>=2025.7.22.4.0",
   "mpich>=5.0.1",
   "openmm>=8.5.1",
-  "pytest>=8.3",
-  "ruff>=0.8",
+]
+# Full dev environment = test tooling + reference engines.
+dev = [
+  { include-group = "test" },
+  { include-group = "reference" },
 ]
 
 [tool.uv]
@@ -68,8 +79,14 @@ config-settings-package = { lammps = { "cmake.define.PKG_GPU" = "ON", "cmake.def
 packages = ["src/mlx_atomistic"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "slow: long-running test (>~1s); excluded from the fast CI lane",
+  "integration: multi-component end-to-end flow",
+  "reference: requires an external reference engine (openmm/lammps); skipped if absent",
+  "data: requires a heavy/gitignored dataset; skipped if absent",
+]
 
 [tool.ruff]
 exclude = ["vendors", ".venv"]

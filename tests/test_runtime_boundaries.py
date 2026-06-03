@@ -36,6 +36,23 @@ def _import_roots(path: Path) -> set[str]:
     return {module.split(".", maxsplit=1)[0] for module in _import_modules(path)}
 
 
+def _resolve_dependency_group(
+    groups: dict, name: str, seen: set[str] | None = None
+) -> set[str]:
+    """Flatten a PEP 735 dependency group, resolving ``include-group`` entries."""
+    seen = seen if seen is not None else set()
+    if name in seen:
+        return set()
+    seen.add(name)
+    resolved: set[str] = set()
+    for entry in groups.get(name, []):
+        if isinstance(entry, str):
+            resolved.add(entry)
+        elif isinstance(entry, dict) and "include-group" in entry:
+            resolved |= _resolve_dependency_group(groups, entry["include-group"], seen)
+    return resolved
+
+
 def test_core_runtime_does_not_import_reference_engines():
     offenders = {
         path.relative_to(ROOT): sorted(_import_roots(path) & FORBIDDEN_ENGINE_ROOTS)
@@ -142,14 +159,20 @@ def test_external_engine_imports_stay_in_documented_reference_scripts():
 
 def test_engine_dependencies_are_not_core_runtime_dependencies():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    groups = data["dependency-groups"]
     core_dependencies = set(data["project"]["dependencies"])
-    dev_dependencies = set(data["dependency-groups"]["dev"])
+    dev_dependencies = _resolve_dependency_group(groups, "dev")
     scripts = data["project"]["scripts"]
 
     assert "openmm>=8.5.1" not in core_dependencies
     assert "lammps>=2025.7.22.4.0" not in core_dependencies
     assert "openmm>=8.5.1" in dev_dependencies
     assert "lammps>=2025.7.22.4.0" in dev_dependencies
+    # Engines reach `dev` via the `reference` group and must never leak into the
+    # light `test` group that powers the fast CI lane (no LAMMPS build there).
+    assert "openmm>=8.5.1" in _resolve_dependency_group(groups, "reference")
+    assert "lammps>=2025.7.22.4.0" not in _resolve_dependency_group(groups, "test")
+    assert "openmm>=8.5.1" not in _resolve_dependency_group(groups, "test")
     legacy_command = "atomistic" + "-prep"
     assert legacy_command not in scripts
     assert legacy_command not in {

@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from mlx_atomistic.benchmarks import (
     NORMALIZED_BENCHMARK_FIELDS,
     cadence_sensitivity,
@@ -109,6 +111,7 @@ def test_dhfr_readiness_missing_inputs_fail_closed(tmp_path):
     assert "missing DHFR input path" in payload["blocker"]
 
 
+@pytest.mark.slow
 def test_dhfr_implicit_prepare_saves_openmm_gbsa_artifact():
     payload = dhfr.prepare_payload(case_spec=dhfr.CASE_SPECS["dhfr-implicit"])
 
@@ -124,6 +127,7 @@ def test_dhfr_implicit_prepare_saves_openmm_gbsa_artifact():
     assert payload["artifact_path"].startswith("results/dhfr-artifacts/")
 
 
+@pytest.mark.slow
 def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
     payload = dhfr.prepare_payload(case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"])
 
@@ -148,6 +152,7 @@ def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
         assert payload["pme"]["mesh_shape"]
 
 
+@pytest.mark.slow
 def test_dhfr_implicit_runtime_runs_bounded_mlx_path():
     payload = dhfr.runtime_payload(
         case_spec=dhfr.CASE_SPECS["dhfr-implicit"],
@@ -167,6 +172,7 @@ def test_dhfr_implicit_runtime_runs_bounded_mlx_path():
     assert payload["finite"] is True
 
 
+@pytest.mark.slow
 def test_dhfr_explicit_runtime_reports_pme_artifact_blocker():
     payload = dhfr.runtime_payload(
         case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"],
@@ -843,6 +849,7 @@ def test_openmm_import_failure_does_not_mask_invalid_input(tmp_path):
     assert "synthetic missing openmm" not in result.stderr
 
 
+@pytest.mark.slow
 def test_openmm_dhfr_reference_cases_report_normalized_blocker_or_ok():
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_openmm_dhfr.py"
 
@@ -1833,6 +1840,7 @@ def test_dft_spin_kpoints_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert csv_path.read_text().startswith("kpoint_count,occupation_count")
 
 
+@pytest.mark.slow
 def test_dft_relaxation_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_relaxation.csv"
 

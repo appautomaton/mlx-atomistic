@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.reference
+
 pytest.importorskip("openmm")
 _HELPER_PATH = Path(__file__).resolve().parents[1] / "scripts" / "openmm_mlx_parity.py"
 _SPEC = importlib.util.spec_from_file_location("openmm_mlx_parity", _HELPER_PATH)

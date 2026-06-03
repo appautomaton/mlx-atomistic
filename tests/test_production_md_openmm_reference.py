@@ -35,6 +35,7 @@ requires_reference_data = pytest.mark.skipif(
 
 
 @requires_reference_data
+@pytest.mark.data
 def test_existing_gpcrmd_reference_evidence_is_recorded(tmp_path: Path):
     candidate_path = EVIDENCE_DIR / "candidate-fixture.json"
     candidate = json.loads(candidate_path.read_text())
@@ -119,6 +120,7 @@ def test_missing_reference_data_records_reference_blocker(tmp_path: Path):
 
 
 @requires_reference_data
+@pytest.mark.data
 def test_cli_writes_openmm_reference_json(tmp_path: Path):
     candidate_path = EVIDENCE_DIR / "candidate-fixture.json"
     out_path = tmp_path / "openmm-reference.json"

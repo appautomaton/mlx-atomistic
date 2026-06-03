@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 NOTEBOOK_DIR = Path("notebooks/ligand-receptor-motion").resolve()
 if str(NOTEBOOK_DIR) not in sys.path:
@@ -33,6 +34,8 @@ from helpers.motion_analysis import (  # noqa: E402
     water_counts_around_ligand,
 )
 from helpers.visualization import make_ligand_motion_figure  # noqa: E402
+
+pytestmark = pytest.mark.integration
 
 
 def test_notebook_source_uses_gpcrmd_mlx_without_old_active_result_wording():
