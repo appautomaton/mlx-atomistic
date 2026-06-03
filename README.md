@@ -58,6 +58,7 @@ temperature-controlled experiments.
   trajectory I/O, and the combined nonbonded path.
 - `docs/validation-and-performance.md`: force validation, stability checks, and
   benchmark workflow.
+- `docs/testing.md`: test tiers (markers), the parallel fast lane, and CI lanes.
 - `docs/runtime-boundaries.md`: MLX runtime boundary and reference-engine policy.
 - `docs/units.md`: internal unit policy.
 - `docs/dft-foundations.md`: spin-unpolarized Γ-point plane-wave DFT prototype.
