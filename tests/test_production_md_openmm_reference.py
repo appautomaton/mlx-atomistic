@@ -5,7 +5,10 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
+EVIDENCE_DIR = Path(__file__).resolve().parent / "fixtures" / "production-md-readiness"
 SCRIPT_PATH = ROOT / "scripts" / "run_openmm_production_md_reference.py"
 SPEC = importlib.util.spec_from_file_location("run_openmm_production_md_reference", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -14,10 +17,26 @@ sys.modules[SPEC.name] = HELPER
 SPEC.loader.exec_module(HELPER)
 
 
+def _reference_data_available() -> bool:
+    """The OpenMM run-report lives under gitignored notebooks/.../openmm-md/ and is
+    absent from clean checkouts (including CI). Resolve it exactly as the helper does."""
+    candidate = json.loads((EVIDENCE_DIR / "candidate-fixture.json").read_text())
+    dynamics_id = candidate.get("fixture", {}).get("dynamics_id")
+    return HELPER._select_reference_evidence(HELPER.DEFAULT_REFERENCE_ROOT, dynamics_id) is not None
+
+
+requires_reference_data = pytest.mark.skipif(
+    not _reference_data_available(),
+    reason=(
+        "OpenMM reference report under notebooks/ligand-receptor-motion/data/openmm-md/ "
+        "is gitignored and absent in this checkout"
+    ),
+)
+
+
+@requires_reference_data
 def test_existing_gpcrmd_reference_evidence_is_recorded(tmp_path: Path):
-    candidate_path = (
-        ROOT / ".agent/work/production-md-readiness-fixture-probe/evidence/candidate-fixture.json"
-    )
+    candidate_path = EVIDENCE_DIR / "candidate-fixture.json"
     candidate = json.loads(candidate_path.read_text())
 
     report = HELPER.build_openmm_reference_evidence(
@@ -99,10 +118,9 @@ def test_missing_reference_data_records_reference_blocker(tmp_path: Path):
     assert report["product_runtime_boundary"]["status"] == "preserved"
 
 
+@requires_reference_data
 def test_cli_writes_openmm_reference_json(tmp_path: Path):
-    candidate_path = (
-        ROOT / ".agent/work/production-md-readiness-fixture-probe/evidence/candidate-fixture.json"
-    )
+    candidate_path = EVIDENCE_DIR / "candidate-fixture.json"
     out_path = tmp_path / "openmm-reference.json"
 
     old_argv = sys.argv

@@ -17,11 +17,11 @@ build_blocker_matrix = HELPER.build_blocker_matrix
 build_readiness_report = HELPER.build_readiness_report
 TAXONOMY_CATEGORIES = HELPER.TAXONOMY_CATEGORIES
 
+EVIDENCE_DIR = Path(__file__).resolve().parent / "fixtures" / "production-md-readiness"
+
 
 def _evidence(name: str) -> dict:
-    return json.loads(
-        (ROOT / ".agent/work/production-md-readiness-fixture-probe/evidence" / name).read_text()
-    )
+    return json.loads((EVIDENCE_DIR / name).read_text())
 
 
 def test_blocker_matrix_covers_every_taxonomy_category():
