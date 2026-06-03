@@ -39,9 +39,11 @@ Each result file should answer, in order:
 | [same-workload-openmm-comparison.md](./same-workload-openmm-comparison.md) | mlx_atomistic/openmm-reference | refreshed controlled same-workload comparison report | Metal/OpenCL where available | local |
 | [same-workload-dhfr-stretch.md](./same-workload-dhfr-stretch.md) | mlx_atomistic/openmm-reference | DHFR stretch status | Metal/OpenCL where available | local |
 | [performance-audit-baseline.md](./performance-audit-baseline.md) | mlx_atomistic | fast baseline audit and ranked backlog | Metal/OpenCL where available | local |
+| [m5max-reference-engines.md](./m5max-reference-engines.md) | openmm-reference/lammps-reference | M5 Max reference-engine manifest overview | OpenCL | Apple M5 Max |
 | [openmm-opencl-dhfr.md](./openmm-opencl-dhfr.md) | openmm-reference | DHFR (23k atoms) | OpenCL | Apple M5 Max |
 | [openmm-opencl-apoa1.md](./openmm-opencl-apoa1.md) | openmm-reference | ApoA1 (92k atoms) | OpenCL | Apple M5 Max |
 | [openmm-opencl-amber20.md](./openmm-opencl-amber20.md) | openmm-reference | Cellulose (409k) + STMV (1.07M atoms) | OpenCL | Apple M5 Max |
+| [lammps-opencl-m5max.md](./lammps-opencl-m5max.md) | lammps-reference | official LAMMPS five-case benchmark set | OpenCL | Apple M5 Max |
 
 The inventory appears first. Result files are ordered by system size, smallest
 first, so the scaling story reads top-to-bottom.
@@ -76,6 +78,11 @@ Markdown summaries should cite those raw paths and reproduction commands.
 | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-explicit-pme --platform Reference --steps 1 --json > results/same-workload-openmm-comparison/openmm-dhfr-explicit-pme.json` | openmm-reference | opt-in reference shape check | raw JSON under `results/` |
 | `uv run python scripts/benchmark_openmm_opencl.py --platform DefinitelyMissing --particles 16 --steps 1 --json` | openmm-reference | fast blocked-path smoke | normalized blocked JSON on stdout |
 | `uv run python scripts/benchmark_lammps_opencl.py --particles 16 --steps 1 --json` | lammps-reference | opt-in reference / blocked-path smoke | normalized JSON or blocked JSON on stdout |
+| `uv run python scripts/benchmark_m5max_reference.py environment --json` | openmm-reference/lammps-reference | reference environment probe | normalized JSON on stdout |
+| `uv run python scripts/benchmark_m5max_reference.py openmm --dry-run --json` | openmm-reference | opt-in reference command plan | raw path plan under `results/m5max-reference/openmm/` |
+| `uv run python scripts/benchmark_m5max_reference.py lammps --classify-only --json` | lammps-reference | opt-in official case classification | normalized diagnostic JSON on stdout |
+| `uv run python scripts/benchmark_m5max_reference.py run --seconds 30 --json` | openmm-reference/lammps-reference | host-only reference benchmark suite | raw manifest under `results/m5max-reference/` |
+| `uv run python scripts/benchmark_m5max_reference.py validate --manifest results/m5max-reference/manifest.json --json` | openmm-reference/lammps-reference | reference manifest validation | validation JSON on stdout |
 
 ## External inputs
 
@@ -103,6 +110,8 @@ stock upstream benchmark script:
 | [openmm-opencl-dhfr.md](./openmm-opencl-dhfr.md) | `results/openmm-opencl-dhfr-m5max.json` from `vendors/openmm/examples/benchmarks/benchmark.py` | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
 | [openmm-opencl-apoa1.md](./openmm-opencl-apoa1.md) | `results/openmm-opencl-apoa1-m5max.json` from `vendors/openmm/examples/benchmarks/benchmark.py` | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
 | [openmm-opencl-amber20.md](./openmm-opencl-amber20.md) | `results/openmm-opencl-amber20-m5max.json` from `vendors/openmm/examples/benchmarks/benchmark.py` | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
+| [m5max-reference-engines.md](./m5max-reference-engines.md) | `results/m5max-reference/manifest.json` from `scripts/benchmark_m5max_reference.py` | engine provenance, required case coverage, OpenMM rows, LAMMPS statuses, raw output paths |
+| [lammps-opencl-m5max.md](./lammps-opencl-m5max.md) | `results/m5max-reference/lammps/*.json` from `scripts/benchmark_m5max_reference.py` | official input paths, style mapping, acceleration classification, loop time or blocker |
 
 `scripts/benchmark_openmm_opencl.py` and
 `scripts/benchmark_lammps_opencl.py` emit the shared normalized JSON schema

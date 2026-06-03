@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import subprocess
@@ -58,7 +59,7 @@ def _assert_reference_payload(payload, *, engine, benchmark_name, timing_metric)
     assert payload["engine"] == engine
     assert payload["benchmark_name"] == benchmark_name
     assert payload["timing_metric"] == timing_metric
-    assert payload["status"] in {"ok", "failed", "blocked"}
+    assert payload["status"] in {"ok", "failed", "blocked", "diagnostic"}
     assert payload["command"].startswith("uv run python scripts/")
     assert "runtime" in payload
     assert "hardware" in payload
@@ -1446,6 +1447,196 @@ def test_lammps_invalid_input_exits_nonzero():
 
     assert result.returncode != 0
     assert "particles must be positive" in result.stderr
+
+
+def test_reference_payload_allows_diagnostic_status():
+    payload = {field: None for field in NORMALIZED_BENCHMARK_FIELDS}
+    payload.update(
+        {
+            "engine": "lammps-reference",
+            "benchmark_name": "diagnostic_reference",
+            "fixture": "diagnostic",
+            "system": "diagnostic",
+            "timing_metric": "steps_per_s",
+            "timing_value": None,
+            "hardware": {},
+            "runtime": {},
+            "finite": False,
+            "status": "diagnostic",
+            "blocker": "style has no GPU/OpenCL equivalent",
+            "command": "uv run python scripts/benchmark_lammps_opencl.py",
+            "commit": "test",
+            "raw_output_path": "results/diagnostic.json",
+        }
+    )
+
+    _assert_reference_payload(
+        payload,
+        engine="lammps-reference",
+        benchmark_name="diagnostic_reference",
+        timing_metric="steps_per_s",
+    )
+
+
+def test_m5max_reference_environment_probe_reports_reference_engines():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "environment",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    _assert_reference_payload(
+        payload,
+        engine="reference-environment",
+        benchmark_name="m5max_reference_environment",
+        timing_metric="environment_probe",
+    )
+    assert payload["status"] in {"ok", "diagnostic"}
+    assert payload["raw_output_path"] == "results/m5max-reference/environment.json"
+    cases = {case["engine"]: case for case in payload["cases"]}
+    assert {"openmm-reference", "lammps-reference"} == set(cases)
+    assert cases["openmm-reference"]["status"] in {"ok", "diagnostic"}
+    assert cases["lammps-reference"]["status"] in {"ok", "diagnostic"}
+    assert payload["command_surface"]["harness"].startswith(
+        "uv run python scripts/benchmark_m5max_reference.py"
+    )
+    assert "stale shebang" in payload["command_surface"]["lammps_console_script_policy"]
+
+
+def test_m5max_reference_lammps_classify_only_covers_official_cases():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "lammps",
+            "--classify-only",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    _assert_reference_payload(
+        payload,
+        engine="lammps-reference",
+        benchmark_name="m5max_lammps_official",
+        timing_metric="loop_time_s",
+    )
+    cases = {case["case"]: case for case in payload["cases"]}
+    assert set(cases) == {"lj", "chain", "eam", "chute", "rhodo"}
+    assert payload["status"] == "diagnostic"
+    assert {case["status"] for case in cases.values()} == {"diagnostic"}
+    assert cases["lj"]["acceleration_classification"] == "full_gpu_opencl"
+    assert cases["eam"]["acceleration_classification"] == "full_gpu_opencl"
+    assert cases["chain"]["acceleration_classification"] == "partial_gpu_opencl"
+    assert cases["rhodo"]["acceleration_classification"] == "partial_gpu_opencl"
+    assert cases["chute"]["acceleration_classification"] == "cpu_only_diagnostic"
+    for case in cases.values():
+        assert case["input_script"].startswith("vendors/lammps/bench/")
+        assert case["work_dir"].startswith("results/m5max-reference/lammps/")
+        assert case["command"].startswith("uv run python scripts/benchmark_m5max_reference.py")
+        assert case["blocker"] == "classification only; benchmark not executed"
+
+
+def test_m5max_reference_openmm_dry_run_covers_named_systems():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "openmm",
+            "--dry-run",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    _assert_reference_payload(
+        payload,
+        engine="openmm-reference",
+        benchmark_name="m5max_openmm_official",
+        timing_metric="ns_per_day",
+    )
+    cases = {case["case"]: case for case in payload["cases"]}
+    assert set(cases) == {"dhfr", "apoa1", "amber20"}
+    assert [case["case"] for case in payload["cases"]] == ["dhfr", "apoa1", "amber20"]
+    assert payload["status"] == "diagnostic"
+    assert {case["status"] for case in cases.values()} == {"diagnostic"}
+    assert cases["dhfr"]["tests"] == "gbsa,rf,pme"
+    assert cases["apoa1"]["tests"] == "apoa1rf,apoa1pme,apoa1ljpme"
+    assert cases["amber20"]["tests"] == "amber20-cellulose,amber20-stmv"
+    assert cases["amber20"]["external_inputs"] == [
+        "https://ambermd.org/Amber20_Benchmark_Suite.tar.gz"
+    ]
+    for case in cases.values():
+        assert "benchmark.py" in case["command"]
+        assert "--platform OpenCL" in case["command"]
+        assert "--precision single" in case["command"]
+        assert case["timeout_s"] == 1200
+        assert case["raw_output_path"].startswith("results/m5max-reference/openmm/")
+        assert case["blocker"] == "dry run; benchmark not executed"
+
+
+def test_m5max_reference_openmm_run_path_invokes_executor(monkeypatch, tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
+    spec = importlib.util.spec_from_file_location("benchmark_m5max_reference_under_test", script)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    calls = []
+
+    def fake_execute(record):
+        calls.append(record["case"])
+        updated = dict(record)
+        updated.update(
+            {
+                "status": "ok",
+                "blocker": None,
+                "benchmarks": [{"ns_per_day": 1.0}],
+                "benchmark_count": 1,
+                "ns_per_day": 1.0,
+                "timing_value": 1.0,
+                "finite": True,
+            }
+        )
+        return updated
+
+    monkeypatch.setattr(module, "_execute_openmm_case", fake_execute)
+
+    payload = module.build_openmm_payload(
+        cases=["dhfr"],
+        dry_run=False,
+        output_root=tmp_path / "m5max-reference",
+        seconds=0.01,
+    )
+
+    assert calls == ["dhfr"]
+    assert payload["status"] == "ok"
+    case = payload["cases"][0]
+    assert case["case"] == "dhfr"
+    assert case["benchmark_count"] == 1
+    assert case["timing_value"] == 1.0
 
 
 def test_pme_performance_stage_summary_schema_without_fixture(tmp_path):
