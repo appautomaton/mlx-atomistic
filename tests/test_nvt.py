@@ -2,11 +2,13 @@ import numpy as np
 import pytest
 
 from mlx_atomistic.core import Cell
+from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import (
     LangevinThermostat,
     LennardJonesPotential,
     NoseHooverThermostat,
     SimulationConfig,
+    _langevin_block_execution_enabled,
     simulate_nve,
     simulate_nvt,
 )
@@ -39,6 +41,104 @@ def test_nose_hoover_thermostat_validation():
         NoseHooverThermostat(relaxation_time=0.0)
     with pytest.raises(ValueError, match="thermal_mass"):
         NoseHooverThermostat(thermal_mass=-1.0)
+
+
+def _batched_fcc_system(n=256):
+    positions, cell = fcc_lattice(n, density=0.8)
+    velocities = thermal_velocities(n, temperature=1.0, seed=7)
+    return (
+        np.asarray(positions, dtype=np.float32),
+        np.asarray(velocities, dtype=np.float32),
+        cell,
+        LennardJonesPotential(cutoff=2.5),
+    )
+
+
+def test_block_execution_gate_requires_supported_langevin_config():
+    config = SimulationConfig(steps=10, block_size=8)
+    manager = NeighborListManager(Cell.cubic(6.0), cutoff=2.5, skin=1.0)
+    langevin = LangevinThermostat(temperature=1.0, friction=0.5, seed=1)
+    # Supported: Langevin + managed neighbors + no constraints/virtual sites.
+    assert _langevin_block_execution_enabled(
+        config, thermostat=langevin, neighbor_manager=manager,
+        constraints=None, virtual_sites=None,
+    )
+    # block_size == 1 is the per-step path.
+    assert not _langevin_block_execution_enabled(
+        SimulationConfig(steps=10, block_size=1), thermostat=langevin,
+        neighbor_manager=manager, constraints=None, virtual_sites=None,
+    )
+    # No neighbor manager (dense path) cannot batch.
+    assert not _langevin_block_execution_enabled(
+        config, thermostat=langevin, neighbor_manager=None,
+        constraints=None, virtual_sites=None,
+    )
+    # Nose-Hoover is not supported by the fast path.
+    assert not _langevin_block_execution_enabled(
+        config, thermostat=NoseHooverThermostat(temperature=1.0),
+        neighbor_manager=manager, constraints=None, virtual_sites=None,
+    )
+
+
+@pytest.mark.parametrize("block_size", [4, 16])
+def test_batched_langevin_matches_per_step(block_size):
+    """The compiled batched-block fast path must reproduce the per-step loop.
+
+    Same seed + same Langevin substep arithmetic => the batched trajectory
+    matches the per-step loop to floating-point precision (the only differences
+    are summation-order ULPs from the larger skin's neighbor list, the same class
+    of difference as changing the rebuild interval). Sampling/diagnostic cadences
+    here are deliberately NOT multiples of block_size to exercise boundary
+    capping.
+    """
+    positions, velocities, cell, potential = _batched_fcc_system()
+
+    def run(bs, skin):
+        manager = NeighborListManager(
+            cell, cutoff=2.5, skin=skin, check_interval=1, backend="mlx_cell_pairs"
+        )
+        config = SimulationConfig(
+            dt=0.002, steps=120, sample_interval=30, diagnostic_interval=30,
+            evaluation_interval=25, block_size=bs,
+        )
+        return simulate_nvt(
+            positions, velocities, cell=cell, force_terms=potential,
+            neighbor_manager=manager, config=config,
+            thermostat=LangevinThermostat(temperature=1.0, friction=0.5, seed=7),
+        )
+
+    reference = run(1, 0.4)
+    batched = run(block_size, 1.2)
+
+    assert np.array_equal(
+        np.asarray(batched.diagnostic_steps), np.asarray(reference.diagnostic_steps)
+    )
+    assert np.array_equal(
+        np.asarray(batched.sampled_steps), np.asarray(reference.sampled_steps)
+    )
+    assert np.allclose(
+        np.asarray(batched.total_energy), np.asarray(reference.total_energy),
+        rtol=0.0, atol=1e-3,
+    )
+    assert np.allclose(
+        np.asarray(batched.sampled_positions), np.asarray(reference.sampled_positions),
+        rtol=0.0, atol=1e-3,
+    )
+    assert bool(np.isfinite(np.asarray(batched.total_energy)).all())
+
+
+def test_batched_block_size_falls_back_without_neighbor_manager():
+    """block_size > 1 on the dense path (no manager) must still run correctly."""
+    positions, velocities, cell, potential = _batched_fcc_system(n=108)
+    config = SimulationConfig(
+        dt=0.002, steps=40, sample_interval=40, diagnostic_interval=40, block_size=8
+    )
+    result = simulate_nvt(
+        positions, velocities, cell=cell, force_terms=potential,
+        neighbor_manager=None, config=config,
+        thermostat=LangevinThermostat(temperature=1.0, friction=0.5, seed=7),
+    )
+    assert bool(np.isfinite(np.asarray(result.total_energy)).all())
 
 
 def test_nose_hoover_nvt_produces_finite_state_and_metadata():

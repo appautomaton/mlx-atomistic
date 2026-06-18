@@ -93,6 +93,8 @@ def run_ladder(
     opencl_device: str,
     run_openmm: bool,
     run_lammps: bool,
+    block_size: int = 1,
+    neighbor_skin: float = 0.4,
     timeout: int = DEFAULT_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Run the ladder on all selected engines and return the scaling summary.
@@ -121,6 +123,10 @@ def run_ladder(
                 str(steps),
                 "--dt",
                 str(dt),
+                "--block-size",
+                str(block_size),
+                "--neighbor-skin",
+                str(neighbor_skin),
                 "--json",
             ],
             out_dir / f"mlx-lj-N{n}.json",
@@ -242,6 +248,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--skip-lammps", action="store_true")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
     parser.add_argument(
+        "--block-size",
+        type=int,
+        default=1,
+        help="MLX batched-block size (>1 enables the compiled NVT fast path)",
+    )
+    parser.add_argument(
+        "--neighbor-skin",
+        type=float,
+        default=0.4,
+        help="MLX neighbor-list skin (larger skin => fewer rebuilds, pairs with batched blocks)",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="print the summary JSON instead of a table"
     )
     args = parser.parse_args(argv)
@@ -261,6 +279,8 @@ def main(argv: list[str] | None = None) -> None:
         opencl_device=args.opencl_device,
         run_openmm=not args.skip_openmm,
         run_lammps=not args.skip_lammps,
+        block_size=args.block_size,
+        neighbor_skin=args.neighbor_skin,
         timeout=args.timeout,
     )
     if args.json:

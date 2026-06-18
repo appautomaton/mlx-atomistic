@@ -365,6 +365,7 @@ class SimulationConfig:
     initial_step: int = 0
     initial_time: float = 0.0
     virtual_sites: VirtualSiteManager | None = None
+    block_size: int = 1
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -396,6 +397,9 @@ class SimulationConfig:
             raise ValueError(msg)
         if self.initial_time < 0.0:
             msg = "initial_time must be non-negative"
+            raise ValueError(msg)
+        if self.block_size < 1:
+            msg = "block_size must be a positive integer (1 = per-step execution)"
             raise ValueError(msg)
 
 
@@ -1358,6 +1362,35 @@ def _is_diagnostic_step(step: int, config: SimulationConfig, *, final: bool = Fa
     return step % config.diagnostic_interval == 0 or final
 
 
+def _langevin_block_execution_enabled(
+    config: SimulationConfig,
+    *,
+    thermostat: object,
+    neighbor_manager: NeighborListManager | None,
+    constraints: object | None,
+    virtual_sites: VirtualSiteManager | None,
+) -> bool:
+    """Whether the compiled batched-block fast path applies to this NVT run.
+
+    The fast path runs `block_size` velocity-Verlet/Langevin substeps as one
+    compiled block between neighbor rebuilds, syncing to the host once per block
+    instead of every step. It is only safe when nothing in the loop needs
+    per-step host interaction or per-step force bookkeeping: a Langevin
+    thermostat (deterministic threaded PRNG, compiles cleanly), a managed
+    neighbor list, no constraints, and no virtual sites. Block length is capped
+    at the next sampling/diagnostic boundary at run time, so recording cadences
+    need not divide `block_size` and no recorded step is ever skipped.
+    """
+
+    return (
+        config.block_size > 1
+        and isinstance(thermostat, LangevinThermostat)
+        and neighbor_manager is not None
+        and constraints is None
+        and virtual_sites is None
+    )
+
+
 def _normalize_reporters(
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None,
 ) -> tuple[RuntimeReporter, ...]:
@@ -2164,7 +2197,258 @@ def simulate_nvt(
         runtime_sync=runtime_sync,
     )
 
-    for local_step in range(1, config.steps + 1):
+    _batched = _langevin_block_execution_enabled(
+        config,
+        thermostat=thermostat,
+        neighbor_manager=neighbor_manager,
+        constraints=constraints,
+        virtual_sites=virtual_sites,
+    )
+    if _batched:
+        fscale = config.force_to_acceleration_scale
+        dt = config.dt
+        # Use the same arithmetic as the per-step loop below (division by the
+        # mass column, not multiply-by-reciprocal) so the batched trajectory is
+        # bit-for-bit identical, not just close.
+        masses_col = masses[:, None]
+        sqrt_masses_col = mx.sqrt(masses)[:, None]
+
+        def _langevin_substep(pos, vel, forces, prng, block_pairs):
+            accel = fscale * forces / masses_col
+            vel_half = vel + 0.5 * dt * accel
+            pos = pos + 0.5 * dt * vel_half
+            if cell is not None:
+                pos = cell.wrap(pos)
+            split_keys = mx.random.split(prng, 2)
+            prng = split_keys[0]
+            noise = mx.random.normal(vel.shape, key=split_keys[1])
+            middle = velocity_decay * vel_half + (noise_scale / sqrt_masses_col) * noise
+            pos = pos + 0.5 * dt * middle
+            if cell is not None:
+                pos = cell.wrap(pos)
+            _, next_forces = _energy_forces_from_terms(
+                pos, unnamed_terms, cell=cell, pairs=block_pairs, virtual_sites=None
+            )
+            next_accel = fscale * next_forces / masses_col
+            vel = vel_half + 0.5 * dt * next_accel
+            return pos, vel, next_forces, prng
+
+        _block_cache: dict[int, object] = {}
+
+        def _compiled_block(n_substeps: int):
+            cached = _block_cache.get(n_substeps)
+            if cached is not None:
+                return cached
+
+            def block(pos, vel, forces, prng, block_pairs):
+                for _ in range(n_substeps):
+                    pos, vel, forces, prng = _langevin_substep(
+                        pos, vel, forces, prng, block_pairs
+                    )
+                return pos, vel, forces, prng
+
+            compiled = mx.compile(block)
+            _block_cache[n_substeps] = compiled
+            return compiled
+
+        def _next_recording_local_step(local_step: int) -> int:
+            """Smallest local step > `local_step` that is a sampling, diagnostic,
+            or final step — so a block never steps past a recorded boundary."""
+            current = config.initial_step + local_step
+            next_sample = ((current // config.sample_interval) + 1) * config.sample_interval
+            next_diag = ((current // config.diagnostic_interval) + 1) * config.diagnostic_interval
+            next_step = min(next_sample, next_diag) - config.initial_step
+            return min(next_step, config.steps)
+
+        def _run_langevin_batched(
+            state, key, thermostat_metadata, pairs, pair_count, rebuild_count, fe_wall
+        ):
+            pos, vel, forces = state.positions, state.velocities, state.forces
+            local_step = 0
+            while local_step < config.steps:
+                n = min(config.block_size, _next_recording_local_step(local_step) - local_step)
+                pos, vel, forces, key = _compiled_block(n)(pos, vel, forces, key, pairs)
+                local_step += n
+                current_step = config.initial_step + local_step
+                current_time = config.initial_time + local_step * config.dt
+
+                force_start = perf_counter()
+                neighbor_list = neighbor_manager.update(pos)
+                pairs = neighbor_list.interactions
+                pair_count = neighbor_list.pair_count
+                rebuild_count = neighbor_manager.rebuild_count
+                fe_wall += perf_counter() - force_start
+
+                state = SimulationState(
+                    positions=pos,
+                    velocities=vel,
+                    masses=masses,
+                    forces=forces,
+                    step=current_step,
+                    time=current_time,
+                )
+                thermostat_metadata = _thermostat_metadata(
+                    thermostat,
+                    dof=temperature_dof,
+                    boltzmann_constant=config.boltzmann_constant,
+                    rng_step_offset=rng_step_offset + local_step,
+                )
+
+                diagnostic_step = _is_diagnostic_step(
+                    current_step, config, final=local_step == config.steps
+                )
+                energy_by_term = None
+                potential_energy = None
+                if diagnostic_step:
+                    force_start = perf_counter()
+                    potential_energy, _, energy_by_term = _energy_forces_by_term(
+                        pos, terms, cell=cell, pairs=pairs, virtual_sites=None
+                    )
+                    fe_wall += perf_counter() - force_start
+
+                sampled_state_evaluated = False
+                if current_step % config.sample_interval == 0 or local_step == config.steps:
+                    _materialize_sampled_state(
+                        state,
+                        runtime_sync=runtime_sync,
+                        reason="final_state"
+                        if local_step == config.steps
+                        else "explicit_user_output",
+                    )
+                    sampled_state_evaluated = True
+                    sampled_positions.append(state.positions)
+                    sampled_velocities.append(state.velocities)
+                    sampled_steps.append(current_step)
+                    sampled_times.append(state.time)
+                    _notify_reporters(
+                        reporters_tuple,
+                        ReporterEvent(
+                            ensemble="nvt",
+                            event_type="sample",
+                            step=current_step,
+                            time=state.time,
+                            state=state,
+                            thermostat=thermostat_metadata,
+                        ),
+                        runtime_sync=runtime_sync,
+                    )
+                if diagnostic_step:
+                    diagnostic_steps.append(current_step)
+                    diagnostic_times.append(state.time)
+                    potential_energies.append(potential_energy)
+                    for name, energy in energy_by_term.items():
+                        potential_energy_by_term[name].append(energy)
+                    kinetic_energies.append(
+                        kinetic_energy(
+                            state.velocities,
+                            masses,
+                            kinetic_energy_scale=config.kinetic_energy_scale,
+                        )
+                    )
+                    temperatures.append(
+                        instantaneous_temperature(
+                            state.velocities,
+                            masses,
+                            dof=temperature_dof,
+                            kinetic_energy_scale=config.kinetic_energy_scale,
+                            boltzmann_constant=config.boltzmann_constant,
+                        )
+                    )
+                    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+                        state.positions,
+                        state.velocities,
+                        masses,
+                        state.forces,
+                        unnamed_terms,
+                        cell=cell,
+                        pairs=pairs,
+                        kinetic_energy_scale=config.kinetic_energy_scale,
+                        enabled=config.pressure_diagnostics,
+                        virtual_sites=virtual_sites,
+                    )
+                    virials.append(virial)
+                    pressure_tensors.append(pressure_tensor_value)
+                    pressures.append(pressure_value)
+                    pair_counts.append(pair_count)
+                    rebuild_counts.append(rebuild_count)
+                    constraint_errors.append(constraint_error)
+                    _notify_reporters(
+                        reporters_tuple,
+                        ReporterEvent(
+                            ensemble="nvt",
+                            event_type="diagnostic",
+                            step=current_step,
+                            time=state.time,
+                            state=state,
+                            potential_energy=potential_energy,
+                            kinetic_energy=kinetic_energies[-1],
+                            total_energy=potential_energy + kinetic_energies[-1],
+                            temperature=temperatures[-1],
+                            energy_by_term=energy_by_term,
+                            virial_tensor=virial,
+                            pressure_tensor=pressure_tensor_value,
+                            pressure=pressure_value,
+                            pair_count=pair_count,
+                            rebuild_count=rebuild_count,
+                            constraint_max_error=constraint_error,
+                            thermostat=thermostat_metadata,
+                        ),
+                        runtime_sync=runtime_sync,
+                    )
+                if (
+                    (current_step % config.evaluation_interval == 0 or local_step == config.steps)
+                    and diagnostic_step
+                    and energy_by_term is not None
+                ):
+                    _eval_step_state(
+                        state,
+                        potential_energy,
+                        kinetic_energies[-1],
+                        temperatures[-1],
+                        virials[-1],
+                        pressure_tensors[-1],
+                        pressures[-1],
+                        constraint_error,
+                        energy_by_term,
+                        evaluate_sampled_state=not sampled_state_evaluated,
+                        runtime_sync=runtime_sync,
+                        sync_reason="diagnostic",
+                    )
+                # Bound the lazy graph and catch divergence: one sync per block
+                # (every block_size steps) instead of per step. The manager
+                # update above already materialized positions; this covers the
+                # velocity/force/PRNG state carried into the next block.
+                runtime_sync.record_sync("failure_check", vel, forces, key)
+            return (
+                state,
+                key,
+                thermostat_metadata,
+                pairs,
+                pair_count,
+                rebuild_count,
+                fe_wall,
+            )
+
+        (
+            state,
+            key,
+            thermostat_metadata,
+            pairs,
+            pair_count,
+            rebuild_count,
+            force_evaluation_wall_seconds,
+        ) = _run_langevin_batched(
+            state,
+            key,
+            thermostat_metadata,
+            pairs,
+            pair_count,
+            rebuild_count,
+            force_evaluation_wall_seconds,
+        )
+
+    step_range = range(0) if _batched else range(1, config.steps + 1)
+    for local_step in step_range:
         current_step = config.initial_step + local_step
         current_time = config.initial_time + local_step * config.dt
         acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]

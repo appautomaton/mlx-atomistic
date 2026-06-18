@@ -73,54 +73,63 @@ Measured on an Apple M5 Max (128 GB), reduced density 0.8, `dt = 0.002`, per-siz
 step counts (3000 / 2000 / 800 / 300). MLX and LAMMPS share the same `fcc_lattice`
 geometry and reduced LJ units; OpenMM runs the same particle/step counts in
 physical units. All four sizes are `comparable` and all MLX runs conserved energy
-(see note below). The MLX rows below are the post-switch numbers: above the dense
-threshold the default neighbor backend is now `mlx_cell_pairs` (compacted real
-pairs) rather than the former `mlx_cell_blocks` (padded candidate blocks).
+(see note below). The MLX rows are the current best per size: above the dense
+threshold (1536 atoms) the neighbor backend is `mlx_cell_pairs` (compacted real
+pairs) and the integrator runs the **compiled batched-block fast path**
+(`block_size=16`, `neighbor_skin=1.2`) — `block_size` Langevin substeps per
+compiled block with one host sync per block instead of per step.
 
 | atoms | MLX steps/s | MLX backend | OpenMM steps/s | OpenMM/MLX | LAMMPS steps/s | LAMMPS/MLX |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| 1000  | 1974.3 | `mlx_dense` | 24024.7 | 12.2× | 4358.1 | 2.2× |
-| 4000  | 649.2  | `mlx_cell_pairs` | 4819.9 | 7.4× | 2165.1 | 3.3× |
-| 16000 | 180.2  | `mlx_cell_pairs` | 4171.0 | 23.1× | 664.6 | 3.7× |
-| 50000 | 57.0   | `mlx_cell_pairs` | 3193.6 | 56.0× | 234.0 | 4.1× |
+| 1000  | 1966.4 | `mlx_dense` | 24024.7 | 12.2× | 4358.1 | 2.2× |
+| 4000  | 1354.4 | `mlx_cell_pairs` + batched | 4819.9 | 3.6× | 2165.1 | 1.6× |
+| 16000 | 345.6  | `mlx_cell_pairs` + batched | 4171.0 | 12.1× | 664.6 | 1.9× |
+| 50000 | 101.9  | `mlx_cell_pairs` + batched | 3193.6 | 31.3× | 234.0 | 2.3× |
 
 `ratio = reference_steps_per_s / mlx_steps_per_s` (> 1 means the reference engine
 runs more steps/s — the MLX gap).
 
-For reference, the prior `mlx_cell_blocks` default measured 99.5 / 31.8 / 8.5
-steps/s at 4k / 16k / 50k. Switching to `mlx_cell_pairs` is a **6.5× / 5.7× / 6.7×**
-MLX speedup at identical physics (energy and forces agree to float precision; a
-regression test locks this in
-`tests/test_neighbors.py::test_default_backend_switch_preserves_lj_physics`).
+Two compounding MLX changes produced these numbers, both at identical physics:
+
+1. **Neighbor backend `mlx_cell_blocks` → `mlx_cell_pairs`** (compact real pairs
+   instead of ~11× padded candidates): 99.5 / 31.8 / 8.5 → 649 / 180 / 57 steps/s
+   at 4k / 16k / 50k (**~6×**). Locked by
+   `tests/test_neighbors.py::test_default_backend_switch_preserves_lj_physics`.
+2. **Compiled batched-block integrator** (sync once per block, not per step):
+   649 / 180 / 57 → 1354 / 346 / 102 steps/s (**2.2× / 1.9× / 1.8×**). The batched
+   path uses the same seeded threaded PRNG and the same per-step arithmetic, so it
+   reproduces the per-step trajectory to floating-point precision (≈1e-4 energy
+   over the run; differences are summation-order ULPs from a larger skin, the same
+   class of difference as changing the rebuild interval) — locked by
+   `tests/test_nvt.py::test_batched_langevin_matches_per_step`.
+
+Cumulatively MLX is **13.6× / 10.9× / 12.0×** faster at 4k / 16k / 50k than the
+original `mlx_cell_blocks` baseline.
 
 ### Interpretation
 
-- **The dense → neighbor-list cliff is now mild.** MLX's `auto` policy uses dense
-  all-pairs below 1536 atoms and a neighbor list above it. Crossing that boundary
-  (1k → 4k) drops MLX from 1974 to 649 steps/s — a ~3× slowdown for 4× the atoms,
-  versus the ~19× cliff the old `mlx_cell_blocks` default produced. The fix was to
-  stop evaluating padded candidate blocks: the former default generated ~11× more
-  candidate pair-math than real pairs (256-wide padded blocks over a 27-cell
-  stencil, ~91% masked) and rebuilt them on the host every few steps. Compacting
-  to real pairs (`mlx_cell_pairs`) removes that waste at identical physics.
-- **The residual gap is real per-step overhead, not the neighbor representation.**
-  LAMMPS uses the identical reduced-unit LJ physics and also builds neighbor lists
-  on the host (GPU pair force only). After the switch it is ~3.3–4.1× faster than
-  MLX at 4k–50k, down from ~20–27× with the old default. That remaining ~3–4× is
-  genuine MLX runtime overhead — per-step host sync (`mx.eval` each step),
-  Langevin RNG, diagnostics, and per-term energy bookkeeping in the production
-  loop — not the cost of compaction.
-- **MLX still scales worse than OpenMM, but far less so.** OpenMM throughput is
-  nearly flat across the ladder (24k → 3.2k steps/s, ~7.5× for a 50× size
-  increase); MLX now goes 1974 → 57 steps/s (~35×), versus ~220× before the
-  switch. The OpenMM/MLX ratio grows from ~12× at 1k to ~56× at 50k because OpenMM
-  keeps the entire step on-device (fused tile kernels, no per-step host
-  round-trip), which is the structural advantage MLX has yet to match.
-- The next closure levers are therefore (1) the per-step loop overhead measured
-  against the clean NVE micro-loop, and (2) keeping the step on-device to cut the
-  per-step host sync — an on-device neighbor/pair-emitter kernel
-  (`mx.fast.metal_kernel` exists) rather than the host compaction the
-  `mlx_cell_pairs` path still uses.
+- **MLX now tracks LAMMPS within ~1.6–2.3× across the ladder** — same reduced-unit
+  LJ physics, both building neighbor lists on the host with the pair force on the
+  GPU — down from ~20–27× at the start. The two levers were structural, not
+  micro-optimization: stop computing masked padded candidates, and stop paying a
+  host round-trip every step.
+- **The batched fast path removes the per-step host sync.** With a managed
+  neighbor list the integrator could not be compiled and synced (`mx.eval`) every
+  step. Running `block_size` Langevin substeps as one compiled block — with the
+  neighbor displacement check at block boundaries and a larger skin so rebuilds
+  stay rare — cuts the host round-trips by `block_size`× and lets MLX fuse the
+  step. A fixed-list NVE micro-loop showed the ceiling: per-step sync caps 4k at
+  ~3.2k steps/s, while syncing once per ~50 steps reaches ~9k.
+- **The residual gap to OpenMM is structural.** OpenMM throughput is nearly flat
+  (24k → 3.2k steps/s, ~7.5× for a 50× size increase); MLX goes 1966 → 102 (~19×).
+  OpenMM keeps the *entire* step on-device (fused tile kernels, neighbor list on
+  device, no host round-trip). MLX still rebuilds the neighbor list on the host
+  (`argwhere` compaction), which is ~60–75% of the remaining wall time at scale and
+  forces a host sync per block.
+- The next closure lever is therefore an **on-device neighbor rebuild** — a Metal
+  pair-emitter kernel (`mx.fast.metal_kernel` exists) to eliminate the host
+  `argwhere` compaction the `mlx_cell_pairs` path still uses — plus reducing the
+  per-step Langevin RNG cost inside the block.
 
 ### Energy-conservation note (why these numbers are trustworthy)
 
@@ -141,8 +150,14 @@ post-fix: every MLX run completed with finite, bounded energy drift.
 
 ```bash
 uv run python scripts/run_same_workload_lj_scaling.py \
-  --sizes 1000,4000,16000,50000 --steps 3000,2000,800,300
+  --sizes 1000,4000,16000,50000 --steps 3000,2000,800,300 \
+  --block-size 16 --neighbor-skin 1.2
 ```
+
+(`--block-size 1` reproduces the per-step baseline; `--block-size 16
+--neighbor-skin 1.2` is the batched fast path reported above. Both are the same
+physics — the batched path matches the per-step trajectory to floating-point
+precision.)
 
 Raw per-engine JSON and the aggregated `summary.json` are written under the
 gitignored `results/same-workload-lj-scaling/`. The MLX command stays in the

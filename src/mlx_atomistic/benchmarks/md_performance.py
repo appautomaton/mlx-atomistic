@@ -330,6 +330,7 @@ def run_synthetic_case(
     evaluation_interval: int = 25,
     neighbor_check_interval: int = 1,
     neighbor_skin: float = 0.4,
+    block_size: int = 1,
     temperature: float = 1.0,
     friction: float = 0.5,
     density: float = 0.8,
@@ -378,6 +379,7 @@ def run_synthetic_case(
         diagnostic_interval=diagnostic_interval,
         evaluation_interval=evaluation_interval,
         compile_force_evaluator=neighbor_manager is None,
+        block_size=block_size,
     )
     start = perf_counter()
     result = simulate_nvt(
@@ -699,6 +701,7 @@ def build_payload(
     include_atp: bool = False,
     prepared: Path | None = None,
     constraint_max_iterations: int = 4,
+    block_size: int = 1,
 ) -> dict:
     """Run the selected benchmark cases and return a payload."""
 
@@ -715,6 +718,7 @@ def build_payload(
                 evaluation_interval=evaluation_interval,
                 neighbor_check_interval=neighbor_check_interval,
                 neighbor_skin=neighbor_skin,
+                block_size=block_size,
             )
             for size in sizes
         ]
@@ -799,6 +803,7 @@ def build_payload(
             "evaluation_interval": evaluation_interval,
             "neighbor_check_interval": neighbor_check_interval,
             "neighbor_skin": neighbor_skin,
+            "block_size": block_size,
             "replicas": replicas,
             "include_atp": include_atp,
             "prepared": str(prepared) if prepared is not None else None,
@@ -849,6 +854,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--evaluation-interval", type=int, default=25)
     parser.add_argument("--neighbor-check-interval", type=int, default=1)
     parser.add_argument("--neighbor-skin", type=float, default=0.4)
+    parser.add_argument("--block-size", type=int, default=1)
     parser.add_argument("--replicas", type=int, default=1)
     parser.add_argument("--include-atp", action="store_true")
     parser.add_argument("--prepared", type=Path, default=None)
@@ -871,6 +877,7 @@ def main(argv: list[str] | None = None) -> None:
         evaluation_interval=args.evaluation_interval,
         neighbor_check_interval=args.neighbor_check_interval,
         neighbor_skin=args.neighbor_skin,
+        block_size=args.block_size,
         replicas=args.replicas,
         include_atp=args.include_atp,
         prepared=args.prepared,
