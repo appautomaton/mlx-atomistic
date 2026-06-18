@@ -1,7 +1,14 @@
-"""Benchmark a small synthetic LAMMPS OpenCL/GPU MD run.
+"""Benchmark a synthetic LAMMPS OpenCL/GPU Lennard-Jones MD run.
 
 This is an opt-in reference-engine path. It keeps LAMMPS outside the product
-runtime while giving the benchmark harness a fail-soft OpenCL smoke command.
+runtime while giving the benchmark harness a real OpenCL throughput command for
+the same-workload LJ scaling ladder.
+
+Geometry is generated with the product's own ``fcc_lattice`` so the MLX and
+LAMMPS runs share identical particle counts, box, and initial positions at a
+matched reduced density. GPU engagement is verified by inspecting the LAMMPS log
+for the active ``lj/cut/gpu`` pair build; if it cannot be confirmed the run is
+reported as a CPU-only ``diagnostic`` rather than claimed as OpenCL.
 """
 
 from __future__ import annotations
@@ -11,6 +18,8 @@ import csv
 import json
 import math
 import platform as platform_module
+import re
+import tempfile
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -19,12 +28,17 @@ from typing import Any
 import numpy as np
 
 from mlx_atomistic.benchmarks import normalize_benchmark_payload
+from mlx_atomistic.initialize import fcc_lattice
 
 BENCHMARK_NAME = "lammps_opencl_reference"
 ENGINE = "lammps-reference"
 FIXTURE = "synthetic_lj_periodic"
 TIMING_METRIC = "steps_per_s"
 COMMAND = "uv run python scripts/benchmark_lammps_opencl.py"
+COMPARISON_OUTPUT_ROOT = "results/same-workload-lj-scaling"
+PAIR_STYLE = "lj/cut/gpu"
+CUTOFF = 2.5
+SKIN = 0.3
 
 
 def main() -> None:
@@ -48,7 +62,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             warmup_steps=args.warmup_steps,
             dt=args.dt,
             temperature=args.temperature,
-            spacing=args.spacing,
+            density=args.density,
             fixture=args.fixture,
             opencl_platform=args.opencl_platform,
             opencl_device=args.opencl_device,
@@ -68,7 +82,7 @@ def run_benchmark(
     warmup_steps: int,
     dt: float,
     temperature: float,
-    spacing: float,
+    density: float,
     fixture: str,
     opencl_platform: str,
     opencl_device: str,
@@ -91,39 +105,66 @@ def run_benchmark(
     if dt <= 0.0:
         msg = "dt must be positive"
         raise ValueError(msg)
-    if spacing <= 0.0:
-        msg = "spacing must be positive"
+    if density <= 0.0:
+        msg = "density must be positive"
         raise ValueError(msg)
 
-    lammps_class, lammps_version = _load_lammps()
-    positions, box_length = _lattice_positions(particles, spacing)
-    lmp = lammps_class(cmdargs=["-screen", "none", "-log", "none", "-nocite"])
-    try:
-        _configure_lammps(
-            lmp,
-            positions=positions,
-            box_length=box_length,
-            dt=dt,
-            temperature=temperature,
-            opencl_platform=opencl_platform,
-            opencl_device=opencl_device,
-            seed=seed,
+    positions, box_length = _fcc_positions(particles, density)
+    # LAMMPS needs the periodic box to comfortably exceed the ghost-atom cutoff.
+    if box_length <= 2.0 * (CUTOFF + SKIN):
+        msg = (
+            f"system too dense for cutoff: box={box_length:.3g} <= 2*(cutoff+skin)="
+            f"{2.0 * (CUTOFF + SKIN):.3g}; increase particles or decrease density"
         )
-        if warmup_steps:
-            lmp.command(f"run {warmup_steps} post no")
-        start = time.perf_counter()
-        lmp.command(f"run {steps} post no")
-        wall_s = time.perf_counter() - start
-        potential_energy = _extract_lammps_value(lmp, "pe")
-        kinetic_energy = _extract_lammps_value(lmp, "ke")
+        raise RuntimeError(msg)
+
+    lammps_class, lammps_version = _load_lammps()
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as handle:
+        log_path = handle.name
+    try:
+        lmp = lammps_class(cmdargs=["-screen", "none", "-log", log_path, "-nocite"])
+        try:
+            _configure_box(lmp, box_length=box_length, opencl_platform=opencl_platform)
+            created = int(
+                lmp.create_atoms(
+                    int(positions.shape[0]),
+                    None,
+                    [1] * int(positions.shape[0]),
+                    positions.flatten().tolist(),
+                )
+            )
+            _configure_interactions(lmp, dt=dt, temperature=temperature, seed=seed)
+            if warmup_steps:
+                lmp.command(f"run {warmup_steps} post no")
+            start = time.perf_counter()
+            lmp.command(f"run {steps} post no")
+            wall_s = time.perf_counter() - start
+            potential_energy = _extract_lammps_value(lmp, "pe")
+            kinetic_energy = _extract_lammps_value(lmp, "ke")
+            natoms = int(lmp.get_natoms())
+        finally:
+            with suppress(Exception):
+                lmp.close()
+        gpu = _inspect_gpu_log(log_path)
     finally:
-        with suppress(Exception):
-            lmp.close()
+        with suppress(OSError):
+            Path(log_path).unlink()
+
+    if created != particles or natoms != particles:
+        msg = f"atom-count mismatch: requested {particles}, created {created}, present {natoms}"
+        raise RuntimeError(msg)
 
     steps_per_s = steps / wall_s if wall_s > 0.0 else 0.0
     simulated_time = steps * dt
+    gpu_active = gpu["gpu_pair_style_active"]
+    status = "ok" if gpu_active else "diagnostic"
+    blocker = (
+        None
+        if gpu_active
+        else "GPU pair style lj/cut/gpu not confirmed active in LAMMPS log; possible CPU fallback"
+    )
     return {
-        "status": "ok",
+        "status": status,
         "engine": ENGINE,
         "benchmark_name": BENCHMARK_NAME,
         "fixture": FIXTURE,
@@ -134,8 +175,8 @@ def run_benchmark(
             "opencl_platform": opencl_platform,
             "opencl_device": None,
             "requested_opencl_device": opencl_device,
-            "opencl_device_applied": False,
-            "pair_style": "lj/cut/gpu",
+            "opencl_device_applied": gpu_active,
+            "pair_style": PAIR_STYLE,
         },
         "lammps_version": lammps_version,
         "particles": particles,
@@ -150,18 +191,25 @@ def run_benchmark(
         "opencl_platform": opencl_platform,
         "opencl_device": None,
         "requested_opencl_device": opencl_device,
-        "opencl_device_applied": False,
+        "opencl_device_applied": gpu_active,
+        "gpu_pair_style_active": gpu_active,
+        "neighbor_build_on_host": gpu["neighbor_build_on_host"],
+        "gpu_log_excerpt": gpu["excerpt"],
+        "density_lj": density,
         "temperature_lj": temperature,
-        "spacing_lj": spacing,
         "box_length_lj": box_length,
         "potential_energy_lj": potential_energy,
         "kinetic_energy_lj": kinetic_energy,
+        "comparison_role": "lammps",
+        "comparison_metric_family": "steps/s",
+        "comparison_command": COMMAND,
+        "comparison_raw_output_path": f"{COMPARISON_OUTPUT_ROOT}/lammps-lj-N{particles}.json",
         "finite": bool(
             math.isfinite(steps_per_s)
             and math.isfinite(potential_energy)
             and math.isfinite(kinetic_energy)
         ),
-        "blocker": None,
+        "blocker": blocker,
     }
 
 
@@ -175,16 +223,11 @@ def _load_lammps() -> tuple[Any, str]:
     return lammps, str(lammps_version)
 
 
-def _configure_lammps(
+def _configure_box(
     lmp: Any,
     *,
-    positions: np.ndarray,
     box_length: float,
-    dt: float,
-    temperature: float,
     opencl_platform: str,
-    opencl_device: str,
-    seed: int,
 ) -> None:
     commands = [
         "clear",
@@ -199,12 +242,19 @@ def _configure_lammps(
     ]
     for command in commands:
         lmp.command(command)
-    for x, y, z in positions:
-        lmp.command(f"create_atoms 1 single {x:.12g} {y:.12g} {z:.12g} units box")
+
+
+def _configure_interactions(
+    lmp: Any,
+    *,
+    dt: float,
+    temperature: float,
+    seed: int,
+) -> None:
     for command in (
-        "pair_style lj/cut/gpu 2.5",
+        f"pair_style {PAIR_STYLE} {CUTOFF:.12g}",
         "pair_coeff 1 1 1.0 1.0 2.5",
-        "neighbor 0.3 bin",
+        f"neighbor {SKIN:.12g} bin",
         "neigh_modify every 1 delay 0 check yes",
         f"velocity all create {temperature:.12g} {seed} mom yes rot no dist gaussian",
         "fix integrate all nve",
@@ -214,23 +264,34 @@ def _configure_lammps(
         lmp.command(command)
 
 
-def _lattice_positions(particles: int, spacing: float) -> tuple[np.ndarray, float]:
-    side = int(np.ceil(particles ** (1.0 / 3.0)))
-    box_length = side * spacing
-    coords = []
-    for z in range(side):
-        for y in range(side):
-            for x in range(side):
-                coords.append(
-                    (
-                        (x + 0.5) * spacing,
-                        (y + 0.5) * spacing,
-                        (z + 0.5) * spacing,
-                    )
-                )
-                if len(coords) == particles:
-                    return np.asarray(coords, dtype=np.float64), box_length
-    raise RuntimeError("failed to generate lattice positions")
+def _fcc_positions(particles: int, density: float) -> tuple[np.ndarray, float]:
+    """Return FCC positions and the cubic box edge, matching MLX ``fcc_lattice``."""
+
+    positions, cell = fcc_lattice(particles, density=density)
+    box_length = float(np.asarray(cell.lengths, dtype=np.float64)[0])
+    coords = np.asarray(positions, dtype=np.float64)
+    return coords, box_length
+
+
+def _inspect_gpu_log(log_path: str) -> dict[str, Any]:
+    """Parse the LAMMPS log to confirm the GPU pair build engaged."""
+
+    try:
+        text = Path(log_path).read_text()
+    except OSError:
+        text = ""
+    gpu_pair_style_active = bool(re.search(r"pair\s+lj/cut/gpu,\s*perpetual", text))
+    neighbor_build_on_host = "does not support neighbor lists on device" in text
+    excerpt = [
+        line.strip()
+        for line in text.splitlines()
+        if re.search(r"GPU|OpenCL|lj/cut/gpu|package gpu|Device\b", line, re.I)
+    ]
+    return {
+        "gpu_pair_style_active": gpu_pair_style_active,
+        "neighbor_build_on_host": neighbor_build_on_host,
+        "excerpt": excerpt[:12],
+    }
 
 
 def _extract_lammps_value(lmp: Any, name: str) -> float:
@@ -255,7 +316,7 @@ def _blocked_payload(args: argparse.Namespace, *, blocker: str) -> dict[str, Any
             "opencl_device": None,
             "requested_opencl_device": args.opencl_device,
             "opencl_device_applied": False,
-            "pair_style": "lj/cut/gpu",
+            "pair_style": PAIR_STYLE,
         },
         "lammps_version": None,
         "particles": args.particles,
@@ -271,11 +332,18 @@ def _blocked_payload(args: argparse.Namespace, *, blocker: str) -> dict[str, Any
         "opencl_device": None,
         "requested_opencl_device": args.opencl_device,
         "opencl_device_applied": False,
+        "gpu_pair_style_active": False,
+        "neighbor_build_on_host": None,
+        "gpu_log_excerpt": [],
+        "density_lj": args.density,
         "temperature_lj": args.temperature,
-        "spacing_lj": args.spacing,
         "box_length_lj": None,
         "potential_energy_lj": None,
         "kinetic_energy_lj": None,
+        "comparison_role": "lammps",
+        "comparison_metric_family": "steps/s",
+        "comparison_command": COMMAND,
+        "comparison_raw_output_path": f"{COMPARISON_OUTPUT_ROOT}/lammps-lj-N{args.particles}.json",
         "finite": False,
         "blocker": blocker,
     }
@@ -323,7 +391,8 @@ def _format_human_payload(payload: dict[str, Any]) -> str:
             f"LAMMPS OpenCL {payload['particles']} atoms: blocked; "
             f"blocker={payload.get('blocker')}"
         )
-    return "LAMMPS OpenCL {particles} atoms: {steps_per_s:.1f} steps/s".format(**payload)
+    suffix = "" if payload.get("gpu_pair_style_active") else " (CPU diagnostic)"
+    return "LAMMPS OpenCL {particles} atoms: {steps_per_s:.1f} steps/s".format(**payload) + suffix
 
 
 def _write_csv(path: Path, payload: dict[str, Any]) -> None:
@@ -345,7 +414,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--spacing", type=float, default=1.2)
+    parser.add_argument("--density", type=float, default=0.8)
     parser.add_argument("--fixture", default=FIXTURE)
     parser.add_argument("--opencl-platform", default="0")
     parser.add_argument("--opencl-device", default="0")

@@ -1138,6 +1138,130 @@ def test_same_workload_comparison_summary_computes_only_comparable_ratios():
     assert rows["tip4p-ew-water"]["blocker"] == "missing MLX normalized row for pair"
 
 
+def _mlx_lj_case(*, atom_count, step_count, steps_per_s, status="ok"):
+    return {
+        "case": "synthetic_lj",
+        "status": status,
+        "timing_metric": "steps_per_s",
+        "timing_value": steps_per_s,
+        "atom_count": atom_count,
+        "step_count": step_count,
+        "command": "uv run python -m mlx_atomistic.benchmarks.md_performance",
+    }
+
+
+def _reference_lj_row(*, fixture, atom_count, step_count, steps_per_s, status="ok", blocker=None):
+    return {
+        "fixture": fixture,
+        "case": fixture,
+        "status": status,
+        "blocker": blocker,
+        "timing_metric": "steps_per_s",
+        "timing_value": steps_per_s,
+        "atom_count": atom_count,
+        "step_count": step_count,
+        "command": f"uv run python scripts/benchmark_{fixture}.py",
+    }
+
+
+def test_scaling_summary_pairs_ladder_by_size_and_computes_ratios():
+    mlx_payloads = [
+        {
+            "cases": [
+                _mlx_lj_case(atom_count=1000, step_count=500, steps_per_s=50.0),
+                _mlx_lj_case(atom_count=4000, step_count=500, steps_per_s=12.0),
+            ]
+        }
+    ]
+    openmm_payloads = [
+        _reference_lj_row(
+            fixture="synthetic_lj_periodic", atom_count=1000, step_count=500, steps_per_s=100.0
+        ),
+        _reference_lj_row(
+            fixture="synthetic_lj_periodic", atom_count=4000, step_count=500, steps_per_s=18.0
+        ),
+    ]
+    lammps_payloads = [
+        _reference_lj_row(
+            fixture="synthetic_lj_periodic", atom_count=1000, step_count=500, steps_per_s=200.0
+        ),
+        _reference_lj_row(
+            fixture="synthetic_lj_periodic",
+            atom_count=4000,
+            step_count=500,
+            steps_per_s=None,
+            status="diagnostic",
+            blocker="GPU pair style not confirmed active",
+        ),
+    ]
+
+    payload = same_workload_compare.build_scaling_summary(
+        mlx_payloads=mlx_payloads,
+        openmm_payloads=openmm_payloads,
+        lammps_payloads=lammps_payloads,
+    )
+
+    assert payload["benchmark_name"] == "same_workload_lj_scaling"
+    # The ladder must NOT collide on a single comparison_pair_id.
+    assert payload["size_count"] == 2
+    rows = {row["pair_id"]: row for row in payload["cases"]}
+    assert set(rows) == {"lj-synthetic@N=1000", "lj-synthetic@N=4000"}
+
+    small = rows["lj-synthetic@N=1000"]
+    assert small["comparison_status"] == "comparable"
+    assert small["openmm_to_mlx_ratio"] == 2.0
+    assert small["lammps_to_mlx_ratio"] == 4.0
+    assert small["mlx_steps_per_s"] == 50.0
+
+    large = rows["lj-synthetic@N=4000"]
+    assert large["comparison_status"] == "comparable"  # OpenMM is comparable
+    assert large["openmm_to_mlx_ratio"] == 1.5
+    # LAMMPS diagnostic at this size suppresses its ratio but does not block the row.
+    assert large["lammps_status"] == "diagnostic"
+    assert large["lammps_to_mlx_ratio"] is None
+
+
+def test_scaling_summary_mismatched_size_does_not_pair():
+    mlx_payloads = [{"cases": [_mlx_lj_case(atom_count=1000, step_count=500, steps_per_s=50.0)]}]
+    openmm_payloads = [
+        _reference_lj_row(
+            fixture="synthetic_lj_periodic", atom_count=2000, step_count=500, steps_per_s=99.0
+        )
+    ]
+
+    payload = same_workload_compare.build_scaling_summary(
+        mlx_payloads=mlx_payloads,
+        openmm_payloads=openmm_payloads,
+    )
+
+    rows = {row["pair_id"]: row for row in payload["cases"]}
+    assert set(rows) == {"lj-synthetic@N=1000", "lj-synthetic@N=2000"}
+    # MLX-only size: reference missing, no spurious ratio.
+    assert rows["lj-synthetic@N=1000"]["comparison_status"] == "blocked"
+    assert rows["lj-synthetic@N=1000"]["openmm_to_mlx_ratio"] is None
+    # OpenMM-only size: no MLX row, blocked.
+    assert rows["lj-synthetic@N=2000"]["comparison_status"] == "blocked"
+
+
+def test_scaling_summary_nonpositive_reference_is_diagnostic():
+    mlx_payloads = [{"cases": [_mlx_lj_case(atom_count=1000, step_count=500, steps_per_s=50.0)]}]
+    openmm_payloads = [
+        _reference_lj_row(
+            fixture="synthetic_lj_periodic", atom_count=1000, step_count=500, steps_per_s=0.0
+        )
+    ]
+
+    payload = same_workload_compare.build_scaling_summary(
+        mlx_payloads=mlx_payloads,
+        openmm_payloads=openmm_payloads,
+    )
+
+    row = {r["pair_id"]: r for r in payload["cases"]}["lj-synthetic@N=1000"]
+    assert row["openmm_status"] == "diagnostic"
+    assert row["openmm_to_mlx_ratio"] is None
+    assert row["comparison_status"] == "diagnostic"
+
+
 def test_same_workload_comparison_controlled_pairs_require_matching_operations():
     mlx_payloads = [
         {

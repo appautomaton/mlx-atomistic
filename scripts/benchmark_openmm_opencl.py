@@ -209,6 +209,11 @@ def run_benchmark(
 
     start = time.perf_counter()
     integrator.step(steps)
+    # OpenCL enqueues integration kernels asynchronously, so step() can return
+    # before the GPU has done the work. Force the queue to drain inside the timed
+    # region (getEnergy requires all forces computed) so wall_s reflects real
+    # compute rather than just kernel enqueue.
+    context.getState(getEnergy=True)
     wall_s = time.perf_counter() - start
 
     state = context.getState(getEnergy=True, getPositions=True, getVelocities=True)

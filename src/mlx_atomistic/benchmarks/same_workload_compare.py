@@ -327,18 +327,231 @@ def _command(row: dict[str, Any]) -> str | None:
     return row.get("comparison_command") or row.get("command")
 
 
+# --- LJ scaling-ladder comparison (production-size, multi-engine) ---
+#
+# The semantic pairs above (gbsa/tip4p/dhfr) match one MLX row to one OpenMM row
+# by a fixed pair id with workload-specific parity gates. The LJ scaling ladder
+# is a different shape: it pairs a *sweep* of synthetic-LJ sizes across up to
+# three engines (MLX, OpenMM, LAMMPS) by matching (atom_count, step_count). It
+# lives in its own builder so the delicate semantic-parity machinery above stays
+# untouched, and so LAMMPS -- which has no gbsa/tip4p analog -- only ever enters
+# through this LJ path.
+
+SCALING_BENCHMARK_NAME = "same_workload_lj_scaling"
+SCALING_ENGINE = "mlx-reference-scaling-comparison"
+SCALING_OUTPUT_ROOT = "results/same-workload-lj-scaling"
+SCALING_METRIC = "steps_per_s"
+
+_MLX_LJ_CASES = {"synthetic_lj"}
+_OPENMM_LJ_KEYS = {"synthetic-lj-periodic", "synthetic_lj_periodic"}
+_LAMMPS_LJ_KEYS = {"synthetic_lj_periodic", "synthetic-lj-periodic"}
+
+
+def _row_workload_key(row: dict[str, Any]) -> str:
+    return str(row.get("case") or row.get("fixture") or row.get("system") or "")
+
+
+def _row_is_lj_synthetic(row: dict[str, Any], *, role: str) -> bool:
+    if role == "mlx":
+        return row.get("case") in _MLX_LJ_CASES
+    if role == "openmm":
+        return _row_workload_key(row) in _OPENMM_LJ_KEYS
+    if role == "lammps":
+        return _row_workload_key(row) in _LAMMPS_LJ_KEYS
+    return False
+
+
+def _scaling_size_key(row: dict[str, Any]) -> tuple[int, int] | None:
+    try:
+        return (int(row.get("atom_count")), int(row.get("step_count")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _scaling_timing(row: dict[str, Any] | None) -> Any:
+    if row is None:
+        return None
+    value = row.get("timing_value")
+    return value if value is not None else row.get(SCALING_METRIC)
+
+
+def _scaling_selection_rank(row: dict[str, Any]) -> tuple[int, int]:
+    ok = 0 if row.get("status") == "ok" else 1
+    finite = 0 if _positive_number(_scaling_timing(row)) else 1
+    return (ok, finite)
+
+
+def _index_scaling_rows(
+    payloads: list[dict[str, Any]],
+    *,
+    role: str,
+) -> dict[tuple[int, int], dict[str, Any]]:
+    rows: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in _payload_rows(payloads):
+        if not isinstance(row, dict) or not _row_is_lj_synthetic(row, role=role):
+            continue
+        key = _scaling_size_key(row)
+        if key is None:
+            continue
+        current = rows.get(key)
+        if current is None or _scaling_selection_rank(row) < _scaling_selection_rank(current):
+            rows[key] = row
+    return rows
+
+
+def _scaling_reference(
+    role: str,
+    mlx_row: dict[str, Any] | None,
+    ref_row: dict[str, Any] | None,
+) -> tuple[str, float | None, str | None]:
+    """Classify one reference engine against MLX for a single ladder size."""
+
+    if ref_row is None:
+        return "blocked", None, f"missing {role} row for this size"
+    ref_status = ref_row.get("status")
+    if ref_status == "diagnostic":
+        return "diagnostic", None, f"{role} status is diagnostic: {_row_reason(ref_row)}"
+    if ref_status != "ok":
+        return "blocked", None, f"{role} status is {ref_status}: {_row_reason(ref_row)}"
+    if mlx_row is None or mlx_row.get("status") != "ok":
+        return "blocked", None, "MLX row missing or not ok for this size"
+    mlx_value = _scaling_timing(mlx_row)
+    ref_value = _scaling_timing(ref_row)
+    if not _positive_number(mlx_value) or not _positive_number(ref_value):
+        return "diagnostic", None, "timing values missing or non-positive; ratio suppressed"
+    return "comparable", float(ref_value) / float(mlx_value), None
+
+
+def _scaling_row(
+    key: tuple[int, int],
+    mlx_row: dict[str, Any] | None,
+    openmm_row: dict[str, Any] | None,
+    lammps_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    atom_count, step_count = key
+    openmm_status, openmm_ratio, openmm_blocker = _scaling_reference("openmm", mlx_row, openmm_row)
+    lammps_status, lammps_ratio, lammps_blocker = _scaling_reference("lammps", mlx_row, lammps_row)
+    sub_statuses = (openmm_status, lammps_status)
+    if mlx_row is None or mlx_row.get("status") != "ok":
+        comparison_status = "blocked"
+    elif "comparable" in sub_statuses:
+        comparison_status = "comparable"
+    elif "diagnostic" in sub_statuses:
+        comparison_status = "diagnostic"
+    else:
+        comparison_status = "blocked"
+    pair_id = f"lj-synthetic@N={atom_count}"
+    row = {
+        "pair_id": pair_id,
+        "workload": "lj-synthetic-scaling",
+        "fixture": pair_id,
+        "system": pair_id,
+        "atom_count": atom_count,
+        "step_count": step_count,
+        "metric_family": "steps/s",
+        "mlx_status": None if mlx_row is None else mlx_row.get("status"),
+        "mlx_steps_per_s": _scaling_timing(mlx_row),
+        "mlx_command": None if mlx_row is None else _command(mlx_row),
+        "openmm_status": openmm_status,
+        "openmm_steps_per_s": _scaling_timing(openmm_row),
+        "openmm_to_mlx_ratio": openmm_ratio,
+        "openmm_command": None if openmm_row is None else _command(openmm_row),
+        "lammps_status": lammps_status,
+        "lammps_steps_per_s": _scaling_timing(lammps_row),
+        "lammps_to_mlx_ratio": lammps_ratio,
+        "lammps_command": None if lammps_row is None else _command(lammps_row),
+        "comparison_status": comparison_status,
+        "blocker": openmm_blocker or lammps_blocker,
+        "ratio_direction": (
+            "ratio = reference_steps_per_s / mlx_steps_per_s; "
+            ">1 means the reference engine runs more steps/s (the MLX gap)"
+        ),
+    }
+    return normalize_benchmark_row(
+        row,
+        benchmark_name=SCALING_BENCHMARK_NAME,
+        timing_metric="openmm_to_mlx_ratio",
+        engine=SCALING_ENGINE,
+        fixture=pair_id,
+        status="ok" if comparison_status == "comparable" else comparison_status,
+        blocker=row["blocker"],
+    )
+
+
+def build_scaling_summary(
+    *,
+    mlx_payloads: list[dict[str, Any]],
+    openmm_payloads: list[dict[str, Any]] | None = None,
+    lammps_payloads: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the LJ size-ladder MLX-vs-reference scaling comparison.
+
+    Synthetic-LJ rows from each engine are matched by ``(atom_count,
+    step_count)``, so a sweep of sizes pairs cleanly without colliding on a
+    single ``comparison_pair_id``. Ratios are only computed for sizes where MLX
+    and the reference engine both ran ``ok`` at the same particle/step count.
+    """
+
+    mlx_rows = _index_scaling_rows(mlx_payloads, role="mlx")
+    openmm_rows = _index_scaling_rows(openmm_payloads or [], role="openmm")
+    lammps_rows = _index_scaling_rows(lammps_payloads or [], role="lammps")
+    keys = sorted(set(mlx_rows) | set(openmm_rows) | set(lammps_rows))
+    cases = [
+        _scaling_row(key, mlx_rows.get(key), openmm_rows.get(key), lammps_rows.get(key))
+        for key in keys
+    ]
+    hardware = get_hardware_info()
+    runtime = asdict(get_runtime_info())
+    payload = {
+        "benchmark_name": SCALING_BENCHMARK_NAME,
+        "fixture": "lj_synthetic_scaling",
+        "hardware": hardware,
+        "runtime": runtime,
+        "size_count": len(cases),
+        "comparable_count": sum(row["comparison_status"] == "comparable" for row in cases),
+        "diagnostic_count": sum(row["comparison_status"] == "diagnostic" for row in cases),
+        "blocked_count": sum(row["comparison_status"] == "blocked" for row in cases),
+        "atom_counts": [row["atom_count"] for row in cases],
+        "cases": cases,
+    }
+    return normalize_benchmark_payload(
+        payload,
+        benchmark_name=SCALING_BENCHMARK_NAME,
+        fixture="lj_synthetic_scaling",
+        timing_metric="reference_to_mlx_ratio",
+        hardware=hardware,
+        runtime=runtime,
+        engine=SCALING_ENGINE,
+        finite=all(row["comparison_status"] != "failed" for row in cases),
+        command="uv run python -m mlx_atomistic.benchmarks.same_workload_compare --scaling",
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mlx-json", type=Path, action="append", default=[])
     parser.add_argument("--openmm-json", type=Path, action="append", default=[])
+    parser.add_argument("--lammps-json", type=Path, action="append", default=[])
     parser.add_argument("--out", type=Path)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--scaling",
+        action="store_true",
+        help="LJ size-ladder comparison across MLX, OpenMM, and LAMMPS",
+    )
     args = parser.parse_args(argv)
 
-    payload = build_summary(
-        mlx_payloads=load_json_payloads(args.mlx_json),
-        openmm_payloads=load_json_payloads(args.openmm_json),
-    )
+    if args.scaling:
+        payload = build_scaling_summary(
+            mlx_payloads=load_json_payloads(args.mlx_json),
+            openmm_payloads=load_json_payloads(args.openmm_json),
+            lammps_payloads=load_json_payloads(args.lammps_json),
+        )
+    else:
+        payload = build_summary(
+            mlx_payloads=load_json_payloads(args.mlx_json),
+            openmm_payloads=load_json_payloads(args.openmm_json),
+        )
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(payload, indent=2, sort_keys=True))
