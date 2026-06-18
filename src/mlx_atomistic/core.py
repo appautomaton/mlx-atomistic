@@ -132,8 +132,24 @@ class Cell:
         return as_mx_array(fractional) @ self.matrix
 
     def wrap(self, positions: mx.array) -> mx.array:
-        """Wrap positions back into the periodic cell."""
+        """Wrap positions back into the periodic cell.
 
+        For orthorhombic cells this subtracts an integer number of box lengths
+        directly (``x - L*floor(x/L)``) instead of round-tripping through
+        fractional coordinates. The round-trip form ``(x/L - floor(x/L))*L`` is
+        algebraically identical but, in float32, does not return a position that
+        is exactly ``x`` minus an integer multiple of ``L`` -- it nudges atoms
+        near a cell boundary by up to ~1e-2. Applied every MD step that spurious
+        displacement does work against the forces and injects energy, breaking
+        energy conservation over long runs (invisible in short-run tests). The
+        direct form keeps the wrap a pure lattice translation, consistent with
+        :meth:`minimum_image` below.
+        """
+
+        positions = as_mx_array(positions)
+        if self.is_orthorhombic:
+            lengths = mx.diag(self.matrix)
+            return positions - lengths * mx.floor(positions / lengths)
         fractional = self.fractional_coordinates(positions)
         return self.cartesian_coordinates(fractional - mx.floor(fractional))
 

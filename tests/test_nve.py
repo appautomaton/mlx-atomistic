@@ -1,8 +1,36 @@
 import numpy as np
 
 from mlx_atomistic.core import Cell
+from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate, simulate_nve
 from mlx_atomistic.neighbors import NeighborListManager
+
+
+def test_simulate_nve_conserves_energy_over_long_run():
+    # Regression: a dense periodic LJ fluid must conserve energy under NVE.
+    # Cell.wrap used a float32 fractional round-trip that nudged boundary atoms
+    # each step, injecting energy until the run diverged to NaN within a few
+    # thousand steps. The other NVE tests only run 5 steps and cannot see it;
+    # integrate long enough to expose any per-step energy injection.
+    positions, cell = fcc_lattice(256, density=0.8)
+    velocities = thermal_velocities(256, temperature=1.0, seed=11)
+    result = simulate_nve(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=LennardJonesPotential(cutoff=2.5),
+        config=SimulationConfig(
+            dt=0.002,
+            steps=800,
+            sample_interval=800,
+            diagnostic_interval=800,
+            evaluation_interval=25,
+        ),
+    )
+    energy = np.array(result.total_energy)
+    assert np.isfinite(energy).all()
+    relative_drift = abs(float(energy[-1]) - float(energy[0])) / abs(float(energy[0]))
+    assert relative_drift < 5e-3, f"NVE energy drifted {relative_drift:.4f} over 800 steps"
 
 
 def test_neighbor_manager_rebuild_threshold():
