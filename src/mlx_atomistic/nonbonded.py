@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell
+from mlx_atomistic.neighbors import DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND
 from mlx_atomistic.topology import Topology
 
 NonbondedBackend = Literal["auto", "mlx_dense", "mlx_tiled", "mlx_pairs", "python_neighbor"]
@@ -454,9 +455,11 @@ def choose_full_loop_nonbonded_policy(
 ) -> FullLoopNonbondedPolicy:
     """Choose the default nonbonded policy for a complete MD loop.
 
-    The default is based on S1/S2 full-loop and staged-neighbor evidence: use
-    dynamic fixed-shape neighbor blocks when periodic cutoff semantics make
-    that path safe, while preserving explicit dense and fallback modes.
+    The default is based on S1/S2 full-loop and staged-neighbor evidence: above
+    the dense threshold use a dynamic neighbor list with compacted pairs
+    (`mlx_cell_pairs`), which is measured to dominate the padded-block path at
+    every tested scale (see `DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND`), while
+    preserving explicit dense and fallback modes.
     """
 
     concrete_mode = validate_full_loop_nonbonded_mode(mode)
@@ -504,10 +507,10 @@ def choose_full_loop_nonbonded_policy(
             mode=concrete_mode,
             use_neighbor_list=True,
             potential_backend="mlx_pairs",
-            selected_backend="dynamic-neighbor+mlx_cell_blocks",
+            selected_backend=f"dynamic-neighbor+{DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND}",
             selected_policy=policy,
             evidence=evidence,
-            neighbor_backend="mlx_cell_blocks",
+            neighbor_backend=DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND,
         )
 
     blocker = None

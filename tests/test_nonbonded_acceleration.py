@@ -464,7 +464,7 @@ def test_lazy_large_periodic_nonbonded_refuses_dense_fallback_and_reports_compac
     assert result.nonbonded_report["force_evaluation_wall_seconds"] >= 0.0
 
 
-def test_auto_neighbor_backend_selects_mlx_cell_blocks_above_dense_limit():
+def test_auto_neighbor_backend_selects_mlx_cell_pairs_above_dense_limit():
     positions = as_mx_array(
         [
             [0.1, 0.1, 0.1],
@@ -501,10 +501,10 @@ def test_auto_neighbor_backend_selects_mlx_cell_blocks_above_dense_limit():
         config=SimulationConfig(steps=1, diagnostic_interval=1),
     )
 
-    assert result.nonbonded_report["backend"] == "mlx_cell_blocks"
-    assert result.nonbonded_report["representation_kind"] == "blocks"
+    assert result.nonbonded_report["backend"] == "mlx_cell_pairs"
+    assert result.nonbonded_report["representation_kind"] == "pairs"
     assert result.nonbonded_report["candidate_count"] is not None
-    assert result.nonbonded_report["compaction_backend"] is None
+    assert result.nonbonded_report["compaction_backend"] == "cpu_argwhere"
     assert result.nonbonded_report["fallback_reason"] is None
     assert result.nonbonded_report["neighbor_update_wall_seconds"] >= 0.0
     assert result.nonbonded_report["neighbor_rebuild_wall_seconds"] >= 0.0
@@ -684,8 +684,8 @@ def test_full_loop_auto_policy_selects_dynamic_neighbor_from_evidence():
     )
     assert large.use_neighbor_list is True
     assert large.potential_backend == "mlx_pairs"
-    assert large.selected_backend == "dynamic-neighbor+mlx_cell_blocks"
-    assert large.neighbor_backend == "mlx_cell_blocks"
+    assert large.selected_backend == "dynamic-neighbor+mlx_cell_pairs"
+    assert large.neighbor_backend == "mlx_cell_pairs"
     assert large.selected_policy == "auto:evidence_dynamic_neighbor; dense_threshold:1536"
     assert large.evidence == "s1_s2_s3_full_loop_policy_evidence"
     assert large.blocker is None
@@ -864,7 +864,7 @@ def test_md_performance_neighbor_policy_knobs_are_reported():
     )
 
     case = payload["cases"][0]
-    assert case["backend"] == "dynamic-neighbor+mlx_cell_blocks"
+    assert case["backend"] == "dynamic-neighbor+mlx_cell_pairs"
     assert case["finite"] is True
     assert payload["config"]["neighbor_check_interval"] == 20
     assert payload["config"]["neighbor_skin"] == 1.0
@@ -886,10 +886,10 @@ def test_md_performance_auto_default_routes_2000_to_dynamic_neighbor():
         neighbor_check_interval=1,
     )
 
-    assert result.backend == "dynamic-neighbor+mlx_cell_blocks"
+    assert result.backend == "dynamic-neighbor+mlx_cell_pairs"
     assert result.selected_policy == "auto:evidence_dynamic_neighbor; dense_threshold:1536"
-    assert result.selected_representation == "blocks"
-    assert result.compaction_backend is None
+    assert result.selected_representation == "pairs"
+    assert result.compaction_backend == "cpu_argwhere"
     assert result.neighbor_candidate_count is not None
     assert result.candidate_waste_count is not None
     assert result.candidate_waste_fraction is not None
@@ -948,7 +948,7 @@ def test_md_performance_dynamic_neighbor_mode_smoke():
         neighbor_check_interval=1,
     )
 
-    assert result.backend == "dynamic-neighbor+mlx_cell_blocks"
+    assert result.backend == "dynamic-neighbor+mlx_cell_pairs"
     assert result.final_pair_count > 0
     assert result.rebuild_count >= 1
     assert result.finite is True

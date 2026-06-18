@@ -37,6 +37,14 @@ _ALLOWED_NEIGHBOR_CHECK_BACKENDS = {"numpy", "mlx_scalar"}
 DEFAULT_MLX_DENSE_PAIR_LIMIT = 4096
 DEFAULT_MLX_CELL_PAIR_CANDIDATE_CHUNK = 1_000_000
 DEFAULT_MLX_CELL_BLOCK_SIZE = 256
+# Default neighbor backend for systems above the dense-pair limit. Measured on
+# M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
+# ("mlx_cell_pairs") beats the fixed-shape padded-block path ("mlx_cell_blocks")
+# by 5.9-7.1x in a managed loop (incl. rebuild) at identical physics (dE=0).
+# Host compaction scales near-linearly (50k build ~0.34s) and does not OOM, so
+# there is no scaling reason to prefer padded blocks. Blocks remain available as
+# an explicit backend for the future on-device fused path.
+DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND: NeighborBackend = "mlx_cell_pairs"
 _BOOL_BYTES = np.dtype(np.bool_).itemsize
 _FLOAT_BYTES = np.dtype(np.float32).itemsize
 _INT_BYTES = np.dtype(np.int32).itemsize
@@ -445,7 +453,7 @@ def build_neighbor_list(
         if positions_np.shape[0] <= max_mlx_dense_atoms:
             backend = "mlx_dense_pairs"
         else:
-            backend = "mlx_cell_blocks"
+            backend = DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND
     if backend == "mlx_dense_pairs":
         return _build_mlx_dense_pair_list(
             positions_np,

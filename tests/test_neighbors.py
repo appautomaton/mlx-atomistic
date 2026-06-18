@@ -361,7 +361,7 @@ def test_neighbor_list_manager_selects_mlx_dense_pairs_backend():
     assert manager.rebuild_count == 1
 
 
-def test_neighbor_list_manager_auto_selects_mlx_cell_blocks_above_dense_limit():
+def test_neighbor_list_manager_auto_selects_mlx_cell_pairs_above_dense_limit():
     rng = np.random.default_rng(9)
     positions = rng.uniform(0.0, 8.0, size=(16, 3)).astype(np.float32)
     cell = Cell.cubic(8.0)
@@ -381,13 +381,46 @@ def test_neighbor_list_manager_auto_selects_mlx_cell_blocks_above_dense_limit():
         backend="periodic_cell_list",
     )
 
-    assert neighbors.backend == "mlx_cell_blocks"
-    assert neighbors.representation_kind == "blocks"
-    assert neighbors.compaction_backend is None
-    assert {tuple(pair) for pair in np.asarray(oracle.pairs).tolist()} <= _block_pair_set(
-        neighbors
-    )
+    assert neighbors.backend == "mlx_cell_pairs"
+    assert neighbors.representation_kind == "pairs"
+    assert neighbors.compaction_backend == "cpu_argwhere"
+    assert {tuple(pair) for pair in np.asarray(oracle.pairs).tolist()} <= {
+        tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()
+    }
     assert manager.rebuild_count == 1
+
+
+def test_default_backend_switch_preserves_lj_physics():
+    """Regression lock for the production neighbor default.
+
+    Above the dense limit the default moved from ``mlx_cell_blocks`` (padded
+    candidate blocks) to ``mlx_cell_pairs`` (host-compacted real pairs) for
+    throughput. The two representations are the SAME physics -- masked
+    candidates contribute zero -- so the Lennard-Jones energy and forces must
+    agree. This locks "switching the neighbor backend is an optimization, not a
+    physics change". N=2048 (a full FCC box above the 1536 dense threshold)
+    exercises the production regime where the switch takes effect.
+    """
+    positions, cell = fcc_lattice(2048, density=0.8)
+    pos_np = np.asarray(positions, dtype=np.float32)
+    pos = mx.array(pos_np)
+    lj = LennardJonesPotential(cutoff=2.5)
+
+    nl_pairs = build_neighbor_list(
+        pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_pairs"
+    )
+    nl_blocks = build_neighbor_list(
+        pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_blocks"
+    )
+    assert nl_pairs.backend == "mlx_cell_pairs"
+    assert nl_blocks.backend == "mlx_cell_blocks"
+
+    e_pairs, f_pairs = lj.energy_forces(pos, cell, pairs=nl_pairs.interactions)
+    e_blocks, f_blocks = lj.energy_forces(pos, cell, pairs=nl_blocks.interactions)
+    mx.eval(e_pairs, f_pairs, e_blocks, f_blocks)
+
+    assert abs(float(e_pairs) - float(e_blocks)) < 1e-2
+    assert float(mx.max(mx.abs(f_pairs - f_blocks))) < 1e-3
 
 
 def test_neighbor_list_is_deterministic_when_periodic_offsets_alias():
