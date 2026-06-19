@@ -252,7 +252,14 @@ class NeighborListManager:
     cutoff: float
     skin: float = 0.3
     check_interval: int = 1
-    sort_pairs: bool = True
+    # Pair sorting is off by default in the MD loop: it is pure force-kernel
+    # locality, not correctness, and MLX scatter-add is insensitive to pair order.
+    # Measured on M5 Max (50k LJ, 2026-06-18): the per-rebuild np.lexsort of ~4.8M
+    # pairs is ~700ms and dominates the rebuild (~77%); disabling it ~2x'd 50k NVT
+    # throughput (68->134 steps/s) with energy identical to ULPs. Unsorted lists are
+    # still fully deterministic (same positions -> same array). Set True to restore
+    # canonical (i, j) ordering.
+    sort_pairs: bool = False
     max_workers: int | None = None
     backend: NeighborBackend = "auto"
     max_mlx_dense_atoms: int = DEFAULT_MLX_DENSE_PAIR_LIMIT

@@ -423,6 +423,44 @@ def test_default_backend_switch_preserves_lj_physics():
     assert float(mx.max(mx.abs(f_pairs - f_blocks))) < 1e-3
 
 
+def test_unsorted_pairs_are_physics_neutral_and_default_in_md_loop():
+    """Lock: dropping the per-rebuild pair sort is an optimization, not a physics change.
+
+    The MD-loop neighbor manager defaults to ``sort_pairs=False`` because the
+    per-rebuild ``np.lexsort`` of the compacted pair list dominates large-system
+    rebuilds (~77% of a 50k rebuild on M5 Max) while buying nothing: MLX
+    scatter-add is insensitive to pair order. Sorted and unsorted lists must
+    therefore hold the SAME pairs and yield identical Lennard-Jones energy and
+    forces (differences are summation-order ULPs). The unsorted list is still
+    deterministic (same positions -> same array), so reproducibility is preserved.
+    """
+    positions, cell = fcc_lattice(2048, density=0.8)
+    pos_np = np.asarray(positions, dtype=np.float32)
+    pos = mx.array(pos_np)
+    lj = LennardJonesPotential(cutoff=2.5)
+
+    # The MD loop must not pay for canonical pair ordering by default.
+    assert NeighborListManager(cell, cutoff=2.5).sort_pairs is False
+
+    sorted_nl = build_neighbor_list(
+        pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_pairs", sort_pairs=True
+    )
+    unsorted_nl = build_neighbor_list(
+        pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_pairs", sort_pairs=False
+    )
+    assert _neighbor_pair_set(sorted_nl) == _neighbor_pair_set(unsorted_nl)
+
+    e_sorted, f_sorted = lj.energy_forces(pos, cell, pairs=sorted_nl.interactions)
+    e_unsorted, f_unsorted = lj.energy_forces(pos, cell, pairs=unsorted_nl.interactions)
+    mx.eval(e_sorted, f_sorted, e_unsorted, f_unsorted)
+
+    # Identical pair sets => identical physics; residuals are float32 summation
+    # order from MLX's (atomically non-deterministic) scatter-add, same tolerance
+    # band as the cell_pairs-vs-cell_blocks lock above.
+    assert abs(float(e_sorted) - float(e_unsorted)) < 1e-2
+    assert float(mx.max(mx.abs(f_sorted - f_unsorted))) < 1e-3
+
+
 def test_neighbor_list_is_deterministic_when_periodic_offsets_alias():
     positions = np.array(
         [
