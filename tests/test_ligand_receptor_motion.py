@@ -13,6 +13,11 @@ NOTEBOOK_DIR = Path("notebooks/ligand-receptor-motion").resolve()
 if str(NOTEBOOK_DIR) not in sys.path:
     sys.path.insert(0, str(NOTEBOOK_DIR))
 
+# The notebook helpers import pandas (it ships only in the `viz` extra), which the
+# CI lanes do not install. Skip the whole module when pandas is absent so pytest
+# collection never fails on the helper imports below.
+pytest.importorskip("pandas")
+
 import helpers.mlx_real_md as mlx_real_md  # noqa: E402
 from helpers.mlx_real_md import (  # noqa: E402
     ensure_gpcrmd_mlx_bundle,

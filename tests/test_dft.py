@@ -307,6 +307,7 @@ def test_local_pseudopotential_force_zero_for_symmetric_uniform_density():
     np.testing.assert_allclose(force, [0.0, 0.0, 0.0], atol=1e-5)
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_upf_and_gth_parsers_capture_local_and_nonlocal_metadata():
     upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
     single_gth = read_gth("vendors/quantum-espresso/pseudo/C-q4.gth", element="C")
@@ -339,6 +340,7 @@ def test_upf_and_gth_parsers_capture_local_and_nonlocal_metadata():
         )
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_ion_collection_local_fields_are_finite_and_periodic():
     grid = RealSpaceGrid((4, 4, 4), [6.0, 6.0, 6.0])
     gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
@@ -352,6 +354,7 @@ def test_ion_collection_local_fields_are_finite_and_periodic():
     np.testing.assert_allclose(first_field, translated_field, atol=1e-6)
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_system_ions_default_electron_count_and_run_scf_for_gth_and_upf():
     gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
     upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
@@ -384,6 +387,7 @@ def test_dft_system_ions_default_electron_count_and_run_scf_for_gth_and_upf():
     assert "nonlocal_pseudopotential" in upf_result.energy_by_term
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_ion_local_force_matches_fixed_density_finite_difference():
     grid = RealSpaceGrid((6, 6, 6), [6.0, 6.0, 6.0])
     coordinates = np.array(grid.coordinates())
@@ -410,6 +414,7 @@ def test_ion_local_force_matches_fixed_density_finite_difference():
     np.testing.assert_allclose(force[1:], [0.0, 0.0], atol=2e-4)
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_upf_local_force_matches_fixed_density_finite_difference():
     grid = RealSpaceGrid((6, 6, 6), [8.0, 8.0, 8.0])
     coordinates = np.array(grid.coordinates())
@@ -436,6 +441,7 @@ def test_upf_local_force_matches_fixed_density_finite_difference():
     np.testing.assert_allclose(force[1:], [0.0, 0.0], atol=2e-4)
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_scf_total_energy_force_check_works_for_gth_ion_system():
     gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
     system = DFTSystem(

@@ -78,6 +78,7 @@ def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     )
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dhfr_readiness_reports_local_inputs_for_both_cases():
     implicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-implicit"])
     explicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"])
@@ -937,6 +938,7 @@ def test_openmm_dhfr_missing_inputs_report_normalized_blocker(tmp_path):
     assert payload["ns_per_day"] is None
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_openmm_dhfr_unavailable_platform_reports_blocked_json():
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_openmm_dhfr.py"
 
@@ -1644,6 +1646,7 @@ def test_m5max_reference_environment_probe_reports_reference_engines():
     assert "stale shebang" in payload["command_surface"]["lammps_console_script_policy"]
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_m5max_reference_lammps_classify_only_covers_official_cases():
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
 
@@ -1684,6 +1687,7 @@ def test_m5max_reference_lammps_classify_only_covers_official_cases():
         assert case["blocker"] == "classification only; benchmark not executed"
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_m5max_reference_openmm_dry_run_covers_named_systems():
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
 
@@ -1728,6 +1732,7 @@ def test_m5max_reference_openmm_dry_run_covers_named_systems():
         assert case["blocker"] == "dry run; benchmark not executed"
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_m5max_reference_openmm_run_path_invokes_executor(monkeypatch, tmp_path):
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_m5max_reference.py"
     spec = importlib.util.spec_from_file_location("benchmark_m5max_reference_under_test", script)
@@ -1879,6 +1884,7 @@ def test_dft_operator_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert csv_path.read_text().startswith("grid_shape,grid_points")
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_pseudopotential_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_pseudo.csv"
 
@@ -1905,6 +1911,7 @@ def test_dft_pseudopotential_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert csv_path.read_text().startswith("case,grid_shape")
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_geometry.csv"
 
@@ -1930,6 +1937,7 @@ def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert csv_path.read_text().startswith("case,grid_shape")
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_nonlocal_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_nonlocal.csv"
 

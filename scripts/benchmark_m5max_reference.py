@@ -496,7 +496,11 @@ def _build_lammps_case_record(
     spec = LAMMPS_CASES[case]
     input_script = bench_root / spec["input_script"]
     dependency_paths = [bench_root / path for path in spec["dependencies"]]
-    missing = [str(path.relative_to(repo_root)) for path in (input_script, *dependency_paths) if not path.exists()]
+    missing = [
+        str(path.relative_to(repo_root))
+        for path in (input_script, *dependency_paths)
+        if not path.exists()
+    ]
     styles = [_style_mapping(style) for style in spec["styles"]]
     acceleration_class = _acceleration_class(styles)
     work_dir = output_root / "lammps" / case / "work"
@@ -949,7 +953,10 @@ def _execute_lammps_case(record: dict[str, Any]) -> dict[str, Any]:
     record["returncode"] = result.returncode
     record["screen_output_path"] = str(screen_path.relative_to(repo_root))
     record["log_output_path"] = str(log_path.relative_to(repo_root))
-    text = _read_text(log_path) + "\n" + _read_text(screen_path) + "\n" + result.stdout + result.stderr
+    text = (
+        _read_text(log_path) + "\n" + _read_text(screen_path) + "\n"
+        + result.stdout + result.stderr
+    )
     loop = _parse_lammps_loop_time(text)
     if result.returncode != 0:
         failure_excerpt = _first_lammps_error_line(text)
@@ -976,7 +983,11 @@ def _execute_lammps_case(record: dict[str, Any]) -> dict[str, Any]:
         )
     else:
         loop_time_s, procs, steps, atoms = loop
-        status = "ok" if record["acceleration_classification"] == "full_gpu_opencl" else "diagnostic"
+        status = (
+            "ok"
+            if record["acceleration_classification"] == "full_gpu_opencl"
+            else "diagnostic"
+        )
         blocker = None
         if status == "diagnostic":
             blocker = f"{record['acceleration_classification']} case executed with caveats"
@@ -1014,7 +1025,8 @@ def _read_text(path: Path) -> str:
 
 def _parse_lammps_loop_time(text: str) -> tuple[float, int, int, int] | None:
     match = re.search(
-        r"Loop time of\s+([0-9.eE+-]+)\s+on\s+(\d+)\s+procs\s+for\s+(\d+)\s+steps\s+with\s+(\d+)\s+atoms",
+        r"Loop time of\s+([0-9.eE+-]+)\s+on\s+(\d+)\s+procs\s+for\s+"
+        r"(\d+)\s+steps\s+with\s+(\d+)\s+atoms",
         text,
     )
     if match is None:

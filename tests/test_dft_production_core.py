@@ -33,6 +33,7 @@ from mlx_atomistic.dft import (
 )
 
 
+@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_nonlocal_projector_operator_is_hermitian_and_matches_dense_reference():
     upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
     system = DFTSystem(
