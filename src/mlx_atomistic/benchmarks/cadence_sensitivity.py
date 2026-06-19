@@ -122,7 +122,7 @@ def build_payload(
     dense_threshold: int = DEFAULT_FULL_LOOP_DENSE_THRESHOLD,
     cadences: tuple[CadenceConfig, ...] = DEFAULT_CADENCES,
     neighbor_check_interval: int = 1,
-    neighbor_skin: float = 0.4,
+    neighbor_skin: float = 1.2,  # match md_performance: tuned reduced-units LJ skin
 ) -> dict:
     """Run cadence sensitivity cases and return a durable JSON payload."""
 
@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument("--neighbor-check-interval", type=int, default=1)
-    parser.add_argument("--neighbor-skin", type=float, default=0.4)
+    parser.add_argument("--neighbor-skin", type=float, default=1.2)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 

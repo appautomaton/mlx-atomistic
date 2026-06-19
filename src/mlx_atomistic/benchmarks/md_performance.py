@@ -329,8 +329,14 @@ def run_synthetic_case(
     diagnostic_interval: int | None = None,
     evaluation_interval: int = 25,
     neighbor_check_interval: int = 1,
-    neighbor_skin: float = 0.4,
+    # Skin 1.2 (reduced units) measured on M5 Max (50k LJ, 2026-06-19): a larger
+    # Verlet skin trades cheap extra pairs for far fewer expensive host rebuilds.
+    # Pareto-better than the old 0.4 for both the op-chain (+33%) and the fused
+    # kernel (+148%); matches the published same-workload-lj-scaling report. See
+    # memory/project_perf_levers_measured.md.
+    neighbor_skin: float = 1.2,
     block_size: int = 1,
+    use_fused_kernel: bool = False,
     temperature: float = 1.0,
     friction: float = 0.5,
     density: float = 0.8,
@@ -359,7 +365,9 @@ def run_synthetic_case(
         dense_threshold=dense_threshold,
     )
     backend: NonbondedBackend = policy.potential_backend
-    potential = LennardJonesPotential(cutoff=2.5, backend=backend)
+    potential = LennardJonesPotential(
+        cutoff=2.5, backend=backend, use_fused_kernel=use_fused_kernel
+    )
     neighbor_manager = (
         NeighborListManager(
             cell,
@@ -696,12 +704,13 @@ def build_payload(
     diagnostic_interval: int,
     evaluation_interval: int = 25,
     neighbor_check_interval: int = 1,
-    neighbor_skin: float = 0.4,
+    neighbor_skin: float = 1.2,  # see run_synthetic_case: rebuild-vs-pairs tradeoff
     replicas: int = 1,
     include_atp: bool = False,
     prepared: Path | None = None,
     constraint_max_iterations: int = 4,
     block_size: int = 1,
+    use_fused_kernel: bool = False,
 ) -> dict:
     """Run the selected benchmark cases and return a payload."""
 
@@ -853,8 +862,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--diagnostic-interval", type=int, default=100)
     parser.add_argument("--evaluation-interval", type=int, default=25)
     parser.add_argument("--neighbor-check-interval", type=int, default=1)
-    parser.add_argument("--neighbor-skin", type=float, default=0.4)
+    parser.add_argument("--neighbor-skin", type=float, default=1.2)
     parser.add_argument("--block-size", type=int, default=1)
+    parser.add_argument(
+        "--fused-lj",
+        action="store_true",
+        help="use the fused Metal LJ force kernel (neighbor path, orthorhombic cell)",
+    )
     parser.add_argument("--replicas", type=int, default=1)
     parser.add_argument("--include-atp", action="store_true")
     parser.add_argument("--prepared", type=Path, default=None)
@@ -878,6 +892,7 @@ def main(argv: list[str] | None = None) -> None:
         neighbor_check_interval=args.neighbor_check_interval,
         neighbor_skin=args.neighbor_skin,
         block_size=args.block_size,
+        use_fused_kernel=args.fused_lj,
         replicas=args.replicas,
         include_atp=args.include_atp,
         prepared=args.prepared,
