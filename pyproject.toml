@@ -86,6 +86,7 @@ markers = [
   "integration: multi-component end-to-end flow",
   "reference: requires an external reference engine (openmm/lammps); skipped if absent",
   "data: requires a heavy/gitignored dataset; skipped if absent",
+  "gpu: requires a Metal GPU; skipped if unavailable",
 ]
 
 [tool.ruff]

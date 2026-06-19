@@ -13,6 +13,7 @@ import numpy as np
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.metal_kernels import fused_lj_forces
 from mlx_atomistic.neighbors import (
     NeighborBlocks,
     NeighborList,
@@ -67,6 +68,7 @@ class LennardJonesPotential:
     memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
     name: str = "lj"
     supports_virial: bool = True
+    use_fused_kernel: bool = False
 
     def __post_init__(self) -> None:
         if self.cutoff is not None and self.cutoff <= 0.0:
@@ -133,6 +135,23 @@ class LennardJonesPotential:
         if self.topology is not None:
             filtered_pairs, scales = self._topology_pairs_and_scales(pairs)
             return self._pair_energy_forces(positions, filtered_pairs, cell, scales=scales)
+        if (
+            self.use_fused_kernel
+            and pairs is not None
+            and isinstance(pairs, mx.array)
+            and cell is not None
+            and cell.is_orthorhombic
+            and self.cutoff is not None
+        ):
+            return fused_lj_forces(
+                positions,
+                pairs,
+                mx.diag(cell.matrix),
+                epsilon=self.epsilon,
+                sigma=self.sigma,
+                cutoff=self.cutoff,
+                shift=self.shift,
+            )
         if pairs is not None:
             return self._pair_energy_forces(positions, pairs, cell)
 
