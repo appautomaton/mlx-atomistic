@@ -16,38 +16,39 @@ validation surfaces only; they never replace the MLX runtime path.
   targets unless a task explicitly moves that boundary.
 - Do not add heavyweight chemistry or ML helper packages without a concrete need.
 
-## Repository layout — bare repo + linked worktrees
+## Repository layout
 
-    mlx-atomistic/        container root — NOT a checkout (.git -> ./.bare)
-    ├── .bare/            the bare repository (objects + refs); read-mostly storage
-    ├── main/             worktree for the `main` branch   <- work happens here
-    └── vendors/          shared reference trees, untracked (scripts/fetch-vendors)
+    mlx-atomistic/        standard checkout and project root
+    ├── .git/             normal Git metadata
+    ├── src/              product package source
+    ├── tests/            pytest suite
+    ├── docs/             project and benchmark documentation
+    ├── results/          local generated outputs, gitignored
+    └── vendors/          local reference trees, gitignored
 
-- The container root has no working tree: `git status` there fatals by design.
-  Never edit, build, or run from it — only from inside a worktree.
-- `vendors/` exists once at the container root and is shared into each worktree
-  via a `vendors -> ../vendors` symlink (untracked).
+- Run Git, builds, tests, and edits from the repository root.
+- `results/` contains local generated benchmark/science outputs and stays
+  gitignored.
+- `vendors/` contains local reference source trees and stays read-mostly unless
+  a task explicitly moves that boundary.
 
 ## Worktree workflow
 
-One branch <-> one worktree <-> (typically) one agent or session. From inside any
-worktree:
+Use worktrees only when parallel branch isolation is worth the extra setup. From
+the repository root:
 
-    git worktree add ../feat-x -b feat/x       # new sibling worktree + branch
-    ln -s ../vendors ../feat-x/vendors          # share the reference trees
-    cd ../feat-x && uv venv --python 3.13 && uv sync --group dev
+    git worktree add ../mlx-atomistic-feat-x -b feat/x
+    ln -s ../mlx-atomistic/vendors ../mlx-atomistic-feat-x/vendors
+    cd ../mlx-atomistic-feat-x && uv venv --python 3.13 && uv sync --group dev
 
-Tear down with `git worktree remove ../feat-x` (never `rm -rf`). Each worktree
-carries its own `.venv` and its own committed copy of this file, so a branch's
-rules always travel with its checkout.
+Tear down with `git worktree remove ../mlx-atomistic-feat-x` (never `rm -rf`).
+Each worktree carries its own `.venv` and its own committed copy of this file.
 
 ## Multi-agent / parallel work
 
 - Instruction context is per-agent, resolved from each agent's worktree root.
-  Because this file is committed in-branch, every spun-up worktree materializes it
-  automatically and it dies with the worktree on teardown.
 - Isolate agents that edit files in parallel into their own worktrees so changes
-  never collide; merge back through the shared `.bare` history.
+  never collide; merge back through normal Git history.
 - Keep the `vendors/` reference-only boundary in every worktree.
 
 ## Communication
