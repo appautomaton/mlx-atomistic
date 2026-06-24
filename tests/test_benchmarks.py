@@ -1643,7 +1643,8 @@ def test_m5max_reference_environment_probe_reports_reference_engines():
     assert payload["command_surface"]["harness"].startswith(
         "uv run python scripts/benchmark_m5max_reference.py"
     )
-    assert "stale shebang" in payload["command_surface"]["lammps_console_script_policy"]
+    assert payload["command_surface"]["lammps_console_script"] == ".venv/bin/lmp"
+    assert "packaged executable" in payload["command_surface"]["lammps_console_script_policy"]
 
 
 @pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
