@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - "site/**"
+      - "src/**"
+      - "scripts/gen_api_docs.py"
+      - "pyproject.toml"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
 
@@ -27,10 +30,18 @@ jobs:
         working-directory: site
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      # Griffe statically parses src/ — no MLX install, so this runs on Linux.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+
+      - name: Generate API reference
+        working-directory: ${{ github.workspace }}
+        run: uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -43,7 +54,7 @@ jobs:
         run: npm run build
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site/dist
 
@@ -57,4 +68,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

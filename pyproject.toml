@@ -69,6 +69,12 @@ dev = [
   { include-group = "test" },
   { include-group = "reference" },
 ]
+# Docs tooling. Griffe statically parses the package source (no import, no MLX),
+# so the API-reference generator runs anywhere — including Linux Pages CI via
+# `uv run --no-project --with griffe`.
+docs = [
+  "griffe>=1.5",
+]
 
 [tool.uv]
 package = true

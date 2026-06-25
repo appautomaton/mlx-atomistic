@@ -1,117 +1,105 @@
-/* mlx-atomistic — 2026 palette: near-black dark, cyan accent, surgical gradients. */
+/* mlx-atomistic docs — Apple-Native (HIG) identity, light-first.
+   System font stack renders real SF Pro / SF Mono on Apple devices. */
 
 :root {
-  --accent: #06b6d4;
-  --accent-bright: #22d3ee;
-  --accent-deep: #0891b2;
-  --gradient-accent: linear-gradient(135deg, #22d3ee 0%, #7c3aed 100%);
-
-  --font-sans:
-    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
-  --font-mono:
-    "JetBrains Mono", "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas,
-    monospace;
-}
-
-/* ---------- Dark theme (primary, 2026 dev-tool default) ---------- */
-:root,
-[data-theme="dark"] {
-  --sl-color-bg: #0a0b0c;
-  --sl-color-bg-nav: #0a0b0c;
-  --sl-color-bg-sidebar: #0d0e10;
-  --sl-color-bg-inline-code: #15171b;
-  --sl-color-bg-input: #15171b;
-  --sl-color-bg-row: #121317;
-  --sl-color-bg-row-hover: #181a1f;
-
-  --sl-color-white: #fafafa;
-  --sl-color-gray-1: #e4e4e7;
-  --sl-color-gray-2: #a1a1aa;
-  --sl-color-gray-3: #71717a;
-  --sl-color-gray-4: #52525b;
-  --sl-color-gray-5: #3f3f46;
-  --sl-color-gray-6: #27272a;
-  --sl-color-gray-7: #18181b;
-
-  --sl-color-black: #0a0b0c;
-  --sl-color-accent: #22d3ee;
-  --sl-color-accent-text: #0a0b0c;
-  --sl-color-accent-low: rgba(34, 211, 238, 0.12);
-  --sl-color-accent-high: rgba(34, 211, 238, 0.28);
-
-  --sl-color-healing-1: #34d399;
-  --sl-color-healing-2: #059669;
-  --sl-color-admonition-tip: #22d3ee;
-  --sl-color-admonition-note: #71717a;
-  --sl-color-admonition-caution: #fbbf24;
-  --sl-color-admonition-danger: #f87171;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+    "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Monaco,
+    Consolas, monospace;
 
   --sl-font: var(--font-sans);
   --sl-font-mono: var(--font-mono);
-}
 
-/* ---------- Light theme (scientific, airy) ---------- */
-[data-theme="light"] {
-  --sl-color-bg: #fafafa;
-  --sl-color-bg-nav: #ffffff;
-  --sl-color-bg-sidebar: #ffffff;
-  --sl-color-bg-inline-code: #f4f4f5;
-  --sl-color-bg-input: #ffffff;
-  --sl-color-bg-row: #ffffff;
-  --sl-color-bg-row-hover: #f4f4f5;
-
-  --sl-color-white: #18181b;
-  --sl-color-gray-1: #18181b;
-  --sl-color-gray-2: #3f3f46;
-  --sl-color-gray-3: #52525b;
-  --sl-color-gray-4: #71717a;
-  --sl-color-gray-5: #a1a1aa;
-  --sl-color-gray-6: #d4d4d8;
-  --sl-color-gray-7: #e4e4e7;
-
-  --sl-color-black: #ffffff;
-  --sl-color-accent: #0891b2;
-  --sl-color-accent-text: #ffffff;
-  --sl-color-accent-low: rgba(8, 145, 178, 0.08);
-  --sl-color-accent-high: rgba(8, 145, 178, 0.22);
-
-  --sl-color-healing-1: #059669;
-  --sl-color-healing-2: #047857;
-  --sl-color-admonition-tip: #0891b2;
-  --sl-color-admonition-note: #52525b;
-  --sl-color-admonition-caution: #d97706;
-  --sl-color-admonition-danger: #dc2626;
-}
-
-/* Refined type scale for a scientific feel */
-:root {
-  --sl-text-xs: 0.75rem;
-  --sl-text-sm: 0.875rem;
+  /* Slightly tighter scientific type scale. */
   --sl-text-base: 0.9375rem;
-  --sl-text-lg: 1.0625rem;
-  --sl-text-xl: 1.25rem;
-  --sl-text-2xl: 1.5rem;
-  --sl-text-3xl: 2rem;
-  --sl-text-4xl: 2.5rem;
-  --sl-text-5xl: 3.25rem;
+  --sl-text-h1: clamp(2rem, 4vw, 2.75rem);
 }
 
-/* Border over shadow (2026 aesthetic) */
-.starlight-sidebar,
-.sl-card,
-.card {
-  border: 1px solid var(--sl-color-gray-7);
+/* ---------- Light theme (primary) ---------- */
+:root,
+[data-theme="light"] {
+  --sl-color-bg: #fbfbfd;
+  --sl-color-bg-nav: rgba(251, 251, 253, 0.8);
+  --sl-color-bg-sidebar: #fbfbfd;
+  --sl-color-bg-inline-code: #f0f0f3;
+  --sl-color-bg-input: #ffffff;
+
+  --sl-color-white: #1d1d1f;
+  --sl-color-gray-1: #1d1d1f;
+  --sl-color-gray-2: #424245;
+  --sl-color-gray-3: #6e6e73;
+  --sl-color-gray-4: #86868b;
+  --sl-color-gray-5: #d2d2d7;
+  --sl-color-gray-6: #e8e8ed;
+  --sl-color-gray-7: #f0f0f3;
+  --sl-color-black: #ffffff;
+
+  --sl-color-accent: #0071e3;
+  --sl-color-accent-low: rgba(0, 113, 227, 0.1);
+  --sl-color-accent-high: #0066cc;
+  --sl-color-text-accent: #0071e3;
+
+  --sl-color-hairline: #d2d2d7;
+  --sl-color-hairline-light: #e8e8ed;
+}
+
+/* ---------- Dark theme ---------- */
+[data-theme="dark"] {
+  --sl-color-bg: #000000;
+  --sl-color-bg-nav: rgba(10, 10, 11, 0.8);
+  --sl-color-bg-sidebar: #0a0a0b;
+  --sl-color-bg-inline-code: #1c1c1e;
+  --sl-color-bg-input: #161617;
+
+  --sl-color-white: #f5f5f7;
+  --sl-color-gray-1: #f5f5f7;
+  --sl-color-gray-2: #c7c7cc;
+  --sl-color-gray-3: #a1a1a6;
+  --sl-color-gray-4: #86868b;
+  --sl-color-gray-5: #2a2a2c;
+  --sl-color-gray-6: #1c1c1e;
+  --sl-color-gray-7: #161617;
+  --sl-color-black: #000000;
+
+  --sl-color-accent: #2997ff;
+  --sl-color-accent-low: rgba(41, 151, 255, 0.12);
+  --sl-color-accent-high: #4aa8ff;
+  --sl-color-text-accent: #2997ff;
+
+  --sl-color-hairline: #2a2a2c;
+  --sl-color-hairline-light: #1c1c1e;
+}
+
+body {
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tighter, Apple-like display headings. */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3 {
+  letter-spacing: -0.025em;
+  font-weight: 600;
+}
+
+/* Soft cards and code blocks — border over heavy shadow. */
+.card,
+.sl-card {
+  border: 1px solid var(--sl-color-hairline-light);
+  border-radius: 16px;
   box-shadow: none;
 }
 
-/* Accent link underline */
-.sl-link {
-  text-decoration-color: var(--sl-color-accent);
+:where(.expressive-code pre),
+.sl-markdown-content :not(pre) > code {
+  border-radius: 10px;
+}
+:where(.expressive-code pre) {
+  border: 1px solid var(--sl-color-hairline-light);
 }
 
-/* Code blocks: subtle border, no heavy shadow */
-:where(.expressive-code pre) {
-  border: 1px solid var(--sl-color-gray-7);
-  border-radius: 12px;
+/* Rounded, soft search input. */
+site-search button {
+  border-radius: 12px !important;
 }

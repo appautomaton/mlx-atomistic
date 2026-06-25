@@ -14,7 +14,7 @@ export default defineConfig({
         src: "./src/assets/logo.svg",
         replacesTitle: false,
       },
-      favicon: "./public/favicon.svg",
+      favicon: "/favicon.svg",
       social: [
         {
           icon: "github",
@@ -44,6 +44,11 @@ export default defineConfig({
         {
           label: "Project",
           items: [{ autogenerate: { directory: "project" } }],
+        },
+        {
+          label: "API Reference",
+          collapsed: true,
+          items: [{ autogenerate: { directory: "api" } }],
         },
       ],
     }),
