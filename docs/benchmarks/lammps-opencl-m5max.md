@@ -23,16 +23,15 @@ the shared vendor tree stays unchanged.
 | Field | Value |
 | --- | --- |
 | LAMMPS version | 20250722 |
-| Packaged executable | `main/.venv/lib/python3.13/site-packages/lammps/lmp` |
+| Packaged executable | `.venv/lib/python3.13/site-packages/lammps/lmp` |
 | GPU package | `PKG_GPU=ON` |
 | GPU API | `opencl` |
 | GPU precision | `single` |
 | Device | Apple M5 Max |
 | Run command root | `UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_m5max_reference.py` |
 
-Do not use `main/.venv/bin/lmp` as the reproducer. That console script has a
-stale shebang in this checkout. The harness bypasses it and records the active
-packaged executable.
+Do not rely on `.venv/bin/lmp` as the final reproducer. The harness bypasses the
+console script and records the active packaged executable.
 
 ## Acceleration Mapping
 
