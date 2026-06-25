@@ -259,8 +259,11 @@ def build_environment_payload(*, output_path: Path | None = None) -> dict[str, A
         "case_count": 2,
         "command_surface": {
             "harness": f"{COMMAND} environment --json",
-            "lammps_console_script": "main/.venv/bin/lmp",
-            "lammps_console_script_policy": "do not rely on stale shebang for final runs",
+            "lammps_console_script": ".venv/bin/lmp",
+            "lammps_console_script_policy": (
+                "do not rely on the console script for final runs; "
+                "use the packaged executable recorded by the harness"
+            ),
         },
         "host": {
             "node": platform.node(),

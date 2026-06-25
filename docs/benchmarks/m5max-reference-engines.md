@@ -18,10 +18,10 @@ LAMMPS on the Apple M5 Max host. These are reference-engine results, not
 | Manifest validation | `ok` |
 | Suite status | `blocked`, because LAMMPS `rhodo` cannot run with this single-precision OpenCL GPU build |
 
-The LAMMPS package metadata and executable path come from the active
-`main/.venv` environment. The stale `main/.venv/bin/lmp` console script is not
-the reproducer surface; the harness records and invokes the packaged executable
-under `main/.venv/lib/python3.13/site-packages/lammps/lmp`.
+The LAMMPS package metadata and executable path come from the active `.venv`
+environment. The harness records and invokes the packaged executable under
+`.venv/lib/python3.13/site-packages/lammps/lmp`, so final reproducer commands do
+not depend on console-script shebang details.
 
 ## OpenMM Reference Results
 

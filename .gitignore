@@ -16,7 +16,7 @@
 .python-version.local
 
 # Local agent/tool runtime payloads
-.agent/.automaton/
+.agent/
 .claude/
 .codex/
 .opencode/
