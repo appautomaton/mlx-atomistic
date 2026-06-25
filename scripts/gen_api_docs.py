@@ -10,8 +10,11 @@ needs neither MLX nor a Metal GPU. That keeps it runnable on Linux Pages CI.
     # Anywhere (Linux CI), isolated, without installing the project / MLX:
     uv run --no-project --with griffe python scripts/gen_api_docs.py
 
-Output lands in site/src/content/docs/api/ and is git-ignored — it is a build
-artifact, regenerated from source every time.
+Docstrings are parsed as Google style: ``Args:`` descriptions are merged with the
+real signature (types/defaults come from the code), and ``Returns:``/``Raises:``/
+``Examples:`` render as their own sections. Output lands in
+site/src/content/docs/api/ and is git-ignored — a build artifact regenerated
+from source every time.
 """
 
 from __future__ import annotations
@@ -20,7 +23,8 @@ import shutil
 from pathlib import Path
 
 import griffe
-from griffe import ParameterKind
+from griffe import DocstringSectionKind as Kind
+from griffe import ParameterKind, Parser
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -45,27 +49,70 @@ ORDER_HINT = [
 
 _VAR_POSITIONAL = ParameterKind.var_positional
 _VAR_KEYWORD = ParameterKind.var_keyword
+_KEYWORD_ONLY = ParameterKind.keyword_only
 
 
-def summary(obj) -> str:
-    """First paragraph of a docstring, collapsed to a single line."""
-    if obj.docstring is None:
-        return ""
-    text = obj.docstring.value.strip()
-    if not text:
-        return ""
-    para = text.split("\n\n", 1)[0]
-    return " ".join(line.strip() for line in para.splitlines())
+def esc(text: str) -> str:
+    """Make a string safe for a single Markdown table cell."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def parse_doc(obj) -> dict:
+    """Pull the structured pieces out of an object's Google-style docstring."""
+    out = {"summary": "", "body": [], "params": {}, "returns": [], "raises": [], "examples": []}
+    doc = getattr(obj, "docstring", None)
+    if doc is None:
+        return out
+    try:
+        sections = doc.parse(Parser.google)
+    except Exception:
+        text = doc.value.strip()
+        out["summary"] = text.split("\n\n", 1)[0]
+        return out
+
+    first_text = True
+    for s in sections:
+        if s.kind is Kind.text:
+            text = s.value.strip()
+            if first_text:
+                parts = text.split("\n\n", 1)
+                out["summary"] = parts[0]
+                if len(parts) > 1:
+                    out["body"].append(parts[1])
+                first_text = False
+            else:
+                out["body"].append(text)
+        elif s.kind is Kind.parameters:
+            for p in s.value:
+                out["params"][p.name] = (p.description or "").strip()
+        elif s.kind is Kind.returns:
+            for r in s.value:
+                ann = str(r.annotation) if r.annotation is not None else ""
+                out["returns"].append((ann, (r.description or "").strip()))
+        elif s.kind is Kind.raises:
+            for r in s.value:
+                ann = str(r.annotation) if r.annotation is not None else ""
+                out["raises"].append((ann, (r.description or "").strip()))
+        elif s.kind is Kind.examples:
+            for item in s.value:
+                content = item[1] if isinstance(item, tuple) else str(item)
+                out["examples"].append(content.strip())
+    return out
 
 
 def param_list(func, *, is_method: bool = False) -> str:
     parts: list[str] = []
+    star_done = False
     for p in func.parameters:
         if is_method and p.name in ("self", "cls"):
             continue
+        if p.kind is _KEYWORD_ONLY and not star_done:
+            parts.append("*")
+            star_done = True
         tok = p.name
         if p.kind is _VAR_POSITIONAL:
             tok = "*" + tok
+            star_done = True
         elif p.kind is _VAR_KEYWORD:
             tok = "**" + tok
         if p.annotation is not None:
@@ -76,31 +123,90 @@ def param_list(func, *, is_method: bool = False) -> str:
     return "(" + ", ".join(parts) + ")"
 
 
-def render_function(func, *, level: int = 3) -> list[str]:
-    sig = f"def {func.name}{param_list(func)}"
-    if func.returns is not None:
-        sig += f" -> {func.returns}"
-    lines = [f"{'#' * level} `{func.name}`", "", "```python", sig, "```", ""]
-    if func.docstring and func.docstring.value.strip():
-        lines.append(func.docstring.value.strip())
+def render_params_table(func, descriptions: dict, *, is_method: bool = False) -> list[str]:
+    params = [
+        p for p in func.parameters if not (is_method and p.name in ("self", "cls"))
+    ]
+    if not params:
+        return []
+    lines = ["**Parameters**", "", "| Name | Type | Default | Description |", "|---|---|---|---|"]
+    for p in params:
+        name = p.name
+        if p.kind is _VAR_POSITIONAL:
+            name = "*" + name
+        elif p.kind is _VAR_KEYWORD:
+            name = "**" + name
+        typ = f"`{esc(p.annotation)}`" if p.annotation is not None else ""
+        default = f"`{esc(p.default)}`" if p.default is not None else ""
+        desc = esc(descriptions.get(p.name, ""))
+        lines.append(f"| `{name}` | {typ} | {default} | {desc} |")
+    lines.append("")
+    return lines
+
+
+def render_returns_raises(doc: dict, func) -> list[str]:
+    lines: list[str] = []
+    if doc["returns"]:
+        lines += ["**Returns**", ""]
+        for ann, desc in doc["returns"]:
+            ann = ann or (str(func.returns) if func.returns is not None else "")
+            tag = f"`{ann}` — " if ann else ""
+            lines.append(f"- {tag}{desc}".rstrip(" —"))
+        lines.append("")
+    elif func.returns is not None:
+        lines += ["**Returns**", "", f"- `{func.returns}`", ""]
+    if doc["raises"]:
+        lines += ["**Raises**", ""]
+        for ann, desc in doc["raises"]:
+            tag = f"`{ann}` — " if ann else ""
+            lines.append(f"- {tag}{desc}".rstrip(" —"))
         lines.append("")
     return lines
 
 
+def render_examples(doc: dict) -> list[str]:
+    if not doc["examples"]:
+        return []
+    lines = ["**Examples**", ""]
+    for ex in doc["examples"]:
+        lines += ["```python", ex, "```", ""]
+    return lines
+
+
+def render_function(func, *, level: int = 3, is_method: bool = False) -> list[str]:
+    doc = parse_doc(func)
+    sig = f"def {func.name}{param_list(func, is_method=is_method)}"
+    if func.returns is not None:
+        sig += f" -> {func.returns}"
+    lines = [f"{'#' * level} `{func.name}`", "", "```python", sig, "```", ""]
+    if doc["summary"]:
+        lines += [doc["summary"], ""]
+    for block in doc["body"]:
+        lines += [block, ""]
+    lines += render_params_table(func, doc["params"], is_method=is_method)
+    lines += render_returns_raises(doc, func)
+    lines += render_examples(doc)
+    return lines
+
+
 def render_class(cls, *, level: int = 3) -> list[str]:
+    doc = parse_doc(cls)
     bases = [str(b) for b in cls.bases] if cls.bases else []
     header = f"class {cls.name}" + (f"({', '.join(bases)})" if bases else "")
     lines = [f"{'#' * level} `{cls.name}`", "", "```python", header]
-
     init = cls.members.get("__init__")
     if init is not None and getattr(init, "is_function", False):
         lines.append(f"    def __init__{param_list(init, is_method=True)}")
     lines.append("```")
     lines.append("")
-
-    if cls.docstring and cls.docstring.value.strip():
-        lines.append(cls.docstring.value.strip())
-        lines.append("")
+    if doc["summary"]:
+        lines += [doc["summary"], ""]
+    for block in doc["body"]:
+        lines += [block, ""]
+    if init is not None and getattr(init, "is_function", False):
+        init_doc = parse_doc(init)
+        params = {**init_doc["params"], **doc["params"]}
+        lines += render_params_table(init, params, is_method=True)
 
     methods = [
         m
@@ -108,26 +214,20 @@ def render_class(cls, *, level: int = 3) -> list[str]:
         if not m.is_alias
         and getattr(m, "is_function", False)
         and m.is_public
-        and m.name != "__init__"
+        and not m.name.startswith("__")
     ]
     if methods:
-        lines.append("**Methods**")
-        lines.append("")
+        lines += ["**Methods**", ""]
         for m in sorted(methods, key=lambda x: x.name):
-            sig = param_list(m, is_method=True)
-            desc = summary(m)
+            desc = parse_doc(m)["summary"]
             suffix = f" — {desc}" if desc else ""
-            lines.append(f"- `{m.name}{sig}`{suffix}")
+            lines.append(f"- `{m.name}{param_list(m, is_method=True)}`{suffix}")
         lines.append("")
     return lines
 
 
 def public(obj, predicate) -> list:
-    out = [
-        m
-        for m in obj.members.values()
-        if not m.is_alias and m.is_public and predicate(m)
-    ]
+    out = [m for m in obj.members.values() if not m.is_alias and m.is_public and predicate(m)]
     return sorted(out, key=lambda x: x.name)
 
 
@@ -138,6 +238,7 @@ def render_module(mod, order: int) -> str | None:
         return None
 
     title = mod.path.replace(f"{PACKAGE}.", "")
+    doc = parse_doc(mod)
     lines = [
         "---",
         f"title: {title}",
@@ -147,9 +248,10 @@ def render_module(mod, order: int) -> str | None:
         "---",
         "",
     ]
-    mod_summary = summary(mod)
-    if mod_summary:
-        lines += [mod_summary, ""]
+    if doc["summary"]:
+        lines += [doc["summary"], ""]
+    for block in doc["body"]:
+        lines += [block, ""]
     lines += [f"> `import {mod.path}`", ""]
 
     if classes:
@@ -171,7 +273,6 @@ def iter_target_modules(package):
             continue
         if member.name.startswith("_") or member.name in SKIP:
             continue
-        # A subpackage (e.g. dft): descend one level into its modules.
         if member.is_package or member.members:
             sub = [
                 s
@@ -187,15 +288,14 @@ def iter_target_modules(package):
 
 
 def order_for(name: str) -> int:
-    short = name.replace(f"{PACKAGE}.", "")
-    leaf = short.split(".")[-1]
+    leaf = name.replace(f"{PACKAGE}.", "").split(".")[-1]
     if leaf in ORDER_HINT:
         return ORDER_HINT.index(leaf)
     return 100 + sum(ord(c) for c in leaf[:3])
 
 
 def main() -> None:
-    package = griffe.load(PACKAGE, search_paths=[str(SRC)])
+    package = griffe.load(PACKAGE, search_paths=[str(SRC)], docstring_parser=Parser.google)
 
     if OUT.exists():
         shutil.rmtree(OUT)
