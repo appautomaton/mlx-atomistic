@@ -74,6 +74,12 @@ def build_payload(
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Run the DFT geometry-optimization benchmark from the command line.
+
+    Args:
+        argv: Optional argument vector; defaults to ``sys.argv`` when ``None``.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--system",

@@ -251,12 +251,31 @@ def _evaluate(node: _ExprNode, env: dict[str, mx.array]) -> mx.array:
 
 
 def parse_expression(expr: str) -> _ExprNode:
+    """Parse a force-expression string into an evaluable expression tree.
+
+    Args:
+        expr: The expression source string.
+
+    Returns:
+        The parsed expression AST node.
+    """
+
     tokens = _tokenize(expr)
     parser = _Parser(tokens)
     return parser.parse()
 
 
 def evaluate_expression(node: _ExprNode, env: dict[str, mx.array]) -> mx.array:
+    """Evaluate a parsed expression tree against a variable environment.
+
+    Args:
+        node: A parsed expression AST node.
+        env: Mapping from variable name to its ``mx.array`` value.
+
+    Returns:
+        The evaluated result as an ``mx.array``.
+    """
+
     return _evaluate(node, env)
 
 
@@ -401,6 +420,17 @@ class CustomForcePotential:
         return [env], geom
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the custom force-term energy from the symbolic expression.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total custom force-term energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self.indices.shape[0] == 0:
             return _cf_zero_energy(positions)
@@ -414,6 +444,20 @@ class CustomForcePotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the custom force-term energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self.indices.shape[0] == 0:

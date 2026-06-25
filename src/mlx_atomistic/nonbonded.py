@@ -79,6 +79,8 @@ class ForceScopeReport:
     unsupported_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
+        """Return the force-scope report as a plain JSON-serializable dict."""
+
         return {
             "scope": self.scope,
             "supported": self.supported,

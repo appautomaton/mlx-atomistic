@@ -103,9 +103,20 @@ class TwoParticleAverage:
 
     @property
     def parent_atoms(self) -> tuple[int, int]:
+        """Indices of the two parent atoms."""
+
         return (self.particle1, self.particle2)
 
     def compute_position(self, positions: mx.array) -> mx.array:
+        """Return the virtual-site position from the parent-atom positions.
+
+        Args:
+            positions: Cartesian positions of all atoms, shape ``(n_atoms, 3)``.
+
+        Returns:
+            The virtual-site position, shape ``(3,)``.
+        """
+
         positions = as_mx_array(positions)
         return self.weight1 * positions[self.particle1] + self.weight2 * positions[self.particle2]
 
@@ -131,9 +142,20 @@ class ThreeParticleAverage:
 
     @property
     def parent_atoms(self) -> tuple[int, int, int]:
+        """Indices of the three parent atoms."""
+
         return (self.particle1, self.particle2, self.particle3)
 
     def compute_position(self, positions: mx.array) -> mx.array:
+        """Return the virtual-site position from the parent-atom positions.
+
+        Args:
+            positions: Cartesian positions of all atoms, shape ``(n_atoms, 3)``.
+
+        Returns:
+            The virtual-site position, shape ``(3,)``.
+        """
+
         positions = as_mx_array(positions)
         return (
             self.weight1 * positions[self.particle1]
@@ -169,9 +191,20 @@ class OutOfPlane:
 
     @property
     def parent_atoms(self) -> tuple[int, int, int]:
+        """Indices of the three parent atoms."""
+
         return (self.particle1, self.particle2, self.particle3)
 
     def compute_position(self, positions: mx.array) -> mx.array:
+        """Return the virtual-site position from the parent-atom positions.
+
+        Args:
+            positions: Cartesian positions of all atoms, shape ``(n_atoms, 3)``.
+
+        Returns:
+            The virtual-site position, shape ``(3,)``.
+        """
+
         positions = as_mx_array(positions)
         p1 = positions[self.particle1]
         p2 = positions[self.particle2]
@@ -221,9 +254,20 @@ class LocalCoordinates:
 
     @property
     def parent_atoms(self) -> tuple[int, int, int]:
+        """Indices of the three parent atoms."""
+
         return (self.particle1, self.particle2, self.particle3)
 
     def compute_position(self, positions: mx.array) -> mx.array:
+        """Return the virtual-site position from the parent-atom positions.
+
+        Args:
+            positions: Cartesian positions of all atoms, shape ``(n_atoms, 3)``.
+
+        Returns:
+            The virtual-site position, shape ``(3,)``.
+        """
+
         positions = as_mx_array(positions)
         p1 = positions[self.particle1]
         p2 = positions[self.particle2]
@@ -331,10 +375,14 @@ class VirtualSiteManager:
 
     @property
     def n_virtual_sites(self) -> int:
+        """Number of managed virtual sites."""
+
         return len(self.virtual_sites)
 
     @property
     def n_total_atoms(self) -> int:
+        """Total atom count: real atoms plus virtual sites."""
+
         return self.n_real_atoms + len(self.virtual_sites)
 
     def extend_positions(self, positions: mx.array) -> mx.array:

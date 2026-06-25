@@ -85,6 +85,16 @@ class SteeredCOMBiasPotential:
         return mx.sum(center * self.direction)
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the steering COM-bias energy ``0.5 * k * (cv - target)**2``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Accepted for interface uniformity but unused. Defaults to ``None``.
+
+        Returns:
+            The bias energy as a scalar array.
+        """
+
         del cell
         displacement = self.collective_variable(positions) - self.target
         return 0.5 * self.k * displacement * displacement
@@ -95,6 +105,19 @@ class SteeredCOMBiasPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the steering COM-bias energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Accepted for interface uniformity but unused. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del cell, pairs
         positions = as_mx_array(positions)
         cv = self.collective_variable(positions)

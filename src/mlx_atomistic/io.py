@@ -49,6 +49,12 @@ class RuntimeTraceReporter:
     events: list[dict[str, Any]] = field(default_factory=list)
 
     def __call__(self, event: ReporterEvent) -> None:
+        """Record a reporter event, honoring the include-sample/diagnostic flags.
+
+        Args:
+            event: The reporter event to record.
+        """
+
         if event.event_type == "sample" and not self.include_samples:
             return
         if event.event_type == "diagnostic" and not self.include_diagnostics:
@@ -73,6 +79,8 @@ class RuntimeTraceReporter:
         )
 
     def to_jsonable(self) -> list[dict[str, Any]]:
+        """Return the collected events as a list of JSON-serializable dicts."""
+
         return list(self.events)
 
 
@@ -94,6 +102,12 @@ class SimulationCheckpoint:
     metadata: dict[str, Any]
 
     def state(self) -> SimulationState:
+        """Rebuild the in-memory simulation state from this checkpoint.
+
+        Returns:
+            A :class:`SimulationState` with MLX-backed arrays.
+        """
+
         return SimulationState(
             positions=as_mx_array(self.positions),
             velocities=as_mx_array(self.velocities),
@@ -105,6 +119,8 @@ class SimulationCheckpoint:
 
     @property
     def hmr_state(self) -> dict[str, Any]:
+        """Hydrogen-mass-repartitioning state recovered from the checkpoint metadata."""
+
         return _hmr_state_from_metadata(self.metadata)
 
 
