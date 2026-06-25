@@ -13,15 +13,33 @@ DEFAULT_DTYPE = mx.float32
 
 
 def use_cpu_device() -> None:
-    """Route subsequent MLX operations to the CPU device."""
+    """Route subsequent MLX operations to the CPU device.
+
+    Sets the default MLX device and stream to the CPU. Used as a fallback when no
+    Metal GPU is available, e.g. in CI or other headless environments.
+    """
 
     cpu = mx.Device(mx.cpu, 0)
     mx.set_default_device(cpu)
     mx.set_default_stream(mx.new_stream(cpu))
 
 
-def as_mx_array(value, *, dtype=DEFAULT_DTYPE) -> mx.array:
-    """Convert a value to an MLX array with the project default dtype."""
+def as_mx_array(value, *, dtype: mx.Dtype = DEFAULT_DTYPE) -> mx.array:
+    """Convert a value to an MLX array in the project's default dtype.
+
+    An existing ``mx.array`` is returned unchanged unless its dtype differs. If no
+    Metal device is available the conversion transparently falls back to the CPU
+    device (also forced when the ``MLX_ATOMISTIC_DEVICE=cpu`` environment variable
+    is set).
+
+    Args:
+        value: Array-like data to convert (a sequence, NumPy array, or
+            ``mx.array``).
+        dtype: Target MLX dtype. Defaults to ``mx.float32``.
+
+    Returns:
+        The data as an ``mx.array`` of ``dtype``.
+    """
 
     if isinstance(value, mx.array):
         return value if value.dtype == dtype else value.astype(dtype)
@@ -41,16 +59,32 @@ def as_mx_array(value, *, dtype=DEFAULT_DTYPE) -> mx.array:
 
 @dataclass(frozen=True, init=False)
 class Cell:
-    """Periodic cell in MD reduced units.
+    """Periodic simulation cell in MD reduced units.
 
-    One-dimensional input preserves the historical orthorhombic API. Full
-    `(3, 3)` input stores row-vector cell vectors for triclinic boxes.
+    The cell is stored as a row-vector matrix: row ``i`` is the ``i``-th cell
+    vector. One-dimensional input preserves the historical orthorhombic API; a
+    full ``(3, 3)`` matrix stores an arbitrary triclinic box.
+
+    Attributes:
+        matrix: ``(3, 3)`` row-vector cell matrix.
     """
 
     matrix: mx.array
     _is_orthorhombic: bool
 
     def __init__(self, lengths: Sequence[float] | Sequence[Sequence[float]] | mx.array):
+        """Build a cell from edge lengths or a full cell matrix.
+
+        Args:
+            lengths: Either three positive box lengths with shape ``(3,)`` for an
+                orthorhombic cell, or a ``(3, 3)`` row-vector matrix for a
+                triclinic cell.
+
+        Raises:
+            ValueError: If the lengths are non-positive, the matrix is singular or
+                has a non-positive determinant, or the shape is neither ``(3,)``
+                nor ``(3, 3)``.
+        """
         values = as_mx_array(lengths)
         if values.shape == (3,):
             if np.any(np.asarray(values) <= 0.0):
@@ -75,13 +109,30 @@ class Cell:
 
     @classmethod
     def cubic(cls, length: float) -> Cell:
-        """Create a cubic periodic cell."""
+        """Create a cubic periodic cell.
+
+        Args:
+            length: Edge length of the cube.
+
+        Returns:
+            A cubic :class:`Cell` with all three edges equal to ``length``.
+        """
 
         return cls(as_mx_array([length, length, length]))
 
     @classmethod
     def orthorhombic(cls, lengths: Sequence[float]) -> Cell:
-        """Create an orthorhombic periodic cell."""
+        """Create an orthorhombic (axis-aligned) periodic cell.
+
+        Args:
+            lengths: The three box edge lengths ``(a, b, c)``.
+
+        Returns:
+            An axis-aligned :class:`Cell`.
+
+        Raises:
+            ValueError: If ``lengths`` does not contain exactly three values.
+        """
 
         if len(lengths) != 3:
             msg = "orthorhombic cell requires exactly three lengths"
@@ -90,25 +141,33 @@ class Cell:
 
     @classmethod
     def triclinic(cls, matrix: Sequence[Sequence[float]]) -> Cell:
-        """Create a triclinic periodic cell from row-vector cell vectors."""
+        """Create a triclinic periodic cell from row-vector cell vectors.
+
+        Args:
+            matrix: ``(3, 3)`` matrix whose rows are the three cell vectors.
+
+        Returns:
+            A :class:`Cell` for the given (possibly non-orthogonal) box.
+        """
 
         return cls(matrix)
 
     @property
     def lengths(self) -> mx.array:
-        """Return cell-vector lengths for compatibility with existing callers."""
+        """Cell-vector lengths ``(3,)``: the Euclidean norm of each row of
+        :attr:`matrix`."""
 
         return mx.sqrt(mx.sum(self.matrix * self.matrix, axis=1))
 
     @property
     def is_orthorhombic(self) -> bool:
-        """Return true when the cell is axis-aligned orthorhombic."""
+        """Whether the cell is axis-aligned orthorhombic (no off-diagonal terms)."""
 
         return self._is_orthorhombic
 
     @property
     def volume(self) -> mx.array:
-        """Return the periodic cell volume."""
+        """Cell volume, computed as the determinant of :attr:`matrix`."""
 
         matrix = self.matrix
         determinant = (
@@ -119,7 +178,15 @@ class Cell:
         return determinant
 
     def fractional_coordinates(self, positions: mx.array) -> mx.array:
-        """Convert Cartesian row-vector coordinates to fractional coordinates."""
+        """Map Cartesian coordinates into the fractional cell basis.
+
+        Args:
+            positions: Cartesian row-vector coordinates, shape ``(..., 3)``.
+
+        Returns:
+            Fractional coordinates (Cartesian expressed in the cell basis), with
+            the same shape as ``positions``.
+        """
 
         positions = as_mx_array(positions)
         if self.is_orthorhombic:
@@ -127,23 +194,37 @@ class Cell:
         return positions @ mx.linalg.inv(self.matrix)
 
     def cartesian_coordinates(self, fractional: mx.array) -> mx.array:
-        """Convert fractional row-vector coordinates to Cartesian coordinates."""
+        """Map fractional cell coordinates back to Cartesian coordinates.
+
+        Args:
+            fractional: Fractional row-vector coordinates, shape ``(..., 3)``.
+
+        Returns:
+            Cartesian coordinates, with the same shape as ``fractional``.
+        """
 
         return as_mx_array(fractional) @ self.matrix
 
     def wrap(self, positions: mx.array) -> mx.array:
-        """Wrap positions back into the periodic cell.
+        """Wrap positions back into the primary periodic cell.
 
         For orthorhombic cells this subtracts an integer number of box lengths
         directly (``x - L*floor(x/L)``) instead of round-tripping through
         fractional coordinates. The round-trip form ``(x/L - floor(x/L))*L`` is
         algebraically identical but, in float32, does not return a position that
         is exactly ``x`` minus an integer multiple of ``L`` -- it nudges atoms
-        near a cell boundary by up to ~1e-2. Applied every MD step that spurious
+        near a cell boundary by up to ~1e-2. Applied every MD step, that spurious
         displacement does work against the forces and injects energy, breaking
         energy conservation over long runs (invisible in short-run tests). The
         direct form keeps the wrap a pure lattice translation, consistent with
-        :meth:`minimum_image` below.
+        :meth:`minimum_image`.
+
+        Args:
+            positions: Cartesian row-vector coordinates, shape ``(..., 3)``.
+
+        Returns:
+            Positions translated into the primary cell, with the same shape as
+            ``positions``.
         """
 
         positions = as_mx_array(positions)
@@ -154,7 +235,17 @@ class Cell:
         return self.cartesian_coordinates(fractional - mx.floor(fractional))
 
     def minimum_image(self, displacement: mx.array) -> mx.array:
-        """Apply the minimum-image convention to displacement vectors."""
+        """Apply the minimum-image convention to displacement vectors.
+
+        Returns the shortest periodic image of each displacement, so that pair
+        distances use the nearest copy of each atom across cell boundaries.
+
+        Args:
+            displacement: Cartesian displacement vectors, shape ``(..., 3)``.
+
+        Returns:
+            Minimum-image displacements, with the same shape as the input.
+        """
 
         displacement = as_mx_array(displacement)
         if self.is_orthorhombic:
@@ -166,7 +257,14 @@ class Cell:
 
 @dataclass(frozen=True)
 class Atoms:
-    """Atoms or particles with MLX-backed coordinates."""
+    """A collection of atoms (or particles) with MLX-backed arrays.
+
+    Attributes:
+        symbols: Per-atom chemical symbols, one entry per atom.
+        positions: ``(n_atoms, 3)`` Cartesian coordinates.
+        masses: ``(n_atoms,)`` per-atom masses.
+        velocities: Optional ``(n_atoms, 3)`` per-atom velocities.
+    """
 
     symbols: tuple[str, ...]
     positions: mx.array
@@ -182,7 +280,18 @@ class Atoms:
         masses: Sequence[float] | None = None,
         velocities: Sequence[Sequence[float]] | None = None,
     ) -> Atoms:
-        """Create an atom collection from Python sequences."""
+        """Build an :class:`Atoms` collection from plain Python sequences.
+
+        Args:
+            symbols: Chemical symbols, one per atom.
+            positions: ``(n_atoms, 3)`` Cartesian coordinates.
+            masses: Optional per-atom masses; defaults to unit mass for every
+                atom.
+            velocities: Optional ``(n_atoms, 3)`` initial velocities.
+
+        Returns:
+            An :class:`Atoms` instance with MLX-backed arrays.
+        """
 
         atom_count = len(symbols)
         if masses is None:
@@ -209,6 +318,6 @@ class Atoms:
 
     @property
     def count(self) -> int:
-        """Number of atoms or particles."""
+        """Number of atoms in the collection."""
 
         return len(self.symbols)
