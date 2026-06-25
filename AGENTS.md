@@ -51,6 +51,25 @@ Each worktree carries its own `.venv` and its own committed copy of this file.
   never collide; merge back through normal Git history.
 - Keep the `vendors/` reference-only boundary in every worktree.
 
+## Documentation & docstrings
+
+The docs site (`site/`) is split: hand-written narrative under
+`site/src/content/docs/` (overview, foundations, mm, dft, benchmarks, project)
+and an auto-generated API reference under `.../api/` produced from the package by
+`scripts/gen_api_docs.py` (static Griffe parse, git-ignored, rebuilt on deploy).
+Never hand-edit the API pages — edit the docstrings.
+
+- Public docstrings use **Google style**; `src/mlx_atomistic/core.py` is the
+  exemplar to copy. Keep the house style of one blank line after the docstring.
+- Two CI guards keep docstrings in sync with signatures (both green today, no
+  backlog): `ruff` **D417** fails if a documented `Args:` section omits a
+  parameter; `gen_api_docs.py` exits non-zero if a docstring documents a
+  parameter the signature no longer has. Run `ruff check src` and the generator
+  before pushing.
+- Full docstring *presence* is not enforced yet (most modules still carry
+  one-line summaries); enrich a module's docstrings, then it renders richer
+  automatically. No separate doc maintenance is needed.
+
 ## Communication
 
 - Address the user as `My Love`.
