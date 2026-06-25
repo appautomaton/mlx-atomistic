@@ -71,3 +71,11 @@ notebooks/archive/atp-pocket-mlx-demo/data/prepared/
 
 # Reference checkouts only — fetched locally, never tracked.
 vendors/
+
+# Auto-generated API reference pages (Griffe → Starlight). Build artifact:
+# regenerated from src/ by scripts/gen_api_docs.py on every build.
+site/src/content/docs/api/
+
+# Astro / Starlight build state
+site/.astro/
+site/node_modules/
