@@ -1,0 +1,693 @@
+---
+const features = [
+  {
+    title: "Apple Silicon native",
+    desc: "MLX arrays and Metal kernels run the GPU on your machine. No CUDA, no server.",
+    span: "wide",
+    icon: "chip",
+  },
+  {
+    title: "Plane-wave DFT",
+    desc: "Kohn–Sham SCF, LDA + PBE GGA via autodiff, Γ-point and k-mesh, Davidson diagonalization.",
+    span: "tall",
+    icon: "wave",
+  },
+  {
+    title: "Molecular mechanics",
+    desc: "LJ, Coulomb, harmonic bonds/angles, periodic + RB torsions, bounded PME, Langevin NVT.",
+    span: "std",
+    icon: "bond",
+  },
+  {
+    title: "Pseudopotentials",
+    desc: "GTH and UPF readers, local + nonlocal projectors, analytic + finite-difference forces.",
+    span: "std",
+    icon: "grid",
+  },
+  {
+    title: "Python 3.13 + uv",
+    desc: "Reproducible environments, fast sync, Jupyter-first exploration.",
+    span: "std",
+    icon: "python",
+  },
+  {
+    title: "Validated",
+    desc: "OpenMM and LAMMPS reference surfaces keep the MLX runtime honest.",
+    span: "wide",
+    icon: "check",
+  },
+];
+
+const stats = [
+  { value: "LDA + PBE", label: "XC functionals" },
+  { value: "NVE / NVT", label: "Integrators" },
+  { value: "PME", label: "Long-range electrostatics" },
+  { value: "Jupyter", label: "First-class viz" },
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mlx-atomistic — Apple Silicon atomistic simulation</title>
+    <meta
+      name="description"
+      content="Apple Silicon-native atomistic simulation: MLX + Metal DFT and MD runtime."
+    />
+    <meta name="theme-color" content="#0a0b0c" />
+    <meta property="og:title" content="mlx-atomistic" />
+    <meta
+      property="og:description"
+      content="Apple Silicon-native atomistic simulation: MLX + Metal DFT and MD runtime."
+    />
+    <meta property="og:type" content="website" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script is:inline>
+      const stored = localStorage.getItem("starlight-theme");
+      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const theme = stored ?? (prefersDark ? "dark" : "light");
+      document.documentElement.dataset.theme = theme;
+    </script>
+  </head>
+  <body>
+    <!-- Floating navigation -->
+    <nav class="float-nav" aria-label="Primary">
+      <a class="float-nav__brand" href="/">
+        <svg width="22" height="22" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+          <circle cx="32" cy="32" r="6" fill="currentColor" />
+          <ellipse cx="32" cy="32" rx="26" ry="11" stroke="currentColor" stroke-width="2.5" opacity="0.85" />
+          <ellipse cx="32" cy="32" rx="26" ry="11" transform="rotate(60 32 32)" stroke="currentColor" stroke-width="2.5" opacity="0.55" />
+          <ellipse cx="32" cy="32" rx="26" ry="11" transform="rotate(120 32 32)" stroke="currentColor" stroke-width="2.5" opacity="0.35" />
+        </svg>
+        <span>mlx-atomistic</span>
+      </a>
+      <div class="float-nav__links">
+        <a href="/mlx-atomistic/foundations/">Foundations</a>
+        <a href="/mlx-atomistic/dft/">DFT</a>
+        <a href="/mlx-atomistic/mm/">MD</a>
+        <a href="/mlx-atomistic/benchmarks/">Benchmarks</a>
+      </div>
+      <div class="float-nav__actions">
+        <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+          <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+        <a class="icon-btn" href="https://github.com/appautomaton/mlx-atomistic" aria-label="GitHub">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.9 10.9c.6.1.8-.2.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z"/></svg>
+        </a>
+      </div>
+    </nav>
+
+    <main>
+      <!-- Hero -->
+      <section class="hero">
+        <div class="hero__glow" aria-hidden="true"></div>
+        <div class="hero__grid-bg" aria-hidden="true"></div>
+        <div class="hero__inner">
+          <span class="badge">Apple Silicon · MLX · Metal</span>
+          <h1>
+            Atomistic simulation,<br />
+            <span class="gradient-text">native to your Mac.</span>
+          </h1>
+          <p class="lead">
+            An Apple Silicon-native MD + DFT runtime built on MLX and Metal —
+            the product, not a wrapper.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn--primary" href="/mlx-atomistic/foundations/">
+              Get started
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </a>
+            <a class="btn btn--ghost" href="https://github.com/appautomaton/mlx-atomistic">
+              View on GitHub
+            </a>
+          </div>
+        </div>
+      </section>
+
+      <!-- Bento grid -->
+      <section class="bento" aria-label="Features">
+        <h2 class="section-title">One runtime, two scales.</h2>
+        <div class="bento__grid">
+          {
+            features.map((f) => (
+              <article class={`card card--${f.span}`}>
+                <div class="card__icon" data-icon={f.icon} aria-hidden="true">
+                  <span />
+                </div>
+                <h3>{f.title}</h3>
+                <p>{f.desc}</p>
+              </article>
+            ))
+          }
+        </div>
+      </section>
+
+      <!-- Stats -->
+      <section class="stats" aria-label="Capabilities">
+        {
+          stats.map((s) => (
+            <div class="stat">
+              <div class="stat__value">{s.value}</div>
+              <div class="stat__label">{s.label}</div>
+            </div>
+          ))
+        }
+      </section>
+
+      <!-- Quick start -->
+      <section class="quickstart" aria-label="Quick start">
+        <h2 class="section-title">Quick start</h2>
+        <div class="code-block">
+          <div class="code-block__bar">
+            <span class="dot dot--red" />
+            <span class="dot dot--amber" />
+            <span class="dot dot--green" />
+            <span class="code-block__label">shell</span>
+          </div>
+          <pre><code><span class="c-prompt">$</span> uv venv --python 3.13
+<span class="c-prompt">$</span> uv sync --extra notebook --group dev
+<span class="c-prompt">$</span> uv run jupyter lab
+
+<span class="c-comment"># run a DFT SCF benchmark</span>
+<span class="c-prompt">$</span> uv run python -m mlx_atomistic.benchmarks.dft_scf \
+    --sizes 8,16,24,32 --iterations 5 --mixer both --json</code></pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer__inner">
+        <span>mlx-atomistic · Apple Silicon atomistic simulation</span>
+        <div class="footer__links">
+          <a href="/mlx-atomistic/project/">Docs</a>
+          <a href="https://github.com/appautomaton/mlx-atomistic">GitHub</a>
+        </div>
+      </div>
+    </footer>
+
+    <script is:inline>
+      const toggle = document.getElementById("theme-toggle");
+      toggle?.addEventListener("click", () => {
+        const cur = document.documentElement.dataset.theme || "dark";
+        const next = cur === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem("starlight-theme", next);
+      });
+    </script>
+  </body>
+</html>
+
+<style is:global>
+  :root {
+    --accent: #06b6d4;
+    --accent-bright: #22d3ee;
+    --accent-deep: #0891b2;
+    --gradient-accent: linear-gradient(135deg, #22d3ee 0%, #7c3aed 100%);
+    --bg: #0a0b0c;
+    --bg-elev: #121317;
+    --border: rgba(255, 255, 255, 0.08);
+    --text: #e4e4e7;
+    --text-muted: #a1a1aa;
+    --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  [data-theme="light"] {
+    --bg: #fafafa;
+    --bg-elev: #ffffff;
+    --border: rgba(0, 0, 0, 0.08);
+    --text: #18181b;
+    --text-muted: #52525b;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  /* ---------- Floating nav ---------- */
+  .float-nav {
+    position: fixed;
+    top: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: 0.5rem 0.75rem 0.5rem 1rem;
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+    transition: top 0.3s ease;
+  }
+
+  .float-nav__brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 600;
+    font-size: 0.9375rem;
+    color: var(--accent-bright);
+  }
+
+  .float-nav__links {
+    display: flex;
+    gap: 1.25rem;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+  }
+
+  .float-nav__links a {
+    transition: color 0.15s ease;
+  }
+
+  .float-nav__links a:hover {
+    color: var(--text);
+  }
+
+  .float-nav__actions {
+    display: flex;
+    gap: 0.375rem;
+  }
+
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .icon-btn:hover {
+    color: var(--text);
+    background: var(--border);
+  }
+
+  .icon-sun {
+    display: none;
+  }
+  [data-theme="light"] .icon-sun {
+    display: block;
+  }
+  [data-theme="light"] .icon-moon {
+    display: none;
+  }
+
+  /* ---------- Hero ---------- */
+  .hero {
+    position: relative;
+    min-height: 100svh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 8rem 1.5rem 6rem;
+    overflow: hidden;
+  }
+
+  .hero__glow {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 900px;
+    height: 900px;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(
+      circle,
+      rgba(34, 211, 238, 0.18) 0%,
+      rgba(124, 58, 237, 0.08) 35%,
+      transparent 65%
+    );
+    pointer-events: none;
+    filter: blur(20px);
+  }
+
+  .hero__grid-bg {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .hero__inner {
+    position: relative;
+    max-width: 820px;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 0.375rem 0.875rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accent-bright);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: 999px;
+    margin-bottom: 1.75rem;
+  }
+
+  .hero h1 {
+    font-size: clamp(2.5rem, 7vw, 4.5rem);
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    margin-bottom: 1.5rem;
+  }
+
+  .gradient-text {
+    background: var(--gradient-accent);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .lead {
+    font-size: clamp(1.0625rem, 2.2vw, 1.375rem);
+    color: var(--text-muted);
+    max-width: 620px;
+    margin: 0 auto 2.5rem;
+  }
+
+  .cta-row {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1.25rem;
+    font-size: 0.9375rem;
+    font-weight: 500;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    transition: all 0.18s ease;
+  }
+
+  .btn--primary {
+    background: var(--accent);
+    color: #0a0b0c;
+    border-color: var(--accent);
+  }
+  [data-theme="light"] .btn--primary {
+    color: #ffffff;
+  }
+  .btn--primary:hover {
+    background: var(--accent-bright);
+    box-shadow: 0 0 32px color-mix(in srgb, var(--accent) 40%, transparent);
+    transform: translateY(-1px);
+  }
+
+  .btn--ghost:hover {
+    background: var(--border);
+    transform: translateY(-1px);
+  }
+
+  /* ---------- Bento grid ---------- */
+  .bento {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem;
+  }
+
+  .section-title {
+    font-size: clamp(1.5rem, 3vw, 2rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-bottom: 2rem;
+    text-align: center;
+  }
+
+  .bento__grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 1rem;
+  }
+
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 1.5rem;
+    transition: all 0.2s ease;
+  }
+
+  .card:hover {
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+    transform: translateY(-2px);
+  }
+
+  .card--wide {
+    grid-column: span 4;
+  }
+  .card--tall {
+    grid-column: span 2;
+    grid-row: span 2;
+  }
+  .card--std {
+    grid-column: span 2;
+  }
+
+  .card__icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 1rem;
+  }
+
+  .card__icon span {
+    width: 14px;
+    height: 14px;
+    border-radius: 4px;
+    background: var(--accent-bright);
+  }
+
+  .card h3 {
+    font-size: 1.0625rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+
+  .card p {
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+  }
+
+  /* ---------- Stats ---------- */
+  .stats {
+    max-width: 1120px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    padding: 2rem 1.5rem 4rem;
+  }
+
+  .stat {
+    text-align: center;
+    padding: 1.5rem 1rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .stat__value {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--accent-bright);
+    letter-spacing: -0.01em;
+  }
+
+  .stat__label {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+  }
+
+  /* ---------- Quick start ---------- */
+  .quickstart {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 6rem;
+  }
+
+  .code-block {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  .code-block__bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 999px;
+  }
+  .dot--red {
+    background: #f87171;
+  }
+  .dot--amber {
+    background: #fbbf24;
+  }
+  .dot--green {
+    background: #34d399;
+  }
+
+  .code-block__label {
+    margin-left: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+
+  .code-block pre {
+    padding: 1.25rem 1.5rem;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    line-height: 1.7;
+    color: var(--text);
+  }
+
+  .c-prompt {
+    color: var(--accent-bright);
+    user-select: none;
+  }
+  .c-comment {
+    color: var(--text-muted);
+  }
+
+  /* ---------- Footer ---------- */
+  .footer {
+    border-top: 1px solid var(--border);
+    padding: 2rem 1.5rem;
+  }
+
+  .footer__inner {
+    max-width: 1120px;
+    margin: 0 auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+  }
+
+  .footer__links {
+    display: flex;
+    gap: 1.25rem;
+  }
+
+  .footer__links a:hover {
+    color: var(--text);
+  }
+
+  /* ---------- Mobile-first responsive ---------- */
+  @media (max-width: 860px) {
+    .bento__grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    .card--wide,
+    .card--tall,
+    .card--std {
+      grid-column: span 2;
+      grid-row: auto;
+    }
+    .stats {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    .float-nav__links {
+      display: none;
+    }
+  }
+
+  @media (max-width: 560px) {
+    .hero {
+      padding-top: 6rem;
+    }
+    .bento__grid {
+      grid-template-columns: 1fr;
+    }
+    .card--wide,
+    .card--tall,
+    .card--std {
+      grid-column: span 1;
+    }
+    .stats {
+      grid-template-columns: 1fr;
+    }
+    .cta-row .btn {
+      flex: 1;
+      justify-content: center;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      transition: none !important;
+      animation: none !important;
+    }
+  }
+</style>

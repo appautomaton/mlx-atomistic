@@ -1,0 +1,117 @@
+/* mlx-atomistic — 2026 palette: near-black dark, cyan accent, surgical gradients. */
+
+:root {
+  --accent: #06b6d4;
+  --accent-bright: #22d3ee;
+  --accent-deep: #0891b2;
+  --gradient-accent: linear-gradient(135deg, #22d3ee 0%, #7c3aed 100%);
+
+  --font-sans:
+    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    "JetBrains Mono", "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+    monospace;
+}
+
+/* ---------- Dark theme (primary, 2026 dev-tool default) ---------- */
+:root,
+[data-theme="dark"] {
+  --sl-color-bg: #0a0b0c;
+  --sl-color-bg-nav: #0a0b0c;
+  --sl-color-bg-sidebar: #0d0e10;
+  --sl-color-bg-inline-code: #15171b;
+  --sl-color-bg-input: #15171b;
+  --sl-color-bg-row: #121317;
+  --sl-color-bg-row-hover: #181a1f;
+
+  --sl-color-white: #fafafa;
+  --sl-color-gray-1: #e4e4e7;
+  --sl-color-gray-2: #a1a1aa;
+  --sl-color-gray-3: #71717a;
+  --sl-color-gray-4: #52525b;
+  --sl-color-gray-5: #3f3f46;
+  --sl-color-gray-6: #27272a;
+  --sl-color-gray-7: #18181b;
+
+  --sl-color-black: #0a0b0c;
+  --sl-color-accent: #22d3ee;
+  --sl-color-accent-text: #0a0b0c;
+  --sl-color-accent-low: rgba(34, 211, 238, 0.12);
+  --sl-color-accent-high: rgba(34, 211, 238, 0.28);
+
+  --sl-color-healing-1: #34d399;
+  --sl-color-healing-2: #059669;
+  --sl-color-admonition-tip: #22d3ee;
+  --sl-color-admonition-note: #71717a;
+  --sl-color-admonition-caution: #fbbf24;
+  --sl-color-admonition-danger: #f87171;
+
+  --sl-font: var(--font-sans);
+  --sl-font-mono: var(--font-mono);
+}
+
+/* ---------- Light theme (scientific, airy) ---------- */
+[data-theme="light"] {
+  --sl-color-bg: #fafafa;
+  --sl-color-bg-nav: #ffffff;
+  --sl-color-bg-sidebar: #ffffff;
+  --sl-color-bg-inline-code: #f4f4f5;
+  --sl-color-bg-input: #ffffff;
+  --sl-color-bg-row: #ffffff;
+  --sl-color-bg-row-hover: #f4f4f5;
+
+  --sl-color-white: #18181b;
+  --sl-color-gray-1: #18181b;
+  --sl-color-gray-2: #3f3f46;
+  --sl-color-gray-3: #52525b;
+  --sl-color-gray-4: #71717a;
+  --sl-color-gray-5: #a1a1aa;
+  --sl-color-gray-6: #d4d4d8;
+  --sl-color-gray-7: #e4e4e7;
+
+  --sl-color-black: #ffffff;
+  --sl-color-accent: #0891b2;
+  --sl-color-accent-text: #ffffff;
+  --sl-color-accent-low: rgba(8, 145, 178, 0.08);
+  --sl-color-accent-high: rgba(8, 145, 178, 0.22);
+
+  --sl-color-healing-1: #059669;
+  --sl-color-healing-2: #047857;
+  --sl-color-admonition-tip: #0891b2;
+  --sl-color-admonition-note: #52525b;
+  --sl-color-admonition-caution: #d97706;
+  --sl-color-admonition-danger: #dc2626;
+}
+
+/* Refined type scale for a scientific feel */
+:root {
+  --sl-text-xs: 0.75rem;
+  --sl-text-sm: 0.875rem;
+  --sl-text-base: 0.9375rem;
+  --sl-text-lg: 1.0625rem;
+  --sl-text-xl: 1.25rem;
+  --sl-text-2xl: 1.5rem;
+  --sl-text-3xl: 2rem;
+  --sl-text-4xl: 2.5rem;
+  --sl-text-5xl: 3.25rem;
+}
+
+/* Border over shadow (2026 aesthetic) */
+.starlight-sidebar,
+.sl-card,
+.card {
+  border: 1px solid var(--sl-color-gray-7);
+  box-shadow: none;
+}
+
+/* Accent link underline */
+.sl-link {
+  text-decoration-color: var(--sl-color-accent);
+}
+
+/* Code blocks: subtle border, no heavy shadow */
+:where(.expressive-code pre) {
+  border: 1px solid var(--sl-color-gray-7);
+  border-radius: 12px;
+}
