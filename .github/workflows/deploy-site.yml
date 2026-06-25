@@ -34,7 +34,7 @@ jobs:
 
       # Griffe statically parses src/ — no MLX install, so this runs on Linux.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v8.2.0
 
       - name: Generate API reference
         working-directory: ${{ github.workspace }}
