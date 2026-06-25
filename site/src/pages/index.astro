@@ -183,19 +183,21 @@ const stats = [
             <rect x="40" y="40" width="240" height="240" rx="40" class="die-edge" />
             <rect x="74" y="74" width="172" height="172" rx="26" class="die-inner" />
             <!-- close-packed atomic lattice (19-atom hex cluster) -->
+            <!-- Lattice sites double as MD "home" positions; a script upgrades
+                 this static lattice into an interactive molecular-dynamics toy. -->
             <g class="atoms">
               <!-- outer shell -->
-              <circle cx="228" cy="160" r="8" fill="url(#atom)" class="j" style="--d:0s" />
+              <circle cx="228" cy="160" r="8" fill="url(#atom)" />
               <circle cx="194" cy="101" r="8" fill="url(#atom)" />
-              <circle cx="126" cy="101" r="8" fill="url(#atom)" class="j" style="--d:0.7s" />
+              <circle cx="126" cy="101" r="8" fill="url(#atom)" />
               <circle cx="92" cy="160" r="8" fill="url(#atom)" />
               <circle cx="126" cy="219" r="8" fill="url(#atom)" />
-              <circle cx="194" cy="219" r="8" fill="url(#atom)" class="j" style="--d:1.3s" />
+              <circle cx="194" cy="219" r="8" fill="url(#atom)" />
               <circle cx="211" cy="131" r="8" fill="url(#atom)" />
               <circle cx="160" cy="101" r="8" fill="url(#atom)" />
               <circle cx="109" cy="131" r="8" fill="url(#atom)" />
               <circle cx="109" cy="189" r="8" fill="url(#atomA)" />
-              <circle cx="160" cy="219" r="8" fill="url(#atom)" class="j" style="--d:2s" />
+              <circle cx="160" cy="219" r="8" fill="url(#atom)" />
               <circle cx="211" cy="189" r="8" fill="url(#atom)" />
               <!-- first shell -->
               <circle cx="194" cy="160" r="9" fill="url(#atom)" />
@@ -205,10 +207,20 @@ const stats = [
               <circle cx="143" cy="189" r="9" fill="url(#atom)" />
               <circle cx="177" cy="189" r="9" fill="url(#atomA)" />
               <!-- center -->
-              <circle cx="160" cy="160" r="10.5" fill="url(#atomA)" class="j" style="--d:0.4s" />
+              <circle cx="160" cy="160" r="10.5" fill="url(#atomA)" />
             </g>
           </svg>
         </div>
+
+        <!-- Live MD readout: phase (Lindemann criterion) + temperature. -->
+        <div class="hero__readout" hidden>
+          <span class="phase" data-phase="crystalline">Crystalline</span>
+          <span class="thermo" aria-hidden="true"><i class="thermo__fill" data-temp></i></span>
+        </div>
+        <p class="hero__hint" hidden>
+          Drag the lattice to add kinetic energy — heat it past melting, then
+          let go and watch it re-crystallize.
+        </p>
       </section>
 
       <!-- Bento -->
@@ -278,6 +290,134 @@ const stats = [
         document.documentElement.dataset.theme = next;
         localStorage.setItem("starlight-theme", next);
       });
+    </script>
+
+    <!-- Interactive molecular-dynamics toy on the hero lattice.
+         Harmonic pull to each lattice site (Einstein crystal) + soft pairwise
+         repulsion (excluded volume) + Langevin-style damping & thermal noise.
+         Dragging injects kinetic energy (heat); the phase chip uses the
+         Lindemann criterion (RMS displacement / nearest-neighbour spacing). -->
+    <script>
+      const visual = document.querySelector(".hero__visual");
+      const svg = visual?.querySelector("svg.lattice");
+      const group = svg?.querySelector(".atoms");
+      const hero = visual?.closest(".hero");
+      const phaseEl = hero?.querySelector("[data-phase]");
+      const tempEl = hero?.querySelector("[data-temp]");
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      if (visual && svg && group && !reduce) {
+        hero?.querySelector(".hero__readout")?.removeAttribute("hidden");
+        hero?.querySelector(".hero__hint")?.removeAttribute("hidden");
+
+        const atoms = [...group.querySelectorAll("circle")].map((el) => {
+          const hx = parseFloat(el.getAttribute("cx"));
+          const hy = parseFloat(el.getAttribute("cy"));
+          return { el, hx, hy, x: hx, y: hy, vx: 0, vy: 0 };
+        });
+
+        const SPRING = 0.022;   // harmonic pull to lattice site
+        const DAMP = 0.88;      // cooling per frame (settle / recrystallize)
+        const DAMP_HOT = 0.985; // barely cools while you stir
+        const MOUSE_R = 72;     // cursor influence radius (viewBox units)
+        const MOUSE_F = 1.5;    // cursor push strength
+        const PAIR_R = 24;      // soft repulsion cutoff
+        const PAIR_F = 0.45;
+        const NOISE = 0.06;     // idle thermal vibration
+        const MAXV = 14;        // velocity clamp (stability)
+        const LO = 86, HI = 234; // simulation-cell walls
+        const A_NN = 34;        // nearest-neighbour spacing
+        const MELT = 0.16;      // Lindemann ratio at melting
+
+        const mouse = { x: -999, y: -999, on: false, down: false };
+        let heat = 0, frame = 0;
+
+        const toSvg = (cx, cy) => {
+          const r = svg.getBoundingClientRect();
+          return { x: ((cx - r.left) / r.width) * 320, y: ((cy - r.top) / r.height) * 320 };
+        };
+        visual.addEventListener("pointermove", (e) => {
+          const p = toSvg(e.clientX, e.clientY);
+          mouse.x = p.x; mouse.y = p.y; mouse.on = true;
+          if (mouse.down) heat = Math.min(heat + 0.5, 6);
+        });
+        visual.addEventListener("pointerdown", () => { mouse.down = true; });
+        window.addEventListener("pointerup", () => { mouse.down = false; });
+        visual.addEventListener("pointerleave", () => { mouse.on = false; });
+
+        let raf = 0, running = false, inView = false;
+        const tick = () => {
+          heat *= 0.95;
+          const damp = mouse.down ? DAMP_HOT : DAMP;
+          const springK = SPRING * (1 - Math.min(heat / 6, 0.82));
+          const temp = NOISE + heat;
+          let ke = 0, msd = 0;
+
+          for (const a of atoms) {
+            a.vx += (a.hx - a.x) * springK;
+            a.vy += (a.hy - a.y) * springK;
+            if (mouse.on) {
+              const dx = a.x - mouse.x, dy = a.y - mouse.y;
+              const d = Math.hypot(dx, dy);
+              if (d < MOUSE_R && d > 0.001) {
+                const push = (1 - d / MOUSE_R) * MOUSE_F;
+                a.vx += (dx / d) * push;
+                a.vy += (dy / d) * push;
+              }
+            }
+            a.vx += (Math.random() - 0.5) * temp;
+            a.vy += (Math.random() - 0.5) * temp;
+          }
+          for (let i = 0; i < atoms.length; i++) {
+            for (let j = i + 1; j < atoms.length; j++) {
+              const a = atoms[i], b = atoms[j];
+              const dx = b.x - a.x, dy = b.y - a.y;
+              const d = Math.hypot(dx, dy);
+              if (d < PAIR_R && d > 0.001) {
+                const push = (1 - d / PAIR_R) * PAIR_F;
+                const fx = (dx / d) * push, fy = (dy / d) * push;
+                a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
+              }
+            }
+          }
+          for (const a of atoms) {
+            a.vx *= damp; a.vy *= damp;
+            a.vx = Math.max(-MAXV, Math.min(MAXV, a.vx));
+            a.vy = Math.max(-MAXV, Math.min(MAXV, a.vy));
+            a.x += a.vx; a.y += a.vy;
+            if (a.x < LO) { a.x = LO; a.vx = Math.abs(a.vx) * 0.5; }
+            else if (a.x > HI) { a.x = HI; a.vx = -Math.abs(a.vx) * 0.5; }
+            if (a.y < LO) { a.y = LO; a.vy = Math.abs(a.vy) * 0.5; }
+            else if (a.y > HI) { a.y = HI; a.vy = -Math.abs(a.vy) * 0.5; }
+            a.el.setAttribute("cx", a.x.toFixed(2));
+            a.el.setAttribute("cy", a.y.toFixed(2));
+            ke += a.vx * a.vx + a.vy * a.vy;
+            msd += (a.x - a.hx) ** 2 + (a.y - a.hy) ** 2;
+          }
+
+          if (phaseEl && (frame++ & 7) === 0) {
+            const n = atoms.length;
+            const lindemann = Math.sqrt(msd / n) / A_NN;
+            const molten = lindemann > MELT;
+            phaseEl.textContent = molten ? "Molten" : "Crystalline";
+            phaseEl.dataset.phase = molten ? "molten" : "crystalline";
+            if (tempEl) {
+              const fill = Math.min(100, (Math.sqrt(ke / n) / 11) * 100);
+              tempEl.style.width = Math.max(6, fill).toFixed(0) + "%";
+            }
+          }
+          raf = requestAnimationFrame(tick);
+        };
+
+        const start = () => { if (!running) { running = true; raf = requestAnimationFrame(tick); } };
+        const stop = () => { running = false; cancelAnimationFrame(raf); };
+        new IntersectionObserver((es) => {
+          for (const e of es) { inView = e.isIntersecting; inView ? start() : stop(); }
+        }, { threshold: 0 }).observe(visual);
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) stop(); else if (inView) start();
+        });
+      }
     </script>
   </body>
 </html>
@@ -497,6 +637,11 @@ const stats = [
     aspect-ratio: 1;
     display: grid;
     place-items: center;
+    cursor: grab;
+    touch-action: pan-y;
+  }
+  .hero__visual:active {
+    cursor: grabbing;
   }
   /* Iridescent spectral glow leaking from under the silicon die.
      Pure CSS: one blurred conic gradient, slow rotation + hue drift.
@@ -590,16 +735,61 @@ const stats = [
   .lattice .atoms circle {
     filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.18));
   }
-  /* subtle molecular-dynamics jitter on a few atoms */
-  .lattice .j {
-    transform-box: fill-box;
-    transform-origin: center;
-    animation: jitter 3.4s ease-in-out var(--d, 0s) infinite;
+  /* Atom motion is driven by the molecular-dynamics script (see below);
+     no CSS keyframes so JS fully owns each atom's position. */
+
+  /* ---------- Live MD readout + hint ---------- */
+  .hero__readout {
+    margin: 1.5rem auto 0;
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    justify-content: center;
   }
-  @keyframes jitter {
-    0%, 100% { transform: translate(0, 0); }
-    30% { transform: translate(2.5px, -2px); }
-    65% { transform: translate(-2px, 2.5px); }
+  .hero__readout .phase {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    letter-spacing: -0.01em;
+    padding: 0.2rem 0.65rem;
+    border-radius: 999px;
+    color: var(--blue);
+    background: color-mix(in srgb, var(--blue) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--blue) 28%, transparent);
+    transition: color 0.25s ease, background 0.25s ease, border-color 0.25s ease;
+  }
+  .hero__readout .phase[data-phase="molten"] {
+    color: #e8590c;
+    background: color-mix(in srgb, #ff8a3d 16%, transparent);
+    border-color: color-mix(in srgb, #ff8a3d 36%, transparent);
+  }
+  .hero__readout .thermo {
+    width: 88px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--border-soft);
+    overflow: hidden;
+  }
+  .hero__readout .thermo__fill {
+    display: block;
+    height: 100%;
+    width: 6%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--blue), #ff8a3d);
+    transition: width 0.18s linear;
+  }
+  .hero__hint {
+    margin: 0.75rem auto 0;
+    max-width: 360px;
+    text-align: center;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--ink-3);
+    letter-spacing: -0.01em;
+    animation: hint-pulse 3s ease-in-out 1.2s 3;
+  }
+  @keyframes hint-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
   }
 
   /* ---------- Sections ---------- */
