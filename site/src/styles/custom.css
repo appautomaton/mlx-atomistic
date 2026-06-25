@@ -34,10 +34,11 @@
   --sl-color-gray-7: #f0f0f3;
   --sl-color-black: #ffffff;
 
-  --sl-color-accent: #0071e3;
-  --sl-color-accent-low: rgba(0, 113, 227, 0.1);
-  --sl-color-accent-high: #0066cc;
-  --sl-color-text-accent: #0071e3;
+  --sl-color-accent: #6c5ce7;
+  --sl-color-accent-low: rgba(108, 92, 231, 0.1);
+  --sl-color-accent-high: #5343c9;
+  --sl-color-text-accent: #5a4bd4;
+  --sl-color-text-invert: #ffffff;
 
   --sl-color-hairline: #d2d2d7;
   --sl-color-hairline-light: #e8e8ed;
@@ -61,10 +62,11 @@
   --sl-color-gray-7: #161617;
   --sl-color-black: #000000;
 
-  --sl-color-accent: #2997ff;
-  --sl-color-accent-low: rgba(41, 151, 255, 0.12);
-  --sl-color-accent-high: #4aa8ff;
-  --sl-color-text-accent: #2997ff;
+  --sl-color-accent: #b7abff;
+  --sl-color-accent-low: rgba(183, 171, 255, 0.14);
+  --sl-color-accent-high: #cfc6ff;
+  --sl-color-text-accent: #b7abff;
+  --sl-color-text-invert: #14122b;
 
   --sl-color-hairline: #2a2a2c;
   --sl-color-hairline-light: #1c1c1e;
@@ -102,4 +104,11 @@ body {
 /* Rounded, soft search input. */
 site-search button {
   border-radius: 12px !important;
+}
+
+/* Current-page sidebar link: a legible tinted highlight instead of an opaque
+   accent pill that hid its own label. */
+a[aria-current="page"] {
+  color: var(--sl-color-text-accent) !important;
+  background-color: var(--sl-color-accent-low) !important;
 }
