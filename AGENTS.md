@@ -57,18 +57,20 @@ The docs site (`site/`) is split: hand-written narrative under
 `site/src/content/docs/` (overview, foundations, mm, dft, benchmarks, project)
 and an auto-generated API reference under `.../api/` produced from the package by
 `scripts/gen_api_docs.py` (static Griffe parse, git-ignored, rebuilt on deploy).
+The build also emits `llms.txt` / `llms-full.txt` for agentic consumption.
 Never hand-edit the API pages — edit the docstrings.
 
 - Public docstrings use **Google style**; `src/mlx_atomistic/core.py` is the
   exemplar to copy. Keep the house style of one blank line after the docstring.
-- Two CI guards keep docstrings in sync with signatures (both green today, no
-  backlog): `ruff` **D417** fails if a documented `Args:` section omits a
-  parameter; `gen_api_docs.py` exits non-zero if a docstring documents a
-  parameter the signature no longer has. Run `ruff check src` and the generator
-  before pushing.
-- Full docstring *presence* is not enforced yet (most modules still carry
-  one-line summaries); enrich a module's docstrings, then it renders richer
-  automatically. No separate doc maintenance is needed.
+- Three CI guards keep the docs honest (all green, no backlog): `ruff` **D101/
+  D102/D103** require a docstring on every public class/method/function on the
+  docs surface; **D417** fails if a documented `Args:` omits a parameter; and
+  `gen_api_docs.py` exits non-zero if a docstring documents a parameter the
+  signature no longer has. Run `ruff check src` and the generator before pushing.
+- Presence is scoped to the documented API. `prep/`, `benchmarks/`, `tests/`, and
+  `scripts/` are excluded (see `[tool.ruff.lint.per-file-ignores]`), matching the
+  generator's SKIP set. Most docstrings are still one-line summaries; enrich them
+  toward full `Args:`/`Returns:` and the page renders richer automatically.
 
 ## Communication
 

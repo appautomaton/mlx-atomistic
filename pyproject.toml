@@ -101,11 +101,21 @@ line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint]
-# D417 welds docstring↔signature sync: if a function documents an Args section,
-# every parameter must be described. Full docstring presence is not enforced yet
-# (most modules still have one-line docstrings); see scripts/gen_api_docs.py for
-# the complementary drift guard on documented-but-removed parameters.
-select = ["E", "F", "I", "UP", "B", "SIM", "D417"]
+# Docstrings: D417 welds Args↔signature sync (every documented Args param must be
+# described); D101/D102/D103 weld *presence* — every public class/method/function
+# on the docs surface must have a docstring. The presence rules are scoped (see
+# per-file-ignores) to the package's documented API; prep/, benchmarks/, tests/,
+# and scripts/ are internal tooling and excluded, matching the docs generator's
+# SKIP set. gen_api_docs.py adds the complementary drift guard on removed params.
+select = ["E", "F", "I", "UP", "B", "SIM", "D101", "D102", "D103", "D417"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Presence rules apply only to the documented public API (what the docs site
+# renders). These trees are internal/tooling and not on the site.
+"src/mlx_atomistic/prep/**" = ["D101", "D102", "D103"]
+"src/mlx_atomistic/benchmarks/**" = ["D101", "D102", "D103"]
+"tests/**" = ["D101", "D102", "D103"]
+"scripts/**" = ["D101", "D102", "D103"]
