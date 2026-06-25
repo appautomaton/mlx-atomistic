@@ -85,6 +85,8 @@ class PMEDiagnostics:
     direct_space_fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
+        """Return the diagnostics as a plain JSON-serializable dict."""
+
         return {
             "mesh_shape": self.mesh_shape,
             "assignment_order": self.assignment_order,
@@ -120,6 +122,8 @@ class PMEDirectSpacePolicyReport:
     fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
+        """Return the policy report as a plain JSON-serializable dict."""
+
         return {
             "policy": self.policy,
             "representation": self.representation,

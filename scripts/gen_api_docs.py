@@ -286,24 +286,24 @@ def render_module(mod, order: int) -> str | None:
 
 
 def iter_target_modules(package):
-    """Yield the package's documentable submodules (one level into subpackages)."""
+    """Yield the package's documentable modules (descending one level into
+    subpackages such as ``dft``, which Griffe reports as a plain module)."""
     for member in package.members.values():
         if member.is_alias or not getattr(member, "is_module", False):
             continue
         if member.name.startswith("_") or member.name in SKIP:
             continue
-        if member.is_package or member.members:
-            sub = [
-                s
-                for s in member.members.values()
-                if not s.is_alias
-                and getattr(s, "is_module", False)
-                and not s.name.startswith("_")
-            ]
-            if sub and member.is_package:
-                yield from sorted(sub, key=lambda x: x.name)
-                continue
-        yield member
+        sub = [
+            s
+            for s in member.members.values()
+            if not s.is_alias
+            and getattr(s, "is_module", False)
+            and not s.name.startswith("_")
+        ]
+        if sub:
+            yield from sorted(sub, key=lambda x: x.name)
+        else:
+            yield member
 
 
 def order_for(name: str) -> int:

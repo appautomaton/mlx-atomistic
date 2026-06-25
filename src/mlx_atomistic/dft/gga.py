@@ -97,6 +97,22 @@ class PBEExchangeCorrelation:
         *,
         density_floor: float = 1e-12,
     ) -> XCResult:
+        """Evaluate the PBE GGA exchange-correlation energy density, potential, and total energy.
+
+        Args:
+            density: Electron density ``rho`` sampled on the grid.
+            grid: Real-space grid; required for GGA to evaluate the density gradient.
+                Defaults to ``None``.
+            density_floor: Lower clamp applied to the density for numerical stability.
+                Defaults to ``1e-12``.
+
+        Returns:
+            An :class:`XCResult` with the energy density, potential, and total energy.
+
+        Raises:
+            ValueError: If ``grid`` is ``None`` (a grid is required for GGA).
+        """
+
         if grid is None:
             msg = "PBE (GGA) requires a real-space grid to evaluate the density gradient"
             raise ValueError(msg)

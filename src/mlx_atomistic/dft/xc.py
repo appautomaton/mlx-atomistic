@@ -49,6 +49,19 @@ class DiracExchange:
         *,
         density_floor: float = 1e-12,
     ) -> XCResult:
+        """Evaluate the Dirac LDA exchange energy density, potential, and total energy.
+
+        Args:
+            density: Electron density ``rho`` sampled on the grid.
+            grid: Real-space grid providing the integration weight ``dv``; ``None``
+                uses unit weight. Defaults to ``None``.
+            density_floor: Lower clamp applied to the density for numerical stability.
+                Defaults to ``1e-12``.
+
+        Returns:
+            An :class:`XCResult` with the energy density, potential, and total energy.
+        """
+
         rho = mx.maximum(mx.array(density), density_floor)
         coefficient = (3.0 / pi) ** (1.0 / 3.0)
         potential = -coefficient * rho ** (1.0 / 3.0)
@@ -82,6 +95,19 @@ class LDACorrelationPZ81:
         *,
         density_floor: float = 1e-12,
     ) -> XCResult:
+        """Evaluate the PZ81 LDA correlation energy density, potential, and total energy.
+
+        Args:
+            density: Electron density ``rho`` sampled on the grid.
+            grid: Real-space grid providing the integration weight ``dv``; ``None``
+                uses unit weight. Defaults to ``None``.
+            density_floor: Lower clamp applied to the density for numerical stability.
+                Defaults to ``1e-12``.
+
+        Returns:
+            An :class:`XCResult` with the energy density, potential, and total energy.
+        """
+
         rho = mx.maximum(mx.array(density), density_floor)
         rs = (3.0 / (4.0 * pi * rho)) ** (1.0 / 3.0)
         sqrt_rs = mx.sqrt(rs)
@@ -125,6 +151,19 @@ class LDAExchangeCorrelation:
         *,
         density_floor: float = 1e-12,
     ) -> XCResult:
+        """Evaluate the combined LDA exchange-correlation (Dirac + PZ81).
+
+        Args:
+            density: Electron density ``rho`` sampled on the grid.
+            grid: Real-space grid providing the integration weight ``dv``; ``None``
+                uses unit weight. Defaults to ``None``.
+            density_floor: Lower clamp applied to the density for numerical stability.
+                Defaults to ``1e-12``.
+
+        Returns:
+            An :class:`XCResult` with the energy density, potential, and total energy.
+        """
+
         exchange = self.exchange.evaluate(density, grid, density_floor=density_floor)
         correlation = self.correlation.evaluate(density, grid, density_floor=density_floor)
         energy_density = exchange.energy_density + correlation.energy_density

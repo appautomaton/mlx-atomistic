@@ -299,10 +299,14 @@ class PreparedMLXArtifact:
 
     @property
     def atom_count(self) -> int:
+        """Number of atoms in the prepared system."""
+
         return int(self.arrays["positions"].shape[0])
 
     @property
     def cell(self) -> Cell | None:
+        """Periodic cell reconstructed from the artifact arrays, or ``None`` if aperiodic."""
+
         cell_matrix = np.asarray(self.arrays.get("cell_matrix", np.asarray([])))
         if cell_matrix.size != 0:
             if cell_matrix.shape != (3, 3):

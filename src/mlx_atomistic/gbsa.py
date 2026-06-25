@@ -188,6 +188,17 @@ class GBSAForcePotential:
         return mx.where(r + scaled_radius2 - offset_radius1 >= 0.0, value, 0.0)
 
     def ace_surface_area_energy(self, positions: object, cell: Cell | None = None) -> mx.array:
+        """Return the ACE nonpolar (surface-area) solvation energy.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            The nonpolar solvation energy as a scalar array.
+        """
+
         positions = self._validate_positions(positions)
         pairs = self._all_pairs(positions.shape[0])
         born = self._born_radii(positions, cell, pairs)
@@ -248,6 +259,19 @@ class GBSAForcePotential:
         cell: Cell | None = None,
         pairs: object | None = None,
     ) -> mx.array:
+        """Return the GB/SA implicit-solvent energy (polar + nonpolar terms).
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            Total implicit-solvent energy as a scalar array.
+        """
+
         del pairs
         positions = self._validate_positions(positions)
         validated_pairs = self._all_pairs(positions.shape[0])
@@ -259,6 +283,20 @@ class GBSAForcePotential:
         cell: Cell | None = None,
         pairs: object | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the GB/SA implicit-solvent energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = self._validate_positions(positions)
         validated_pairs = self._all_pairs(positions.shape[0])
