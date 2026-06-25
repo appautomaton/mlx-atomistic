@@ -19,7 +19,9 @@ from source every time.
 
 from __future__ import annotations
 
+import logging
 import shutil
+import sys
 from pathlib import Path
 
 import griffe
@@ -294,7 +296,29 @@ def order_for(name: str) -> int:
     return 100 + sum(ord(c) for c in leaf[:3])
 
 
+class _DriftHandler(logging.Handler):
+    """Capture Griffe warnings that signal docstring/signature drift."""
+
+    PHRASE = "does not appear in the function signature"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.drift: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if self.PHRASE in message:
+            self.drift.append(message)
+
+
 def main() -> None:
+    # Fail the build if a docstring documents a parameter the signature no longer
+    # has — the rename-style drift that structural auto-sync cannot catch.
+    drift = _DriftHandler()
+    griffe_logger = logging.getLogger("griffe")
+    griffe_logger.addHandler(drift)
+    griffe_logger.setLevel(logging.WARNING)
+
     package = griffe.load(PACKAGE, search_paths=[str(SRC)], docstring_parser=Parser.google)
 
     if OUT.exists():
@@ -334,6 +358,16 @@ def main() -> None:
     (OUT / "index.md").write_text("\n".join(index) + "\n", encoding="utf-8")
 
     print(f"Generated {len(written)} API page(s) into {OUT.relative_to(ROOT)}")
+
+    if drift.drift:
+        print(
+            "\nDocstring drift detected — documented parameters absent from the "
+            "signature:",
+            file=sys.stderr,
+        )
+        for message in sorted(set(drift.drift)):
+            print(f"  - {message}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
