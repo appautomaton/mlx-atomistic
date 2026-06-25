@@ -170,6 +170,17 @@ class CHARMMUreyBradleyPotential:
         object.__setattr__(self, "distance", as_mx_array(distance))
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the CHARMM Urey-Bradley 1-3 energy ``0.5 * sum(k * (r13 - r0)**2)``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total Urey-Bradley energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self.urey_bradley_terms.shape[0] == 0:
             return _zero_energy(positions)
@@ -188,6 +199,20 @@ class CHARMMUreyBradleyPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the Urey-Bradley energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self.urey_bradley_terms.shape[0] == 0:
@@ -250,6 +275,17 @@ class CHARMMCMAPPotential:
         object.__setattr__(self, "_indices_np", indices)
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the CHARMM CMAP two-dihedral correction energy.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total CMAP energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self._terms_np.shape[0] == 0:
             return _zero_energy(positions)
@@ -266,6 +302,20 @@ class CHARMMCMAPPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the CMAP energy and per-atom forces (forces via autodiff).
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self._terms_np.shape[0] == 0:
@@ -504,6 +554,19 @@ class CHARMMForceSwitchNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> mx.array:
+        """Return the force-switched LJ and Coulomb energy.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            Total force-switched nonbonded energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         pair_array = self._pairs(pairs)
         components = self._component_energies_for_pairs(positions, cell, pair_array)
@@ -515,6 +578,19 @@ class CHARMMForceSwitchNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> dict[str, mx.array]:
+        """Return separate LJ and Coulomb force-switched energy components.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            A dict of named energy components (e.g. ``"lj"``, ``"coulomb"``).
+        """
+
         positions = as_mx_array(positions)
         return self._component_energies_for_pairs(positions, cell, self._pairs(pairs))
 
@@ -524,6 +600,20 @@ class CHARMMForceSwitchNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the force-switched LJ and Coulomb energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         positions = as_mx_array(positions)
         pair_array = self._pairs(pairs)
         components, forces = self._components_and_forces_for_pairs(positions, cell, pair_array)
@@ -536,6 +626,19 @@ class CHARMMForceSwitchNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+        """Return energy, forces, and LJ/Coulomb components in one pass.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces, components)`` tuple.
+        """
+
         positions = as_mx_array(positions)
         pair_array = self._pairs(pairs)
         components, forces = self._components_and_forces_for_pairs(positions, cell, pair_array)
@@ -699,6 +802,17 @@ class CHARMMNBFIXPairOverridePotential:
         return override - regular
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the base nonbonded energy plus the NBFIX explicit-pair LJ correction.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total NBFIX-corrected nonbonded energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         base_energy, _ = self.potential.energy_forces(positions, cell=cell)
         return base_energy + self._correction_energy(positions, cell)
@@ -709,6 +823,22 @@ class CHARMMNBFIXPairOverridePotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> dict[str, mx.array]:
+        """Return nonbonded components with the NBFIX LJ correction folded into the LJ term.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Must be ``None`` — NBFIX overrides require full-system evaluation.
+                Defaults to ``None``.
+
+        Returns:
+            A dict of named energy components (e.g. ``"lj"``, ``"coulomb"``).
+
+        Raises:
+            ValueError: If ``pairs`` is not ``None``.
+        """
+
         if pairs is not None:
             msg = "CHARMM NBFIX pair overrides require full-system nonbonded evaluation"
             raise ValueError(msg)
@@ -723,6 +853,23 @@ class CHARMMNBFIXPairOverridePotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the NBFIX-corrected nonbonded energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Must be ``None`` — NBFIX overrides require full-system evaluation.
+                Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+
+        Raises:
+            ValueError: If ``pairs`` is not ``None``.
+        """
+
         if pairs is not None:
             msg = "CHARMM NBFIX pair overrides require full-system nonbonded evaluation"
             raise ValueError(msg)

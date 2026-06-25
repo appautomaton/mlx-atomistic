@@ -154,6 +154,17 @@ class HarmonicBondPotential:
         )
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the harmonic bond-stretch energy ``0.5 * sum(k * (r - r0)**2)``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total bond-stretch energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self.bonds.shape[0] == 0:
             return _zero_energy(positions)
@@ -171,6 +182,20 @@ class HarmonicBondPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the harmonic bond-stretch energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self.bonds.shape[0] == 0:
@@ -212,6 +237,17 @@ class HarmonicAnglePotential:
         object.__setattr__(self, "angle", _parameter_array(self.angle, count=count, name="angle"))
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the harmonic angle-bend energy ``0.5 * sum(k * (theta - theta0)**2)``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total angle-bend energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self.angles.shape[0] == 0:
             return _zero_energy(positions)
@@ -233,6 +269,20 @@ class HarmonicAnglePotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the harmonic angle-bend energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self.angles.shape[0] == 0:
@@ -303,6 +353,17 @@ class PositionalRestraintPotential:
         object.__setattr__(self, "mask", as_mx_array(mask.astype(np.float32)))
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the positional-restraint energy ``0.5 * k * sum(mask * |x - x_ref|**2)``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Accepted for interface uniformity but unused; restraints act on
+                absolute positions. Defaults to ``None``.
+
+        Returns:
+            Total restraint energy as a scalar array.
+        """
+
         del cell
         positions = as_mx_array(positions)
         displacement = positions - self.reference_positions
@@ -315,6 +376,20 @@ class PositionalRestraintPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the positional-restraint energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Accepted for interface uniformity but unused; restraints act on
+                absolute positions. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         energy = self.potential_energy(positions, cell)
@@ -351,6 +426,17 @@ class PeriodicDihedralPotential:
         object.__setattr__(self, "phase", _parameter_array(self.phase, count=count, name="phase"))
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the periodic torsion energy ``sum(k * (1 + cos(n * phi + phase)))``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total periodic torsion energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self.dihedrals.shape[0] == 0:
             return _zero_energy(positions)
@@ -391,6 +477,20 @@ class PeriodicDihedralPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the periodic torsion energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self.dihedrals.shape[0] == 0:
@@ -485,6 +585,17 @@ class RBDihedralPotential:
         return derivative * cosine + self.c1
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the Ryckaert-Bellemans torsion energy ``sum(Cn * cos(phi - pi)**n)``.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+
+        Returns:
+            Total Ryckaert-Bellemans torsion energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         if self.dihedrals.shape[0] == 0:
             return _zero_energy(positions)
@@ -502,6 +613,20 @@ class RBDihedralPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the Ryckaert-Bellemans torsion energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Accepted for interface uniformity and ignored; the term uses its
+                stored index list. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         del pairs
         positions = as_mx_array(positions)
         if self.dihedrals.shape[0] == 0:
@@ -635,6 +760,19 @@ class CoulombPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> mx.array:
+        """Return the direct pair Coulomb energy.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            Total Coulomb energy as a scalar array.
+        """
+
         positions = as_mx_array(positions)
         pairs, scales = self._pairs_and_scales(positions, pairs)
         if pairs.shape[0] == 0:
@@ -663,6 +801,20 @@ class CoulombPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return the direct pair Coulomb energy and per-atom forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         positions = as_mx_array(positions)
         pairs, scales = self._pairs_and_scales(positions, pairs)
         if pairs.shape[0] == 0:
@@ -2425,11 +2577,39 @@ class PairRestrictedNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> dict[str, mx.array]:
+        """Return LJ and Coulomb components, evaluated on the fixed pair list.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Ignored; the fixed pair list supplied at construction is used.
+                Defaults to ``None``.
+
+        Returns:
+            A dict of named energy components (e.g. ``"lj"``, ``"coulomb"``).
+
+        Raises:
+            ValueError: If the wrapped electrostatics needs full-system
+            evaluation (``ewald_reference`` / ``pme``).
+        """
+
         del pairs
         self._validate_scope_is_pair_restricted()
         return self.potential.component_energies(positions, cell=cell, pairs=self.pairs)
 
     def force_scope_report(self, scope: str = "total") -> dict[str, object]:
+        """Return force-scope support metadata for pair-restricted evaluation.
+
+        Args:
+            scope: Force-evaluation scope, e.g. ``"total"`` or a direct/reciprocal-space
+                component. Defaults to ``"total"``.
+
+        Returns:
+            A metadata dict describing whether the scope is supported and how it is
+                evaluated; full-system scopes are marked unsupported.
+        """
+
         report = dict(self.potential.force_scope_report(scope))
         if report["supported"] and report["requires_full_system"]:
             report.update(
@@ -2456,6 +2636,24 @@ class PairRestrictedNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return total nonbonded energy and forces on the fixed pair list.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Ignored; the fixed pair list supplied at construction is used.
+                Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+
+        Raises:
+            ValueError: If the wrapped electrostatics needs full-system
+            evaluation (``ewald_reference`` / ``pme``).
+        """
+
         del pairs
         self._validate_scope_is_pair_restricted()
         return self.potential.energy_forces(positions, cell=cell, pairs=self.pairs)
@@ -2468,6 +2666,25 @@ class PairRestrictedNonbondedPotential:
         *,
         scope: str = "total",
     ) -> tuple[mx.array, mx.array]:
+        """Evaluate energy and forces through an explicit force scope on the fixed pair list.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Ignored; the fixed pair list supplied at construction is used.
+                Defaults to ``None``.
+            scope: Force-evaluation scope, e.g. ``"total"`` or a direct/reciprocal-space
+                component. Defaults to ``"total"``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+
+        Raises:
+            ValueError: If ``scope`` is unsupported for pair-restricted evaluation.
+        """
+
         del pairs
         report = self.force_scope_report(scope)
         if not report["supported"]:
@@ -2489,6 +2706,23 @@ class PairRestrictedNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+        """Return energy, forces, and LJ/Coulomb components on the fixed pair list.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Ignored; the fixed pair list supplied at construction is used.
+                Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces, components)`` tuple.
+
+        Raises:
+            ValueError: If the wrapped electrostatics needs full-system
+            evaluation (``ewald_reference`` / ``pme``).
+        """
+
         del pairs
         self._validate_scope_is_pair_restricted()
         return self.potential.energy_forces_with_components(
@@ -2521,10 +2755,14 @@ class SoftCoreNonbondedPotential:
 
     @property
     def sigma(self) -> mx.array:
+        """Per-atom Lennard-Jones ``sigma`` of the wrapped potential."""
+
         return self.potential.sigma
 
     @property
     def electrostatics(self) -> NonbondedElectrostatics:
+        """Electrostatics mode of the wrapped potential."""
+
         return self.potential.electrostatics
 
     def component_energies(
@@ -2533,6 +2771,19 @@ class SoftCoreNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> dict[str, mx.array | object]:
+        """Return LJ and Coulomb components from the lambda-scaled potential.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            A dict of named energy components (e.g. ``"lj"``, ``"coulomb"``).
+        """
+
         return self.potential.component_energies(positions, cell=cell, pairs=pairs)
 
     def energy_forces(
@@ -2541,6 +2792,20 @@ class SoftCoreNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        """Return total energy and forces from the lambda-scaled potential.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         return self.potential.energy_forces(positions, cell=cell, pairs=pairs)
 
     def energy_forces_with_components(
@@ -2549,9 +2814,32 @@ class SoftCoreNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
+        """Return energy, forces, and LJ/Coulomb components from the lambda-scaled potential.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces, components)`` tuple.
+        """
+
         return self.potential.energy_forces_with_components(positions, cell=cell, pairs=pairs)
 
     def force_scope_report(self, scope: str = "total") -> dict[str, object]:
+        """Return force-scope support metadata from the wrapped potential.
+
+        Args:
+            scope: Force-evaluation scope, e.g. ``"total"`` or a direct/reciprocal-space
+                component. Defaults to ``"total"``.
+
+        Returns:
+            A metadata dict describing whether the scope is supported and how it is evaluated.
+        """
+
         return self.potential.force_scope_report(scope)
 
     def energy_forces_for_scope(
@@ -2562,6 +2850,22 @@ class SoftCoreNonbondedPotential:
         *,
         scope: str = "total",
     ) -> tuple[mx.array, mx.array]:
+        """Evaluate energy and forces through an explicit force scope (lambda-scaled).
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+            scope: Force-evaluation scope, e.g. ``"total"`` or a direct/reciprocal-space
+                component. Defaults to ``"total"``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar energy and per-atom forces of shape
+                ``(n_atoms, 3)``.
+        """
+
         return self.potential.energy_forces_for_scope(
             positions,
             cell=cell,
@@ -2575,4 +2879,18 @@ class SoftCoreNonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
+        """Return energy, forces, and analytic derivatives w.r.t. the coupling parameters.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell; when given, distances use the minimum-image
+                convention. Defaults to ``None``.
+            pairs: Optional explicit atom-pair list, shape ``(n_pairs, 2)``; ``None``
+                evaluates all unique pairs. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces, derivatives)`` tuple; ``derivatives`` maps
+                each coupling parameter to dE/dlambda.
+        """
+
         return self.potential.energy_forces_dlambda(positions, cell=cell, pairs=pairs)

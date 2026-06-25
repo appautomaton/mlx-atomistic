@@ -210,6 +210,26 @@ def render_class(cls, *, level: int = 3) -> list[str]:
         params = {**init_doc["params"], **doc["params"]}
         lines += render_params_table(init, params, is_method=True)
 
+    # Properties render compactly (no parameters): name, type, summary.
+    props = [
+        m
+        for m in cls.members.values()
+        if not m.is_alias
+        and m.is_public
+        and getattr(m, "is_attribute", False)
+        and "property" in (m.labels or set())
+        and not m.name.startswith("_")
+    ]
+    if props:
+        lines += ["**Properties**", ""]
+        for p in sorted(props, key=lambda x: x.name):
+            ann = f" `{p.annotation}`" if p.annotation is not None else ""
+            desc = parse_doc(p)["summary"]
+            tail = f" — {desc}" if desc else ""
+            lines.append(f"- `{p.name}`{ann}{tail}")
+        lines.append("")
+
+    # Methods render as full subsections so their Args/Returns/Raises show.
     methods = [
         m
         for m in cls.members.values()
@@ -221,10 +241,7 @@ def render_class(cls, *, level: int = 3) -> list[str]:
     if methods:
         lines += ["**Methods**", ""]
         for m in sorted(methods, key=lambda x: x.name):
-            desc = parse_doc(m)["summary"]
-            suffix = f" — {desc}" if desc else ""
-            lines.append(f"- `{m.name}{param_list(m, is_method=True)}`{suffix}")
-        lines.append("")
+            lines += render_function(m, level=level + 1, is_method=True)
     return lines
 
 
