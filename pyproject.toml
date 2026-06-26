@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlx-atomistic"
-version = "0.2.0"
+version = "0.0.1"
 description = "Apple Silicon-native atomistic simulation experiments built on MLX and Metal."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -12,11 +12,37 @@ license = { text = "MIT" }
 authors = [
   { name = "mlx-atomistic contributors" },
 ]
+keywords = [
+  "apple-silicon",
+  "atomistic-simulation",
+  "density-functional-theory",
+  "metal",
+  "mlx",
+  "molecular-dynamics",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Typing :: Typed",
+]
 dependencies = [
   "mlx>=0.31.1",
   "numpy>=2.0",
   "scipy>=1.14",
 ]
+
+[project.urls]
+Documentation = "https://appautomaton.github.io/mlx-atomistic/"
+Source = "https://github.com/appautomaton/mlx-atomistic"
+Issues = "https://github.com/appautomaton/mlx-atomistic/issues"
 
 [project.scripts]
 mlx-atomistic-benchmark = "mlx_atomistic.benchmarks.md_performance:main"
@@ -84,14 +110,24 @@ config-settings-package = { lammps = { "cmake.define.PKG_GPU" = "ON", "cmake.def
 [tool.hatch.build.targets.wheel]
 packages = ["src/mlx_atomistic"]
 
+[tool.hatch.build.targets.sdist]
+# Keep the PyPI source distribution focused on the Python package. Hatchling
+# still force-includes root VCS exclusion files in sdists as build provenance.
+only-include = [
+  "pyproject.toml",
+  "README.md",
+  "LICENSE",
+  "src/mlx_atomistic",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"
 testpaths = ["tests"]
 markers = [
   "slow: long-running test (>~1s); excluded from the fast CI lane",
   "integration: multi-component end-to-end flow",
-  "reference: requires an external reference engine (openmm/lammps); skipped if absent",
-  "data: requires a heavy/gitignored dataset; skipped if absent",
+  "reference: requires an external reference engine (openmm/lammps); run with --run-reference",
+  "data: requires a heavy/gitignored dataset; run with --run-data",
   "gpu: requires a Metal GPU; skipped if unavailable",
 ]
 

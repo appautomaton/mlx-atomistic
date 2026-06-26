@@ -1,0 +1,45 @@
+name: Publish Python package
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  pypi-publish:
+    name: Build and publish to PyPI
+    runs-on: macos-14
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install test tooling
+        run: uv sync --extra prep --group test
+
+      - name: Lint
+        run: uv run --group test ruff check src tests scripts
+
+      - name: Fast package tests
+        run: uv run --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+
+      - name: Build package distributions
+        run: uv build
+
+      - name: Check package distributions
+        run: uv run --with twine twine check dist/*
+
+      - name: Isolated wheel import smoke
+        run: uv run --isolated --with dist/mlx_atomistic-*-py3-none-any.whl python -c "import mlx_atomistic as ma; print(ma.__version__)"
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
