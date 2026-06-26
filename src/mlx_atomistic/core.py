@@ -24,7 +24,9 @@ def use_cpu_device() -> None:
     mx.set_default_stream(mx.new_stream(cpu))
 
 
-def as_mx_array(value, *, dtype: mx.Dtype = DEFAULT_DTYPE) -> mx.array:
+def as_mx_array(
+    value: Sequence | np.ndarray | mx.array, *, dtype: mx.Dtype = DEFAULT_DTYPE
+) -> mx.array:
     """Convert a value to an MLX array in the project's default dtype.
 
     An existing ``mx.array`` is returned unchanged unless its dtype differs. If no

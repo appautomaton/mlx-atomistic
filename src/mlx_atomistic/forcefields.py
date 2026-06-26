@@ -2591,7 +2591,7 @@ class PairRestrictedNonbondedPotential:
 
         Raises:
             ValueError: If the wrapped electrostatics needs full-system
-            evaluation (``ewald_reference`` / ``pme``).
+                evaluation (``ewald_reference`` / ``pme``).
         """
 
         del pairs
@@ -2651,7 +2651,7 @@ class PairRestrictedNonbondedPotential:
 
         Raises:
             ValueError: If the wrapped electrostatics needs full-system
-            evaluation (``ewald_reference`` / ``pme``).
+                evaluation (``ewald_reference`` / ``pme``).
         """
 
         del pairs
@@ -2720,7 +2720,7 @@ class PairRestrictedNonbondedPotential:
 
         Raises:
             ValueError: If the wrapped electrostatics needs full-system
-            evaluation (``ewald_reference`` / ``pme``).
+                evaluation (``ewald_reference`` / ``pme``).
         """
 
         del pairs
