@@ -50,7 +50,17 @@ class ForceTerm(Protocol):
         cell: Cell | None = None,
         pairs: object | None = None,
     ) -> tuple[mx.array, mx.array]:
-        """Return potential energy and forces."""
+        """Return potential energy and forces.
+
+        Args:
+            positions: Particle coordinates, shape ``(n_particles, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar potential energy and forces of
+                shape ``(n_particles, 3)``.
+        """
 
 
 @dataclass(frozen=True)
@@ -92,7 +102,22 @@ class LennardJonesPotential:
         cell: Cell | None = None,
         pairs: object | None = None,
     ) -> tuple[mx.array, mx.array]:
-        """Return potential energy and forces for positions with shape `(N, 3)`."""
+        """Return potential energy and forces for positions with shape ``(n_particles, 3)``.
+
+        Args:
+            positions: Particle coordinates, shape ``(n_particles, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional neighbor list, neighbor blocks, or dense pair array; the
+                nonbonded backend is chosen automatically. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar LJ energy and forces of shape
+                ``(n_particles, 3)``.
+
+        Raises:
+            ValueError: If ``positions`` is not ``(n_particles, 3)`` or a lazy
+                topology is used without a runtime pair provider.
+        """
 
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:
@@ -667,7 +692,17 @@ def kinetic_energy(
     *,
     kinetic_energy_scale: float = 1.0,
 ) -> mx.array:
-    """Return kinetic energy using the configured unit conversion."""
+    """Return the total kinetic energy in the configured unit system.
+
+    Args:
+        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``.
+        kinetic_energy_scale: Multiplicative factor converting the raw kinetic
+            quantity into the configured energy unit. Defaults to ``1.0``.
+
+    Returns:
+        Scalar kinetic energy ``½ · scale · Σ_i m_i |v_i|²``.
+    """
 
     velocities = as_mx_array(velocities)
     masses = as_mx_array(masses)
@@ -682,7 +717,21 @@ def instantaneous_temperature(
     kinetic_energy_scale: float = 1.0,
     boltzmann_constant: float = 1.0,
 ) -> mx.array:
-    """Return the instantaneous temperature for the configured unit system."""
+    """Return the instantaneous temperature from the kinetic energy.
+
+    Args:
+        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``.
+        dof: Degrees of freedom in the equipartition denominator; ``None``
+            uses ``velocities.size`` (no constraints removed). Defaults to ``None``.
+        kinetic_energy_scale: Energy-unit factor forwarded to
+            `kinetic_energy`. Defaults to ``1.0``.
+        boltzmann_constant: Boltzmann constant in the configured units.
+            Defaults to ``1.0`` (reduced units).
+
+    Returns:
+        Scalar temperature ``2·E_kin / (dof · k_B)``.
+    """
 
     if dof is None:
         dof = velocities.size
@@ -698,7 +747,19 @@ def instantaneous_temperature(
 
 
 def virial_tensor(positions: mx.array, forces: mx.array) -> mx.array:
-    """Return the non-periodic configurational virial tensor."""
+    """Return the non-periodic configurational virial tensor.
+
+    Args:
+        positions: Particle coordinates, shape ``(n_particles, 3)``.
+        forces: Forces on each particle, shape ``(n_particles, 3)``.
+
+    Returns:
+        The ``(3, 3)`` virial tensor ``positionsᵀ · forces``.
+
+    Raises:
+        ValueError: If ``positions`` and ``forces`` do not both have
+            shape ``(n_particles, 3)``.
+    """
 
     positions = as_mx_array(positions)
     forces = as_mx_array(forces)
@@ -723,6 +784,28 @@ def configurational_virial_tensor(
     Periodic orthorhombic cells use diagonal finite differences in cell strain
     with fractional coordinates held fixed. Off-diagonal strain is not part of
     this Slice 8 diagnostic convention and is reported as zero.
+
+    Args:
+        positions: Particle coordinates, shape ``(n_particles, 3)``.
+        forces: Forces used for the non-periodic fallback, shape ``(n_particles, 3)``.
+        force_terms: Force terms whose energy is finite-differenced under cell
+            strain; each must support virial diagnostics.
+        cell: Periodic cell; ``None`` returns the non-periodic
+            `virial_tensor`.
+        pairs: Optional neighbor/pair structure forwarded to the force terms;
+            ``None`` lets each term build its own.
+        virtual_sites: Optional virtual-site manager applied before energy
+            evaluation. Defaults to ``None``.
+        strain_epsilon: Half-width of the symmetric cell-strain finite
+            difference. Defaults to ``1e-3``.
+
+    Returns:
+        The ``(3, 3)`` diagonal virial tensor (off-diagonal entries are zero
+            by this diagnostic's convention).
+
+    Raises:
+        ValueError: If a force term lacks virial support, ``strain_epsilon``
+            is non-positive, or the cell volume is non-positive.
     """
 
     validate_virial_support(force_terms)
@@ -789,7 +872,21 @@ def kinetic_pressure_tensor(
     *,
     kinetic_energy_scale: float = 1.0,
 ) -> mx.array:
-    """Return ``sum_i m_i v_i outer v_i`` in the configured kinetic units."""
+    """Return the kinetic (momentum-flux) tensor in the configured units.
+
+    Args:
+        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``.
+        kinetic_energy_scale: Multiplicative factor converting the raw kinetic
+            quantity into the configured energy unit. Defaults to ``1.0``.
+
+    Returns:
+        The ``(3, 3)`` tensor ``scale · Σ_i m_i v_i ⊗ v_i``.
+
+    Raises:
+        ValueError: If ``velocities`` is not ``(n_particles, 3)`` or
+            ``masses`` is not ``(n_particles,)``.
+    """
 
     velocities = as_mx_array(velocities)
     masses = as_mx_array(masses)
@@ -821,6 +918,28 @@ def pressure_tensor(
     ``P = (kinetic tensor + configurational virial) / V``. Periodic virials
     are diagonal-only orthorhombic cell-strain diagnostics; non-periodic runs
     report finite zero pressure diagnostics because no volume is defined.
+
+    Args:
+        positions: Particle coordinates, shape ``(n_particles, 3)``.
+        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``.
+        forces: Forces on each particle, shape ``(n_particles, 3)``.
+        force_terms: Force terms supplying the configurational virial; each must
+            support virial diagnostics.
+        cell: Periodic cell; ``None`` reports zero pressure (no volume defined).
+        pairs: Optional neighbor/pair structure forwarded to the force terms.
+        kinetic_energy_scale: Energy-unit factor for the kinetic tensor.
+            Defaults to ``1.0``.
+        virtual_sites: Optional virtual-site manager applied before energy
+            evaluation. Defaults to ``None``.
+
+    Returns:
+        A ``(virial, pressure, scalar)`` tuple: the ``(3, 3)`` configurational
+            virial, the ``(3, 3)`` pressure tensor ``(kinetic + virial) / V``,
+            and the scalar pressure ``tr(P) / 3``.
+
+    Raises:
+        ValueError: If a periodic cell has non-positive volume.
     """
 
     virial = configurational_virial_tensor(
@@ -913,7 +1032,15 @@ def _named_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTer
 def missing_virial_support(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
 ) -> tuple[str, ...]:
-    """Return exact force-term names without a supported virial diagnostics path."""
+    """Return exact force-term names without a supported virial diagnostics path.
+
+    Args:
+        force_terms: A single force term or a list/tuple of force terms to inspect.
+
+    Returns:
+        The names of the terms lacking virial support, in input order
+            (empty if all are supported).
+    """
 
     missing = []
     for name, term in _named_force_terms(force_terms):
@@ -925,7 +1052,14 @@ def missing_virial_support(
 def validate_virial_support(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
 ) -> None:
-    """Fail closed when future pressure-coupled runtimes see unsupported terms."""
+    """Fail closed when future pressure-coupled runtimes see unsupported terms.
+
+    Args:
+        force_terms: A single force term or a list/tuple of force terms to validate.
+
+    Raises:
+        ValueError: If any term lacks a supported virial diagnostics path.
+    """
 
     missing = missing_virial_support(force_terms)
     if missing:
@@ -1541,7 +1675,24 @@ class VelocityVerlet:
         forces: mx.array | None = None,
         pairs: object | None = None,
     ) -> StepState:
-        """Advance one MD step."""
+        """Advance one MD step.
+
+        Args:
+            positions: Current coordinates, shape ``(n_particles, 3)``.
+            velocities: Current velocities, shape ``(n_particles, 3)``.
+            masses: Per-particle masses, shape ``(n_particles,)``.
+            potential: Force model providing ``energy_forces``.
+            cell: Optional periodic cell; positions are wrapped into it when given.
+                Defaults to ``None``.
+            forces: Optional forces at the current positions to skip a recompute;
+                ``None`` evaluates them. Defaults to ``None``.
+            pairs: Optional neighbor/pair structure passed to the potential.
+                Defaults to ``None``.
+
+        Returns:
+            The `StepState` after one Velocity Verlet step (new positions,
+                velocities, forces, and energies).
+        """
 
         if forces is None:
             _, forces = potential.energy_forces(positions, cell, pairs=pairs)
@@ -1576,7 +1727,26 @@ def simulate(
     dt: float = 0.005,
     steps: int = 100,
 ) -> SimulationResult:
-    """Run a short NVE MD simulation in reduced units."""
+    """Run a short NVE MD simulation in reduced units.
+
+    Args:
+        positions: Initial coordinates, shape ``(n_particles, 3)``.
+        velocities: Initial velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``; ``None`` uses unit
+            masses. Defaults to ``None``.
+        cell: Optional periodic cell for minimum-image distances and wrapping.
+            Defaults to ``None``.
+        potential: Force model to integrate; ``None`` uses a default
+            `LennardJonesPotential`. Defaults to ``None``.
+        pairs: Optional precomputed neighbor/pair structure passed to the
+            potential. Defaults to ``None``.
+        dt: Integration time step. Defaults to ``0.005``.
+        steps: Number of Velocity Verlet steps. Defaults to ``100``.
+
+    Returns:
+        A `SimulationResult` with stacked per-frame positions,
+            velocities, and energy/temperature series (``steps + 1`` frames).
+    """
 
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
@@ -1642,8 +1812,29 @@ def simulate_nve(
 ) -> NVEResult:
     """Run NVE molecular dynamics with sparse trajectory and configurable diagnostics.
 
-    `sample_interval` controls trajectory storage. `diagnostic_interval`
+    ``sample_interval`` controls trajectory storage. ``diagnostic_interval``
     controls energy, temperature, pair-count, and constraint diagnostics.
+
+    Args:
+        positions: Initial coordinates, shape ``(n_particles, 3)``.
+        velocities: Initial velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``; ``None`` uses unit
+            masses. Defaults to ``None``.
+        cell: Optional periodic cell. Defaults to ``None``.
+        force_terms: One or more force terms; ``None`` uses a default
+            `LennardJonesPotential`. Defaults to ``None``.
+        neighbor_manager: Optional neighbor-list manager for compact nonbonded
+            backends. Defaults to ``None``.
+        config: Run configuration (step count, sampling/diagnostic intervals,
+            virtual sites); ``None`` uses defaults. Defaults to ``None``.
+        constraints: Optional distance constraints applied each step.
+            Defaults to ``None``.
+        reporters: Optional runtime reporter(s) invoked on diagnostic events.
+            Defaults to ``None``.
+
+    Returns:
+        An `NVEResult` with the sparse trajectory, diagnostics, and
+            energy-drift metrics.
     """
 
     if config is None:
@@ -2020,7 +2211,29 @@ def simulate_nvt(
     constraints: DistanceConstraints | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> NVTResult:
-    """Run NVT molecular dynamics with Langevin BAOAB or Nose-Hoover dynamics."""
+    """Run NVT molecular dynamics with Langevin BAOAB or Nose-Hoover dynamics.
+
+    Args:
+        positions: Initial coordinates, shape ``(n_particles, 3)``.
+        velocities: Initial velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``; ``None`` uses unit
+            masses. Defaults to ``None``.
+        cell: Optional periodic cell. Defaults to ``None``.
+        force_terms: One or more force terms; ``None`` uses a default
+            `LennardJonesPotential`. Defaults to ``None``.
+        neighbor_manager: Optional neighbor-list manager for compact nonbonded
+            backends. Defaults to ``None``.
+        config: Run configuration; ``None`` uses defaults. Defaults to ``None``.
+        thermostat: Langevin (BAOAB) or Nose-Hoover thermostat; ``None`` uses a
+            default `LangevinThermostat`. Defaults to ``None``.
+        constraints: Optional distance constraints applied each step.
+            Defaults to ``None``.
+        reporters: Optional runtime reporter(s). Defaults to ``None``.
+
+    Returns:
+        An `NVTResult` with the trajectory, diagnostics, and
+            temperature-control metrics.
+    """
 
     if config is None:
         config = SimulationConfig()
@@ -2755,7 +2968,33 @@ def simulate_npt(
     constraints: DistanceConstraints | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> NPTResult:
-    """Run NVT dynamics followed by a Monte Carlo pressure-coupling attempt."""
+    """Run NVT dynamics followed by a Monte Carlo pressure-coupling attempt.
+
+    Args:
+        positions: Initial coordinates, shape ``(n_particles, 3)``.
+        velocities: Initial velocities, shape ``(n_particles, 3)``.
+        masses: Per-particle masses, shape ``(n_particles,)``; ``None`` uses unit
+            masses. Defaults to ``None``.
+        cell: Periodic cell (required for NPT). Defaults to ``None``.
+        force_terms: One or more force terms; ``None`` uses a default
+            `LennardJonesPotential`. Defaults to ``None``.
+        neighbor_manager: Optional neighbor-list manager. Defaults to ``None``.
+        config: Run configuration; ``None`` uses defaults. Defaults to ``None``.
+        thermostat: Thermostat for the NVT stage; ``None`` uses a default
+            `LangevinThermostat`. Defaults to ``None``.
+        barostat: Monte Carlo barostat; ``None`` uses one matched to the
+            thermostat temperature. Defaults to ``None``.
+        constraints: Optional distance constraints applied each step.
+            Defaults to ``None``.
+        reporters: Optional runtime reporter(s). Defaults to ``None``.
+
+    Returns:
+        An `NPTResult` with the NVT trajectory plus cell-volume history
+            from the pressure-coupling attempts.
+
+    Raises:
+        ValueError: If ``cell`` is ``None`` (NPT requires a periodic cell).
+    """
 
     if cell is None:
         msg = "NPT simulation requires a periodic cell"

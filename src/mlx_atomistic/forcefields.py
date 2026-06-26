@@ -1275,7 +1275,15 @@ class NonbondedPotential:
         return switch, derivative
 
     def mixed_pair_parameters(self, pairs) -> tuple[mx.array, mx.array]:
-        """Return mixed sigma and epsilon, with NBFIX LJ overrides substituted."""
+        """Return mixed sigma and epsilon, with NBFIX LJ overrides substituted.
+
+        Args:
+            pairs: Atom-index pairs, shape ``(n_pairs, 2)``.
+
+        Returns:
+            A ``(sigma_ij, epsilon_ij)`` tuple of per-pair mixed LJ parameters, each
+                shape ``(n_pairs,)`` (NBFIX overrides applied where defined).
+        """
 
         pair_array = as_mx_array(pairs, dtype=mx.int32)
         if pair_array.shape[0] == 0:
@@ -2329,7 +2337,15 @@ class NonbondedPotential:
         raise ValueError(msg)
 
     def force_scope_report(self, scope: str = "total") -> dict[str, object]:
-        """Return support metadata for a force-evaluation scope."""
+        """Return support metadata for a force-evaluation scope.
+
+        Args:
+            scope: Force-evaluation scope to query. Defaults to ``"total"``.
+
+        Returns:
+            A `ForceScopeReport` dict describing whether the scope is supported
+                and how it is evaluated for this potential's electrostatics.
+        """
 
         normalized = normalize_force_scope(scope)
         requires_full_system = self.electrostatics in {"ewald_reference", "pme"}
@@ -2407,7 +2423,21 @@ class NonbondedPotential:
         *,
         scope: str = "total",
     ) -> tuple[mx.array, mx.array]:
-        """Evaluate energy and forces through an explicit force scope."""
+        """Evaluate energy and forces through an explicit force scope.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
+            scope: Force-evaluation scope to evaluate. Defaults to ``"total"``.
+
+        Returns:
+            An ``(energy, forces)`` tuple for the scope: scalar energy and ``(n_atoms, 3)`` forces.
+
+        Raises:
+            ValueError: If the scope is unsupported for this potential's electrostatics
+                or ``positions`` is not ``(n_atoms, 3)``.
+        """
 
         normalized = normalize_force_scope(scope)
         report = self.force_scope_report(normalized)
@@ -2439,7 +2469,16 @@ class NonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> dict[str, mx.array | object]:
-        """Return LJ and Coulomb energy components."""
+        """Return LJ and Coulomb energy components.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
+
+        Returns:
+            A dict of named energy components (e.g. ``"lj"``, ``"coulomb"``).
+        """
 
         positions = as_mx_array(positions)
         if self.electrostatics in {"ewald_reference", "pme"}:
@@ -2457,7 +2496,20 @@ class NonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
-        """Return total energy, forces, and LJ/Coulomb components in one pass."""
+        """Return total energy, forces, and LJ/Coulomb components in one pass.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces, components)`` tuple: scalar total energy, ``(n_atoms, 3)``
+                forces, and a dict of ``"lj"``/``"coulomb"`` energies.
+
+        Raises:
+            ValueError: If ``positions`` is not ``(n_atoms, 3)``.
+        """
 
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:
@@ -2490,7 +2542,21 @@ class NonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
-        """Return energy, forces, and analytic lambda derivatives."""
+        """Return energy, forces, and analytic lambda derivatives.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces, derivatives)`` tuple: scalar energy, ``(n_atoms, 3)`` forces,
+                and a dict with ``"lambda_lj"`` and ``"lambda_electrostatics"`` dU/dλ terms.
+
+        Raises:
+            ValueError: If the electrostatics mode is not ``"cutoff"`` (the only mode
+                with analytic dU/dλ).
+        """
 
         if self.electrostatics != "cutoff":
             msg = "dU/dlambda is currently available for cutoff electrostatics only"
@@ -2512,7 +2578,20 @@ class NonbondedPotential:
         cell: Cell | None = None,
         pairs: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
-        """Return total nonbonded energy and forces."""
+        """Return total nonbonded energy and forces.
+
+        Args:
+            positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
+            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
+
+        Returns:
+            An ``(energy, forces)`` tuple: scalar total nonbonded energy and
+                ``(n_atoms, 3)`` forces.
+
+        Raises:
+            ValueError: If ``positions`` is not ``(n_atoms, 3)``.
+        """
 
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:

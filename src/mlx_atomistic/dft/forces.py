@@ -59,9 +59,9 @@ def scf_total_energy_forces(
 ) -> SCFForceConsistencyResult:
     """Compare SCF Hellmann-Feynman forces with total-energy finite differences.
 
-    The analytic force is the force reported by :func:`run_scf`, which includes
+    The analytic force is the force reported by `run_scf`, which includes
     electronic local-pseudopotential forces and center-center repulsion for a
-    :class:`DFTSystem`. The finite-difference force is
+    `DFTSystem`. The finite-difference force is
     ``-[E(R + δ) - E(R - δ)] / 2δ`` after re-running SCF for each displacement.
     """
 

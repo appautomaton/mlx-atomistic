@@ -107,7 +107,7 @@ class PBEExchangeCorrelation:
                 Defaults to ``1e-12``.
 
         Returns:
-            An :class:`XCResult` with the energy density, potential, and total energy.
+            An `XCResult` with the energy density, potential, and total energy.
 
         Raises:
             ValueError: If ``grid`` is ``None`` (a grid is required for GGA).

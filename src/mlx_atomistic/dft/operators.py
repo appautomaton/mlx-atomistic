@@ -45,7 +45,18 @@ def apply_kinetic(
     *,
     kpoint: Sequence[float] | None = None,
 ) -> mx.array:
-    """Apply the plane-wave kinetic operator ``-1/2 ∇²``."""
+    """Apply the plane-wave kinetic operator ``-1/2 ∇²``.
+
+    Args:
+        orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+            stack ``(n_orbitals, *grid.shape)``.
+        grid: Real-space grid defining the FFT mesh.
+        kpoint: Optional k-point 3-vector added to the reciprocal-grid G-vectors;
+            ``None`` uses the Γ point. Defaults to ``None``.
+
+    Returns:
+        The kinetic operator applied to ``orbitals``, same shape as ``orbitals``.
+    """
 
     stack, was_single = _as_orbital_stack(orbitals, grid)
     reciprocal = ReciprocalGrid.from_real_space(grid)
@@ -63,7 +74,16 @@ def apply_kinetic(
 
 
 def apply_local_potential(orbitals: mx.array, local_potential: mx.array) -> mx.array:
-    """Apply a local multiplicative potential to orbitals."""
+    """Apply a local multiplicative potential to orbitals.
+
+    Args:
+        orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+            stack ``(n_orbitals, *grid.shape)``.
+        local_potential: Local potential on the grid, shape ``grid.shape``.
+
+    Returns:
+        The elementwise product ``V · ψ``, same shape as ``orbitals``.
+    """
 
     return mx.array(orbitals) * mx.array(local_potential)
 
@@ -73,7 +93,17 @@ def apply_hartree_xc_potential(
     hartree: mx.array,
     xc_potential: mx.array,
 ) -> mx.array:
-    """Apply Hartree plus exchange-correlation potential to orbitals."""
+    """Apply Hartree plus exchange-correlation potential to orbitals.
+
+    Args:
+        orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+            stack ``(n_orbitals, *grid.shape)``.
+        hartree: Hartree potential on the grid, shape ``grid.shape``.
+        xc_potential: Exchange-correlation potential on the grid, shape ``grid.shape``.
+
+    Returns:
+        The product ``(V_H + V_xc) · ψ``, same shape as ``orbitals``.
+    """
 
     return mx.array(orbitals) * (mx.array(hartree) + mx.array(xc_potential))
 
@@ -83,7 +113,18 @@ def apply_hamiltonian(
     effective_potential: mx.array,
     grid: RealSpaceGrid,
 ) -> mx.array:
-    """Apply ``T + V_eff`` using an explicit effective potential."""
+    """Apply ``T + V_eff`` using an explicit effective potential.
+
+    Args:
+        orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+            stack ``(n_orbitals, *grid.shape)``.
+        effective_potential: Combined local effective potential on the grid, shape
+            ``grid.shape``.
+        grid: Real-space grid defining the FFT mesh.
+
+    Returns:
+        ``(T + V_eff) ψ``, same shape as ``orbitals``.
+    """
 
     return apply_kinetic(orbitals, grid) + apply_local_potential(orbitals, effective_potential)
 
@@ -113,7 +154,23 @@ class KohnShamOperator:
         nonlocal_operator: NonlocalPseudopotentialOperator | None = None,
         kpoint: Sequence[float] | None = None,
     ) -> KohnShamOperator:
-        """Build an operator from ``ρ`` and a local potential."""
+        """Build an operator from ``ρ`` and a local potential.
+
+        Args:
+            grid: Real-space grid defining the FFT mesh.
+            local_potential: External local (ionic) potential on the grid, shape ``grid.shape``.
+            density: Electron density ``ρ`` on the grid, shape ``grid.shape``.
+            xc_functional: Exchange-correlation functional; ``None`` uses
+                `LDAExchangeCorrelation`. Defaults to ``None``.
+            density_floor: Lower clamp on the density for XC numerical stability.
+                Defaults to ``1e-12``.
+            nonlocal_operator: Optional nonlocal pseudopotential operator. Defaults to ``None``.
+            kpoint: Optional Bloch k-point; ``None`` uses Γ. Defaults to ``None``.
+
+        Returns:
+            A `KohnShamOperator` with the Hartree, XC, and effective potentials
+                precomputed.
+        """
 
         xc_functional = LDAExchangeCorrelation() if xc_functional is None else xc_functional
         hartree = hartree_potential(density, grid)
@@ -133,22 +190,54 @@ class KohnShamOperator:
         )
 
     def apply_kinetic(self, orbitals: mx.array) -> mx.array:
-        """Apply only the kinetic part."""
+        """Apply only the kinetic part.
+
+        Args:
+            orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+                stack ``(n_orbitals, *grid.shape)``.
+
+        Returns:
+            ``T ψ`` at this operator's k-point, same shape as ``orbitals``.
+        """
 
         return apply_kinetic(orbitals, self.grid, kpoint=self.kpoint)
 
     def apply_local_potential(self, orbitals: mx.array) -> mx.array:
-        """Apply only the external local potential."""
+        """Apply only the external local potential.
+
+        Args:
+            orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+                stack ``(n_orbitals, *grid.shape)``.
+
+        Returns:
+            ``V_local · ψ``, same shape as ``orbitals``.
+        """
 
         return apply_local_potential(orbitals, self.local_potential)
 
     def apply_hartree_xc_potential(self, orbitals: mx.array) -> mx.array:
-        """Apply only the Hartree plus exchange-correlation potential."""
+        """Apply only the Hartree plus exchange-correlation potential.
+
+        Args:
+            orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+                stack ``(n_orbitals, *grid.shape)``.
+
+        Returns:
+            ``(V_H + V_xc) · ψ``, same shape as ``orbitals``.
+        """
 
         return apply_hartree_xc_potential(orbitals, self.hartree, self.xc_potential)
 
     def apply_hamiltonian(self, orbitals: mx.array) -> mx.array:
-        """Apply ``H = T + V_eff``."""
+        """Apply ``H = T + V_eff``.
+
+        Args:
+            orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+                stack ``(n_orbitals, *grid.shape)``.
+
+        Returns:
+            ``H ψ`` (kinetic + effective local + any nonlocal term), same shape as ``orbitals``.
+        """
 
         applied = self.apply_kinetic(orbitals) + apply_local_potential(
             orbitals,
@@ -159,7 +248,15 @@ class KohnShamOperator:
         return applied
 
     def rayleigh_quotients(self, orbitals: mx.array) -> mx.array:
-        """Return ``<ψᵢ|H|ψᵢ>/<ψᵢ|ψᵢ>`` for each orbital."""
+        """Return ``<ψᵢ|H|ψᵢ>/<ψᵢ|ψᵢ>`` for each orbital.
+
+        Args:
+            orbitals: Real-space orbital stack ``(n_orbitals, *grid.shape)``.
+
+        Returns:
+            The per-orbital Rayleigh quotients (energy estimates), shape
+                ``(n_orbitals,)``.
+        """
 
         stack, _ = _as_orbital_stack(orbitals, self.grid)
         applied, _ = _as_orbital_stack(self.apply_hamiltonian(stack), self.grid)
@@ -172,7 +269,16 @@ class KohnShamOperator:
 
 
 def orthonormality_error(orbitals: mx.array, grid: RealSpaceGrid) -> float:
-    """Return max absolute overlap error from the identity matrix."""
+    """Return max absolute overlap error from the identity matrix.
+
+    Args:
+        orbitals: Real-space orbital stack ``(n_orbitals, *grid.shape)``.
+        grid: Real-space grid; its ``dv`` weights the overlap integral.
+
+    Returns:
+        The maximum absolute deviation of the overlap matrix ``⟨ψᵢ|ψⱼ⟩`` from the
+            identity.
+    """
 
     stack, _ = _as_orbital_stack(orbitals, grid)
     flat = np.array(stack, dtype=np.complex128).reshape(stack.shape[0], grid.size)
@@ -185,7 +291,17 @@ def orbital_residuals(
     operator: KohnShamOperator,
     eigenvalues: mx.array | None = None,
 ) -> mx.array:
-    """Return ``||Hψᵢ - εᵢψᵢ||`` for each orbital."""
+    """Return ``||Hψᵢ - εᵢψᵢ||`` for each orbital.
+
+    Args:
+        orbitals: Real-space orbital stack ``(n_orbitals, *grid.shape)``.
+        operator: The `KohnShamOperator` supplying ``H``.
+        eigenvalues: Optional per-orbital eigenvalues εᵢ; ``None`` uses the Rayleigh
+            quotients. Defaults to ``None``.
+
+    Returns:
+        The per-orbital residual norms, shape ``(n_orbitals,)``.
+    """
 
     stack, _ = _as_orbital_stack(orbitals, operator.grid)
     if eigenvalues is None:
@@ -213,7 +329,12 @@ class DiagonalizationResult:
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """Return a JSON-safe summary."""
+        """Return a JSON-safe summary.
+
+        Returns:
+            The eigenvalues, residuals, orthonormality error, iteration count,
+                convergence flag, and metadata as a JSON-serializable dict.
+        """
 
         return {
             "eigenvalues": np.array(self.eigenvalues).tolist(),
@@ -232,7 +353,11 @@ class DenseHamiltonianReference:
     operator: KohnShamOperator
 
     def matrix(self) -> np.ndarray:
-        """Build the dense matrix by applying the operator to basis vectors."""
+        """Build the dense matrix by applying the operator to basis vectors.
+
+        Returns:
+            The Hermitized dense Hamiltonian, shape ``(grid.size, grid.size)``.
+        """
 
         size = self.operator.grid.size
         columns = []
@@ -245,14 +370,29 @@ class DenseHamiltonianReference:
         return 0.5 * (matrix + matrix.conjugate().T)
 
     def matvec(self, orbital: mx.array) -> mx.array:
-        """Apply the dense matrix to a single orbital."""
+        """Apply the dense matrix to a single orbital.
+
+        Args:
+            orbital: A single real-space orbital of shape ``grid.shape``.
+
+        Returns:
+            ``H ψ`` as a grid-shaped array.
+        """
 
         flat = np.array(orbital, dtype=np.complex128).reshape(self.operator.grid.size)
         applied = self.matrix() @ flat
         return mx.array(applied.reshape(self.operator.grid.shape).astype(np.complex64))
 
     def diagonalize(self, n_orbitals: int) -> DiagonalizationResult:
-        """Diagonalize the dense reference matrix."""
+        """Diagonalize the dense reference matrix.
+
+        Args:
+            n_orbitals: Number of lowest eigenpairs to return.
+
+        Returns:
+            A `DiagonalizationResult` with the lowest ``n_orbitals`` eigenpairs
+                (orthonormalized).
+        """
 
         matrix = self.matrix()
         values, vectors = np.linalg.eigh(matrix)
@@ -285,6 +425,13 @@ class SubspaceDiagonalizer:
         For this milestone the implementation intentionally uses the explicit
         tiny-grid reference matrix as the Rayleigh-Ritz space. The public solver
         boundary lets us replace this with an iterative Davidson path later.
+
+        Args:
+            operator: The `KohnShamOperator` to diagonalize.
+            n_orbitals: Number of occupied orbitals to solve for.
+
+        Returns:
+            A `DiagonalizationResult` for the lowest ``n_orbitals`` states.
         """
 
         result = DenseHamiltonianReference(operator).diagonalize(n_orbitals)
@@ -331,7 +478,15 @@ class KineticPreconditioner:
     shift: float = 0.5
 
     def apply(self, residual: mx.array, operator: KohnShamOperator) -> mx.array:
-        """Apply ``1 / (0.5|G+k|² + shift)`` to a residual."""
+        """Apply ``1 / (0.5|G+k|² + shift)`` to a residual.
+
+        Args:
+            residual: A real-space residual to precondition.
+            operator: The `KohnShamOperator` supplying the grid and k-point.
+
+        Returns:
+            The preconditioned residual, same shape as ``residual``.
+        """
 
         reciprocal = ReciprocalGrid.from_real_space(operator.grid)
         k = mx.reshape(mx.array(operator.kpoint, dtype=mx.float32), (1, 1, 1, 3))
@@ -359,7 +514,18 @@ class DavidsonDiagonalizer:
         n_orbitals: int,
         initial_orbitals: mx.array | None = None,
     ) -> DiagonalizationResult:
-        """Solve for the lowest occupied orbitals."""
+        """Solve for the lowest occupied orbitals.
+
+        Args:
+            operator: The `KohnShamOperator` to diagonalize.
+            n_orbitals: Number of occupied orbitals to solve for.
+            initial_orbitals: Optional starting orbital stack; ``None`` uses a
+                deterministic random guess. Defaults to ``None``.
+
+        Returns:
+            A `DiagonalizationResult` for the lowest ``n_orbitals`` states (dense
+                reference below the fallback size, preconditioned iteration above).
+        """
 
         if operator.grid.size <= self.config.dense_fallback_size:
             result = DenseHamiltonianReference(operator).diagonalize(n_orbitals)

@@ -49,7 +49,14 @@ class LocalGaussianPseudopotential:
         object.__setattr__(self, "widths", as_mx_array(widths_np))
 
     def field(self, grid: RealSpaceGrid) -> mx.array:
-        """Evaluate the local potential on a real-space grid."""
+        """Evaluate the local potential on a real-space grid.
+
+        Args:
+            grid: Real-space grid to sample the potential on.
+
+        Returns:
+            The summed Gaussian local potential on the grid, shape ``grid.shape``.
+        """
 
         coordinates = grid.coordinates()
         potential = mx.zeros(grid.shape, dtype=mx.float32)
@@ -66,7 +73,16 @@ class LocalGaussianPseudopotential:
 
 
 def hartree_potential(density: mx.array, grid: RealSpaceGrid) -> mx.array:
-    """Solve the periodic Hartree potential for ``ρ`` with the ``G = 0`` term removed."""
+    """Solve the periodic Hartree potential for ``ρ`` with the ``G = 0`` term removed.
+
+    Args:
+        density: Electron density ``ρ`` on the grid, shape ``grid.shape``.
+        grid: Real-space grid defining the FFT mesh.
+
+    Returns:
+        The real-space Hartree potential ``V_H``, shape ``grid.shape`` (the
+            ``G = 0`` term is dropped against a neutralizing background).
+    """
 
     reciprocal = ReciprocalGrid.from_real_space(grid)
     density_g = fft3(density)
@@ -82,14 +98,34 @@ def lda_exchange_energy_potential(
     *,
     density_floor: float = 1e-12,
 ) -> tuple[mx.array, mx.array]:
-    """Return Dirac LDA exchange energy and potential for an unpolarized density."""
+    """Return Dirac LDA exchange energy and potential for an unpolarized density.
+
+    Args:
+        density: Electron density ``ρ`` on the grid, shape ``grid.shape``.
+        grid: Real-space grid providing the integration weight ``dv``; ``None`` uses
+            unit weight. Defaults to ``None``.
+        density_floor: Lower clamp on the density for numerical stability.
+            Defaults to ``1e-12``.
+
+    Returns:
+        An ``(energy, potential)`` tuple: the scalar exchange energy and the
+            exchange potential on the grid.
+    """
 
     result = DiracExchange().evaluate(density, grid, density_floor=density_floor)
     return result.total_energy, result.potential
 
 
 def apply_kinetic(orbital: mx.array, grid: RealSpaceGrid) -> mx.array:
-    """Apply the plane-wave kinetic operator ``-1/2 ∇²`` to one orbital."""
+    """Apply the plane-wave kinetic operator ``-1/2 ∇²`` to one orbital.
+
+    Args:
+        orbital: A single real-space orbital, shape ``grid.shape``.
+        grid: Real-space grid defining the FFT mesh.
+
+    Returns:
+        The kinetic operator applied to the orbital (real part), shape ``grid.shape``.
+    """
 
     reciprocal = ReciprocalGrid.from_real_space(grid)
     return mx.real(ifft3(0.5 * reciprocal.g2 * fft3(orbital)))
@@ -101,7 +137,17 @@ def kinetic_energy(
     *,
     occupations: Sequence[float],
 ) -> mx.array:
-    """Return the occupied one-particle kinetic energy."""
+    """Return the occupied one-particle kinetic energy.
+
+    Args:
+        orbitals: Real-space orbital(s); a single orbital of shape ``grid.shape`` or a
+            stack ``(n_orbitals, *grid.shape)``.
+        grid: Real-space grid; its ``dv`` weights the integral.
+        occupations: Per-orbital occupation numbers.
+
+    Returns:
+        The scalar occupied kinetic energy ``Σᵢ fᵢ ⟨ψᵢ|T|ψᵢ⟩``.
+    """
 
     stack = mx.array(orbitals)
     if stack.shape == grid.shape:
@@ -124,7 +170,22 @@ def energy_decomposition(
     density_floor: float = 1e-12,
     xc_functional: ExchangeCorrelationFunctional | None = None,
 ) -> dict[str, mx.array]:
-    """Return core toy-DFT energy terms."""
+    """Return core toy-DFT energy terms.
+
+    Args:
+        orbitals: Real-space occupied orbital(s).
+        density: Electron density ``ρ`` on the grid, shape ``grid.shape``.
+        local_potential: External local potential on the grid, shape ``grid.shape``.
+        grid: Real-space grid; its ``dv`` weights the integrals.
+        occupations: Per-orbital occupation numbers.
+        density_floor: Lower clamp on the density for XC stability. Defaults to ``1e-12``.
+        xc_functional: Exchange-correlation functional; ``None`` uses
+            `DiracExchange`. Defaults to ``None``.
+
+    Returns:
+        A dict of energy terms — ``kinetic``, ``local``, ``hartree``, ``xc``,
+            ``total`` (plus ``exchange``/``correlation`` when the functional exposes them).
+    """
 
     xc_functional = DiracExchange() if xc_functional is None else xc_functional
     v_hartree = hartree_potential(density, grid)
@@ -157,7 +218,15 @@ def energy_decomposition(
 
 
 def electron_count(density: mx.array, grid: RealSpaceGrid) -> mx.array:
-    """Integrate a density over the real-space grid."""
+    """Integrate a density over the real-space grid.
+
+    Args:
+        density: Electron density ``ρ`` on the grid, shape ``grid.shape``.
+        grid: Real-space grid; its ``dv`` weights the integral.
+
+    Returns:
+        The scalar integrated electron count ``∫ρ dr``.
+    """
 
     return mx.sum(density) * grid.dv
 
@@ -168,7 +237,16 @@ def density_from_normalized_orbitals(
     *,
     occupations: Sequence[float],
 ) -> mx.array:
-    """Build a density after normalizing orbitals."""
+    """Build a density after normalizing orbitals.
+
+    Args:
+        orbitals: Real-space orbital stack ``(n_orbitals, *grid.shape)``.
+        grid: Real-space grid defining the FFT mesh.
+        occupations: Per-orbital occupation numbers.
+
+    Returns:
+        The electron density ``ρ = Σᵢ fᵢ |ψᵢ|²`` on the grid, shape ``grid.shape``.
+    """
 
     return density_from_orbitals(orbitals, grid, occupations=occupations)
 
@@ -182,6 +260,15 @@ def local_pseudopotential_forces(
 
     The local energy is ``∫ρ(r)V_loc(r; R_I)dr``. This computes
     ``-∂E/∂R_I`` for the Gaussian center coordinates.
+
+    Args:
+        density: Electron density ``ρ`` on the grid, shape ``grid.shape``.
+        grid: Real-space grid; its ``dv`` weights the integral.
+        pseudopotential: The `LocalGaussianPseudopotential` whose centers feel
+            the force.
+
+    Returns:
+        The force on each Gaussian center, shape ``(n_centers, 3)``.
     """
 
     coordinates = grid.coordinates()

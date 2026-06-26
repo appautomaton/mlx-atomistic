@@ -85,7 +85,12 @@ class PMEDiagnostics:
     direct_space_fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        """Return the diagnostics as a plain JSON-serializable dict."""
+        """Return the diagnostics as a plain JSON-serializable dict.
+
+        Returns:
+            The diagnostics fields (mesh shape, alpha, cutoff, net charge, grid sums,
+                direct-space policy, …) as a dict.
+        """
 
         return {
             "mesh_shape": self.mesh_shape,
@@ -122,7 +127,12 @@ class PMEDirectSpacePolicyReport:
     fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        """Return the policy report as a plain JSON-serializable dict."""
+        """Return the policy report as a plain JSON-serializable dict.
+
+        Returns:
+            The policy report fields (policy, representation, support, cutoff, pair
+                counts, fallback reason) as a dict.
+        """
 
         return {
             "policy": self.policy,
@@ -140,7 +150,16 @@ class PMEDirectSpacePolicyReport:
 
 
 def pme_force_scope_report(scope: str) -> dict[str, object]:
-    """Return PME support metadata for a requested force-evaluation scope."""
+    """Return PME support metadata for a requested force-evaluation scope.
+
+    Args:
+        scope: Force-evaluation scope to query (``"total"``, ``"components"``,
+            ``"direct_space"``, ``"reciprocal_space"``).
+
+    Returns:
+        A `ForceScopeReport` dict; every PME scope is supported and marked
+            as requiring full-system evaluation.
+    """
 
     normalized = normalize_force_scope(scope)
     if normalized == "total":
@@ -196,7 +215,22 @@ def pme_readiness_report(
     one_four_count: int,
     explicit_exception_count: int,
 ) -> dict[str, object]:
-    """Return fail-closed PME readiness metadata for production run gates."""
+    """Return fail-closed PME readiness metadata for production run gates.
+
+    Args:
+        atom_count: Number of atoms in the system.
+        charges: Per-atom partial charges, shape ``(atom_count,)``.
+        cell_lengths: Orthorhombic box lengths, shape ``(3,)``.
+        config: PME parameters (mesh, alpha, cutoffs); ``None`` is reported as a blocker.
+        nonbonded_cutoff: Real-space nonbonded cutoff, cross-checked against the PME cutoff.
+        exclusion_count: Number of excluded pairs.
+        one_four_count: Number of 1-4 corrected pairs.
+        explicit_exception_count: Number of explicit nonbonded exceptions.
+
+    Returns:
+        A readiness dict with a ``"status"``, a ``"blockers"`` list, and the
+            individual boolean checks (neutrality, box, mesh, alpha, cutoff, …).
+    """
 
     checks: dict[str, bool] = {}
     blockers: list[str] = []
@@ -304,7 +338,22 @@ def pme_platform_readiness_report(
     one_four_count: int,
     explicit_exception_count: int,
 ) -> ReadinessReport:
-    """Return PME readiness using the shared platform readiness schema."""
+    """Return PME readiness using the shared platform readiness schema.
+
+    Args:
+        atom_count: Number of atoms in the system.
+        charges: Per-atom partial charges, shape ``(atom_count,)``.
+        cell_lengths: Orthorhombic box lengths, shape ``(3,)``.
+        config: PME parameters; ``None`` is reported as a blocker.
+        nonbonded_cutoff: Real-space nonbonded cutoff, cross-checked against the PME cutoff.
+        exclusion_count: Number of excluded pairs.
+        one_four_count: Number of 1-4 corrected pairs.
+        explicit_exception_count: Number of explicit nonbonded exceptions.
+
+    Returns:
+        A `ReadinessReport` (name ``"pme"``, status, blockers, and the
+            remaining checks as metadata).
+    """
 
     report = pme_readiness_report(
         atom_count=atom_count,
@@ -333,7 +382,27 @@ def pme_coulomb_energy_forces(
     config: PMEConfig | None = None,
     direct_space_pairs: mx.array | NeighborBlocks | None = None,
 ) -> tuple[mx.array, mx.array, dict[str, mx.array | PMEDiagnostics]]:
-    """Evaluate neutral orthorhombic Coulomb energy and forces with PME."""
+    """Evaluate neutral orthorhombic Coulomb energy and forces with PME.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
+        direct_space_pairs: Optional precomputed real-space pairs or neighbor blocks.
+            Defaults to ``None``.
+
+    Returns:
+        An ``(energy, forces, components)`` tuple: scalar total Coulomb energy,
+            ``(n_atoms, 3)`` forces, and a components dict including a
+            `PMEDiagnostics` entry.
+
+    Raises:
+        ValueError: If shapes are wrong, the cell is non-orthorhombic, or the
+            system is not neutral.
+    """
 
     total_energy, forces, components = _pme_coulomb_energy_forces_impl(
         positions,
@@ -359,7 +428,24 @@ def pme_coulomb_total_energy_forces(
     config: PMEConfig | None = None,
     direct_space_pairs: mx.array | NeighborBlocks | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Evaluate neutral orthorhombic Coulomb total energy and forces with PME."""
+    """Evaluate neutral orthorhombic Coulomb total energy and forces with PME.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
+        direct_space_pairs: Optional precomputed real-space pairs or neighbor blocks.
+            Defaults to ``None``.
+
+    Returns:
+        An ``(energy, forces)`` tuple: scalar total Coulomb energy and ``(n_atoms, 3)`` forces.
+
+    Raises:
+        ValueError: If shapes/cell are invalid or the system is not neutral.
+    """
 
     total_energy, forces, _ = _pme_coulomb_energy_forces_impl(
         positions,
@@ -379,7 +465,21 @@ def pme_direct_space_policy_report(
     config: PMEConfig | None = None,
     pairs: mx.array | NeighborBlocks | None = None,
 ) -> dict[str, object]:
-    """Report whether PME direct-space can use dense, pair, block, or fallback policy."""
+    """Report whether PME direct-space can use dense, pair, block, or fallback policy.
+
+    Args:
+        cell: Periodic orthorhombic cell.
+        config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
+        pairs: Optional candidate real-space pairs or neighbor blocks to evaluate the
+            policy against. Defaults to ``None``.
+
+    Returns:
+        A `PMEDirectSpacePolicyReport` dict (selected policy/representation,
+            support, cutoff, and pair-count provenance).
+
+    Raises:
+        ValueError: If the cell is missing, non-orthorhombic, or has non-positive lengths.
+    """
 
     config = PMEConfig() if config is None else config
     if not isinstance(cell, Cell):
@@ -411,7 +511,23 @@ def pme_coulomb_direct_space_energy_forces(
     config: PMEConfig | None = None,
     pairs: mx.array | NeighborBlocks | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Evaluate only the PME real/direct-space Coulomb energy and forces."""
+    """Evaluate only the PME real/direct-space Coulomb energy and forces.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
+        pairs: Optional real-space pairs or neighbor blocks. Defaults to ``None``.
+
+    Returns:
+        An ``(energy, forces)`` tuple: scalar real-space energy and ``(n_atoms, 3)`` forces.
+
+    Raises:
+        ValueError: If shapes/cell are invalid or the system is not neutral.
+    """
 
     config = PMEConfig() if config is None else config
     positions_mx, charges_mx, cell_lengths_mx, cell_lengths_np = _validate_inputs_mx(
@@ -447,6 +563,22 @@ def pme_coulomb_reciprocal_space_energy_forces(
 
     By default the scalar self correction is included so direct-space plus
     reciprocal-space equals the total PME Coulomb energy.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
+        include_self_correction: Whether to add the scalar self-energy correction so
+            direct + reciprocal equals the total. Defaults to ``True``.
+
+    Returns:
+        An ``(energy, forces)`` tuple: scalar reciprocal-space energy and ``(n_atoms, 3)`` forces.
+
+    Raises:
+        ValueError: If shapes/cell are invalid or the system is not neutral.
     """
 
     config = PMEConfig() if config is None else config
@@ -557,7 +689,20 @@ def assign_charges_cic(
     cell: Cell,
     mesh_shape: tuple[int, int, int],
 ) -> mx.array:
-    """Assign charges to a periodic mesh with cloud-in-cell weights."""
+    """Assign charges to a periodic mesh with cloud-in-cell weights.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom charges, shape ``(n_atoms,)``.
+        cell: Periodic orthorhombic cell.
+        mesh_shape: Reciprocal-space mesh dimensions ``(nx, ny, nz)``.
+
+    Returns:
+        The charge density on the mesh, shape ``mesh_shape``.
+
+    Raises:
+        ValueError: If the cell is non-orthorhombic or the shapes are invalid.
+    """
 
     return assign_charges_bspline(
         positions,
@@ -576,7 +721,21 @@ def assign_charges_bspline(
     *,
     assignment_order: int = 2,
 ) -> mx.array:
-    """Assign charges to a periodic mesh with cardinal B-spline weights."""
+    """Assign charges to a periodic mesh with cardinal B-spline weights.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom charges, shape ``(n_atoms,)``.
+        cell: Periodic orthorhombic cell.
+        mesh_shape: Reciprocal-space mesh dimensions ``(nx, ny, nz)``.
+        assignment_order: Cardinal B-spline order (2 = cloud-in-cell). Defaults to ``2``.
+
+    Returns:
+        The charge density on the mesh, shape ``mesh_shape``.
+
+    Raises:
+        ValueError: If the cell is non-orthorhombic or the shapes are invalid.
+    """
 
     positions_mx, charges_mx, cell_lengths_mx, _ = _validate_inputs_mx(
         positions,
