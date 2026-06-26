@@ -79,7 +79,11 @@ class RuntimeTraceReporter:
         )
 
     def to_jsonable(self) -> list[dict[str, Any]]:
-        """Return the collected events as a list of JSON-serializable dicts."""
+        """Return the collected events as a list of JSON-serializable dicts.
+
+        Returns:
+            One dict per recorded reporter event, in arrival order.
+        """
 
         return list(self.events)
 
@@ -105,7 +109,7 @@ class SimulationCheckpoint:
         """Rebuild the in-memory simulation state from this checkpoint.
 
         Returns:
-            A :class:`SimulationState` with MLX-backed arrays.
+            A `SimulationState` with MLX-backed arrays.
         """
 
         return SimulationState(
@@ -162,7 +166,19 @@ def _cell_payload(cell: Cell | None) -> np.ndarray:
 
 
 def read_xyz(path: str | Path) -> tuple[tuple[str, ...], np.ndarray, str]:
-    """Read a single-frame XYZ file."""
+    """Read a single-frame XYZ file.
+
+    Args:
+        path: Path to the ``.xyz`` file.
+
+    Returns:
+        A ``(symbols, positions, comment)`` tuple: element symbols, an
+            ``(n_atoms, 3)`` float array of coordinates, and the comment line.
+
+    Raises:
+        ValueError: If the file has fewer than two lines or the declared atom
+            count does not match the number of coordinate lines.
+    """
 
     lines = Path(path).read_text().splitlines()
     if len(lines) < 2:
@@ -192,7 +208,17 @@ def write_xyz(
     *,
     comment: str = "",
 ) -> None:
-    """Write a single-frame XYZ file."""
+    """Write a single-frame XYZ file.
+
+    Args:
+        path: Destination path for the ``.xyz`` file.
+        symbols: Element symbols, one per atom.
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        comment: Comment written as the file's second line. Defaults to ``""``.
+
+    Raises:
+        ValueError: If ``positions`` does not have shape ``(len(symbols), 3)``.
+    """
 
     positions_np = np.asarray(positions, dtype=np.float32)
     if positions_np.shape != (len(symbols), 3):
@@ -214,7 +240,15 @@ def save_npz_trajectory(
     cell: Cell | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Save a native trajectory record."""
+    """Save a native trajectory record to a compressed ``.npz`` file.
+
+    Args:
+        path: Destination ``.npz`` path.
+        result: A finished simulation result (e.g. `NVEResult`) to serialize.
+        symbols: Optional element symbols stored with the trajectory. Defaults to ``None``.
+        cell: Optional periodic cell stored with the frames. Defaults to ``None``.
+        metadata: Optional JSON-serializable metadata dict. Defaults to ``None``.
+    """
 
     payload = {
         "sampled_positions": np.asarray(result.sampled_positions),
@@ -285,7 +319,18 @@ def trajectory_record_from_result(
     cell: Cell | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> TrajectoryRecord:
-    """Create a native loaded-record view from an in-memory simulation result."""
+    """Create a native loaded-record view from an in-memory simulation result.
+
+    Args:
+        result: A finished simulation result to convert.
+        symbols: Optional element symbols. Defaults to ``None``.
+        cell: Optional periodic cell. Defaults to ``None``.
+        metadata: Optional JSON-serializable metadata dict. Defaults to ``None``.
+
+    Returns:
+        A `TrajectoryRecord` mirroring what `load_npz_trajectory`
+            would return for the same run.
+    """
 
     return TrajectoryRecord(
         sampled_positions=np.asarray(result.sampled_positions),
@@ -331,7 +376,14 @@ def trajectory_record_from_result(
 
 
 def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
-    """Load a native trajectory record."""
+    """Load a native trajectory record from a ``.npz`` file.
+
+    Args:
+        path: Path to a file written by `save_npz_trajectory`.
+
+    Returns:
+        The reconstructed `TrajectoryRecord`.
+    """
 
     with np.load(path, allow_pickle=False) as data:
         term_names = tuple(str(item) for item in data["energy_term_names"].tolist())
@@ -377,7 +429,23 @@ def save_simulation_checkpoint(
     runtime_sync_report: dict[str, int | float] | None = None,
     runtime_nonbonded_report: dict[str, int | float | str | None] | None = None,
 ) -> None:
-    """Write a restart checkpoint for a runner-level continuation."""
+    """Write a restart checkpoint for a runner-level continuation.
+
+    Args:
+        path: Destination checkpoint path (parent directories are created).
+        state: The `SimulationState` to serialize.
+        cell: Optional periodic cell. Defaults to ``None``.
+        thermostat: Optional thermostat state (RNG offset or Nose-Hoover state).
+            Defaults to ``None``.
+        neighbor_policy: Optional neighbor-list policy dict. Defaults to ``None``.
+        force_terms: Optional names of the force terms in effect. Defaults to ``None``.
+        diagnostic_cursor: Optional index into the diagnostic series for exact
+            resumption. Defaults to ``None``.
+        metadata: Optional JSON-serializable metadata dict. Defaults to ``None``.
+        runtime_sync_report: Optional runtime-sync counters to persist. Defaults to ``None``.
+        runtime_nonbonded_report: Optional nonbonded-runtime report to persist.
+            Defaults to ``None``.
+    """
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -462,7 +530,14 @@ def _increment_runtime_wall_seconds(
 
 
 def load_simulation_checkpoint(path: str | Path) -> SimulationCheckpoint:
-    """Load a restart checkpoint written by `save_simulation_checkpoint`."""
+    """Load a restart checkpoint written by `save_simulation_checkpoint`.
+
+    Args:
+        path: Path to a checkpoint file.
+
+    Returns:
+        The reconstructed `SimulationCheckpoint`.
+    """
 
     with np.load(path, allow_pickle=False) as data:
         cell = np.asarray(data["cell"], dtype=np.float32)
@@ -527,7 +602,22 @@ def restart_state_from_trajectory(
     cell: Cell | None = None,
     frame: int = -1,
 ) -> SimulationState:
-    """Recompute forces for a continuation-ready state from a trajectory frame."""
+    """Recompute forces for a continuation-ready state from a trajectory frame.
+
+    Args:
+        record: The `TrajectoryRecord` to restart from.
+        masses: Per-particle masses, shape ``(n_particles,)``.
+        force_terms: One or more force terms used to recompute forces at the frame.
+        cell: Optional periodic cell. Defaults to ``None``.
+        frame: Frame index into the sampled trajectory. Defaults to ``-1`` (last frame).
+
+    Returns:
+        A `SimulationState` with the frame's positions/velocities and
+            freshly recomputed forces.
+
+    Raises:
+        ValueError: If ``force_terms`` is empty.
+    """
 
     positions = as_mx_array(record.sampled_positions[frame])
     velocities = as_mx_array(record.sampled_velocities[frame])

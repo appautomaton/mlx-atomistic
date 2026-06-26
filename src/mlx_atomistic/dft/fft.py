@@ -62,7 +62,7 @@ def ifft3(field_g: mx.array) -> mx.array:
 
 
 def real_to_reciprocal(field: mx.array) -> mx.array:
-    """Alias for :func:`fft3` used by notebooks and docs."""
+    """Alias for `fft3` used by notebooks and docs."""
 
     return fft3(field)
 

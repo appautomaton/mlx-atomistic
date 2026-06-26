@@ -59,7 +59,7 @@ class DiracExchange:
                 Defaults to ``1e-12``.
 
         Returns:
-            An :class:`XCResult` with the energy density, potential, and total energy.
+            An `XCResult` with the energy density, potential, and total energy.
         """
 
         rho = mx.maximum(mx.array(density), density_floor)
@@ -105,7 +105,7 @@ class LDACorrelationPZ81:
                 Defaults to ``1e-12``.
 
         Returns:
-            An :class:`XCResult` with the energy density, potential, and total energy.
+            An `XCResult` with the energy density, potential, and total energy.
         """
 
         rho = mx.maximum(mx.array(density), density_floor)
@@ -161,7 +161,7 @@ class LDAExchangeCorrelation:
                 Defaults to ``1e-12``.
 
         Returns:
-            An :class:`XCResult` with the energy density, potential, and total energy.
+            An `XCResult` with the energy density, potential, and total energy.
         """
 
         exchange = self.exchange.evaluate(density, grid, density_floor=density_floor)

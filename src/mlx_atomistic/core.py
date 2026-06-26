@@ -117,7 +117,7 @@ class Cell:
             length: Edge length of the cube.
 
         Returns:
-            A cubic :class:`Cell` with all three edges equal to ``length``.
+            A cubic `Cell` with all three edges equal to ``length``.
         """
 
         return cls(as_mx_array([length, length, length]))
@@ -130,7 +130,7 @@ class Cell:
             lengths: The three box edge lengths ``(a, b, c)``.
 
         Returns:
-            An axis-aligned :class:`Cell`.
+            An axis-aligned `Cell`.
 
         Raises:
             ValueError: If ``lengths`` does not contain exactly three values.
@@ -149,7 +149,7 @@ class Cell:
             matrix: ``(3, 3)`` matrix whose rows are the three cell vectors.
 
         Returns:
-            A :class:`Cell` for the given (possibly non-orthogonal) box.
+            A `Cell` for the given (possibly non-orthogonal) box.
         """
 
         return cls(matrix)
@@ -157,7 +157,7 @@ class Cell:
     @property
     def lengths(self) -> mx.array:
         """Cell-vector lengths ``(3,)``: the Euclidean norm of each row of
-        :attr:`matrix`."""
+        `matrix`."""
 
         return mx.sqrt(mx.sum(self.matrix * self.matrix, axis=1))
 
@@ -169,7 +169,7 @@ class Cell:
 
     @property
     def volume(self) -> mx.array:
-        """Cell volume, computed as the determinant of :attr:`matrix`."""
+        """Cell volume, computed as the determinant of `matrix`."""
 
         matrix = self.matrix
         determinant = (
@@ -219,7 +219,7 @@ class Cell:
         displacement does work against the forces and injects energy, breaking
         energy conservation over long runs (invisible in short-run tests). The
         direct form keeps the wrap a pure lattice translation, consistent with
-        :meth:`minimum_image`.
+        `minimum_image`.
 
         Args:
             positions: Cartesian row-vector coordinates, shape ``(..., 3)``.
@@ -282,7 +282,7 @@ class Atoms:
         masses: Sequence[float] | None = None,
         velocities: Sequence[Sequence[float]] | None = None,
     ) -> Atoms:
-        """Build an :class:`Atoms` collection from plain Python sequences.
+        """Build an `Atoms` collection from plain Python sequences.
 
         Args:
             symbols: Chemical symbols, one per atom.
@@ -292,7 +292,7 @@ class Atoms:
             velocities: Optional ``(n_atoms, 3)`` initial velocities.
 
         Returns:
-            An :class:`Atoms` instance with MLX-backed arrays.
+            An `Atoms` instance with MLX-backed arrays.
         """
 
         atom_count = len(symbols)

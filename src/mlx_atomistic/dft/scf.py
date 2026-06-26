@@ -144,7 +144,12 @@ class SCFResult:
     solver_metadata: dict | None = None
 
     def to_dict(self) -> dict:
-        """Return a JSON-safe summary without dense array payloads."""
+        """Return a JSON-safe summary without dense array payloads.
+
+        Returns:
+            A JSON-serializable dict of the scalar results, energy terms, history, and
+                timings (dense arrays such as the density are reduced to shapes/lists).
+        """
 
         return {
             "converged": self.converged,
@@ -624,7 +629,30 @@ def run_scf(
     initial_density: mx.array | None = None,
     xc_functional: ExchangeCorrelationFunctional | None = None,
 ) -> SCFResult:
-    """Run a minimal spin-unpolarized Γ-point SCF calculation."""
+    """Run a minimal spin-unpolarized Γ-point SCF calculation.
+
+    Args:
+        system_or_grid: Either a `DFTSystem` (carrying grid, ions, and electron
+            count) or a bare `RealSpaceGrid`.
+        local_potential: External local potential — a Gaussian/field pseudopotential, a
+            grid array, or ``None`` when supplied by ``system_or_grid``. Defaults to ``None``.
+        electron_count: Total electron count; ``None`` takes it from the system.
+            Defaults to ``None``.
+        n_orbitals: Number of orbitals to solve; ``None`` derives it from the electron
+            count. Defaults to ``None``.
+        config: SCF controls (max iterations, tolerances, mixer, solver); ``None`` uses
+            defaults. Defaults to ``None``.
+        initial_orbitals: Optional starting orbitals; ``None`` uses a deterministic
+            guess. Defaults to ``None``.
+        initial_density: Optional starting density; ``None`` builds it from the initial
+            orbitals. Defaults to ``None``.
+        xc_functional: Exchange-correlation functional; ``None`` uses
+            `LDAExchangeCorrelation`. Defaults to ``None``.
+
+    Returns:
+        An `SCFResult` with the converged density, orbitals, energy
+            decomposition, and convergence/timing diagnostics.
+    """
 
     config = SCFConfig() if config is None else config
     grid, local_input, electron_count_value, system = _resolve_inputs(

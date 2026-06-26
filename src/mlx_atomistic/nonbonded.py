@@ -79,7 +79,12 @@ class ForceScopeReport:
     unsupported_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        """Return the force-scope report as a plain JSON-serializable dict."""
+        """Return the force-scope report as a plain JSON-serializable dict.
+
+        Returns:
+            The report's fields (scope, support flags, execution path, electrostatics,
+                reason) as a dict.
+        """
 
         return {
             "scope": self.scope,
@@ -160,7 +165,18 @@ class EwaldReferenceConfig:
 
 
 def validate_nonbonded_backend(backend: str) -> NonbondedBackend:
-    """Validate and normalize a nonbonded backend name."""
+    """Validate and normalize a nonbonded backend name.
+
+    Args:
+        backend: Backend name; one of ``"auto"``, ``"mlx_dense"``,
+            ``"mlx_tiled"``, ``"mlx_pairs"``, ``"python_neighbor"``.
+
+    Returns:
+        The validated backend name.
+
+    Raises:
+        ValueError: If ``backend`` is not a recognized backend.
+    """
 
     allowed = {"auto", "mlx_dense", "mlx_tiled", "mlx_pairs", "python_neighbor"}
     if backend not in allowed:
@@ -170,7 +186,17 @@ def validate_nonbonded_backend(backend: str) -> NonbondedBackend:
 
 
 def validate_full_loop_nonbonded_mode(mode: str) -> FullLoopNonbondedMode:
-    """Validate a full-loop nonbonded policy mode."""
+    """Validate a full-loop nonbonded policy mode.
+
+    Args:
+        mode: Policy mode; one of ``"auto"``, ``"dense"``, ``"dynamic-neighbor"``.
+
+    Returns:
+        The validated mode.
+
+    Raises:
+        ValueError: If ``mode`` is not a recognized mode.
+    """
 
     allowed = {"auto", "dense", "dynamic-neighbor"}
     if mode not in allowed:
@@ -180,7 +206,18 @@ def validate_full_loop_nonbonded_mode(mode: str) -> FullLoopNonbondedMode:
 
 
 def normalize_nonbonded_electrostatics(mode: str) -> NonbondedElectrostatics:
-    """Normalize an electrostatics mode or known metadata alias."""
+    """Normalize an electrostatics mode or known metadata alias.
+
+    Args:
+        mode: Electrostatics mode or alias (case/separator-insensitive), resolving
+            to ``"cutoff"``, ``"ewald_reference"``, or ``"pme"``.
+
+    Returns:
+        The canonical electrostatics mode.
+
+    Raises:
+        ValueError: If ``mode`` does not resolve to a known electrostatics mode.
+    """
 
     normalized = mode.strip().lower().replace("-", "_").replace(" ", "_")
     normalized = _ELECTROSTATICS_ALIASES.get(normalized, normalized)
@@ -192,13 +229,34 @@ def normalize_nonbonded_electrostatics(mode: str) -> NonbondedElectrostatics:
 
 
 def validate_nonbonded_electrostatics(mode: str) -> NonbondedElectrostatics:
-    """Validate an electrostatics mode for executable nonbonded evaluation."""
+    """Validate an electrostatics mode for executable nonbonded evaluation.
+
+    Args:
+        mode: Electrostatics mode or alias to validate.
+
+    Returns:
+        The canonical electrostatics mode.
+
+    Raises:
+        ValueError: If ``mode`` is not a recognized electrostatics mode.
+    """
 
     return normalize_nonbonded_electrostatics(mode)
 
 
 def normalize_force_scope(scope: str) -> ForceEvaluationScope:
-    """Validate and normalize a force-evaluation scope name."""
+    """Validate and normalize a force-evaluation scope name.
+
+    Args:
+        scope: Scope name or alias (case/separator-insensitive), e.g. ``"total"``,
+            ``"components"``, ``"direct_space"``, ``"reciprocal_space"``.
+
+    Returns:
+        The canonical force-evaluation scope.
+
+    Raises:
+        ValueError: If ``scope`` is not a recognized scope.
+    """
 
     normalized = scope.strip().lower().replace("-", "_").replace(" ", "_")
     normalized = _FORCE_SCOPE_ALIASES.get(normalized, normalized)
@@ -221,6 +279,23 @@ def ewald_reference_coulomb_energy(
     This is a correctness reference for small periodic systems. It is not a
     particle-mesh implementation and is intentionally kept separate from the
     production nonbonded force path until force validation is complete.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: Ewald reference parameters (alpha, cutoffs, charge tolerance);
+            ``None`` uses defaults. Defaults to ``None``.
+
+    Returns:
+        An ``(energy, components)`` tuple: scalar total Coulomb energy and a dict
+            of ``coulomb_real``/``coulomb_reciprocal``/``coulomb_self`` parts.
+
+    Raises:
+        ValueError: If shapes are wrong, the cell is non-orthorhombic, lengths are
+            non-positive, or the system is not neutral.
     """
 
     config = EwaldReferenceConfig() if config is None else config
@@ -294,7 +369,23 @@ def ewald_reference_coulomb_energy_forces(
     coulomb_constant: float = 1.0,
     config: EwaldReferenceConfig | None = None,
 ) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
-    """Evaluate neutral orthorhombic Ewald Coulomb energy and analytical forces."""
+    """Evaluate neutral orthorhombic Ewald Coulomb energy and analytical forces.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: Ewald reference parameters; ``None`` uses defaults. Defaults to ``None``.
+
+    Returns:
+        An ``(energy, forces, components)`` tuple: scalar energy, ``(n_atoms, 3)`` forces,
+            and the real/reciprocal/self component dict.
+
+    Raises:
+        ValueError: If shapes/cell are invalid or the system is not neutral.
+    """
 
     total, forces, components = _ewald_reference_coulomb_energy_forces_impl(
         positions,
@@ -318,7 +409,22 @@ def ewald_reference_coulomb_total_energy_forces(
     coulomb_constant: float = 1.0,
     config: EwaldReferenceConfig | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Evaluate neutral orthorhombic Ewald Coulomb total energy and forces."""
+    """Evaluate neutral orthorhombic Ewald Coulomb total energy and forces.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
+            net-neutral.
+        cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
+        coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
+        config: Ewald reference parameters; ``None`` uses defaults. Defaults to ``None``.
+
+    Returns:
+        An ``(energy, forces)`` tuple: scalar total energy and ``(n_atoms, 3)`` forces.
+
+    Raises:
+        ValueError: If shapes/cell are invalid or the system is not neutral.
+    """
 
     total, forces, _ = _ewald_reference_coulomb_energy_forces_impl(
         positions,
@@ -407,7 +513,19 @@ def _ewald_reference_coulomb_energy_forces_impl(
 
 
 def estimate_dense_nonbonded_bytes(n_atoms: int, *, components: str = "combined") -> int:
-    """Return a conservative estimate for dense MLX nonbonded temporaries."""
+    """Return a conservative estimate for dense MLX nonbonded temporaries.
+
+    Args:
+        n_atoms: Number of atoms in the dense evaluation.
+        components: ``"lj"`` for Lennard-Jones-only temporaries or ``"combined"``
+            for LJ+Coulomb. Defaults to ``"combined"``.
+
+    Returns:
+        The estimated peak temporary size in bytes (grows as ``n_atoms²``).
+
+    Raises:
+        ValueError: If ``n_atoms`` is negative.
+    """
 
     if n_atoms < 0:
         msg = "n_atoms must be non-negative"
@@ -426,7 +544,22 @@ def choose_nonbonded_backend(
     estimated_dense_bytes: int,
     memory_budget_bytes: int | None,
 ) -> NonbondedBackend:
-    """Choose the concrete backend for one nonbonded evaluation."""
+    """Choose the concrete backend for one nonbonded evaluation.
+
+    Args:
+        requested: The requested backend; ``"auto"`` resolves from the inputs below.
+        n_atoms: Number of atoms in the evaluation.
+        pairs_provided: Whether an explicit pair list is supplied.
+        estimated_dense_bytes: Estimated dense temporary size (see
+            `estimate_dense_nonbonded_bytes`).
+        memory_budget_bytes: Dense memory budget in bytes; ``None`` means unbounded.
+
+    Returns:
+        The concrete backend to execute.
+
+    Raises:
+        MemoryError: If ``"mlx_dense"`` is explicitly requested but exceeds the budget.
+    """
 
     validate_nonbonded_backend(requested)
     if requested == "auto":
@@ -459,9 +592,25 @@ def choose_full_loop_nonbonded_policy(
 
     The default is based on S1/S2 full-loop and staged-neighbor evidence: above
     the dense threshold use a dynamic neighbor list with compacted pairs
-    (`mlx_cell_pairs`), which is measured to dominate the padded-block path at
-    every tested scale (see `DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND`), while
+    (``mlx_cell_pairs``), which is measured to dominate the padded-block path at
+    every tested scale (see ``DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND``), while
     preserving explicit dense and fallback modes.
+
+    Args:
+        mode: Requested policy mode (``"auto"``, ``"dense"``, ``"dynamic-neighbor"``).
+        n_atoms: Number of atoms in the loop.
+        cutoff: Nonbonded cutoff; required (finite, positive) for the neighbor-list path.
+        cell_provided: Whether a periodic cell is available.
+        dense_threshold: Atom count above which ``"auto"`` switches to a dynamic
+            neighbor list. Defaults to ``DEFAULT_FULL_LOOP_DENSE_THRESHOLD``.
+
+    Returns:
+        The selected `FullLoopNonbondedPolicy` (backend, neighbor-list use,
+            and the evidence/blocker provenance).
+
+    Raises:
+        ValueError: If counts are negative, or a ``"dynamic-neighbor"`` request
+            lacks a periodic cell or a finite positive cutoff.
     """
 
     concrete_mode = validate_full_loop_nonbonded_mode(mode)
@@ -554,7 +703,23 @@ def dense_lj_energy_forces(
     one_four_scale: float,
     tile_size: int | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Evaluate uniform Lennard-Jones energy and forces with dense MLX arrays."""
+    """Evaluate uniform Lennard-Jones energy and forces with dense MLX arrays.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        epsilon: Uniform LJ well depth ε.
+        sigma: Uniform LJ diameter σ.
+        cutoff: Pair cutoff distance; ``None`` disables the cutoff.
+        shift: Whether to energy-shift the potential to zero at the cutoff.
+        cell: Optional periodic cell for minimum-image distances; ``None`` is non-periodic.
+        topology: Optional topology supplying exclusions and 1-4 scaling; ``None`` is all-pairs.
+        one_four_scale: Scale factor applied to 1-4 interactions.
+        tile_size: If set, evaluate in row tiles of this size instead of one dense
+            matrix. Defaults to ``None``.
+
+    Returns:
+        An ``(energy, forces)`` tuple: scalar LJ energy and ``(n_atoms, 3)`` forces.
+    """
 
     if tile_size is not None:
         return tiled_lj_energy_forces(
@@ -608,7 +773,22 @@ def tiled_lj_energy_forces(
     one_four_scale: float,
     tile_size: int,
 ) -> tuple[mx.array, mx.array]:
-    """Evaluate uniform Lennard-Jones energy and forces by row tiles."""
+    """Evaluate uniform Lennard-Jones energy and forces by row tiles.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        epsilon: Uniform LJ well depth ε.
+        sigma: Uniform LJ diameter σ.
+        cutoff: Pair cutoff distance; ``None`` disables the cutoff.
+        shift: Whether to energy-shift the potential to zero at the cutoff.
+        cell: Optional periodic cell for minimum-image distances; ``None`` is non-periodic.
+        topology: Optional topology supplying exclusions and 1-4 scaling; ``None`` is all-pairs.
+        one_four_scale: Scale factor applied to 1-4 interactions.
+        tile_size: Row-block size for the tiled evaluation.
+
+    Returns:
+        An ``(energy, forces)`` tuple: scalar LJ energy and ``(n_atoms, 3)`` forces.
+    """
 
     n_atoms = int(positions.shape[0])
     if n_atoms <= 1:
@@ -669,7 +849,27 @@ def dense_combined_energy_forces(
     coulomb_one_four_scale: float,
     tile_size: int | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Evaluate mixed LJ+Coulomb energy components and forces with MLX arrays."""
+    """Evaluate mixed LJ+Coulomb energy components and forces with dense MLX arrays.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        sigma: Per-atom LJ diameters, shape ``(n_atoms,)`` (Lorentz-Berthelot mixed).
+        epsilon: Per-atom LJ well depths, shape ``(n_atoms,)`` (Lorentz-Berthelot mixed).
+        charges: Per-atom partial charges, shape ``(n_atoms,)``.
+        coulomb_constant: Coulomb prefactor in the configured unit system.
+        cutoff: Pair cutoff distance; ``None`` disables the cutoff.
+        lj_shift: Whether to energy-shift the LJ term at the cutoff.
+        coulomb_shift: Whether to shift the Coulomb term at the cutoff.
+        cell: Optional periodic cell for minimum-image distances.
+        topology: Optional topology supplying exclusions and 1-4 scaling.
+        lj_one_four_scale: 1-4 scale factor for the LJ term.
+        coulomb_one_four_scale: 1-4 scale factor for the Coulomb term.
+        tile_size: If set, evaluate in row tiles of this size. Defaults to ``None``.
+
+    Returns:
+        An ``(lj_energy, coulomb_energy, forces)`` tuple: the two scalar energy
+            components and ``(n_atoms, 3)`` forces.
+    """
 
     if tile_size is not None:
         return tiled_combined_energy_forces(
@@ -739,7 +939,27 @@ def tiled_combined_energy_forces(
     coulomb_one_four_scale: float,
     tile_size: int,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Evaluate mixed LJ+Coulomb energy components and forces by row tiles."""
+    """Evaluate mixed LJ+Coulomb energy components and forces by row tiles.
+
+    Args:
+        positions: Atomic coordinates, shape ``(n_atoms, 3)``.
+        sigma: Per-atom LJ diameters, shape ``(n_atoms,)`` (Lorentz-Berthelot mixed).
+        epsilon: Per-atom LJ well depths, shape ``(n_atoms,)`` (Lorentz-Berthelot mixed).
+        charges: Per-atom partial charges, shape ``(n_atoms,)``.
+        coulomb_constant: Coulomb prefactor in the configured unit system.
+        cutoff: Pair cutoff distance; ``None`` disables the cutoff.
+        lj_shift: Whether to energy-shift the LJ term at the cutoff.
+        coulomb_shift: Whether to shift the Coulomb term at the cutoff.
+        cell: Optional periodic cell for minimum-image distances.
+        topology: Optional topology supplying exclusions and 1-4 scaling.
+        lj_one_four_scale: 1-4 scale factor for the LJ term.
+        coulomb_one_four_scale: 1-4 scale factor for the Coulomb term.
+        tile_size: Row-block size for the tiled evaluation.
+
+    Returns:
+        An ``(lj_energy, coulomb_energy, forces)`` tuple: the two scalar energy
+            components and ``(n_atoms, 3)`` forces.
+    """
 
     n_atoms = int(positions.shape[0])
     if n_atoms <= 1:
@@ -806,7 +1026,20 @@ def dense_pair_mask_and_scales(
     lj_one_four_scale: float,
     coulomb_one_four_scale: float,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Return dense pair mask and scale matrices."""
+    """Return dense pair mask and scale matrices.
+
+    Args:
+        n_atoms: Number of atoms (mask side length).
+        r2: Pairwise squared distances, shape ``(n_atoms, n_atoms)``.
+        cutoff: Pair cutoff distance; ``None`` disables the distance mask.
+        topology: Optional topology supplying exclusions and 1-4 scaling.
+        lj_one_four_scale: 1-4 scale factor for the LJ scale matrix.
+        coulomb_one_four_scale: 1-4 scale factor for the Coulomb scale matrix.
+
+    Returns:
+        A ``(pair_mask, lj_scales, coulomb_scales)`` tuple of ``(n_atoms, n_atoms)``
+            arrays: a boolean inclusion mask and the per-pair LJ/Coulomb scales.
+    """
 
     indices = mx.arange(n_atoms)
     pair_mask = indices[:, None] != indices[None, :]
@@ -834,7 +1067,21 @@ def topology_dense_matrices(
     lj_one_four_scale: float,
     coulomb_one_four_scale: float,
 ) -> tuple[mx.array | None, mx.array | None, mx.array | None]:
-    """Build dense topology masks/scales without creating explicit pair lists."""
+    """Build dense topology masks/scales without creating explicit pair lists.
+
+    Args:
+        n_atoms: Number of atoms (matrix side length).
+        topology: Topology supplying exclusions and 1-4 pairs; ``None`` returns all-``None``.
+        lj_one_four_scale: 1-4 scale factor for the LJ scale matrix.
+        coulomb_one_four_scale: 1-4 scale factor for the Coulomb scale matrix.
+
+    Returns:
+        A ``(mask, lj_scales, coulomb_scales)`` tuple of ``(n_atoms, n_atoms)``
+            arrays, or all ``None`` when ``topology`` is ``None``.
+
+    Raises:
+        ValueError: If ``topology.n_atoms`` does not equal ``n_atoms``.
+    """
 
     if topology is None:
         return None, None, None

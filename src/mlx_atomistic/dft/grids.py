@@ -89,7 +89,7 @@ class RealSpaceGrid:
 
 @dataclass(frozen=True)
 class ReciprocalGrid:
-    """Reciprocal-space vectors matching a :class:`RealSpaceGrid` FFT layout."""
+    """Reciprocal-space vectors matching a `RealSpaceGrid` FFT layout."""
 
     real_grid: RealSpaceGrid
     vectors: mx.array
