@@ -52,7 +52,7 @@ The compressed NPZ helpers save and load the accepted geometry history:
 ```python
 from mlx_atomistic.dft import save_geometry_optimization, load_geometry_optimization
 
-save_geometry_optimization("relaxation.npz", result, metadata={"system": "gth-h2"})
+save_geometry_optimization("relaxation.npz", result, metadata={"system": "gaussian-dimer"})
 record = load_geometry_optimization("relaxation.npz")
 ```
 
@@ -63,16 +63,14 @@ The NPZ record stores positions, forces, energies, maximum forces, statuses, JSO
 Compact built-in demos are available through:
 
 ```bash
-uv run python -m mlx_atomistic.dft.optimize --system gth-h2 --steps 5 --json
+uv run python -m mlx_atomistic.dft.optimize --system gaussian-dimer --steps 5 --json
 ```
 
-Supported demo systems:
+Supported built-in demo systems:
 
 - `gaussian-dimer`: toy two-center Gaussian local potential.
-- `gth-h2`: two hydrogen ions using parsed GTH local pseudopotentials.
-- `upf-si2`: two silicon ions using parsed UPF local pseudopotentials.
 
-The benchmark entry point compares the same families:
+The benchmark entry point runs the same self-contained demo by default:
 
 ```bash
 uv run python -m mlx_atomistic.benchmarks.dft_geometry --json

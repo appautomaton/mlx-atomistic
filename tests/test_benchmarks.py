@@ -74,17 +74,16 @@ def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     assert row["comparison_metric_family"] == metric_family
     assert row["comparison_command"].startswith("uv run python -m mlx_atomistic.benchmarks.")
     assert row["comparison_raw_output_path"].startswith(
-        "results/same-workload-openmm-comparison/mlx-"
+        "benchmark-output/same-workload-openmm-comparison/mlx-"
     )
 
 
-@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
-def test_dhfr_readiness_reports_local_inputs_for_both_cases():
+def test_dhfr_readiness_requires_explicit_inputs_for_both_cases():
     implicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-implicit"])
     explicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"])
 
-    _assert_normalized_payload(implicit, timing_metric="ns_per_day")
-    _assert_normalized_payload(explicit, timing_metric="ns_per_day")
+    _assert_normalized_payload(implicit, timing_metric="ns_per_day", status="blocked")
+    _assert_normalized_payload(explicit, timing_metric="ns_per_day", status="blocked")
     assert implicit["case"] == "dhfr-implicit"
     assert explicit["case"] == "dhfr-explicit-pme"
     assert implicit["comparison_pair_id"] == "dhfr-implicit"
@@ -95,9 +94,11 @@ def test_dhfr_readiness_reports_local_inputs_for_both_cases():
     assert explicit["electrostatics_model"] == "pme"
     assert implicit["input_status"]["downloads_attempted"] is False
     assert explicit["input_status"]["downloads_attempted"] is False
-    assert implicit["atom_count"] and implicit["atom_count"] > 0
-    assert explicit["atom_count"] and explicit["atom_count"] > implicit["atom_count"]
-    assert explicit["cell_metadata_available"] is True
+    assert implicit["atom_count"] is None
+    assert explicit["atom_count"] is None
+    assert explicit["cell_metadata_available"] is False
+    assert "caller-provided DHFR input path" in implicit["blocker"]
+    assert "caller-provided DHFR input path" in explicit["blocker"]
 
 
 def test_dhfr_readiness_missing_inputs_fail_closed(tmp_path):
@@ -109,23 +110,19 @@ def test_dhfr_readiness_missing_inputs_fail_closed(tmp_path):
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["input_status"]["all_inputs_present"] is False
     assert payload["input_status"]["downloads_attempted"] is False
-    assert "missing DHFR input path" in payload["blocker"]
+    assert "caller-provided DHFR input path" in payload["blocker"]
 
 
 @pytest.mark.slow
-def test_dhfr_implicit_prepare_saves_openmm_gbsa_artifact():
+def test_dhfr_implicit_prepare_blocks_without_explicit_inputs():
     payload = dhfr.prepare_payload(case_spec=dhfr.CASE_SPECS["dhfr-implicit"])
 
-    _assert_normalized_payload(payload, timing_metric="ns_per_day")
+    _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["prepare"] is True
-    assert payload["artifact_status"] == "saved"
+    assert payload["artifact_status"] == "not_attempted"
     assert payload["electrostatics_model"] == "gbsa_obc"
-    assert payload["gbsa_obc"]["model"] == "OBC"
-    assert payload["gbsa_obc"]["present_arrays"] == ["gbsa_radius", "gbsa_scale"]
-    assert payload["gbsa_obc"]["missing_arrays"] == []
-    assert payload["gbsa_obc"]["metadata"]["force"] == "GBSAOBCForce"
-    assert payload["artifact_readiness"]["status"] == "ready"
-    assert payload["artifact_path"].startswith("results/dhfr-artifacts/")
+    assert payload["artifact_path"].startswith("dhfr-artifacts/")
+    assert "caller-provided DHFR input path" in payload["blocker"]
 
 
 @pytest.mark.slow
@@ -135,7 +132,7 @@ def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["prepare"] is True
     assert payload["electrostatics_model"] == "pme"
-    assert payload["artifact_path"].startswith("results/dhfr-artifacts/")
+    assert payload["artifact_path"].startswith("dhfr-artifacts/")
     assert payload["force_term_required_arrays"] == [
         "pme_mesh_shape",
         "pme_alpha",
@@ -144,33 +141,24 @@ def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
         "pme_charge_tolerance",
         "pme_deconvolve_assignment",
     ]
-    if payload["artifact_status"] == "blocked":
-        assert payload["unsupported_terms"] or payload["pme"]["missing_arrays"]
-        assert "AMBER explicit PME artifact import blocked" in payload["blocker"]
-    else:
-        assert payload["artifact_status"] == "saved"
-        assert payload["artifact_readiness"]["status"] in {"ready", "blocked"}
-        assert payload["pme"]["mesh_shape"]
+    assert payload["artifact_status"] == "not_attempted"
+    assert "caller-provided DHFR input path" in payload["blocker"]
 
 
 @pytest.mark.slow
-def test_dhfr_implicit_runtime_runs_bounded_mlx_path():
+def test_dhfr_implicit_runtime_blocks_without_explicit_inputs():
     payload = dhfr.runtime_payload(
         case_spec=dhfr.CASE_SPECS["dhfr-implicit"],
         steps=1,
     )
 
-    _assert_normalized_payload(payload, timing_metric="ns_per_day")
+    _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["comparison_pair_id"] == "dhfr-implicit"
     assert payload["step_count"] == 1
-    assert payload["runtime_attempted"] is True
-    assert payload["runtime_stage"] == "completed"
-    assert payload["runtime_blocker_category"] is None
-    assert payload["timing_value"] > 0.0
-    assert payload["ns_per_day"] == payload["timing_value"]
-    assert payload["dt_ps"] == 0.004
-    assert payload["simulated_ns"] == 4e-6
-    assert payload["finite"] is True
+    assert payload["runtime_attempted"] is False
+    assert payload["runtime_stage"] == "blocked"
+    assert payload["runtime_blocker_category"] == "input_absence"
+    assert "caller-provided DHFR input path" in payload["blocker"]
 
 
 @pytest.mark.slow
@@ -1885,7 +1873,6 @@ def test_dft_operator_benchmark_json_and_csv_smoke(tmp_path, capsys):
     assert csv_path.read_text().startswith("grid_shape,grid_points")
 
 
-@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_pseudopotential_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_pseudo.csv"
 
@@ -1903,16 +1890,17 @@ def test_dft_pseudopotential_benchmark_json_and_csv_smoke(tmp_path, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["grid_shape"] == [2, 2, 2]
-    assert payload["case_count"] == 3
-    assert {case["case"] for case in payload["cases"]} == {
-        "gaussian",
-        "gth-local",
-        "upf-local",
+    assert payload["case_count"] == 1
+    assert {case["case"] for case in payload["cases"]} == {"gaussian"}
+    assert payload["external_pseudopotentials"] == {
+        "upf_path": None,
+        "gth_path": None,
+        "gth_element": None,
+        "gth_name": None,
     }
     assert csv_path.read_text().startswith("case,grid_shape")
 
 
-@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_geometry.csv"
 
@@ -1923,7 +1911,7 @@ def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
             "--steps",
             "1",
             "--systems",
-            "gaussian-dimer,gth-h2",
+            "gaussian-dimer",
             "--csv",
             str(csv_path),
             "--json",
@@ -1932,23 +1920,23 @@ def test_dft_geometry_benchmark_json_and_csv_smoke(tmp_path, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["grid_shape"] == [4, 4, 4]
-    assert payload["case_count"] == 2
-    assert {case["case"] for case in payload["cases"]} == {"gaussian-dimer", "gth-h2"}
+    assert payload["case_count"] == 1
+    assert {case["case"] for case in payload["cases"]} == {"gaussian-dimer"}
     assert all(case["steps_completed"] == 1 for case in payload["cases"])
     assert csv_path.read_text().startswith("case,grid_shape")
 
 
-@pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
 def test_dft_nonlocal_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "dft_nonlocal.csv"
 
     dft_nonlocal.main(["--grid", "4,4,4", "--iterations", "1", "--csv", str(csv_path), "--json"])
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["projector_count"] > 0
-    assert payload["nonlocal_applied"]
-    assert payload["dense_vs_operator_max_error"] < 1e-5
-    assert csv_path.read_text().startswith("case,grid_shape")
+    assert payload["status"] == "blocked"
+    assert payload["projector_count"] == 0
+    assert payload["nonlocal_applied"] is False
+    assert "explicit --upf" in payload["blocker"]
+    assert csv_path.read_text().startswith("case,status")
 
 
 def test_dft_solver_benchmark_json_and_csv_smoke(tmp_path, capsys):

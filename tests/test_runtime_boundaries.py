@@ -9,6 +9,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_ENGINE_ROOTS = {"openmm", "lammps"}
+FORBIDDEN_REFERENCE_PATH_FRAGMENTS = (
+    "vendors/",
+    "quantum-espresso/",
+    "cp2k/data",
+    "scripts/prepare_openmm",
+    "results/",
+    "results/inputs/",
+)
+REFERENCE_POLICY_TEXT_FILES = {
+    Path("src/mlx_atomistic/runtime.py"),
+    Path("src/mlx_atomistic/dft/references.py"),
+}
 
 
 def _python_files(root: Path, excluded_parts: set[str] | None = None) -> list[Path]:
@@ -36,6 +48,15 @@ def _import_roots(path: Path) -> set[str]:
     return {module.split(".", maxsplit=1)[0] for module in _import_modules(path)}
 
 
+def _string_literals(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+
+
 def _resolve_dependency_group(
     groups: dict, name: str, seen: set[str] | None = None
 ) -> set[str]:
@@ -59,6 +80,26 @@ def test_core_runtime_does_not_import_reference_engines():
         for path in _python_files(ROOT / "src/mlx_atomistic")
         if _import_roots(path) & FORBIDDEN_ENGINE_ROOTS
     }
+
+    assert offenders == {}
+
+
+def test_installed_package_does_not_hardcode_reference_tree_paths():
+    offenders: dict[Path, list[str]] = {}
+    for path in _python_files(ROOT / "src/mlx_atomistic"):
+        relative = path.relative_to(ROOT)
+        if relative in REFERENCE_POLICY_TEXT_FILES:
+            continue
+        matches = sorted(
+            {
+                fragment
+                for literal in _string_literals(path)
+                for fragment in FORBIDDEN_REFERENCE_PATH_FRAGMENTS
+                if fragment in literal
+            }
+        )
+        if matches:
+            offenders[relative] = matches
 
     assert offenders == {}
 

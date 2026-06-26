@@ -6,15 +6,13 @@ on:
     branches:
       - main
       - master
+  schedule:
+    - cron: "0 9 * * 1"
   workflow_dispatch:
 
 jobs:
-  lint:
-    # GitHub-hosted macOS runners have no usable Metal GPU, so the MLX test suite
-    # SIGABRTs there ("Fatal Python error: Aborted", a different test each run) no
-    # matter the parallelism. CI therefore only LINTS on push/PR; the full MLX test
-    # suite runs locally / on a self-hosted Apple-silicon runner (see README/CI notes).
-    name: lint
+  fast:
+    name: fast package lane
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: macos-14
     steps:
@@ -27,15 +25,19 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
 
-      - name: Install lint tooling
+      - name: Install test tooling
         run: uv sync --extra prep --group test
 
       - name: Lint
         run: uv run --group test ruff check src tests scripts
 
+      - name: Fast package tests
+        run: uv run --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+
   full:
-    # Comprehensive nightly/manual run: builds LAMMPS, runs every tier, gates coverage.
-    name: full suite + coverage
+    # Comprehensive scheduled/manual run. Data/reference tests are still opt-in
+    # because their fixtures and engines are local validation surfaces.
+    name: package suite + coverage
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     steps:
@@ -51,5 +53,5 @@ jobs:
       - name: Install full dev environment (builds LAMMPS)
         run: uv sync --extra prep --group dev
 
-      - name: Full suite + coverage gate
-        run: uv run --group dev python -m pytest --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+      - name: Package suite + coverage gate
+        run: uv run --group dev python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80

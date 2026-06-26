@@ -34,12 +34,7 @@ from mlx_atomistic.runtime import get_runtime_info
 BENCHMARK_NAME = "dhfr"
 COMMAND = default_benchmark_command(BENCHMARK_NAME)
 
-OPENMM_DHFR_MINIMIZED = Path("vendors/openmm/examples/benchmarks/5dfr_minimized.pdb")
-OPENMM_DHFR_SOLVATED = Path("vendors/openmm/examples/benchmarks/5dfr_solv-cube_equil.pdb")
-AMBER20_JAC_PRMTOP = Path("results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop")
-AMBER20_JAC_INPCRD = Path("results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd")
-ARTIFACT_ROOT = Path("results/dhfr-artifacts")
-OPENMM_DHFR_IMPLICIT_PREP_SCRIPT = Path("scripts/prepare_openmm_dhfr_implicit.py")
+DEFAULT_ARTIFACT_ROOT = Path("dhfr-artifacts")
 GBSA_REQUIRED_ARRAYS = ("gbsa_radius", "gbsa_scale")
 PME_REQUIRED_ARRAYS = (
     "pme_mesh_shape",
@@ -61,8 +56,8 @@ class DHFRCaseSpec:
     electrostatics_model: str
     force_field_family: str
     timing_metric: str
-    input_paths: tuple[Path, ...]
-    primary_structure_path: Path
+    input_paths: tuple[Path, ...] = ()
+    primary_structure_path: Path | None = None
     amber_topology_path: Path | None = None
     amber_coordinates_path: Path | None = None
 
@@ -73,22 +68,16 @@ CASE_SPECS = {
         fixture="dhfr_implicit",
         solvent_model="implicit",
         electrostatics_model="gbsa_obc",
-        force_field_family="openmm-stock-dhfr-gbsa",
+        force_field_family="caller-provided-dhfr-gbsa",
         timing_metric="ns_per_day",
-        input_paths=(OPENMM_DHFR_MINIMIZED,),
-        primary_structure_path=OPENMM_DHFR_MINIMIZED,
     ),
     "dhfr-explicit-pme": DHFRCaseSpec(
         case="dhfr-explicit-pme",
         fixture="dhfr_explicit_pme",
         solvent_model="explicit",
         electrostatics_model="pme",
-        force_field_family="amber20-jac",
+        force_field_family="caller-provided-amber-pme",
         timing_metric="ns_per_day",
-        input_paths=(OPENMM_DHFR_SOLVATED, AMBER20_JAC_PRMTOP, AMBER20_JAC_INPCRD),
-        primary_structure_path=OPENMM_DHFR_SOLVATED,
-        amber_topology_path=AMBER20_JAC_PRMTOP,
-        amber_coordinates_path=AMBER20_JAC_INPCRD,
     ),
 }
 
@@ -105,14 +94,21 @@ def main(argv: list[str] | None = None) -> None:
 def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     """Build the DHFR readiness payload for one case."""
 
-    case_spec = CASE_SPECS[args.case]
+    case_spec = _case_spec_from_args(args)
     if args.prepare:
-        return prepare_payload(case_spec=case_spec, repo_root=args.repo_root)
+        return prepare_payload(
+            case_spec=case_spec,
+            repo_root=args.repo_root,
+            artifact_root=args.artifact_root,
+            implicit_prep_script=args.implicit_prep_script,
+        )
     if args.steps is not None:
         return runtime_payload(
             case_spec=case_spec,
             steps=args.steps,
             repo_root=args.repo_root,
+            artifact_root=args.artifact_root,
+            implicit_prep_script=args.implicit_prep_script,
         )
     if args.readiness:
         return readiness_payload(case_spec=case_spec, repo_root=args.repo_root)
@@ -124,7 +120,11 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
 
     root = Path.cwd() if repo_root is None else Path(repo_root)
     input_status = _input_status(case_spec, root)
-    atom_count = _pdb_atom_count(root / case_spec.primary_structure_path)
+    atom_count = (
+        _pdb_atom_count(root / case_spec.primary_structure_path)
+        if case_spec.primary_structure_path is not None
+        else None
+    )
     amber_atom_count = (
         _amber_prmtop_atom_count(root / case_spec.amber_topology_path)
         if case_spec.amber_topology_path is not None
@@ -144,7 +144,11 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
         "solvent_model": case_spec.solvent_model,
         "electrostatics_model": case_spec.electrostatics_model,
         "force_field_family": case_spec.force_field_family,
-        "primary_structure_path": str(case_spec.primary_structure_path),
+        "primary_structure_path": (
+            None
+            if case_spec.primary_structure_path is None
+            else str(case_spec.primary_structure_path)
+        ),
         "amber_topology_path": (
             None if case_spec.amber_topology_path is None else str(case_spec.amber_topology_path)
         ),
@@ -172,19 +176,42 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
         status="blocked" if blocker else "ok",
         blocker=blocker,
         command=COMMAND,
-        raw_output_path=f"results/same-workload-openmm-comparison/mlx-{case_spec.case}.json",
+        raw_output_path=f"benchmark-output/same-workload-openmm-comparison/mlx-{case_spec.case}.json",
     )
 
 
-def prepare_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None) -> dict[str, Any]:
+def prepare_payload(
+    *,
+    case_spec: DHFRCaseSpec,
+    repo_root: Path | None = None,
+    artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
+    implicit_prep_script: Path | None = None,
+) -> dict[str, Any]:
     """Prepare a DHFR artifact when inputs and compatibility metadata are available."""
+
+    return _prepare_payload(
+        case_spec=case_spec,
+        repo_root=repo_root,
+        artifact_root=artifact_root,
+        implicit_prep_script=implicit_prep_script,
+    )
+
+
+def _prepare_payload(
+    *,
+    case_spec: DHFRCaseSpec,
+    repo_root: Path | None = None,
+    artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
+    implicit_prep_script: Path | None = None,
+) -> dict[str, Any]:
+    """Prepare a DHFR artifact with explicit local reference inputs."""
 
     root = Path.cwd() if repo_root is None else Path(repo_root)
     payload = readiness_payload(case_spec=case_spec, repo_root=root)
     payload["readiness_only"] = False
     payload["prepare"] = True
     payload["artifact_status"] = "not_attempted"
-    payload["artifact_path"] = str(ARTIFACT_ROOT / case_spec.case)
+    payload["artifact_path"] = str(artifact_root / case_spec.case)
     payload["required_arrays"] = list(REQUIRED_ARRAYS)
     payload["force_term_required_arrays"] = _force_term_required_arrays(case_spec)
     payload["unsupported_terms"] = []
@@ -194,8 +221,19 @@ def prepare_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None) -
     if payload["status"] == "blocked":
         return payload
     if case_spec.solvent_model == "implicit":
-        return _prepare_implicit_gbsa(case_spec=case_spec, repo_root=root, payload=payload)
-    return _prepare_explicit_pme(case_spec=case_spec, repo_root=root, payload=payload)
+        return _prepare_implicit_gbsa(
+            case_spec=case_spec,
+            repo_root=root,
+            payload=payload,
+            artifact_root=artifact_root,
+            implicit_prep_script=implicit_prep_script,
+        )
+    return _prepare_explicit_pme(
+        case_spec=case_spec,
+        repo_root=root,
+        payload=payload,
+        artifact_root=artifact_root,
+    )
 
 
 def runtime_payload(
@@ -203,10 +241,17 @@ def runtime_payload(
     case_spec: DHFRCaseSpec,
     steps: int,
     repo_root: Path | None = None,
+    artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
+    implicit_prep_script: Path | None = None,
 ) -> dict[str, Any]:
     """Return the DHFR runtime benchmark row or a concrete runtime blocker."""
 
-    payload = prepare_payload(case_spec=case_spec, repo_root=repo_root)
+    payload = _prepare_payload(
+        case_spec=case_spec,
+        repo_root=repo_root,
+        artifact_root=artifact_root,
+        implicit_prep_script=implicit_prep_script,
+    )
     payload["prepare"] = False
     payload["runtime_attempted"] = False
     payload["step_count"] = steps
@@ -222,6 +267,7 @@ def runtime_payload(
         repo_root=Path.cwd() if repo_root is None else Path(repo_root),
         steps=steps,
         payload=payload,
+        artifact_root=artifact_root,
     )
 
 
@@ -230,10 +276,39 @@ def _prepare_implicit_gbsa(
     case_spec: DHFRCaseSpec,
     repo_root: Path,
     payload: dict[str, Any],
+    artifact_root: Path,
+    implicit_prep_script: Path | None,
 ) -> dict[str, Any]:
-    artifact_dir = repo_root / ARTIFACT_ROOT / case_spec.case
+    artifact_dir = repo_root / artifact_root / case_spec.case
+    if implicit_prep_script is None:
+        blocker = "implicit DHFR preparation requires an explicit prep script path"
+        payload.update(
+            {
+                "status": "blocked",
+                "blocker": blocker,
+                "artifact_status": "blocked",
+                "unsupported_terms": ["gbsa_obc_artifact_prepare_unconfigured"],
+                "gbsa_obc": {
+                    "model": "OBC",
+                    "required_arrays": list(GBSA_REQUIRED_ARRAYS),
+                    "present_arrays": [],
+                    "missing_arrays": list(GBSA_REQUIRED_ARRAYS),
+                    "input_source": (
+                        None
+                        if case_spec.primary_structure_path is None
+                        else str(case_spec.primary_structure_path)
+                    ),
+                    "blocker": blocker,
+                },
+            }
+        )
+        return payload
     try:
-        _run_openmm_implicit_prep(repo_root=repo_root, artifact_dir=artifact_dir)
+        _run_openmm_implicit_prep(
+            repo_root=repo_root,
+            artifact_dir=artifact_dir,
+            prep_script=implicit_prep_script,
+        )
         artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as exc:
         blocker = _implicit_prep_error_message(exc)
@@ -248,7 +323,11 @@ def _prepare_implicit_gbsa(
                     "required_arrays": list(GBSA_REQUIRED_ARRAYS),
                     "present_arrays": [],
                     "missing_arrays": list(GBSA_REQUIRED_ARRAYS),
-                    "input_source": str(OPENMM_DHFR_MINIMIZED),
+                    "input_source": (
+                        None
+                        if case_spec.primary_structure_path is None
+                        else str(case_spec.primary_structure_path)
+                    ),
                     "blocker": blocker,
                 },
             }
@@ -278,11 +357,11 @@ def _prepare_implicit_gbsa(
             "blocker": blocker,
             "atom_count": artifact.atom_count,
             "artifact_status": "saved",
-            "artifact_path": str(ARTIFACT_ROOT / case_spec.case),
+            "artifact_path": str(artifact_root / case_spec.case),
             "artifact_files": [
-                str(ARTIFACT_ROOT / case_spec.case / "prepared_system.json"),
-                str(ARTIFACT_ROOT / case_spec.case / "prepared_system.npz"),
-                str(ARTIFACT_ROOT / case_spec.case / "view.pdb"),
+                str(artifact_root / case_spec.case / "prepared_system.json"),
+                str(artifact_root / case_spec.case / "prepared_system.npz"),
+                str(artifact_root / case_spec.case / "view.pdb"),
             ],
             "required_arrays": _array_presence(arrays, REQUIRED_ARRAYS),
             "force_term_required_arrays": _array_presence(arrays, GBSA_REQUIRED_ARRAYS),
@@ -304,7 +383,11 @@ def _prepare_implicit_gbsa(
                     name for name in GBSA_REQUIRED_ARRAYS if _array_present(arrays.get(name))
                 ],
                 "missing_arrays": missing_gbsa_arrays,
-                "input_source": str(OPENMM_DHFR_MINIMIZED),
+                "input_source": (
+                    None
+                    if case_spec.primary_structure_path is None
+                    else str(case_spec.primary_structure_path)
+                ),
                 "metadata": gbsa_metadata,
                 "blocker": blocker,
             },
@@ -313,8 +396,8 @@ def _prepare_implicit_gbsa(
     return payload
 
 
-def _run_openmm_implicit_prep(*, repo_root: Path, artifact_dir: Path) -> None:
-    script = repo_root / OPENMM_DHFR_IMPLICIT_PREP_SCRIPT
+def _run_openmm_implicit_prep(*, repo_root: Path, artifact_dir: Path, prep_script: Path) -> None:
+    script = repo_root / prep_script
     subprocess.run(
         [
             sys.executable,
@@ -359,8 +442,9 @@ def _run_prepared_artifact_runtime(
     repo_root: Path,
     steps: int,
     payload: dict[str, Any],
+    artifact_root: Path,
 ) -> dict[str, Any]:
-    artifact_dir = repo_root / ARTIFACT_ROOT / case_spec.case
+    artifact_dir = repo_root / artifact_root / case_spec.case
     setup_start = time.perf_counter()
     try:
         artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
@@ -482,6 +566,7 @@ def _prepare_explicit_pme(
     case_spec: DHFRCaseSpec,
     repo_root: Path,
     payload: dict[str, Any],
+    artifact_root: Path,
 ) -> dict[str, Any]:
     if case_spec.amber_topology_path is None or case_spec.amber_coordinates_path is None:
         payload.update(
@@ -493,7 +578,7 @@ def _prepare_explicit_pme(
         )
         return payload
 
-    artifact_dir = repo_root / ARTIFACT_ROOT / case_spec.case
+    artifact_dir = repo_root / artifact_root / case_spec.case
     try:
         prepared = import_amber_prmtop(
             prmtop_path=repo_root / case_spec.amber_topology_path,
@@ -562,11 +647,11 @@ def _prepare_explicit_pme(
             "blocker": blocker,
             "atom_count": artifact.atom_count,
             "artifact_status": "saved",
-            "artifact_path": str(ARTIFACT_ROOT / case_spec.case),
+            "artifact_path": str(artifact_root / case_spec.case),
             "artifact_files": [
-                str(ARTIFACT_ROOT / case_spec.case / "prepared_system.json"),
-                str(ARTIFACT_ROOT / case_spec.case / "prepared_system.npz"),
-                str(ARTIFACT_ROOT / case_spec.case / "view.pdb"),
+                str(artifact_root / case_spec.case / "prepared_system.json"),
+                str(artifact_root / case_spec.case / "prepared_system.npz"),
+                str(artifact_root / case_spec.case / "view.pdb"),
             ],
             "required_arrays": _array_presence(arrays, REQUIRED_ARRAYS),
             "force_term_required_arrays": _array_presence(arrays, PME_REQUIRED_ARRAYS),
@@ -691,6 +776,8 @@ def _amber_coordinate_format(path: Path) -> str:
 def _input_status(case_spec: DHFRCaseSpec, repo_root: Path) -> dict[str, Any]:
     existing: list[str] = []
     missing: list[str] = []
+    if not case_spec.input_paths:
+        missing.append("caller-provided DHFR input path(s)")
     for path in case_spec.input_paths:
         target = repo_root / path
         if target.exists():
@@ -745,6 +832,24 @@ def _format_human_payload(payload: dict[str, Any]) -> str:
     return f"DHFR {case}: ready, atom_count={atom_count}"
 
 
+def _case_spec_from_args(args: argparse.Namespace) -> DHFRCaseSpec:
+    spec = CASE_SPECS[args.case]
+    input_paths: list[Path] = []
+    if args.primary_structure is not None:
+        input_paths.append(args.primary_structure)
+    if args.amber_topology is not None:
+        input_paths.append(args.amber_topology)
+    if args.amber_coordinates is not None:
+        input_paths.append(args.amber_coordinates)
+    return replace(
+        spec,
+        input_paths=tuple(input_paths),
+        primary_structure_path=args.primary_structure,
+        amber_topology_path=args.amber_topology,
+        amber_coordinates_path=args.amber_coordinates,
+    )
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=tuple(CASE_SPECS), required=True)
@@ -752,6 +857,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prepare", action="store_true", help="prepare artifact when implemented")
     parser.add_argument("--steps", type=int, default=None, help="runtime steps for later slices")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument("--primary-structure", type=Path, default=None)
+    parser.add_argument("--amber-topology", type=Path, default=None)
+    parser.add_argument("--amber-coordinates", type=Path, default=None)
+    parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
+    parser.add_argument("--implicit-prep-script", type=Path, default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if args.steps is not None and args.steps <= 0:

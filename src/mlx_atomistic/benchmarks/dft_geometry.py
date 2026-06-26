@@ -32,11 +32,11 @@ def _parse_grid(value: str) -> tuple[int, int, int]:
 
 def _systems(value: str | None) -> list[str]:
     if value is None or value == "all":
-        return ["gaussian-dimer", "gth-h2", "upf-si2"]
+        return ["gaussian-dimer"]
     names = [item.strip() for item in value.split(",") if item.strip()]
-    allowed = {"gaussian-dimer", "gth-h2", "upf-si2"}
+    allowed = {"gaussian-dimer"}
     if any(name not in allowed for name in names):
-        msg = "--systems may contain gaussian-dimer, gth-h2, upf-si2, or all"
+        msg = "--systems may contain gaussian-dimer or all"
         raise ValueError(msg)
     return names
 

@@ -83,8 +83,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--system",
-        choices=["gaussian-dimer", "gth-h2", "upf-si2"],
-        default="gth-h2",
+        choices=["gaussian-dimer"],
+        default="gaussian-dimer",
     )
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--grid", default="4,4,4", help="Grid shape as nx,ny,nz.")

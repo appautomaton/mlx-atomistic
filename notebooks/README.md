@@ -3,7 +3,7 @@
 Use the project `uv` environment:
 
 ```bash
-uv sync --extra notebook --extra prep --extra viz --group dev
+uv sync --extra notebook --extra prep --extra viz
 uv run jupyter lab
 ```
 

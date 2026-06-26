@@ -65,18 +65,8 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-explicit-pme --platform Reference --steps 1 --json > results/same-workload-openmm-comparison/openmm-dhfr-explicit-pme.json
 ```
 
-OpenMM OpenCL context reproducer:
-
-```bash
-cd vendors/openmm/examples/benchmarks
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --project ../../../.. \
-  python benchmark.py \
-    --platform OpenCL \
-    --test pme \
-    --seconds 30 \
-    --precision single \
-    --outfile ../../../../results/openmm-opencl-dhfr-m5max.json
-```
+OpenMM OpenCL context is preserved as internal reference evidence; it is not a
+package workflow or a required PyPI validation step.
 
 The OpenMM Reference commands above are one-step same-workload shape checks.
 They are not the OpenCL performance numbers in the context table.

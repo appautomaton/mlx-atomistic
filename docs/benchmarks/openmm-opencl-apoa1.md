@@ -23,8 +23,8 @@ ceiling for what OpenMM extracts from the M5 Max via its OpenCL backend.
 
 ## Provenance
 
-- Engine: OpenMM 8.5.1.dev-f7fa0c2 (vendored at `vendors/openmm/`, run from the
-  upstream stock benchmark script)
+- Engine: OpenMM 8.5.1.dev-f7fa0c2, run as an internal reference checkout
+  outside the package runtime
 - Platform: OpenCL
 - OpenCL platform name: Apple
 - Device: Apple M5 Max (DeviceIndex 0)
@@ -52,16 +52,9 @@ column is directly comparable to the NVIDIA columns in that table.
 
 ## Reproducer
 
-```bash
-cd vendors/openmm/examples/benchmarks
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --project ../../../.. \
-  python benchmark.py \
-    --platform OpenCL \
-    --test apoa1rf,apoa1pme,apoa1ljpme \
-    --seconds 30 \
-    --precision single \
-    --outfile ../../../../results/openmm-opencl-apoa1-m5max.json
-```
+This is an internal reference run, not a package workflow. Use the repository
+reference harness to recreate the OpenMM command plan and keep raw outputs under
+gitignored `results/`.
 
 OpenCL device access on macOS requires running outside the default Claude
 Code sandbox; from a normal terminal session no special permission is

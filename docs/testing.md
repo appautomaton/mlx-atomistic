@@ -10,10 +10,10 @@ or dependency-bound tests run on demand.
 - `slow` — long-running physics / SCF / benchmark tests (>~1s).
 - `integration` — multi-component end-to-end flows. A label, not a speed gate:
   fast integration tests still run in the fast lane; slow ones also carry `slow`.
-- `reference` — require an external reference engine (OpenMM / LAMMPS). Guarded
-  with `pytest.importorskip`, so they skip cleanly when the engine is absent.
+- `reference` — require an external reference engine (OpenMM / LAMMPS). Skipped
+  unless the run includes `--run-reference`.
 - `data` — require a heavy, gitignored dataset (e.g. notebook OpenMM run reports).
-  Skip-guarded when the data is absent.
+  Skipped unless the run includes `--run-data`.
 
 Markers are registered with `--strict-markers`, so a typo'd marker fails fast.
 
@@ -23,20 +23,22 @@ Fast lane — parallel, what CI runs on every push/PR (no reference engines, so 
 never builds LAMMPS):
 
 ```bash
-uv run --group test python -m pytest -n auto -m "not slow and not reference and not data"
+uv run --group test python -m pytest -n auto -m "not slow and not integration and not reference and not data and not gpu"
 ```
 
-Full suite + coverage — what CI runs nightly / on demand (builds LAMMPS, runs
-every tier, gates coverage):
+Package suite + coverage — what CI runs scheduled / on demand. Reference-engine
+and vendor-data tests remain separate opt-in lanes:
 
 ```bash
-uv run --group dev python -m pytest --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+uv run --group dev python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
 ```
 
-Run a single tier, e.g. just the slow tests:
+Run explicit reference or data tiers only after provisioning those local
+surfaces:
 
 ```bash
-uv run --group dev python -m pytest -m slow
+uv run --group dev python -m pytest --run-reference -m reference
+uv run --group dev python -m pytest --run-data -m data
 ```
 
 ## Dependency groups
@@ -45,7 +47,7 @@ uv run --group dev python -m pytest -m slow
   so the fast CI lane never has to build LAMMPS.
 - `reference` — OpenMM (PyPI wheel) and LAMMPS (built from source with
   GPU/OpenCL).
-- `dev` — `test` + `reference` (the full local/CI environment).
+- `dev` — `test` + `reference` for opt-in local validation.
 
 ## Conventions
 

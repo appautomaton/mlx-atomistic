@@ -34,10 +34,15 @@ def _parse_grid(value: str) -> tuple[int, int, int]:
     return shape
 
 
-def _case_systems(grid_shape: tuple[int, int, int]) -> list[tuple[str, DFTSystem]]:
-    upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
-    gth = read_gth("vendors/quantum-espresso/pseudo/H-q1.gth", element="H")
-    return [
+def _case_systems(
+    grid_shape: tuple[int, int, int],
+    *,
+    upf_path: str | Path | None = None,
+    gth_path: str | Path | None = None,
+    gth_element: str | None = None,
+    gth_name: str | None = None,
+) -> list[tuple[str, DFTSystem]]:
+    cases = [
         (
             "gaussian",
             DFTSystem.one_center(
@@ -47,23 +52,32 @@ def _case_systems(grid_shape: tuple[int, int, int]) -> list[tuple[str, DFTSystem
                 electron_count=2.0,
             ),
         ),
-        (
-            "upf-local",
-            DFTSystem(
-                cell=(8.0, 8.0, 8.0),
-                grid_shape=grid_shape,
-                ions=IonCollection([Ion("Si", (4.0, 4.0, 4.0), upf)]),
-            ),
-        ),
-        (
-            "gth-local",
-            DFTSystem(
-                cell=(8.0, 8.0, 8.0),
-                grid_shape=grid_shape,
-                ions=IonCollection([Ion("H", (4.0, 4.0, 4.0), gth)]),
-            ),
-        ),
     ]
+    if upf_path is not None:
+        upf = read_upf(upf_path)
+        cases.append(
+            (
+                "upf-local",
+                DFTSystem(
+                    cell=(8.0, 8.0, 8.0),
+                    grid_shape=grid_shape,
+                    ions=IonCollection([Ion(upf.element, (4.0, 4.0, 4.0), upf)]),
+                ),
+            )
+        )
+    if gth_path is not None:
+        gth = read_gth(gth_path, element=gth_element, name=gth_name)
+        cases.append(
+            (
+                "gth-local",
+                DFTSystem(
+                    cell=(8.0, 8.0, 8.0),
+                    grid_shape=grid_shape,
+                    ions=IonCollection([Ion(gth.element, (4.0, 4.0, 4.0), gth)]),
+                ),
+            )
+        )
+    return cases
 
 
 def run_case(*, label: str, system: DFTSystem, iterations: int) -> dict:
@@ -98,12 +112,22 @@ def build_payload(
     *,
     grid_shape: tuple[int, int, int] = (4, 4, 4),
     iterations: int = 2,
+    upf_path: str | Path | None = None,
+    gth_path: str | Path | None = None,
+    gth_element: str | None = None,
+    gth_name: str | None = None,
 ) -> dict:
     """Run compact local-pseudopotential benchmark cases."""
 
     cases = [
         run_case(label=label, system=system, iterations=iterations)
-        for label, system in _case_systems(grid_shape)
+        for label, system in _case_systems(
+            grid_shape,
+            upf_path=upf_path,
+            gth_path=gth_path,
+            gth_element=gth_element,
+            gth_name=gth_name,
+        )
     ]
     return {
         "runtime": asdict(get_runtime_info()),
@@ -111,6 +135,12 @@ def build_payload(
         "case_count": len(cases),
         "grid_shape": list(grid_shape),
         "iterations_requested": iterations,
+        "external_pseudopotentials": {
+            "upf_path": None if upf_path is None else str(upf_path),
+            "gth_path": None if gth_path is None else str(gth_path),
+            "gth_element": gth_element,
+            "gth_name": gth_name,
+        },
     }
 
 
@@ -135,13 +165,24 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grid", default="4,4,4", help="Grid shape as nx,ny,nz.")
     parser.add_argument("--iterations", type=int, default=2)
+    parser.add_argument("--upf", type=Path, default=None, help="Optional UPF file to include.")
+    parser.add_argument("--gth", type=Path, default=None, help="Optional GTH file or database.")
+    parser.add_argument("--gth-element", default=None, help="Element for a GTH database lookup.")
+    parser.add_argument("--gth-name", default=None, help="Optional named GTH database entry.")
     parser.add_argument("--csv", default=None, help="Optional path for per-case CSV output.")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if args.iterations <= 0:
         msg = "--iterations must be positive"
         raise ValueError(msg)
-    payload = build_payload(grid_shape=_parse_grid(args.grid), iterations=args.iterations)
+    payload = build_payload(
+        grid_shape=_parse_grid(args.grid),
+        iterations=args.iterations,
+        upf_path=args.upf,
+        gth_path=args.gth,
+        gth_element=args.gth_element,
+        gth_name=args.gth_name,
+    )
     if args.csv is not None:
         _write_csv(args.csv, payload["cases"])
     if args.json:
