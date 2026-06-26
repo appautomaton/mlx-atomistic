@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://appautomaton.github.io/mlx-atomistic/">
-    <img src="site/public/og.png" alt="mlx-atomistic — Apple Silicon-native molecular dynamics and DFT runtime on MLX and Metal" width="760">
+    <img src="https://appautomaton.github.io/mlx-atomistic/og.png" alt="mlx-atomistic — Apple Silicon-native molecular dynamics and DFT runtime on MLX and Metal" width="760">
   </a>
 </p>
 
@@ -64,7 +64,7 @@ validation surfaces only — they never replace the MLX runtime path.
 
 ```bash
 uv venv --python 3.13
-uv sync --extra notebook --extra prep --extra viz --group dev
+uv sync --extra notebook --extra prep --extra viz
 uv run python -m ipykernel install --user --name mlx-atomistic --display-name "mlx-atomistic"
 uv run jupyter lab
 ```
@@ -72,7 +72,7 @@ uv run jupyter lab
 If `uv` cannot use the home cache in a sandboxed run, point it at a writable cache:
 
 ```bash
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra prep --extra viz --group dev
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra prep --extra viz
 ```
 
 ## Benchmarks
