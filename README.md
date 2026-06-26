@@ -1,19 +1,66 @@
-# mlx-atomistic
+<p align="center">
+  <a href="https://appautomaton.github.io/mlx-atomistic/">
+    <img src="site/public/og.png" alt="mlx-atomistic — Apple Silicon-native molecular dynamics and DFT runtime on MLX and Metal" width="760">
+  </a>
+</p>
 
-Apple Silicon-native atomistic simulation experiments built on MLX and Metal.
+<h1 align="center">mlx-atomistic</h1>
 
-This project targets Python 3.13 through `uv` and uses MLX for local GPU execution on Apple Silicon. The first milestones are lightweight DFT building blocks, validation notebooks, and visualization utilities rather than a heavy production DFT engine.
+<p align="center">
+  Apple&nbsp;Silicon-native <b>molecular dynamics</b> and <b>density-functional-theory</b> runtime,
+  built directly on <a href="https://github.com/ml-explore/mlx">MLX</a> and Metal —<br>
+  it runs the GPU on your Mac, with no CUDA, server, or cloud.
+</p>
 
-## Runtime Boundary
+<p align="center">
+  <a href="https://appautomaton.github.io/mlx-atomistic/"><img alt="Documentation" src="https://img.shields.io/badge/docs-appautomaton.github.io-6c5ce7?style=flat-square&logo=readthedocs&logoColor=white"></a>
+  <a href="https://github.com/appautomaton/mlx-atomistic/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/appautomaton/mlx-atomistic/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1d1d1f?style=flat-square">
+  <a href="https://appautomaton.github.io"><img alt="Part of App Automaton" src="https://img.shields.io/badge/part%20of-App%20Automaton-6c5ce7?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <b><a href="https://appautomaton.github.io/mlx-atomistic/">Documentation</a></b> ·
+  <a href="https://appautomaton.github.io/mlx-atomistic/overview/">Overview</a> ·
+  <a href="https://appautomaton.github.io/mlx-atomistic/mm/molecular-mechanics/">Molecular mechanics</a> ·
+  <a href="https://appautomaton.github.io/mlx-atomistic/dft/dft-scf-core/">DFT</a> ·
+  <a href="https://appautomaton.github.io/mlx-atomistic/api/">API reference</a> ·
+  <a href="https://appautomaton.github.io/mlx-atomistic/benchmarks/">Benchmarks</a>
+</p>
+
+---
+
+## What is mlx-atomistic?
+
+**mlx-atomistic is an Apple Silicon-native runtime for molecular dynamics (MD) and
+density functional theory (DFT)**, built directly on Apple's [MLX](https://github.com/ml-explore/mlx)
+array framework and the Metal GPU backend. It runs the simulation kernels on the
+GPU in your Mac — no CUDA, no remote cluster, no cloud. The aim is a fast, local,
+fully scriptable atomistic toolkit: plane-wave DFT building blocks, a real
+molecular-mechanics force field, prepared-system imports, and Jupyter-first
+visualization.
 
 `mlx_atomistic` is the primary trajectory generator and product runtime in this
-repo. OpenMM, LAMMPS, and the source trees under `vendors/` are reference or
-validation surfaces; they do not replace the MLX runtime path.
+repo. OpenMM, LAMMPS, and the source trees under `vendors/` are reference and
+validation surfaces only — they never replace the MLX runtime path.
 
-See `docs/runtime-boundaries.md` for the dependency roles and current
-OpenMM/LAMMPS provenance.
+## Features
 
-## Setup
+- **Apple Silicon native** — MLX arrays and Metal kernels drive the GPU on your
+  machine. No CUDA, no server, no cloud.
+- **Plane-wave DFT** — Kohn–Sham SCF, LDA + PBE via autodiff, Γ-point and k-mesh,
+  Davidson diagonalization, GTH/UPF pseudopotentials with local + nonlocal projectors.
+- **Molecular mechanics** — Lennard-Jones, Coulomb, harmonic bonds and angles,
+  periodic + Ryckaert-Bellemans torsions, bounded PME, Langevin NVT, NPT.
+- **Prepared-system imports** — AMBER `prmtop`/`inpcrd`, CHARMM PSF/parameter, and
+  GROMACS `.top`/`.gro` subsets, with explicit physical-unit metadata.
+- **Reference-validated** — OpenMM and LAMMPS reference surfaces keep the MLX
+  runtime honest, run after run.
+- **Self-documenting** — Google-style docstrings generate the [API reference](https://appautomaton.github.io/mlx-atomistic/api/)
+  and an [`llms.txt`](https://appautomaton.github.io/mlx-atomistic/llms.txt) for agentic tools.
+
+## Quick start
 
 ```bash
 uv venv --python 3.13
@@ -22,48 +69,11 @@ uv run python -m ipykernel install --user --name mlx-atomistic --display-name "m
 uv run jupyter lab
 ```
 
-If `uv` cannot use the home cache in a sandboxed run, use a writable cache:
+If `uv` cannot use the home cache in a sandboxed run, point it at a writable cache:
 
 ```bash
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --extra notebook --extra prep --extra viz --group dev
 ```
-
-## Initial Scope
-
-- MLX-backed arrays and kernels for atomistic/DFT experiments.
-- Molecular mechanics in reduced and physical units: LJ, Coulomb, harmonic
-  bonds/angles, periodic torsions, Ryckaert-Bellemans torsions, and bounded PME.
-- Programmatic topology with exclusions, 1-4 scaling, and partial charges.
-- Native prepared-system imports for accepted AMBER `prmtop`/`inpcrd`, CHARMM
-  PSF/parameter, and GROMACS `.top`/`.gro` subsets.
-- Jupyter-first visualization of structures, densities, orbitals, and SCF convergence.
-- Small, validated examples before broader chemistry coverage.
-
-See `docs/units.md` for the internal unit policy.
-
-Low-level MD kernels still accept Lennard-Jones reduced-unit inputs unless a
-caller converts values at the API boundary. Prepared-system artifacts use
-explicit physical-unit metadata for imported force-field systems. Both paths keep
-sparse trajectory frames separately from dense per-step diagnostics. NVE is
-available for energy drift checks, and Langevin NVT is available for seeded
-temperature-controlled experiments.
-
-## Documentation
-
-- `docs/molecular-mechanics.md`: topology, force-field terms, virtual sites,
-  custom forces, GBSA/OBC, soft-core lambda scaling, and replica exchange.
-- `docs/production-md.md`: prepared-system artifacts, accepted parser paths,
-  TIP4P-Ew, PME, runtime readiness, and production MD gates.
-- `docs/real-mm-core.md`: typed systems, force-field assignment, constraints,
-  trajectory I/O, and the combined nonbonded path.
-- `docs/validation-and-performance.md`: force validation, stability checks, and
-  benchmark workflow.
-- `docs/testing.md`: test tiers (markers), the parallel fast lane, and CI lanes.
-- `docs/runtime-boundaries.md`: MLX runtime boundary and reference-engine policy.
-- `docs/units.md`: internal unit policy.
-- `docs/dft-foundations.md`: spin-unpolarized Γ-point plane-wave DFT prototype.
-- `docs/dft-scf-core.md`: exchange-correlation, SCF mixing, force, and DFT
-  benchmark surface.
 
 ## Benchmarks
 
@@ -76,10 +86,37 @@ uv run python -m mlx_atomistic.benchmarks.stability --json
 uv run python -m mlx_atomistic.benchmarks.dft_scf --sizes 8,16,24,32 --iterations 5 --mixer both --json
 ```
 
-## Layout
+## Documentation
 
-- `src/mlx_atomistic/`: core MLX/Metal simulation package code.
-- `src/mlx_atomistic/prep/`: preparation/import tooling for MLX-ready artifacts.
-- `notebooks/`: exploratory notebooks and visual validation.
-- `tests/`: focused unit tests.
-- `vendors/`: reference source trees; not imported as project code.
+The full documentation — narrative guides plus an auto-generated API reference —
+lives at **[appautomaton.github.io/mlx-atomistic](https://appautomaton.github.io/mlx-atomistic/)**:
+
+- [Overview](https://appautomaton.github.io/mlx-atomistic/overview/) — what the runtime is and how the pieces fit.
+- [Molecular mechanics](https://appautomaton.github.io/mlx-atomistic/mm/molecular-mechanics/) — topology, force-field terms, virtual sites, GBSA/OBC, soft-core λ, replica exchange.
+- [Density functional theory](https://appautomaton.github.io/mlx-atomistic/dft/dft-scf-core/) — plane-wave SCF, exchange-correlation, mixing, forces.
+- [API reference](https://appautomaton.github.io/mlx-atomistic/api/) — generated directly from the package docstrings.
+- [Benchmarks](https://appautomaton.github.io/mlx-atomistic/benchmarks/) — validation gauntlet, stability, and performance methodology.
+
+The narrative source lives in [`docs/`](docs/) and the site itself in [`site/`](site/);
+the API pages are regenerated from the package on every deploy, so they never drift
+from the code.
+
+## Runtime boundary
+
+`mlx_atomistic` is the product runtime. Low-level MD kernels accept Lennard-Jones
+reduced-unit inputs unless a caller converts at the API boundary; prepared-system
+artifacts carry explicit physical-unit metadata. Sparse trajectory frames are kept
+separately from dense per-step diagnostics. NVE is available for energy-drift
+checks and Langevin NVT for seeded temperature-controlled runs. See
+[`docs/runtime-boundaries.md`](docs/runtime-boundaries.md) for the dependency roles
+and reference-engine provenance, and [`docs/units.md`](docs/units.md) for the unit policy.
+
+## Part of App Automaton
+
+mlx-atomistic is part of **[App Automaton](https://appautomaton.github.io)** — open
+skills, harnesses, and on-device tools for engineering with AI coding agents, with a
+focus on local-first, Apple-Silicon-native execution.
+
+## License
+
+[MIT](LICENSE).
