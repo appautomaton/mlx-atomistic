@@ -20,6 +20,7 @@ from source every time.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -54,6 +55,23 @@ _VAR_KEYWORD = ParameterKind.var_keyword
 _KEYWORD_ONLY = ParameterKind.keyword_only
 
 
+# Sphinx/RST cross-reference roles like :class:`~pkg.mod.Name`. Starlight renders
+# Markdown, not RST, so these never resolve to links — strip the role to plain
+# inline code. A leading ``~`` keeps only the last dotted component, per RST.
+_ROLE_RE = re.compile(r":(?:class|func|meth|mod|obj|data|attr|exc|ref):`(~?)([^`]+)`")
+
+
+def clean(text: str) -> str:
+    """Downgrade RST cross-reference roles in docstring prose to inline code."""
+    def repl(match: re.Match) -> str:
+        name = match.group(2)
+        if match.group(1):
+            name = name.split(".")[-1]
+        return f"`{name}`"
+
+    return _ROLE_RE.sub(repl, text)
+
+
 def esc(text: str) -> str:
     """Make a string safe for a single Markdown table cell."""
     return " ".join(str(text).split()).replace("|", "\\|")
@@ -69,7 +87,7 @@ def parse_doc(obj) -> dict:
         sections = doc.parse(Parser.google)
     except Exception:
         text = doc.value.strip()
-        out["summary"] = text.split("\n\n", 1)[0]
+        out["summary"] = clean(text.split("\n\n", 1)[0])
         return out
 
     first_text = True
@@ -78,23 +96,23 @@ def parse_doc(obj) -> dict:
             text = s.value.strip()
             if first_text:
                 parts = text.split("\n\n", 1)
-                out["summary"] = parts[0]
+                out["summary"] = clean(parts[0])
                 if len(parts) > 1:
-                    out["body"].append(parts[1])
+                    out["body"].append(clean(parts[1]))
                 first_text = False
             else:
-                out["body"].append(text)
+                out["body"].append(clean(text))
         elif s.kind is Kind.parameters:
             for p in s.value:
-                out["params"][p.name] = (p.description or "").strip()
+                out["params"][p.name] = clean((p.description or "").strip())
         elif s.kind is Kind.returns:
             for r in s.value:
                 ann = str(r.annotation) if r.annotation is not None else ""
-                out["returns"].append((ann, (r.description or "").strip()))
+                out["returns"].append((ann, clean((r.description or "").strip())))
         elif s.kind is Kind.raises:
             for r in s.value:
                 ann = str(r.annotation) if r.annotation is not None else ""
-                out["raises"].append((ann, (r.description or "").strip()))
+                out["raises"].append((ann, clean((r.description or "").strip())))
         elif s.kind is Kind.examples:
             for item in s.value:
                 content = item[1] if isinstance(item, tuple) else str(item)
