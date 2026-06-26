@@ -49,8 +49,8 @@ also a struggle.
 
 ## Provenance
 
-- Engine: OpenMM 8.5.1.dev-f7fa0c2 (vendored at `vendors/openmm/`, run via
-  the upstream stock benchmark script)
+- Engine: OpenMM 8.5.1.dev-f7fa0c2, run as an internal reference checkout
+  outside the package runtime
 - Platform: OpenCL
 - OpenCL platform name: Apple
 - Device: Apple M5 Max (DeviceIndex 0)
@@ -91,22 +91,9 @@ Identical to the configuration used at `openmm.org/benchmarks`.
 
 ## Reproducer
 
-```bash
-cd results/inputs
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --project ../.. \
-  python ../../vendors/openmm/examples/benchmarks/benchmark.py \
-    --platform OpenCL \
-    --test amber20-cellulose,amber20-stmv \
-    --seconds 30 \
-    --precision single \
-    --outfile ../openmm-opencl-amber20-m5max.json
-```
-
-The script downloads `Amber20_Benchmark_Suite.tar.gz` into the current
-working directory on first run and extracts it next to itself. By running
-from `results/inputs/`, the download stays inside the gitignored
-`results/` tree rather than polluting the vendored OpenMM source under
-`vendors/`.
+This is an internal reference run, not a package workflow. Use the repository
+reference harness to recreate the OpenMM command plan; it keeps downloaded
+AMBER inputs and raw outputs under gitignored `results/`.
 
 ## Open questions for follow-up benchmarks
 

@@ -55,8 +55,8 @@ competes in.
 
 ## Provenance
 
-- Engine: OpenMM 8.5.1.dev-f7fa0c2 (vendored at `vendors/openmm/`, run from
-  the upstream stock benchmark script)
+- Engine: OpenMM 8.5.1.dev-f7fa0c2, run as an internal reference checkout
+  outside the package runtime
 - Platform: OpenCL
 - OpenCL platform name: Apple
 - Device: Apple M5 Max (DeviceIndex 0)
@@ -84,16 +84,9 @@ M5 Max column is directly comparable to the NVIDIA columns in that table.
 
 ## Reproducer
 
-```bash
-cd vendors/openmm/examples/benchmarks
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --project ../../../.. \
-  python benchmark.py \
-    --platform OpenCL \
-    --test gbsa,rf,pme \
-    --seconds 30 \
-    --precision single \
-    --outfile ../../../../results/openmm-opencl-dhfr-m5max.json
-```
+This is an internal reference run, not a package workflow. Use the repository
+reference harness to recreate the OpenMM command plan and keep raw outputs under
+gitignored `results/`.
 
 PDB inputs (`5dfr_minimized.pdb`, `5dfr_solv-cube_equil.pdb`) ship with the
 OpenMM source in this directory — no downloads required.

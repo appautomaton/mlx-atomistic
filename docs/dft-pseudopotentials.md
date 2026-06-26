@@ -73,4 +73,11 @@ uv run python -m mlx_atomistic.benchmarks.dft_pseudopotential --json
 ```
 
 The benchmark compares compact Gaussian, UPF-local, and GTH-local SCF cases and
-reports timing plus pseudopotential diagnostics.
+reports timing plus pseudopotential diagnostics when explicit pseudopotential
+files are supplied. Without extra inputs, the installed package runs only the
+self-contained Gaussian case:
+
+```bash
+uv run python -m mlx_atomistic.benchmarks.dft_pseudopotential --json
+uv run python -m mlx_atomistic.benchmarks.dft_pseudopotential --upf path/to/pseudo.upf --gth path/to/pseudo.gth --gth-element H --json
+```

@@ -34,10 +34,10 @@ def _parse_grid(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in parts)
 
 
-def run_case(*, grid_shape: tuple[int, int, int], iterations: int) -> dict:
+def run_case(*, grid_shape: tuple[int, int, int], iterations: int, upf_path: str | Path) -> dict:
     """Run one compact nonlocal benchmark case."""
 
-    upf = read_upf("vendors/quantum-espresso/pseudo/Si_r.upf")
+    upf = read_upf(upf_path)
     system = DFTSystem(
         cell=(8.0, 8.0, 8.0),
         grid_shape=grid_shape,
@@ -77,14 +77,52 @@ def run_case(*, grid_shape: tuple[int, int, int], iterations: int) -> dict:
     }
 
 
-def build_payload(*, grid_shape: tuple[int, int, int] = (4, 4, 4), iterations: int = 1) -> dict:
+def _blocked_case(
+    *,
+    grid_shape: tuple[int, int, int],
+    iterations: int,
+    blocker: str,
+) -> dict:
+    return {
+        "case": "upf-si-nonlocal",
+        "status": "blocked",
+        "blocker": blocker,
+        "grid_shape": list(grid_shape),
+        "grid_points": int(np.prod(grid_shape)),
+        "iterations_requested": iterations,
+        "projector_count": 0,
+        "nonlocal_applied": False,
+        "final_energy": None,
+        "nonlocal_energy": None,
+        "operator_apply_ms": None,
+        "dense_vs_operator_max_error": None,
+        "timings": None,
+    }
+
+
+def build_payload(
+    *,
+    grid_shape: tuple[int, int, int] = (4, 4, 4),
+    iterations: int = 1,
+    upf_path: str | Path | None = None,
+) -> dict:
     """Run nonlocal benchmark smoke."""
 
-    case = run_case(grid_shape=grid_shape, iterations=iterations)
+    case = (
+        _blocked_case(
+            grid_shape=grid_shape,
+            iterations=iterations,
+            blocker="nonlocal benchmark requires an explicit --upf pseudopotential path",
+        )
+        if upf_path is None
+        else run_case(grid_shape=grid_shape, iterations=iterations, upf_path=upf_path)
+    )
     return {
         "runtime": asdict(get_runtime_info()),
         "cases": [case],
         "case_count": 1,
+        "status": case.get("status", "ok"),
+        "blocker": case.get("blocker"),
         **case,
     }
 
@@ -110,19 +148,27 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grid", default="4,4,4")
     parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--upf", type=Path, default=None, help="UPF file with nonlocal projectors.")
     parser.add_argument("--csv", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    payload = build_payload(grid_shape=_parse_grid(args.grid), iterations=args.iterations)
+    payload = build_payload(
+        grid_shape=_parse_grid(args.grid),
+        iterations=args.iterations,
+        upf_path=args.upf,
+    )
     if args.csv is not None:
         _write_csv(args.csv, payload["cases"])
     if args.json:
         print(json.dumps(payload, indent=2))
         return
-    print(
-        f"dft_nonlocal grid={tuple(payload['grid_shape'])} "
-        f"projectors={payload['projector_count']} energy={payload['final_energy']:.8g}"
-    )
+    if payload["status"] == "blocked":
+        print(f"dft_nonlocal blocked: {payload['blocker']}")
+    else:
+        print(
+            f"dft_nonlocal grid={tuple(payload['grid_shape'])} "
+            f"projectors={payload['projector_count']} energy={payload['final_energy']:.8g}"
+        )
 
 
 if __name__ == "__main__":

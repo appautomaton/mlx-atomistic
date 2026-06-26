@@ -48,10 +48,10 @@ STMV systems, but these numbers are reference ceilings for this repo.
 
 ## LAMMPS Reference Results
 
-LAMMPS coverage uses the five official top-level inputs from
-`vendors/lammps/bench/`. The harness copies each input into
-`results/m5max-reference/lammps/<case>/work/` before running, so `vendors/`
-stays read-only.
+LAMMPS coverage uses the five official top-level inputs from an internal
+reference checkout. The harness copies each input into
+`results/m5max-reference/lammps/<case>/work/` before running, so the reference
+checkout stays read-only.
 
 | Case | Status | Acceleration class | Loop time, s | Raw wrapper |
 | --- | ---: | --- | ---: | --- |

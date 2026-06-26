@@ -13,7 +13,6 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell
-from mlx_atomistic.dft.pseudopotentials import Ion, IonCollection, read_gth, read_upf
 from mlx_atomistic.dft.scf import SCFConfig, SCFResult, run_scf
 from mlx_atomistic.dft.system import DFTSystem
 from mlx_atomistic.dft.xc import DiracExchange, ExchangeCorrelationFunctional
@@ -474,7 +473,7 @@ def geometry_demo_system(
     *,
     grid_shape: Sequence[int] = (4, 4, 4),
 ) -> DFTSystem:
-    """Build one of the compact DFT geometry-optimization demo systems."""
+    """Build a compact built-in DFT geometry-optimization demo system."""
 
     shape = tuple(int(item) for item in grid_shape)
     if name == "gaussian-dimer":
@@ -487,31 +486,7 @@ def geometry_demo_system(
             widths=(0.85, 0.85),
             charges=(0.6, 0.6),
         )
-    if name == "gth-h2":
-        gth = read_gth(_reference_path("vendors/quantum-espresso/pseudo/H-q1.gth"), element="H")
-        return DFTSystem(
-            cell=(8.0, 8.0, 8.0),
-            grid_shape=shape,
-            ions=IonCollection(
-                [
-                    Ion("H", (3.15, 4.0, 4.0), gth),
-                    Ion("H", (4.85, 4.0, 4.0), gth),
-                ]
-            ),
-        )
-    if name == "upf-si2":
-        upf = read_upf(_reference_path("vendors/quantum-espresso/pseudo/Si_r.upf"))
-        return DFTSystem(
-            cell=(10.0, 10.0, 10.0),
-            grid_shape=shape,
-            ions=IonCollection(
-                [
-                    Ion("Si", (3.2, 5.0, 5.0), upf),
-                    Ion("Si", (6.8, 5.0, 5.0), upf),
-                ]
-            ),
-        )
-    msg = "unknown demo system; expected gaussian-dimer, gth-h2, or upf-si2"
+    msg = "unknown demo system; expected gaussian-dimer"
     raise ValueError(msg)
 
 
@@ -746,11 +721,3 @@ def _scf_config_summary(config: SCFConfig) -> dict[str, Any]:
         },
     }
 
-
-def _reference_path(relative: str) -> Path:
-    candidates = [Path.cwd().resolve(), *Path(__file__).resolve().parents]
-    for base in candidates:
-        path = base / relative
-        if path.exists():
-            return path
-    return Path(relative)

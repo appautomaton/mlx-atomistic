@@ -35,8 +35,8 @@ from mlx_atomistic.pme import (
 )
 from mlx_atomistic.runtime import get_runtime_info
 
-DEFAULT_FIXTURE_DIR = Path("results/md-engine-structural-gap-closure/pme-parity")
-DEFAULT_OUTPUT_DIR = Path("results/md-engine-structural-gap-closure/baseline")
+DEFAULT_OUTPUT_DIR = Path("pme-profile-output")
+MISSING_FIXTURE_LABEL = Path("user-provided-pme-fixture")
 SYNC_TIMING_BLOCKER = (
     "PME exposes stage-level mx.eval barriers in the profiler, but exact "
     "in-function synchronization attribution requires runtime instrumentation "
@@ -310,12 +310,19 @@ def _empty_correction_result(positions: mx.array) -> tuple[mx.array, mx.array]:
 
 def build_payload(
     *,
-    fixture_dir: Path = DEFAULT_FIXTURE_DIR,
+    fixture_dir: Path | None = None,
     iterations: int = 5,
     warmups: int = 1,
 ) -> dict:
     """Return a PME profile payload for the existing parity fixture."""
 
+    if fixture_dir is None:
+        return _blocked_payload(
+            fixture_dir=MISSING_FIXTURE_LABEL,
+            iterations=iterations,
+            warmups=warmups,
+            blocker="PME profiling requires an explicit --fixture-dir path",
+        )
     prepared_dir = fixture_dir / "prepared"
     report_path = fixture_dir / "openmm_mlx_parity_report.json"
     if not report_path.exists():
@@ -769,7 +776,7 @@ def _write_payload(path: Path, payload: dict) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fixture-dir", type=Path, default=DEFAULT_FIXTURE_DIR)
+    parser.add_argument("--fixture-dir", type=Path, default=None)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUT_DIR)

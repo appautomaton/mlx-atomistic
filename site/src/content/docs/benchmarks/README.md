@@ -58,7 +58,7 @@ LAMMPS, OpenCL, large downloaded fixtures, or committed raw outputs.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
-| `uv run pytest tests/test_benchmarks.py -q` | mlx_atomistic | fast developer | pytest stdout; temporary test files only |
+| `uv run --group test python -m pytest tests/test_benchmarks.py -m "not slow and not reference and not data and not gpu"` | mlx_atomistic | fast developer | pytest stdout; temporary test files only |
 | `uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 1 --particles 16 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --sizes 16 --evaluations 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --sizes 32 --steps 1 --sample-interval 1 --diagnostic-interval 1 --evaluation-interval 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
@@ -110,9 +110,9 @@ stock upstream benchmark script:
 
 | Summary | Raw reference input | Normalized fields |
 | --- | --- | --- |
-| [openmm-opencl-dhfr.md](./openmm-opencl-dhfr.md) | `results/openmm-opencl-dhfr-m5max.json` from `vendors/openmm/examples/benchmarks/benchmark.py` | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
-| [openmm-opencl-apoa1.md](./openmm-opencl-apoa1.md) | `results/openmm-opencl-apoa1-m5max.json` from `vendors/openmm/examples/benchmarks/benchmark.py` | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
-| [openmm-opencl-amber20.md](./openmm-opencl-amber20.md) | `results/openmm-opencl-amber20-m5max.json` from `vendors/openmm/examples/benchmarks/benchmark.py` | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
+| [openmm-opencl-dhfr.md](./openmm-opencl-dhfr.md) | `results/openmm-opencl-dhfr-m5max.json` from an internal OpenMM reference run | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
+| [openmm-opencl-apoa1.md](./openmm-opencl-apoa1.md) | `results/openmm-opencl-apoa1-m5max.json` from an internal OpenMM reference run | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
+| [openmm-opencl-amber20.md](./openmm-opencl-amber20.md) | `results/openmm-opencl-amber20-m5max.json` from an internal OpenMM reference run | engine, fixture/system, atom count, timing metric, runtime, hardware, raw output path |
 | [m5max-reference-engines.md](./m5max-reference-engines.md) | `results/m5max-reference/manifest.json` from `scripts/benchmark_m5max_reference.py` | engine provenance, required case coverage, OpenMM rows, LAMMPS statuses, raw output paths |
 | [lammps-opencl-m5max.md](./lammps-opencl-m5max.md) | `results/m5max-reference/lammps/*.json` from `scripts/benchmark_m5max_reference.py` | official input paths, style mapping, acceleration classification, loop time or blocker |
 

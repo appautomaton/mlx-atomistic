@@ -50,8 +50,8 @@ def test_gaussian_dimer_one_step_lowers_or_preserves_energy():
 
 
 @pytest.mark.slow
-def test_gth_relaxation_reduces_force_and_preserves_electron_count():
-    system = geometry_demo_system("gth-h2", grid_shape=(4, 4, 4))
+def test_gaussian_relaxation_reduces_force_and_preserves_electron_count():
+    system = geometry_demo_system("gaussian-dimer", grid_shape=(4, 4, 4))
 
     result = optimize_geometry(
         system,
@@ -67,7 +67,7 @@ def test_gth_relaxation_reduces_force_and_preserves_electron_count():
 @pytest.mark.slow
 def test_line_search_failure_is_structured_for_too_large_step():
     result = optimize_geometry(
-        geometry_demo_system("gth-h2", grid_shape=(4, 4, 4)),
+        geometry_demo_system("gaussian-dimer", grid_shape=(4, 4, 4)),
         config=GeometryOptimizationConfig(
             max_steps=1,
             initial_step_size=10.0,
@@ -84,7 +84,7 @@ def test_line_search_failure_is_structured_for_too_large_step():
 
 @pytest.mark.slow
 def test_geometry_positions_are_wrapped_into_periodic_cell():
-    system = geometry_demo_system("gth-h2", grid_shape=(4, 4, 4)).with_centers(
+    system = geometry_demo_system("gaussian-dimer", grid_shape=(4, 4, 4)).with_centers(
         ((11.15, 4.0, 4.0), (-3.15, 4.0, 4.0))
     )
 
@@ -103,11 +103,11 @@ def test_geometry_positions_are_wrapped_into_periodic_cell():
 def test_geometry_optimization_npz_round_trip(tmp_path):
     path = tmp_path / "relaxation.npz"
     result = optimize_geometry(
-        geometry_demo_system("gth-h2", grid_shape=(4, 4, 4)),
+        geometry_demo_system("gaussian-dimer", grid_shape=(4, 4, 4)),
         config=GeometryOptimizationConfig(max_steps=1, scf_config=_scf_config()),
     )
 
-    save_geometry_optimization(path, result, metadata={"system": "gth-h2"})
+    save_geometry_optimization(path, result, metadata={"system": "gaussian-dimer"})
     record = load_geometry_optimization(path)
 
     assert record.positions.shape == (1, 2, 3)
@@ -115,7 +115,7 @@ def test_geometry_optimization_npz_round_trip(tmp_path):
     assert record.energies.shape == (1,)
     assert record.max_forces.shape == (1,)
     assert record.statuses == ("accepted",)
-    assert record.metadata["user"]["system"] == "gth-h2"
+    assert record.metadata["user"]["system"] == "gaussian-dimer"
     json.dumps(record.to_dict())
 
 
@@ -124,7 +124,7 @@ def test_geometry_optimization_cli_json_smoke(capsys):
     optimize_main(
         [
             "--system",
-            "gth-h2",
+            "gaussian-dimer",
             "--steps",
             "1",
             "--grid",
@@ -134,7 +134,7 @@ def test_geometry_optimization_cli_json_smoke(capsys):
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["system"] == "gth-h2"
+    assert payload["system"] == "gaussian-dimer"
     assert payload["step_count"] == 1
     assert payload["status"] in {"converged", "max_steps"}
     assert payload["result"]["final_energy"] == payload["final_energy"]

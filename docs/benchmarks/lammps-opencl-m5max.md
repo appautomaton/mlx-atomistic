@@ -1,8 +1,8 @@
 # LAMMPS OpenCL on Apple M5 Max
 
 Engine: `lammps-reference`. This report covers the five official top-level
-LAMMPS benchmark inputs from `vendors/lammps/bench/` on the single Apple M5 Max
-host. It does not describe `mlx_atomistic` runtime performance.
+LAMMPS benchmark inputs from an internal reference checkout on the single Apple
+M5 Max host. It does not describe `mlx_atomistic` runtime performance.
 
 ## Result
 

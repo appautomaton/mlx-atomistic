@@ -186,6 +186,7 @@ def _native_mini_protein_positions() -> np.ndarray:
     return np.asarray(positions, dtype=np.float32)
 
 
+@pytest.mark.reference
 def test_gbsa_openmm_obc_reference_energy_for_protein_fixture():
     openmm = pytest.importorskip("openmm")
     unit = pytest.importorskip("openmm.unit")
