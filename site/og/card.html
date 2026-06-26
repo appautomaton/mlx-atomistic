@@ -1,0 +1,128 @@
+<!doctype html>
+<!--
+  Open Graph social card source — 1200×630. Rasterized to site/public/og.png via
+  headless Chrome. Self-contained SVG art (no external fonts/CSS): on macOS the
+  system font stack renders real SF Pro. Regenerate:
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      --headless=new --disable-gpu --hide-scrollbars --window-size=1200,630 \
+      --screenshot=site/public/og.png site/og/card.html
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 1200px; height: 630px; }
+      .card {
+        width: 1200px; height: 630px; position: relative; overflow: hidden;
+        background:
+          radial-gradient(900px 600px at 88% 52%, #efeafc 0%, rgba(239,234,252,0) 60%),
+          linear-gradient(165deg, #ffffff 0%, #f4f4f7 100%);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+          "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      /* hairline frame, Apple-neutral */
+      .card::after {
+        content: ""; position: absolute; inset: 0;
+        box-shadow: inset 0 0 0 1px rgba(0,0,0,0.05);
+      }
+      .copy { position: absolute; left: 84px; top: 150px; width: 560px; }
+      .eyebrow {
+        font-size: 19px; font-weight: 590; letter-spacing: 0.16em;
+        text-transform: uppercase; color: #6c5ce7;
+      }
+      .wordmark {
+        margin-top: 22px; font-size: 78px; font-weight: 640; letter-spacing: -0.02em;
+        color: #1d1d1f; line-height: 1.02;
+      }
+      .tagline {
+        margin-top: 24px; font-size: 32px; font-weight: 500; letter-spacing: -0.01em;
+        color: #3a3a3e; line-height: 1.28;
+      }
+      .sub {
+        margin-top: 18px; font-size: 21px; font-weight: 400; color: #6e6e73;
+        line-height: 1.45; max-width: 520px;
+      }
+      .foot {
+        position: absolute; left: 84px; bottom: 56px;
+        font-size: 20px; font-weight: 500; color: #86868b; letter-spacing: 0.01em;
+      }
+      .foot b { color: #1d1d1f; font-weight: 600; }
+      .visual { position: absolute; right: 60px; top: 0; width: 520px; height: 630px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="copy">
+        <div class="eyebrow">Apple Silicon · MLX · Metal</div>
+        <div class="wordmark">mlx-atomistic</div>
+        <div class="tagline">Molecular dynamics &amp; DFT,<br />native to your Mac.</div>
+        <div class="sub">An MLX + Metal runtime that drives the GPU on your machine — no CUDA, no server, no cloud.</div>
+      </div>
+      <div class="foot">App&nbsp;Automaton&nbsp;·&nbsp;<b>appautomaton.github.io/mlx-atomistic</b></div>
+
+      <svg class="visual" viewBox="0 0 520 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="die" x1="170" y1="135" x2="450" y2="495" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#272733" />
+            <stop offset="1" stop-color="#101017" />
+          </linearGradient>
+          <radialGradient id="atom" cx="0.36" cy="0.3" r="0.85">
+            <stop stop-color="#a99bf6" />
+            <stop offset="1" stop-color="#6c5ce7" />
+          </radialGradient>
+          <radialGradient id="atomC" cx="0.36" cy="0.3" r="0.9">
+            <stop stop-color="#d7cfff" />
+            <stop offset="1" stop-color="#7c6ef2" />
+          </radialGradient>
+          <radialGradient id="aura" cx="0.5" cy="0.5" r="0.5">
+            <stop stop-color="#8b7ff0" stop-opacity="0.55" />
+            <stop offset="0.55" stop-color="#9d8cf2" stop-opacity="0.20" />
+            <stop offset="1" stop-color="#9d8cf2" stop-opacity="0" />
+          </radialGradient>
+        </defs>
+
+        <!-- iridescent under-glow -->
+        <ellipse cx="300" cy="315" rx="250" ry="250" fill="url(#aura)" />
+
+        <!-- package pins -->
+        <g stroke="#b9b9c2" stroke-width="3" stroke-linecap="round">
+          <line x1="210" y1="135" x2="210" y2="112" /><line x1="300" y1="135" x2="300" y2="112" /><line x1="390" y1="135" x2="390" y2="112" />
+          <line x1="210" y1="495" x2="210" y2="518" /><line x1="300" y1="495" x2="300" y2="518" /><line x1="390" y1="495" x2="390" y2="518" />
+          <line x1="120" y1="225" x2="97" y2="225" /><line x1="120" y1="315" x2="97" y2="315" /><line x1="120" y1="405" x2="97" y2="405" />
+          <line x1="480" y1="225" x2="503" y2="225" /><line x1="480" y1="315" x2="503" y2="315" /><line x1="480" y1="405" x2="503" y2="405" />
+        </g>
+
+        <!-- silicon die -->
+        <rect x="120" y="135" width="360" height="360" rx="60" fill="url(#die)" />
+        <rect x="120.5" y="135.5" width="359" height="359" rx="59.5" stroke="#3a3a48" stroke-width="1" />
+        <rect x="171" y="186" width="258" height="258" rx="40" stroke="#ffffff" stroke-opacity="0.06" stroke-width="1.5" />
+
+        <!-- bonds: center to inner ring -->
+        <g stroke="#8b7ff0" stroke-width="2.4" stroke-opacity="0.4">
+          <line x1="300" y1="315" x2="348" y2="315" /><line x1="300" y1="315" x2="324" y2="357" /><line x1="300" y1="315" x2="276" y2="357" />
+          <line x1="300" y1="315" x2="252" y2="315" /><line x1="300" y1="315" x2="276" y2="273" /><line x1="300" y1="315" x2="324" y2="273" />
+        </g>
+
+        <!-- 19-atom hexagonal close-packed cluster -->
+        <g>
+          <!-- outer corners (r≈96) -->
+          <circle cx="396" cy="315" r="11" fill="url(#atom)" /><circle cx="348" cy="398" r="11" fill="url(#atom)" />
+          <circle cx="252" cy="398" r="11" fill="url(#atom)" /><circle cx="204" cy="315" r="11" fill="url(#atom)" />
+          <circle cx="252" cy="232" r="11" fill="url(#atom)" /><circle cx="348" cy="232" r="11" fill="url(#atom)" />
+          <!-- outer edges (r≈83) -->
+          <circle cx="372" cy="357" r="11" fill="url(#atom)" /><circle cx="300" cy="398" r="11" fill="url(#atom)" />
+          <circle cx="228" cy="357" r="11" fill="url(#atom)" /><circle cx="228" cy="273" r="11" fill="url(#atom)" />
+          <circle cx="300" cy="232" r="11" fill="url(#atom)" /><circle cx="372" cy="273" r="11" fill="url(#atom)" />
+          <!-- inner ring (r≈48) -->
+          <circle cx="348" cy="315" r="12" fill="url(#atom)" /><circle cx="324" cy="357" r="12" fill="url(#atom)" />
+          <circle cx="276" cy="357" r="12" fill="url(#atom)" /><circle cx="252" cy="315" r="12" fill="url(#atom)" />
+          <circle cx="276" cy="273" r="12" fill="url(#atom)" /><circle cx="324" cy="273" r="12" fill="url(#atom)" />
+          <!-- center -->
+          <circle cx="300" cy="315" r="14" fill="url(#atomC)" />
+        </g>
+      </svg>
+    </div>
+  </body>
+</html>

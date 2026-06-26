@@ -1,6 +1,8 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
+import sitemap from "@astrojs/sitemap";
 import starlightLlmsTxt from "starlight-llms-txt";
+import { socialHead } from "./src/seo.mjs";
 
 export default defineConfig({
   site: "https://appautomaton.github.io",
@@ -11,6 +13,9 @@ export default defineConfig({
       title: "mlx-atomistic",
       description:
         "Apple Silicon-native atomistic simulation: MLX + Metal DFT and MD runtime.",
+      // Social-card image + structured-data (@graph) on every docs page; the
+      // entity graph lives in src/seo.mjs so it stays identical to the landing.
+      head: socialHead,
       logo: {
         src: "./src/assets/logo.svg",
         replacesTitle: false,
@@ -62,5 +67,6 @@ export default defineConfig({
         },
       ],
     }),
+    sitemap(),
   ],
 });

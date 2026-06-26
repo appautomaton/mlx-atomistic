@@ -2,6 +2,8 @@
 // mlx-atomistic — landing page. Apple-Native (HIG) identity, light-first.
 // System font stack renders real SF Pro / SF Mono on Apple devices.
 
+import { jsonLd, OG_IMAGE, SITE, ORIGIN } from "../seo.mjs";
+
 // Inline monoline icon set — Apple-style 1.8px strokes, currentColor.
 function icon(name) {
   const s = (p) =>
@@ -83,13 +85,30 @@ const stats = [
     />
     <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
-    <meta property="og:title" content="mlx-atomistic" />
+    <link rel="canonical" href={`${SITE}/`} />
+    <meta property="og:title" content="mlx-atomistic — Apple Silicon atomistic simulation" />
     <meta
       property="og:description"
-      content="Apple Silicon-native atomistic simulation: MLX + Metal DFT and MD runtime."
+      content="Apple Silicon-native molecular dynamics and DFT runtime built on MLX and Metal — the GPU on your Mac, no CUDA or cloud."
     />
     <meta property="og:type" content="website" />
+    <meta property="og:url" content={`${SITE}/`} />
+    <meta property="og:site_name" content="mlx-atomistic" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:image" content={OG_IMAGE} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="mlx-atomistic — Apple Silicon atomistic simulation" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="mlx-atomistic — Apple Silicon atomistic simulation" />
+    <meta
+      name="twitter:description"
+      content="Apple Silicon-native MD + DFT runtime on MLX and Metal — the GPU on your Mac."
+    />
+    <meta name="twitter:image" content={OG_IMAGE} />
     <link rel="icon" type="image/svg+xml" href="/mlx-atomistic/favicon.svg" />
+    <link rel="sitemap" href="/mlx-atomistic/sitemap-index.xml" />
+    <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} is:inline />
     <script is:inline>
       // Light-first: honor an explicit choice, else follow the OS, defaulting to light.
       const stored = localStorage.getItem("starlight-theme");
@@ -274,10 +293,14 @@ const stats = [
 
     <footer class="footer">
       <div class="footer__inner">
-        <span>mlx-atomistic · Apple Silicon atomistic simulation</span>
+        <span>
+          mlx-atomistic · part of
+          <a href="https://appautomaton.github.io" rel="me">App&nbsp;Automaton</a>
+        </span>
         <div class="footer__links">
           <a href="/mlx-atomistic/overview/">Docs</a>
           <a href="https://github.com/appautomaton/mlx-atomistic">GitHub</a>
+          <a href="https://appautomaton.github.io">App Automaton</a>
         </div>
       </div>
     </footer>
@@ -956,7 +979,9 @@ const stats = [
     color: var(--ink-3);
   }
   .footer__links { display: flex; gap: 1.4rem; }
-  .footer__links a:hover { color: var(--ink); }
+  .footer__inner a { color: inherit; text-decoration: none; transition: color 0.15s ease; }
+  .footer__inner a:hover { color: var(--ink); }
+  .footer__inner span a { text-decoration: underline; text-underline-offset: 2px; }
 
   /* ---------- Responsive ---------- */
   @media (max-width: 860px) {
