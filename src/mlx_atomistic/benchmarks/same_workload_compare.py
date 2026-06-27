@@ -17,7 +17,7 @@ from mlx_atomistic.runtime import get_runtime_info
 
 BENCHMARK_NAME = "same_workload_openmm_comparison"
 ENGINE = "mlx-openmm-comparison"
-OUTPUT_ROOT = "benchmark-output/same-workload-openmm-comparison"
+OUTPUT_ROOT = "outputs/benchmarks/same-workload-openmm-comparison"
 
 PAIR_SPECS = {
     "lj-synthetic-loop": {
@@ -339,7 +339,7 @@ def _command(row: dict[str, Any]) -> str | None:
 
 SCALING_BENCHMARK_NAME = "same_workload_lj_scaling"
 SCALING_ENGINE = "mlx-reference-scaling-comparison"
-SCALING_OUTPUT_ROOT = "benchmark-output/same-workload-lj-scaling"
+SCALING_OUTPUT_ROOT = "outputs/benchmarks/same-workload-lj-scaling"
 SCALING_METRIC = "steps_per_s"
 
 _MLX_LJ_CASES = {"synthetic_lj"}

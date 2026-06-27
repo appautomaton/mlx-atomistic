@@ -81,4 +81,7 @@ uv run python -m mlx_atomistic.benchmarks.dft_geometry --json
 
 ## Current Scientific Boundary
 
-This milestone still has no spin polarization, k-points, nonlocal projector application, stress tensor, cell relaxation, or geometry optimizer for production materials workloads. The force path is useful for validating local potential derivatives and workflow mechanics before those larger DFT features are added.
+This milestone is still a proof-level fixed-cell relaxation workflow, not a
+chemically certified production materials optimizer. Spin/k-point diagnostics,
+nonlocal projectors, finite-difference stress, and geometry optimization exist as
+prototype surfaces; production validation and cell relaxation remain out of scope.

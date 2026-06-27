@@ -35,7 +35,7 @@ from mlx_atomistic.pme import (
 )
 from mlx_atomistic.runtime import get_runtime_info
 
-DEFAULT_OUTPUT_DIR = Path("pme-profile-output")
+DEFAULT_OUTPUT_DIR = Path("outputs/benchmarks/pme-profile")
 MISSING_FIXTURE_LABEL = Path("user-provided-pme-fixture")
 SYNC_TIMING_BLOCKER = (
     "PME exposes stage-level mx.eval barriers in the profiler, but exact "

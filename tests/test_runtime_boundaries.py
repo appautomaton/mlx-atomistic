@@ -17,6 +17,12 @@ FORBIDDEN_REFERENCE_PATH_FRAGMENTS = (
     "results/",
     "results/inputs/",
 )
+FORBIDDEN_UNIGNORED_OUTPUT_ROOTS = (
+    "benchmark-output/",
+    "pme-profile-output",
+    "dhfr-artifacts",
+)
+IGNORED_GENERATED_OUTPUT_PREFIX = "outputs/benchmarks/"
 REFERENCE_POLICY_TEXT_FILES = {
     Path("src/mlx_atomistic/runtime.py"),
     Path("src/mlx_atomistic/dft/references.py"),
@@ -102,6 +108,42 @@ def test_installed_package_does_not_hardcode_reference_tree_paths():
             offenders[relative] = matches
 
     assert offenders == {}
+
+
+def test_installed_package_does_not_hardcode_unignored_output_roots():
+    offenders: dict[Path, list[str]] = {}
+    for path in _python_files(ROOT / "src/mlx_atomistic"):
+        matches = sorted(
+            {
+                fragment
+                for literal in _string_literals(path)
+                for fragment in FORBIDDEN_UNIGNORED_OUTPUT_ROOTS
+                if fragment in literal and not literal.startswith(IGNORED_GENERATED_OUTPUT_PREFIX)
+            }
+        )
+        if matches:
+            offenders[path.relative_to(ROOT)] = matches
+
+    assert offenders == {}
+
+
+def test_default_generated_benchmark_paths_are_gitignored():
+    paths = [
+        "outputs/benchmarks/pme-profile/pme-profile.json",
+        "outputs/benchmarks/dhfr-artifacts/dhfr-implicit/prepared_system.json",
+        "outputs/benchmarks/same-workload-openmm-comparison/mlx-dhfr-implicit.json",
+        "outputs/benchmarks/same-workload-lj-scaling/summary.json",
+    ]
+    result = subprocess.run(
+        ["git", "check-ignore", *paths],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    ignored = set(result.stdout.splitlines())
+    assert ignored == set(paths), result.stdout + result.stderr
 
 
 def test_core_runtime_does_not_import_prep_layer():

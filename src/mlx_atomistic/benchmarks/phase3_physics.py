@@ -27,7 +27,7 @@ from mlx_atomistic.runtime import get_runtime_info
 from mlx_atomistic.virtual_sites import VirtualSiteManager, tip4p_ew_virtual_site
 
 COMMAND = default_benchmark_command("phase3_physics")
-COMPARISON_OUTPUT_ROOT = "benchmark-output/same-workload-openmm-comparison"
+COMPARISON_OUTPUT_ROOT = "outputs/benchmarks/same-workload-openmm-comparison"
 
 
 COMPARISON_PAIR_METADATA = {

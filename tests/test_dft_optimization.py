@@ -65,13 +65,14 @@ def test_gaussian_relaxation_reduces_force_and_preserves_electron_count():
 
 
 @pytest.mark.slow
-def test_line_search_failure_is_structured_for_too_large_step():
+def test_line_search_failure_is_structured_when_trials_are_exhausted():
     result = optimize_geometry(
         geometry_demo_system("gaussian-dimer", grid_shape=(4, 4, 4)),
         config=GeometryOptimizationConfig(
             max_steps=1,
             initial_step_size=10.0,
             max_step=10.0,
+            line_search_min_step=20.0,
             max_line_search_iterations=1,
             scf_config=_scf_config(),
         ),

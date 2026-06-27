@@ -9,8 +9,10 @@ but the PyPI artifacts should ship only `mlx_atomistic` plus package metadata.
 Run these from the repository root on an Apple Silicon machine with usable Metal:
 
 ```bash
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv build
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with twine twine check dist/*
+RELEASE_DIST=/tmp/mlx-atomistic-release-dist
+rm -rf "$RELEASE_DIST"
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv build --out-dir "$RELEASE_DIST"
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with twine twine check "$RELEASE_DIST"/*
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --group test ruff check src tests scripts
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --group test pytest -m "not slow and not integration and not reference and not data and not gpu"
@@ -34,7 +36,7 @@ Confirm the wheel contains the package, metadata, license, entry points, and the
 `py.typed` marker:
 
 ```bash
-unzip -l dist/mlx_atomistic-*.whl
+unzip -l /tmp/mlx-atomistic-release-dist/mlx_atomistic-*.whl
 ```
 
 Confirm the source distribution excludes monorepo surfaces such as `.github/`,
@@ -43,13 +45,13 @@ and `uv.lock`. Hatchling may still include the root `.gitignore` as sdist build
 provenance:
 
 ```bash
-tar -tzf dist/mlx_atomistic-*.tar.gz
+tar -tzf /tmp/mlx-atomistic-release-dist/mlx_atomistic-*.tar.gz
 ```
 
 Install the wheel outside the checkout and verify the import:
 
 ```bash
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --isolated --with dist/mlx_atomistic-*-py3-none-any.whl python -c "import mlx_atomistic as ma; print(ma.__version__)"
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --isolated --with /tmp/mlx-atomistic-release-dist/mlx_atomistic-*-py3-none-any.whl python -c "import mlx_atomistic as ma; print(ma.__version__)"
 ```
 
 ## Publishing
