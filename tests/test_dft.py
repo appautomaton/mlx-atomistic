@@ -333,11 +333,6 @@ def test_upf_and_gth_parsers_capture_local_and_nonlocal_metadata():
 
     with pytest.raises(ValueError, match="requested GTH entry"):
         read_gth("vendors/cp2k/data/GTH_POTENTIALS", element="Xe", name="missing")
-    with pytest.raises(NotImplementedError, match="nonlocal"):
-        upf.apply_nonlocal(
-            np.ones((2, 2, 2), dtype=np.float32),
-            RealSpaceGrid((2, 2, 2), [2, 2, 2]),
-        )
 
 
 @pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane

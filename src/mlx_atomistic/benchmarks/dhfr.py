@@ -34,7 +34,7 @@ from mlx_atomistic.runtime import get_runtime_info
 BENCHMARK_NAME = "dhfr"
 COMMAND = default_benchmark_command(BENCHMARK_NAME)
 
-DEFAULT_ARTIFACT_ROOT = Path("dhfr-artifacts")
+DEFAULT_ARTIFACT_ROOT = Path("outputs/benchmarks/dhfr-artifacts")
 GBSA_REQUIRED_ARRAYS = ("gbsa_radius", "gbsa_scale")
 PME_REQUIRED_ARRAYS = (
     "pme_mesh_shape",
@@ -176,7 +176,9 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
         status="blocked" if blocker else "ok",
         blocker=blocker,
         command=COMMAND,
-        raw_output_path=f"benchmark-output/same-workload-openmm-comparison/mlx-{case_spec.case}.json",
+        raw_output_path=(
+            f"outputs/benchmarks/same-workload-openmm-comparison/mlx-{case_spec.case}.json"
+        ),
     )
 
 

@@ -50,8 +50,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
 
-      - name: Install full dev environment (builds LAMMPS)
-        run: uv sync --extra prep --group dev
+      - name: Install package test environment
+        run: uv sync --extra prep --group test
 
       - name: Package suite + coverage gate
-        run: uv run --group dev python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+        run: uv run --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80

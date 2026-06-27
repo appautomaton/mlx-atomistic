@@ -91,11 +91,7 @@ class RadialGrid:
 
 @dataclass(frozen=True)
 class NonlocalProjectorData:
-    """Parsed nonlocal projector metadata.
-
-    Milestone 4 stores this data but intentionally does not apply nonlocal
-    projectors in the Kohn-Sham operator yet.
-    """
+    """Parsed nonlocal projector metadata for ion-aware operator application."""
 
     angular_momentum: int
     values: tuple[float, ...] = ()
@@ -156,12 +152,6 @@ class PseudopotentialData:
             msg = "UPF pseudopotential is missing a local radial grid"
             raise ValueError(msg)
         return self.local_grid.derivative(radius_np, tail_charge=self.valence_charge)
-
-    def apply_nonlocal(self, _orbitals: mx.array, _grid: RealSpaceGrid) -> mx.array:
-        """Reject nonlocal application until the Milestone 5+ operator path exists."""
-
-        msg = "nonlocal pseudopotential application is not implemented in this milestone"
-        raise NotImplementedError(msg)
 
 
 @dataclass(frozen=True)

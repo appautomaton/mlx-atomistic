@@ -33,7 +33,7 @@ Package suite + coverage — what CI runs scheduled / on demand. Reference-engin
 and vendor-data tests remain separate opt-in lanes:
 
 ```bash
-uv run --group dev python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+uv run --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
 ```
 
 Run explicit reference or data tiers only after provisioning those local

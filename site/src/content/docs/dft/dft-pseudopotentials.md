@@ -3,9 +3,9 @@ title: "DFT Pseudopotentials"
 ---
 
 
-Milestone 4 adds a real ion-model layer while keeping the DFT engine small and
-inspectable. The code now supports parsed UPF and GTH pseudopotential inputs for
-local-potential SCF calculations.
+The DFT layer includes an ion-model surface while keeping the engine small and
+inspectable. The code supports parsed UPF and GTH pseudopotential inputs for
+local-potential SCF plus proof-level nonlocal projector application.
 
 ## What Is Implemented
 
@@ -14,6 +14,8 @@ local-potential SCF calculations.
 - `Ion` and `IonCollection` place parsed pseudopotentials at periodic ion
   centers.
 - `LocalPseudopotentialField` builds `V_local(r)` on a real-space DFT grid.
+- `NonlocalPseudopotentialOperator` applies ion-aware separable projectors when
+  parsed projector metadata is available.
 - `DFTSystem` accepts `IonCollection` and defaults the electron count to the
   sum of valence charges for neutral systems.
 - `run_scf(...)` records pseudopotential diagnostics:
@@ -31,7 +33,8 @@ sources. The current path uses:
 - `PP_BETA.*` tags for nonlocal projector metadata.
 
 The local UPF potential is interpolated onto the periodic real-space grid. UPF
-nonlocal projectors are parsed and stored, but not applied to orbitals yet.
+nonlocal projectors are parsed and applied by the ion-aware operator when
+`SCFConfig(apply_nonlocal=True)` is active.
 
 ## GTH
 
@@ -44,8 +47,8 @@ V_local(r) = -Z_ion erf(r / √2 r_loc) / r
 ```
 
 The derivative of this local form is used for fixed-density ion-force checks.
-GTH nonlocal channel metadata is parsed and stored, but nonlocal application is
-still intentionally disabled.
+GTH nonlocal channel metadata is parsed and applied by the same separable
+operator path when projector metadata is present.
 
 ## Forces
 
@@ -61,9 +64,11 @@ local-potential model, not a claim of production DFT force accuracy.
 
 ## Current Limits
 
-- No nonlocal projector application yet.
-- No spin, k-points, stress tensor, geometry optimizer, or real production
-  pseudopotential validation.
+- Nonlocal projectors are a proof-level Hermitian separable operator path, not a
+  chemically certified reproduction of every UPF/GTH convention.
+- Fixed-cell geometry optimization, spin/k-point diagnostics, and
+  finite-difference stress exist as prototype surfaces; production materials validation
+  and cell relaxation remain out of scope.
 - Vendor checkouts remain reference material only; the package does not import
   Quantum ESPRESSO or CP2K code.
 

@@ -55,8 +55,8 @@ validation surfaces only — they never replace the MLX runtime path.
   periodic + Ryckaert-Bellemans torsions, bounded PME, Langevin NVT, NPT.
 - **Prepared-system imports** — AMBER `prmtop`/`inpcrd`, CHARMM PSF/parameter, and
   GROMACS `.top`/`.gro` subsets, with explicit physical-unit metadata.
-- **Reference-validated** — OpenMM and LAMMPS reference surfaces keep the MLX
-  runtime honest, run after run.
+- **Reference-validation ready** — OpenMM and LAMMPS surfaces are opt-in local
+  validation lanes, not package/runtime dependencies.
 - **Self-documenting** — Google-style docstrings generate the [API reference](https://appautomaton.github.io/mlx-atomistic/api/)
   and an [`llms.txt`](https://appautomaton.github.io/mlx-atomistic/llms.txt) for agentic tools.
 

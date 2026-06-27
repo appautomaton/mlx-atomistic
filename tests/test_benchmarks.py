@@ -74,7 +74,7 @@ def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     assert row["comparison_metric_family"] == metric_family
     assert row["comparison_command"].startswith("uv run python -m mlx_atomistic.benchmarks.")
     assert row["comparison_raw_output_path"].startswith(
-        "benchmark-output/same-workload-openmm-comparison/mlx-"
+        "outputs/benchmarks/same-workload-openmm-comparison/mlx-"
     )
 
 
@@ -121,7 +121,7 @@ def test_dhfr_implicit_prepare_blocks_without_explicit_inputs():
     assert payload["prepare"] is True
     assert payload["artifact_status"] == "not_attempted"
     assert payload["electrostatics_model"] == "gbsa_obc"
-    assert payload["artifact_path"].startswith("dhfr-artifacts/")
+    assert payload["artifact_path"].startswith("outputs/benchmarks/dhfr-artifacts/")
     assert "caller-provided DHFR input path" in payload["blocker"]
 
 
@@ -132,7 +132,7 @@ def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["prepare"] is True
     assert payload["electrostatics_model"] == "pme"
-    assert payload["artifact_path"].startswith("dhfr-artifacts/")
+    assert payload["artifact_path"].startswith("outputs/benchmarks/dhfr-artifacts/")
     assert payload["force_term_required_arrays"] == [
         "pme_mesh_shape",
         "pme_alpha",
@@ -162,7 +162,7 @@ def test_dhfr_implicit_runtime_blocks_without_explicit_inputs():
 
 
 @pytest.mark.slow
-def test_dhfr_explicit_runtime_reports_pme_artifact_blocker():
+def test_dhfr_explicit_runtime_blocks_without_explicit_inputs():
     payload = dhfr.runtime_payload(
         case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"],
         steps=1,
@@ -173,12 +173,8 @@ def test_dhfr_explicit_runtime_reports_pme_artifact_blocker():
     assert payload["step_count"] == 1
     assert payload["runtime_attempted"] is False
     assert payload["runtime_stage"] == "blocked"
-    assert payload["runtime_blocker_category"] in {
-        "amber_import_unsupported_terms",
-        "pme_readiness",
-        "artifact_runtime_gap",
-    }
-    assert payload["blocker"]
+    assert payload["runtime_blocker_category"] == "input_absence"
+    assert "caller-provided DHFR input path" in payload["blocker"]
 
 
 def test_validation_gauntlet_cli_json_and_csv(tmp_path, capsys):

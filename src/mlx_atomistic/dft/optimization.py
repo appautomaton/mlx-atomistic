@@ -720,4 +720,3 @@ def _scf_config_summary(config: SCFConfig) -> dict[str, Any]:
             "dense_fallback_size": config.eigensolver_config.dense_fallback_size,
         },
     }
-

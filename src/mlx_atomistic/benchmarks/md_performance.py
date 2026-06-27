@@ -44,7 +44,7 @@ from mlx_atomistic.validation import build_platform_validation_evidence
 BenchmarkMode = Literal["auto", "dense", "dynamic-neighbor"]
 S5_LARGE_BENCHMARK_SIZES: tuple[int, ...] = (5000,)
 COMMAND = default_benchmark_command("md_performance")
-COMPARISON_OUTPUT_ROOT = "benchmark-output/same-workload-openmm-comparison"
+COMPARISON_OUTPUT_ROOT = "outputs/benchmarks/same-workload-openmm-comparison"
 
 
 @dataclass(frozen=True)
