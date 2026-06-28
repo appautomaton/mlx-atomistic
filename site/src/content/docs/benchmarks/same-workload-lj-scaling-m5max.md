@@ -8,12 +8,13 @@ switch, the batched-block integrator, and dropping the per-rebuild pair sort;
 OpenMM and LAMMPS reference rows are carried over unchanged from the 2026-06-17
 run on the same machine — only the MLX runtime changed.)
 
-This is the first **production-scale** same-workload throughput comparison of the
-`mlx_atomistic` runtime against the OpenMM and LAMMPS reference engines on a
-single Apple M5 Max. It exists because every prior committed MLX number was
-smoke-sized (4–32 atoms, 1 step), where fixed overhead dominates and the real
-O(N) force/neighbor costs are invisible. The goal here is an honest baseline, not
-a favorable one.
+This is the first **large-scale synthetic-LJ** same-workload throughput
+comparison of the `mlx_atomistic` runtime against the OpenMM and LAMMPS
+reference engines on a single Apple M5 Max. It exists because every prior
+committed MLX number was smoke-sized (4–32 atoms, 1 step), where fixed overhead
+dominates and the real O(N) force/neighbor costs are invisible. The goal here is
+an honest throughput baseline, not production chemistry or production MD
+certification.
 
 ## What is measured
 

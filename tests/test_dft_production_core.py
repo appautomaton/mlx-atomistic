@@ -16,10 +16,14 @@ from mlx_atomistic.dft import (
     KPoint,
     KPointMesh,
     MonkhorstPackGrid,
+    NonlocalProjectorData,
     NonlocalPseudopotentialOperator,
+    PseudopotentialData,
+    PseudopotentialFormat,
     ReferenceDFTCase,
     SCFConfig,
     compare_reference_case,
+    density_from_orbitals,
     dft_qm_scope_readiness_report,
     finite_difference_stress,
     get_dft_qm_scope_report,
@@ -75,6 +79,9 @@ def test_davidson_agrees_with_dense_on_tiny_grid():
     dense = DenseHamiltonianReference(operator).diagonalize(1)
     davidson = DavidsonDiagonalizer().solve(operator, n_orbitals=1)
 
+    with pytest.raises(ValueError, match="n_orbitals cannot exceed"):
+        DenseHamiltonianReference(operator).diagonalize(system.grid.size + 1)
+
     np.testing.assert_allclose(
         np.array(dense.eigenvalues),
         np.array(davidson.eigenvalues),
@@ -104,6 +111,23 @@ def test_spin_occupations_and_magnetization_are_json_safe():
     json.dumps(fermi.to_dict())
 
 
+def test_scf_result_returns_consistent_density_and_orbitals():
+    system = DFTSystem.one_center(grid_shape=(4, 4, 4))
+    result = run_scf(system, config=SCFConfig(max_iterations=1, solver="dense", seed=19))
+    reconstructed = density_from_orbitals(
+        result.orbitals,
+        system.grid,
+        occupations=[2.0],
+    )
+
+    assert result.status == "max_iterations"
+    np.testing.assert_allclose(
+        np.array(result.density),
+        np.array(reconstructed),
+        atol=1e-6,
+    )
+
+
 def test_kpoint_mesh_and_band_structure_reuse_density():
     system = DFTSystem.one_center(grid_shape=(4, 4, 4))
     result = run_scf(system, config=SCFConfig(max_iterations=1, solver="dense", seed=5))
@@ -115,9 +139,94 @@ def test_kpoint_mesh_and_band_structure_reuse_density():
 
     assert len(gamma.points) == 1
     assert len(mesh.points) == 2
+    assert all(point.coordinate_system == "reduced" for point in mesh.points)
     assert bands.eigenvalues.shape == (2, 1)
     assert bands.reused_density
     json.dumps(bands.to_dict())
+
+    with pytest.raises(ValueError, match="n_bands cannot exceed"):
+        run_band_structure(system, result, path, n_bands=system.grid.size + 1)
+
+    reduced_path = BandPath([KPoint((0.0, 0.0, 0.0), coordinate_system="reduced")])
+    with pytest.raises(ValueError, match="cartesian"):
+        run_band_structure(system, result, reduced_path, n_bands=1)
+
+
+def test_band_structure_applies_nonlocal_projectors_for_ion_system():
+    pseudopotential = PseudopotentialData(
+        element="X",
+        format=PseudopotentialFormat.GTH,
+        valence_charge=1.0,
+        gth_rloc=0.6,
+        gth_coefficients=(0.0,),
+        nonlocal_projectors=(
+            NonlocalProjectorData(
+                angular_momentum=0,
+                cutoff_radius=1.1,
+                coupling=3.0,
+            ),
+        ),
+    )
+    system = DFTSystem(
+        cell=(4.0, 4.0, 4.0),
+        grid_shape=(2, 2, 2),
+        ions=IonCollection([Ion("X", (2.0, 2.0, 2.0), pseudopotential)]),
+    )
+    result = run_scf(
+        system,
+        config=SCFConfig(max_iterations=1, solver="dense", seed=17),
+    )
+    path = BandPath([KPoint.gamma()])
+    bands = run_band_structure(system, result, path, n_bands=1)
+    local_only = run_band_structure(system, result, path, n_bands=1, apply_nonlocal=False)
+    local_scf = run_scf(
+        system,
+        config=SCFConfig(max_iterations=1, solver="dense", seed=17, apply_nonlocal=False),
+    )
+    default_from_local_scf = run_band_structure(system, local_scf, path, n_bands=1)
+    forced_from_local_scf = run_band_structure(
+        system,
+        local_scf,
+        path,
+        n_bands=1,
+        apply_nonlocal=True,
+    )
+    nonlocal_operator = NonlocalPseudopotentialOperator.from_ions(system.ions, system.grid)
+    expected = DenseHamiltonianReference(
+        KohnShamOperator.from_density(
+            system.grid,
+            system.pseudopotential.field(system.grid),
+            result.density,
+            nonlocal_operator=nonlocal_operator,
+            kpoint=path.points[0].vector,
+        )
+    ).diagonalize(1)
+
+    assert bands.nonlocal_available
+    assert bands.nonlocal_applied
+    assert bands.nonlocal_projector_count == nonlocal_operator.projectors.count
+    assert local_only.nonlocal_available
+    assert not local_only.nonlocal_applied
+    assert local_only.nonlocal_projector_count == 0
+    assert default_from_local_scf.nonlocal_available
+    assert not default_from_local_scf.nonlocal_applied
+    assert forced_from_local_scf.nonlocal_available
+    assert forced_from_local_scf.nonlocal_applied
+    assert forced_from_local_scf.nonlocal_projector_count == nonlocal_operator.projectors.count
+    np.testing.assert_allclose(
+        np.array(bands.eigenvalues[0]),
+        np.array(expected.eigenvalues),
+        atol=1e-6,
+    )
+    assert not np.allclose(
+        np.array(bands.eigenvalues),
+        np.array(local_only.eigenvalues),
+        atol=1e-5,
+    )
+    assert bands.to_dict()["nonlocal_applied"]
+
+    with pytest.raises(ValueError, match="Γ-point"):
+        run_band_structure(system, result, BandPath([KPoint((0.25, 0.0, 0.0))]), n_bands=1)
 
 
 def test_stress_restart_and_reference_comparison(tmp_path):

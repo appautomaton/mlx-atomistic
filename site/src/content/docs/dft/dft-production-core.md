@@ -21,7 +21,11 @@ SCF applies nonlocal projectors by default when available. `SCFConfig(apply_nonl
 
 ## Solvers
 
-Dense diagonalization remains the tiny-grid reference. Above the dense cutoff, `auto` SCF selects the Davidson-style path. The current Davidson implementation uses a kinetic preconditioner and residual iteration for larger grids, while still falling back to dense reference on tiny validation grids.
+Dense diagonalization remains the tiny-grid reference. Above the dense cutoff,
+`auto` SCF selects a Davidson-style alpha path. The current non-dense
+implementation is a kinetic-preconditioned residual iteration, not a production
+Davidson/Rayleigh-Ritz solver; it still falls back to the dense reference on
+tiny validation grids and reports convergence metadata for callers.
 
 Diagnostics expose residuals, orthonormality error, solver metadata, subspace size, and restart count.
 
@@ -32,7 +36,12 @@ The new spin layer is collinear only:
 - `unpolarized`: one total density `ρ(r)`.
 - `polarized`: separate `ρ↑(r)` and `ρ↓(r)` diagnostics.
 
-Occupation models include fixed occupations and Fermi-Dirac occupations. k-point abstractions support Γ-point meshes, Monkhorst-Pack-style meshes, and non-SCF band paths. The kinetic operator supports `0.5|G + k|²`, and Γ remains the default.
+Occupation models include fixed occupations and Fermi-Dirac occupations. k-point
+abstractions support Γ-point meshes, reduced-coordinate Monkhorst-Pack diagnostic
+meshes, and Cartesian non-SCF band paths. The kinetic operator supports
+`0.5|G + k|²`; Hamiltonian band evaluation rejects reduced-coordinate paths, and
+nonlocal projector bands are Γ-only until Bloch-phase nonlocal projectors are
+implemented.
 
 ## Stress, Relaxation, And Restart
 

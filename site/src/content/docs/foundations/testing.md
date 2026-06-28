@@ -17,6 +17,8 @@ or dependency-bound tests run on demand.
   unless the run includes `--run-reference`.
 - `data` — require a heavy, gitignored dataset (e.g. notebook OpenMM run reports).
   Skipped unless the run includes `--run-data`.
+- `gpu` — require a visible Metal GPU. Skipped unless the run includes
+  `--run-gpu`.
 
 Markers are registered with `--strict-markers`, so a typo'd marker fails fast.
 
@@ -26,28 +28,34 @@ Fast lane — parallel, what CI runs on every push/PR (no reference engines, so 
 never builds LAMMPS):
 
 ```bash
-uv run --group test python -m pytest -n auto -m "not slow and not integration and not reference and not data and not gpu"
+uv run --locked --no-default-groups --group test python -m pytest -n auto -m "not slow and not integration and not reference and not data and not gpu"
 ```
 
 Package suite + coverage — what CI runs scheduled / on demand. Reference-engine
 and vendor-data tests remain separate opt-in lanes:
 
 ```bash
-uv run --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+uv run --locked --no-default-groups --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
 ```
 
 Run explicit reference or data tiers only after provisioning those local
 surfaces:
 
 ```bash
-uv run --group dev python -m pytest --run-reference -m reference
-uv run --group dev python -m pytest --run-data -m data
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group dev python -m pytest --run-reference -m reference
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group dev python -m pytest --run-data -m data
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test python -m pytest --run-gpu -m gpu
 ```
+
+MLX runtime tests require a Metal-visible Apple Silicon host. Headless or
+virtualized sessions can collect tests, but they are not the release validation
+environment for `0.0.1`.
 
 ## Dependency groups
 
-- `test` — pytest, pytest-cov, pytest-xdist, ruff. Light; no reference engines,
-  so the fast CI lane never has to build LAMMPS.
+- `test` — pytest, pytest-cov, pytest-xdist, ruff. Light and selected as the
+  default `uv` group; no reference engines, so the fast CI lane never has to
+  build LAMMPS.
 - `reference` — OpenMM (PyPI wheel) and LAMMPS (built from source with
   GPU/OpenCL).
 - `dev` — `test` + `reference` for opt-in local validation.

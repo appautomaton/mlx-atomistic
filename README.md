@@ -7,7 +7,7 @@
 <h1 align="center">mlx-atomistic</h1>
 
 <p align="center">
-  Apple&nbsp;Silicon-native <b>molecular dynamics</b> and <b>density-functional-theory</b> runtime,
+  Apple&nbsp;Silicon-native alpha <b>molecular dynamics</b> and <b>density-functional-theory</b> runtime,
   built directly on <a href="https://github.com/ml-explore/mlx">MLX</a> and Metal —<br>
   it runs the GPU on your Mac, with no CUDA, server, or cloud.
 </p>
@@ -33,13 +33,12 @@
 
 ## What is mlx-atomistic?
 
-**mlx-atomistic is an Apple Silicon-native runtime for molecular dynamics (MD) and
-density functional theory (DFT)**, built directly on Apple's [MLX](https://github.com/ml-explore/mlx)
+**mlx-atomistic is an experimental Apple Silicon-native runtime for molecular dynamics (MD)
+and density functional theory (DFT)**, built directly on Apple's [MLX](https://github.com/ml-explore/mlx)
 array framework and the Metal GPU backend. It runs the simulation kernels on the
-GPU in your Mac — no CUDA, no remote cluster, no cloud. The aim is a fast, local,
-fully scriptable atomistic toolkit: plane-wave DFT building blocks, a real
-molecular-mechanics force field, prepared-system imports, and Jupyter-first
-visualization.
+GPU in your Mac — no CUDA, no remote cluster, no cloud. The `0.0.1` package is
+a strict alpha preview: early plane-wave DFT building blocks, molecular-mechanics
+force terms, prepared-system imports, and Jupyter-first visualization.
 
 `mlx_atomistic` is the primary trajectory generator and product runtime in this
 repo. OpenMM, LAMMPS, and the source trees under `vendors/` are reference and
@@ -47,12 +46,15 @@ validation surfaces only — they never replace the MLX runtime path.
 
 ## Features
 
-- **Apple Silicon native** — MLX arrays and Metal kernels drive the GPU on your
-  machine. No CUDA, no server, no cloud.
-- **Plane-wave DFT** — Kohn–Sham SCF, LDA + PBE via autodiff, Γ-point and k-mesh,
-  Davidson diagonalization, GTH/UPF pseudopotentials with local + nonlocal projectors.
-- **Molecular mechanics** — Lennard-Jones, Coulomb, harmonic bonds and angles,
-  periodic + Ryckaert-Bellemans torsions, bounded PME, Langevin NVT, NPT.
+- **Apple Silicon native** — MLX arrays execute through the Metal backend on
+  your machine. No CUDA, no server, no cloud.
+- **Plane-wave DFT building blocks** — Γ-point Kohn–Sham SCF, LDA plus
+  public-alpha PBE-PZ81 GGA diagnostics, non-SCF k-point/band diagnostics,
+  Davidson/preconditioned-residual eigensolver diagnostics, and GTH/UPF
+  pseudopotentials with proof-level local + nonlocal projector diagnostics.
+- **Molecular-mechanics building blocks** — Lennard-Jones, Coulomb, harmonic
+  bonds and angles, periodic + Ryckaert-Bellemans torsions, NVE/Langevin NVT,
+  bounded PME proof surfaces, and proof-level barostat/NPT diagnostics.
 - **Prepared-system imports** — AMBER `prmtop`/`inpcrd`, CHARMM PSF/parameter, and
   GROMACS `.top`/`.gro` subsets, with explicit physical-unit metadata.
 - **Reference-validation ready** — OpenMM and LAMMPS surfaces are opt-in local
@@ -62,12 +64,24 @@ validation surfaces only — they never replace the MLX runtime path.
 
 ## Quick start
 
+Install the alpha package from PyPI into a Python 3.13 environment:
+
+```bash
+uv run --no-project --python 3.13 --with mlx-atomistic \
+  python -c "import mlx_atomistic as ma; print(ma.__version__)"
+```
+
+For notebook or development work from a checkout:
+
 ```bash
 uv venv --python 3.13
 uv sync --extra notebook --extra prep --extra viz
 uv run python -m ipykernel install --user --name mlx-atomistic --display-name "mlx-atomistic"
 uv run jupyter lab
 ```
+
+Plain `uv sync` uses the light test group by default. OpenMM and LAMMPS are
+installed only when you explicitly request the `reference` or `dev` group.
 
 If `uv` cannot use the home cache in a sandboxed run, point it at a writable cache:
 

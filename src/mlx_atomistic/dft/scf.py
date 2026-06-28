@@ -589,6 +589,8 @@ def _history_row(
     orthonormality: float | None,
 ) -> dict[str, float | int | str | None]:
     electronic = float(energy_terms["total"])
+    exchange = energy_terms.get("exchange")
+    correlation = energy_terms.get("correlation")
     return {
         "iteration": iteration,
         "residual": density_residual,
@@ -606,8 +608,8 @@ def _history_row(
         ),
         "hartree": float(energy_terms["hartree"]),
         "xc": float(energy_terms["xc"]),
-        "exchange": float(energy_terms.get("exchange", energy_terms["xc"])),
-        "correlation": float(energy_terms.get("correlation", mx.array(0.0))),
+        "exchange": None if exchange is None else float(exchange),
+        "correlation": None if correlation is None else float(correlation),
         "electronic": electronic,
         "center_center": center_energy,
         "total": electronic + center_energy,
@@ -765,7 +767,11 @@ def run_scf(
                 initial_orbitals=orbitals,
             )
             next_orbitals = diagonalized.orbitals
-            solver_metadata = diagonalized.metadata
+            solver_metadata = {
+                **diagonalized.metadata,
+                "eigensolver_converged": diagonalized.converged,
+                "max_eigensolver_residual": float(mx.max(diagonalized.residuals)),
+            }
         else:
             next_orbitals = _gradient_step_orbitals(
                 orbitals,
@@ -877,6 +883,43 @@ def run_scf(
             converged = True
             convergence_reason = config.convergence_mode
             break
+
+    density = density_from_orbitals(
+        orbitals,
+        grid,
+        occupations=occupation_values,
+    )
+    start = perf_counter()
+    final_v_hartree = hartree_potential(density, grid)
+    _add_timing(timings, "hartree_ms", start, enabled=config.record_timing)
+    start = perf_counter()
+    final_xc = xc_functional.evaluate(
+        density,
+        grid,
+        density_floor=config.density_floor,
+    )
+    _add_timing(timings, "xc_ms", start, enabled=config.record_timing)
+    effective_potential = v_local + final_v_hartree + final_xc.potential
+    energy_terms = _energy_terms(
+        orbitals,
+        density,
+        v_local,
+        final_v_hartree,
+        final_xc.total_energy,
+        grid,
+        occupations=occupation_values,
+        timings=timings,
+        timing_enabled=config.record_timing,
+        nonlocal_operator=nonlocal_operator,
+    )
+    _add_xc_components(
+        energy_terms,
+        xc_functional,
+        density,
+        grid,
+        density_floor=config.density_floor,
+    )
+    _assert_finite(density, orbitals, effective_potential, *energy_terms.values())
 
     forces = None
     if isinstance(local_input, LocalGaussianPseudopotential | LocalPseudopotentialField):

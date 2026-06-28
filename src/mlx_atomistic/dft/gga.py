@@ -1,4 +1,4 @@
-"""PBE GGA exchange-correlation with an autodiff-derived potential.
+"""PBE-form GGA exchange-correlation with an autodiff-derived potential.
 
 The defining idea: a GGA energy is ``E_xc = ∫ ε(ρ, ∇ρ) dr``, and its potential is
 the functional derivative ``v_xc = δE_xc/δρ = ∂ε/∂ρ - ∇·(∂ε/∂∇ρ)``. The gradient
@@ -19,7 +19,7 @@ from mlx_atomistic.dft.fft import fft3, ifft3
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.xc import LDACorrelationPZ81, XCResult
 
-# PBE (Perdew-Burke-Ernzerhof 1996) constants.
+# PBE (Perdew-Burke-Ernzerhof 1996) gradient constants.
 _KAPPA = 0.804
 _MU = 0.2195149727645171
 _BETA = 0.06672455060314922
@@ -67,14 +67,15 @@ def _pbe_correlation_energy_density(
 
 @dataclass(frozen=True)
 class PBEExchangeCorrelation:
-    """PBE GGA exchange-correlation; ``v_xc`` is the autodiff functional derivative.
+    """Alpha PBE-form GGA exchange-correlation with a PZ81 uniform baseline.
 
-    The uniform-gas correlation baseline reuses the PZ81 parameterization already in
-    the package (true PBE uses PW92; the difference is sub-mHa and the baseline is
-    swappable).
+    The exchange enhancement and correlation gradient terms follow the PBE form, while
+    the uniform-gas correlation baseline reuses the PZ81 parameterization already in
+    the package. Full production PBE uses a PW92 baseline, so this public alpha class
+    intentionally reports an explicit alpha result name.
     """
 
-    name: str = "pbe-gga"
+    name: str = "pbe-pz81-gga-alpha"
 
     def _energy_density(
         self, rho: mx.array, grid: RealSpaceGrid, density_floor: float
@@ -97,7 +98,7 @@ class PBEExchangeCorrelation:
         *,
         density_floor: float = 1e-12,
     ) -> XCResult:
-        """Evaluate the PBE GGA exchange-correlation energy density, potential, and total energy.
+        """Evaluate alpha PBE-form GGA energy density, potential, and total energy.
 
         Args:
             density: Electron density ``rho`` sampled on the grid.

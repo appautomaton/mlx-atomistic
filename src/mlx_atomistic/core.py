@@ -15,8 +15,8 @@ DEFAULT_DTYPE = mx.float32
 def use_cpu_device() -> None:
     """Route subsequent MLX operations to the CPU device.
 
-    Sets the default MLX device and stream to the CPU. Used as a fallback when no
-    Metal GPU is available, e.g. in CI or other headless environments.
+    Sets the default MLX device and stream to the CPU. This supports CPU-preferred
+    test paths; release validation still runs on Apple Silicon with visible Metal.
     """
 
     cpu = mx.Device(mx.cpu, 0)
@@ -29,10 +29,10 @@ def as_mx_array(
 ) -> mx.array:
     """Convert a value to an MLX array in the project's default dtype.
 
-    An existing ``mx.array`` is returned unchanged unless its dtype differs. If no
-    Metal device is available the conversion transparently falls back to the CPU
-    device (also forced when the ``MLX_ATOMISTIC_DEVICE=cpu`` environment variable
-    is set).
+    An existing ``mx.array`` is returned unchanged unless its dtype differs. When
+    ``MLX_ATOMISTIC_DEVICE=cpu`` is set, or when MLX reports that no Metal device is
+    available during conversion, the function routes MLX to its CPU device and
+    retries the conversion.
 
     Args:
         value: Array-like data to convert (a sequence, NumPy array, or

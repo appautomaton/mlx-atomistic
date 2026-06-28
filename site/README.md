@@ -4,9 +4,14 @@ Astro + Starlight site for https://appautomaton.github.io/mlx-atomistic.
 
 ## Local dev
 
+Use Node 24, matching the Pages workflow.
+
 ```bash
 cd site
-npm install
+npm ci
+cd ..
+uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
+cd site
 npm run dev      # http://localhost:4321/mlx-atomistic/
 npm run build    # outputs to dist/
 npm run preview  # preview the build
@@ -22,4 +27,5 @@ npm run preview  # preview the build
 ## Deploy
 
 `.github/workflows/deploy-site.yml` builds and deploys to GitHub Pages on push
-to `main` when `site/**` changes.
+to `main` when `site/**`, `src/**`, `scripts/gen_api_docs.py`, `pyproject.toml`,
+or the deploy workflow changes.

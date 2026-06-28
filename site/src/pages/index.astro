@@ -29,13 +29,13 @@ function icon(name) {
 const features = [
   {
     title: "Apple Silicon native",
-    desc: "MLX arrays and Metal kernels drive the GPU on your machine. No CUDA, no server, no cloud.",
+    desc: "MLX arrays execute through the Metal backend on your machine. No CUDA, no server, no cloud.",
     span: "wide",
     icon: "chip",
   },
   {
     title: "Plane-wave DFT",
-    desc: "Kohn–Sham SCF, LDA + PBE via autodiff, Γ-point and k-mesh, Davidson diagonalization.",
+    desc: "Γ-point Kohn–Sham SCF, LDA plus public-alpha PBE-PZ81 GGA diagnostics, non-SCF band paths.",
     span: "tall",
     icon: "wave",
   },
@@ -47,7 +47,7 @@ const features = [
   },
   {
     title: "Pseudopotentials",
-    desc: "GTH and UPF readers, local + nonlocal projectors, analytic and finite-difference forces.",
+    desc: "GTH and UPF readers, proof-level projector diagnostics, analytic local forces plus fixed-orbital nonlocal diagnostics.",
     span: "std",
     icon: "lattice",
   },
@@ -58,15 +58,15 @@ const features = [
     icon: "terminal",
   },
   {
-    title: "Reference-validated",
-    desc: "OpenMM and LAMMPS reference surfaces keep the MLX runtime honest, run after run.",
+    title: "Reference validation lanes",
+    desc: "OpenMM and LAMMPS remain opt-in local reference surfaces, not package runtime dependencies.",
     span: "wide",
     icon: "check",
   },
 ];
 
 const stats = [
-  { value: "LDA · PBE", label: "XC functionals" },
+  { value: "LDA · PBE-PZ81", label: "XC diagnostics" },
   { value: "NVE · NVT", label: "Integrators" },
   { value: "PME", label: "Long-range electrostatics" },
   { value: "Jupyter", label: "First-class visualization" },
@@ -81,7 +81,7 @@ const stats = [
     <title>mlx-atomistic — Apple Silicon atomistic simulation</title>
     <meta
       name="description"
-      content="Apple Silicon-native atomistic simulation: an MLX + Metal DFT and MD runtime that runs the GPU on your Mac."
+      content="Apple Silicon-native alpha atomistic simulation: an MLX + Metal DFT and MD runtime that runs the GPU on your Mac."
     />
     <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
@@ -89,7 +89,7 @@ const stats = [
     <meta property="og:title" content="mlx-atomistic — Apple Silicon atomistic simulation" />
     <meta
       property="og:description"
-      content="Apple Silicon-native molecular dynamics and DFT runtime built on MLX and Metal — the GPU on your Mac, no CUDA or cloud."
+      content="Apple Silicon-native alpha molecular dynamics and DFT runtime built on MLX and Metal — the GPU on your Mac, no CUDA or cloud."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content={`${SITE}/`} />
@@ -103,7 +103,7 @@ const stats = [
     <meta name="twitter:title" content="mlx-atomistic — Apple Silicon atomistic simulation" />
     <meta
       name="twitter:description"
-      content="Apple Silicon-native MD + DFT runtime on MLX and Metal — the GPU on your Mac."
+      content="Apple Silicon-native alpha MD + DFT runtime on MLX and Metal — the GPU on your Mac."
     />
     <meta name="twitter:image" content={OG_IMAGE} />
     <link rel="icon" type="image/svg+xml" href="/mlx-atomistic/favicon.svg" />
@@ -160,7 +160,7 @@ const stats = [
             <span class="accent">native to your Mac.</span>
           </h1>
           <p class="lead">
-            An MD and DFT runtime built directly on MLX and Metal — it runs the
+            An alpha MD and DFT runtime built directly on MLX and Metal — it runs the
             GPU on your machine, not a wrapper around someone else's cluster.
           </p>
           <div class="cta-row">
@@ -274,14 +274,19 @@ const stats = [
       <!-- Quick start -->
       <section class="section section--narrow">
         <p class="kicker">Quick start</p>
-        <h2 class="section-title">Up and running in three lines.</h2>
+        <h2 class="section-title">Try the alpha, then open a checkout.</h2>
         <div class="window">
           <div class="window__bar">
             <span class="traffic"><i class="t-red" /><i class="t-amber" /><i class="t-green" /></span>
             <span class="window__title">zsh — mlx-atomistic</span>
           </div>
-          <pre><code><span class="c-prompt">$</span> uv venv --python 3.13
-<span class="c-prompt">$</span> uv sync --extra notebook --group dev
+          <pre><code><span class="c-comment"># try the PyPI alpha</span>
+<span class="c-prompt">$</span> uv run --no-project --python 3.13 --with mlx-atomistic \
+    python -c "import mlx_atomistic as ma; print(ma.__version__)"
+
+<span class="c-comment"># work from a checkout</span>
+<span class="c-prompt">$</span> uv venv --python 3.13
+<span class="c-prompt">$</span> uv sync --extra notebook --extra prep --extra viz
 <span class="c-prompt">$</span> uv run jupyter lab
 
 <span class="c-comment"># run a DFT SCF benchmark</span>
