@@ -6,13 +6,11 @@ on:
       - published
 
 jobs:
-  pypi-publish:
-    name: Build and publish to PyPI
+  build:
+    name: Build release distributions
     runs-on: macos-15
-    environment: pypi
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -49,6 +47,28 @@ jobs:
 
       - name: Isolated wheel import smoke
         run: uv run --no-project --isolated --with dist/mlx_atomistic-*-py3-none-any.whl python -c "import mlx_atomistic as ma; print(ma.__version__)"
+
+      - name: Upload package distributions
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-distributions
+          path: dist/*
+
+  pypi-publish:
+    name: Publish package distributions to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download package distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-distributions
+          path: dist
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
