@@ -23,8 +23,6 @@ from mlx_atomistic.md import (
 from mlx_atomistic.metal_kernels import fused_lj_forces
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 
-_GPU = mx.Device(mx.gpu, 0)
-
 
 @pytest.fixture(autouse=True)
 def _on_gpu(monkeypatch):
@@ -38,8 +36,9 @@ def _on_gpu(monkeypatch):
     monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
     prev_device = mx.default_device()
     try:
-        mx.set_default_device(_GPU)
-        mx.set_default_stream(mx.new_stream(_GPU))
+        gpu = mx.Device(mx.gpu, 0)
+        mx.set_default_device(gpu)
+        mx.set_default_stream(mx.new_stream(gpu))
         mx.eval(mx.array([1.0], dtype=mx.float32) + 1.0)
     except Exception:  # noqa: BLE001 - any Metal load failure means skip
         mx.set_default_device(prev_device)

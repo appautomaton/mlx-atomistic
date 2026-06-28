@@ -8,7 +8,7 @@ on:
 jobs:
   pypi-publish:
     name: Build and publish to PyPI
-    runs-on: macos-14
+    runs-on: macos-15
     environment: pypi
     permissions:
       contents: read
@@ -23,23 +23,35 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
 
+      - name: Verify release tag matches package version
+        run: uv run --no-project --python 3.13 python -c "import os, sys, tomllib; version = tomllib.load(open('pyproject.toml', 'rb'))['project']['version']; tag = os.environ['GITHUB_REF_NAME']; sys.exit(0 if tag == f'v{version}' else f'release tag {tag!r} must equal v{version}')"
+
       - name: Install test tooling
-        run: uv sync --extra prep --group test
+        run: uv sync --locked --no-default-groups --extra prep --group test
 
       - name: Lint
-        run: uv run --group test ruff check src tests scripts
+        run: uv run --locked --no-default-groups --group test ruff check src tests scripts
 
       - name: Fast package tests
-        run: uv run --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+        run: uv run --locked --no-default-groups --group test python -m pytest -n auto -m "not slow and not integration and not reference and not data and not gpu"
+
+      - name: Generate API documentation
+        run: uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
+
+      - name: Package suite + coverage gate
+        run: uv run --locked --no-default-groups --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
 
       - name: Build package distributions
         run: uv build
 
       - name: Check package distributions
-        run: uv run --with twine twine check dist/*
+        run: uv run --no-project --with twine twine check dist/*
+
+      - name: Check package distribution contents
+        run: uv run --no-project --python 3.13 python scripts/check_dist_contents.py dist/*
 
       - name: Isolated wheel import smoke
-        run: uv run --isolated --with dist/mlx_atomistic-*-py3-none-any.whl python -c "import mlx_atomistic as ma; print(ma.__version__)"
+        run: uv run --no-project --isolated --with dist/mlx_atomistic-*-py3-none-any.whl python -c "import mlx_atomistic as ma; print(ma.__version__)"
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

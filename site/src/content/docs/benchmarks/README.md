@@ -58,7 +58,7 @@ LAMMPS, OpenCL, large downloaded fixtures, or committed raw outputs.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
-| `uv run --group test python -m pytest tests/test_benchmarks.py -m "not slow and not reference and not data and not gpu"` | mlx_atomistic | fast developer | pytest stdout; temporary test files only |
+| `uv run --locked --no-default-groups --group test python -m pytest tests/test_benchmarks.py -m "not slow and not reference and not data and not gpu"` | mlx_atomistic | fast developer | pytest stdout; temporary test files only |
 | `uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 1 --particles 16 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --sizes 16 --evaluations 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --sizes 32 --steps 1 --sample-interval 1 --diagnostic-interval 1 --evaluation-interval 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |

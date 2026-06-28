@@ -30,13 +30,13 @@ artifact for benchmark implementation, not a performance report.
 | `dhfr-implicit` | DHFR implicit GBSA/OBC real-system stretch | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-implicit --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-implicit --platform Reference --steps 1 --json` | `ns/day` | `comparable` for the one-step MLX/OpenMM Reference smoke row when both sides are `ok` and use `0.004 ps` | `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; `results/same-workload-openmm-comparison/summary.json` | Use as a narrow runtime/artifact smoke comparison. OpenMM OpenCL DHFR implicit remains context only. |
 | `dhfr-explicit-pme` | DHFR explicit PME real-system stretch | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-explicit-pme --platform Reference --steps 1 --json` | `ns/day` | `blocked` until MLX has a scientifically valid neutral PME artifact or charged-PME policy | `results/same-workload-openmm-comparison/mlx-dhfr-explicit-pme.json`; `results/same-workload-openmm-comparison/openmm-dhfr-explicit-pme.json` | Current local Amber20/JAC PME artifact has `net_charge=-11`; OpenMM OpenCL DHFR PME remains context only. |
 
-## Production Scaling Ladder
+## Large-Scale Synthetic-LJ Scaling Ladder
 
-The `lj-synthetic-loop` row above is a tiny controlled smoke. The production-scale
-throughput comparison is the synthetic-LJ size ladder (1k/4k/16k/50k) across MLX,
-OpenMM, and LAMMPS, driven by `scripts/run_same_workload_lj_scaling.py` and
-aggregated by `same_workload_compare.build_scaling_summary` (matched per size by
-`(atom_count, step_count)`). Results, method, and caveats:
+The `lj-synthetic-loop` row above is a tiny controlled smoke. The large-scale
+synthetic-LJ throughput comparison is the size ladder (1k/4k/16k/50k) across
+MLX, OpenMM, and LAMMPS, driven by `scripts/run_same_workload_lj_scaling.py` and
+aggregated by `same_workload_compare.build_scaling_summary` (matched per size
+by `(atom_count, step_count)`). Results, method, and caveats:
 `docs/benchmarks/same-workload-lj-scaling-m5max.md`. Raw JSON under gitignored
 `results/same-workload-lj-scaling/`.
 

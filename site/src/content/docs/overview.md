@@ -3,9 +3,9 @@ title: Overview
 description: Apple Silicon-native atomistic simulation with MLX and Metal.
 ---
 
-mlx-atomistic is an Apple Silicon-native atomistic simulation runtime built on
-MLX and Metal. It targets Python 3.13 through `uv` and uses MLX for local GPU
-execution on Apple Silicon.
+mlx-atomistic is an experimental Apple Silicon-native atomistic simulation
+runtime built on MLX and Metal. It targets Python 3.13 through `uv` and uses
+MLX for local GPU execution on Apple Silicon.
 
 ## What it is
 
@@ -15,9 +15,10 @@ validation surfaces; they do not replace the MLX runtime path.
 
 ## Two scales, one runtime
 
-- **Density Functional Theory** — spin-unpolarized Γ-point plane-wave Kohn–Sham
-  SCF, LDA + PBE GGA (autodiff-derived potential), pseudopotentials (GTH / UPF),
-  forces, stress, and geometry optimization.
+- **Density Functional Theory** — spin-unpolarized Γ-point plane-wave Kohn-Sham
+  SCF, LDA plus public-alpha PBE-PZ81 GGA diagnostics, non-SCF k-point/band
+  diagnostics, pseudopotentials (GTH / UPF), forces, stress, and geometry
+  optimization prototypes.
 - **Molecular Mechanics** — Lennard-Jones, Coulomb, harmonic bonds/angles,
   periodic + Ryckaert–Bellemans torsions, bounded PME, NVE and Langevin NVT.
 
@@ -27,7 +28,17 @@ Lightweight DFT building blocks, validation notebooks, and visualization
 utilities rather than a heavy production DFT engine. Small, validated examples
 before broader chemistry coverage.
 
-## Setup
+## Try the PyPI Alpha
+
+```bash
+uv run --no-project --python 3.13 --with mlx-atomistic \
+  python -c "import mlx_atomistic as ma; print(ma.__version__)"
+```
+
+Extras are opt-in for checkout workflows: `prep` for topology/prep imports,
+`viz` for visualization, and `notebook` for Jupyter.
+
+## Checkout Setup
 
 ```bash
 uv venv --python 3.13

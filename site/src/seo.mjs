@@ -8,7 +8,7 @@ export const REPO = "https://github.com/appautomaton/mlx-atomistic";
 export const OG_IMAGE = `${SITE}/og.png`;
 
 const DESCRIPTION =
-  "Apple Silicon-native molecular dynamics and density-functional-theory " +
+  "Apple Silicon-native alpha molecular dynamics and density-functional-theory " +
   "runtime built directly on MLX and Metal — it runs the GPU on your Mac, " +
   "with no CUDA, server, or cloud.";
 

@@ -82,8 +82,8 @@ right answer should come from timing data, not intuition.
 For normal development:
 
 ```bash
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --group test ruff check src tests
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --group test pytest -m "not slow and not integration and not reference and not data and not gpu"
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test ruff check src tests
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.validation_gauntlet --json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.stability --sizes 16 --steps 2 --bonded-steps 2 --dt-values 0.001 --json
 ```

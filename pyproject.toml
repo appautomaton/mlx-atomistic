@@ -104,11 +104,16 @@ docs = [
 
 [tool.uv]
 package = true
+default-groups = ["test"]
 no-binary-package = ["lammps"]
 config-settings-package = { lammps = { "cmake.define.PKG_GPU" = "ON", "cmake.define.GPU_API" = "opencl", "cmake.define.GPU_PREC" = "single" } }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mlx_atomistic"]
+exclude = [
+  "**/__pycache__/**",
+  "**/*.py[cod]",
+]
 
 [tool.hatch.build.targets.sdist]
 # Keep the PyPI source distribution focused on the Python package. Hatchling
@@ -118,6 +123,10 @@ only-include = [
   "README.md",
   "LICENSE",
   "src/mlx_atomistic",
+]
+exclude = [
+  "**/__pycache__/**",
+  "**/*.py[cod]",
 ]
 
 [tool.pytest.ini_options]

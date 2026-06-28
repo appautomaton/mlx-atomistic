@@ -1,9 +1,10 @@
 # DFT Numerics
 
-Milestone 3 makes the DFT layer more numerically inspectable. It is still a
-small Γ-point, spin-unpolarized, local-pseudopotential prototype, but the code
-now has explicit checks for the Kohn-Sham operator, orbital residuals, energy
-decomposition, and total-energy force consistency.
+Milestone 3 makes the DFT layer more numerically inspectable. The primary SCF
+path is still small, Γ-point, and alpha/proof-level, but the code now has
+explicit checks for the Kohn-Sham operator, orbital residuals, energy
+decomposition, nonlocal projector diagnostics, and total-energy force
+consistency.
 
 ## Kohn-Sham Operator
 
@@ -16,12 +17,14 @@ H_KS[ρ] ψᵢ = εᵢ ψᵢ
 For the current prototype:
 
 ```text
-H_KS[ρ] = T + V_local + V_H[ρ] + V_xc[ρ]
+H_KS[ρ] = T + V_local + V_nonlocal + V_H[ρ] + V_xc[ρ]
 ```
 
 - `T` is the plane-wave kinetic operator, applied in reciprocal space as
   `0.5 |G|²`.
 - `V_local` is the toy Gaussian local pseudopotential.
+- `V_nonlocal` is included only when ion-backed proof-level nonlocal projectors
+  are active.
 - `V_H[ρ]` is the Hartree potential from the reciprocal-space Poisson solve.
 - `V_xc[ρ]` is the exchange-correlation potential.
 
@@ -66,15 +69,16 @@ The SCF electronic energy is separated from center-center repulsion:
 E_total = E_electronic + E_center-center
 ```
 
-`E_electronic` includes kinetic, local, Hartree, and XC terms. The
-center-center term is a toy Coulomb repulsion between Gaussian centers. This is
-not yet a real pseudopotential ion-ion model, but it prevents the total energy
-from hiding an important physical contribution.
+`E_electronic` includes kinetic, local, nonlocal pseudopotential, Hartree, and
+XC terms when those terms are active. The center-center term is the current
+ion-center Coulomb contribution; it prevents the total energy from hiding an
+important physical contribution.
 
 ## Force Checks
 
 `run_scf(...)` reports center forces for `DFTSystem` calculations. These combine
-the local Gaussian Hellmann-Feynman force with the center-center force.
+the local electron-ion force, the center-center force, and the fixed-orbital
+nonlocal finite-difference correction when nonlocal projectors are active.
 
 `scf_total_energy_forces(...)` reruns SCF after displacing each center and
 compares:
@@ -84,9 +88,9 @@ F_A ≈ -[E(R_A + δ) - E(R_A - δ)] / 2δ
 ```
 
 This checks consistency between the reported force and the total-energy surface.
-It does not prove production-grade DFT forces because the current model lacks
-real pseudopotentials, Pulay terms for non-plane-wave bases, stress, geometry
-optimization, spin, and k-points.
+It does not prove production-grade DFT forces because the nonlocal correction is
+an alpha finite-difference path and production materials validation, cell
+relaxation, and custom kernels remain out of scope.
 
 ## Benchmark Evidence
 

@@ -9,6 +9,7 @@ from mlx_atomistic.dft.fft import (
     reciprocal_to_real,
 )
 from mlx_atomistic.dft.forces import SCFForceConsistencyResult, scf_total_energy_forces
+from mlx_atomistic.dft.gga import PBEExchangeCorrelation
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.kpoints import (
     BandPath,
@@ -136,6 +137,7 @@ __all__ = [
     "NonlocalPseudopotentialOperator",
     "NonlocalProjectorData",
     "OccupationResult",
+    "PBEExchangeCorrelation",
     "ProjectorSet",
     "PulayDIISMixer",
     "PseudopotentialData",

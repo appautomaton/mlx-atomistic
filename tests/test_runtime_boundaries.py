@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import ast
 import importlib.metadata as metadata
+import io
 import subprocess
 import sys
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FORBIDDEN_ENGINE_ROOTS = {"openmm", "lammps"}
+FORBIDDEN_ENGINE_ROOTS = {"cp2k", "lammps", "openmm", "qe", "quantum_espresso"}
 FORBIDDEN_REFERENCE_PATH_FRAGMENTS = (
     "vendors/",
     "quantum-espresso/",
@@ -247,6 +250,7 @@ def test_engine_dependencies_are_not_core_runtime_dependencies():
     dev_dependencies = _resolve_dependency_group(groups, "dev")
     scripts = data["project"]["scripts"]
 
+    assert data["tool"]["uv"]["default-groups"] == ["test"]
     assert "openmm>=8.5.1" not in core_dependencies
     assert "lammps>=2025.7.22.4.0" not in core_dependencies
     assert "openmm>=8.5.1" in dev_dependencies
@@ -261,6 +265,134 @@ def test_engine_dependencies_are_not_core_runtime_dependencies():
     assert legacy_command not in {
         entry_point.name for entry_point in metadata.entry_points(group="console_scripts")
     }
+
+
+def test_dist_content_checker_rejects_monorepo_surfaces(tmp_path):
+    safe_archive = tmp_path / "safe.whl"
+    unsafe_archive = tmp_path / "unsafe.whl"
+    with zipfile.ZipFile(safe_archive, "w") as archive:
+        archive.writestr("mlx_atomistic/__init__.py", "")
+        archive.writestr("mlx_atomistic/py.typed", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/METADATA", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/WHEEL", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/entry_points.txt", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/licenses/LICENSE", "")
+    with zipfile.ZipFile(unsafe_archive, "w") as archive:
+        archive.writestr("mlx_atomistic/__pycache__/stale.pyc", "")
+        archive.writestr("vendors/reference.py", "")
+
+    safe = subprocess.run(
+        [sys.executable, "scripts/check_dist_contents.py", str(safe_archive)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    unsafe = subprocess.run(
+        [sys.executable, "scripts/check_dist_contents.py", str(unsafe_archive)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert safe.returncode == 0, safe.stdout + safe.stderr
+    assert unsafe.returncode == 1
+    assert "__pycache__" in unsafe.stderr
+    assert "vendors" in unsafe.stderr
+
+
+def test_dist_content_checker_rejects_documented_forbidden_surfaces(tmp_path):
+    archive_path = tmp_path / "unsafe.tar.gz"
+    forbidden_members = [
+        "mlx_atomistic-0.0.1/.github/workflow.yml",
+        "mlx_atomistic-0.0.1/.coverage",
+        "mlx_atomistic-0.0.1/.venv/bin/python",
+        "mlx_atomistic-0.0.1/artifacts/report.json",
+        "mlx_atomistic-0.0.1/docs/index.md",
+        "mlx_atomistic-0.0.1/outputs/run.json",
+        "mlx_atomistic-0.0.1/scratch/work.txt",
+        "mlx_atomistic-0.0.1/tests/test_release.py",
+        "mlx_atomistic-0.0.1/tmp/cache.txt",
+        "mlx_atomistic-0.0.1/scripts/helper.py",
+        "mlx_atomistic-0.0.1/AGENTS.md",
+        "mlx_atomistic-0.0.1/CLAUDE.md",
+        "mlx_atomistic-0.0.1/uv.lock",
+    ]
+
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for member in forbidden_members:
+            info = tarfile.TarInfo(member)
+            info.size = 0
+            archive.addfile(info, io.BytesIO())
+
+    result = subprocess.run(
+        [sys.executable, "scripts/check_dist_contents.py", str(archive_path)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    for expected in [
+        ".github",
+        ".coverage",
+        ".venv",
+        "artifacts",
+        "docs",
+        "outputs",
+        "scratch",
+        "tests",
+        "tmp",
+        "scripts",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "uv.lock",
+    ]:
+        assert expected in result.stderr
+
+
+def test_dist_content_checker_requires_release_metadata(tmp_path):
+    archive_path = tmp_path / "missing-metadata.whl"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("mlx_atomistic/__init__.py", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/METADATA", "")
+
+    result = subprocess.run(
+        [sys.executable, "scripts/check_dist_contents.py", str(archive_path)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "missing required wheel member mlx_atomistic/py.typed" in result.stderr
+    assert "missing required dist-info file WHEEL" in result.stderr
+    assert "missing required dist-info file entry_points.txt" in result.stderr
+    assert "missing required dist-info file LICENSE" in result.stderr
+
+
+def test_dist_content_checker_requires_package_code(tmp_path):
+    archive_path = tmp_path / "metadata-only.whl"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("mlx_atomistic/py.typed", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/METADATA", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/WHEEL", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/entry_points.txt", "")
+        archive.writestr("mlx_atomistic-0.0.1.dist-info/licenses/LICENSE", "")
+
+    result = subprocess.run(
+        [sys.executable, "scripts/check_dist_contents.py", str(archive_path)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "missing required wheel member mlx_atomistic/__init__.py" in result.stderr
 
 
 def test_runtime_boundary_docs_label_reference_surfaces():

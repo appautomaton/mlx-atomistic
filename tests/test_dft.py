@@ -15,6 +15,7 @@ from mlx_atomistic.dft import (
     LinearMixer,
     LocalGaussianPseudopotential,
     LocalPseudopotentialField,
+    PBEExchangeCorrelation,
     PseudopotentialFormat,
     PulayDIISMixer,
     RealSpaceGrid,
@@ -147,6 +148,99 @@ def test_xc_known_values_and_combined_components():
         np.array(exchange.total_energy + correlation.total_energy),
         atol=1e-6,
     )
+
+
+def test_pbe_public_api_requires_grid_and_returns_finite_values():
+    from mlx_atomistic import PBEExchangeCorrelation as TopLevelPBEExchangeCorrelation
+
+    grid = RealSpaceGrid((2, 2, 2), [2.0, 2.0, 2.0])
+    density = np.linspace(0.35, 0.65, grid.size, dtype=np.float32).reshape(grid.shape)
+    functional = PBEExchangeCorrelation()
+
+    assert TopLevelPBEExchangeCorrelation is PBEExchangeCorrelation
+    with pytest.raises(ValueError, match="requires a real-space grid"):
+        functional.evaluate(density)
+
+    result = functional.evaluate(density, grid)
+
+    assert result.name == "pbe-pz81-gga-alpha"
+    assert result.energy_density.shape == grid.shape
+    assert result.potential.shape == grid.shape
+    assert np.isfinite(float(result.total_energy))
+    assert np.isfinite(np.array(result.energy_density)).all()
+    assert np.isfinite(np.array(result.potential)).all()
+
+
+def test_scf_accepts_public_pbe_exchange_correlation():
+    system = DFTSystem.one_center(grid_shape=(4, 4, 4))
+    result = run_scf(
+        system,
+        config=SCFConfig(max_iterations=1, solver="dense", seed=23),
+        xc_functional=PBEExchangeCorrelation(),
+    )
+
+    assert np.isfinite(result.total_energy)
+    assert np.isfinite(result.energy_by_term["xc"])
+    assert result.history[-1]["exchange"] is None
+    assert result.history[-1]["correlation"] is None
+
+
+def test_pbe_uniform_density_matches_lda_baseline():
+    grid = RealSpaceGrid((2, 2, 2), [2.0, 2.0, 2.0])
+    density = np.ones(grid.shape, dtype=np.float32) * 0.4
+
+    pbe = PBEExchangeCorrelation().evaluate(density, grid)
+    lda = LDAExchangeCorrelation().evaluate(density, grid)
+
+    np.testing.assert_allclose(
+        np.array(pbe.energy_density),
+        np.array(lda.energy_density),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(pbe.total_energy),
+        np.array(lda.total_energy),
+        atol=1e-6,
+    )
+
+
+def test_pbe_potential_matches_finite_difference_derivative():
+    grid = RealSpaceGrid((2, 2, 2), [2.0, 2.0, 2.0])
+    density = np.linspace(0.35, 0.65, grid.size, dtype=np.float32).reshape(grid.shape)
+    functional = PBEExchangeCorrelation()
+    epsilon = 1e-3
+
+    plus = density.copy()
+    minus = density.copy()
+    plus[0, 0, 0] += epsilon
+    minus[0, 0, 0] -= epsilon
+
+    e_plus = float(functional.evaluate(plus, grid).total_energy)
+    e_minus = float(functional.evaluate(minus, grid).total_energy)
+    derivative = (e_plus - e_minus) / (2.0 * epsilon * grid.dv)
+    potential = float(np.array(functional.evaluate(density, grid).potential)[0, 0, 0])
+
+    assert derivative == pytest.approx(potential, abs=5e-2)
+
+
+def test_scf_history_reports_xc_components_only_when_available():
+    system = DFTSystem.one_center(grid_shape=(4, 4, 4))
+
+    lda_result = run_scf(
+        system,
+        config=SCFConfig(max_iterations=1, solver="dense", seed=31),
+        xc_functional=LDAExchangeCorrelation(),
+    )
+    pbe_result = run_scf(
+        system,
+        config=SCFConfig(max_iterations=1, solver="dense", seed=31),
+        xc_functional=PBEExchangeCorrelation(),
+    )
+
+    assert isinstance(lda_result.history[-1]["exchange"], float)
+    assert isinstance(lda_result.history[-1]["correlation"], float)
+    assert pbe_result.history[-1]["exchange"] is None
+    assert pbe_result.history[-1]["correlation"] is None
 
 
 def test_xc_potential_matches_finite_difference_derivative():

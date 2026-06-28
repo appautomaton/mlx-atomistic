@@ -52,12 +52,14 @@ operator path when projector metadata is present.
 For ion-backed systems, reported forces include:
 
 ```text
-F_total = F_local electron-ion + F_center-center
+F_total = F_local electron-ion + F_center-center + F_nonlocal correction
 ```
 
-The force validation in this milestone checks fixed-density local forces and
-SCF total-energy finite differences. This is a consistency check for the current
-local-potential model, not a claim of production DFT force accuracy.
+The nonlocal term is a fixed-orbital finite-difference correction and is reported
+through `force_provenance["nonlocal_finite_difference"]`. The force validation
+in this milestone checks fixed-density local forces and SCF total-energy finite
+differences. This is a consistency check for the current model, not a claim of
+production DFT force accuracy.
 
 ## Current Limits
 

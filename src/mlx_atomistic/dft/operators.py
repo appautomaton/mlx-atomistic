@@ -394,6 +394,12 @@ class DenseHamiltonianReference:
                 (orthonormalized).
         """
 
+        if n_orbitals <= 0:
+            msg = "n_orbitals must be positive"
+            raise ValueError(msg)
+        if n_orbitals > self.operator.grid.size:
+            msg = "n_orbitals cannot exceed the real-space grid size"
+            raise ValueError(msg)
         matrix = self.matrix()
         values, vectors = np.linalg.eigh(matrix)
         orbitals = vectors[:, :n_orbitals].T.reshape((n_orbitals, *self.operator.grid.shape))
@@ -497,11 +503,12 @@ class KineticPreconditioner:
 
 @dataclass(frozen=True)
 class DavidsonDiagonalizer:
-    """Small block Davidson-style eigensolver.
+    """Alpha Davidson-style eigensolver.
 
     The dense reference path is still used for tiny grids. Above that cutoff,
     this applies a conservative preconditioned residual iteration that avoids
-    building the dense Hamiltonian.
+    building the dense Hamiltonian. It is not yet a production Rayleigh-Ritz
+    Davidson implementation.
     """
 
     config: EigensolverConfig = field(default_factory=EigensolverConfig)
@@ -524,7 +531,8 @@ class DavidsonDiagonalizer:
 
         Returns:
             A `DiagonalizationResult` for the lowest ``n_orbitals`` states (dense
-                reference below the fallback size, preconditioned iteration above).
+                reference below the fallback size, alpha preconditioned iteration
+                above).
         """
 
         if operator.grid.size <= self.config.dense_fallback_size:

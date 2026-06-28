@@ -1,8 +1,8 @@
 # DFT SCF Core
 
 The DFT layer now has a more explicit SCF core while staying intentionally
-small: spin-unpolarized, Γ-point, orthorhombic cells, and local Gaussian
-pseudopotentials only.
+small: spin-unpolarized Γ-point SCF, orthorhombic cells, local Gaussian toy
+pseudopotentials, and ion-backed GTH/UPF pseudopotential prototypes.
 
 ## Exchange-Correlation
 
@@ -16,9 +16,13 @@ This milestone exposes that as a small API:
 - `DiracExchange`
 - `LDACorrelationPZ81`
 - `LDAExchangeCorrelation`
+- `PBEExchangeCorrelation`
 
 Each functional returns an energy density, total energy, and potential `v_xc`.
-The default SCF path now uses LDA exchange plus PZ81 correlation.
+The default SCF path uses LDA exchange plus PZ81 correlation.
+`PBEExchangeCorrelation` is public alpha API: it uses the PBE GGA gradient form
+with the package's PZ81 uniform correlation baseline, so it reports itself as a
+PBE-PZ81 alpha diagnostic rather than full PW92-backed production PBE.
 
 ## SCF Mixing
 
@@ -41,9 +45,10 @@ change the number of electrons.
 ## Forces
 
 `local_pseudopotential_forces(...)` computes Hellmann-Feynman-style forces on
-Gaussian centers from a converged or fixed density. These are diagnostic forces
-for the toy local pseudopotential model, not production DFT forces and not yet a
-geometry optimizer.
+Gaussian centers from a converged or fixed density. Ion-backed systems add
+center-center forces, and systems that apply nonlocal projectors report a
+fixed-orbital finite-difference nonlocal correction. These are diagnostic alpha
+forces, not production DFT force claims.
 
 ## Performance Evidence
 
