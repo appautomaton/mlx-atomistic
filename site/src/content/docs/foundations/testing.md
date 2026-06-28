@@ -24,11 +24,11 @@ Markers are registered with `--strict-markers`, so a typo'd marker fails fast.
 
 ## Commands
 
-Fast lane — parallel, what CI runs on every push/PR (no reference engines, so it
-never builds LAMMPS):
+Fast lane — what CI runs on every push/PR (no reference engines, so it never
+builds LAMMPS):
 
 ```bash
-uv run --locked --no-default-groups --group test python -m pytest -n auto -m "not slow and not integration and not reference and not data and not gpu"
+uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
 ```
 
 Package suite + coverage — what CI runs scheduled / on demand. Reference-engine
@@ -65,5 +65,4 @@ environment for `0.0.1`.
 - Prove physics on tiny synthesized systems; never mock the numerics.
 - Mock or guard only external boundaries: reference engines, file I/O, downloads.
 - Keep heavy/gitignored datasets out of the fast lane; tag such tests `data`.
-- Write outputs under `tmp_path`, never a fixed shared path — this keeps tests
-  parallel-safe under `-n auto`.
+- Write outputs under `tmp_path`, never a fixed shared path.
