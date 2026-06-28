@@ -31,8 +31,8 @@ jobs:
       - name: Lint
         run: uv run --locked --no-default-groups --group test ruff check src tests scripts
 
-      - name: Fast package tests
-        run: uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+      - name: Hosted package boundary tests
+        run: uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py
 
   full:
     # Comprehensive scheduled/manual run. Data/reference tests are still opt-in
@@ -53,5 +53,5 @@ jobs:
       - name: Install package test environment
         run: uv sync --locked --no-default-groups --extra prep --group test
 
-      - name: Package suite + coverage gate
-        run: uv run --locked --no-default-groups --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+      - name: Hosted package boundary tests
+        run: uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py

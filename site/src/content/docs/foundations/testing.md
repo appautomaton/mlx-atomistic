@@ -24,14 +24,20 @@ Markers are registered with `--strict-markers`, so a typo'd marker fails fast.
 
 ## Commands
 
-Fast lane — what CI runs on every push/PR (no reference engines, so it never
-builds LAMMPS):
+Local fast lane — no reference engines, so it never builds LAMMPS:
 
 ```bash
 uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
 ```
 
-Package suite + coverage — what CI runs scheduled / on demand. Reference-engine
+Hosted CI/package boundary lane — the deterministic subset GitHub Actions runs
+before packaging:
+
+```bash
+uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py
+```
+
+Package suite + coverage — local Apple Silicon release gate. Reference-engine
 and vendor-data tests remain separate opt-in lanes:
 
 ```bash
@@ -47,9 +53,10 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --g
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test python -m pytest --run-gpu -m gpu
 ```
 
-MLX runtime tests require a Metal-visible Apple Silicon host. Headless or
-virtualized sessions can collect tests, but they are not the release validation
-environment for `0.0.1`.
+MLX runtime tests require a local Apple Silicon host with stable MLX execution.
+Headless, virtualized, or hosted macOS sessions can collect tests and run static
+package-boundary checks, but they are not the runtime validation environment for
+`0.0.1`.
 
 ## Dependency groups
 
