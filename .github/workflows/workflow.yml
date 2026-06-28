@@ -33,7 +33,7 @@ jobs:
         run: uv run --locked --no-default-groups --group test ruff check src tests scripts
 
       - name: Fast package tests
-        run: uv run --locked --no-default-groups --group test python -m pytest -n auto -m "not slow and not integration and not reference and not data and not gpu"
+        run: uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
 
       - name: Generate API documentation
         run: uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
