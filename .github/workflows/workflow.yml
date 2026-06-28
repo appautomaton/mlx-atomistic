@@ -32,14 +32,11 @@ jobs:
       - name: Lint
         run: uv run --locked --no-default-groups --group test ruff check src tests scripts
 
-      - name: Fast package tests
-        run: uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+      - name: Hosted package boundary tests
+        run: uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py
 
       - name: Generate API documentation
         run: uv run --no-project --with griffe --python 3.13.12 python scripts/gen_api_docs.py
-
-      - name: Package suite + coverage gate
-        run: uv run --locked --no-default-groups --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
 
       - name: Build package distributions
         run: uv build

@@ -22,9 +22,10 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-project --with twine twine 
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-project --python 3.13.12 python scripts/check_dist_contents.py "$RELEASE_DIST"/*
 ```
 
-The full pytest suite requires Metal access. A headless or sandboxed macOS
-session may fail with `No Metal device available`; rerun on the host if that
-happens.
+The full pytest suite requires a local Apple Silicon runtime with stable MLX
+execution. GitHub-hosted macOS runners are used only for lint, package-boundary,
+documentation, build, and publish checks because hosted MLX runtime tests can
+abort inside the MLX backend.
 
 Reference-engine and vendor-data validation is not a PyPI gate. Run it only
 after explicitly provisioning the local reference surfaces:
