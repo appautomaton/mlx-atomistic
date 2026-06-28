@@ -23,7 +23,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.2.0
 
       - name: Set up Python
-        run: uv python install 3.13
+        run: uv python install 3.13.12
 
       - name: Install test tooling
         run: uv sync --locked --no-default-groups --extra prep --group test
@@ -48,7 +48,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.2.0
 
       - name: Set up Python
-        run: uv python install 3.13
+        run: uv python install 3.13.12
 
       - name: Install package test environment
         run: uv sync --locked --no-default-groups --extra prep --group test

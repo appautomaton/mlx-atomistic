@@ -38,7 +38,7 @@ jobs:
 
       - name: Generate API reference
         working-directory: ${{ github.workspace }}
-        run: uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
+        run: uv run --no-project --with griffe --python 3.13.12 python scripts/gen_api_docs.py
 
       - name: Set up Node
         uses: actions/setup-node@v6
