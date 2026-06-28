@@ -10,7 +10,7 @@ Use Node 24, matching the Pages workflow.
 cd site
 npm ci
 cd ..
-uv run --no-project --with griffe --python 3.13 python scripts/gen_api_docs.py
+uv run --no-project --with griffe --python 3.13.12 python scripts/gen_api_docs.py
 cd site
 npm run dev      # http://localhost:4321/mlx-atomistic/
 npm run build    # outputs to dist/
