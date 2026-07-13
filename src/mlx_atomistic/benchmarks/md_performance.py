@@ -875,6 +875,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--constraint-max-iterations", type=int, default=4)
     parser.add_argument("--csv", default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--json-out",
+        type=Path,
+        default=None,
+        help="write the normalized JSON payload to this path",
+    )
     args = parser.parse_args(argv)
 
     sizes = _parse_ints(args.sizes)
@@ -900,6 +906,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     if args.csv is not None:
         _write_csv(args.csv, payload["cases"])
+    if args.json_out is not None:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     if args.json:
         print(json.dumps(payload, indent=2))

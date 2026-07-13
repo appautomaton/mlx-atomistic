@@ -24,6 +24,7 @@ from mlx_atomistic.benchmarks import (
     md_acceleration,
     md_performance,
     mm_force_terms,
+    neighbor_nonbonded_parity,
     normalize_benchmark_row,
     phase3_physics,
     pme_performance,
@@ -453,6 +454,77 @@ def test_md_performance_baseline_schema_reports_cadence_and_neighbor_fields():
     assert row["evaluation_interval"] == 1
     assert row["materialized_frame_count"] >= 1
     assert "diagnostics:1" in row["sync_cadence"]
+
+
+def test_md_performance_json_output(tmp_path, capsys):
+    out = tmp_path / "md-performance.json"
+
+    md_performance.main(
+        [
+            "--sizes",
+            "16",
+            "--steps",
+            "1",
+            "--mode",
+            "dynamic-neighbor",
+            "--sample-interval",
+            "1",
+            "--diagnostic-interval",
+            "1",
+            "--evaluation-interval",
+            "1",
+            "--json-out",
+            str(out),
+            "--json",
+        ]
+    )
+
+    stdout_payload = json.loads(capsys.readouterr().out)
+    persisted = json.loads(out.read_text())
+    assert persisted == stdout_payload
+    assert persisted["cases"][0]["neighbor_candidate_count"] is not None
+
+
+def test_neighbor_nonbonded_parity_command_writes_validated_row(tmp_path, capsys):
+    out = tmp_path / "neighbor-parity.json"
+
+    neighbor_nonbonded_parity.main(
+        [
+            "--sizes",
+            "32",
+            "--density",
+            "0.1",
+            "--cutoff",
+            "1.5",
+            "--tile-size",
+            "8",
+            "--out",
+            str(out),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    persisted = json.loads(out.read_text())
+    row = payload["cases"][0]
+    assert persisted == payload
+    assert row["status"] == "validated"
+    assert row["backend"] == "mlx_cell_pairs"
+    assert row["pair_policy"] == "lazy"
+    assert row["dense_pair_cache_materialized"] is False
+    assert row["semantic_topology"] is True
+    assert row["exclusion_count"] >= 2
+    assert row["one_four_count"] == 1
+    assert row["energy_abs_delta"] <= (
+        row["energy_tolerance"]["atol"]
+        + row["energy_tolerance"]["rtol"] * max(abs(row["reference_energy"]), 1.0)
+    )
+    assert row["force_max_abs_delta"] <= (
+        row["force_tolerance"]["atol"]
+        + row["force_tolerance"]["rtol"] * max(row["reference_force_max_abs"], 1.0)
+    )
+    assert payload["largest_validated_size"] == 32
+    assert payload["triclinic_status"] == "deferred_fail_closed"
 
 
 def test_cadence_sensitivity_reports_timing_and_sync_counts():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import shutil
@@ -288,6 +289,14 @@ def _completed_row(
         or compatibility_report.get("electrostatics_model")
         or "cutoff"
     )
+    nonbonded_runtime = dict(metadata.get("nonbonded_runtime", {}))
+    neighbor_rebuild_wall_s = float(
+        nonbonded_runtime.get("neighbor_rebuild_wall_seconds") or 0.0
+    )
+    force_eval_wall_s = float(
+        nonbonded_runtime.get("force_evaluation_wall_seconds") or 0.0
+    )
+    decomposed_wall_s = neighbor_rebuild_wall_s + force_eval_wall_s
     return {
         **_base_row(
             case_dir=case_dir,
@@ -312,6 +321,20 @@ def _completed_row(
         "diagnostic_count": int(np.asarray(record.diagnostic_steps).shape[0]),
         "final_pair_count": last_int(record.pair_count),
         "rebuild_count": last_int(record.rebuild_count),
+        "neighbor_backend": nonbonded_runtime.get("backend"),
+        "neighbor_fallback_reason": nonbonded_runtime.get("fallback_reason"),
+        "compact_pair_count": nonbonded_runtime.get("compact_pair_count"),
+        "candidate_count": nonbonded_runtime.get("candidate_count"),
+        "candidate_waste_count": nonbonded_runtime.get("candidate_waste_count"),
+        "candidate_waste_fraction": nonbonded_runtime.get("candidate_waste_fraction"),
+        "compaction_backend": nonbonded_runtime.get("compaction_backend"),
+        "neighbor_update_wall_s": nonbonded_runtime.get("neighbor_update_wall_seconds"),
+        "neighbor_rebuild_wall_s": neighbor_rebuild_wall_s,
+        "force_eval_wall_s": force_eval_wall_s,
+        "force_eval_ms_per_step": force_eval_wall_s * 1000.0 / max(steps, 1),
+        "neighbor_build_fraction": (
+            neighbor_rebuild_wall_s / decomposed_wall_s if decomposed_wall_s > 0.0 else None
+        ),
         "total_wall_s": total_wall_s,
         "run_wall_s": run_wall,
         "import_wall_s": import_wall,
@@ -366,6 +389,18 @@ def _blocked_row(
         "diagnostic_count": None,
         "final_pair_count": None,
         "rebuild_count": None,
+        "neighbor_backend": None,
+        "neighbor_fallback_reason": None,
+        "compact_pair_count": None,
+        "candidate_count": None,
+        "candidate_waste_count": None,
+        "candidate_waste_fraction": None,
+        "compaction_backend": None,
+        "neighbor_update_wall_s": None,
+        "neighbor_rebuild_wall_s": None,
+        "force_eval_wall_s": None,
+        "force_eval_ms_per_step": None,
+        "neighbor_build_fraction": None,
         "total_wall_s": total_wall_s,
         "run_wall_s": None,
         "import_wall_s": None,
@@ -462,8 +497,75 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _parse_float_tuple(value: str) -> tuple[float, ...]:
+    return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _parse_string_tuple(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run GPCRmd benchmark rows from the command line."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--target-id", default=None)
+    parser.add_argument("--cache", type=Path, default=None)
+    parser.add_argument("--registry-path", type=Path, default=None)
+    parser.add_argument("--prepared", type=Path, default=None)
+    parser.add_argument("--durations-ps", default="0.01")
+    parser.add_argument("--electrostatics-modes", default="artifact")
+    parser.add_argument("--dt", type=float, default=0.001)
+    parser.add_argument("--sample-interval", type=int, default=10)
+    parser.add_argument("--temperature", type=float, default=300.0)
+    parser.add_argument("--friction", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--restraint-k", type=float, default=5.0)
+    parser.add_argument("--minimize-steps", type=int, default=0)
+    parser.add_argument("--equilibration-steps", type=int, default=0)
+    parser.add_argument("--constraint-max-iterations", type=int, default=4)
+    parser.add_argument("--diagnostic-interval", type=int, default=None)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    payload = benchmark_gpcrmd_mlx(
+        out=args.out,
+        target_id=args.target_id,
+        cache=args.cache,
+        registry_path=args.registry_path,
+        prepared=args.prepared,
+        durations_ps=_parse_float_tuple(args.durations_ps),
+        electrostatics_modes=_parse_string_tuple(args.electrostatics_modes),
+        dt=args.dt,
+        sample_interval=args.sample_interval,
+        temperature=args.temperature,
+        friction=args.friction,
+        seed=args.seed,
+        restraint_k=args.restraint_k,
+        minimize_steps=args.minimize_steps,
+        equilibration_steps=args.equilibration_steps,
+        constraint_max_iterations=args.constraint_max_iterations,
+        diagnostic_interval=args.diagnostic_interval,
+        force=args.force,
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"cases={payload['case_count']} blocked={payload['blocked_case_count']} "
+            f"out={args.out}"
+        )
+
+
 __all__ = [
     "GPCRMD_BENCHMARK_CSV_NAME",
     "GPCRMD_BENCHMARK_JSON_NAME",
     "benchmark_gpcrmd_mlx",
+    "main",
 ]
+
+
+if __name__ == "__main__":
+    main()
