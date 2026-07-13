@@ -755,6 +755,26 @@ def test_gpcrmd_production_neighbor_manager_requires_optimized_cutoff_route():
             require_production=True,
         )
 
+    no_cell_system = SimpleNamespace(cell=None)
+    with pytest.raises(ValueError, match="periodic cell-list neighbors"):
+        _production_neighbor_manager(
+            no_cell_system,
+            (cutoff_term,),
+            require_production=True,
+        )
+
+    no_cutoff_term = SimpleNamespace(
+        topology=topology,
+        cutoff=None,
+        electrostatics="cutoff",
+    )
+    with pytest.raises(ValueError, match="finite nonbonded cutoff"):
+        _production_neighbor_manager(
+            system,
+            (no_cutoff_term,),
+            require_production=True,
+        )
+
 
 def test_gpcrmd_short_range_prototype_pme_artifact_runs_cutoff_not_pme(tmp_path):
     from mlx_atomistic.io import load_npz_trajectory

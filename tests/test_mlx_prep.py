@@ -769,6 +769,37 @@ def test_gpcrmd_production_neighbor_manager_uses_auto_backend_policy():
     assert tuned_manager.skin == 1.25
     assert tuned_manager.check_interval == 4
 
+    large_system = SimpleNamespace(cell=Cell.cubic(80.0))
+    large_topology = Topology.from_sequences(
+        n_atoms=4100,
+        eager_nonbonded_pair_limit=0,
+    )
+    large_term = SimpleNamespace(
+        topology=large_topology,
+        cutoff=1.6,
+        electrostatics="cutoff",
+    )
+    large_manager = _production_neighbor_manager(
+        large_system,
+        (large_term,),
+        require_production=True,
+    )
+    assert large_manager is not None
+    positions = np.random.default_rng(7).uniform(0.0, 80.0, size=(4100, 3)).astype(np.float32)
+    neighbors = large_manager.update(positions)
+    assert neighbors.backend == "mlx_cell_pairs"
+    assert neighbors.fallback_reason is None
+    assert large_topology._nonbonded_pairs is None
+
+    eager_topology = Topology.from_sequences(n_atoms=4)
+    eager_term = SimpleNamespace(
+        topology=eager_topology,
+        cutoff=1.6,
+        electrostatics="cutoff",
+    )
+    assert _production_neighbor_manager(system, (eager_term,), require_production=True) is None
+    assert _production_neighbor_manager(system, (term,), require_production=False) is None
+
 
 def test_solvated_ligand_receptor_builder_exports_complete_runtime_artifact(tmp_path: Path):
     from mlx_atomistic.artifacts import load_prepared_mlx_artifact
