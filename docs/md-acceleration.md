@@ -74,6 +74,15 @@ runtime does not currently expose a NumPy-style one-argument `where(mask)` or
 `mlx_cell_pairs` is the current pragmatic hybrid: bounded cell candidates and
 MLX distance filtering, with dynamic compaction still CPU-side.
 
+A fresh synthetic orthorhombic parity ladder now validates this route at
+1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001
+atoms, the compact build took 0.545 s, the explicitly synchronized pair-force
+evaluation took 0.068 s, and the tiled oracle took 112.1 s; relative energy
+delta was `4.56e-7` and maximum absolute force delta was `8.49e-7`. The result is
+diagnostic rather than a GPCRmd production claim because the local real-fixture
+cache was unavailable and PME remains out of the at-scale runtime envelope. See
+[`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](./benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md).
+
 For the active solvated ligand-receptor notebook system, the near-term GPU
 occupancy lever is independent replica batching. The system is only a few
 hundred atoms, so one trajectory does not expose much work to the GPU. Use the
