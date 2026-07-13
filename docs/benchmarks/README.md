@@ -38,6 +38,7 @@ Each result file should answer, in order:
 | [same-workload-comparison-matrix.md](./same-workload-comparison-matrix.md) | mlx_atomistic/openmm-reference | planned same-workload comparison pairs | Metal/OpenCL where available | local |
 | [same-workload-openmm-comparison.md](./same-workload-openmm-comparison.md) | mlx_atomistic/openmm-reference | refreshed controlled same-workload comparison report | Metal/OpenCL where available | local |
 | [same-workload-dhfr-stretch.md](./same-workload-dhfr-stretch.md) | mlx_atomistic/openmm-reference | DHFR stretch status | Metal/OpenCL where available | local |
+| [scalable-neighbor-nonbonded-runtime-m5max.md](./scalable-neighbor-nonbonded-runtime-m5max.md) | mlx_atomistic | orthorhombic neighbor/nonbonded parity, 1k-92k atoms | Metal | Apple M5 Max |
 | [performance-audit-baseline.md](./performance-audit-baseline.md) | mlx_atomistic | fast baseline audit and ranked backlog | Metal/OpenCL where available | local |
 | [m5max-reference-engines.md](./m5max-reference-engines.md) | openmm-reference/lammps-reference | M5 Max reference-engine manifest overview | OpenCL | Apple M5 Max |
 | [openmm-opencl-dhfr.md](./openmm-opencl-dhfr.md) | openmm-reference | DHFR (23k atoms) | OpenCL | Apple M5 Max |
@@ -59,6 +60,7 @@ LAMMPS, OpenCL, large downloaded fixtures, or committed raw outputs.
 | `uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 1 --particles 16 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --sizes 16 --evaluations 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --sizes 32 --steps 1 --sample-interval 1 --diagnostic-interval 1 --evaluation-interval 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
+| `uv run python -m mlx_atomistic.benchmarks.neighbor_nonbonded_parity --sizes 32 --density 0.1 --cutoff 1.5 --tile-size 8 --out results/neighbor-parity-smoke.json` | mlx_atomistic | fast developer | parity JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.pme_performance --fixture-dir results/missing-pme-fixture --iterations 1 --warmups 0 --json` | mlx_atomistic | fast developer blocked-path smoke | normalized blocked JSON on stdout |
 
 Opt-in performance commands are non-CI and non-routine. They may need Apple
@@ -70,6 +72,8 @@ Markdown summaries should cite those raw paths and reproduction commands.
 | --- | --- | --- | --- |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --include-large --steps 100 --json > results/mlx-md-performance.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --include-large --evaluations 10 --json > results/mlx-md-acceleration.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
+| `uv run python -m mlx_atomistic.benchmarks.neighbor_nonbonded_parity --sizes 1000,4000,16000,50000,92001 --out results/scalable-neighbor-nonbonded-runtime/parity.json` | mlx_atomistic | opt-in correctness/performance | parity and timing JSON under `results/` |
+| `uv run python -m mlx_atomistic.benchmarks.md_performance --sizes 92001 --steps 2 --mode dynamic-neighbor --sample-interval 2 --diagnostic-interval 2 --evaluation-interval 2 --json-out results/scalable-neighbor-nonbonded-runtime/synthetic-runtime-92001.json` | mlx_atomistic | opt-in performance | at-scale runtime JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.pme_performance --out-dir results/pme-performance --json` | mlx_atomistic | opt-in performance | raw JSON under `results/pme-performance/` |
 | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-implicit --steps 1 --json > results/same-workload-openmm-comparison/mlx-dhfr-implicit.json` | mlx_atomistic | opt-in runnable stretch smoke | normalized runnable JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --json > results/same-workload-openmm-comparison/mlx-dhfr-explicit-pme.json` | mlx_atomistic | opt-in blocked-path stretch | normalized blocked JSON under `results/` until PME neutrality policy is resolved |

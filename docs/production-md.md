@@ -43,16 +43,21 @@ The active production-readiness probe uses
 `gpcrmd-729-beta1-5f8u-cyanopindolol`, a local GPCRmd 729 cache with `92001`
 atoms, CHARMM36, TIP3P water, sodium/chloride ions, and a POPC membrane.
 
-The probe result is blocked, not a production-MD pass:
+The production-readiness result remains blocked, but the neighbor/topology axis
+is no longer the blocker:
 
 - OpenMM reference evidence is available as reference-only CHARMM/PME data.
 - MLX preparation, strict artifact loading, and readiness checks now pass for
   the fixture.
-- Bounded MLX execution blocks at `topology_terms`: lazy topology needs a
-  runtime nonbonded pair provider, and full dense pair materialization was not
-  requested.
-- Because the run blocks before production frames, energy parity, trajectory
-  output, checkpoint, and restart behavior are not claimed.
+- Lazy topology now receives the production `NeighborListManager`; large systems
+  select `mlx_cell_pairs` and refuse dense/tiled fallback.
+- Synthetic bounded-probe coverage asserts that short-range frames complete and
+  the blocker matrix advances from `topology_terms` to `electrostatics_pme`.
+- The scalable neighbor/nonbonded path matches its tiled oracle through 92,001
+  atoms; see
+  [the M5 Max report](./benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md).
+- The gitignored GPCRmd cache was absent for the 2026-07-13 rerun, so no fresh
+  real-fixture trajectory, checkpoint, or restart claim is made.
 
 This is one bounded fixture probe and is not broad production MD certification.
 
@@ -160,6 +165,7 @@ SMD. Current PME and NPT paths are bounded proof surfaces, not evidence for a
 complete membrane-production workflow.
 
 For the GPCRmd 729 production-readiness probe, the next implementation blocker
-is runtime nonbonded pair provisioning for lazy topology at GPCRmd scale. Until
-that blocker is closed and re-run evidence is recorded, production-MD readiness
-remains blocked for the selected large fixture.
+is PME-scale electrostatics. The neighbor-listed real-space path is validated at
+92,001 synthetic atoms, but PME remains capped at 4,096 atoms and the real
+fixture still needs a local-cache rerun. Production-MD readiness therefore
+remains blocked for the selected membrane system.

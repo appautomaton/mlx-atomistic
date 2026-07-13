@@ -29,6 +29,7 @@ artifact for benchmark implementation, not a performance report.
 | `tip4p-ew-water` | TIP4P-Ew virtual-site / water row | `uv run python -m mlx_atomistic.benchmarks.phase3_physics --evaluations 1 --waters 1 --atoms 4 --replica-steps 1 --json` | `uv run python scripts/benchmark_openmm_opencl.py --case tip4p-ew-water --platform Reference --particles 4 --steps 1 --json` | `ms/eval` or per-step timing | `comparable` only if both sides report the same TIP4P-Ew virtual-site or water-workload operation; `diagnostic` if the MLX side measures reconstruction and OpenMM measures full water force evaluation | `results/same-workload-openmm-comparison/mlx-tip4p-ew-water.json`; `results/same-workload-openmm-comparison/openmm-tip4p-ew-water.json` | Do not compare virtual-site reconstruction alone against full OpenMM water dynamics. |
 | `dhfr-implicit` | DHFR implicit GBSA/OBC real-system stretch | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-implicit --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-implicit --platform Reference --steps 1 --json` | `ns/day` | `comparable` for the one-step MLX/OpenMM Reference smoke row when both sides are `ok` and use `0.004 ps` | `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; `results/same-workload-openmm-comparison/summary.json` | Use as a narrow runtime/artifact smoke comparison. OpenMM OpenCL DHFR implicit remains context only. |
 | `dhfr-explicit-pme` | DHFR explicit PME real-system stretch | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-explicit-pme --platform Reference --steps 1 --json` | `ns/day` | `blocked` until MLX has a scientifically valid neutral PME artifact or charged-PME policy | `results/same-workload-openmm-comparison/mlx-dhfr-explicit-pme.json`; `results/same-workload-openmm-comparison/openmm-dhfr-explicit-pme.json` | Current local Amber20/JAC PME artifact has `net_charge=-11`; OpenMM OpenCL DHFR PME remains context only. |
+| `neighbor-nonbonded-parity-92k` | heterogeneous LJ+Coulomb orthorhombic parity ladder with lazy topology | `uv run python -m mlx_atomistic.benchmarks.neighbor_nonbonded_parity --sizes 1000,4000,16000,50000,92001 --out results/scalable-neighbor-nonbonded-runtime/parity.json` | none | `dE`, max `dF`, build/eval wall time | `diagnostic`; internal MLX compact-pair versus tiled-oracle validation | `results/scalable-neighbor-nonbonded-runtime/parity.json`; [scalable-neighbor-nonbonded-runtime-m5max.md](./scalable-neighbor-nonbonded-runtime-m5max.md) | Existing reference rows use different physics; do not compute a cross-engine ratio. |
 
 ## Large-Scale Synthetic-LJ Scaling Ladder
 
@@ -44,6 +45,11 @@ by `(atom_count, step_count)`). Results, method, and caveats:
 uv run python scripts/run_same_workload_lj_scaling.py \
   --sizes 1000,4000,16000,50000 --steps 3000,2000,800,300
 ```
+
+The separate neighbor/nonbonded parity ladder reaches 92,001 atoms but remains
+`diagnostic` because its heterogeneous LJ+Coulomb topology workload does not have
+a matching OpenMM/LAMMPS row. See
+`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`.
 
 ## Required Report Behavior
 

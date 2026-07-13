@@ -21,7 +21,6 @@ from mlx_atomistic.runtime import get_runtime_info
 from mlx_atomistic.topology import Topology
 
 DEFAULT_SIZES = (1000, 4000, 16000, 50000, 92001)
-DEFAULT_OUT = Path("results/scalable-neighbor-nonbonded-runtime/parity.json")
 
 
 def _parse_sizes(value: str) -> tuple[int, ...]:
@@ -290,7 +289,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--energy-rtol", type=float, default=1e-5)
     parser.add_argument("--force-atol", type=float, default=1e-3)
     parser.add_argument("--force-rtol", type=float, default=1e-5)
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
