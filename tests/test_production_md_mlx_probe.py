@@ -4,8 +4,12 @@ import importlib.util
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 
 _HELPER_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "run_mlx_production_md_probe.py"
@@ -204,3 +208,93 @@ def test_mlx_probe_written_evidence_redacts_temporary_prepared_paths(
         persisted["earliest_blocker"]["smallest_reproduction_context"]
         == "prepared_artifact_path=<mlx-production-md-probe>/prepared"
     )
+
+
+def test_mlx_probe_bounded_run_uses_production_neighbor_manager(monkeypatch):
+    from mlx_atomistic.core import Cell
+    from mlx_atomistic.forcefields import NonbondedPotential
+    from mlx_atomistic.neighbors import NeighborListManager
+    from mlx_atomistic.topology import Topology
+
+    positions = np.asarray(
+        [
+            [0.1, 0.1, 0.1],
+            [1.1, 0.1, 0.1],
+            [0.1, 1.1, 0.1],
+            [1.1, 1.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(5.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=np.ones((4,), dtype=np.float32),
+        epsilon=np.full((4,), 0.01, dtype=np.float32),
+        charges=np.zeros((4,), dtype=np.float32),
+        topology=topology,
+        cutoff=1.6,
+        backend="auto",
+    )
+    system = SimpleNamespace(cell=cell)
+    artifact = SimpleNamespace(
+        arrays={
+            "positions": positions,
+            "velocities": np.zeros_like(positions),
+            "masses": np.ones((4,), dtype=np.float32),
+        },
+        cell=cell,
+        unit_system=None,
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=1.6,
+        skin=0.2,
+        max_mlx_dense_atoms=3,
+    )
+    policy_calls = []
+
+    monkeypatch.setattr(
+        _HELPER,
+        "build_mlx_system_from_artifact",
+        lambda value: (system, [term], None),
+    )
+
+    def production_policy(value, terms, *, require_production):
+        policy_calls.append((value, tuple(terms), require_production))
+        return manager
+
+    monkeypatch.setattr(_HELPER, "_production_neighbor_manager", production_policy)
+    report = {
+        "status": "running",
+        "stages": {"run": _HELPER._stage("pending")},
+        "finite_checks": _HELPER._empty_finite_checks(),
+        "runtime_performance": {
+            "bounded_run_attempted": False,
+            "bounded_run_completed": False,
+            "wall_time_seconds": None,
+        },
+        "taxonomy_blockers": [],
+        "earliest_blocker": None,
+    }
+
+    _HELPER._run_bounded_probe(
+        report,
+        artifact,
+        time.perf_counter(),
+        prepared_artifact_evidence_path="<synthetic>/prepared",
+    )
+
+    assert policy_calls == [(system, (term,), True)]
+    assert report["status"] == "passed"
+    assert report["stages"]["run"]["status"] == "passed"
+    assert report["runtime_performance"]["bounded_run_completed"] is True
+    assert report["runtime_performance"]["backend"] == "mlx_cell_pairs"
+    assert report["runtime_performance"]["fallback_reason"] is None
+    assert report["runtime_performance"]["candidate_count"] is not None
+    assert report["runtime_performance"]["force_evaluation_wall_seconds"] >= 0.0
+    assert report["finite_checks"]["energies"] is True
+    assert topology._nonbonded_pairs is None

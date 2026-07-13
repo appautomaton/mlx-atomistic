@@ -280,19 +280,49 @@ def _apply_mlx(entries: dict[str, dict[str, Any]], mlx: dict[str, Any]) -> None:
                 "next_implementation_decision": "do not claim NPT coverage from this fixture",
             }
         )
+    run_stage = stages.get("run", {})
+    nonbonded_runtime = run_stage.get("nonbonded_runtime", {})
+    if run_stage.get("status") == "passed" and nonbonded_runtime.get("backend") in {
+        "mlx_dense_pairs",
+        "mlx_cell_pairs",
+        "mlx_cell_blocks",
+    }:
+        entries["topology_terms"].update(
+            {
+                "status": "passed",
+                "command": "run_minimize_then_nvt bounded production probe",
+                "observed_result": (
+                    "lazy topology used runtime compact neighbor pairs via "
+                    f"{nonbonded_runtime.get('backend')}"
+                ),
+                "smallest_reproduction_context": "mlx-probe.json:stages.run.nonbonded_runtime",
+                "affected_acceptance_criteria": ["AC4", "AC6", "AC7"],
+                "next_implementation_decision": (
+                    "keep compact neighbor provisioning while addressing downstream physics"
+                ),
+                "prevents_bounded_pass": False,
+            }
+        )
     finite = mlx.get("finite_checks", {})
     if finite.get("positions") and finite.get("velocities"):
+        energies_finite = finite.get("energies") is True
         entries["stability_finiteness"].update(
             {
-                "status": "partial",
+                "status": "passed" if energies_finite else "partial",
                 "command": mlx.get("command", "MLX probe"),
                 "observed_result": (
-                    "MLX prep produced finite positions and velocities; energies "
+                    "MLX bounded run produced finite positions, velocities, and energies"
+                    if energies_finite
+                    else "MLX prep produced finite positions and velocities; energies "
                     "are unavailable because bounded run blocked"
                 ),
                 "smallest_reproduction_context": "mlx-probe.json:finite_checks",
                 "affected_acceptance_criteria": ["AC6", "AC7"],
-                "next_implementation_decision": "rerun finite energy checks after runtime blocker",
+                "next_implementation_decision": (
+                    "retain finite-state checks in at-scale runs"
+                    if energies_finite
+                    else "rerun finite energy checks after runtime blocker"
+                ),
             }
         )
     runtime = mlx.get("runtime_performance", {})
@@ -336,6 +366,27 @@ def _finalize_defaults(
     mlx: dict[str, Any],
 ) -> None:
     del openmm
+    pme_relevance = str(
+        candidate.get("protocol_relevance", {}).get("pme_electrostatics_relevance", "")
+    ).lower()
+    neighbor_axis_passed = entries["topology_terms"]["status"] == "passed"
+    if neighbor_axis_passed and "required" in pme_relevance:
+        entries["electrostatics_pme"].update(
+            {
+                "status": "blocked",
+                "command": "candidate fixture and successful MLX short-range probe",
+                "observed_result": (
+                    "neighbor-listed cutoff execution passed, but the selected fixture "
+                    "requires PME-scale electrostatics"
+                ),
+                "smallest_reproduction_context": "candidate-fixture.json and mlx-probe.json",
+                "affected_acceptance_criteria": ["AC5", "AC7"],
+                "next_implementation_decision": (
+                    "implement and validate PME beyond the current runtime envelope"
+                ),
+                "prevents_bounded_pass": True,
+            }
+        )
     if entries["electrostatics_pme"]["status"] == "deferred":
         entries["electrostatics_pme"].update(
             {
