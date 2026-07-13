@@ -376,6 +376,63 @@ def test_mlx_cell_blocks_preserve_lazy_topology_pair_semantics():
     np.testing.assert_allclose(np.asarray(block_forces), np.asarray(oracle_forces), rtol=1e-5)
 
 
+def test_mlx_cell_pairs_preserve_lazy_topology_pair_semantics():
+    positions = as_mx_array(
+        [
+            [0.1, 0.1, 0.1],
+            [1.1, 0.1, 0.1],
+            [0.1, 1.1, 0.1],
+            [1.2, 1.1, 0.1],
+        ]
+    )
+    cell = Cell.cubic(4.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        one_four_pairs=[(0, 3)],
+        nonbonded_exception_pairs=[(1, 3)],
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.1, 1.2, 1.0],
+        epsilon=[0.2, 0.25, 0.3, 0.2],
+        charges=[0.25, -0.25, 0.1, -0.1],
+        atom_types=["H", "C", "O", "H"],
+        topology=topology,
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.75,
+        exception_pairs=[(1, 3)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+        nbfix_type_pairs=[("H", "O")],
+        nbfix_type_sigma=[1.35],
+        nbfix_type_epsilon=[0.6],
+        cutoff=2.0,
+        lj_shift=False,
+        backend="auto",
+    )
+    oracle = build_neighbor_list(positions, cell, cutoff=2.0, skin=0.0)
+    mlx_pairs = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.0,
+        skin=0.0,
+        backend="mlx_cell_pairs",
+    )
+
+    oracle_energy, oracle_forces = term.energy_forces(positions, cell, pairs=oracle.pairs)
+    mlx_energy, mlx_forces = term.energy_forces(positions, cell, pairs=mlx_pairs.pairs)
+
+    mx.eval(oracle_energy, oracle_forces, mlx_energy, mlx_forces)
+    assert topology._nonbonded_pairs is None
+    assert mlx_pairs.backend == "mlx_cell_pairs"
+    assert mlx_pairs.compaction_backend == "cpu_argwhere"
+    assert mlx_pairs.fallback_reason is None
+    np.testing.assert_allclose(np.asarray(mlx_energy), np.asarray(oracle_energy), rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(mlx_forces), np.asarray(oracle_forces), rtol=1e-5)
+
+
 def test_nbfix_type_pair_substitution_works_on_neighbor_pairs():
     positions = as_mx_array(
         [[0.1, 0.1, 0.1], [1.4, 0.1, 0.1], [0.1, 1.5, 0.1]]
@@ -631,6 +688,58 @@ def test_dense_nonbonded_respects_topology_exclusions_and_one_four_scaling():
     mx.eval(reference_energy, reference_forces, dense_energy, dense_forces)
     np.testing.assert_allclose(np.asarray(dense_energy), np.asarray(reference_energy), rtol=1e-6)
     np.testing.assert_allclose(np.asarray(dense_forces), np.asarray(reference_forces), rtol=1e-5)
+
+
+def test_lazy_mlx_cell_pairs_match_dense_topology_energy_and_forces():
+    positions = _positions()
+    cell = Cell.cubic(6.0)
+    topology_kwargs = {
+        "n_atoms": 4,
+        "bonds": [(0, 1)],
+        "one_four_pairs": [(0, 3)],
+    }
+    eager_topology = Topology.from_sequences(
+        **topology_kwargs,
+        eager_nonbonded_pair_limit=None,
+    )
+    lazy_topology = Topology.from_sequences(
+        **topology_kwargs,
+        eager_nonbonded_pair_limit=0,
+    )
+    potential_kwargs = {
+        "sigma": [1.0, 1.1, 0.9, 1.05],
+        "epsilon": [0.2, 0.3, 0.25, 0.35],
+        "charges": [0.25, -0.25, 0.1, -0.1],
+        "cutoff": 4.0,
+        "lj_one_four_scale": 0.5,
+        "coulomb_one_four_scale": 0.75,
+    }
+    dense = NonbondedPotential(
+        **potential_kwargs,
+        topology=eager_topology,
+        backend="mlx_tiled",
+        tile_size=2,
+    )
+    lazy = NonbondedPotential(
+        **potential_kwargs,
+        topology=lazy_topology,
+        backend="auto",
+    )
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=4.0,
+        skin=0.0,
+        backend="mlx_cell_pairs",
+    )
+
+    dense_energy, dense_forces = dense.energy_forces(positions, cell)
+    lazy_energy, lazy_forces = lazy.energy_forces(positions, cell, pairs=neighbors.pairs)
+
+    mx.eval(dense_energy, dense_forces, lazy_energy, lazy_forces)
+    assert lazy_topology._nonbonded_pairs is None
+    np.testing.assert_allclose(np.asarray(lazy_energy), np.asarray(dense_energy), rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(lazy_forces), np.asarray(dense_forces), rtol=1e-5)
 
 
 def test_backend_validation_and_memory_policy():
