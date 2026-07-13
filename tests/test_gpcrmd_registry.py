@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -966,11 +967,62 @@ def test_gpcrmd_runtime_benchmark_writes_json_csv_for_tiny_fixture(tmp_path: Pat
     assert row["steps"] == 2
     assert row["frame_count"] == 3
     assert row["final_pair_count"] is not None
+    assert row["neighbor_backend"] is not None
+    assert row["compact_pair_count"] is not None
+    assert row["candidate_count"] is not None
+    assert row["candidate_waste_fraction"] is not None
+    assert row["neighbor_rebuild_wall_s"] >= 0.0
+    assert row["force_eval_wall_s"] >= 0.0
+    assert row["force_eval_ms_per_step"] >= 0.0
     assert row["artifact_size_bytes"] > 0
     assert row["integration_steps_per_s"] is not None
     assert row["positions_finite"] is True
     assert (out / GPCRMD_BENCHMARK_JSON_NAME).exists()
     assert (out / GPCRMD_BENCHMARK_CSV_NAME).read_text().startswith("case,status")
+
+
+def test_gpcrmd_runtime_benchmark_module_cli(tmp_path: Path, capsys):
+    from mlx_atomistic.prep.gpcrmd_benchmark import (
+        GPCRMD_BENCHMARK_JSON_NAME,
+        main,
+    )
+
+    target, registry, manifest = _write_tiny_gpcrmd_amber_cache(tmp_path)
+    out = tmp_path / "gpcrmd-benchmark-cli"
+
+    main(
+        [
+            "--target-id",
+            target.target_id,
+            "--registry-path",
+            str(registry),
+            "--cache",
+            str(manifest),
+            "--out",
+            str(out),
+            "--durations-ps",
+            "0.001",
+            "--dt",
+            "0.0005",
+            "--sample-interval",
+            "1",
+            "--temperature",
+            "0",
+            "--restraint-k",
+            "0",
+            "--constraint-max-iterations",
+            "8",
+            "--diagnostic-interval",
+            "1",
+            "--force",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["blocked_case_count"] == 0
+    assert payload["cases"][0]["neighbor_backend"] is not None
+    assert (out / GPCRMD_BENCHMARK_JSON_NAME).exists()
 
 
 def test_gpcrmd_runtime_benchmark_blocks_without_timing_placeholders(tmp_path: Path):
