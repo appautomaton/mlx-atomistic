@@ -476,17 +476,26 @@ def _ewald_reference_coulomb_energy_forces_impl(
     real_cutoff = config.real_cutoff
     if real_cutoff is None:
         real_cutoff = 0.5 * float(np.min(cell_lengths))
-    real_shifts = _ewald_real_shifts(cell_lengths, real_cutoff)
     k_vectors = _ewald_k_vectors(cell_lengths, config.reciprocal_cutoff)
-
-    real_energy, real_forces = _ewald_real_energy_forces(
-        positions,
-        charges,
-        real_shifts,
-        alpha=config.alpha,
-        cutoff=real_cutoff,
-        coulomb_constant=coulomb_constant,
-    )
+    if float(real_cutoff) <= 0.5 * float(np.min(cell_lengths)) + 1e-7:
+        real_energy, real_forces = _ewald_real_minimum_image_energy_forces(
+            positions,
+            charges,
+            mx.array(cell_lengths),
+            alpha=config.alpha,
+            cutoff=real_cutoff,
+            coulomb_constant=coulomb_constant,
+        )
+    else:
+        real_shifts = _ewald_real_shifts(cell_lengths, real_cutoff)
+        real_energy, real_forces = _ewald_real_energy_forces(
+            positions,
+            charges,
+            real_shifts,
+            alpha=config.alpha,
+            cutoff=real_cutoff,
+            coulomb_constant=coulomb_constant,
+        )
     reciprocal_energy, reciprocal_forces = _ewald_reciprocal_energy_forces(
         positions,
         charges,
@@ -1271,6 +1280,38 @@ def _ewald_real_energy_forces(
     )
     scalar = mx.where(pair_mask, scalar, 0.0)
     forces = mx.sum(scalar[:, :, :, None] * displacement, axis=(1, 2))
+    return 0.5 * mx.sum(pair_energy), forces
+
+
+def _ewald_real_minimum_image_energy_forces(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
+    *,
+    alpha: float,
+    cutoff: float,
+    coulomb_constant: float,
+) -> tuple[mx.array, mx.array]:
+    displacement = positions[:, None, :] - positions[None, :, :]
+    displacement = displacement - cell_lengths * mx.floor(displacement / cell_lengths + 0.5)
+    r2 = mx.sum(displacement * displacement, axis=-1)
+    atom_index = mx.arange(positions.shape[0])
+    pair_mask = (r2 > 0.0) & (r2 < float(cutoff) ** 2)
+    pair_mask = pair_mask & (atom_index[:, None] != atom_index[None, :])
+    safe_r2 = mx.where(pair_mask, r2, 1.0)
+    distance = mx.sqrt(safe_r2)
+    qij = charges[:, None] * charges[None, :]
+    erfc = 1.0 - mx.erf(float(alpha) * distance)
+    pair_energy = float(coulomb_constant) * qij * erfc / distance
+    pair_energy = mx.where(pair_mask, pair_energy, 0.0)
+    scalar = float(coulomb_constant) * qij * (
+        erfc / (safe_r2 * distance)
+        + (2.0 * float(alpha) / float(np.sqrt(np.pi)))
+        * mx.exp(-(float(alpha) ** 2) * safe_r2)
+        / safe_r2
+    )
+    scalar = mx.where(pair_mask, scalar, 0.0)
+    forces = mx.sum(scalar[:, :, None] * displacement, axis=1)
     return 0.5 * mx.sum(pair_energy), forces
 
 

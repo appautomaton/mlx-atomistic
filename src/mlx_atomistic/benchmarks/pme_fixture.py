@@ -82,8 +82,8 @@ class PMEFixtureSpec:
 
 
 FIXTURE_SPECS = {
-    "water-small": PMEFixtureSpec("water-small", bcc_cells_per_axis=3, ion_pairs=0),
-    "salt-small": PMEFixtureSpec("salt-small", bcc_cells_per_axis=7, ion_pairs=2),
+    "water-small": PMEFixtureSpec("water-small", bcc_cells_per_axis=5, ion_pairs=0),
+    "salt-small": PMEFixtureSpec("salt-small", bcc_cells_per_axis=6, ion_pairs=1),
     "target": PMEFixtureSpec("target", bcc_cells_per_axis=16, ion_pairs=22),
 }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,11 @@ from mlx_atomistic.benchmarks.pme_fixture import (
     build_pme_fixture,
     fixture_summary,
     write_pme_fixture,
+)
+from mlx_atomistic.benchmarks.pme_validation import (
+    deterministic_configurations,
+    force_error_metrics,
+    run_ewald_convergence,
 )
 from mlx_atomistic.prep.io import load_prepared_system
 
@@ -67,3 +73,65 @@ def test_pme_fixture_prepared_round_trip(tmp_path: Path):
     assert loaded.metadata.compatibility_report["electrostatics_model"] == "pme"
     assert loaded.pme_assignment_order.tolist() == [5]
     np.testing.assert_array_equal(loaded.positions, loaded.reference_positions)
+
+
+def test_normalized_force_metrics_and_zero_reference_fail_closed():
+    reference = np.asarray([[2.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    candidate = reference + np.asarray([[0.2, 0.0, 0.0], [0.0, -0.1, 0.0]])
+
+    metrics = force_error_metrics(
+        candidate,
+        reference,
+        candidate_energy=-9.0,
+        reference_energy=-10.0,
+    )
+
+    assert metrics.normalized_rms == pytest.approx(0.1)
+    assert metrics.normalized_maximum == pytest.approx(0.1)
+    assert metrics.energy_error_per_atom_kj_mol == pytest.approx(0.5)
+    with pytest.raises(ValueError, match="non-zero reference"):
+        force_error_metrics(
+            np.zeros((2, 3)),
+            np.zeros((2, 3)),
+            candidate_energy=0.0,
+            reference_energy=0.0,
+        )
+
+
+def test_pme_validation_configurations_are_deterministic_wrapped_and_rigid():
+    prepared = build_pme_fixture(PMEFixtureSpec("test", 2, 1, seed=23))
+
+    first = deterministic_configurations(prepared, count=3)
+    second = deterministic_configurations(prepared, count=3)
+
+    for left, right in zip(first, second, strict=True):
+        np.testing.assert_array_equal(left, right)
+        assert np.all(left >= 0.0)
+        assert np.all(left < prepared.cell_lengths)
+        displacement = left[1 : 3 * 14 : 3] - left[0 : 3 * 14 : 3]
+        displacement -= prepared.cell_lengths * np.round(displacement / prepared.cell_lengths)
+        distances = np.linalg.norm(displacement, axis=1)
+        np.testing.assert_allclose(distances, 0.9572, atol=2e-5)
+
+
+@pytest.mark.gpu
+def test_ewald_convergence_payload_reports_finite_metrics():
+    prepared = build_pme_fixture(PMEFixtureSpec("test", 2, 0, seed=29))
+    prepared = replace(
+        prepared,
+        pme_real_cutoff=np.asarray([3.0], dtype=np.float32),
+        pme_alpha=np.asarray([0.5], dtype=np.float32),
+    )
+
+    payload = run_ewald_convergence(
+        prepared,
+        reciprocal_cutoffs=(2, 3),
+        configurations=1,
+        convergence_tolerance=1.0,
+    )
+
+    assert payload["status"] == "passed"
+    row = payload["rows"][0]
+    assert row["finite"] is True
+    assert row["converged"] is True
+    assert np.isfinite(row["pme_vs_ewald"]["normalized_rms"])
