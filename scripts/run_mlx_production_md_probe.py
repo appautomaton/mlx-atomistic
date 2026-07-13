@@ -20,6 +20,7 @@ from mlx_atomistic.artifacts import (
     load_prepared_mlx_artifact,
 )
 from mlx_atomistic.prep.gpcrmd import attempt_gpcrmd_prepared_artifact_import
+from mlx_atomistic.prep.runner import _production_neighbor_manager
 from mlx_atomistic.protocols import MinimizeThenNVTProtocol, protocol_readiness_report
 from mlx_atomistic.runtime import get_platform_boundary_report, get_runtime_info
 
@@ -234,7 +235,12 @@ def _run_bounded_probe(
     run_started = time.perf_counter()
     report["runtime_performance"]["bounded_run_attempted"] = True
     try:
-        _, terms, constraints = build_mlx_system_from_artifact(artifact)
+        system, terms, constraints = build_mlx_system_from_artifact(artifact)
+        neighbor_manager = _production_neighbor_manager(
+            system,
+            terms,
+            require_production=True,
+        )
         result = MinimizeThenNVTProtocol(
             minimize_steps=0,
             equilibration_steps=0,
@@ -253,6 +259,7 @@ def _run_bounded_probe(
             cell=artifact.cell,
             constraints=constraints,
             unit_system=artifact.unit_system,
+            neighbor_manager=neighbor_manager,
         )
     except Exception as exc:  # pragma: no cover - exercised only by large live artifacts.
         blocker = _blocker(
@@ -272,16 +279,38 @@ def _run_bounded_probe(
         _block_report(report, "run", blocker, started)
         return
 
-    total_energy = np.asarray(trajectory.production.total_energy)
+    production = trajectory.production
+    total_energy = np.asarray(production.total_energy)
+    nonbonded_runtime = dict(production.nonbonded_report)
     report["stages"]["run"] = {
         **_stage("passed"),
         "duration_seconds": _elapsed(run_started),
         "production_steps": 2,
         "sample_interval": 1,
+        "nonbonded_runtime": nonbonded_runtime,
     }
     report["finite_checks"]["energies"] = bool(np.all(np.isfinite(total_energy)))
-    report["runtime_performance"]["bounded_run_completed"] = True
-    report["runtime_performance"]["wall_time_seconds"] = _elapsed(started)
+    report["runtime_performance"].update(
+        {
+            "bounded_run_completed": True,
+            "wall_time_seconds": _elapsed(started),
+            "backend": nonbonded_runtime.get("backend"),
+            "fallback_reason": nonbonded_runtime.get("fallback_reason"),
+            "pair_count": nonbonded_runtime.get("pair_count"),
+            "candidate_count": nonbonded_runtime.get("candidate_count"),
+            "candidate_waste_count": nonbonded_runtime.get("candidate_waste_count"),
+            "candidate_waste_fraction": nonbonded_runtime.get("candidate_waste_fraction"),
+            "neighbor_update_wall_seconds": nonbonded_runtime.get(
+                "neighbor_update_wall_seconds"
+            ),
+            "neighbor_rebuild_wall_seconds": nonbonded_runtime.get(
+                "neighbor_rebuild_wall_seconds"
+            ),
+            "force_evaluation_wall_seconds": nonbonded_runtime.get(
+                "force_evaluation_wall_seconds"
+            ),
+        }
+    )
     report["status"] = "passed"
 
 

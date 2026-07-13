@@ -82,3 +82,48 @@ def test_readiness_report_states_bounded_claim_boundary():
     assert "not broad production MD certification" in report
     assert "`topology_terms`" in report
     assert "lazy topology requires a runtime nonbonded pair provider" in report
+
+
+def test_successful_neighbor_probe_advances_to_pme_blocker():
+    candidate = _evidence("candidate-fixture.json")
+    mlx = _evidence("mlx-probe.json")
+    mlx["status"] = "passed"
+    mlx["earliest_blocker"] = None
+    mlx["taxonomy_blockers"] = []
+    mlx["stages"]["run"] = {
+        "status": "passed",
+        "duration_seconds": 1.0,
+        "production_steps": 2,
+        "sample_interval": 1,
+        "nonbonded_runtime": {
+            "backend": "mlx_cell_pairs",
+            "fallback_reason": None,
+            "pair_count": 100,
+            "candidate_count": 120,
+            "candidate_waste_fraction": 1.0 / 6.0,
+        },
+    }
+    mlx["finite_checks"]["energies"] = True
+    mlx["finite_checks"]["reason"] = None
+    mlx["runtime_performance"].update(
+        {
+            "bounded_run_attempted": True,
+            "bounded_run_completed": True,
+            "backend": "mlx_cell_pairs",
+        }
+    )
+
+    matrix = build_blocker_matrix(
+        candidate=candidate,
+        openmm=_evidence("openmm-reference.json"),
+        mlx=mlx,
+    )
+
+    categories = {entry["category"]: entry for entry in matrix["entries"]}
+    assert categories["topology_terms"]["status"] == "passed"
+    assert categories["topology_terms"]["prevents_bounded_pass"] is False
+    assert categories["stability_finiteness"]["status"] == "passed"
+    assert categories["performance_runtime"]["status"] == "passed"
+    assert categories["electrostatics_pme"]["status"] == "blocked"
+    assert categories["electrostatics_pme"]["prevents_bounded_pass"] is True
+    assert matrix["status"] == "blocked"
