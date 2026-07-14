@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
 
@@ -15,6 +16,7 @@ from mlx_atomistic.artifacts import (
     build_mlx_system_from_artifact,
     load_prepared_mlx_artifact,
 )
+from mlx_atomistic.benchmarks import get_hardware_info
 from mlx_atomistic.benchmarks.pme_fixture import (
     PME_REAL_CUTOFF_ANGSTROM,
     build_pme_fixture,
@@ -33,6 +35,7 @@ from mlx_atomistic.minimize import minimize_energy
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import pme_readiness_report
 from mlx_atomistic.prep.io import save_prepared_system
+from mlx_atomistic.runtime import get_runtime_info
 
 CONSTRAINT_LIMIT_NM = 2.0e-5
 NVE_HALF_FS_DRIFT_LIMIT_KJ_MOL_ATOM = 5.0e-2
@@ -152,6 +155,7 @@ def run_pme_stability(
     reference = Path(reference_dir)
     manifest_path = reference / "reference.json"
     manifest = json.loads(manifest_path.read_text())
+    parameter_manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     prepared = apply_openmm_pme_manifest(build_pme_fixture(case), manifest)
     prepared_dir = out / "prepared"
     save_prepared_system(prepared, prepared_dir)
@@ -339,8 +343,13 @@ def run_pme_stability(
         **classification,
         "fixture": fixture_summary(prepared),
         "fixture_hash": prepared.metadata.selections["content_hash"],
+        "parameter_manifest_hash": parameter_manifest_hash,
         "reference_manifest": str(manifest_path),
-        "reference_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "reference_manifest_sha256": parameter_manifest_hash,
+        "operation": "target_pme_nve_nvt_stability",
+        "precision": "float32",
+        "hardware": get_hardware_info(),
+        "runtime": asdict(get_runtime_info()),
         "pme": {
             "mesh_shape": prepared.pme_mesh_shape.astype(int).tolist(),
             "alpha_per_angstrom": float(prepared.pme_alpha[0]),
@@ -379,6 +388,7 @@ def run_pme_stability(
         "nve": nve_rows,
         "nvt": nvt_row,
         "raw_outputs": {
+            "stability_report": str(out / "stability.json"),
             "minimized_state": str(out / "minimized_state.npz"),
             "nve": [str(out / f"nve-{dt:g}fs.npz") for dt in nve_dt_fs],
             "nvt": str(out / "nvt.npz"),

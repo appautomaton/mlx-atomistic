@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import resource
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,22 @@ def max_rss_mb() -> float:
     if rss > 10_000_000:
         return rss / (1024.0 * 1024.0)
     return rss / 1024.0
+
+
+def resident_rss_mb() -> float:
+    """Return current resident memory in MB for the current process."""
+
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        resident_pages = int(statm.read_text().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+    result = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(os.getpid())],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip()) / 1024.0
 
 
 def pme_mesh_summary(
@@ -68,4 +86,5 @@ __all__ = [
     "max_float",
     "max_rss_mb",
     "pme_mesh_summary",
+    "resident_rss_mb",
 ]

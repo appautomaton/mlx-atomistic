@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -19,6 +20,10 @@ from mlx_atomistic.benchmarks import (
     get_hardware_info,
     normalize_benchmark_payload,
     normalize_benchmark_row,
+)
+from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb, resident_rss_mb
+from mlx_atomistic.benchmarks.same_workload_compare import (
+    build_strict_timing_comparison,
 )
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.neighbors import build_neighbor_list
@@ -42,6 +47,13 @@ SYNC_TIMING_BLOCKER = (
     "in-function synchronization attribution requires runtime instrumentation "
     "outside pme.py"
 )
+DENSE_REFERENCE_MAX_ATOMS = 4096
+DENSE_REFERENCE_TARGET_SKIP = (
+    "dense quadratic real-space oracle is restricted to fixtures with at most "
+    f"{DENSE_REFERENCE_MAX_ATOMS} atoms and is intentionally skipped at target scale"
+)
+MEMORY_GROWTH_MIN_MB = 32.0
+MEMORY_GROWTH_MIN_FRACTION = 0.05
 
 
 @dataclass(frozen=True)
@@ -97,22 +109,199 @@ def _eval_all(value: object) -> None:
         mx.eval(value)
 
 
-def _load_parity_report(fixture_dir: Path) -> dict:
-    report_path = fixture_dir / "openmm_mlx_parity_report.json"
+def _metal_memory_mb(name: str) -> float | None:
+    getter = getattr(mx, name, None)
+    if getter is None:
+        getter = getattr(mx.metal, name, None)
+    if getter is None:
+        return None
+    return float(getter()) / (1024.0 * 1024.0)
+
+
+def _memory_snapshot(evaluation: int) -> dict[str, float | int | None]:
+    return {
+        "evaluation": evaluation,
+        "resident_rss_mb": resident_rss_mb(),
+        "max_rss_mb": max_rss_mb(),
+        "metal_active_mb": _metal_memory_mb("get_active_memory"),
+        "metal_cache_mb": _metal_memory_mb("get_cache_memory"),
+        "metal_peak_mb": _metal_memory_mb("get_peak_memory"),
+    }
+
+
+def classify_memory_growth(
+    samples: list[dict[str, float | int | None]],
+) -> dict[str, object]:
+    """Classify repeated-evaluation memory samples for monotonic growth."""
+
+    checks = []
+    for field in ("resident_rss_mb", "metal_active_mb"):
+        values = [float(row[field]) for row in samples if row.get(field) is not None]
+        growth = 0.0 if len(values) < 2 else values[-1] - values[0]
+        threshold = (
+            MEMORY_GROWTH_MIN_MB
+            if not values
+            else max(MEMORY_GROWTH_MIN_MB, values[0] * MEMORY_GROWTH_MIN_FRACTION)
+        )
+        monotonic = len(values) >= 3 and all(
+            right > left + 0.5
+            for left, right in zip(values[:-1], values[1:], strict=True)
+        )
+        checks.append(
+            {
+                "field": field,
+                "sample_count": len(values),
+                "growth_mb": growth,
+                "growth_threshold_mb": threshold,
+                "monotonic_increase": monotonic,
+                "unbounded_growth_detected": monotonic and growth > threshold,
+            }
+        )
+    failed = [row["field"] for row in checks if row["unbounded_growth_detected"]]
+    return {
+        "status": "passed" if not failed else "failed",
+        "passed": not failed,
+        "failed_series": failed,
+        "checks": checks,
+    }
+
+
+def _profile_memory(
+    fn: Callable[[], object],
+    *,
+    evaluations: int,
+) -> tuple[list[dict[str, float | int | None]], dict[str, object]]:
+    reset_peak = getattr(mx, "reset_peak_memory", None)
+    if reset_peak is None:
+        reset_peak = getattr(mx.metal, "reset_peak_memory", None)
+    if reset_peak is not None:
+        reset_peak()
+    samples = []
+    for index in range(max(3, evaluations)):
+        _eval_all(fn())
+        samples.append(_memory_snapshot(index + 1))
+    return samples, classify_memory_growth(samples)
+
+
+def _load_stability_report(prepared_dir: Path) -> dict[str, object]:
+    candidates = (
+        prepared_dir.parent.parent / "stability" / "stability.json",
+        prepared_dir.parent / "stability.json",
+    )
+    report_path = next((path for path in candidates if path.exists()), candidates[0])
+    if not report_path.exists():
+        return {
+            "status": "missing",
+            "report_path": str(report_path),
+            "fixture_hash": None,
+            "parameter_manifest_hash": None,
+        }
+    report = json.loads(report_path.read_text())
+    return {
+        "status": report.get("status"),
+        "report_path": str(report_path),
+        "fixture_hash": report.get("fixture_hash"),
+        "parameter_manifest_hash": report.get(
+            "parameter_manifest_hash",
+            report.get("reference_manifest_sha256"),
+        ),
+        "hardware": report.get("hardware"),
+        "runtime": report.get("runtime"),
+        "raw_outputs": report.get("raw_outputs"),
+    }
+
+
+def _reference_timing_row(parity: dict, pme_parameters: dict) -> dict[str, object]:
+    manifest_path = parity.get("reference_manifest")
+    manifest = {}
+    if manifest_path is not None and Path(str(manifest_path)).exists():
+        manifest = json.loads(Path(str(manifest_path)).read_text())
+    fixture = manifest.get("fixture", {})
+    manifest_pme = manifest.get("pme", {})
+    reference_pme_parameters = {
+        "mesh_shape": manifest_pme.get("mesh_shape"),
+        "assignment_order": manifest_pme.get("assignment_order"),
+        "alpha_per_angstrom": manifest_pme.get("alpha_per_angstrom"),
+        "real_cutoff_angstrom": manifest_pme.get("real_cutoff_angstrom"),
+    }
+    return {
+        "operation": manifest.get("operation_semantics"),
+        "atom_count": fixture.get("atom_count"),
+        "fixture_hash": fixture.get("content_hash"),
+        "parameter_manifest_hash": parity.get("parameter_manifest_hash"),
+        "pme_parameters": reference_pme_parameters or pme_parameters,
+        "step_count": 1,
+        "precision": manifest.get("precision"),
+        "timing_metric": manifest.get("timing_metric"),
+        "timing_value": manifest.get("timing_value"),
+    }
+
+
+def _resolve_fixture_paths(fixture_dir: Path) -> tuple[Path, Path]:
+    if (fixture_dir / "prepared_system.json").exists():
+        prepared_dir = fixture_dir
+        candidates = (
+            fixture_dir.parent / "mlx_parity.json",
+            fixture_dir / "mlx_parity.json",
+            fixture_dir.parent / "openmm_mlx_parity_report.json",
+        )
+    else:
+        prepared_dir = fixture_dir / "prepared"
+        candidates = (
+            fixture_dir / "openmm_mlx_parity_report.json",
+            fixture_dir / "mlx_parity.json",
+        )
+    report_path = next((path for path in candidates if path.exists()), candidates[0])
+    return prepared_dir, report_path
+
+
+def _load_parity_report(report_path: Path) -> dict:
     with report_path.open() as handle:
         report = json.load(handle)
+    fixture_payload = report.get("fixture")
+    fixture = (
+        fixture_payload.get("fixture")
+        if isinstance(fixture_payload, dict)
+        else fixture_payload
+    )
+    atom_count = (
+        fixture_payload.get("atom_count")
+        if isinstance(fixture_payload, dict)
+        else report.get("atom_count")
+    )
+    fixture_hash = report.get("fixture_hash")
+    if fixture_hash is None and isinstance(fixture_payload, dict):
+        fixture_hash = fixture_payload.get("content_hash")
+    parameter_manifest_hash = report.get("parameter_manifest_hash")
+    reference_manifest = report.get("reference_manifest")
+    if (
+        parameter_manifest_hash is None
+        and reference_manifest is not None
+        and Path(str(reference_manifest)).exists()
+    ):
+        parameter_manifest_hash = hashlib.sha256(
+            Path(str(reference_manifest)).read_bytes()
+        ).hexdigest()
     return {
         "report_path": str(report_path),
         "status": report.get("status"),
         "passed": bool(report.get("passed", False)),
-        "fixture": report.get("fixture"),
-        "atom_count": report.get("atom_count"),
+        "fixture": fixture,
+        "atom_count": atom_count,
+        "fixture_hash": fixture_hash,
+        "parameter_manifest_hash": parameter_manifest_hash,
+        "reference_manifest": reference_manifest,
+        "reference_precision": report.get("reference_precision"),
+        "precision": report.get("precision"),
+        "hardware": report.get("hardware"),
+        "runtime": report.get("runtime"),
+        "raw_output_path": report.get("raw_output_path", str(report_path)),
         "openmm_nonbonded_method": report.get("openmm_nonbonded_method"),
         "total_energy_abs_error_kj_mol": report.get("total_energy_abs_error_kj_mol"),
         "force_max_abs_error_kj_mol_nm": report.get("force_max_abs_error_kj_mol_nm"),
         "force_rms_abs_error_kj_mol_nm": report.get("force_rms_abs_error_kj_mol_nm"),
         "pme_readiness": report.get("pme_readiness"),
-        "pme_config": report.get("pme_config"),
+        "pme_config": report.get("pme_config", report.get("pme")),
         "prepared_dir": report.get("prepared_dir"),
     }
 
@@ -199,6 +388,30 @@ def _stage_timings(
             blocker=missing_blocker,
         ),
         "reciprocal_fft_influence": _sum_timing_summaries(fft_rows, blocker=missing_blocker),
+        "charge_assignment": _timing_summary(
+            by_name.get("charge_assignment_bspline"),
+            blocker=missing_blocker,
+        ),
+        "interpolation": _sum_timing_summaries(
+            [
+                by_name[name]
+                for name in ("interpolate_potential", "interpolate_field")
+                if name in by_name
+            ],
+            blocker=missing_blocker,
+        ),
+        "forward_fft": _timing_summary(
+            by_name.get("forward_fft"),
+            blocker=missing_blocker,
+        ),
+        "inverse_fft_fields": _timing_summary(
+            by_name.get("inverse_fft_potential_and_fields"),
+            blocker=missing_blocker,
+        ),
+        "influence_work": _timing_summary(
+            by_name.get("influence_function"),
+            blocker=missing_blocker,
+        ),
         "assignment_interpolation": _sum_timing_summaries(
             assignment_rows,
             blocker=missing_blocker,
@@ -323,8 +536,7 @@ def build_payload(
             warmups=warmups,
             blocker="PME profiling requires an explicit --fixture-dir path",
         )
-    prepared_dir = fixture_dir / "prepared"
-    report_path = fixture_dir / "openmm_mlx_parity_report.json"
+    prepared_dir, report_path = _resolve_fixture_paths(fixture_dir)
     if not report_path.exists():
         return _blocked_payload(
             fixture_dir=fixture_dir,
@@ -381,7 +593,7 @@ def build_payload(
             system.cell,
             cutoff=real_cutoff,
             skin=0.0,
-            backend="mlx_cell_blocks",
+            backend="mlx_cell_pairs",
         )
         direct_space_interactions = direct_space_neighbors.interactions
         direct_space_neighbor_report = {
@@ -397,6 +609,21 @@ def build_payload(
         }
     except (RuntimeError, TypeError, ValueError) as exc:
         shared_neighbor_blocker = f"pme_direct_space_shared_neighbor_build_failed:{exc}"
+    if (
+        shared_neighbor_blocker is not None
+        or direct_space_neighbor_report["backend"] != "mlx_cell_pairs"
+        or direct_space_neighbor_report["representation_kind"] != "pairs"
+        or direct_space_neighbor_report["fallback_reason"] is not None
+    ):
+        blocker = shared_neighbor_blocker or (
+            "target-safe PME profiling requires mlx_cell_pairs without fallback"
+        )
+        return _blocked_payload(
+            fixture_dir=fixture_dir,
+            iterations=iterations,
+            warmups=warmups,
+            blocker=blocker,
+        )
     direct_space_policy = pme_direct_space_policy_report(
         system.cell,
         config=config,
@@ -493,22 +720,6 @@ def build_payload(
                 coulomb_constant=nonbonded.coulomb_constant,
                 config=config,
                 pairs=direct_space_interactions,
-            ),
-            eval_outputs=_eval_all,
-            warmups=warmups,
-            iterations=iterations,
-        ),
-        _time(
-            "real_space_coulomb_dense_reference",
-            "pme_reference",
-            lambda: _real_space_energy_forces_mx(
-                positions,
-                charges,
-                cell_lengths,
-                cell_lengths_np,
-                alpha=config.alpha,
-                cutoff=real_cutoff,
-                coulomb_constant=nonbonded.coulomb_constant,
             ),
             eval_outputs=_eval_all,
             warmups=warmups,
@@ -616,6 +827,7 @@ def build_payload(
                 system.cell,
                 coulomb_constant=nonbonded.coulomb_constant,
                 config=config,
+                direct_space_pairs=direct_space_interactions,
             )[:2],
             eval_outputs=_eval_all,
             warmups=warmups,
@@ -640,7 +852,11 @@ def build_payload(
             "lj_regular_plus_exception",
             "non_pme_lj",
             lambda: (
-                nonbonded._regular_lj_components(positions, system.cell),
+                nonbonded._regular_lj_components(
+                    positions,
+                    system.cell,
+                    direct_space_interactions,
+                ),
                 nonbonded._exception_lj_components(positions, system.cell),
             ),
             eval_outputs=lambda value: mx.eval(value[0][0], value[0][1], value[1][0], value[1][1]),
@@ -685,11 +901,66 @@ def build_payload(
         ),
     ]
 
-    parity = _load_parity_report(fixture_dir)
+    dense_reference_skipped = artifact.atom_count > DENSE_REFERENCE_MAX_ATOMS
+    if not dense_reference_skipped:
+        rows.insert(
+            1,
+            _time(
+                "real_space_coulomb_dense_reference",
+                "pme_reference",
+                lambda: _real_space_energy_forces_mx(
+                    positions,
+                    charges,
+                    cell_lengths,
+                    cell_lengths_np,
+                    alpha=config.alpha,
+                    cutoff=real_cutoff,
+                    coulomb_constant=nonbonded.coulomb_constant,
+                ),
+                eval_outputs=_eval_all,
+                warmups=warmups,
+                iterations=iterations,
+            ),
+        )
+
+    memory_samples, memory_growth = _profile_memory(
+        lambda: nonbonded._pme_energy_forces_with_components(
+            positions,
+            system.cell,
+            direct_space_interactions,
+        )[:2],
+        evaluations=iterations,
+    )
+
+    parity = _load_parity_report(report_path)
+    stability = _load_stability_report(prepared_dir)
+    fixture_hash = parity.get("fixture_hash")
+    parameter_manifest_hash = parity.get("parameter_manifest_hash")
+    evidence_consistent = bool(
+        fixture_hash
+        and parameter_manifest_hash
+        and stability.get("status") == "passed"
+        and stability.get("fixture_hash") == fixture_hash
+        and stability.get("parameter_manifest_hash") == parameter_manifest_hash
+    )
+    provenance_complete = bool(
+        parity.get("hardware")
+        and parity.get("runtime")
+        and stability.get("hardware")
+        and stability.get("runtime")
+    )
+    pme_parameters = {
+        "mesh_shape": list(config.mesh_shape),
+        "assignment_order": config.assignment_order,
+        "alpha_per_angstrom": config.alpha,
+        "real_cutoff_angstrom": real_cutoff,
+    }
     diagnostics = {
         "fixture_dir": str(fixture_dir),
         "prepared_dir": str(prepared_dir),
         "atom_count": int(artifact.atom_count),
+        "fixture_hash": fixture_hash,
+        "parameter_manifest_hash": parameter_manifest_hash,
         "mesh_shape": list(config.mesh_shape),
         "assignment_order": config.assignment_order,
         "real_cutoff": real_cutoff,
@@ -698,6 +969,13 @@ def build_payload(
         "one_four_pair_count": int(one_four_pairs.shape[0]),
         "net_charge": float(np.sum(np.asarray(nonbonded.charges), dtype=np.float64)),
         "direct_space_neighbor": direct_space_neighbor_report,
+        "dense_reference": {
+            "executed": not dense_reference_skipped,
+            "max_atoms": DENSE_REFERENCE_MAX_ATOMS,
+            "skip_reason": DENSE_REFERENCE_TARGET_SKIP
+            if dense_reference_skipped
+            else None,
+        },
     }
     missing_splits = [
         {
@@ -720,6 +998,13 @@ def build_payload(
             stage="direct_space",
             blocker=str(direct_space_policy.get("fallback_reason")),
         )
+    if dense_reference_skipped:
+        _append_missing_split_once(
+            missing_splits,
+            name="real_space_coulomb_dense_reference",
+            stage="direct_space_reference",
+            blocker=DENSE_REFERENCE_TARGET_SKIP,
+        )
     timing_rows = [
         normalize_benchmark_row(
             row.to_dict(),
@@ -733,11 +1018,45 @@ def build_payload(
     ]
     hardware = get_hardware_info()
     runtime = asdict(get_runtime_info())
+    stage_timings = _stage_timings(timing_rows)
+    production_timing = stage_timings["production_nonbonded_total"]
+    mlx_comparison_row = {
+        "operation": "production_nonbonded_pme_force_evaluation",
+        "atom_count": diagnostics["atom_count"],
+        "fixture_hash": fixture_hash,
+        "parameter_manifest_hash": parameter_manifest_hash,
+        "pme_parameters": pme_parameters,
+        "step_count": 1,
+        "precision": "float32",
+        "timing_metric": "median_s",
+        "timing_value": production_timing["median_s"],
+    }
+    strict_comparison = build_strict_timing_comparison(
+        mlx_comparison_row,
+        _reference_timing_row(parity, pme_parameters),
+    )
+    profile_blockers = []
+    if not memory_growth["passed"]:
+        profile_blockers.append("monotonic resident or active Metal memory growth detected")
+    if not evidence_consistent:
+        profile_blockers.append("parity and stability evidence hashes or status differ")
+    if not provenance_complete:
+        profile_blockers.append("parity or stability hardware/runtime provenance is incomplete")
+    status = "ok" if not profile_blockers else "failed"
+    blocker = None if not profile_blockers else "; ".join(profile_blockers)
     payload = {
         "benchmark_name": "pme_performance",
-        "status": "ok",
+        "status": status,
         "hardware": hardware,
         "runtime": runtime,
+        "operation": "production_nonbonded_pme_force_evaluation",
+        "precision": "float32",
+        "fixture_hash": fixture_hash,
+        "parameter_manifest_hash": parameter_manifest_hash,
+        "pme_parameters": pme_parameters,
+        "timing_metric": "median_s",
+        "timing_value": production_timing["median_s"],
+        "step_count": 1,
         "config": {
             "iterations": iterations,
             "warmups": warmups,
@@ -745,10 +1064,32 @@ def build_payload(
         "fixture": parity.get("fixture"),
         "atom_count": diagnostics["atom_count"],
         "parity": parity,
+        "stability": stability,
+        "evidence_consistent": evidence_consistent,
+        "provenance_complete": provenance_complete,
         "diagnostics": diagnostics,
         "direct_space_policy": direct_space_policy,
         "timings": timing_rows,
-        "stage_timings": _stage_timings(timing_rows),
+        "stage_timings": stage_timings,
+        "memory": {
+            "units": "MB",
+            "peak_resident_mb": max(float(row["max_rss_mb"]) for row in memory_samples),
+            "peak_metal_mb": max(
+                float(row["metal_peak_mb"] or 0.0) for row in memory_samples
+            ),
+            "samples": memory_samples,
+            "growth": memory_growth,
+        },
+        "same_workload_comparison": {
+            **strict_comparison,
+            "mlx": mlx_comparison_row,
+            "reference": _reference_timing_row(parity, pme_parameters),
+        },
+        "raw_outputs": {
+            "parity": parity.get("raw_output_path"),
+            "stability": stability.get("report_path"),
+            "prepared": str(prepared_dir),
+        },
         "missing_timing_splits": missing_splits,
         "unsupported_timing_split_blockers": missing_splits,
     }
@@ -762,7 +1103,8 @@ def build_payload(
         atom_count=diagnostics["atom_count"],
         evaluation_count=iterations,
         finite=True,
-        status="ok",
+        status=status,
+        blocker=blocker,
         command=default_benchmark_command("pme_performance"),
     )
 
@@ -797,6 +1139,10 @@ def main(argv: list[str] | None = None) -> None:
         warmups=args.warmups,
     )
     payload["raw_output_path"] = str(raw_output_path)
+    payload["raw_outputs"] = {
+        **dict(payload.get("raw_outputs", {})),
+        "profile": str(raw_output_path),
+    }
     _write_payload(raw_output_path, payload)
 
     if args.json:

@@ -11,6 +11,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.benchmarks import get_hardware_info
 from mlx_atomistic.benchmarks.pme_fixture import (
     PME_ASSIGNMENT_ORDER as FIXTURE_PME_ORDER,
 )
@@ -31,7 +32,9 @@ from mlx_atomistic.pme import (
     pme_coulomb_energy_forces,
     pme_readiness_report,
 )
+from mlx_atomistic.prep.io import save_prepared_system
 from mlx_atomistic.prep.schema import PreparedSystem
+from mlx_atomistic.runtime import get_runtime_info
 from mlx_atomistic.topology import Topology
 from mlx_atomistic.units import COULOMB_CONSTANT_KJ_MOL_ANGSTROM
 
@@ -243,9 +246,11 @@ def run_openmm_parity(
     """Compare the production MLX PME electrostatic path with OpenMM output."""
 
     reference_path = Path(reference_dir)
-    manifest = json.loads((reference_path / "reference.json").read_text())
+    manifest_path = reference_path / "reference.json"
+    forces_path = reference_path / "reference_forces.npz"
+    manifest = json.loads(manifest_path.read_text())
     prepared = apply_openmm_pme_manifest(prepared, manifest)
-    with np.load(reference_path / "reference_forces.npz", allow_pickle=False) as data:
+    with np.load(forces_path, allow_pickle=False) as data:
         reference_forces = {name: np.asarray(data[name]) for name in data.files}
     configurations = deterministic_configurations(
         prepared,
@@ -308,9 +313,19 @@ def run_openmm_parity(
         "status": "passed" if all_passed else "failed",
         "passed": all_passed,
         "fixture": fixture_summary(prepared),
-        "reference_manifest": str(reference_path / "reference.json"),
+        "fixture_hash": prepared.metadata.selections["content_hash"],
+        "parameter_manifest_hash": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "reference_manifest": str(manifest_path),
         "reference_platform": manifest["platform"],
         "reference_precision": manifest["precision"],
+        "precision": "float32",
+        "operation": "production_pme_electrostatic_energy_force_evaluation",
+        "hardware": get_hardware_info(),
+        "runtime": asdict(get_runtime_info()),
+        "raw_outputs": {
+            "reference_manifest": str(manifest_path),
+            "reference_forces": str(forces_path),
+        },
         "pme": manifest["pme"],
         "pme_readiness": readiness,
         "wrapping_invariance": wrapping,
@@ -591,11 +606,24 @@ def main() -> None:
         payload = run_openmm_parity(prepared, args.reference)
     if args.out is not None:
         output_path = args.out
+        output_dir = output_path if output_path.suffix == "" else output_path.parent
         if args.reference is not None or output_path.suffix == "":
             output_path.mkdir(parents=True, exist_ok=True)
             output_path = output_path / "mlx_parity.json"
         else:
             output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload["raw_output_path"] = str(output_path)
+        if args.reference is not None:
+            manifest = json.loads((args.reference / "reference.json").read_text())
+            matched = apply_openmm_pme_manifest(prepared, manifest)
+            prepared_dir = output_dir / "prepared"
+            save_prepared_system(matched, prepared_dir)
+            payload["prepared_dir"] = str(prepared_dir)
+            payload["raw_outputs"] = {
+                **dict(payload.get("raw_outputs", {})),
+                "mlx_report": str(output_path),
+                "prepared": str(prepared_dir),
+            }
         output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     if args.json or args.out is None:
         print(json.dumps(payload, indent=2, sort_keys=True))

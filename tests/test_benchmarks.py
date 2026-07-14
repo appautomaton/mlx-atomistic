@@ -1849,6 +1849,66 @@ def test_pme_performance_stage_summary_schema_without_fixture(tmp_path):
     assert payload["unsupported_timing_split_blockers"][0]["name"] == "pme_fixture"
 
 
+def test_pme_performance_resolves_direct_prepared_fixture_layout(tmp_path):
+    prepared_dir = tmp_path / "mlx-target" / "prepared"
+    prepared_dir.mkdir(parents=True)
+    (prepared_dir / "prepared_system.json").write_text("{}")
+    report_path = prepared_dir.parent / "mlx_parity.json"
+    report_path.write_text("{}")
+
+    resolved_prepared, resolved_report = pme_performance._resolve_fixture_paths(
+        prepared_dir
+    )
+
+    assert resolved_prepared == prepared_dir
+    assert resolved_report == report_path
+
+
+def test_pme_performance_memory_growth_fails_only_sustained_growth():
+    stable = [
+        {"resident_rss_mb": value, "metal_active_mb": 200.0}
+        for value in (500.0, 500.2, 500.1, 500.3)
+    ]
+    growing = [
+        {"resident_rss_mb": value, "metal_active_mb": 200.0}
+        for value in (500.0, 540.0, 580.0, 620.0)
+    ]
+
+    assert pme_performance.classify_memory_growth(stable)["status"] == "passed"
+    failed = pme_performance.classify_memory_growth(growing)
+    assert failed["status"] == "failed"
+    assert failed["failed_series"] == ["resident_rss_mb"]
+
+
+def test_pme_same_workload_comparison_requires_full_workload_match():
+    mlx_row = {
+        "operation": "pme_force",
+        "atom_count": 24488,
+        "fixture_hash": "fixture",
+        "parameter_manifest_hash": "parameters",
+        "pme_parameters": {"mesh_shape": [56, 56, 56]},
+        "step_count": 1,
+        "precision": "float32",
+        "timing_metric": "median_s",
+        "timing_value": 2.0,
+    }
+    reference_row = {**mlx_row, "timing_value": 4.0}
+
+    matched = same_workload_compare.build_strict_timing_comparison(
+        mlx_row,
+        reference_row,
+    )
+    mismatched = same_workload_compare.build_strict_timing_comparison(
+        mlx_row,
+        {**reference_row, "precision": "double"},
+    )
+
+    assert matched == {"status": "comparable", "ratio": 2.0, "blocker": None}
+    assert mismatched["status"] == "diagnostic"
+    assert mismatched["ratio"] is None
+    assert mismatched["blocker"] == "precision differs; ratio suppressed"
+
+
 def test_ewald_reference_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "ewald.csv"
 
