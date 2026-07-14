@@ -588,7 +588,7 @@ def test_nonbonded_ewald_one_four_scaling_is_correction_not_double_count():
     )
 
 
-def test_nonbonded_pme_requires_mesh_config_cell_and_full_system():
+def test_nonbonded_pme_requires_mesh_config_cell_and_accepts_compact_pairs():
     positions = np.array(
         [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
         dtype=np.float32,
@@ -616,19 +616,25 @@ def test_nonbonded_pme_requires_mesh_config_cell_and_full_system():
         electrostatics="pme",
         pme_config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0),
     )
-    for kwargs, expected in [
-        ({}, "periodic cell"),
-        (
-            {"cell": Cell.cubic(12.0), "pairs": np.array([[0, 1]], dtype=np.int32)},
-            "pme_production_direct_space_requires_neighbor_blocks",
-        ),
-    ]:
+    for kwargs, expected in [({}, "periodic cell")]:
         try:
             term.energy_forces(positions, **kwargs)
         except ValueError as err:
             assert expected in str(err)
         else:
             raise AssertionError(f"PME nonbonded accepted invalid input: {kwargs}")
+
+    cell = Cell.cubic(12.0)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=5.0,
+        skin=0.0,
+        backend="mlx_cell_pairs",
+    )
+    energy, forces = term.energy_forces(positions, cell, pairs=neighbors.interactions)
+    assert np.isfinite(np.asarray(energy))
+    assert np.all(np.isfinite(np.asarray(forces)))
 
     with pytest.raises(ValueError, match="positive orthorhombic"):
         Cell.orthorhombic([12.0, 0.0, 12.0])

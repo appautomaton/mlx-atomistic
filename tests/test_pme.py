@@ -475,6 +475,42 @@ def test_pme_readiness_report_accepts_mlx_fft_backend_for_production():
     assert pme_force_scope_report("total_only")["scope"] == "total"
 
 
+def test_pme_readiness_target_scale_stops_at_validated_atom_ceiling():
+    config = PMEConfig(
+        mesh_shape=(56, 56, 56),
+        alpha=0.29202898720871845,
+        real_cutoff=9.0,
+        assignment_order=5,
+    )
+    charges = np.zeros((24_488,), dtype=np.float32)
+
+    ready = pme_readiness_report(
+        atom_count=24_488,
+        charges=charges,
+        cell_lengths=np.asarray([62.619522] * 3, dtype=np.float32),
+        config=config,
+        nonbonded_cutoff=9.0,
+        exclusion_count=24_444,
+        one_four_count=0,
+        explicit_exception_count=24_444,
+    )
+    blocked = pme_readiness_report(
+        atom_count=24_489,
+        charges=np.zeros((24_489,), dtype=np.float32),
+        cell_lengths=np.asarray([62.619522] * 3, dtype=np.float32),
+        config=config,
+        nonbonded_cutoff=9.0,
+        exclusion_count=0,
+        one_four_count=0,
+        explicit_exception_count=0,
+    )
+
+    assert ready["status"] == "ready"
+    assert ready["runtime_envelope"]["max_atoms"] == 24_488
+    assert blocked["status"] == "blocked"
+    assert blocked["checks"]["atom_count"] is False
+
+
 def test_pme_platform_readiness_report_uses_shared_schema():
     report = pme_platform_readiness_report(
         atom_count=4,

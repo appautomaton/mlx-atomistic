@@ -2323,12 +2323,6 @@ class NonbondedPotential:
         if self.pme_config is None:
             msg = "PME electrostatics requires pme_config"
             raise ValueError(msg)
-        if not isinstance(pairs, NeighborBlocks):
-            msg = (
-                "PME production direct-space shared pair policy unsupported: "
-                "pme_production_direct_space_requires_neighbor_blocks"
-            )
-            raise ValueError(msg)
         report = pme_direct_space_policy_report(cell, config=self.pme_config, pairs=pairs)
         if report["uses_shared_neighbor_policy"]:
             return pairs

@@ -26,7 +26,11 @@ from mlx_atomistic.nonbonded import (
     EwaldReferenceConfig,
     ewald_reference_coulomb_energy_forces,
 )
-from mlx_atomistic.pme import PMEConfig, pme_coulomb_energy_forces
+from mlx_atomistic.pme import (
+    PMEConfig,
+    pme_coulomb_energy_forces,
+    pme_readiness_report,
+)
 from mlx_atomistic.prep.schema import PreparedSystem
 from mlx_atomistic.topology import Topology
 from mlx_atomistic.units import COULOMB_CONSTANT_KJ_MOL_ANGSTROM
@@ -44,6 +48,9 @@ class ForceErrorMetrics:
 FORCE_RMS_LIMIT = 1.0e-3
 FORCE_MAXIMUM_LIMIT = 5.0e-3
 ENERGY_PER_ATOM_LIMIT_KJ_MOL = 2.0e-2
+WRAPPING_FORCE_RMS_LIMIT = 2.0e-5
+WRAPPING_FORCE_MAXIMUM_LIMIT = 1.0e-4
+WRAPPING_ENERGY_PER_ATOM_LIMIT_KJ_MOL = 1.0e-5
 
 
 def force_error_metrics(
@@ -244,8 +251,21 @@ def run_openmm_parity(
         prepared,
         count=int(manifest["configuration_count"]),
     )
+    pme_config = _prepared_pme_config(prepared)
+    topology = _prepared_topology(prepared)
+    readiness = pme_readiness_report(
+        atom_count=prepared.atom_count,
+        charges=prepared.charges,
+        cell_lengths=prepared.cell_lengths,
+        config=pme_config,
+        nonbonded_cutoff=PME_REAL_CUTOFF_ANGSTROM,
+        exclusion_count=int(topology.exclusions.shape[0]),
+        one_four_count=int(topology.one_four_pairs.shape[0]),
+        explicit_exception_count=int(prepared.nonbonded_exception_pairs.shape[0]),
+    )
     rows = []
-    all_passed = True
+    all_passed = readiness["status"] == "ready"
+    first_result = None
     for row, positions in zip(manifest["rows"], configurations, strict=True):
         if row["position_hash"] != array_hash(positions):
             configuration = row["configuration"]
@@ -268,7 +288,11 @@ def run_openmm_parity(
             and metrics.energy_error_per_atom_kj_mol <= ENERGY_PER_ATOM_LIMIT_KJ_MOL
             and diagnostics["grid_charge_error_e"] <= 1.0e-3
             and diagnostics["normalized_net_force"] <= 1.0e-5
+            and diagnostics["neighbor_backend"] == "mlx_cell_pairs"
+            and diagnostics["neighbor_representation"] == "pairs"
         )
+        if first_result is None:
+            first_result = (positions, energy, forces)
         all_passed = all_passed and passed
         rows.append(
             {
@@ -278,6 +302,8 @@ def run_openmm_parity(
                 **diagnostics,
             }
         )
+    wrapping = _wrapping_invariance(prepared, first_result)
+    all_passed = all_passed and wrapping["passed"]
     return {
         "status": "passed" if all_passed else "failed",
         "passed": all_passed,
@@ -286,6 +312,8 @@ def run_openmm_parity(
         "reference_platform": manifest["platform"],
         "reference_precision": manifest["precision"],
         "pme": manifest["pme"],
+        "pme_readiness": readiness,
+        "wrapping_invariance": wrapping,
         "configuration_count": len(rows),
         "thresholds": {
             "normalized_rms": FORCE_RMS_LIMIT,
@@ -296,11 +324,8 @@ def run_openmm_parity(
     }
 
 
-def _mlx_production_coulomb(
-    prepared: PreparedSystem,
-    positions: np.ndarray,
-) -> tuple[float, np.ndarray, dict[str, float | str | int | None]]:
-    pme_config = PMEConfig(
+def _prepared_pme_config(prepared: PreparedSystem) -> PMEConfig:
+    return PMEConfig(
         mesh_shape=tuple(int(value) for value in prepared.pme_mesh_shape.tolist()),
         alpha=float(prepared.pme_alpha[0]),
         real_cutoff=float(prepared.pme_real_cutoff[0]),
@@ -308,7 +333,10 @@ def _mlx_production_coulomb(
         charge_tolerance=float(prepared.pme_charge_tolerance[0]),
         deconvolve_assignment=bool(prepared.pme_deconvolve_assignment[0]),
     )
-    topology = Topology.from_sequences(
+
+
+def _prepared_topology(prepared: PreparedSystem) -> Topology:
+    return Topology.from_sequences(
         n_atoms=prepared.atom_count,
         bonds=prepared.bonds,
         angles=prepared.angles,
@@ -319,6 +347,49 @@ def _mlx_production_coulomb(
         nonbonded_cutoff=PME_REAL_CUTOFF_ANGSTROM,
         eager_nonbonded_pair_limit=0,
     )
+
+
+def _wrapping_invariance(
+    prepared: PreparedSystem,
+    first_result: tuple[np.ndarray, float, np.ndarray] | None,
+) -> dict[str, object]:
+    if first_result is None:
+        return {"passed": False, "reason": "no_configurations"}
+    positions, energy, forces = first_result
+    shift = prepared.cell_lengths * np.asarray([1.0, -2.0, 3.0], dtype=np.float32)
+    shifted_energy, shifted_forces, diagnostics = _mlx_production_coulomb(
+        prepared,
+        positions + shift,
+    )
+    metrics = force_error_metrics(
+        shifted_forces,
+        forces,
+        candidate_energy=shifted_energy,
+        reference_energy=energy,
+    )
+    passed = bool(
+        metrics.normalized_rms <= WRAPPING_FORCE_RMS_LIMIT
+        and metrics.normalized_maximum <= WRAPPING_FORCE_MAXIMUM_LIMIT
+        and metrics.energy_error_per_atom_kj_mol
+        <= WRAPPING_ENERGY_PER_ATOM_LIMIT_KJ_MOL
+        and diagnostics["neighbor_backend"] == "mlx_cell_pairs"
+        and diagnostics["neighbor_representation"] == "pairs"
+    )
+    return {
+        "passed": passed,
+        "metrics": asdict(metrics),
+        "shift_box_multiples": [1, -2, 3],
+        "neighbor_backend": diagnostics["neighbor_backend"],
+        "neighbor_representation": diagnostics["neighbor_representation"],
+    }
+
+
+def _mlx_production_coulomb(
+    prepared: PreparedSystem,
+    positions: np.ndarray,
+) -> tuple[float, np.ndarray, dict[str, float | str | int | None]]:
+    pme_config = _prepared_pme_config(prepared)
+    topology = _prepared_topology(prepared)
     nonbonded = NonbondedPotential(
         sigma=prepared.sigma,
         epsilon=np.zeros_like(prepared.epsilon),
@@ -339,7 +410,7 @@ def _mlx_production_coulomb(
         cell,
         cutoff=PME_REAL_CUTOFF_ANGSTROM,
         skin=0.0,
-        backend="mlx_cell_blocks",
+        backend="mlx_cell_pairs",
     )
     energy, forces, components = nonbonded.energy_forces_with_components(
         mx.array(positions),
