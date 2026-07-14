@@ -222,6 +222,7 @@ def test_external_engine_imports_stay_in_documented_reference_scripts():
         Path("scripts/openmm_mlx_parity.py"),
         Path("scripts/prepare_openmm_dhfr_implicit.py"),
         Path("scripts/run_openmm_mlx_npt_parity.py"),
+        Path("scripts/run_openmm_pme_validation.py"),
         Path("scripts/run_openmm_gpcrmd_preview.py"),
         Path("scripts/run_openmm_gpcrmd_charmm_md.py"),
     }

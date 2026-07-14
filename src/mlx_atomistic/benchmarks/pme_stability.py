@@ -43,7 +43,7 @@ NVT_TEMPERATURE_RANGE_K = (270.0, 330.0)
 NVT_FRICTION_PER_PS = 10.0
 RUNTIME_CONSTRAINT_TOLERANCE_ANGSTROM = 1.0e-4
 DEFAULT_REFERENCE_DIR = Path(
-    "results/dhfr-scale-neutral-pme-validation/openmm-target"
+    "outputs/benchmarks/dhfr-scale-neutral-pme-validation/openmm-target"
 )
 
 

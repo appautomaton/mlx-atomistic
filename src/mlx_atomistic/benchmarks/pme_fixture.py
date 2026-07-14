@@ -586,7 +586,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    out = args.out or Path("results/dhfr-scale-neutral-pme-validation/fixtures") / args.case
+    out = args.out or (
+        Path("outputs/benchmarks/dhfr-scale-neutral-pme-validation/fixtures")
+        / args.case
+    )
     summary = write_pme_fixture(args.case, out)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
