@@ -86,6 +86,74 @@ def test_settle_water_constraints_remove_pair_relative_velocity():
         assert abs(float(np.dot(relative, unit))) < 1e-6
 
 
+def test_distance_constraints_iterate_coupled_velocity_projection():
+    constraints = DistanceConstraints(
+        [(0, 1), (0, 2), (1, 2)],
+        distances=[1.0, 1.0, 1.5],
+        max_iterations=50,
+    )
+    positions, _ = constraints.apply_positions(
+        np.asarray([[0.0, 0.0, 0.0], [1.1, 0.1, 0.0], [-0.1, 0.9, 0.0]]),
+        masses=np.asarray([16.0, 1.0, 1.0]),
+    )
+    velocities = constraints.apply_velocities(
+        positions,
+        np.asarray([[0.1, -0.2, 0.0], [0.5, 0.2, 0.0], [-0.4, 0.3, 0.0]]),
+        masses=np.asarray([16.0, 1.0, 1.0]),
+    )
+
+    for left, right in np.asarray(constraints.pairs):
+        displacement = np.asarray(positions)[left] - np.asarray(positions)[right]
+        unit = displacement / np.linalg.norm(displacement)
+        relative = np.asarray(velocities)[left] - np.asarray(velocities)[right]
+        assert abs(float(np.dot(relative, unit))) < 1e-6
+
+
+def test_distance_constraints_leave_positions_within_tolerance_unchanged():
+    constraints = DistanceConstraints(
+        [(0, 1)],
+        distances=[1.0],
+        tolerance=1.0e-3,
+        max_iterations=8,
+    )
+    positions = np.asarray([[0.0, 0.0, 0.0], [1.0005, 0.0, 0.0]], dtype=np.float32)
+
+    projected, error = constraints.apply_positions(positions, masses=[1.0, 1.0])
+
+    np.testing.assert_array_equal(np.asarray(projected), positions)
+    assert float(np.asarray(error)) <= constraints.tolerance
+
+
+def test_constraint_position_correction_preserves_zero_force_kinetic_energy():
+    constraints = DistanceConstraints(
+        [(0, 1), (0, 2), (1, 2)],
+        distances=[1.0, 1.0, 1.5],
+        max_iterations=50,
+    )
+    masses = np.asarray([16.0, 1.0, 1.0], dtype=np.float32)
+    positions, _ = constraints.apply_positions(
+        np.asarray([[2.0, 2.0, 2.0], [3.1, 2.1, 2.0], [1.9, 2.9, 2.0]]),
+        masses=masses,
+    )
+    velocities = constraints.apply_velocities(
+        positions,
+        np.asarray([[0.02, -0.01, 0.0], [0.1, 0.02, 0.0], [-0.08, 0.03, 0.0]]),
+        masses=masses,
+    )
+
+    result = simulate_nve(
+        positions,
+        velocities,
+        masses=masses,
+        force_terms=ZeroForce(),
+        constraints=constraints,
+        config=SimulationConfig(dt=0.001, steps=100, diagnostic_interval=10),
+    )
+
+    energy = np.asarray(result.kinetic_energy)
+    assert np.max(np.abs(energy - energy[0])) < 5.0e-5
+
+
 def test_settle_interoperates_with_generic_distance_constraints_in_nve():
     settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
     tether = DistanceConstraints([(0, 3)], distances=[2.0], max_iterations=4)

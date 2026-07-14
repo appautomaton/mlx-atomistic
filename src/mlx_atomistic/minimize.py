@@ -8,6 +8,7 @@ import mlx.core as mx
 import numpy as np
 from scipy.optimize import minimize as scipy_minimize
 
+from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.md import ForceTerm, _energy_forces_from_terms
 from mlx_atomistic.neighbors import NeighborListManager
@@ -59,6 +60,8 @@ def minimize_energy(
     min_step_size: float = 1e-12,
     neighbor_manager: NeighborListManager | None = None,
     method: str = "steepest_descent",
+    constraints: DistanceConstraints | None = None,
+    masses=None,
 ) -> MinimizationResult:
     """Minimize potential energy with a selectable local optimizer."""
 
@@ -78,6 +81,9 @@ def minimize_energy(
     method_name = _normalize_method(method)
     terms = _as_terms(force_terms)
     if method_name in {"l-bfgs", "conjugate-gradient"}:
+        if constraints is not None:
+            msg = "constrained minimization currently supports steepest_descent only"
+            raise ValueError(msg)
         return _minimize_with_scipy(
             positions,
             terms,
@@ -98,6 +104,8 @@ def minimize_energy(
         backtracking=backtracking,
         min_step_size=min_step_size,
         neighbor_manager=neighbor_manager,
+        constraints=constraints,
+        masses=masses,
     )
 
 
@@ -132,11 +140,34 @@ def _minimize_steepest_descent(
     backtracking: float,
     min_step_size: float,
     neighbor_manager: NeighborListManager | None,
+    constraints: DistanceConstraints | None,
+    masses,
 ) -> MinimizationResult:
     current_positions = as_mx_array(positions)
+    masses_mx = (
+        mx.ones((current_positions.shape[0],), dtype=mx.float32)
+        if masses is None
+        else as_mx_array(masses)
+    )
+    if masses_mx.shape != (current_positions.shape[0],):
+        msg = "masses must have shape (n_particles,)"
+        raise ValueError(msg)
+    if constraints is not None:
+        current_positions, _ = constraints.apply_positions(
+            current_positions,
+            masses_mx,
+            cell,
+        )
     energy, forces = _energy_forces(current_positions, terms, cell, neighbor_manager)
+    descent_forces = _constraint_tangent_forces(
+        current_positions,
+        forces,
+        constraints=constraints,
+        masses=masses_mx,
+        cell=cell,
+    )
     energy_history = [energy]
-    max_force_history = [mx.max(mx.abs(forces))]
+    max_force_history = [mx.max(mx.abs(descent_forces))]
     converged = bool(np.asarray(max_force_history[-1]) <= force_tolerance)
     steps_taken = 0
     convergence_reason = "force_tolerance" if converged else "max_steps"
@@ -147,9 +178,16 @@ def _minimize_steepest_descent(
         trial_step = step_size
         accepted = False
         while trial_step >= min_step_size:
-            trial_positions = current_positions + trial_step * forces
+            trial_positions = current_positions + trial_step * descent_forces
             if cell is not None:
                 trial_positions = cell.wrap(trial_positions)
+            if constraints is not None:
+                trial_positions, _ = constraints.apply_positions(
+                    trial_positions,
+                    masses_mx,
+                    cell,
+                    reference_positions=current_positions,
+                )
             trial_energy, trial_forces = _energy_forces(
                 trial_positions,
                 terms,
@@ -160,6 +198,13 @@ def _minimize_steepest_descent(
                 current_positions = trial_positions
                 energy = trial_energy
                 forces = trial_forces
+                descent_forces = _constraint_tangent_forces(
+                    current_positions,
+                    forces,
+                    constraints=constraints,
+                    masses=masses_mx,
+                    cell=cell,
+                )
                 accepted = True
                 break
             trial_step *= backtracking
@@ -167,7 +212,7 @@ def _minimize_steepest_descent(
             convergence_reason = "line_search_failed"
             break
         steps_taken = step
-        max_force = mx.max(mx.abs(forces))
+        max_force = mx.max(mx.abs(descent_forces))
         energy_history.append(energy)
         max_force_history.append(max_force)
         converged = bool(np.asarray(max_force) <= force_tolerance)
@@ -185,6 +230,19 @@ def _minimize_steepest_descent(
         method="steepest_descent",
         convergence_reason=convergence_reason,
     )
+
+
+def _constraint_tangent_forces(
+    positions,
+    forces,
+    *,
+    constraints: DistanceConstraints | None,
+    masses,
+    cell: Cell | None,
+):
+    if constraints is None:
+        return forces
+    return constraints.apply_velocities(positions, forces, masses, cell)
 
 
 def _minimize_with_scipy(

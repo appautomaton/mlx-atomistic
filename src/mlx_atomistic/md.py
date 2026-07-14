@@ -1988,11 +1988,17 @@ def simulate_nve(
             next_positions = cell.wrap(next_positions)
         constraint_error = _zero_constraint_error(next_positions)
         if constraints is not None:
+            unconstrained_positions = next_positions
             next_positions, constraint_error = constraints.apply_positions(
                 next_positions,
                 masses,
                 cell,
+                reference_positions=state.positions,
             )
+            position_correction = next_positions - unconstrained_positions
+            if cell is not None:
+                position_correction = cell.minimum_image(position_correction)
+            velocities_half = velocities_half + position_correction / config.dt
 
         eval_positions = _neighbor_evaluation_positions(next_positions, virtual_sites)
         neighbor_list = (
@@ -2462,7 +2468,7 @@ def simulate_nvt(
                 pos, unnamed_terms, cell=cell, pairs=block_pairs, virtual_sites=None
             )
             next_accel = fscale * next_forces / masses_col
-            vel = vel_half + 0.5 * dt * next_accel
+            vel = middle + 0.5 * dt * next_accel
             return pos, vel, next_forces, prng
 
         _block_cache: dict[int, object] = {}
@@ -2689,13 +2695,36 @@ def simulate_nvt(
             next_positions = state.positions + 0.5 * config.dt * velocities_half
             if cell is not None:
                 next_positions = cell.wrap(next_positions)
+            constraint_error = _zero_constraint_error(next_positions)
+            if constraints is not None:
+                unconstrained_positions = next_positions
+                next_positions, constraint_error = constraints.apply_positions(
+                    next_positions,
+                    masses,
+                    cell,
+                    reference_positions=state.positions,
+                )
+                position_correction = next_positions - unconstrained_positions
+                if cell is not None:
+                    position_correction = cell.minimum_image(position_correction)
+                velocities_half = (
+                    velocities_half + 2.0 * position_correction / config.dt
+                )
 
             keys = mx.random.split(key, 2)
             key = keys[0]
             noise = mx.random.normal(state.velocities.shape, key=keys[1])
             thermal_scale = noise_scale / mx.sqrt(masses)[:, None]
             middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
+            if constraints is not None:
+                middle_velocities = constraints.apply_velocities(
+                    next_positions,
+                    middle_velocities,
+                    masses,
+                    cell,
+                )
 
+            half_step_positions = next_positions
             next_positions = next_positions + 0.5 * config.dt * middle_velocities
         else:
             current_kinetic = kinetic_energy(
@@ -2712,13 +2741,35 @@ def simulate_nvt(
             next_positions = state.positions + config.dt * velocities_half
         if cell is not None:
             next_positions = cell.wrap(next_positions)
-        constraint_error = _zero_constraint_error(next_positions)
-        if constraints is not None:
-            next_positions, constraint_error = constraints.apply_positions(
-                next_positions,
-                masses,
-                cell,
-            )
+        if isinstance(thermostat, LangevinThermostat):
+            if constraints is not None:
+                unconstrained_positions = next_positions
+                next_positions, constraint_error = constraints.apply_positions(
+                    next_positions,
+                    masses,
+                    cell,
+                    reference_positions=half_step_positions,
+                )
+                position_correction = next_positions - unconstrained_positions
+                if cell is not None:
+                    position_correction = cell.minimum_image(position_correction)
+                middle_velocities = (
+                    middle_velocities + 2.0 * position_correction / config.dt
+                )
+        else:
+            constraint_error = _zero_constraint_error(next_positions)
+            if constraints is not None:
+                unconstrained_positions = next_positions
+                next_positions, constraint_error = constraints.apply_positions(
+                    next_positions,
+                    masses,
+                    cell,
+                    reference_positions=state.positions,
+                )
+                position_correction = next_positions - unconstrained_positions
+                if cell is not None:
+                    position_correction = cell.minimum_image(position_correction)
+                velocities_half = velocities_half + position_correction / config.dt
 
         eval_positions = _neighbor_evaluation_positions(next_positions, virtual_sites)
         neighbor_list = (
@@ -2760,7 +2811,12 @@ def simulate_nvt(
             energy_by_term = None
         force_evaluation_wall_seconds += perf_counter() - force_start
         next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
-        next_velocities = velocities_half + 0.5 * config.dt * next_acceleration
+        velocity_base = (
+            middle_velocities
+            if isinstance(thermostat, LangevinThermostat)
+            else velocities_half
+        )
+        next_velocities = velocity_base + 0.5 * config.dt * next_acceleration
         if constraints is not None:
             next_velocities = constraints.apply_velocities(
                 next_positions,

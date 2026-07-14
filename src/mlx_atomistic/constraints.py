@@ -14,6 +14,21 @@ def _empty_pairs() -> mx.array:
     return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
 
 
+def _independent_constraint_groups(pairs: np.ndarray) -> tuple[mx.array, ...]:
+    groups: list[list[int]] = []
+    used_atoms: list[set[int]] = []
+    for index, (left, right) in enumerate(pairs.tolist()):
+        for group, used in zip(groups, used_atoms, strict=True):
+            if left not in used and right not in used:
+                group.append(index)
+                used.update((left, right))
+                break
+        else:
+            groups.append([index])
+            used_atoms.append({left, right})
+    return tuple(mx.array(group, dtype=mx.int32) for group in groups)
+
+
 @dataclass(frozen=True)
 class DistanceConstraints:
     """Fixed pair-distance constraints."""
@@ -22,6 +37,7 @@ class DistanceConstraints:
     distances: object
     tolerance: float = 1e-5
     max_iterations: int = 20
+    velocity_max_iterations: int | None = None
 
     def __post_init__(self) -> None:
         pairs = np.asarray(self.pairs, dtype=np.int32)
@@ -48,10 +64,20 @@ class DistanceConstraints:
         if self.max_iterations <= 0:
             msg = "max_iterations must be positive"
             raise ValueError(msg)
+        velocity_iterations = (
+            self.max_iterations
+            if self.velocity_max_iterations is None
+            else int(self.velocity_max_iterations)
+        )
+        if velocity_iterations <= 0:
+            msg = "velocity_max_iterations must be positive"
+            raise ValueError(msg)
         max_pair_index = int(np.max(pairs)) if pairs.size else -1
         object.__setattr__(self, "pairs", mx.array(pairs, dtype=mx.int32))
         object.__setattr__(self, "distances", as_mx_array(distances))
         object.__setattr__(self, "_max_pair_index", max_pair_index)
+        object.__setattr__(self, "_independent_groups", _independent_constraint_groups(pairs))
+        object.__setattr__(self, "_velocity_iterations", velocity_iterations)
 
     def _displacements(self, positions: mx.array, cell: Cell | None) -> mx.array:
         i = self.pairs[:, 0]
@@ -76,6 +102,7 @@ class DistanceConstraints:
         positions,
         masses,
         cell: Cell | None = None,
+        reference_positions=None,
     ) -> tuple[mx.array, mx.array]:
         """Project positions onto the configured pair distances."""
 
@@ -86,20 +113,49 @@ class DistanceConstraints:
         if self._max_pair_index >= constrained.shape[0]:
             msg = "constraint pair index outside positions"
             raise ValueError(msg)
+        reference = (
+            constrained
+            if reference_positions is None
+            else as_mx_array(reference_positions)
+        )
+        if reference.shape != constrained.shape:
+            msg = "reference_positions must match positions"
+            raise ValueError(msg)
 
-        i = self.pairs[:, 0]
-        j = self.pairs[:, 1]
         inverse_masses = 1.0 / masses
         for _ in range(self.max_iterations):
-            displacement = self._displacements(constrained, cell)
-            distances = mx.sqrt(mx.maximum(mx.sum(displacement * displacement, axis=-1), 1e-12))
-            errors = distances - self.distances
-            unit = displacement / distances[:, None]
-            weight_i = inverse_masses[i] / (inverse_masses[i] + inverse_masses[j])
-            weight_j = inverse_masses[j] / (inverse_masses[i] + inverse_masses[j])
-            correction = errors[:, None] * unit
-            constrained = constrained.at[i].add(-weight_i[:, None] * correction)
-            constrained = constrained.at[j].add(weight_j[:, None] * correction)
+            for group in self._independent_groups:
+                i = self.pairs[group, 0]
+                j = self.pairs[group, 1]
+                displacement = constrained[i] - constrained[j]
+                reference_displacement = reference[i] - reference[j]
+                if cell is not None:
+                    displacement = cell.minimum_image(displacement)
+                    reference_displacement = cell.minimum_image(reference_displacement)
+                distance2 = mx.sum(displacement * displacement, axis=-1)
+                target2 = self.distances[group] * self.distances[group]
+                distance_error = (
+                    mx.sqrt(mx.maximum(distance2, 1.0e-12)) - self.distances[group]
+                )
+                denominator = (
+                    2.0
+                    * (inverse_masses[i] + inverse_masses[j])
+                    * mx.sum(displacement * reference_displacement, axis=-1)
+                )
+                safe_denominator = mx.where(
+                    mx.abs(denominator) < 1.0e-12,
+                    1.0e-12,
+                    denominator,
+                )
+                multiplier = -(distance2 - target2) / safe_denominator
+                multiplier = mx.where(
+                    mx.abs(distance_error) <= self.tolerance,
+                    0.0,
+                    multiplier,
+                )
+                correction = multiplier[:, None] * reference_displacement
+                constrained = constrained.at[i].add(inverse_masses[i, None] * correction)
+                constrained = constrained.at[j].add(-inverse_masses[j, None] * correction)
             if cell is not None:
                 constrained = cell.wrap(constrained)
         return constrained, self.max_error(constrained, cell)
@@ -122,19 +178,25 @@ class DistanceConstraints:
             msg = "constraint pair index outside positions"
             raise ValueError(msg)
 
-        i = self.pairs[:, 0]
-        j = self.pairs[:, 1]
         inverse_masses = 1.0 / masses
-        displacement = self._displacements(positions, cell)
-        distances = mx.sqrt(mx.maximum(mx.sum(displacement * displacement, axis=-1), 1e-12))
-        unit = displacement / distances[:, None]
-        relative_velocity = constrained[i] - constrained[j]
-        relative_along_bond = mx.sum(relative_velocity * unit, axis=-1)
-        weight_i = inverse_masses[i] / (inverse_masses[i] + inverse_masses[j])
-        weight_j = inverse_masses[j] / (inverse_masses[i] + inverse_masses[j])
-        correction = relative_along_bond[:, None] * unit
-        constrained = constrained.at[i].add(-weight_i[:, None] * correction)
-        constrained = constrained.at[j].add(weight_j[:, None] * correction)
+        for _ in range(self._velocity_iterations):
+            for group in self._independent_groups:
+                i = self.pairs[group, 0]
+                j = self.pairs[group, 1]
+                displacement = positions[i] - positions[j]
+                if cell is not None:
+                    displacement = cell.minimum_image(displacement)
+                distances = mx.sqrt(
+                    mx.maximum(mx.sum(displacement * displacement, axis=-1), 1e-12)
+                )
+                unit = displacement / distances[:, None]
+                weight_i = inverse_masses[i] / (inverse_masses[i] + inverse_masses[j])
+                weight_j = inverse_masses[j] / (inverse_masses[i] + inverse_masses[j])
+                relative_velocity = constrained[i] - constrained[j]
+                relative_along_bond = mx.sum(relative_velocity * unit, axis=-1)
+                correction = relative_along_bond[:, None] * unit
+                constrained = constrained.at[i].add(-weight_i[:, None] * correction)
+                constrained = constrained.at[j].add(weight_j[:, None] * correction)
         return constrained
 
 
@@ -213,6 +275,7 @@ class SettleWaterConstraints:
         positions,
         masses,
         cell: Cell | None = None,
+        reference_positions=None,
     ) -> tuple[mx.array, mx.array]:
         """Project water triplets onto the configured rigid geometry."""
 
@@ -237,9 +300,15 @@ class SettleWaterConstraints:
             difference = _unit_or_fallback(difference, _perpendicular_unit(bisector))
 
             half_hh = 0.5 * float(self.hh_distance)
-            along_bisector = float(np.sqrt(float(self.oh_distance) ** 2 - half_hh * half_hh))
-            constrained_np[hydrogen_a] = origin + along_bisector * bisector + half_hh * difference
-            constrained_np[hydrogen_b] = origin + along_bisector * bisector - half_hh * difference
+            along_bisector = float(
+                np.sqrt(float(self.oh_distance) ** 2 - half_hh * half_hh)
+            )
+            constrained_np[hydrogen_a] = (
+                origin + along_bisector * bisector + half_hh * difference
+            )
+            constrained_np[hydrogen_b] = (
+                origin + along_bisector * bisector - half_hh * difference
+            )
         constrained = as_mx_array(constrained_np)
         if cell is not None:
             constrained = cell.wrap(constrained)
@@ -299,6 +368,7 @@ class CompositeConstraints:
         positions,
         masses,
         cell: Cell | None = None,
+        reference_positions=None,
     ) -> tuple[mx.array, mx.array]:
         """Apply child position constraints in sequence."""
 

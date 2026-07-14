@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell
 from mlx_atomistic.md import LennardJonesPotential
 from mlx_atomistic.minimize import minimize_energy
@@ -67,3 +68,18 @@ def test_l_bfgs_handles_neighbor_list_backed_force_terms():
 def test_minimizer_rejects_unknown_method():
     with pytest.raises(ValueError, match="unknown minimization method"):
         minimize_energy([[0.0, 0.0, 0.0]], HarmonicWell([[0.0, 0.0, 0.0]]), method="magic")
+
+
+def test_constrained_minimization_projects_every_trial():
+    positions = np.asarray([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=np.float32)
+    constraints = DistanceConstraints([(0, 1)], distances=[1.0])
+    result = minimize_energy(
+        positions,
+        HarmonicWell([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]),
+        max_steps=5,
+        step_size=0.1,
+        constraints=constraints,
+        masses=[1.0, 1.0],
+    )
+
+    assert float(np.asarray(constraints.max_error(result.positions))) <= constraints.tolerance

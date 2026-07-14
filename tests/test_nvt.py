@@ -15,6 +15,15 @@ from mlx_atomistic.md import (
 from mlx_atomistic.neighbors import NeighborListManager
 
 
+class ZeroForce:
+    supports_virial = True
+
+    def energy_forces(self, positions, cell=None, pairs=None):
+        import mlx.core as mx
+
+        return mx.sum(positions[:, 0] * 0.0), mx.zeros_like(positions)
+
+
 def _small_system():
     positions = np.array(
         [[1.0, 1.0, 1.0], [2.2, 1.0, 1.0], [1.0, 2.2, 1.0], [2.2, 2.2, 1.0]],
@@ -243,6 +252,19 @@ def test_seeded_nvt_runs_are_reproducible():
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_langevin_middle_velocity_drives_final_state():
+    result = simulate_nvt(
+        np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        np.zeros((2, 3), dtype=np.float32),
+        masses=np.ones((2,), dtype=np.float32),
+        force_terms=ZeroForce(),
+        config=SimulationConfig(dt=0.01, steps=1),
+        thermostat=LangevinThermostat(temperature=1.0, friction=1.0, seed=7),
+    )
+
+    assert np.linalg.norm(np.asarray(result.final_state.velocities)) > 0.0
 
 
 def test_zero_friction_nvt_matches_nve():

@@ -12,6 +12,10 @@ from mlx_atomistic.benchmarks.pme_fixture import (
     fixture_summary,
     write_pme_fixture,
 )
+from mlx_atomistic.benchmarks.pme_stability import (
+    _runtime_constraints,
+    classify_pme_stability,
+)
 from mlx_atomistic.benchmarks.pme_validation import (
     apply_openmm_pme_manifest,
     array_hash,
@@ -19,6 +23,7 @@ from mlx_atomistic.benchmarks.pme_validation import (
     force_error_metrics,
     run_ewald_convergence,
 )
+from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.prep.io import load_prepared_system
 
 
@@ -54,6 +59,13 @@ def test_target_pme_fixture_has_approved_composition_and_clearance():
     assert prepared.ion_mask.sum() == 44
     assert prepared.constraints.shape == (3 * 8148, 2)
     assert prepared.nonbonded_pairs.shape == (0, 2)
+    pairs = prepared.constraints
+    displacement = prepared.positions[pairs[:, 0]] - prepared.positions[pairs[:, 1]]
+    displacement -= prepared.cell_lengths * np.round(
+        displacement / prepared.cell_lengths
+    )
+    measured = np.linalg.norm(displacement, axis=1)
+    np.testing.assert_allclose(measured, prepared.constraint_distance, atol=6.0e-6)
 
 
 def test_pme_fixture_rejects_clearance_it_cannot_guarantee():
@@ -184,3 +196,109 @@ def test_array_hash_tracks_shape_dtype_and_values():
     assert array_hash(values) == array_hash(values.copy())
     assert array_hash(values) != array_hash(values.astype(np.float64))
     assert array_hash(values) != array_hash(values.reshape(2, 1))
+
+
+def test_pme_stability_classification_accepts_timestep_convergence_and_target_nvt():
+    minimization = {
+        "finite": True,
+        "initial_energy_kj_mol": 10.0,
+        "final_energy_kj_mol": 9.0,
+    }
+    nve = [
+        {
+            "dt_fs": 1.0,
+            "finite": True,
+            "max_constraint_error_nm": 1.0e-5,
+            "max_energy_drift_per_atom_kj_mol": 0.04,
+            "neighbor_backend": "mlx_cell_pairs",
+            "neighbor_representation": "pairs",
+            "fallback_reason": None,
+        },
+        {
+            "dt_fs": 0.5,
+            "finite": True,
+            "max_constraint_error_nm": 1.0e-5,
+            "max_energy_drift_per_atom_kj_mol": 0.02,
+            "neighbor_backend": "mlx_cell_pairs",
+            "neighbor_representation": "pairs",
+            "fallback_reason": None,
+        },
+    ]
+    nvt = {
+        "finite": True,
+        "max_constraint_error_nm": 1.0e-5,
+        "mean_temperature_k": 302.0,
+        "neighbor_backend": "mlx_cell_pairs",
+        "neighbor_representation": "pairs",
+        "fallback_reason": None,
+    }
+
+    result = classify_pme_stability(
+        minimization=minimization,
+        nve=nve,
+        nvt=nvt,
+        pme_readiness={"status": "ready"},
+    )
+
+    assert result["status"] == "passed"
+    assert result["blockers"] == []
+
+
+def test_pme_stability_uses_tighter_fine_timestep_constraints():
+    constraints = DistanceConstraints([[0, 1]], distances=[1.0])
+
+    coarse = _runtime_constraints(constraints, dt_fs=1.0)
+    fine = _runtime_constraints(constraints, dt_fs=0.5)
+
+    assert coarse is not None
+    assert fine is not None
+    assert coarse.max_iterations == 8
+    assert fine.max_iterations == 6
+    assert coarse.tolerance == pytest.approx(1.0e-4)
+    assert fine.tolerance == pytest.approx(1.0e-4)
+    assert coarse._velocity_iterations == 4
+    assert fine._velocity_iterations == 4
+
+
+def test_pme_stability_classification_fails_closed_for_drift_and_temperature():
+    result = classify_pme_stability(
+        minimization={
+            "finite": True,
+            "initial_energy_kj_mol": 10.0,
+            "final_energy_kj_mol": 9.0,
+        },
+        nve=[
+            {
+                "dt_fs": 1.0,
+                "finite": True,
+                "max_constraint_error_nm": 1.0e-5,
+                "max_energy_drift_per_atom_kj_mol": 0.01,
+                "neighbor_backend": "mlx_cell_pairs",
+                "neighbor_representation": "pairs",
+                "fallback_reason": None,
+            },
+            {
+                "dt_fs": 0.5,
+                "finite": True,
+                "max_constraint_error_nm": 1.0e-5,
+                "max_energy_drift_per_atom_kj_mol": 0.06,
+                "neighbor_backend": "mlx_cell_pairs",
+                "neighbor_representation": "pairs",
+                "fallback_reason": None,
+            },
+        ],
+        nvt={
+            "finite": True,
+            "max_constraint_error_nm": 1.0e-5,
+            "mean_temperature_k": 350.0,
+            "neighbor_backend": "mlx_cell_pairs",
+            "neighbor_representation": "pairs",
+            "fallback_reason": None,
+        },
+        pme_readiness={"status": "ready"},
+    )
+
+    assert result["status"] == "failed"
+    assert "nve:0.5fs:energy_drift" in result["blockers"]
+    assert "nve:timestep_convergence" in result["blockers"]
+    assert "nvt:mean_temperature" in result["blockers"]

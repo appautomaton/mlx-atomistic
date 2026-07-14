@@ -172,13 +172,13 @@ def build_pme_fixture(
         ],
         axis=1,
     )
-    constraint_distance = np.tile(
-        np.asarray(
-            [OH_DISTANCE_ANGSTROM, OH_DISTANCE_ANGSTROM, HH_DISTANCE_ANGSTROM],
-            dtype=np.float32,
-        ),
-        water_count,
-    )
+    constraint_distance = np.concatenate(
+        [
+            np.full((water_count,), OH_DISTANCE_ANGSTROM),
+            np.full((water_count,), OH_DISTANCE_ANGSTROM),
+            np.full((water_count,), HH_DISTANCE_ANGSTROM),
+        ]
+    ).astype(np.float32)
 
     symbols = np.concatenate(
         [
@@ -275,6 +275,7 @@ def build_pme_fixture(
         "bonds": bonds,
         "angles": angles,
         "constraints": constraints,
+        "constraint_distance": constraint_distance,
     }
     content_hash = _fixture_hash(spec, box_length, arrays_for_hash)
     supported_terms = [
@@ -348,6 +349,12 @@ def build_pme_fixture(
             "fixture_content_hash": content_hash,
         },
         pme_config=pme_config,
+        protocol_metadata={
+            "nonbonded": {
+                "cutoff": PME_REAL_CUTOFF_ANGSTROM,
+                "electrostatics": "pme",
+            }
+        },
         warnings=[
             (
                 "The deterministic lattice is a controlled PME validation fixture, "
