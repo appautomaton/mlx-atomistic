@@ -13,6 +13,8 @@ from mlx_atomistic.benchmarks.pme_fixture import (
     write_pme_fixture,
 )
 from mlx_atomistic.benchmarks.pme_validation import (
+    apply_openmm_pme_manifest,
+    array_hash,
     deterministic_configurations,
     force_error_metrics,
     run_ewald_convergence,
@@ -135,3 +137,50 @@ def test_ewald_convergence_payload_reports_finite_metrics():
     assert row["finite"] is True
     assert row["converged"] is True
     assert np.isfinite(row["pme_vs_ewald"]["normalized_rms"])
+
+
+def test_openmm_manifest_matching_is_fail_closed():
+    prepared = build_pme_fixture(PMEFixtureSpec("test", 2, 1, seed=31))
+    manifest = {
+        "fixture": fixture_summary(prepared),
+        "platform": "Reference",
+        "precision": "double",
+        "exception_count": prepared.nonbonded_exception_pairs.shape[0],
+        "topology": {
+            "charge_hash": array_hash(prepared.charges),
+            "exception_pairs_hash": array_hash(prepared.nonbonded_exception_pairs),
+            "exception_charge_product_hash": array_hash(
+                prepared.nonbonded_exception_charge_product
+            ),
+        },
+        "coulomb_constant_kj_mol_angstrom": 1389.3545764438198,
+        "pme": {
+            "real_cutoff_angstrom": 9.0,
+            "assignment_order": 5,
+            "alpha_per_angstrom": 0.3,
+            "mesh_shape": [16, 16, 16],
+        },
+    }
+
+    matched = apply_openmm_pme_manifest(prepared, manifest)
+
+    assert matched.metadata.pme_config["parameter_authority"] == "openmm_context"
+    assert matched.pme_mesh_shape.tolist() == [16, 16, 16]
+    assert matched.pme_alpha.tolist() == pytest.approx([0.3])
+    bad = {**manifest, "fixture": {**manifest["fixture"], "content_hash": "wrong"}}
+    with pytest.raises(ValueError, match="fixture_hash"):
+        apply_openmm_pme_manifest(prepared, bad)
+    bad = {
+        **manifest,
+        "topology": {**manifest["topology"], "exception_pairs_hash": "wrong"},
+    }
+    with pytest.raises(ValueError, match="exception_pairs_hash"):
+        apply_openmm_pme_manifest(prepared, bad)
+
+
+def test_array_hash_tracks_shape_dtype_and_values():
+    values = np.asarray([[1.0, 2.0]], dtype=np.float32)
+
+    assert array_hash(values) == array_hash(values.copy())
+    assert array_hash(values) != array_hash(values.astype(np.float64))
+    assert array_hash(values) != array_hash(values.reshape(2, 1))
