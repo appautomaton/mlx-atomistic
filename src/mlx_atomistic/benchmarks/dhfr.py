@@ -36,12 +36,6 @@ BENCHMARK_NAME = "dhfr"
 COMMAND = default_benchmark_command(BENCHMARK_NAME)
 
 DEFAULT_ARTIFACT_ROOT = Path("outputs/benchmarks/dhfr-artifacts")
-AMBER20_JAC_PRMTOP = Path(
-    "results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop"
-)
-AMBER20_JAC_INPCRD = Path(
-    "results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd"
-)
 GBSA_REQUIRED_ARRAYS = ("gbsa_radius", "gbsa_scale")
 PME_REQUIRED_ARRAYS = (
     "pme_mesh_shape",
@@ -886,6 +880,11 @@ def _input_status(case_spec: DHFRCaseSpec, repo_root: Path) -> dict[str, Any]:
     missing: list[str] = []
     if not case_spec.input_paths:
         missing.append("caller-provided DHFR input path(s)")
+    if case_spec.electrostatics_model == "pme":
+        if case_spec.amber_topology_path is None:
+            missing.append("caller-provided AMBER topology path")
+        if case_spec.amber_coordinates_path is None:
+            missing.append("caller-provided AMBER coordinates path")
     for path in case_spec.input_paths:
         target = repo_root / path
         if target.exists():
@@ -944,11 +943,6 @@ def _case_spec_from_args(args: argparse.Namespace) -> DHFRCaseSpec:
     spec = CASE_SPECS[args.case]
     amber_topology = args.amber_topology
     amber_coordinates = args.amber_coordinates
-    if args.case == "dhfr-explicit-pme":
-        if amber_topology is None:
-            amber_topology = AMBER20_JAC_PRMTOP
-        if amber_coordinates is None:
-            amber_coordinates = AMBER20_JAC_INPCRD
     input_paths: list[Path] = []
     if args.primary_structure is not None:
         input_paths.append(args.primary_structure)
