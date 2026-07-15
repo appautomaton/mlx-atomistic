@@ -25,12 +25,17 @@ custom Metal kernels.
   periodic cell/bin search space bounded, batches neighboring-cell candidates
   into MLX distance-filter chunks, and emits compact pairs through CPU
   compaction.
+- `mlx_cell_blocks` keeps the periodic cell/bin candidate search in a
+  fixed-shape block representation. Production PME selects this backend so LJ
+  and direct-space Coulomb share `NeighborBlocks` without materializing a dense
+  topology pair cache.
 - `python_neighbor` means the Python/NumPy cell-list builder is included in the
   benchmark before MLX pair evaluation.
 - `auto` uses dense MLX when no pair list is supplied and the dense memory
   estimate fits the configured budget; otherwise it falls back to tiled MLX.
   For neighbor-list managers, `auto` selects `mlx_dense_pairs` for supported
-  small systems and `mlx_cell_pairs` above the small-system limit.
+  small systems and `mlx_cell_pairs` above the small-system limit. The
+  production PME runner explicitly selects `mlx_cell_blocks`.
 
 ## Current Hot-Path Recommendation
 
@@ -76,6 +81,19 @@ runtime does not currently expose a NumPy-style one-argument `where(mask)` or
 `nonzero(mask)` compaction API for emitting variable-length `(i, j)` pairs.
 `mlx_cell_pairs` is the current pragmatic hybrid: bounded cell candidates and
 MLX distance filtering, with dynamic compaction still CPU-side.
+
+A fresh synthetic orthorhombic parity ladder now validates this route at
+1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001
+atoms, the compact build took 0.545 s, the explicitly synchronized pair-force
+evaluation took 0.068 s, and the tiled oracle took 112.1 s; relative energy
+delta was `4.56e-7` and maximum absolute force delta was `8.49e-7`. The result
+is diagnostic rather than a GPCRmd production claim because the local
+real-fixture cache was unavailable. Charged fixed-cell PME now has a separate
+94,232-atom JAC validation using `mlx_cell_blocks`; that result does not convert
+the synthetic neighbor row into a GPCRmd run. See
+[`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](../benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md)
+and
+[`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](../benchmarks/scalable-charged-pme-runtime-m5max.md).
 
 For the active solvated ligand-receptor notebook system, the near-term GPU
 occupancy lever is independent replica batching. The system is only a few

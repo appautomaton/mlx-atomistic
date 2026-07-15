@@ -3,7 +3,7 @@ title: "Benchmark Ladder"
 ---
 
 
-Date: 2026-05-23
+Date: 2026-07-15
 
 This ladder organizes `mlx_atomistic` benchmark rows by decision value. It is
 not a ranking across engines. Reference rows are used only where operation
@@ -18,7 +18,7 @@ semantics and metric families line up.
 | feature physics | Time MLX feature rows for GBSA/OBC, TIP4P-Ew, soft-core/lambda, and replica exchange. | Comparable only after a matching OpenMM controlled case exists; otherwise diagnostic. |
 | scaling | Sweep sizes or policies to tell fixed overhead from force-evaluation, neighbor-list, or memory-pressure costs. | Usually MLX-only diagnostic; reference parity is separate. |
 | reference parity | Map controlled OpenMM rows to MLX rows and allow ratios only for matching metrics. | Comparable, diagnostic, or blocked from normalized payload status. |
-| stretch | Track real-system rows such as DHFR until MLX artifacts and runtime parity exist. | Blocked or deferred until the MLX system, physics, and metric match the reference. |
+| stretch | Track real-system rows such as DHFR and bounded at-scale PME. | Comparable only for manifest-matched operations; runtime-only rows stay diagnostic until metric semantics match. |
 
 ## Must-Ship Rows
 
@@ -31,7 +31,8 @@ semantics and metric families line up.
 | `replica-exchange` | feature physics | `uv run python -m mlx_atomistic.benchmarks.phase3_physics --evaluations 1 --waters 1 --atoms 4 --replica-steps 1 --json` | deferred mapping | deferred | `ms/eval`, per-replica throughput, aggregate replica throughput, swap/history counters | `results/performance-audit-harness-hardening/phase3-physics-fast.json` | `diagnostic`; reference parity deferred | Decide whether replica execution, history materialization, or swap bookkeeping is the next MLX bottleneck. |
 | `scaling-sweep` | scaling | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --include-large --evaluations 10 --json`; `uv run python -m mlx_atomistic.benchmarks.md_performance --include-large --steps 100 --json` | deferred until a controlled OpenMM sweep is specified | deferred except simple LJ-like smoke notes | `ms/eval`, neighbor-build timing, steps/s; keep units separate by row | `results/mlx-md-acceleration.json`; `results/mlx-md-performance.json`; audit smoke sources under `results/performance-audit-harness-hardening/` | `diagnostic` for MLX scaling; reference parity deferred | Decide whether overhead is fixed, neighbor-list dominated, memory-pressure dominated, or force-evaluation dominated. |
 | `dhfr-implicit` | stretch; reference parity | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-implicit --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-implicit --platform Reference --steps 1 --json` | deferred | `ns/day` for matching one-step GBSA/OBC rows | MLX: `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; OpenMM Reference: `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; summary: `results/same-workload-openmm-comparison/summary.json`; OpenMM OpenCL context: `results/openmm-opencl-dhfr-m5max.json` | `comparable` for the one-step MLX/OpenMM Reference smoke row; broader OpenCL context remains separate | Track the smaller DHFR real-system path and harden MLX artifact/runtime behavior before broad performance claims. |
-| `dhfr-explicit-pme` | stretch; reference parity | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-explicit-pme --platform Reference --steps 1 --json` | deferred | `ns/day` only after matching runnable MLX and OpenMM rows exist | MLX: `results/same-workload-openmm-comparison/mlx-dhfr-explicit-pme.json`; OpenMM Reference: `results/same-workload-openmm-comparison/openmm-dhfr-explicit-pme.json`; OpenMM OpenCL context: `results/openmm-opencl-dhfr-m5max.json` | `blocked`; PME artifact policy requires neutrality and local Amber20/JAC has `net_charge=-11`; no ratio | Track the production-like DHFR PME path and resolve charged-system/neutralization policy before PME runtime optimization. |
+| `dhfr-explicit-pme` | stretch; reference parity | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --amber-topology results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --json` | `uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/dhfr-artifacts/dhfr-explicit-pme --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 1,1,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-1x` | deferred | manifest-matched energy/complete-force parity; MLX `ns/day` is diagnostic until a matching OpenMM runtime row exists | `results/scalable-charged-pme-runtime/jac-1x/charged_pme_parity_report.json`; `results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json`; OpenMM OpenCL context: `results/openmm-opencl-dhfr-m5max.json` | parity passed and the explicit-plasma MLX step is runnable; no throughput ratio because runtime schemas do not match | Keep the charged-system convention explicit and improve the measured runtime without weakening parity or fail-closed policy. |
+| `jac-charged-pme-94k` | stretch; scaling; reference parity | `uv run python -m mlx_atomistic.benchmarks.charged_pme runtime --prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --warmups 1 --steps 2 --out results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json` | `uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 2,2,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-2x2x1` | deferred | manifest-matched energy/complete-force parity plus MLX two-step fixed-cell NVT diagnostics | parity, runtime, and profile JSON under `results/scalable-charged-pme-runtime/jac-2x2x1/`; [scalable-charged-pme-runtime-m5max.md](./scalable-charged-pme-runtime-m5max.md) | parity passed at 94,232 atoms; MLX runtime passed; no throughput ratio without a matching OpenMM NVT manifest | Establish the bounded charged-PME envelope and expose plan, neighbor, PME-stage, throughput, and memory costs. |
 
 ## Reference Coverage Notes
 
@@ -42,6 +43,8 @@ semantics and metric families line up.
   not map LAMMPS materials, protein, or package-specific benchmark families to
   MLX rows without a separate same-workload plan.
 - DHFR now has explicit same-workload row IDs. `dhfr-implicit` is runnable as a
-  one-step GBSA/OBC smoke row; `dhfr-explicit-pme` remains blocked on PME
-  artifact neutrality. ApoA1, Cellulose, and STMV OpenMM reports remain
-  reference context until matching MLX workloads exist.
+  one-step GBSA/OBC smoke row. `dhfr-explicit-pme` and the 94,232-atom JAC
+  supercell pass manifest-matched energy/complete-force parity under the
+  explicit neutralizing-plasma policy, but neither gets a throughput ratio
+  without a matching OpenMM runtime manifest. ApoA1, Cellulose, and STMV
+  OpenMM reports remain reference context until matching MLX workloads exist.

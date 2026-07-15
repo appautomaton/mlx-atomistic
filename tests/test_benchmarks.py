@@ -190,15 +190,37 @@ def test_dhfr_explicit_pme_defaults_to_charged_order_five_contract():
     assert config.real_cutoff == pytest.approx(9.0)
 
 
-def test_dhfr_explicit_pme_cli_resolves_local_jac_inputs_without_global_defaults():
+def test_dhfr_explicit_pme_cli_requires_caller_provided_jac_inputs():
     args = dhfr._parse_args(["--case", "dhfr-explicit-pme", "--steps", "1", "--json"])
 
     spec = dhfr._case_spec_from_args(args)
 
-    assert spec.amber_topology_path == dhfr.AMBER20_JAC_PRMTOP
-    assert spec.amber_coordinates_path == dhfr.AMBER20_JAC_INPCRD
-    assert spec.input_paths == (dhfr.AMBER20_JAC_PRMTOP, dhfr.AMBER20_JAC_INPCRD)
+    assert spec.amber_topology_path is None
+    assert spec.amber_coordinates_path is None
+    assert spec.input_paths == ()
     assert dhfr.CASE_SPECS["dhfr-explicit-pme"].input_paths == ()
+
+    topology = Path("caller/JAC.prmtop")
+    coordinates = Path("caller/JAC.inpcrd")
+    explicit_args = dhfr._parse_args(
+        [
+            "--case",
+            "dhfr-explicit-pme",
+            "--steps",
+            "1",
+            "--amber-topology",
+            str(topology),
+            "--amber-coordinates",
+            str(coordinates),
+            "--json",
+        ]
+    )
+
+    explicit_spec = dhfr._case_spec_from_args(explicit_args)
+
+    assert explicit_spec.amber_topology_path == topology
+    assert explicit_spec.amber_coordinates_path == coordinates
+    assert explicit_spec.input_paths == (topology, coordinates)
 
 
 def test_validation_gauntlet_cli_json_and_csv(tmp_path, capsys):

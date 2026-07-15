@@ -68,6 +68,9 @@ Runtime proof paths now carry compact platform metadata:
   `platform_readiness`;
 - OpenMM parity reports record `platform_evidence` and label OpenMM as
   reference-only validation;
+- charged-PME reports build the OpenMM workload independently from AMBER
+  inputs, require a strict manifest match before energy/force metrics, and keep
+  the reusable MLX PME plan on the product side;
 - the Phase 3 GPCRmd 729 fixture probe records OpenMM reference evidence,
   MLX prep/load/readiness evidence, and a blocker matrix without turning OpenMM
   or `vendors/` into runtime dependencies;
@@ -76,7 +79,10 @@ Runtime proof paths now carry compact platform metadata:
 - DFT/QM scope is reported by `get_dft_qm_scope_report()` and
   `dft_qm_scope_readiness_report()`.
 
-The current large-fixture production-readiness probe is blocked at MLX runtime
-topology/nonbonded provisioning, not at fixture selection or strict artifact
-loading. It should be read as a bounded blocker report, not as a production MD
+The generic short-range neighbor axis and the distinct charged JAC fixed-cell
+PME axis now have at-scale MLX evidence. The charged result is documented in
+[`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md)
+and keeps OpenMM outside the product runtime. The selected GPCRmd membrane
+fixture itself still lacks a fresh local-cache rerun, so these results must not
+be relabeled as a GPCRmd production trajectory or broad production-MD
 certification.
