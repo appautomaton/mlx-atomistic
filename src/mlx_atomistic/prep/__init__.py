@@ -44,6 +44,12 @@ from mlx_atomistic.prep.solvated_example import (
     prepare_solvated_ligand_receptor_example,
     validate_complete_solvated_ligand_receptor_system,
 )
+from mlx_atomistic.prep.supercell import (
+    PreparedSupercellError,
+    normalize_supercell_replicas,
+    prepared_supercell_summary,
+    replicate_prepared_system,
+)
 from mlx_atomistic.prep.t4l_benzene import T4L_BENZENE_PARAMETER_SOURCE, prepare_t4l_benzene
 from mlx_atomistic.prep.topology_import import (
     TopologyImportError,
@@ -92,6 +98,7 @@ __all__ = [
     "GPCRmdTargetError",
     "MissingPrepDependencyError",
     "ProductionPrepNotImplementedError",
+    "PreparedSupercellError",
     "PreparedSystem",
     "PreparedSystemMetadata",
     "SOLVATED_LIGAND_RECEPTOR_PARAMETER_SOURCE",
@@ -112,10 +119,13 @@ __all__ = [
     "inspect_gpcrmd_cache",
     "load_gpcrmd_targets",
     "load_prepared_system",
+    "normalize_supercell_replicas",
     "optional_prep_dependency_status",
     "prepare_p2x4_atp",
     "prepare_solvated_ligand_receptor_example",
     "prepare_t4l_benzene",
+    "prepared_supercell_summary",
+    "replicate_prepared_system",
     "require_production_prep_dependencies",
     "run_mlx",
     "run_steered_mlx",
