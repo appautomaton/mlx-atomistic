@@ -258,6 +258,29 @@ def test_archive_normalized_target_collisions_fail_closed(tmp_path: Path):
     assert exc_info.value.code == "duplicate_extraction_target"
 
 
+def test_tar_root_directory_marker_is_ignored(tmp_path: Path):
+    archive_path = tmp_path / "root-marker.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        root = tarfile.TarInfo(".")
+        root.type = tarfile.DIRTYPE
+        archive.addfile(root)
+        body = b"source protocol\n"
+        info = tarfile.TarInfo("./run/protocol.conf")
+        info.size = len(body)
+        archive.addfile(info, io.BytesIO(body))
+
+    kind, entries = ACQUISITION.scan_archive(archive_path)
+    extracted = ACQUISITION.extract_archive_safely(
+        archive_path,
+        tmp_path / "extracted",
+    )
+
+    assert kind == "tar"
+    assert [entry.normalized_name for entry in entries] == ["run/protocol.conf"]
+    assert [item["normalized_name"] for item in extracted] == ["run/protocol.conf"]
+    assert (tmp_path / "extracted" / "run" / "protocol.conf").read_bytes() == body
+
+
 def test_login_requirement_is_normalized_without_persisting_cookie(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

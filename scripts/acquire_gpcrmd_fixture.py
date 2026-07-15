@@ -351,11 +351,19 @@ def scan_archive(path: str | Path) -> tuple[str, list[ArchiveEntry]]:
     if zipfile.is_zipfile(archive_path):
         kind = "zip"
         with zipfile.ZipFile(archive_path) as archive:
-            entries = [_zip_entry(info) for info in archive.infolist()]
+            entries = [
+                entry
+                for info in archive.infolist()
+                if (entry := _zip_entry(info)) is not None
+            ]
     elif tarfile.is_tarfile(archive_path):
         kind = "tar"
         with tarfile.open(archive_path, "r:*") as archive:
-            entries = [_tar_entry(member) for member in archive.getmembers()]
+            entries = [
+                entry
+                for member in archive.getmembers()
+                if (entry := _tar_entry(member)) is not None
+            ]
     else:
         raise AcquisitionFailure(
             "unsupported_archive",
@@ -931,7 +939,9 @@ def _build_source_opener(*, cookie_env: str, source_url: str) -> Any:
     return build_opener(HTTPCookieProcessor(jar))
 
 
-def _zip_entry(info: zipfile.ZipInfo) -> ArchiveEntry:
+def _zip_entry(info: zipfile.ZipInfo) -> ArchiveEntry | None:
+    if info.is_dir() and _is_archive_root_marker(info.filename):
+        return None
     normalized = _normalize_archive_name(info.filename)
     mode = info.external_attr >> 16
     file_type = stat.S_IFMT(mode)
@@ -959,7 +969,9 @@ def _zip_entry(info: zipfile.ZipInfo) -> ArchiveEntry:
     )
 
 
-def _tar_entry(member: tarfile.TarInfo) -> ArchiveEntry:
+def _tar_entry(member: tarfile.TarInfo) -> ArchiveEntry | None:
+    if member.isdir() and _is_archive_root_marker(member.name):
+        return None
     normalized = _normalize_archive_name(member.name)
     if member.issym() or member.islnk():
         raise AcquisitionFailure(
@@ -983,6 +995,15 @@ def _tar_entry(member: tarfile.TarInfo) -> ArchiveEntry:
         kind=kind,
         size_bytes=0 if kind == "directory" else int(member.size),
     )
+
+
+def _is_archive_root_marker(name: str) -> bool:
+    if not name or "\x00" in name:
+        return False
+    portable = name.replace("\\", "/")
+    if portable.startswith("/") or WINDOWS_ABSOLUTE_PATTERN.match(portable):
+        return False
+    return all(part in {"", "."} for part in portable.split("/"))
 
 
 def _normalize_archive_name(name: str) -> str:
