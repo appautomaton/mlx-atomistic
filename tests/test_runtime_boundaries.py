@@ -12,6 +12,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_ENGINE_ROOTS = {"cp2k", "lammps", "openmm", "qe", "quantum_espresso"}
+NETWORK_IMPORT_PREFIXES = (
+    "aiohttp",
+    "http.client",
+    "httpx",
+    "requests",
+    "socket",
+    "urllib.request",
+)
 FORBIDDEN_REFERENCE_PATH_FRAGMENTS = (
     "vendors/",
     "quantum-espresso/",
@@ -239,6 +247,29 @@ def test_external_engine_imports_stay_in_documented_reference_scripts():
             observed.add(relative)
             if relative not in allowed:
                 offenders[relative] = sorted(imports)
+
+    assert offenders == {}
+    assert observed == allowed
+
+
+def test_external_acquisition_network_code_stays_in_documented_script():
+    allowed = {Path("scripts/acquire_gpcrmd_fixture.py")}
+    offenders: dict[Path, list[str]] = {}
+    observed: set[Path] = set()
+
+    for root in [ROOT / "src", ROOT / "scripts"]:
+        for path in _python_files(root):
+            relative = path.relative_to(ROOT)
+            imports = sorted(
+                module
+                for module in _import_modules(path)
+                if module.startswith(NETWORK_IMPORT_PREFIXES)
+            )
+            if not imports:
+                continue
+            observed.add(relative)
+            if relative not in allowed:
+                offenders[relative] = imports
 
     assert offenders == {}
     assert observed == allowed

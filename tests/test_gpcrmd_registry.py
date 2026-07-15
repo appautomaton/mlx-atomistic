@@ -8,7 +8,10 @@ import numpy as np
 import pytest
 
 from mlx_atomistic.prep.gpcrmd import (
+    GPCRMD_API_DOCS_URL,
     GPCRMD_DATA_DOWNLOAD_DOCS_URL,
+    GPCRMD_DYNAMICS_METADATA_URL_TEMPLATE,
+    GPCRMD_FILE_DOWNLOAD_REQUIRES_ACCOUNT,
     GPCRMD_IMPORT_REPORT_NAME,
     GPCRmdTargetError,
     attempt_gpcrmd_prepared_artifact_import,
@@ -287,6 +290,22 @@ def test_default_gpcrmd_target_passes_selection_gate():
     assert target.periodic_box_expected is True
     assert {"model", "topology", "parameters", "protocol", "trajectory"} <= target.file_roles()
     assert GPCRMD_DATA_DOWNLOAD_DOCS_URL in target.reference_urls
+    assert GPCRMD_API_DOCS_URL in target.reference_urls
+    assert GPCRMD_FILE_DOWNLOAD_REQUIRES_ACCOUNT is True
+    assert GPCRMD_DYNAMICS_METADATA_URL_TEMPLATE.format(dynamics_id=729).endswith(
+        "/api/search_dyn/info/729"
+    )
+    filename_hints = {
+        item.file_id: item.filename_hint
+        for item in target.files
+        if item.role != "trajectory"
+    }
+    assert filename_hints == {
+        15286: "15286_dyn_729.psf",
+        15290: "15290_prm_729.prm",
+        17686: "17686_dyn_729.pdb",
+        17687: "17687_oth_729",
+    }
     assert report["passes_selection_gate"] is True
     assert report["missing_requirements"] == []
 
