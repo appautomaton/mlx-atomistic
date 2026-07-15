@@ -232,10 +232,26 @@ def _classify(
         return "diagnostic", "timing values are missing or non-positive; ratio suppressed"
     if mlx_row.get("atom_count") != openmm_row.get("atom_count"):
         return "diagnostic", "atom counts differ; ratio suppressed"
-    if metric == "steps_per_s" and mlx_row.get("step_count") != openmm_row.get("step_count"):
+    if (
+        mlx_row.get("step_count") is not None
+        or openmm_row.get("step_count") is not None
+    ) and mlx_row.get("step_count") != openmm_row.get("step_count"):
         return "diagnostic", "step counts differ; ratio suppressed"
-    if metric == "ns_per_day" and mlx_row.get("step_count") != openmm_row.get("step_count"):
-        return "diagnostic", "step counts differ; ratio suppressed"
+    if (
+        mlx_row.get("evaluation_count") is not None
+        or openmm_row.get("evaluation_count") is not None
+    ) and mlx_row.get("evaluation_count") != openmm_row.get("evaluation_count"):
+        return "diagnostic", "evaluation counts differ; ratio suppressed"
+    for field, label in (
+        ("fixture_hash", "fixture hashes"),
+        ("parameter_manifest_hash", "parameter manifest hashes"),
+        ("precision", "precision modes"),
+        ("pme_parameters", "PME parameters"),
+    ):
+        mlx_value = mlx_row.get(field)
+        openmm_value = openmm_row.get(field)
+        if (mlx_value is not None or openmm_value is not None) and mlx_value != openmm_value:
+            return "diagnostic", f"{label} differ; ratio suppressed"
     parity_status = _classify_controlled_parity(pair_id, mlx_row, openmm_row)
     if parity_status is not None:
         return parity_status
@@ -321,6 +337,60 @@ def _positive_number(value: Any) -> bool:
         return float(value) > 0.0
     except (TypeError, ValueError):
         return False
+
+
+def build_strict_timing_comparison(
+    mlx_row: dict[str, Any],
+    reference_row: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare timing rows only when their full workload contracts match.
+
+    Args:
+        mlx_row: MLX timing row with workload-manifest fields.
+        reference_row: Reference timing row using the same schema.
+
+    Returns:
+        Comparable status and ratio, or a diagnostic blocker with no ratio.
+    """
+
+    required_fields = (
+        "operation",
+        "atom_count",
+        "fixture_hash",
+        "parameter_manifest_hash",
+        "pme_parameters",
+        "step_count",
+        "precision",
+        "timing_metric",
+    )
+    for field in required_fields:
+        mlx_value = mlx_row.get(field)
+        reference_value = reference_row.get(field)
+        if mlx_value is None or reference_value is None:
+            return {
+                "status": "diagnostic",
+                "ratio": None,
+                "blocker": f"missing {field}; ratio suppressed",
+            }
+        if mlx_value != reference_value:
+            return {
+                "status": "diagnostic",
+                "ratio": None,
+                "blocker": f"{field} differs; ratio suppressed",
+            }
+    mlx_timing = mlx_row.get("timing_value")
+    reference_timing = reference_row.get("timing_value")
+    if not _positive_number(mlx_timing) or not _positive_number(reference_timing):
+        return {
+            "status": "diagnostic",
+            "ratio": None,
+            "blocker": "timing values are missing or non-positive; ratio suppressed",
+        }
+    return {
+        "status": "comparable",
+        "ratio": float(reference_timing) / float(mlx_timing),
+        "blocker": None,
+    }
 
 
 def _command(row: dict[str, Any]) -> str | None:

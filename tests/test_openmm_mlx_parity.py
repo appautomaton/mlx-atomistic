@@ -20,6 +20,15 @@ _CLI_SPEC = importlib.util.spec_from_file_location("run_openmm_mlx_parity", _CLI
 assert _CLI_SPEC is not None and _CLI_SPEC.loader is not None
 _CLI = importlib.util.module_from_spec(_CLI_SPEC)
 _CLI_SPEC.loader.exec_module(_CLI)
+_CHARGED_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_charged_pme_parity.py"
+_CHARGED_SPEC = importlib.util.spec_from_file_location(
+    "run_charged_pme_parity",
+    _CHARGED_PATH,
+)
+assert _CHARGED_SPEC is not None and _CHARGED_SPEC.loader is not None
+_CHARGED = importlib.util.module_from_spec(_CHARGED_SPEC)
+sys.modules[_CHARGED_SPEC.name] = _CHARGED
+_CHARGED_SPEC.loader.exec_module(_CHARGED)
 
 DEFAULT_AMBER_FIXTURE = _HELPER.DEFAULT_AMBER_FIXTURE
 DEFAULT_CHARMM_FIXTURE = _HELPER.DEFAULT_CHARMM_FIXTURE
@@ -1196,6 +1205,117 @@ def test_pme_parity_helper_rejects_non_integer_assignment_order():
 
     with pytest.raises(ValueError, match="assignment_order must be one of 2, 4, or 5"):
         _HELPER._with_pme_artifact_settings(synthetic_prepared_system(), config)
+
+
+@pytest.mark.gpu
+def test_charged_pme_small_fixture_passes_background_and_openmm_gate():
+    payload = _CHARGED.evaluate_small_charged_fixture(platform_name="Reference")
+
+    assert payload["passed"]
+    assert payload["net_charge_e"] == pytest.approx(1.0)
+    assert payload["checks"]["analytic_background_absolute"] is True
+    assert payload["checks"]["analytic_background_relative"] is True
+    assert payload["checks"]["energy_per_atom"] is True
+    assert payload["checks"]["relative_energy"] is True
+    assert payload["checks"]["force_rms"] is True
+    assert payload["checks"]["force_maximum"] is True
+    assert payload["pme"]["assignment_order"] == 5
+    assert payload["pme"]["background_policy"] == "uniform_neutralizing_plasma"
+
+
+def test_charged_pme_openmm_clone_offsets_every_supported_force_class():
+    openmm = pytest.importorskip("openmm")
+    unit = pytest.importorskip("openmm.unit")
+    api = _CHARGED._load_openmm()
+    config = _CHARGED._jac_pme_config((1, 1, 1))
+    source_atom_count = 4
+
+    bond = openmm.HarmonicBondForce()
+    bond.addBond(0, 1, 0.1, 100.0)
+    cloned_bond = _CHARGED._clone_openmm_force(
+        api,
+        source_force=bond,
+        source_atom_count=source_atom_count,
+        replica_count=2,
+        config=config,
+    )
+    assert cloned_bond.getNumBonds() == 2
+    assert tuple(cloned_bond.getBondParameters(1)[:2]) == (4, 5)
+
+    angle = openmm.HarmonicAngleForce()
+    angle.addAngle(0, 1, 2, 1.2, 30.0)
+    cloned_angle = _CHARGED._clone_openmm_force(
+        api,
+        source_force=angle,
+        source_atom_count=source_atom_count,
+        replica_count=2,
+        config=config,
+    )
+    assert tuple(cloned_angle.getAngleParameters(1)[:3]) == (4, 5, 6)
+
+    torsion = openmm.PeriodicTorsionForce()
+    torsion.addTorsion(0, 1, 2, 3, 3, 0.2, 2.0)
+    cloned_torsion = _CHARGED._clone_openmm_force(
+        api,
+        source_force=torsion,
+        source_atom_count=source_atom_count,
+        replica_count=2,
+        config=config,
+    )
+    assert tuple(cloned_torsion.getTorsionParameters(1)[:4]) == (4, 5, 6, 7)
+
+    nonbonded = openmm.NonbondedForce()
+    nonbonded.setNonbondedMethod(openmm.NonbondedForce.PME)
+    nonbonded.setCutoffDistance(0.9 * unit.nanometer)
+    for charge in (0.5, -0.5, 0.25, -0.25):
+        nonbonded.addParticle(charge, 0.2, 0.1)
+    nonbonded.addException(0, 3, -0.125, 0.2, 0.05)
+    cloned_nonbonded = _CHARGED._clone_openmm_force(
+        api,
+        source_force=nonbonded,
+        source_atom_count=source_atom_count,
+        replica_count=2,
+        config=config,
+    )
+    assert cloned_nonbonded.getNumParticles() == 8
+    assert cloned_nonbonded.getNumExceptions() == 2
+    assert tuple(cloned_nonbonded.getExceptionParameters(1)[:2]) == (4, 7)
+    assert cloned_nonbonded.getUseDispersionCorrection() is False
+    alpha, nx, ny, nz = cloned_nonbonded.getPMEParameters()
+    assert alpha.value_in_unit(unit.nanometer**-1) == pytest.approx(3.5)
+    assert (nx, ny, nz) == (64, 64, 64)
+
+
+def test_charged_pme_openmm_clone_rejects_unknown_force_class():
+    openmm = pytest.importorskip("openmm")
+    api = _CHARGED._load_openmm()
+
+    with pytest.raises(_CHARGED.UnsupportedOpenMMForceError, match="CustomExternalForce"):
+        _CHARGED._clone_openmm_force(
+            api,
+            source_force=openmm.CustomExternalForce("0"),
+            source_atom_count=1,
+            replica_count=1,
+            config=_CHARGED._jac_pme_config((1, 1, 1)),
+        )
+
+
+def test_charged_pme_missing_inputs_write_blocked_report(tmp_path: Path):
+    out = tmp_path / "out"
+
+    payload = _CHARGED.run_charged_pme_parity(
+        mlx_prepared=tmp_path / "missing-prepared",
+        amber_prmtop=tmp_path / "missing.prmtop",
+        amber_coordinates=tmp_path / "missing.inpcrd",
+        replicas=(1, 1, 1),
+        platform_name="Reference",
+        out=out,
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["passed"] is False
+    assert len(payload["blockers"]) == 4
+    assert (out / _CHARGED.REPORT_NAME).exists()
 
 
 def test_charmm_openmm_reference_failure_writes_blocked_report(tmp_path: Path):
