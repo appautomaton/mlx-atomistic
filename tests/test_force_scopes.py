@@ -63,7 +63,7 @@ def test_pme_total_scope_avoids_component_helper(monkeypatch):
         cutoff=5.0,
         electrostatics="pme",
         pme_config=config,
-    )
+    ).bind_pme_plan(cell)
     calls = {"total": 0, "components": 0}
     original_total = forcefields.pme_coulomb_total_energy_forces
     original_components = forcefields.pme_coulomb_energy_forces
@@ -107,7 +107,7 @@ def test_pme_direct_and_reciprocal_scopes_sum_to_total():
         cutoff=5.0,
         electrostatics="pme",
         pme_config=config,
-    )
+    ).bind_pme_plan(cell)
 
     total_energy, total_forces = term.energy_forces_for_scope(positions, cell, scope="total")
     direct_energy, direct_forces = term.energy_forces_for_scope(
@@ -138,6 +138,7 @@ def test_pme_direct_and_reciprocal_scopes_sum_to_total():
 
     assert term.force_scope_report("direct")["direct_space"] is True
     assert term.force_scope_report("reciprocal")["reciprocal_space"] is True
+    assert term.pme_plan.reuse_count == 3
     assert pme_force_scope_report("reciprocal")["execution_path"] == "pme_reciprocal_space"
     np.testing.assert_allclose(
         np.asarray(direct_energy + reciprocal_energy),

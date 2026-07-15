@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import time
 from dataclasses import dataclass
 from math import ceil
 from typing import Literal, cast
@@ -26,6 +29,7 @@ PME_BACKGROUND_POLICIES = (
     "reject_non_neutral",
     "uniform_neutralizing_plasma",
 )
+PME_EXECUTION_PLAN_SCHEMA_VERSION = 1
 PMEBackgroundPolicy = Literal[
     "reject_non_neutral",
     "uniform_neutralizing_plasma",
@@ -101,6 +105,272 @@ class PMEConfig:
         )
 
 
+class PMEPlanMismatchError(ValueError):
+    """Raised when a PME execution plan does not match an evaluation request."""
+
+    def __init__(
+        self,
+        mismatches: tuple[str, ...],
+        *,
+        expected_fingerprint: str,
+        actual_fingerprint: str,
+    ) -> None:
+        self.mismatches = mismatches
+        self.expected_fingerprint = expected_fingerprint
+        self.actual_fingerprint = actual_fingerprint
+        fields = ",".join(mismatches)
+        super().__init__(
+            "pme_execution_plan_mismatch:"
+            f"fields={fields}:expected={expected_fingerprint}:actual={actual_fingerprint}"
+        )
+
+
+class PMEExecutionPlan:
+    """Reusable cell-invariant reciprocal state for fixed-cell PME evaluation.
+
+    Args:
+        cell: Periodic orthorhombic cell whose reciprocal state is planned.
+        config: PME parameters; ``None`` uses `PMEConfig` defaults.
+        coulomb_constant: Coulomb prefactor in the configured unit system.
+        dtype: Reciprocal-array dtype. The current backend supports ``float32``.
+        backend: PME execution backend identifier. The current backend is
+            `PME_EXECUTION_BACKEND`.
+
+    Raises:
+        ValueError: If the cell, Coulomb constant, dtype, or backend is unsupported.
+    """
+
+    def __init__(
+        self,
+        cell: Cell,
+        *,
+        config: PMEConfig | None = None,
+        coulomb_constant: float = 1.0,
+        dtype: object = mx.float32,
+        backend: str = PME_EXECUTION_BACKEND,
+    ) -> None:
+        config = _resolve_plan_config(config)
+        coulomb_constant = _validate_coulomb_constant(coulomb_constant)
+        dtype_name = _normalize_plan_dtype(dtype)
+        backend_name = _normalize_plan_backend(backend)
+        if dtype_name != "float32":
+            msg = "PME execution plans currently support dtype='float32' only"
+            raise ValueError(msg)
+        if backend_name != PME_EXECUTION_BACKEND:
+            msg = (
+                "PME execution plan backend is unsupported: "
+                f"backend={backend_name!r},supported={PME_EXECUTION_BACKEND!r}"
+            )
+            raise ValueError(msg)
+        cell_matrix, cell_lengths = _validated_plan_cell(cell)
+        real_cutoff = _resolve_real_cutoff(config, cell_lengths)
+        device = str(mx.default_device())
+        signature = _plan_signature(
+            cell_matrix=cell_matrix,
+            config=config,
+            real_cutoff=real_cutoff,
+            coulomb_constant=coulomb_constant,
+            dtype=dtype_name,
+            backend=backend_name,
+            device=device,
+        )
+
+        setup_started = time.perf_counter()
+        influence, wavevectors, reciprocal_modes = _influence_function_mx(
+            cell_lengths,
+            config.mesh_shape,
+            alpha=config.alpha,
+            coulomb_constant=coulomb_constant,
+            deconvolve_assignment=config.deconvolve_assignment,
+            assignment_order=config.assignment_order,
+        )
+        mx.eval(influence, *wavevectors)
+        setup_seconds = time.perf_counter() - setup_started
+
+        self.cell = cell
+        self.cell_matrix = tuple(tuple(float(value) for value in row) for row in cell_matrix)
+        self.cell_lengths = tuple(float(value) for value in cell_lengths)
+        self.config = config
+        self.real_cutoff = float(real_cutoff)
+        self.coulomb_constant = coulomb_constant
+        self.dtype = dtype_name
+        self.backend = backend_name
+        self.device = device
+        self.influence = influence
+        self.wavevectors = wavevectors
+        self.grid_size = int(np.prod(config.mesh_shape, dtype=np.int64))
+        self.reciprocal_modes = reciprocal_modes
+        self.fingerprint = _plan_fingerprint(signature)
+        self.build_count = 1
+        self.setup_seconds = float(setup_seconds)
+        self.estimated_resident_bytes = _estimated_plan_resident_bytes(
+            self.grid_size,
+            dtype=dtype_name,
+        )
+        self.reuse_count = 0
+        self.reuse_validation_seconds = 0.0
+        self.last_reuse_validation_seconds = 0.0
+        self._signature = signature
+
+    @classmethod
+    def build(
+        cls,
+        cell: Cell,
+        *,
+        config: PMEConfig | None = None,
+        coulomb_constant: float = 1.0,
+        dtype: object = mx.float32,
+        backend: str = PME_EXECUTION_BACKEND,
+    ) -> PMEExecutionPlan:
+        """Build a reusable PME execution plan.
+
+        Args:
+            cell: Periodic orthorhombic cell whose reciprocal state is planned.
+            config: PME parameters; ``None`` uses `PMEConfig` defaults.
+            coulomb_constant: Coulomb prefactor in the configured unit system.
+            dtype: Reciprocal-array dtype. The current backend supports ``float32``.
+            backend: PME execution backend identifier.
+
+        Returns:
+            A materialized reusable execution plan.
+        """
+
+        return cls(
+            cell,
+            config=config,
+            coulomb_constant=coulomb_constant,
+            dtype=dtype,
+            backend=backend,
+        )
+
+    def validate(
+        self,
+        cell: Cell,
+        *,
+        config: PMEConfig | None = None,
+        coulomb_constant: float | None = None,
+        dtype: object = mx.float32,
+        backend: str = PME_EXECUTION_BACKEND,
+    ) -> None:
+        """Validate that requested PME inputs exactly match this plan.
+
+        Args:
+            cell: Cell requested by the evaluation.
+            config: Requested PME configuration; ``None`` uses this plan's config.
+            coulomb_constant: Requested Coulomb prefactor; ``None`` uses this plan's value.
+            dtype: Requested reciprocal-array dtype.
+            backend: Requested PME execution backend.
+
+        Raises:
+            PMEPlanMismatchError: If any plan-defining input differs.
+            ValueError: If an input is invalid independently of the stored plan.
+        """
+
+        config = self.config if config is None else _resolve_plan_config(config)
+        coulomb_constant = (
+            self.coulomb_constant
+            if coulomb_constant is None
+            else _validate_coulomb_constant(coulomb_constant)
+        )
+        dtype_name = _normalize_plan_dtype(dtype)
+        backend_name = _normalize_plan_backend(backend)
+        cell_matrix, cell_lengths = _validated_plan_cell(cell)
+        actual_signature = _plan_signature(
+            cell_matrix=cell_matrix,
+            config=config,
+            real_cutoff=_resolve_real_cutoff(config, cell_lengths),
+            coulomb_constant=coulomb_constant,
+            dtype=dtype_name,
+            backend=backend_name,
+            device=str(mx.default_device()),
+        )
+        mismatches = tuple(
+            key
+            for key in self._signature
+            if self._signature[key] != actual_signature.get(key)
+        )
+        if mismatches:
+            raise PMEPlanMismatchError(
+                mismatches,
+                expected_fingerprint=self.fingerprint,
+                actual_fingerprint=_plan_fingerprint(actual_signature),
+            )
+
+    def rebuild(
+        self,
+        *,
+        cell: Cell | None = None,
+        config: PMEConfig | None = None,
+        coulomb_constant: float | None = None,
+        dtype: object | None = None,
+        backend: str | None = None,
+    ) -> PMEExecutionPlan:
+        """Build a distinct plan after an explicit defining-input change.
+
+        Args:
+            cell: Replacement cell; ``None`` retains the current cell.
+            config: Replacement configuration; ``None`` retains the current config.
+            coulomb_constant: Replacement Coulomb prefactor; ``None`` retains the current value.
+            dtype: Replacement reciprocal dtype; ``None`` retains the current dtype.
+            backend: Replacement execution backend; ``None`` retains the current backend.
+
+        Returns:
+            A new materialized execution plan with counters independent of this plan.
+        """
+
+        return PMEExecutionPlan(
+            self.cell if cell is None else cell,
+            config=self.config if config is None else config,
+            coulomb_constant=(
+                self.coulomb_constant if coulomb_constant is None else coulomb_constant
+            ),
+            dtype=self.dtype if dtype is None else dtype,
+            backend=self.backend if backend is None else backend,
+        )
+
+    @property
+    def diagnostics(self) -> dict[str, object]:
+        """Return JSON-serializable setup and reuse diagnostics for this plan."""
+
+        return {
+            "schema_version": PME_EXECUTION_PLAN_SCHEMA_VERSION,
+            "fingerprint": self.fingerprint,
+            "build_count": self.build_count,
+            "setup_seconds": self.setup_seconds,
+            "reuse_count": self.reuse_count,
+            "reuse_validation_seconds": self.reuse_validation_seconds,
+            "last_reuse_validation_seconds": self.last_reuse_validation_seconds,
+            "mesh_shape": self.config.mesh_shape,
+            "grid_size": self.grid_size,
+            "reciprocal_modes": self.reciprocal_modes,
+            "estimated_resident_bytes": self.estimated_resident_bytes,
+            "backend": self.backend,
+            "device": self.device,
+            "dtype": self.dtype,
+            "cell_lengths": self.cell_lengths,
+            "alpha": self.config.alpha,
+            "real_cutoff": self.real_cutoff,
+            "assignment_order": self.config.assignment_order,
+            "deconvolve_assignment": self.config.deconvolve_assignment,
+            "coulomb_constant": self.coulomb_constant,
+            "background_policy": self.config.background_policy,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the plan diagnostics as a plain JSON-serializable dict.
+
+        Returns:
+            Setup, fingerprint, resident-size, backend, and reuse metadata.
+        """
+
+        return self.diagnostics
+
+    def _record_reuse(self, validation_seconds: float) -> None:
+        self.reuse_count += 1
+        self.last_reuse_validation_seconds = float(validation_seconds)
+        self.reuse_validation_seconds += float(validation_seconds)
+
+
 @dataclass(frozen=True)
 class PMEDiagnostics:
     """Diagnostics emitted by one standalone PME evaluation."""
@@ -121,6 +391,14 @@ class PMEDiagnostics:
     direct_space_pair_count: int | None = None
     direct_space_candidate_count: int | None = None
     direct_space_fallback_reason: str | None = None
+    plan_fingerprint: str | None = None
+    plan_build_count: int = 0
+    plan_reuse_count: int = 0
+    plan_setup_seconds: float = 0.0
+    plan_estimated_resident_bytes: int = 0
+    plan_backend: str | None = None
+    plan_device: str | None = None
+    plan_dtype: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return the diagnostics as a plain JSON-serializable dict.
@@ -147,6 +425,14 @@ class PMEDiagnostics:
             "direct_space_pair_count": self.direct_space_pair_count,
             "direct_space_candidate_count": self.direct_space_candidate_count,
             "direct_space_fallback_reason": self.direct_space_fallback_reason,
+            "plan_fingerprint": self.plan_fingerprint,
+            "plan_build_count": self.plan_build_count,
+            "plan_reuse_count": self.plan_reuse_count,
+            "plan_setup_seconds": self.plan_setup_seconds,
+            "plan_estimated_resident_bytes": self.plan_estimated_resident_bytes,
+            "plan_backend": self.plan_backend,
+            "plan_device": self.plan_device,
+            "plan_dtype": self.plan_dtype,
         }
 
 
@@ -435,6 +721,7 @@ def pme_coulomb_energy_forces(
     coulomb_constant: float = 1.0,
     config: PMEConfig | None = None,
     direct_space_pairs: mx.array | NeighborBlocks | None = None,
+    plan: PMEExecutionPlan | None = None,
 ) -> tuple[mx.array, mx.array, dict[str, mx.array | PMEDiagnostics]]:
     """Evaluate neutral orthorhombic Coulomb energy and forces with PME.
 
@@ -447,6 +734,8 @@ def pme_coulomb_energy_forces(
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
         direct_space_pairs: Optional precomputed real-space pairs or neighbor blocks.
             Defaults to ``None``.
+        plan: Optional reusable fixed-cell execution plan. A one-shot plan is
+            built when omitted. Defaults to ``None``.
 
     Returns:
         An ``(energy, forces, components)`` tuple: scalar total Coulomb energy,
@@ -466,6 +755,7 @@ def pme_coulomb_energy_forces(
         config=config,
         include_components=True,
         direct_space_pairs=direct_space_pairs,
+        plan=plan,
     )
     if components is None:
         msg = "PME component evaluation did not produce components"
@@ -481,6 +771,7 @@ def pme_coulomb_total_energy_forces(
     coulomb_constant: float = 1.0,
     config: PMEConfig | None = None,
     direct_space_pairs: mx.array | NeighborBlocks | None = None,
+    plan: PMEExecutionPlan | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Evaluate neutral orthorhombic Coulomb total energy and forces with PME.
 
@@ -493,6 +784,8 @@ def pme_coulomb_total_energy_forces(
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
         direct_space_pairs: Optional precomputed real-space pairs or neighbor blocks.
             Defaults to ``None``.
+        plan: Optional reusable fixed-cell execution plan. A one-shot plan is
+            built when omitted. Defaults to ``None``.
 
     Returns:
         An ``(energy, forces)`` tuple: scalar total Coulomb energy and ``(n_atoms, 3)`` forces.
@@ -509,6 +802,7 @@ def pme_coulomb_total_energy_forces(
         config=config,
         include_components=False,
         direct_space_pairs=direct_space_pairs,
+        plan=plan,
     )
     return total_energy, forces
 
@@ -518,6 +812,7 @@ def pme_direct_space_policy_report(
     *,
     config: PMEConfig | None = None,
     pairs: mx.array | NeighborBlocks | None = None,
+    plan: PMEExecutionPlan | None = None,
 ) -> dict[str, object]:
     """Report whether PME direct-space can use dense, pair, block, or fallback policy.
 
@@ -526,6 +821,8 @@ def pme_direct_space_policy_report(
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
         pairs: Optional candidate real-space pairs or neighbor blocks to evaluate the
             policy against. Defaults to ``None``.
+        plan: Optional plan whose configuration and fixed cell must match. The
+            policy query does not advance its reuse counter. Defaults to ``None``.
 
     Returns:
         A `PMEDirectSpacePolicyReport` dict (selected policy/representation,
@@ -535,7 +832,9 @@ def pme_direct_space_policy_report(
         ValueError: If the cell is missing, non-orthorhombic, or has non-positive lengths.
     """
 
-    config = PMEConfig() if config is None else config
+    config = _resolve_evaluation_config(config, plan)
+    if plan is not None:
+        plan.validate(cell, config=config)
     if not isinstance(cell, Cell):
         msg = "PME requires an orthorhombic Cell"
         raise ValueError(msg)
@@ -564,6 +863,7 @@ def pme_coulomb_direct_space_energy_forces(
     coulomb_constant: float = 1.0,
     config: PMEConfig | None = None,
     pairs: mx.array | NeighborBlocks | None = None,
+    plan: PMEExecutionPlan | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Evaluate only the PME real/direct-space Coulomb energy and forces.
 
@@ -575,6 +875,8 @@ def pme_coulomb_direct_space_energy_forces(
         coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
         pairs: Optional real-space pairs or neighbor blocks. Defaults to ``None``.
+        plan: Optional reusable fixed-cell execution plan. A one-shot plan is
+            built when omitted. Defaults to ``None``.
 
     Returns:
         An ``(energy, forces)`` tuple: scalar real-space energy and ``(n_atoms, 3)`` forces.
@@ -583,13 +885,19 @@ def pme_coulomb_direct_space_energy_forces(
         ValueError: If shapes/cell or the configured charge policy are invalid.
     """
 
-    config = PMEConfig() if config is None else config
+    config = _resolve_evaluation_config(config, plan)
     positions_mx, charges_mx, cell_lengths_mx, cell_lengths_np = _validate_inputs_mx(
         positions,
         charges,
         cell,
         charge_tolerance=config.charge_tolerance,
         background_policy=config.background_policy,
+    )
+    _acquire_execution_plan(
+        cell,
+        config=config,
+        coulomb_constant=coulomb_constant,
+        plan=plan,
     )
     real_cutoff = _resolve_real_cutoff(config, cell_lengths_np)
     energy, forces, _ = _real_space_energy_forces_with_policy_mx(
@@ -613,6 +921,7 @@ def pme_coulomb_reciprocal_space_energy_forces(
     coulomb_constant: float = 1.0,
     config: PMEConfig | None = None,
     include_self_correction: bool = True,
+    plan: PMEExecutionPlan | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Evaluate PME mesh/reciprocal-space Coulomb forces.
 
@@ -628,6 +937,8 @@ def pme_coulomb_reciprocal_space_energy_forces(
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
         include_self_correction: Whether to add the scalar self-energy correction so
             direct + reciprocal equals the total. Defaults to ``True``.
+        plan: Optional reusable fixed-cell execution plan. A one-shot plan is
+            built when omitted. Defaults to ``None``.
 
     Returns:
         An ``(energy, forces)`` tuple: scalar reciprocal-space energy and ``(n_atoms, 3)`` forces.
@@ -636,13 +947,19 @@ def pme_coulomb_reciprocal_space_energy_forces(
         ValueError: If shapes/cell or the configured charge policy are invalid.
     """
 
-    config = PMEConfig() if config is None else config
+    config = _resolve_evaluation_config(config, plan)
     positions_mx, charges_mx, cell_lengths_mx, cell_lengths_np = _validate_inputs_mx(
         positions,
         charges,
         cell,
         charge_tolerance=config.charge_tolerance,
         background_policy=config.background_policy,
+    )
+    execution_plan = _acquire_execution_plan(
+        cell,
+        config=config,
+        coulomb_constant=coulomb_constant,
+        plan=plan,
     )
     energy, forces, _ = _mesh_reciprocal_energy_forces_mx(
         positions_mx,
@@ -651,6 +968,7 @@ def pme_coulomb_reciprocal_space_energy_forces(
         cell_lengths_np,
         config=config,
         coulomb_constant=coulomb_constant,
+        plan=execution_plan,
         return_mesh_info=False,
     )
     if include_self_correction:
@@ -676,14 +994,21 @@ def _pme_coulomb_energy_forces_impl(
     config: PMEConfig | None,
     include_components: bool,
     direct_space_pairs: mx.array | NeighborBlocks | None,
+    plan: PMEExecutionPlan | None,
 ) -> tuple[mx.array, mx.array, dict[str, mx.array | PMEDiagnostics] | None]:
-    config = PMEConfig() if config is None else config
+    config = _resolve_evaluation_config(config, plan)
     positions_mx, charges_mx, cell_lengths_mx, cell_lengths_np = _validate_inputs_mx(
         positions,
         charges,
         cell,
         charge_tolerance=config.charge_tolerance,
         background_policy=config.background_policy,
+    )
+    execution_plan = _acquire_execution_plan(
+        cell,
+        config=config,
+        coulomb_constant=coulomb_constant,
+        plan=plan,
     )
     real_cutoff = _resolve_real_cutoff(config, cell_lengths_np)
 
@@ -704,6 +1029,7 @@ def _pme_coulomb_energy_forces_impl(
         cell_lengths_np,
         config=config,
         coulomb_constant=coulomb_constant,
+        plan=execution_plan,
         return_mesh_info=include_components,
     )
     self_energy = (
@@ -753,6 +1079,14 @@ def _pme_coulomb_energy_forces_impl(
         direct_space_pair_count=direct_space_report.compact_pair_count,
         direct_space_candidate_count=direct_space_report.candidate_count,
         direct_space_fallback_reason=direct_space_report.fallback_reason,
+        plan_fingerprint=execution_plan.fingerprint,
+        plan_build_count=execution_plan.build_count,
+        plan_reuse_count=execution_plan.reuse_count,
+        plan_setup_seconds=execution_plan.setup_seconds,
+        plan_estimated_resident_bytes=execution_plan.estimated_resident_bytes,
+        plan_backend=execution_plan.backend,
+        plan_device=execution_plan.device,
+        plan_dtype=execution_plan.dtype,
     )
     components = {
         "coulomb_real": real_energy.astype(mx.float32),
@@ -834,6 +1168,165 @@ def assign_charges_bspline(
         mesh_shape,
         assignment_order=assignment_order,
     )
+
+
+def _resolve_plan_config(config: PMEConfig | None) -> PMEConfig:
+    if config is None:
+        return PMEConfig()
+    if not isinstance(config, PMEConfig):
+        msg = "PME config must be a PMEConfig instance"
+        raise TypeError(msg)
+    return config
+
+
+def _resolve_evaluation_config(
+    config: PMEConfig | None,
+    plan: PMEExecutionPlan | None,
+) -> PMEConfig:
+    if plan is not None and not isinstance(plan, PMEExecutionPlan):
+        msg = "PME plan must be a PMEExecutionPlan instance"
+        raise TypeError(msg)
+    if config is None and plan is not None:
+        return plan.config
+    return _resolve_plan_config(config)
+
+
+def _validate_coulomb_constant(value: float) -> float:
+    normalized = float(value)
+    if not np.isfinite(normalized):
+        msg = "coulomb_constant must be finite"
+        raise ValueError(msg)
+    return normalized
+
+
+def _normalize_plan_dtype(dtype: object) -> str:
+    normalized = str(dtype).strip().lower()
+    aliases = {
+        "<class 'numpy.float16'>": "float16",
+        "<class 'numpy.float32'>": "float32",
+        "<class 'numpy.float64'>": "float64",
+        "mlx.core.float16": "float16",
+        "mlx.core.float32": "float32",
+        "mlx.core.float64": "float64",
+        "numpy.float16": "float16",
+        "numpy.float32": "float32",
+        "numpy.float64": "float64",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"float16", "float32", "float64"}:
+        msg = f"unsupported PME plan dtype: {dtype!r}"
+        raise ValueError(msg)
+    return normalized
+
+
+def _normalize_plan_backend(backend: str) -> str:
+    normalized = str(backend).strip()
+    if not normalized:
+        msg = "PME execution plan backend must be non-empty"
+        raise ValueError(msg)
+    return normalized
+
+
+def _validated_plan_cell(cell: Cell) -> tuple[np.ndarray, np.ndarray]:
+    if not isinstance(cell, Cell):
+        msg = "PME requires an orthorhombic Cell"
+        raise ValueError(msg)
+    if not cell.is_orthorhombic:
+        msg = (
+            "PME currently supports orthorhombic cells only; "
+            "triclinic cell matrices are not supported"
+        )
+        raise ValueError(msg)
+    cell_matrix = np.asarray(cell.matrix, dtype=np.float64)
+    cell_lengths = np.asarray(cell.lengths, dtype=np.float64)
+    if cell_matrix.shape != (3, 3) or not np.all(np.isfinite(cell_matrix)):
+        msg = "PME requires a finite orthorhombic cell matrix with shape (3, 3)"
+        raise ValueError(msg)
+    if cell_lengths.shape != (3,) or not np.all(np.isfinite(cell_lengths)):
+        msg = "PME requires finite orthorhombic cell lengths with shape (3,)"
+        raise ValueError(msg)
+    if np.any(cell_lengths <= 0.0):
+        msg = "PME requires positive orthorhombic cell lengths"
+        raise ValueError(msg)
+    return cell_matrix, cell_lengths
+
+
+def _fingerprint_float(value: float) -> str:
+    return float(value).hex()
+
+
+def _plan_signature(
+    *,
+    cell_matrix: np.ndarray,
+    config: PMEConfig,
+    real_cutoff: float,
+    coulomb_constant: float,
+    dtype: str,
+    backend: str,
+    device: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": PME_EXECUTION_PLAN_SCHEMA_VERSION,
+        "cell_matrix": [
+            [_fingerprint_float(value) for value in row]
+            for row in np.asarray(cell_matrix, dtype=np.float64)
+        ],
+        "mesh_shape": list(config.mesh_shape),
+        "alpha": _fingerprint_float(config.alpha),
+        "configured_real_cutoff": (
+            None
+            if config.real_cutoff is None
+            else _fingerprint_float(config.real_cutoff)
+        ),
+        "real_cutoff": _fingerprint_float(real_cutoff),
+        "assignment_order": config.assignment_order,
+        "charge_tolerance": _fingerprint_float(config.charge_tolerance),
+        "deconvolve_assignment": config.deconvolve_assignment,
+        "coulomb_constant": _fingerprint_float(coulomb_constant),
+        "background_policy": config.background_policy,
+        "dtype": dtype,
+        "backend": backend,
+        "device": device,
+    }
+
+
+def _plan_fingerprint(signature: dict[str, object]) -> str:
+    payload = json.dumps(signature, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _estimated_plan_resident_bytes(grid_size: int, *, dtype: str) -> int:
+    dtype_bytes = {"float16": 2, "float32": 4, "float64": 8}[dtype]
+    reciprocal_arrays = 4  # influence plus kx, ky, and kz
+    return int(grid_size) * dtype_bytes * reciprocal_arrays
+
+
+def _acquire_execution_plan(
+    cell: Cell,
+    *,
+    config: PMEConfig,
+    coulomb_constant: float,
+    plan: PMEExecutionPlan | None,
+) -> PMEExecutionPlan:
+    execution_plan = (
+        PMEExecutionPlan(
+            cell,
+            config=config,
+            coulomb_constant=coulomb_constant,
+        )
+        if plan is None
+        else plan
+    )
+    validation_started = time.perf_counter()
+    execution_plan.validate(
+        cell,
+        config=config,
+        coulomb_constant=coulomb_constant,
+        dtype=mx.float32,
+        backend=PME_EXECUTION_BACKEND,
+    )
+    execution_plan._record_reuse(time.perf_counter() - validation_started)
+    return execution_plan
 
 
 def _validate_inputs_mx(
@@ -1247,6 +1740,7 @@ def _mesh_reciprocal_energy_forces_mx(
     *,
     config: PMEConfig,
     coulomb_constant: float,
+    plan: PMEExecutionPlan,
     return_mesh_info: bool = True,
 ) -> tuple[mx.array, mx.array, dict[str, float | int] | None]:
     charge_grid = _assign_charges_bspline_mx(
@@ -1257,20 +1751,13 @@ def _mesh_reciprocal_energy_forces_mx(
         assignment_order=config.assignment_order,
     )
     rho_hat = mx.fft.fftn(charge_grid)
-    influence, k_components, mode_count = _influence_function_mx(
-        cell_lengths_np,
-        config.mesh_shape,
-        alpha=config.alpha,
-        coulomb_constant=coulomb_constant,
-        deconvolve_assignment=config.deconvolve_assignment,
-        assignment_order=config.assignment_order,
-    )
-    phi_hat = influence * rho_hat
-    grid_size = int(np.prod(config.mesh_shape))
+    del cell_lengths_np, coulomb_constant
+    phi_hat = plan.influence * rho_hat
+    grid_size = plan.grid_size
     potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
     field_grids = [
         mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
-        for k_axis in k_components
+        for k_axis in plan.wavevectors
     ]
     field_grid = mx.stack(field_grids, axis=-1)
     potential_at_atoms = _interpolate_bspline_mx(
@@ -1298,7 +1785,7 @@ def _mesh_reciprocal_energy_forces_mx(
             "max_charge_grid_abs": float(np.asarray(mx.max(mx.abs(charge_grid))))
             if int(np.prod(config.mesh_shape)) > 0
             else 0.0,
-            "reciprocal_modes": mode_count,
+            "reciprocal_modes": plan.reciprocal_modes,
         },
     )
 
