@@ -157,6 +157,28 @@ def test_improper_dihedral_uses_periodic_form():
     assert_force_matches_finite_difference(term, positions, atol=5e-3)
 
 
+def test_improper_dihedral_zero_periodicity_uses_charmm_harmonic_form():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.2, 1.0, 0.0], [1.4, 1.1, 0.8]],
+        dtype=np.float32,
+    )
+    phase = -0.25
+    force_constant = 0.4
+    term = ImproperDihedralPotential(
+        [(0, 1, 2, 3)],
+        k=force_constant,
+        periodicity=0.0,
+        phase=phase,
+    )
+
+    phi = reference_periodic_dihedral_angle(positions)
+    delta = np.arctan2(np.sin(phi - phase), np.cos(phi - phase))
+    energy, _ = term.energy_forces(positions)
+
+    assert float(np.asarray(energy)) == pytest.approx(force_constant * delta**2, abs=1e-6)
+    assert_force_matches_finite_difference(term, positions, atol=5e-3)
+
+
 def test_coulomb_force_matches_finite_difference():
     positions = np.array([[0.0, 0.0, 0.0], [1.3, 0.2, 0.0], [0.5, 1.2, 0.0]], dtype=np.float32)
     term = CoulombPotential(charges=[1.0, -0.5, 0.25], cutoff=None)

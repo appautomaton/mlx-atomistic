@@ -2461,6 +2461,71 @@ def test_import_charmm_psf_native_fixture_maps_supported_terms(tmp_path: Path):
     assert reloaded.nbfix_type_pairs.tolist() == [["NH1", "O"]]
 
 
+def test_import_charmm_psf_ignores_title_and_charge_group_metadata(tmp_path: Path):
+    from mlx_atomistic.prep import import_charmm_psf
+
+    fixture_root = Path("tests/fixtures/charmm")
+    source = (fixture_root / "native-mini.psf").read_text()
+    source = source.replace(
+        "PSF EXT CMAP\n",
+        "PSF EXT CMAP\n\n       1 !NTITLE\n REMARKS source metadata\n",
+        1,
+    )
+    source = source.replace(
+        "       1 !NCRTERM: cross-terms",
+        "       1       0 !NGRP\n         0         0         0\n\n"
+        "       1 !NCRTERM: cross-terms",
+        1,
+    )
+    psf = tmp_path / "metadata.psf"
+    psf.write_text(source)
+
+    prepared = import_charmm_psf(
+        psf_path=psf,
+        params=[fixture_root / "native-mini.prm"],
+        coords_path=fixture_root / "native-mini.pdb",
+    )
+
+    assert prepared.atom_count == 8
+    assert prepared.charmm_cmap_terms.shape == (1, 8)
+
+
+def test_import_charmm_psf_maps_reversed_wildcard_harmonic_improper(tmp_path: Path):
+    from mlx_atomistic.prep import import_charmm_psf
+
+    fixture_root = Path("tests/fixtures/charmm")
+    psf = tmp_path / "harmonic-improper.psf"
+    psf.write_text(
+        (fixture_root / "native-mini.psf").read_text().replace(
+            "       0 !NIMPHI: impropers",
+            "       1 !NIMPHI: impropers\n       5       3       1       6",
+            1,
+        )
+    )
+    prm = tmp_path / "harmonic-improper.prm"
+    prm.write_text(
+        (fixture_root / "native-mini.prm").read_text().replace(
+            "CMAP\n",
+            "IMPROPER\nO X X C 12.0 0 15.0\n\nCMAP\n",
+            1,
+        )
+    )
+
+    prepared = import_charmm_psf(
+        psf_path=psf,
+        params=[prm],
+        coords_path=fixture_root / "native-mini.pdb",
+    )
+
+    assert prepared.impropers.tolist() == [[4, 2, 0, 5]]
+    np.testing.assert_allclose(prepared.improper_k, [12.0 * 4.184])
+    np.testing.assert_allclose(prepared.improper_periodicity, [0.0])
+    np.testing.assert_allclose(prepared.improper_phase, [np.deg2rad(15.0)])
+    assert "charmm_harmonic_improper" in prepared.metadata.compatibility_report[
+        "supported_terms"
+    ]
+
+
 def test_import_charmm_psf_blocks_unsupported_virtual_site_records(tmp_path: Path):
     from mlx_atomistic.prep import TopologyImportError, import_charmm_psf
 

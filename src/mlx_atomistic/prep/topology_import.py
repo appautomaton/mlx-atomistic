@@ -8,6 +8,7 @@ existing all-atom topology/parameter data into the strict artifact schema that
 from __future__ import annotations
 
 import importlib.util
+import math
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -114,7 +115,7 @@ class CharmmPsfTopology:
 
 @dataclass(frozen=True)
 class CharmmImproperParameter:
-    """CHARMM improper parameter mapped only when periodic form is explicit."""
+    """One harmonic CHARMM improper parameter."""
 
     kind: str
     k: float
@@ -238,7 +239,7 @@ def import_amber_prmtop(
     constraints, constraint_distance = _hydrogen_bond_constraints(
         bonds,
         symbols=symbols,
-        positions=positions,
+        bond_lengths=bond_length,
     )
     hydrogen_count = int(np.count_nonzero(np.char.upper(symbols.astype(str)) == "H"))
     if hydrogen_count == 0:
@@ -472,6 +473,8 @@ def import_charmm_psf(
     chain_ids = np.asarray([atom.segid or "A" for atom in topology.atoms], dtype=str)
     masses = np.asarray([atom.mass for atom in topology.atoms], dtype=np.float32)
     charges = np.asarray([atom.charge for atom in topology.atoms], dtype=np.float32)
+    source_net_charge = float(math.fsum(atom.charge for atom in topology.atoms))
+    stored_net_charge = float(np.sum(charges, dtype=np.float64))
     _check_charmm_unsupported_atom_records(topology.atoms)
     sigma, epsilon = _charmm_nonbonded_atom_parameters(atom_type_keys, parameters)
     symbols = np.asarray(
@@ -524,7 +527,7 @@ def import_charmm_psf(
     constraints, constraint_distance = _hydrogen_bond_constraints(
         bonds,
         symbols=symbols,
-        positions=positions,
+        bond_lengths=bond_length,
     )
 
     supported_terms = ["nonbonded_lj_coulomb"]
@@ -535,7 +538,7 @@ def import_charmm_psf(
     if dihedrals.shape[0]:
         supported_terms.append("periodic_dihedral")
     if impropers.shape[0]:
-        supported_terms.append("periodic_improper")
+        supported_terms.append("charmm_harmonic_improper")
     if exception_pairs.shape[0]:
         supported_terms.append("nonbonded_exception")
     if constraints.shape[0]:
@@ -555,8 +558,10 @@ def import_charmm_psf(
         constraints=constraints,
         nonbonded_exception_pairs=exception_pairs,
     )
+    term_counts.pop("impropers", None)
     term_counts.update(
         {
+            "charmm_harmonic_improper": int(impropers.shape[0]),
             "charmm_cmap_terms": int(charmm_cmap_terms.shape[0]),
             "charmm_cmap_grids": int(charmm_cmap_grids.shape[0]),
             "urey_bradley_terms": int(urey_terms.shape[0]),
@@ -584,7 +589,9 @@ def import_charmm_psf(
             "water_atom_count": int(np.count_nonzero(water_mask)),
             "ion_atom_count": int(np.count_nonzero(ion_mask)),
             "lipid_atom_count": int(np.count_nonzero(lipid_mask)),
-            "system_charge": float(np.sum(charges)),
+            "system_charge": source_net_charge,
+            "system_charge_source_precision": source_net_charge,
+            "system_charge_stored_float32": stored_net_charge,
         },
         units={
             "coordinates": "angstrom",
@@ -614,6 +621,14 @@ def import_charmm_psf(
             "term_details": term_details,
             "parameter_counts_match_topology": True,
             "term_counts": term_counts,
+            "source_topology_counts": {
+                "atoms": atom_count,
+                "bonds": int(topology.bonds.shape[0]),
+                "angles": int(topology.angles.shape[0]),
+                "proper_dihedrals": int(topology.dihedrals.shape[0]),
+                "impropers": int(topology.impropers.shape[0]),
+                "cmaps": int(topology.cmaps.shape[0]),
+            },
             "force_field_provenance": "native CHARMM PSF/parameter import",
         },
         warnings=[
@@ -735,11 +750,14 @@ def _read_charmm_psf(path: Path) -> CharmmPsfTopology:
 
     section_headers = _charmm_psf_section_headers(lines)
     supported = {"NATOM", "NBOND", "NTHETA", "NPHI", "NIMPHI", "NCRTERM"}
+    ignored_metadata = {"NTITLE", "NGRP"}
     tolerated_empty = {"NDON", "NACC", "NNB", "NGRP", "MOLNT", "NUMLP", "NUMLPH"}
     blockers = [
         _charmm_psf_marker_name(marker)
         for marker, count, _line_index in section_headers
-        if marker not in supported and not (marker in tolerated_empty and count == 0)
+        if marker not in supported
+        and marker not in ignored_metadata
+        and not (marker in tolerated_empty and count == 0)
     ]
     if blockers:
         msg = "unsupported_terms:" + ",".join(
@@ -1010,6 +1028,7 @@ def _charmm_parameter_section(keyword: str) -> str | None:
         "NBFIX": "NBFIX",
         "HBOND": "HBOND",
         "END": "END",
+        "RETURN": "END",
         "MASS": "MASS",
         "LONEPAIR": "LONEPAIR",
         "DRUDE": "DRUDE",
@@ -1059,12 +1078,6 @@ def _parse_charmm_angle_parameter(
     if k < 0.0:
         msg = "unsupported_terms:charmm_invalid_angle_parameters"
         raise TopologyImportError(msg)
-    if urey_k is not None and urey_k < 0.0:
-        msg = "unsupported_terms:charmm_invalid_urey_bradley_parameters"
-        raise TopologyImportError(msg)
-    if urey_distance is not None and urey_distance <= 0.0:
-        msg = "unsupported_terms:charmm_invalid_urey_bradley_parameters"
-        raise TopologyImportError(msg)
     return (
         (_charmm_type_key(fields[0]), _charmm_type_key(fields[1]), _charmm_type_key(fields[2])),
         (k, float(theta), urey_k, urey_distance),
@@ -1101,14 +1114,12 @@ def _parse_charmm_improper_parameter(
         raise TopologyImportError(msg)
     try:
         k = float(fields[4]) * KCAL_TO_KJ
-        if len(fields) >= 7:
-            periodicity = float(fields[5])
-            phase = np.deg2rad(float(fields[6]))
-            kind = "periodic"
-        else:
-            periodicity = 0.0
-            phase = np.deg2rad(float(fields[5]))
-            kind = "harmonic"
+        # CHARMM impropers use a harmonic form.  Seven-column parameter
+        # records retain a historical zero field before the equilibrium
+        # angle; it is not a periodicity declaration.
+        periodicity = 0.0
+        phase = np.deg2rad(float(fields[-1]))
+        kind = "harmonic"
     except ValueError as exc:
         msg = "unsupported_terms:charmm_malformed_improper_parameters"
         raise TopologyImportError(msg) from exc
@@ -1141,9 +1152,6 @@ def _parse_charmm_nonbonded_parameter(
         sigma,
         epsilon,
     )
-    if sigma <= 0.0:
-        msg = "unsupported_terms:charmm_malformed_nonbonded_parameters"
-        raise TopologyImportError(msg)
     return _charmm_type_key(fields[0]), (sigma, epsilon)
 
 
@@ -1244,6 +1252,9 @@ def _charmm_nonbonded_atom_parameters(
         if values is None:
             msg = f"unsupported_terms:charmm_missing_nonbonded_parameter:{atom_type}"
             raise TopologyImportError(msg)
+        if values[0] <= 0.0:
+            msg = "unsupported_terms:charmm_malformed_nonbonded_parameters"
+            raise TopologyImportError(msg)
         sigma.append(values[0])
         epsilon.append(values[1])
     return np.asarray(sigma, dtype=np.float32), np.asarray(epsilon, dtype=np.float32)
@@ -1256,13 +1267,19 @@ def _charmm_bond_arrays(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     k_values: list[float] = []
     lengths: list[float] = []
+    lookup_cache: dict[tuple[str, str], tuple[float, float]] = {}
     for i, j in np.asarray(bonds, dtype=np.int32):
-        k, distance = _charmm_lookup_parameter(
-            parameters.bonds,
-            (atom_type_keys[int(i)], atom_type_keys[int(j)]),
-            blocker="unsupported_terms:charmm_missing_bond_parameter",
-            reversible=True,
-        )
+        query = (atom_type_keys[int(i)], atom_type_keys[int(j)])
+        values = lookup_cache.get(query)
+        if values is None:
+            values = _charmm_lookup_parameter(
+                parameters.bonds,
+                query,
+                blocker="unsupported_terms:charmm_missing_bond_parameter",
+                reversible=True,
+            )
+            lookup_cache[query] = values
+        k, distance = values
         k_values.append(k)
         lengths.append(distance)
     return (
@@ -1282,16 +1299,28 @@ def _charmm_angle_arrays(
     urey_terms: list[tuple[int, int, int]] = []
     urey_k_values: list[float] = []
     urey_distances: list[float] = []
+    lookup_cache: dict[
+        tuple[str, str, str],
+        tuple[float, float, float | None, float | None],
+    ] = {}
     for i, j, k in np.asarray(angles, dtype=np.int32):
-        angle_k, theta, urey_k, urey_distance = _charmm_lookup_parameter(
-            parameters.angles,
-            (atom_type_keys[int(i)], atom_type_keys[int(j)], atom_type_keys[int(k)]),
-            blocker="unsupported_terms:charmm_missing_angle_parameter",
-            reversible=True,
-        )
+        query = (atom_type_keys[int(i)], atom_type_keys[int(j)], atom_type_keys[int(k)])
+        values = lookup_cache.get(query)
+        if values is None:
+            values = _charmm_lookup_parameter(
+                parameters.angles,
+                query,
+                blocker="unsupported_terms:charmm_missing_angle_parameter",
+                reversible=True,
+            )
+            lookup_cache[query] = values
+        angle_k, theta, urey_k, urey_distance = values
         k_values.append(angle_k)
         theta_values.append(theta)
         if urey_k is not None and urey_distance is not None:
+            if urey_k < 0.0 or urey_distance <= 0.0:
+                msg = "unsupported_terms:charmm_invalid_urey_bradley_parameters"
+                raise TopologyImportError(msg)
             urey_terms.append((int(i), int(j), int(k)))
             urey_k_values.append(urey_k)
             urey_distances.append(urey_distance)
@@ -1314,18 +1343,26 @@ def _charmm_dihedral_arrays(
     k_values: list[float] = []
     periodicities: list[float] = []
     phases: list[float] = []
+    lookup_cache: dict[
+        tuple[str, str, str, str],
+        tuple[tuple[float, float, float], ...],
+    ] = {}
     for i, j, k, m in np.asarray(dihedrals, dtype=np.int32):
-        records = _charmm_lookup_parameter(
-            parameters.dihedrals,
-            (
-                atom_type_keys[int(i)],
-                atom_type_keys[int(j)],
-                atom_type_keys[int(k)],
-                atom_type_keys[int(m)],
-            ),
-            blocker="unsupported_terms:charmm_missing_dihedral_parameter",
-            reversible=True,
+        query = (
+            atom_type_keys[int(i)],
+            atom_type_keys[int(j)],
+            atom_type_keys[int(k)],
+            atom_type_keys[int(m)],
         )
+        records = lookup_cache.get(query)
+        if records is None:
+            records = _charmm_lookup_parameter(
+                parameters.dihedrals,
+                query,
+                blocker="unsupported_terms:charmm_missing_dihedral_parameter",
+                reversible=True,
+            )
+            lookup_cache[query] = records
         for force_constant, periodicity, phase in records:
             rows.append((int(i), int(j), int(k), int(m)))
             k_values.append(force_constant)
@@ -1348,21 +1385,23 @@ def _charmm_improper_arrays(
     k_values: list[float] = []
     periodicities: list[float] = []
     phases: list[float] = []
+    lookup_cache: dict[tuple[str, str, str, str], CharmmImproperParameter] = {}
     for i, j, k, m in np.asarray(impropers, dtype=np.int32):
-        parameter = _charmm_lookup_parameter(
-            parameters.impropers,
-            (
-                atom_type_keys[int(i)],
-                atom_type_keys[int(j)],
-                atom_type_keys[int(k)],
-                atom_type_keys[int(m)],
-            ),
-            blocker="unsupported_terms:charmm_missing_improper_parameter",
-            reversible=False,
+        query = (
+            atom_type_keys[int(i)],
+            atom_type_keys[int(j)],
+            atom_type_keys[int(k)],
+            atom_type_keys[int(m)],
         )
-        if parameter.kind != "periodic":
-            msg = "unsupported_terms:charmm_improper_harmonic"
-            raise TopologyImportError(msg)
+        parameter = lookup_cache.get(query)
+        if parameter is None:
+            parameter = _charmm_lookup_parameter(
+                parameters.impropers,
+                query,
+                blocker="unsupported_terms:charmm_missing_improper_parameter",
+                reversible=True,
+            )
+            lookup_cache[query] = parameter
         rows.append((int(i), int(j), int(k), int(m)))
         k_values.append(parameter.k)
         periodicities.append(parameter.periodicity)
@@ -1459,6 +1498,8 @@ def _charmm_nbfix_type_overrides(
             "override_count": len(pairs),
             "atom_type_pair_override_count": len(pairs),
             "source": "charmm_parameter_nbfix",
+            "source_parameter_override_count": int(len(parameters.nbfix)),
+            "applicable_override_count": len(pairs),
             "converted_units": {
                 "sigma": "angstrom",
                 "epsilon": "kilojoule_per_mole",
@@ -1764,7 +1805,7 @@ def _prepared_from_parmed_structure(
     constraints, constraint_distance = _hydrogen_bond_constraints(
         bonds,
         symbols=symbols,
-        positions=positions,
+        bond_lengths=bond_length,
     )
     supported_terms = [
         "harmonic_bond",
@@ -3355,28 +3396,32 @@ def _hydrogen_bond_constraints(
     bonds: np.ndarray,
     *,
     symbols: np.ndarray,
-    positions: np.ndarray,
+    bond_lengths: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     if bonds.size == 0:
         return empty_indices(2), np.asarray([], dtype=np.float32)
+    bond_array = np.asarray(bonds, dtype=np.int32).reshape((-1, 2))
+    length_array = np.asarray(bond_lengths, dtype=np.float32)
+    if length_array.shape != (bond_array.shape[0],):
+        msg = "unsupported_terms:constraint_equilibrium_geometry"
+        raise TopologyImportError(msg)
     upper_symbols = np.char.upper(np.asarray(symbols, dtype=str))
-    rows = [
-        (int(i), int(j))
-        for i, j in np.asarray(bonds, dtype=np.int32)
-        if upper_symbols[int(i)] == "H" or upper_symbols[int(j)] == "H"
-    ]
-    if not rows:
+    distances_by_pair: dict[tuple[int, int], float] = {}
+    for (i, j), distance in zip(bond_array.tolist(), length_array.tolist(), strict=True):
+        if upper_symbols[int(i)] != "H" and upper_symbols[int(j)] != "H":
+            continue
+        pair = (min(int(i), int(j)), max(int(i), int(j)))
+        previous = distances_by_pair.get(pair)
+        if previous is not None and not np.isclose(previous, distance, rtol=0.0, atol=1e-7):
+            msg = "unsupported_terms:constraint_equilibrium_geometry"
+            raise TopologyImportError(msg)
+        distances_by_pair[pair] = float(distance)
+    if not distances_by_pair:
         return empty_indices(2), np.asarray([], dtype=np.float32)
-    constraints = np.asarray(sorted(set(rows)), dtype=np.int32).reshape((-1, 2))
-    distances = _distances(np.asarray(positions, dtype=np.float32), constraints)
+    pairs = sorted(distances_by_pair)
+    constraints = np.asarray(pairs, dtype=np.int32).reshape((-1, 2))
+    distances = np.asarray([distances_by_pair[pair] for pair in pairs], dtype=np.float32)
     return constraints, distances
-
-
-def _distances(positions: np.ndarray, pairs: np.ndarray) -> np.ndarray:
-    if pairs.size == 0:
-        return np.asarray([], dtype=np.float32)
-    delta = positions[pairs[:, 0]] - positions[pairs[:, 1]]
-    return np.linalg.norm(delta, axis=1).astype(np.float32)
 
 
 def _term_counts(

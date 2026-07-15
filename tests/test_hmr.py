@@ -98,6 +98,62 @@ def test_hmr_repartitions_selected_hydrogen_mass_deterministically():
     ]
 
 
+def test_hmr_promotes_large_float32_mass_arrays_to_preserve_total_mass():
+    base = _hmr_fixture()
+    pair_count = 10
+    atom_count = pair_count * 2
+    bonds = np.asarray(
+        [[2 * pair, 2 * pair + 1] for pair in range(pair_count)],
+        dtype=np.int32,
+    )
+    positions = np.asarray(
+        [[float(index), 0.0, 0.0] for index in range(atom_count)],
+        dtype=np.float32,
+    )
+    prepared = replace(
+        base,
+        metadata=replace(
+            base.metadata,
+            compatibility_report={
+                **base.metadata.compatibility_report,
+                "hydrogen_count": pair_count,
+            },
+        ),
+        symbols=np.asarray(["C", "H"] * pair_count, dtype=str),
+        atom_names=np.asarray([f"A{index}" for index in range(atom_count)], dtype=str),
+        atom_types=np.asarray(["C", "H"] * pair_count, dtype=str),
+        residue_names=np.asarray(["LIG"] * atom_count, dtype=str),
+        residue_ids=np.arange(atom_count, dtype=np.int32),
+        chain_ids=np.asarray(["A"] * atom_count, dtype=str),
+        positions=positions,
+        velocities=np.zeros((atom_count, 3), dtype=np.float32),
+        masses=np.tile(np.asarray([12.011, 1.008], dtype=np.float32), pair_count),
+        charges=np.zeros(atom_count, dtype=np.float32),
+        sigma=np.ones(atom_count, dtype=np.float32),
+        epsilon=np.zeros(atom_count, dtype=np.float32),
+        bonds=bonds,
+        bond_k=np.full(pair_count, 300.0, dtype=np.float32),
+        bond_length=np.full(pair_count, 1.09, dtype=np.float32),
+        constraints=bonds,
+        constraint_distance=np.full(pair_count, 1.09, dtype=np.float32),
+        ligand_mask=np.ones(atom_count, dtype=bool),
+        receptor_mask=np.zeros(atom_count, dtype=bool),
+        restraint_mask=np.zeros(atom_count, dtype=bool),
+        reference_positions=positions.copy(),
+    )
+
+    hmr = apply_hydrogen_mass_repartitioning(prepared, target_hydrogen_mass=4.032)
+    provenance = hmr.metadata.protocol_metadata["hydrogen_mass_repartitioning"]
+
+    assert hmr.masses.dtype == np.float64
+    assert provenance["input_mass_dtype"] == "float32"
+    assert provenance["stored_mass_dtype"] == "float64"
+    assert float(np.sum(hmr.masses, dtype=np.float64)) == pytest.approx(
+        float(np.sum(prepared.masses, dtype=np.float64)),
+        abs=1e-10,
+    )
+
+
 def test_hmr_explicit_subset_records_explicit_selection_policy():
     prepared = _hmr_fixture()
 

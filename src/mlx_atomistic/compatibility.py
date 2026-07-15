@@ -186,11 +186,23 @@ def _normalized_term_counts(value: Any) -> dict[str, int]:
 def _array_term_counts(arrays: dict[str, np.ndarray] | None) -> dict[str, int]:
     if arrays is None:
         return {}
+    improper_periodicity = np.asarray(
+        arrays.get("improper_periodicity", np.asarray([])),
+        dtype=np.float32,
+    )
+    improper_count = _row_count(arrays, "impropers")
+    harmonic_improper_count = (
+        int(np.count_nonzero(improper_periodicity == 0.0))
+        if improper_periodicity.shape == (improper_count,)
+        else 0
+    )
+    periodic_improper_count = improper_count - harmonic_improper_count
     counts = {
         "harmonic_bond": _row_count(arrays, "bonds"),
         "harmonic_angle": _row_count(arrays, "angles"),
         "periodic_dihedral": _row_count(arrays, "dihedrals"),
-        "periodic_improper": _row_count(arrays, "impropers"),
+        "periodic_improper": periodic_improper_count,
+        "charmm_harmonic_improper": harmonic_improper_count,
         "rb_dihedral": _row_count(arrays, "rb_dihedrals"),
         "distance_constraint": _row_count(arrays, "constraints"),
         "nonbonded_exception": _row_count(arrays, "nonbonded_exception_pairs"),
