@@ -43,6 +43,7 @@ PME_REQUIRED_ARRAYS = (
     "pme_assignment_order",
     "pme_charge_tolerance",
     "pme_deconvolve_assignment",
+    "pme_background_policy",
 )
 
 
@@ -704,6 +705,7 @@ def _with_pme_metadata(prepared: Any) -> Any:
         pme_assignment_order=np.asarray([pme_config.assignment_order], dtype=np.int32),
         pme_charge_tolerance=np.asarray([pme_config.charge_tolerance], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([pme_config.deconvolve_assignment], dtype=bool),
+        pme_background_policy=np.asarray([pme_config.background_policy], dtype=str),
     )
 
 
@@ -726,6 +728,7 @@ def _pme_config_payload(config: PMEConfig) -> dict[str, Any]:
         "assignment_order": int(config.assignment_order),
         "charge_tolerance": float(config.charge_tolerance),
         "deconvolve_assignment": bool(config.deconvolve_assignment),
+        "background_policy": config.background_policy,
     }
 
 
@@ -737,6 +740,7 @@ def _pme_config_from_arrays(arrays: dict[str, np.ndarray]) -> PMEConfig:
         assignment_order=int(np.asarray(arrays["pme_assignment_order"])[0]),
         charge_tolerance=float(np.asarray(arrays["pme_charge_tolerance"])[0]),
         deconvolve_assignment=bool(np.asarray(arrays["pme_deconvolve_assignment"])[0]),
+        background_policy=str(np.asarray(arrays["pme_background_policy"])[0]),
     )
 
 

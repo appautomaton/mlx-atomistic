@@ -30,7 +30,10 @@ from mlx_atomistic.forcefields import (
 )
 from mlx_atomistic.mm import MMSystem
 from mlx_atomistic.nonbonded import normalize_nonbonded_electrostatics
-from mlx_atomistic.pme import PME_SUPPORTED_ASSIGNMENT_ORDERS
+from mlx_atomistic.pme import (
+    PME_SUPPORTED_ASSIGNMENT_ORDERS,
+    normalize_pme_background_policy,
+)
 from mlx_atomistic.replica_exchange import _validate_replica_exchange_metadata_payload
 from mlx_atomistic.runtime import ReadinessReport
 from mlx_atomistic.topology import DEFAULT_EAGER_NONBONDED_PAIR_LIMIT, Topology
@@ -188,6 +191,7 @@ PME_CONFIG_ARRAYS = (
     "pme_assignment_order",
     "pme_charge_tolerance",
     "pme_deconvolve_assignment",
+    "pme_background_policy",
 )
 
 
@@ -516,7 +520,8 @@ def _validate_pme_config_values(
     real_cutoff: float | None,
     assignment_order: object,
     charge_tolerance: float,
-) -> tuple[tuple[int, int, int], int]:
+    background_policy: object,
+) -> tuple[tuple[int, int, int], int, str]:
     try:
         mesh_values = np.asarray(mesh_shape, dtype=np.float64)
     except (TypeError, ValueError) as err:
@@ -551,7 +556,15 @@ def _validate_pme_config_values(
     if not np.isfinite(charge_tolerance) or charge_tolerance < 0.0:
         msg = "pme artifacts require finite non-negative pme_charge_tolerance"
         raise MLXCompatibilityError(msg)
-    return tuple(int(item) for item in mesh_values.tolist()), int(assignment_order_value)
+    try:
+        normalized_policy = normalize_pme_background_policy(background_policy)
+    except ValueError as err:
+        raise MLXCompatibilityError(str(err)) from err
+    return (
+        tuple(int(item) for item in mesh_values.tolist()),
+        int(assignment_order_value),
+        normalized_policy,
+    )
 
 
 def _pme_config_from_artifact(
@@ -561,6 +574,9 @@ def _pme_config_from_artifact(
     required: bool = False,
 ) -> PMEConfig | None:
     has_array_config = _pme_arrays_present(arrays)
+    payload = _metadata_pme_config_payload(metadata)
+    artifact_version = int(metadata.get("artifact_version", 1))
+    payload_policy = payload.get("background_policy")
     if arrays is not None and has_array_config:
         mesh_shape = np.asarray(arrays.get("pme_mesh_shape", np.asarray([])))
         if mesh_shape.shape != (3,):
@@ -571,12 +587,31 @@ def _pme_config_from_artifact(
             real_cutoff = float(_pme_scalar_from_arrays(arrays, "pme_real_cutoff"))
             assignment_order = float(_pme_scalar_from_arrays(arrays, "pme_assignment_order"))
             charge_tolerance = float(_pme_scalar_from_arrays(arrays, "pme_charge_tolerance"))
-            mesh_shape_tuple, assignment_order = _validate_pme_config_values(
+            if _array_present(arrays, "pme_background_policy"):
+                array_policy = _pme_scalar_from_arrays(
+                    arrays,
+                    "pme_background_policy",
+                    dtype=str,
+                )
+            elif artifact_version >= 3:
+                msg = "artifact version 3 PME arrays require pme_background_policy"
+                raise MLXCompatibilityError(msg)
+            else:
+                array_policy = payload_policy or "reject_non_neutral"
+            if payload_policy is not None and normalize_pme_background_policy(
+                payload_policy
+            ) != normalize_pme_background_policy(array_policy):
+                msg = "pme background policy metadata and array values must match"
+                raise MLXCompatibilityError(msg)
+            mesh_shape_tuple, assignment_order, background_policy = (
+                _validate_pme_config_values(
                 mesh_shape=mesh_shape,
                 alpha=alpha,
                 real_cutoff=real_cutoff,
                 assignment_order=assignment_order,
                 charge_tolerance=charge_tolerance,
+                background_policy=array_policy,
+                )
             )
             return PMEConfig(
                 mesh_shape=mesh_shape_tuple,
@@ -591,11 +626,11 @@ def _pme_config_from_artifact(
                         dtype=bool,
                     )
                 ),
+                background_policy=background_policy,
             )
         except ValueError as err:
             raise MLXCompatibilityError(str(err)) from err
 
-    payload = _metadata_pme_config_payload(metadata)
     if payload:
         try:
             alpha = float(payload.get("alpha", 0.35))
@@ -606,12 +641,18 @@ def _pme_config_from_artifact(
             )
             assignment_order = float(payload.get("assignment_order", 2))
             charge_tolerance = float(payload.get("charge_tolerance", 1e-5))
-            mesh_shape_tuple, assignment_order = _validate_pme_config_values(
+            mesh_shape_tuple, assignment_order, background_policy = (
+                _validate_pme_config_values(
                 mesh_shape=payload.get("mesh_shape", (32, 32, 32)),
                 alpha=alpha,
                 real_cutoff=real_cutoff,
                 assignment_order=assignment_order,
                 charge_tolerance=charge_tolerance,
+                background_policy=payload.get(
+                    "background_policy",
+                    "reject_non_neutral",
+                ),
+                )
             )
             return PMEConfig(
                 mesh_shape=mesh_shape_tuple,
@@ -620,6 +661,7 @@ def _pme_config_from_artifact(
                 assignment_order=assignment_order,
                 charge_tolerance=charge_tolerance,
                 deconvolve_assignment=bool(payload.get("deconvolve_assignment", True)),
+                background_policy=background_policy,
             )
         except (TypeError, ValueError) as err:
             raise MLXCompatibilityError(f"invalid pme_config: {err}") from err
@@ -1117,8 +1159,16 @@ def _validate_electrostatics_arrays(
         charge_tolerance = float(pme_config.charge_tolerance)
     net_charge = float(np.sum(charges, dtype=np.float64))
     if abs(net_charge) > charge_tolerance:
-        msg = f"{mode} artifacts must be neutral; net_charge={net_charge:g}"
-        raise MLXCompatibilityError(msg)
+        if mode != "pme" or pme_config is None:
+            msg = f"{mode} artifacts must be neutral; net_charge={net_charge:g}"
+            raise MLXCompatibilityError(msg)
+        if pme_config.background_policy != "uniform_neutralizing_plasma":
+            msg = (
+                "pme artifacts with non-zero net charge require "
+                "background_policy='uniform_neutralizing_plasma'; "
+                f"net_charge={net_charge:g}"
+            )
+            raise MLXCompatibilityError(msg)
 
 
 def _cell_from_artifact_arrays(arrays: dict[str, np.ndarray], *, mode: str) -> Cell:

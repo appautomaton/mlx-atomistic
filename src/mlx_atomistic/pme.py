@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import ceil
+from typing import Literal, cast
 
 import mlx.core as mx
 import numpy as np
@@ -21,6 +22,35 @@ PME_EXECUTION_BACKEND = "mlx_fft_cic"
 PME_PRODUCTION_EXECUTABLE = True
 PME_PRODUCTION_MAX_ATOMS = 4096
 PME_SUPPORTED_ASSIGNMENT_ORDERS = (2, 4, 5)
+PME_BACKGROUND_POLICIES = (
+    "reject_non_neutral",
+    "uniform_neutralizing_plasma",
+)
+PMEBackgroundPolicy = Literal[
+    "reject_non_neutral",
+    "uniform_neutralizing_plasma",
+]
+
+
+def normalize_pme_background_policy(value: object) -> PMEBackgroundPolicy:
+    """Return a supported PME background-charge policy.
+
+    Args:
+        value: Policy name to normalize.
+
+    Returns:
+        A supported normalized policy string.
+
+    Raises:
+        ValueError: If ``value`` is not a supported policy.
+    """
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized not in PME_BACKGROUND_POLICIES:
+        choices = ", ".join(PME_BACKGROUND_POLICIES)
+        msg = f"PME background_policy must be one of: {choices}"
+        raise ValueError(msg)
+    return cast(PMEBackgroundPolicy, normalized)
 
 
 @dataclass(frozen=True)
@@ -33,6 +63,7 @@ class PMEConfig:
     assignment_order: int = 2
     charge_tolerance: float = 1e-5
     deconvolve_assignment: bool = True
+    background_policy: PMEBackgroundPolicy = "reject_non_neutral"
 
     def __post_init__(self) -> None:
         if len(self.mesh_shape) != 3:
@@ -60,6 +91,11 @@ class PMEConfig:
         object.__setattr__(self, "charge_tolerance", charge_tolerance)
         object.__setattr__(
             self,
+            "background_policy",
+            normalize_pme_background_policy(self.background_policy),
+        )
+        object.__setattr__(
+            self,
             "assignment_order",
             _validate_assignment_order(self.assignment_order),
         )
@@ -78,6 +114,8 @@ class PMEDiagnostics:
     charge_grid_sum: float
     reciprocal_modes: int
     max_charge_grid_abs: float
+    background_policy: PMEBackgroundPolicy = "reject_non_neutral"
+    background_energy: float = 0.0
     direct_space_policy: str = "dense"
     direct_space_representation: str = "dense"
     direct_space_pair_count: int | None = None
@@ -102,6 +140,8 @@ class PMEDiagnostics:
             "charge_grid_sum": self.charge_grid_sum,
             "reciprocal_modes": self.reciprocal_modes,
             "max_charge_grid_abs": self.max_charge_grid_abs,
+            "background_policy": self.background_policy,
+            "background_energy": self.background_energy,
             "direct_space_policy": self.direct_space_policy,
             "direct_space_representation": self.direct_space_representation,
             "direct_space_pair_count": self.direct_space_pair_count,
@@ -247,6 +287,7 @@ def pme_readiness_report(
             f"atom_count={int(atom_count)},max_atoms={PME_PRODUCTION_MAX_ATOMS}"
         )
 
+    background_policy: PMEBackgroundPolicy = "reject_non_neutral"
     if config is None:
         checks["config"] = False
         blockers.append("pme_config:missing")
@@ -254,6 +295,7 @@ def pme_readiness_report(
     else:
         checks["config"] = True
         charge_tolerance = float(config.charge_tolerance)
+        background_policy = config.background_policy
         checks["mesh_shape"] = (
             len(config.mesh_shape) == 3
             and all(isinstance(size, int) and size >= 4 for size in config.mesh_shape)
@@ -278,8 +320,19 @@ def pme_readiness_report(
         and np.all(np.isfinite(charge_values))
         and abs(net_charge) <= charge_tolerance
     )
-    if not checks["neutrality"]:
-        blockers.append(f"neutrality:net_charge={net_charge:g}")
+    checks["charge_policy"] = bool(
+        charge_values.shape == (int(atom_count),)
+        and np.all(np.isfinite(charge_values))
+        and (
+            checks["neutrality"]
+            or background_policy == "uniform_neutralizing_plasma"
+        )
+    )
+    if not checks["charge_policy"]:
+        blockers.append(
+            "charge_policy:non_neutral_requires_uniform_neutralizing_plasma:"
+            f"net_charge={net_charge:g}"
+        )
 
     box = np.asarray(cell_lengths, dtype=np.float64)
     checks["box"] = bool(box.shape == (3,) and np.all(np.isfinite(box)) and np.all(box > 0.0))
@@ -299,6 +352,7 @@ def pme_readiness_report(
         "production_executable": PME_PRODUCTION_EXECUTABLE,
         "atom_count": int(atom_count),
         "net_charge": net_charge,
+        "background_policy": background_policy,
         "mesh_shape": None if config is None else config.mesh_shape,
         "alpha": None if config is None else float(config.alpha),
         "real_cutoff": None if config is None else config.real_cutoff,
@@ -386,8 +440,8 @@ def pme_coulomb_energy_forces(
 
     Args:
         positions: Atomic coordinates, shape ``(n_atoms, 3)``.
-        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
-            net-neutral.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; charged systems
+            require the explicit uniform-plasma background policy.
         cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
         coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
@@ -400,8 +454,8 @@ def pme_coulomb_energy_forces(
             `PMEDiagnostics` entry.
 
     Raises:
-        ValueError: If shapes are wrong, the cell is non-orthorhombic, or the
-            system is not neutral.
+        ValueError: If shapes are wrong, the cell is non-orthorhombic, or charge
+            is incompatible with the configured background policy.
     """
 
     total_energy, forces, components = _pme_coulomb_energy_forces_impl(
@@ -432,8 +486,8 @@ def pme_coulomb_total_energy_forces(
 
     Args:
         positions: Atomic coordinates, shape ``(n_atoms, 3)``.
-        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
-            net-neutral.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; charged systems
+            require the explicit uniform-plasma background policy.
         cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
         coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
@@ -444,7 +498,7 @@ def pme_coulomb_total_energy_forces(
         An ``(energy, forces)`` tuple: scalar total Coulomb energy and ``(n_atoms, 3)`` forces.
 
     Raises:
-        ValueError: If shapes/cell are invalid or the system is not neutral.
+        ValueError: If shapes/cell or the configured charge policy are invalid.
     """
 
     total_energy, forces, _ = _pme_coulomb_energy_forces_impl(
@@ -515,8 +569,8 @@ def pme_coulomb_direct_space_energy_forces(
 
     Args:
         positions: Atomic coordinates, shape ``(n_atoms, 3)``.
-        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
-            net-neutral.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; charged systems
+            require the explicit uniform-plasma background policy.
         cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
         coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
@@ -526,7 +580,7 @@ def pme_coulomb_direct_space_energy_forces(
         An ``(energy, forces)`` tuple: scalar real-space energy and ``(n_atoms, 3)`` forces.
 
     Raises:
-        ValueError: If shapes/cell are invalid or the system is not neutral.
+        ValueError: If shapes/cell or the configured charge policy are invalid.
     """
 
     config = PMEConfig() if config is None else config
@@ -535,6 +589,7 @@ def pme_coulomb_direct_space_energy_forces(
         charges,
         cell,
         charge_tolerance=config.charge_tolerance,
+        background_policy=config.background_policy,
     )
     real_cutoff = _resolve_real_cutoff(config, cell_lengths_np)
     energy, forces, _ = _real_space_energy_forces_with_policy_mx(
@@ -566,8 +621,8 @@ def pme_coulomb_reciprocal_space_energy_forces(
 
     Args:
         positions: Atomic coordinates, shape ``(n_atoms, 3)``.
-        charges: Per-atom partial charges, shape ``(n_atoms,)``; the system must be
-            net-neutral.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``; charged systems
+            require the explicit uniform-plasma background policy.
         cell: Periodic orthorhombic `Cell` (triclinic is unsupported).
         coulomb_constant: Coulomb prefactor in the configured unit system. Defaults to ``1.0``.
         config: PME parameters; ``None`` uses defaults. Defaults to ``None``.
@@ -578,7 +633,7 @@ def pme_coulomb_reciprocal_space_energy_forces(
         An ``(energy, forces)`` tuple: scalar reciprocal-space energy and ``(n_atoms, 3)`` forces.
 
     Raises:
-        ValueError: If shapes/cell are invalid or the system is not neutral.
+        ValueError: If shapes/cell or the configured charge policy are invalid.
     """
 
     config = PMEConfig() if config is None else config
@@ -587,6 +642,7 @@ def pme_coulomb_reciprocal_space_energy_forces(
         charges,
         cell,
         charge_tolerance=config.charge_tolerance,
+        background_policy=config.background_policy,
     )
     energy, forces, _ = _mesh_reciprocal_energy_forces_mx(
         positions_mx,
@@ -601,6 +657,13 @@ def pme_coulomb_reciprocal_space_energy_forces(
         energy = energy - float(coulomb_constant) * config.alpha / float(
             np.sqrt(np.pi)
         ) * mx.sum(charges_mx * charges_mx)
+        energy = energy + _neutralizing_plasma_energy_mx(
+            charges_mx,
+            volume=float(np.prod(cell_lengths_np, dtype=np.float64)),
+            alpha=config.alpha,
+            coulomb_constant=coulomb_constant,
+            background_policy=config.background_policy,
+        )
     return energy.astype(mx.float32), forces.astype(mx.float32)
 
 
@@ -620,6 +683,7 @@ def _pme_coulomb_energy_forces_impl(
         charges,
         cell,
         charge_tolerance=config.charge_tolerance,
+        background_policy=config.background_policy,
     )
     real_cutoff = _resolve_real_cutoff(config, cell_lengths_np)
 
@@ -648,13 +712,27 @@ def _pme_coulomb_energy_forces_impl(
         / float(np.sqrt(np.pi))
         * mx.sum(charges_mx * charges_mx)
     )
+    background_energy = _neutralizing_plasma_energy_mx(
+        charges_mx,
+        volume=float(np.prod(cell_lengths_np, dtype=np.float64)),
+        alpha=config.alpha,
+        coulomb_constant=coulomb_constant,
+        background_policy=config.background_policy,
+    )
 
-    total_energy = real_energy + reciprocal_energy + self_energy
+    total_energy = real_energy + reciprocal_energy + self_energy + background_energy
     forces = real_forces + reciprocal_forces
     if not include_components:
         return total_energy.astype(mx.float32), forces.astype(mx.float32), None
 
-    mx.eval(total_energy, forces, real_energy, reciprocal_energy, self_energy)
+    mx.eval(
+        total_energy,
+        forces,
+        real_energy,
+        reciprocal_energy,
+        self_energy,
+        background_energy,
+    )
     if mesh_info is None:
         msg = "PME component evaluation requires mesh diagnostics"
         raise RuntimeError(msg)
@@ -668,6 +746,8 @@ def _pme_coulomb_energy_forces_impl(
         charge_grid_sum=mesh_info["charge_grid_sum"],
         reciprocal_modes=int(mesh_info["reciprocal_modes"]),
         max_charge_grid_abs=mesh_info["max_charge_grid_abs"],
+        background_policy=config.background_policy,
+        background_energy=float(np.asarray(background_energy)),
         direct_space_policy=direct_space_report.policy,
         direct_space_representation=direct_space_report.representation,
         direct_space_pair_count=direct_space_report.compact_pair_count,
@@ -678,6 +758,7 @@ def _pme_coulomb_energy_forces_impl(
         "coulomb_real": real_energy.astype(mx.float32),
         "coulomb_reciprocal": reciprocal_energy.astype(mx.float32),
         "coulomb_self": self_energy.astype(mx.float32),
+        "coulomb_background": background_energy.astype(mx.float32),
         "diagnostics": diagnostics,
     }
     return total_energy.astype(mx.float32), forces.astype(mx.float32), components
@@ -742,6 +823,7 @@ def assign_charges_bspline(
         charges,
         cell,
         charge_tolerance=np.inf,
+        background_policy="reject_non_neutral",
     )
     mesh_shape = _validate_mesh_shape(mesh_shape)
     assignment_order = _validate_assignment_order(assignment_order)
@@ -760,6 +842,7 @@ def _validate_inputs_mx(
     cell: Cell,
     *,
     charge_tolerance: float,
+    background_policy: PMEBackgroundPolicy,
 ) -> tuple[mx.array, mx.array, mx.array, np.ndarray]:
     if not isinstance(cell, Cell):
         msg = "PME requires an orthorhombic Cell"
@@ -793,14 +876,35 @@ def _validate_inputs_mx(
         msg = "PME requires positive orthorhombic cell lengths"
         raise ValueError(msg)
     net_charge = float(np.asarray(mx.sum(charges_mx)))
-    if abs(net_charge) > charge_tolerance:
+    if (
+        abs(net_charge) > charge_tolerance
+        and background_policy != "uniform_neutralizing_plasma"
+    ):
         msg = (
-            "PME requires a neutral system; non-neutral background policy is not "
-            f"implemented: net_charge={net_charge:g}"
+            "PME requires a neutral system unless background_policy="
+            "'uniform_neutralizing_plasma'; "
+            f"net_charge={net_charge:g}"
         )
         raise ValueError(msg)
     wrapped_positions = positions_mx - mx.floor(positions_mx / cell_lengths_mx) * cell_lengths_mx
     return wrapped_positions, charges_mx, cell_lengths_mx, cell_lengths_np
+
+
+def _neutralizing_plasma_energy_mx(
+    charges: mx.array,
+    *,
+    volume: float,
+    alpha: float,
+    coulomb_constant: float,
+    background_policy: PMEBackgroundPolicy,
+) -> mx.array:
+    if background_policy != "uniform_neutralizing_plasma":
+        return mx.sum(charges * 0.0)
+    net_charge = mx.sum(charges)
+    scale = -float(coulomb_constant) * float(np.pi) / (
+        2.0 * float(volume) * float(alpha) * float(alpha)
+    )
+    return scale * net_charge * net_charge
 
 
 def _validate_mesh_shape(mesh_shape: tuple[int, int, int]) -> tuple[int, int, int]:

@@ -82,6 +82,7 @@ OPTIONAL_NPZ_ARRAY_DEFAULTS = {
     "pme_assignment_order": lambda: np.asarray([], dtype=np.int32),
     "pme_charge_tolerance": lambda: np.asarray([], dtype=np.float32),
     "pme_deconvolve_assignment": lambda: np.asarray([], dtype=bool),
+    "pme_background_policy": lambda: np.asarray([], dtype=str),
     "charmm_cmap_terms": lambda: empty_indices(8),
     "charmm_cmap_grid_indices": lambda: np.asarray([], dtype=np.int32),
     "charmm_cmap_grids": lambda: np.empty((0, 0, 0), dtype=np.float32),

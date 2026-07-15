@@ -8,10 +8,13 @@ from typing import Any
 import numpy as np
 
 from mlx_atomistic.compatibility import normalize_compatibility_report
-from mlx_atomistic.pme import PME_SUPPORTED_ASSIGNMENT_ORDERS
+from mlx_atomistic.pme import (
+    PME_SUPPORTED_ASSIGNMENT_ORDERS,
+    normalize_pme_background_policy,
+)
 
-ARTIFACT_VERSION = 2
-SUPPORTED_ARTIFACT_VERSIONS = frozenset({1, ARTIFACT_VERSION})
+ARTIFACT_VERSION = 3
+SUPPORTED_ARTIFACT_VERSIONS = frozenset({1, 2, ARTIFACT_VERSION})
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,9 @@ class PreparedSystem:
     )
     pme_deconvolve_assignment: np.ndarray = field(
         default_factory=lambda: np.asarray([], dtype=bool)
+    )
+    pme_background_policy: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=str)
     )
     charmm_cmap_terms: np.ndarray = field(default_factory=lambda: empty_indices(8))
     charmm_cmap_grid_indices: np.ndarray = field(
@@ -381,7 +387,8 @@ class PreparedSystem:
             "pme_charge_tolerance",
             "pme_deconvolve_assignment",
         ]
-        has_any = mesh_shape.size != 0 or any(
+        background_policy = np.asarray(self.pme_background_policy)
+        has_any = mesh_shape.size != 0 or background_policy.size != 0 or any(
             np.asarray(getattr(self, name)).size for name in scalar_names
         )
         if not has_any:
@@ -426,6 +433,15 @@ class PreparedSystem:
         if not np.isfinite(charge_tolerance) or charge_tolerance < 0.0:
             msg = "pme_charge_tolerance must be finite and non-negative"
             raise ValueError(msg)
+        if background_policy.size == 0:
+            if self.metadata.artifact_version >= 3:
+                msg = "pme_background_policy must have shape (1,) for artifact version 3"
+                raise ValueError(msg)
+        else:
+            if background_policy.shape != (1,):
+                msg = "pme_background_policy must be empty or have shape (1,)"
+                raise ValueError(msg)
+            normalize_pme_background_policy(background_policy[0])
 
     def _validate_charmm_cmap_grids(self) -> None:
         grids = np.asarray(self.charmm_cmap_grids, dtype=np.float32)

@@ -81,6 +81,7 @@ def _pme_prepared_system(assignment_order: int):
             "real_cutoff": 5.0,
             "assignment_order": assignment_order,
             "charge_tolerance": 1e-5,
+            "background_policy": "reject_non_neutral",
         },
         compatibility_report={
             **prepared.metadata.compatibility_report,
@@ -105,6 +106,7 @@ def _pme_prepared_system(assignment_order: int):
         pme_assignment_order=np.asarray([assignment_order], dtype=np.int32),
         pme_charge_tolerance=np.asarray([1e-5], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([True], dtype=bool),
+        pme_background_policy=np.asarray(["reject_non_neutral"], dtype=str),
     )
 
 

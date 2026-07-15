@@ -1129,10 +1129,14 @@ class NonbondedPotential:
                 msg = "PME electrostatics requires finite non-negative pme_config.charge_tolerance"
                 raise ValueError(msg)
             net_charge = float(np.sum(np.asarray(charges, dtype=np.float64), dtype=np.float64))
-            if abs(net_charge) > self.pme_config.charge_tolerance:
+            if (
+                abs(net_charge) > self.pme_config.charge_tolerance
+                and self.pme_config.background_policy != "uniform_neutralizing_plasma"
+            ):
                 msg = (
-                    "PME electrostatics requires a neutral system; non-neutral "
-                    f"background policy is not implemented: net_charge={net_charge:g}"
+                    "PME electrostatics requires a neutral system unless "
+                    "background_policy='uniform_neutralizing_plasma'; "
+                    f"net_charge={net_charge:g}"
                 )
                 raise ValueError(msg)
         object.__setattr__(self, "sigma", sigma)
@@ -2209,6 +2213,7 @@ class NonbondedPotential:
             "coulomb_real": pme_components["coulomb_real"],
             "coulomb_reciprocal": pme_components["coulomb_reciprocal"],
             "coulomb_self": pme_components["coulomb_self"],
+            "coulomb_background": pme_components["coulomb_background"],
             **correction_components,
             "pme_diagnostics": pme_components["diagnostics"],
         }
