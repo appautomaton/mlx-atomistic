@@ -179,6 +179,27 @@ def test_dhfr_explicit_runtime_blocks_without_explicit_inputs():
     assert "caller-provided DHFR input path" in payload["blocker"]
 
 
+def test_dhfr_explicit_pme_defaults_to_charged_order_five_contract():
+    config = dhfr._default_dhfr_pme_config()
+
+    assert config.assignment_order == 5
+    assert config.background_policy == "uniform_neutralizing_plasma"
+    assert config.mesh_shape == (64, 64, 64)
+    assert config.alpha == pytest.approx(0.35)
+    assert config.real_cutoff == pytest.approx(9.0)
+
+
+def test_dhfr_explicit_pme_cli_resolves_local_jac_inputs_without_global_defaults():
+    args = dhfr._parse_args(["--case", "dhfr-explicit-pme", "--steps", "1", "--json"])
+
+    spec = dhfr._case_spec_from_args(args)
+
+    assert spec.amber_topology_path == dhfr.AMBER20_JAC_PRMTOP
+    assert spec.amber_coordinates_path == dhfr.AMBER20_JAC_INPCRD
+    assert spec.input_paths == (dhfr.AMBER20_JAC_PRMTOP, dhfr.AMBER20_JAC_INPCRD)
+    assert dhfr.CASE_SPECS["dhfr-explicit-pme"].input_paths == ()
+
+
 def test_validation_gauntlet_cli_json_and_csv(tmp_path, capsys):
     csv_path = tmp_path / "validation.csv"
 
@@ -1578,6 +1599,47 @@ def test_same_workload_comparison_dhfr_semantic_mismatch_is_diagnostic():
     assert row["comparison_status"] == "diagnostic"
     assert "solvent/electrostatics semantics differ" in row["blocker"]
     assert row["openmm_to_mlx_ratio"] is None
+
+
+def test_charged_pme_same_workload_ratio_requires_full_manifest_match():
+    mlx_row = {
+        "operation": "fixed_cell_nvt_step",
+        "atom_count": 23558,
+        "fixture_hash": "fixture",
+        "parameter_manifest_hash": "parameters",
+        "pme_parameters": {
+            "mesh_shape": [64, 64, 64],
+            "alpha": 0.35,
+            "real_cutoff": 9.0,
+            "assignment_order": 5,
+            "background_policy": "uniform_neutralizing_plasma",
+        },
+        "step_count": 1,
+        "precision": "float32",
+        "timing_metric": "ns_per_day",
+        "timing_value": 2.0,
+    }
+    reference_row = {**mlx_row, "timing_value": 4.0}
+
+    matched = same_workload_compare.build_strict_timing_comparison(
+        mlx_row,
+        reference_row,
+    )
+    mismatched = same_workload_compare.build_strict_timing_comparison(
+        mlx_row,
+        {
+            **reference_row,
+            "pme_parameters": {
+                **reference_row["pme_parameters"],
+                "assignment_order": 4,
+            },
+        },
+    )
+
+    assert matched == {"status": "comparable", "ratio": 2.0, "blocker": None}
+    assert mismatched["status"] == "diagnostic"
+    assert mismatched["ratio"] is None
+    assert mismatched["blocker"] == "pme_parameters differs; ratio suppressed"
 
 
 def test_lammps_opencl_unsupported_fixture_reports_normalized_blocker():

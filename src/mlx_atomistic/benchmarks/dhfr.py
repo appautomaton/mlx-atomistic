@@ -26,6 +26,7 @@ from mlx_atomistic.benchmarks import (
     normalize_benchmark_payload,
 )
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
+from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import PMEConfig, pme_readiness_report
 from mlx_atomistic.prep.io import save_prepared_system
 from mlx_atomistic.prep.topology_import import TopologyImportError, import_amber_prmtop
@@ -35,6 +36,12 @@ BENCHMARK_NAME = "dhfr"
 COMMAND = default_benchmark_command(BENCHMARK_NAME)
 
 DEFAULT_ARTIFACT_ROOT = Path("outputs/benchmarks/dhfr-artifacts")
+AMBER20_JAC_PRMTOP = Path(
+    "results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop"
+)
+AMBER20_JAC_INPCRD = Path(
+    "results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd"
+)
 GBSA_REQUIRED_ARRAYS = ("gbsa_radius", "gbsa_scale")
 PME_REQUIRED_ARRAYS = (
     "pme_mesh_shape",
@@ -453,8 +460,10 @@ def _run_prepared_artifact_runtime(
         artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
         system, force_terms, constraints = build_mlx_system_from_artifact(
             artifact,
-            eager_nonbonded_pair_limit=None,
+            eager_nonbonded_pair_limit=0,
         )
+        force_terms = _bind_runtime_pme_plan(force_terms, system.cell)
+        neighbor_manager = _runtime_neighbor_manager(force_terms, system.cell)
     except (ValueError, FileNotFoundError) as exc:
         blocker = f"DHFR prepared artifact runtime setup blocked: {exc}"
         payload.update(
@@ -499,6 +508,7 @@ def _run_prepared_artifact_runtime(
                 friction=91.0 if case_spec.solvent_model == "implicit" else 1.0,
                 seed=17,
             ),
+            neighbor_manager=neighbor_manager,
         )
         potential_energy = _last_scalar(result.potential_energy)
         kinetic_energy = _last_scalar(result.kinetic_energy)
@@ -551,10 +561,96 @@ def _run_prepared_artifact_runtime(
                 str(getattr(term, "name", type(term).__name__))
                 for term in force_terms
             ],
+            "operation": "fixed_cell_nvt_step",
+            "precision": "float32",
+            "pme_parameters": _runtime_pme_parameters(force_terms),
+            "pme_plan": _runtime_pme_plan(force_terms),
+            "nonbonded_topology": _runtime_topology_report(force_terms),
+            "neighbor_backend": (
+                None if neighbor_manager is None else neighbor_manager.backend
+            ),
+            "neighbor_representation": (
+                None
+                if neighbor_manager is None or neighbor_manager.neighbor_list is None
+                else neighbor_manager.neighbor_list.representation_kind
+            ),
             "finite": finite,
         }
     )
     return payload
+
+
+def _bind_runtime_pme_plan(force_terms: list[Any], cell: Any) -> tuple[Any, ...]:
+    bound = []
+    for term in force_terms:
+        if getattr(term, "electrostatics", None) != "pme":
+            bound.append(term)
+            continue
+        if cell is None:
+            msg = "DHFR PME runtime requires a periodic fixed cell"
+            raise ValueError(msg)
+        bound.append(term.bind_pme_plan(cell))
+    return tuple(bound)
+
+
+def _runtime_neighbor_manager(
+    force_terms: tuple[Any, ...],
+    cell: Any,
+) -> NeighborListManager | None:
+    lazy_terms = [
+        term
+        for term in force_terms
+        if getattr(getattr(term, "topology", None), "nonbonded_pair_policy", None)
+        == "lazy"
+    ]
+    if not lazy_terms:
+        return None
+    if cell is None:
+        msg = "DHFR lazy nonbonded runtime requires a periodic cell"
+        raise ValueError(msg)
+    cutoffs = {float(term.cutoff) for term in lazy_terms}
+    if len(cutoffs) != 1:
+        msg = "DHFR lazy nonbonded force terms require one shared cutoff"
+        raise ValueError(msg)
+    uses_pme = any(getattr(term, "electrostatics", None) == "pme" for term in lazy_terms)
+    return NeighborListManager(
+        cell,
+        cutoff=cutoffs.pop(),
+        skin=0.3,
+        check_interval=1,
+        sort_pairs=False,
+        backend="mlx_cell_blocks" if uses_pme else "auto",
+    )
+
+
+def _runtime_pme_parameters(force_terms: tuple[Any, ...]) -> dict[str, Any] | None:
+    for term in force_terms:
+        config = getattr(term, "pme_config", None)
+        if config is not None:
+            return _pme_config_payload(config)
+    return None
+
+
+def _runtime_pme_plan(force_terms: tuple[Any, ...]) -> dict[str, Any] | None:
+    for term in force_terms:
+        plan = getattr(term, "pme_plan", None)
+        if plan is not None:
+            return plan.to_dict()
+    return None
+
+
+def _runtime_topology_report(force_terms: tuple[Any, ...]) -> dict[str, Any] | None:
+    for term in force_terms:
+        topology = getattr(term, "topology", None)
+        if topology is None:
+            continue
+        return {
+            "pair_policy": topology.nonbonded_pair_policy,
+            "pair_cache_materialized": getattr(topology, "_nonbonded_pairs", None)
+            is not None,
+            "nonbonded_pair_count": topology.nonbonded_pair_count,
+        }
+    return None
 
 
 def _last_scalar(values: Any) -> float:
@@ -691,6 +787,11 @@ def _with_pme_metadata(prepared: Any) -> Any:
             "supported_terms": supported_terms,
         }
     )
+    hydrogen_masses = np.asarray(prepared.masses)[
+        np.char.upper(np.asarray(prepared.symbols, dtype=str)) == "H"
+    ]
+    if hydrogen_masses.size and np.any(hydrogen_masses > 1.25):
+        report["hydrogen_mass_repartitioning"] = "represented_by_masses"
     metadata = replace(
         prepared.metadata,
         compatibility_report=report,
@@ -714,9 +815,10 @@ def _default_dhfr_pme_config() -> PMEConfig:
         mesh_shape=(64, 64, 64),
         alpha=0.35,
         real_cutoff=9.0,
-        assignment_order=4,
+        assignment_order=5,
         charge_tolerance=1e-5,
         deconvolve_assignment=True,
+        background_policy="uniform_neutralizing_plasma",
     )
 
 
@@ -840,19 +942,26 @@ def _format_human_payload(payload: dict[str, Any]) -> str:
 
 def _case_spec_from_args(args: argparse.Namespace) -> DHFRCaseSpec:
     spec = CASE_SPECS[args.case]
+    amber_topology = args.amber_topology
+    amber_coordinates = args.amber_coordinates
+    if args.case == "dhfr-explicit-pme":
+        if amber_topology is None:
+            amber_topology = AMBER20_JAC_PRMTOP
+        if amber_coordinates is None:
+            amber_coordinates = AMBER20_JAC_INPCRD
     input_paths: list[Path] = []
     if args.primary_structure is not None:
         input_paths.append(args.primary_structure)
-    if args.amber_topology is not None:
-        input_paths.append(args.amber_topology)
-    if args.amber_coordinates is not None:
-        input_paths.append(args.amber_coordinates)
+    if amber_topology is not None:
+        input_paths.append(amber_topology)
+    if amber_coordinates is not None:
+        input_paths.append(amber_coordinates)
     return replace(
         spec,
         input_paths=tuple(input_paths),
         primary_structure_path=args.primary_structure,
-        amber_topology_path=args.amber_topology,
-        amber_coordinates_path=args.amber_coordinates,
+        amber_topology_path=amber_topology,
+        amber_coordinates_path=amber_coordinates,
     )
 
 
