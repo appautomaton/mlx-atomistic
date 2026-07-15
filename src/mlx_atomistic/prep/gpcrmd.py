@@ -1573,6 +1573,7 @@ def _gpcrmd_pme_config(prepared: PreparedSystem, target: GPCRmdTarget) -> dict[s
         "assignment_order": 2,
         "charge_tolerance": 1e-3,
         "deconvolve_assignment": True,
+        "background_policy": "reject_non_neutral",
     }
 
 
@@ -1590,6 +1591,7 @@ def _gpcrmd_pme_arrays(
         "pme_assignment_order": np.asarray([2], dtype=np.int32),
         "pme_charge_tolerance": np.asarray([1e-3], dtype=np.float32),
         "pme_deconvolve_assignment": np.asarray([True], dtype=bool),
+        "pme_background_policy": np.asarray(["reject_non_neutral"], dtype=str),
     }
 
 

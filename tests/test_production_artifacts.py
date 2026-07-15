@@ -828,6 +828,7 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
             "real_cutoff": 5.0,
             "assignment_order": 2,
             "charge_tolerance": 1e-5,
+            "background_policy": "reject_non_neutral",
         },
         compatibility_report={
             **prepared.metadata.compatibility_report,
@@ -852,6 +853,7 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
         pme_assignment_order=np.asarray([2], dtype=np.int32),
         pme_charge_tolerance=np.asarray([1e-5], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([True], dtype=bool),
+        pme_background_policy=np.asarray(["reject_non_neutral"], dtype=str),
     )
     save_prepared_system(prepared, tmp_path)
 
@@ -865,6 +867,7 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
 
     assert nonbonded.electrostatics == "pme"
     assert nonbonded.pme_config.mesh_shape == (8, 8, 8)
+    assert nonbonded.pme_config.background_policy == "reject_non_neutral"
     assert np.isfinite(float(np.asarray(energy)))
     assert np.all(np.isfinite(np.asarray(forces)))
     assert "pme_diagnostics" in components
@@ -892,8 +895,43 @@ def test_pme_artifact_round_trips_and_builds_supported_assignment_order(
     assert int(loaded.pme_assignment_order[0]) == assignment_order
     assert artifact.metadata["pme_config"]["assignment_order"] == assignment_order
     assert int(artifact.arrays["pme_assignment_order"][0]) == assignment_order
+    assert str(loaded.pme_background_policy[0]) == "reject_non_neutral"
+    assert str(artifact.arrays["pme_background_policy"][0]) == "reject_non_neutral"
     assert nonbonded.electrostatics == "pme"
     assert nonbonded.pme_config.assignment_order == assignment_order
+
+
+def test_charged_pme_artifact_requires_explicit_uniform_background(tmp_path):
+    prepared = _pme_fixture_with_config_arrays()
+    charged = replace(prepared, charges=np.asarray([0.1, 0.0], dtype=np.float32))
+
+    with pytest.raises(MLXCompatibilityError, match="uniform_neutralizing_plasma"):
+        save_prepared_system(charged, tmp_path / "reject")
+        load_prepared_mlx_artifact(tmp_path / "reject", require_production=True)
+
+    metadata = replace(
+        charged.metadata,
+        pme_config={
+            **charged.metadata.pme_config,
+            "background_policy": "uniform_neutralizing_plasma",
+        },
+    )
+    accepted = replace(
+        charged,
+        metadata=metadata,
+        pme_background_policy=np.asarray(
+            ["uniform_neutralizing_plasma"],
+            dtype=str,
+        ),
+    )
+    save_prepared_system(accepted, tmp_path / "accepted")
+    artifact = load_prepared_mlx_artifact(
+        tmp_path / "accepted",
+        require_production=True,
+    )
+    _, terms, _ = build_mlx_system_from_artifact(artifact)
+
+    assert terms[-1].pme_config.background_policy == "uniform_neutralizing_plasma"
 
 
 def _pme_fixture_with_config_arrays(assignment_order=2):
@@ -906,6 +944,7 @@ def _pme_fixture_with_config_arrays(assignment_order=2):
             "real_cutoff": 5.0,
             "assignment_order": assignment_order,
             "charge_tolerance": 1e-5,
+            "background_policy": "reject_non_neutral",
         },
         compatibility_report={
             **prepared.metadata.compatibility_report,
@@ -930,6 +969,7 @@ def _pme_fixture_with_config_arrays(assignment_order=2):
         pme_assignment_order=np.asarray([assignment_order], dtype=np.int32),
         pme_charge_tolerance=np.asarray([1e-5], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([True], dtype=bool),
+        pme_background_policy=np.asarray(["reject_non_neutral"], dtype=str),
     )
 
 
@@ -1059,6 +1099,11 @@ def test_rb_artifact_fails_closed_with_charmm_force_switch_nonbonded(tmp_path):
         ("pme_mesh_shape", np.asarray([8.5, 8, 8], dtype=np.float32), "pme_mesh_shape"),
         ("pme_mesh_shape", np.asarray([np.inf, 8, 8], dtype=np.float32), "pme_mesh_shape"),
         ("pme_mesh_shape", np.asarray([8, 8], dtype=np.int32), "pme_mesh_shape"),
+        (
+            "pme_background_policy",
+            np.asarray(["unknown_policy"], dtype=str),
+            "background_policy",
+        ),
     ],
 )
 def test_pme_artifact_load_rejects_invalid_config_arrays(
@@ -1082,6 +1127,14 @@ def test_pme_artifact_array_config_requires_complete_arrays(tmp_path):
         load_prepared_mlx_artifact(tmp_path, require_production=True)
 
 
+def test_pme_artifact_v3_requires_background_policy_array(tmp_path):
+    save_prepared_system(_pme_fixture_with_config_arrays(), tmp_path)
+    _drop_npz_array(tmp_path, "pme_background_policy")
+
+    with pytest.raises(MLXCompatibilityError, match="pme_background_policy"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
+
+
 @pytest.mark.parametrize(
     ("field_name", "value", "match"),
     [
@@ -1094,6 +1147,11 @@ def test_pme_artifact_array_config_requires_complete_arrays(tmp_path):
         ("pme_mesh_shape", np.asarray([8.5, 8, 8], dtype=np.float32), "pme_mesh_shape"),
         ("pme_mesh_shape", np.asarray([np.inf, 8, 8], dtype=np.float32), "pme_mesh_shape"),
         ("pme_mesh_shape", np.asarray([8, 8], dtype=np.int32), "pme_mesh_shape"),
+        (
+            "pme_background_policy",
+            np.asarray(["unknown_policy"], dtype=str),
+            "background_policy",
+        ),
     ],
 )
 def test_prepared_system_validate_rejects_invalid_pme_arrays(field_name, value, match):
@@ -1287,7 +1345,7 @@ def test_charmm_lipid_protocol_arrays_round_trip_and_build(tmp_path):
     system, terms, constraints = build_mlx_system_from_artifact(artifact)
 
     assert constraints is None
-    assert reloaded.metadata.artifact_version == 2
+    assert reloaded.metadata.artifact_version == prepared.metadata.artifact_version
     assert reloaded.metadata.protocol_metadata["ensemble"] == "nvt"
     assert reloaded.lipid_mask.shape == (prepared.atom_count,)
     assert reloaded.charmm_cmap_terms.shape == (1, 8)

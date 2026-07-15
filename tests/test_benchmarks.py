@@ -141,6 +141,7 @@ def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
         "pme_assignment_order",
         "pme_charge_tolerance",
         "pme_deconvolve_assignment",
+        "pme_background_policy",
     ]
     assert payload["artifact_status"] == "not_attempted"
     assert "caller-provided DHFR input path" in payload["blocker"]

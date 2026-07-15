@@ -16,6 +16,7 @@ from mlx_atomistic.pme import (
     assign_charges_cic,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
+    pme_coulomb_reciprocal_space_energy_forces,
     pme_coulomb_total_energy_forces,
     pme_direct_space_policy_report,
     pme_force_scope_report,
@@ -50,6 +51,11 @@ def test_pme_config_accepts_supported_assignment_orders(assignment_order):
 def test_pme_config_rejects_unsupported_assignment_orders(assignment_order):
     with pytest.raises(ValueError, match="assignment_order must be one of 2, 4, or 5"):
         PMEConfig(assignment_order=assignment_order)
+
+
+def test_pme_config_rejects_unknown_background_policy():
+    with pytest.raises(ValueError, match="background_policy"):
+        PMEConfig(background_policy="implicit_magic")
 
 
 def test_cic_charge_assignment_conserves_charge():
@@ -151,6 +157,7 @@ def test_pme_matches_ewald_reference_on_neutral_periodic_fixture():
         "coulomb_real",
         "coulomb_reciprocal",
         "coulomb_self",
+        "coulomb_background",
         "diagnostics",
     }
     diagnostics = components["diagnostics"]
@@ -243,12 +250,86 @@ def test_pme_energy_and_forces_are_wrapping_invariant():
 
 
 def test_pme_refuses_non_neutral_system_without_background_policy():
-    with pytest.raises(ValueError, match="non-neutral background policy is not implemented"):
+    with pytest.raises(ValueError, match="uniform_neutralizing_plasma"):
         pme_coulomb_energy_forces(
             _positions(),
             as_mx_array([0.7, -0.2, -0.3, -0.1]),
             Cell.cubic(12.0),
         )
+
+
+def test_pme_uniform_background_matches_openmm_plasma_formula():
+    charges = as_mx_array([0.7, -0.2, -0.3, -0.1])
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(
+        mesh_shape=(24, 24, 24),
+        alpha=0.35,
+        real_cutoff=5.0,
+        background_policy="uniform_neutralizing_plasma",
+    )
+
+    energy, forces, components = pme_coulomb_energy_forces(
+        _positions(),
+        charges,
+        cell,
+        config=config,
+    )
+    direct_energy, direct_forces = pme_coulomb_direct_space_energy_forces(
+        _positions(),
+        charges,
+        cell,
+        config=config,
+    )
+    reciprocal_energy, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
+        _positions(),
+        charges,
+        cell,
+        config=config,
+    )
+
+    net_charge = float(np.asarray(charges).sum())
+    expected = -np.pi * net_charge**2 / (2.0 * float(cell.volume) * config.alpha**2)
+    np.testing.assert_allclose(
+        np.asarray(components["coulomb_background"]),
+        expected,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(energy),
+        np.asarray(direct_energy + reciprocal_energy),
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(forces),
+        np.asarray(direct_forces + reciprocal_forces),
+        atol=1e-6,
+    )
+    diagnostics = components["diagnostics"]
+    assert diagnostics.background_policy == "uniform_neutralizing_plasma"
+    np.testing.assert_allclose(diagnostics.background_energy, expected, rtol=1e-5)
+
+
+def test_pme_uniform_background_is_zero_for_neutral_system():
+    cell = Cell.cubic(12.0)
+    reject = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    plasma = PMEConfig(
+        mesh_shape=(16, 16, 16),
+        alpha=0.35,
+        real_cutoff=5.0,
+        background_policy="uniform_neutralizing_plasma",
+    )
+
+    reject_energy, reject_forces, _ = pme_coulomb_energy_forces(
+        _positions(), _charges(), cell, config=reject
+    )
+    plasma_energy, plasma_forces, components = pme_coulomb_energy_forces(
+        _positions(), _charges(), cell, config=plasma
+    )
+
+    np.testing.assert_allclose(np.asarray(plasma_energy), np.asarray(reject_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(plasma_forces), np.asarray(reject_forces), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(components["coulomb_background"]), 0.0, atol=1e-7)
 
 
 def test_pme_direct_space_compact_pairs_match_dense_policy():
@@ -473,6 +554,31 @@ def test_pme_readiness_report_accepts_mlx_fft_backend_for_production():
     assert report["force_scopes"]["direct_space"]["direct_space"] is True
     assert report["force_scopes"]["reciprocal_space"]["reciprocal_space"] is True
     assert pme_force_scope_report("total_only")["scope"] == "total"
+
+
+def test_pme_readiness_accepts_charged_uniform_background_policy():
+    charges = np.asarray([0.7, -0.2, -0.3, -0.1], dtype=np.float32)
+    report = pme_readiness_report(
+        atom_count=4,
+        charges=charges,
+        cell_lengths=np.asarray([12.0, 12.0, 12.0], dtype=np.float32),
+        config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=5.0,
+            background_policy="uniform_neutralizing_plasma",
+        ),
+        nonbonded_cutoff=5.0,
+        exclusion_count=0,
+        one_four_count=0,
+        explicit_exception_count=0,
+    )
+
+    assert report["status"] == "ready"
+    assert report["checks"]["neutrality"] is False
+    assert report["checks"]["charge_policy"] is True
+    assert report["background_policy"] == "uniform_neutralizing_plasma"
+    assert report["blockers"] == ()
 
 
 def test_pme_platform_readiness_report_uses_shared_schema():

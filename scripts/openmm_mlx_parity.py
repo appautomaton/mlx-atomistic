@@ -97,6 +97,7 @@ class PMEParityConfig:
     assignment_order: int = 2
     charge_tolerance: float = 1.0e-5
     deconvolve_assignment: bool = True
+    background_policy: str = "reject_non_neutral"
 
     def to_pme_config(self) -> PMEConfig:
         return PMEConfig(
@@ -106,6 +107,7 @@ class PMEParityConfig:
             assignment_order=self.assignment_order,
             charge_tolerance=self.charge_tolerance,
             deconvolve_assignment=self.deconvolve_assignment,
+            background_policy=self.background_policy,
         )
 
 
@@ -456,6 +458,7 @@ def _tip4p_ew_prepared_artifact(pme_config: PMEParityConfig) -> PreparedSystem:
         pme_assignment_order=np.asarray([pme_config.assignment_order], dtype=np.int32),
         pme_charge_tolerance=np.asarray([pme_config.charge_tolerance], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([pme_config.deconvolve_assignment], dtype=bool),
+        pme_background_policy=np.asarray([pme_config.background_policy], dtype=str),
         virtual_site_parent_atoms=np.asarray([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32),
         virtual_site_weights=np.asarray(
             [[0.78664654, 0.10667673, 0.10667673, 0.0]] * 2,
@@ -1061,6 +1064,7 @@ def _with_pme_artifact_settings(prepared: Any, config: PMEParityConfig) -> Any:
         pme_assignment_order=np.asarray([pme_config.assignment_order], dtype=np.int32),
         pme_charge_tolerance=np.asarray([pme_config.charge_tolerance], dtype=np.float32),
         pme_deconvolve_assignment=np.asarray([pme_config.deconvolve_assignment], dtype=bool),
+        pme_background_policy=np.asarray([pme_config.background_policy], dtype=str),
     )
 
 
@@ -1075,6 +1079,7 @@ def _pme_config_payload(config: PMEParityConfig) -> dict[str, Any]:
         "assignment_order": int(pme_config.assignment_order),
         "charge_tolerance": float(pme_config.charge_tolerance),
         "deconvolve_assignment": bool(pme_config.deconvolve_assignment),
+        "background_policy": pme_config.background_policy,
     }
 
 

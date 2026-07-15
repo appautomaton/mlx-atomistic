@@ -645,9 +645,34 @@ def test_nonbonded_pme_refuses_non_neutral_background_policy():
             pme_config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0),
         )
     except ValueError as err:
-        assert "non-neutral background policy is not implemented" in str(err)
+        assert "uniform_neutralizing_plasma" in str(err)
     else:
         raise AssertionError("PME nonbonded accepted a non-neutral system")
+
+
+def test_nonbonded_pme_accepts_explicit_uniform_background_policy():
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0],
+        charges=[1.0, -0.5, -0.4],
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=5.0,
+            background_policy="uniform_neutralizing_plasma",
+        ),
+    )
+
+    energy, forces, components = term.energy_forces_with_components(
+        np.asarray([[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]], dtype=np.float32),
+        Cell.cubic(12.0),
+    )
+
+    assert np.isfinite(np.asarray(energy))
+    assert np.all(np.isfinite(np.asarray(forces)))
+    assert float(np.asarray(components["coulomb_background"])) < 0.0
 
 
 def test_nonbonded_pme_refuses_non_finite_coulomb_constant_and_config_fields():
@@ -709,7 +734,12 @@ def test_nonbonded_pme_matches_standalone_pme_without_lj():
 
     np.testing.assert_allclose(np.array(energy), np.array(reference_energy), atol=1e-6)
     np.testing.assert_allclose(np.array(forces), np.array(reference_forces), atol=1e-6)
-    for name in ["coulomb_real", "coulomb_reciprocal", "coulomb_self"]:
+    for name in [
+        "coulomb_real",
+        "coulomb_reciprocal",
+        "coulomb_self",
+        "coulomb_background",
+    ]:
         np.testing.assert_allclose(
             np.array(components[name]),
             np.array(reference_components[name]),

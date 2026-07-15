@@ -77,6 +77,7 @@ _PME_ARRAY_NAMES = (
     "pme_assignment_order",
     "pme_charge_tolerance",
     "pme_deconvolve_assignment",
+    "pme_background_policy",
 )
 
 
