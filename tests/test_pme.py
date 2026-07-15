@@ -706,6 +706,96 @@ def test_pme_readiness_accepts_charged_uniform_background_policy():
     assert report["blockers"] == ()
 
 
+def test_pme_readiness_admits_94k_atoms_and_maximum_validated_mesh():
+    atom_count = 94_232
+    charges = np.zeros((atom_count,), dtype=np.float32)
+    charges[0] = -44.0
+    report = pme_readiness_report(
+        atom_count=atom_count,
+        charges=charges,
+        cell_lengths=np.asarray([120.0, 120.0, 90.0], dtype=np.float32),
+        cell_matrix=np.diag([120.0, 120.0, 90.0]).astype(np.float32),
+        config=PMEConfig(
+            mesh_shape=(128, 128, 64),
+            alpha=0.35,
+            real_cutoff=10.0,
+            assignment_order=5,
+            background_policy="uniform_neutralizing_plasma",
+        ),
+        nonbonded_cutoff=10.0,
+        exclusion_count=0,
+        one_four_count=0,
+        explicit_exception_count=0,
+    )
+
+    assert report["status"] == "ready"
+    assert report["mesh_points"] == 1_048_576
+    assert report["runtime_envelope"]["max_atoms"] == 100_000
+    assert report["runtime_envelope"]["max_mesh_points"] == 1_048_576
+    assert report["checks"]["orthorhombic_cell"] is True
+    assert report["checks"]["minimum_image_cutoff"] is True
+
+
+@pytest.mark.parametrize(
+    ("atom_count", "mesh_shape", "cell_matrix", "cutoff", "expected"),
+    [
+        (100_001, (16, 16, 16), None, 5.0, "atom_count:outside_pme_runtime_envelope"),
+        (
+            4,
+            (256, 128, 64),
+            None,
+            5.0,
+            "mesh_points:outside_pme_runtime_envelope",
+        ),
+        (
+            4,
+            (16, 16, 16),
+            np.asarray([[12.0, 0.0, 0.0], [1.0, 12.0, 0.0], [0.0, 0.0, 12.0]]),
+            5.0,
+            "cell_shape:orthorhombic_required",
+        ),
+        (4, (16, 16, 16), None, 7.0, "pme_cutoff:exceeds_half_minimum_box_length"),
+    ],
+)
+def test_pme_readiness_rejects_independent_plan_envelope_limits(
+    atom_count,
+    mesh_shape,
+    cell_matrix,
+    cutoff,
+    expected,
+):
+    report = pme_readiness_report(
+        atom_count=atom_count,
+        charges=np.zeros((atom_count,), dtype=np.float32),
+        cell_lengths=np.asarray([12.0, 12.0, 12.0], dtype=np.float32),
+        cell_matrix=cell_matrix,
+        config=PMEConfig(mesh_shape=mesh_shape, alpha=0.35, real_cutoff=cutoff),
+        nonbonded_cutoff=cutoff,
+        exclusion_count=0,
+        one_four_count=0,
+        explicit_exception_count=0,
+    )
+
+    assert report["status"] == "blocked"
+    assert any(str(blocker).startswith(expected) for blocker in report["blockers"])
+
+
+def test_pme_readiness_rejects_nonbonded_cutoff_mismatch():
+    report = pme_readiness_report(
+        atom_count=4,
+        charges=np.zeros((4,), dtype=np.float32),
+        cell_lengths=np.asarray([12.0, 12.0, 12.0], dtype=np.float32),
+        config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0),
+        nonbonded_cutoff=4.0,
+        exclusion_count=0,
+        one_four_count=0,
+        explicit_exception_count=0,
+    )
+
+    assert report["checks"]["cutoff_match"] is False
+    assert "pme_cutoff:mismatch_with_nonbonded_cutoff" in report["blockers"]
+
+
 def test_pme_platform_readiness_report_uses_shared_schema():
     report = pme_platform_readiness_report(
         atom_count=4,

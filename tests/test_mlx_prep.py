@@ -83,6 +83,10 @@ def _pme_prepared_system(assignment_order: int):
             "charge_tolerance": 1e-5,
             "background_policy": "reject_non_neutral",
         },
+        protocol_metadata={
+            **prepared.metadata.protocol_metadata,
+            "nonbonded": {"cutoff": 5.0},
+        },
         compatibility_report={
             **prepared.metadata.compatibility_report,
             "electrostatics_model": "pme",

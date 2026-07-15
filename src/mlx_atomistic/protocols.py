@@ -271,6 +271,7 @@ def run_minimize_then_nvt(
     constraints: DistanceConstraints | None = None,
     unit_system: MDUnitSystem | None = None,
     neighbor_manager: NeighborListManager | None = None,
+    pressure_diagnostics: bool = True,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> ProtocolResult:
     """Run minimization, optional NVT equilibration, and NVT production in MLX."""
@@ -326,6 +327,7 @@ def run_minimize_then_nvt(
                 sample_interval=max(1, protocol.equilibration_steps),
                 diagnostic_interval=max(1, protocol.equilibration_steps),
                 compile_force_evaluator=protocol.compile_force_evaluator,
+                pressure_diagnostics=pressure_diagnostics,
                 **simulation_units,
             ),
             thermostat=thermostat,
@@ -361,6 +363,7 @@ def run_minimize_then_nvt(
             sample_interval=protocol.sample_interval,
             diagnostic_interval=protocol.diagnostic_interval,
             compile_force_evaluator=protocol.compile_force_evaluator,
+            pressure_diagnostics=pressure_diagnostics,
             **simulation_units,
         ),
         thermostat=thermostat,

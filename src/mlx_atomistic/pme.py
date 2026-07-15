@@ -23,7 +23,8 @@ from mlx_atomistic.runtime import ReadinessReport
 
 PME_EXECUTION_BACKEND = "mlx_fft_cic"
 PME_PRODUCTION_EXECUTABLE = True
-PME_PRODUCTION_MAX_ATOMS = 4096
+PME_PRODUCTION_MAX_ATOMS = 100_000
+PME_PRODUCTION_MAX_MESH_POINTS = 1_048_576
 PME_SUPPORTED_ASSIGNMENT_ORDERS = (2, 4, 5)
 PME_BACKGROUND_POLICIES = (
     "reject_non_neutral",
@@ -540,6 +541,7 @@ def pme_readiness_report(
     exclusion_count: int,
     one_four_count: int,
     explicit_exception_count: int,
+    cell_matrix: object | None = None,
 ) -> dict[str, object]:
     """Return fail-closed PME readiness metadata for production run gates.
 
@@ -552,6 +554,8 @@ def pme_readiness_report(
         exclusion_count: Number of excluded pairs.
         one_four_count: Number of 1-4 corrected pairs.
         explicit_exception_count: Number of explicit nonbonded exceptions.
+        cell_matrix: Optional full cell matrix used to assert the orthorhombic
+            execution envelope. ``None`` treats valid lengths as orthorhombic.
 
     Returns:
         A readiness dict with a ``"status"``, a ``"blockers"`` list, and the
@@ -573,11 +577,45 @@ def pme_readiness_report(
             f"atom_count={int(atom_count)},max_atoms={PME_PRODUCTION_MAX_ATOMS}"
         )
 
+    box = np.asarray(cell_lengths, dtype=np.float64)
+    checks["box"] = bool(box.shape == (3,) and np.all(np.isfinite(box)) and np.all(box > 0.0))
+    if not checks["box"]:
+        blockers.append("box:missing_or_invalid")
+    if cell_matrix is None:
+        checks["orthorhombic_cell"] = checks["box"]
+    else:
+        matrix = np.asarray(cell_matrix, dtype=np.float64)
+        diagonal = np.diag(np.diag(matrix)) if matrix.shape == (3, 3) else None
+        checks["orthorhombic_cell"] = bool(
+            checks["box"]
+            and matrix.shape == (3, 3)
+            and np.all(np.isfinite(matrix))
+            and diagonal is not None
+            and np.allclose(matrix, diagonal, rtol=0.0, atol=1e-7)
+            and np.allclose(np.abs(np.diag(matrix)), box, rtol=1e-6, atol=1e-7)
+        )
+    if not checks["orthorhombic_cell"]:
+        blockers.append("cell_shape:orthorhombic_required")
+
     background_policy: PMEBackgroundPolicy = "reject_non_neutral"
-    if config is None:
+    mesh_points: int | None = None
+    if config is None or not isinstance(config, PMEConfig):
         checks["config"] = False
         blockers.append("pme_config:missing")
         charge_tolerance = 1e-5
+        for name in (
+            "mesh_shape",
+            "mesh_points",
+            "alpha",
+            "cutoff",
+            "cutoff_match",
+            "minimum_image_cutoff",
+            "assignment_order",
+            "deconvolve_assignment",
+            "background_policy",
+            "charge_tolerance",
+        ):
+            checks[name] = False
     else:
         checks["config"] = True
         charge_tolerance = float(config.charge_tolerance)
@@ -585,6 +623,14 @@ def pme_readiness_report(
         checks["mesh_shape"] = (
             len(config.mesh_shape) == 3
             and all(isinstance(size, int) and size >= 4 for size in config.mesh_shape)
+        )
+        if checks["mesh_shape"]:
+            mesh_points = int(config.mesh_shape[0]) * int(config.mesh_shape[1]) * int(
+                config.mesh_shape[2]
+            )
+        checks["mesh_points"] = bool(
+            mesh_points is not None
+            and 0 < mesh_points <= PME_PRODUCTION_MAX_MESH_POINTS
         )
         checks["alpha"] = np.isfinite(float(config.alpha)) and float(config.alpha) > 0.0
         checks["cutoff"] = (
@@ -595,9 +641,49 @@ def pme_readiness_report(
             and np.isfinite(float(nonbonded_cutoff))
             and float(nonbonded_cutoff) > 0.0
         )
-        for name in ("mesh_shape", "alpha", "cutoff"):
+        checks["cutoff_match"] = bool(
+            checks["cutoff"]
+            and np.isclose(
+                float(config.real_cutoff),
+                float(nonbonded_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+        )
+        checks["minimum_image_cutoff"] = bool(
+            checks["cutoff"]
+            and checks["box"]
+            and float(config.real_cutoff) <= 0.5 * float(np.min(box)) + 1e-7
+        )
+        checks["assignment_order"] = bool(
+            isinstance(config.assignment_order, int)
+            and config.assignment_order in PME_SUPPORTED_ASSIGNMENT_ORDERS
+        )
+        checks["deconvolve_assignment"] = isinstance(config.deconvolve_assignment, bool)
+        checks["background_policy"] = config.background_policy in PME_BACKGROUND_POLICIES
+        checks["charge_tolerance"] = bool(
+            np.isfinite(charge_tolerance) and charge_tolerance >= 0.0
+        )
+        for name in (
+            "mesh_shape",
+            "alpha",
+            "cutoff",
+            "assignment_order",
+            "deconvolve_assignment",
+            "background_policy",
+            "charge_tolerance",
+        ):
             if not checks[name]:
                 blockers.append(f"pme_{name}:invalid")
+        if not checks["mesh_points"]:
+            blockers.append(
+                "mesh_points:outside_pme_runtime_envelope:"
+                f"mesh_points={mesh_points},max_mesh_points={PME_PRODUCTION_MAX_MESH_POINTS}"
+            )
+        if not checks["cutoff_match"]:
+            blockers.append("pme_cutoff:mismatch_with_nonbonded_cutoff")
+        if not checks["minimum_image_cutoff"]:
+            blockers.append("pme_cutoff:exceeds_half_minimum_box_length")
 
     charge_values = np.asarray(charges, dtype=np.float64)
     net_charge = float(np.sum(charge_values, dtype=np.float64)) if charge_values.size else 0.0
@@ -611,7 +697,10 @@ def pme_readiness_report(
         and np.all(np.isfinite(charge_values))
         and (
             checks["neutrality"]
-            or background_policy == "uniform_neutralizing_plasma"
+            or (
+                checks.get("background_policy", False)
+                and background_policy == "uniform_neutralizing_plasma"
+            )
         )
     )
     if not checks["charge_policy"]:
@@ -619,11 +708,6 @@ def pme_readiness_report(
             "charge_policy:non_neutral_requires_uniform_neutralizing_plasma:"
             f"net_charge={net_charge:g}"
         )
-
-    box = np.asarray(cell_lengths, dtype=np.float64)
-    checks["box"] = bool(box.shape == (3,) and np.all(np.isfinite(box)) and np.all(box > 0.0))
-    if not checks["box"]:
-        blockers.append("box:missing_or_invalid")
 
     checks["exclusions"] = int(exclusion_count) >= 0
     checks["one_four_corrections"] = int(one_four_count) >= 0
@@ -639,19 +723,23 @@ def pme_readiness_report(
         "atom_count": int(atom_count),
         "net_charge": net_charge,
         "background_policy": background_policy,
-        "mesh_shape": None if config is None else config.mesh_shape,
-        "alpha": None if config is None else float(config.alpha),
-        "real_cutoff": None if config is None else config.real_cutoff,
+        "mesh_shape": None if not isinstance(config, PMEConfig) else config.mesh_shape,
+        "mesh_points": mesh_points,
+        "alpha": None if not isinstance(config, PMEConfig) else float(config.alpha),
+        "real_cutoff": None if not isinstance(config, PMEConfig) else config.real_cutoff,
         "nonbonded_cutoff": nonbonded_cutoff,
-        "assignment_order": None if config is None else config.assignment_order,
+        "assignment_order": None
+        if not isinstance(config, PMEConfig)
+        else config.assignment_order,
         "exclusion_count": int(exclusion_count),
         "one_four_count": int(one_four_count),
         "explicit_exception_count": int(explicit_exception_count),
         "runtime_envelope": {
             "max_atoms": PME_PRODUCTION_MAX_ATOMS,
+            "max_mesh_points": PME_PRODUCTION_MAX_MESH_POINTS,
             "cell": "orthorhombic",
             "assignment": None
-            if config is None
+            if not isinstance(config, PMEConfig)
             else f"cardinal_b_spline_order_{config.assignment_order}",
             "supported_assignment_orders": PME_SUPPORTED_ASSIGNMENT_ORDERS,
         },
@@ -677,6 +765,7 @@ def pme_platform_readiness_report(
     exclusion_count: int,
     one_four_count: int,
     explicit_exception_count: int,
+    cell_matrix: object | None = None,
 ) -> ReadinessReport:
     """Return PME readiness using the shared platform readiness schema.
 
@@ -689,6 +778,7 @@ def pme_platform_readiness_report(
         exclusion_count: Number of excluded pairs.
         one_four_count: Number of 1-4 corrected pairs.
         explicit_exception_count: Number of explicit nonbonded exceptions.
+        cell_matrix: Optional full cell matrix for the orthorhombic-envelope check.
 
     Returns:
         A `ReadinessReport` (name ``"pme"``, status, blockers, and the
@@ -704,6 +794,7 @@ def pme_platform_readiness_report(
         exclusion_count=exclusion_count,
         one_four_count=one_four_count,
         explicit_exception_count=explicit_exception_count,
+        cell_matrix=cell_matrix,
     )
     return ReadinessReport(
         name="pme",

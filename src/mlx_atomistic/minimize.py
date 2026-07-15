@@ -43,7 +43,7 @@ def _energy_forces(
     neighbor_manager: NeighborListManager | None,
 ):
     neighbor_list = neighbor_manager.update(positions) if neighbor_manager is not None else None
-    pairs = None if neighbor_list is None else neighbor_list.pairs
+    pairs = None if neighbor_list is None else neighbor_list.interactions
     return _energy_forces_from_terms(positions, terms, cell=cell, pairs=pairs)
 
 
