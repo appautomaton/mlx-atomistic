@@ -28,6 +28,11 @@ from mlx_atomistic.prep.topology_import import (
 )
 
 GPCRMD_DATA_DOWNLOAD_DOCS_URL = "https://gpcrmd-docs.readthedocs.io/en/latest/data-download.html"
+GPCRMD_API_DOCS_URL = "https://gpcrmd-docs.readthedocs.io/en/latest/api.html"
+GPCRMD_DYNAMICS_METADATA_URL_TEMPLATE = (
+    "https://www.gpcrmd.org/api/search_dyn/info/{dynamics_id}"
+)
+GPCRMD_FILE_DOWNLOAD_REQUIRES_ACCOUNT = True
 GPCRMD_IMPORT_REPORT_NAME = "gpcrmd_import_report.json"
 
 REQUIRED_FILE_ROLES = frozenset({"model", "topology", "parameters", "protocol", "trajectory"})
@@ -66,6 +71,7 @@ class GPCRmdFile:
     file_id: int
     label: str
     format_hint: str | None = None
+    filename_hint: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +79,7 @@ class GPCRmdFile:
             "file_id": self.file_id,
             "label": self.label,
             "format_hint": self.format_hint,
+            "filename_hint": self.filename_hint,
         }
 
     @classmethod
@@ -83,6 +90,11 @@ class GPCRmdFile:
             label=str(payload["label"]),
             format_hint=(
                 None if payload.get("format_hint") is None else str(payload["format_hint"])
+            ),
+            filename_hint=(
+                None
+                if payload.get("filename_hint") is None
+                else str(payload["filename_hint"])
             ),
         )
 
@@ -456,16 +468,41 @@ def default_gpcrmd_targets() -> tuple[GPCRmdTarget, ...]:
             accumulated_time_us=1.5,
             periodic_box_expected=True,
             files=(
-                GPCRmdFile("topology", 15286, "Topology file", "topology"),
+                GPCRmdFile(
+                    "topology",
+                    15286,
+                    "Topology file",
+                    "topology",
+                    "15286_dyn_729.psf",
+                ),
                 GPCRmdFile("trajectory", 15287, "Trajectory file replica 1", "trajectory"),
                 GPCRmdFile("trajectory", 15288, "Trajectory file replica 2", "trajectory"),
                 GPCRmdFile("trajectory", 15289, "Trajectory file replica 3", "trajectory"),
-                GPCRmdFile("model", 17686, "Model file", "coordinates"),
-                GPCRmdFile("parameters", 15290, "Parameters file", "parameters"),
-                GPCRmdFile("protocol", 17687, "Others file", "starting files"),
+                GPCRmdFile(
+                    "model",
+                    17686,
+                    "Model file",
+                    "coordinates",
+                    "17686_dyn_729.pdb",
+                ),
+                GPCRmdFile(
+                    "parameters",
+                    15290,
+                    "Parameters file",
+                    "parameters",
+                    "15290_prm_729.prm",
+                ),
+                GPCRmdFile(
+                    "protocol",
+                    17687,
+                    "Others file",
+                    "starting files",
+                    "17687_oth_729",
+                ),
             ),
             reference_urls=(
                 GPCRMD_DATA_DOWNLOAD_DOCS_URL,
+                GPCRMD_API_DOCS_URL,
                 "https://doi.org/10.1038/s41467-025-57034-y",
             ),
             selection_reason=(
@@ -476,6 +513,7 @@ def default_gpcrmd_targets() -> tuple[GPCRmdTarget, ...]:
             notes=(
                 "Large system; this target is expected to stress missing PME/lipid/scale support.",
                 "GPCRmd reference trajectory is comparison context, not an MLX trajectory.",
+                "GPCRmd file downloads require an authenticated account; metadata remains public.",
             ),
         ),
     )
@@ -1736,7 +1774,10 @@ def _status_for_expected_file(
 
 
 __all__ = [
+    "GPCRMD_API_DOCS_URL",
     "GPCRMD_DATA_DOWNLOAD_DOCS_URL",
+    "GPCRMD_DYNAMICS_METADATA_URL_TEMPLATE",
+    "GPCRMD_FILE_DOWNLOAD_REQUIRES_ACCOUNT",
     "GPCRMD_IMPORT_REPORT_NAME",
     "GPCRmdCacheFileStatus",
     "GPCRmdCacheInspection",
