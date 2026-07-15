@@ -41,6 +41,7 @@ from mlx_atomistic.nonbonded import (
 )
 from mlx_atomistic.pme import (
     PMEConfig,
+    PMEExecutionPlan,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
@@ -874,6 +875,7 @@ class NonbondedPotential:
     backend: NonbondedBackend = "auto"
     ewald_config: EwaldReferenceConfig | None = None
     pme_config: PMEConfig | None = None
+    pme_plan: PMEExecutionPlan | None = None
     tile_size: int = 512
     memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
     lambda_lj: float = 1.0
@@ -1139,6 +1141,18 @@ class NonbondedPotential:
                     f"net_charge={net_charge:g}"
                 )
                 raise ValueError(msg)
+            if self.pme_plan is not None:
+                if not isinstance(self.pme_plan, PMEExecutionPlan):
+                    msg = "pme_plan must be a PMEExecutionPlan instance"
+                    raise TypeError(msg)
+                self.pme_plan.validate(
+                    self.pme_plan.cell,
+                    config=self.pme_config,
+                    coulomb_constant=self.coulomb_constant,
+                )
+        elif self.pme_plan is not None:
+            msg = "pme_plan requires electrostatics='pme'"
+            raise ValueError(msg)
         object.__setattr__(self, "sigma", sigma)
         object.__setattr__(self, "epsilon", epsilon)
         object.__setattr__(self, "charges", charges)
@@ -1177,6 +1191,64 @@ class NonbondedPotential:
         object.__setattr__(self, "lambda_electrostatics", float(self.lambda_electrostatics))
         object.__setattr__(self, "_pair_scale_cache", None)
         object.__setattr__(self, "_block_scale_cache", None)
+
+    def build_pme_plan(self, cell: Cell) -> PMEExecutionPlan:
+        """Build a compatible fixed-cell PME execution plan for this potential.
+
+        Args:
+            cell: Orthorhombic periodic cell to bind.
+
+        Returns:
+            A materialized plan matching this potential's PME configuration and
+            Coulomb constant.
+
+        Raises:
+            ValueError: If this potential does not use PME electrostatics.
+        """
+
+        if self.electrostatics != "pme" or self.pme_config is None:
+            msg = "PME plan construction requires electrostatics='pme' and pme_config"
+            raise ValueError(msg)
+        return PMEExecutionPlan(
+            cell,
+            config=self.pme_config,
+            coulomb_constant=self.coulomb_constant,
+        )
+
+    def bind_pme_plan(self, plan: PMEExecutionPlan | Cell) -> NonbondedPotential:
+        """Return a copy explicitly bound to a compatible fixed-cell PME plan.
+
+        Args:
+            plan: Existing compatible plan, or an orthorhombic cell from which
+                to build one.
+
+        Returns:
+            A new potential that reuses the bound plan for every PME scope.
+
+        Raises:
+            ValueError: If this potential is not configured for PME or the plan
+                does not match its configuration.
+        """
+
+        execution_plan = self.build_pme_plan(plan) if isinstance(plan, Cell) else plan
+        if not isinstance(execution_plan, PMEExecutionPlan):
+            msg = "plan must be a PMEExecutionPlan or Cell"
+            raise TypeError(msg)
+        if self.electrostatics != "pme" or self.pme_config is None:
+            msg = "PME plan binding requires electrostatics='pme' and pme_config"
+            raise ValueError(msg)
+        execution_plan.validate(
+            execution_plan.cell,
+            config=self.pme_config,
+            coulomb_constant=self.coulomb_constant,
+        )
+        return replace(self, pme_plan=execution_plan)
+
+    @property
+    def pme_plan_diagnostics(self) -> dict[str, object] | None:
+        """Diagnostics for the bound PME plan, or ``None`` when unbound."""
+
+        return None if self.pme_plan is None else self.pme_plan.diagnostics
 
     @property
     def has_exceptions(self) -> bool:
@@ -2201,6 +2273,7 @@ class NonbondedPotential:
             coulomb_constant=self.coulomb_constant,
             config=self.pme_config,
             direct_space_pairs=direct_space_pairs,
+            plan=self.pme_plan,
         )
         correction_energy, correction_forces, correction_components = (
             self._periodic_coulomb_corrections(positions, cell)
@@ -2246,6 +2319,7 @@ class NonbondedPotential:
             coulomb_constant=self.coulomb_constant,
             config=self.pme_config,
             direct_space_pairs=direct_space_pairs,
+            plan=self.pme_plan,
         )
         correction_energy, correction_forces, _ = self._periodic_coulomb_corrections(
             positions,
@@ -2285,6 +2359,7 @@ class NonbondedPotential:
             coulomb_constant=self.coulomb_constant,
             config=self.pme_config,
             pairs=direct_space_pairs,
+            plan=self.pme_plan,
         )
         correction_energy, correction_forces, _ = self._periodic_coulomb_corrections(
             positions,
@@ -2316,6 +2391,7 @@ class NonbondedPotential:
             cell,
             coulomb_constant=self.coulomb_constant,
             config=self.pme_config,
+            plan=self.pme_plan,
         )
 
     def _validated_pme_direct_space_pairs(
@@ -2334,7 +2410,12 @@ class NonbondedPotential:
                 "pme_production_direct_space_requires_neighbor_blocks"
             )
             raise ValueError(msg)
-        report = pme_direct_space_policy_report(cell, config=self.pme_config, pairs=pairs)
+        report = pme_direct_space_policy_report(
+            cell,
+            config=self.pme_config,
+            pairs=pairs,
+            plan=self.pme_plan,
+        )
         if report["uses_shared_neighbor_policy"]:
             return pairs
         reason = report.get("fallback_reason") or "pme_direct_space_shared_policy_unsupported"

@@ -142,7 +142,7 @@ from mlx_atomistic.nonbonded import (
     normalize_nonbonded_electrostatics,
     validate_nonbonded_electrostatics,
 )
-from mlx_atomistic.pme import PMEConfig
+from mlx_atomistic.pme import PMEConfig, PMEExecutionPlan, PMEPlanMismatchError
 from mlx_atomistic.protocols import (
     MinimizeThenNVTProtocol,
     ProtocolResult,
@@ -264,6 +264,8 @@ __all__ = [
     "OptionalTrajectoryDependencyError",
     "PBEExchangeCorrelation",
     "PMEConfig",
+    "PMEExecutionPlan",
+    "PMEPlanMismatchError",
     "PairRestrictedNonbondedPotential",
     "PlatformBoundaryReport",
     "PlatformBoundarySection",

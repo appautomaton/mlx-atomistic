@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from mlx_atomistic import PMEConfig as ExportedPMEConfig
+from mlx_atomistic import PMEExecutionPlan as ExportedPMEExecutionPlan
 from mlx_atomistic import RBDihedralPotential as ExportedRBDihedralPotential
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import (
@@ -19,7 +20,7 @@ from mlx_atomistic.forcefields import (
 from mlx_atomistic.md import LennardJonesPotential
 from mlx_atomistic.neighbors import build_neighbor_list
 from mlx_atomistic.nonbonded import EwaldReferenceConfig, ewald_reference_coulomb_energy_forces
-from mlx_atomistic.pme import PMEConfig, pme_coulomb_energy_forces
+from mlx_atomistic.pme import PMEConfig, PMEExecutionPlan, pme_coulomb_energy_forces
 from mlx_atomistic.topology import Topology
 
 
@@ -91,6 +92,10 @@ def test_rb_dihedral_is_package_export():
 
 def test_pme_config_is_package_export():
     assert ExportedPMEConfig is PMEConfig
+
+
+def test_pme_execution_plan_is_package_export():
+    assert ExportedPMEExecutionPlan is PMEExecutionPlan
 
 
 def test_rb_dihedral_reference_expression_uses_periodic_angle_minus_pi():
@@ -747,6 +752,71 @@ def test_nonbonded_pme_matches_standalone_pme_without_lj():
         )
     assert components["pme_diagnostics"].mesh_shape == (24, 24, 24)
     assert components["pme_diagnostics"].assignment_order == 2
+
+
+def test_nonbonded_pme_binds_and_reuses_one_execution_plan():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([1.0, -0.5, -0.5], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    bound = term.bind_pme_plan(cell)
+    assert bound is not term
+    assert term.pme_plan is None
+    assert isinstance(bound.pme_plan, PMEExecutionPlan)
+    assert bound.pme_plan_diagnostics["reuse_count"] == 0
+
+    first_energy, first_forces = bound.energy_forces(positions, cell)
+    second_energy, second_forces = bound.energy_forces_for_scope(
+        positions,
+        cell,
+        scope="total",
+    )
+    third_energy, third_forces, components = bound.energy_forces_with_components(
+        positions,
+        cell,
+    )
+
+    assert bound.pme_plan.build_count == 1
+    assert bound.pme_plan.reuse_count == 3
+    assert bound.pme_plan_diagnostics["fingerprint"] == bound.pme_plan.fingerprint
+    assert components["pme_diagnostics"].plan_fingerprint == bound.pme_plan.fingerprint
+    assert components["pme_diagnostics"].plan_reuse_count == 3
+    np.testing.assert_allclose(np.asarray(second_energy), np.asarray(first_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(third_energy), np.asarray(first_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(second_forces), np.asarray(first_forces), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(third_forces), np.asarray(first_forces), atol=1e-6)
+
+
+def test_nonbonded_pme_rejects_incompatible_bound_plan():
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    incompatible = PMEExecutionPlan(
+        cell,
+        config=PMEConfig(mesh_shape=(20, 16, 16), alpha=0.35, real_cutoff=5.0),
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0],
+        epsilon=[0.0, 0.0],
+        charges=[1.0, -1.0],
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    with pytest.raises(ValueError, match="pme_execution_plan_mismatch"):
+        term.bind_pme_plan(incompatible)
 
 
 @pytest.mark.parametrize("assignment_order", [4, 5])

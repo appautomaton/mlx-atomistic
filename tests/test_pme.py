@@ -1,12 +1,15 @@
 import numpy as np
 import pytest
 
+import mlx_atomistic.pme as pme_module
 from mlx_atomistic.benchmarks import ewald_reference
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.neighbors import build_neighbor_list
 from mlx_atomistic.nonbonded import EwaldReferenceConfig, ewald_reference_coulomb_energy_forces
 from mlx_atomistic.pme import (
     PMEConfig,
+    PMEExecutionPlan,
+    PMEPlanMismatchError,
     _assign_charges_bspline_mx,
     _assign_charges_cic_mx,
     _influence_function_mx,
@@ -56,6 +59,128 @@ def test_pme_config_rejects_unsupported_assignment_orders(assignment_order):
 def test_pme_config_rejects_unknown_background_policy():
     with pytest.raises(ValueError, match="background_policy"):
         PMEConfig(background_policy="implicit_magic")
+
+
+def test_pme_execution_plan_materializes_once_and_reuses_all_force_scopes(monkeypatch):
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    setup_calls = 0
+    original = pme_module._influence_function_mx
+
+    def counted_influence(*args, **kwargs):
+        nonlocal setup_calls
+        setup_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pme_module, "_influence_function_mx", counted_influence)
+    plan = PMEExecutionPlan(cell, config=config)
+    matching_plan = PMEExecutionPlan.build(cell, config=config)
+
+    total_energy, total_forces = pme_coulomb_total_energy_forces(
+        _positions(),
+        _charges(),
+        cell,
+        config=config,
+        plan=plan,
+    )
+    component_energy, component_forces, components = pme_coulomb_energy_forces(
+        _positions(),
+        _charges(),
+        cell,
+        plan=plan,
+    )
+    direct_energy, direct_forces = pme_coulomb_direct_space_energy_forces(
+        _positions(),
+        _charges(),
+        cell,
+        config=config,
+        plan=plan,
+    )
+    reciprocal_energy, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
+        _positions(),
+        _charges(),
+        cell,
+        config=config,
+        plan=plan,
+    )
+
+    assert setup_calls == 2
+    assert matching_plan.fingerprint == plan.fingerprint
+    assert plan.build_count == 1
+    assert plan.reuse_count == 4
+    assert plan.setup_seconds >= 0.0
+    assert plan.estimated_resident_bytes == 16 * 16 * 16 * 4 * 4
+    assert plan.diagnostics["backend"] == "mlx_fft_cic"
+    assert plan.diagnostics["dtype"] == "float32"
+    assert plan.diagnostics["reuse_count"] == 4
+    assert components["diagnostics"].plan_fingerprint == plan.fingerprint
+    assert components["diagnostics"].plan_build_count == 1
+    assert components["diagnostics"].plan_reuse_count == 2
+    np.testing.assert_allclose(np.asarray(component_energy), np.asarray(total_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(component_forces), np.asarray(total_forces), atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(direct_energy + reciprocal_energy),
+        np.asarray(total_energy),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(direct_forces + reciprocal_forces),
+        np.asarray(total_forces),
+        atol=1e-6,
+    )
+
+
+def test_pme_execution_plan_rejects_mismatches_and_rebuilds_explicitly():
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    plan = PMEExecutionPlan(cell, config=config, coulomb_constant=2.0)
+
+    with pytest.raises(PMEPlanMismatchError, match="pme_execution_plan_mismatch") as error:
+        plan.validate(Cell.cubic(13.0), config=config, coulomb_constant=2.0)
+    assert "cell_matrix" in error.value.mismatches
+
+    with pytest.raises(PMEPlanMismatchError) as error:
+        plan.validate(
+            cell,
+            config=PMEConfig(mesh_shape=(20, 16, 16), alpha=0.35, real_cutoff=5.0),
+            coulomb_constant=2.0,
+        )
+    assert "mesh_shape" in error.value.mismatches
+
+    with pytest.raises(PMEPlanMismatchError) as error:
+        plan.validate(cell, config=config, coulomb_constant=3.0)
+    assert "coulomb_constant" in error.value.mismatches
+
+    with pytest.raises(PMEPlanMismatchError) as error:
+        plan.validate(cell, config=config, coulomb_constant=2.0, dtype="float16")
+    assert "dtype" in error.value.mismatches
+
+    with pytest.raises(PMEPlanMismatchError) as error:
+        plan.validate(cell, config=config, coulomb_constant=2.0, backend="other_backend")
+    assert "backend" in error.value.mismatches
+
+    rebuilt = plan.rebuild(cell=Cell.cubic(13.0))
+    assert rebuilt is not plan
+    assert rebuilt.fingerprint != plan.fingerprint
+    assert rebuilt.build_count == 1
+    assert rebuilt.reuse_count == 0
+
+
+def test_pme_execution_plan_mismatch_is_enforced_by_public_evaluator():
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    plan = PMEExecutionPlan(cell, config=config)
+
+    with pytest.raises(PMEPlanMismatchError, match="fields=alpha"):
+        pme_coulomb_total_energy_forces(
+            _positions(),
+            _charges(),
+            cell,
+            config=PMEConfig(mesh_shape=(16, 16, 16), alpha=0.4, real_cutoff=5.0),
+            plan=plan,
+        )
+
+    assert plan.reuse_count == 0
 
 
 def test_cic_charge_assignment_conserves_charge():
