@@ -942,7 +942,7 @@ def _common_manifest(
     cell_lengths: np.ndarray,
     config: PMEConfig,
 ) -> dict[str, Any]:
-    canonical_lengths = _rounded_list(cell_lengths, decimals=5)
+    canonical_lengths = _rounded_list(cell_lengths, decimals=4)
     matrix = np.diag(np.asarray(cell_lengths, dtype=np.float64))
     return {
         "schema_version": 1,
@@ -958,7 +958,7 @@ def _common_manifest(
         "cell": {
             "lengths_angstrom": canonical_lengths,
             "matrix_angstrom": [
-                _rounded_list(row, decimals=5) for row in matrix
+                _rounded_list(row, decimals=4) for row in matrix
             ],
             "shape": "orthorhombic",
         },
@@ -1026,7 +1026,7 @@ def _semantic_topology_manifest(
         "exception_count": int(exception["pairs"].shape[0]),
         "exclusion_count": int(exception["exclusion_pairs"].shape[0]),
         "active_exception_count": int(exception["active_pairs"].shape[0]),
-        "net_charge_e": round(float(np.sum(charges, dtype=np.float64)), 5),
+        "net_charge_e": round(float(np.sum(charges, dtype=np.float64)), 4),
         "raw_hashes": {
             "charges": array_hash(np.asarray(charges, dtype=np.float32)),
             "sigma": array_hash(np.asarray(sigma, dtype=np.float32)),

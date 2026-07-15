@@ -10,6 +10,7 @@ import pytest
 from mlx_atomistic.benchmarks import (
     NORMALIZED_BENCHMARK_FIELDS,
     cadence_sensitivity,
+    charged_pme,
     dft_geometry,
     dft_nonlocal,
     dft_operator,
@@ -1640,6 +1641,72 @@ def test_charged_pme_same_workload_ratio_requires_full_manifest_match():
     assert mismatched["status"] == "diagnostic"
     assert mismatched["ratio"] is None
     assert mismatched["blocker"] == "pme_parameters differs; ratio suppressed"
+
+
+def test_charged_pme_runtime_missing_artifact_is_blocked_and_written(tmp_path):
+    out = tmp_path / "runtime.json"
+
+    payload = charged_pme.runtime_payload(
+        prepared=tmp_path / "missing",
+        warmups=1,
+        steps=2,
+        out=out,
+    )
+
+    assert payload["kind"] == charged_pme.RUNTIME_SCHEMA
+    assert payload["status"] == "blocked"
+    assert payload["passed"] is False
+    assert len(payload["blockers"]) == 2
+    assert json.loads(out.read_text())["blockers"] == payload["blockers"]
+
+
+def test_charged_pme_runtime_requires_warmup_and_two_measured_steps(tmp_path):
+    out = tmp_path / "runtime.json"
+
+    payload = charged_pme.runtime_payload(
+        prepared=tmp_path / "missing",
+        warmups=0,
+        steps=1,
+        out=out,
+    )
+
+    assert "warmups_must_be_positive" in payload["blockers"]
+    assert "measured_steps_must_be_at_least_two" in payload["blockers"]
+
+
+def test_charged_pme_profile_resolves_new_report_schema(tmp_path):
+    report_path = tmp_path / pme_performance.CHARGED_PARITY_REPORT_NAME
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    report_path.write_text(
+        json.dumps(
+            {
+                "kind": "mlx_atomistic.charged_pme_parity",
+                "status": "passed",
+                "passed": True,
+                "fixture": "amber20_jac",
+                "atom_count": 94232,
+                "force_metrics": {
+                    "energy_error_per_atom_kj_mol": 0.001,
+                    "maximum_absolute_kj_mol_nm": 1.0,
+                    "rms_absolute_kj_mol_nm": 0.1,
+                },
+                "mlx": {"pme_readiness": {"status": "ready"}},
+                "pme": {"mesh_shape": [128, 128, 64]},
+                "normalized_prepared": str(prepared),
+                "manifest_comparison": {"matched": True},
+            }
+        )
+    )
+
+    resolved_report, resolved_prepared = pme_performance._resolve_fixture_paths(tmp_path)
+    parity = pme_performance._load_parity_report(resolved_report)
+
+    assert resolved_report == report_path
+    assert resolved_prepared == prepared
+    assert parity["schema"] == "charged_pme_parity_v1"
+    assert parity["passed"] is True
+    assert parity["total_energy_abs_error_kj_mol"] == pytest.approx(94.232)
 
 
 def test_lammps_opencl_unsupported_fixture_reports_normalized_blocker():
