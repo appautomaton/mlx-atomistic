@@ -235,6 +235,7 @@ def _run_virtual_site_minimize_then_nvt(
     cell,
     constraints,
     unit_system,
+    pressure_diagnostics=True,
     reporters=None,
 ):
     simulation_units = {}
@@ -290,6 +291,7 @@ def _run_virtual_site_minimize_then_nvt(
                 sample_interval=max(1, protocol.equilibration_steps),
                 diagnostic_interval=max(1, protocol.equilibration_steps),
                 compile_force_evaluator=protocol.compile_force_evaluator,
+                pressure_diagnostics=pressure_diagnostics,
                 virtual_sites=virtual_sites,
                 **simulation_units,
             ),
@@ -310,6 +312,7 @@ def _run_virtual_site_minimize_then_nvt(
             sample_interval=protocol.sample_interval,
             diagnostic_interval=protocol.diagnostic_interval,
             compile_force_evaluator=protocol.compile_force_evaluator,
+            pressure_diagnostics=pressure_diagnostics,
             virtual_sites=virtual_sites,
             **simulation_units,
         ),
@@ -365,33 +368,131 @@ def _production_neighbor_manager(
 ) -> NeighborListManager | None:
     if not require_production:
         return None
+    lazy_terms = []
     for term in force_terms:
         topology = getattr(term, "topology", None)
-        cutoff = getattr(term, "cutoff", None)
-        electrostatics = getattr(term, "electrostatics", "cutoff")
         if topology is None or getattr(topology, "nonbonded_pair_policy", None) != "lazy":
             continue
-        if system.cell is None:
-            msg = "large GPCRmd runs require periodic cell-list neighbors"
-            raise ValueError(msg)
+        lazy_terms.append(term)
+    if not lazy_terms:
+        return None
+    if system.cell is None:
+        msg = "large GPCRmd runs require periodic cell-list neighbors"
+        raise ValueError(msg)
+
+    cutoffs: list[float] = []
+    uses_pme = False
+    for term in lazy_terms:
+        cutoff = getattr(term, "cutoff", None)
+        electrostatics = getattr(term, "electrostatics", "cutoff")
         if cutoff is None:
             msg = "large GPCRmd runs require a finite nonbonded cutoff"
             raise ValueError(msg)
-        if electrostatics != "cutoff":
+        cutoff_value = float(cutoff)
+        if not np.isfinite(cutoff_value) or cutoff_value <= 0.0:
+            msg = "large GPCRmd runs require a finite positive nonbonded cutoff"
+            raise ValueError(msg)
+        cutoffs.append(cutoff_value)
+        if electrostatics not in {"cutoff", "pme"}:
             msg = (
-                "large GPCRmd runs require the optimized cutoff neighbor route; "
+                "large GPCRmd runs require cutoff or PME compact neighbors; "
                 f"got electrostatics={electrostatics!r}"
             )
             raise ValueError(msg)
-        return NeighborListManager(
-            system.cell,
-            cutoff=float(cutoff),
-            skin=neighbor_skin,
-            check_interval=neighbor_check_interval,
-            sort_pairs=False,
-            max_workers=GPCRMD_NEIGHBOR_WORKERS,
+        if electrostatics == "pme":
+            uses_pme = True
+            pme_config = getattr(term, "pme_config", None)
+            if pme_config is None or pme_config.real_cutoff is None:
+                msg = "production PME neighbors require pme_config.real_cutoff"
+                raise ValueError(msg)
+            if not np.isclose(
+                cutoff_value,
+                float(pme_config.real_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            ):
+                msg = "production PME cutoff must match the nonbonded cutoff"
+                raise ValueError(msg)
+            if not system.cell.is_orthorhombic:
+                msg = "production PME neighbors require an orthorhombic cell"
+                raise ValueError(msg)
+            cell_lengths = np.asarray(system.cell.lengths, dtype=np.float64)
+            if cutoff_value > 0.5 * float(np.min(cell_lengths)) + 1e-7:
+                msg = "production PME cutoff must not exceed half the minimum box length"
+                raise ValueError(msg)
+    reference_cutoff = cutoffs[0]
+    if any(
+        not np.isclose(value, reference_cutoff, rtol=1e-6, atol=1e-7)
+        for value in cutoffs[1:]
+    ):
+        msg = "production compact-neighbor force terms require one shared cutoff"
+        raise ValueError(msg)
+    return NeighborListManager(
+        system.cell,
+        cutoff=reference_cutoff,
+        skin=neighbor_skin,
+        check_interval=neighbor_check_interval,
+        sort_pairs=False,
+        max_workers=GPCRMD_NEIGHBOR_WORKERS,
+        backend="mlx_cell_blocks" if uses_pme else "auto",
+    )
+
+
+def _bind_fixed_cell_pme_plans(
+    force_terms,
+    cell,
+    *,
+    require_production: bool,
+    use_npt: bool,
+):
+    terms = tuple(force_terms)
+    pme_terms = tuple(
+        term for term in terms if getattr(term, "electrostatics", None) == "pme"
+    )
+    if not require_production or not pme_terms:
+        return terms
+    if use_npt:
+        msg = "production PME execution plans currently support fixed-cell NVT only"
+        raise ValueError(msg)
+    if cell is None:
+        msg = "production PME execution plan requires a periodic cell"
+        raise ValueError(msg)
+
+    bound_terms = []
+    for term in terms:
+        if getattr(term, "electrostatics", None) != "pme":
+            bound_terms.append(term)
+            continue
+        existing_plan = getattr(term, "pme_plan", None)
+        if existing_plan is not None:
+            existing_plan.validate(
+                cell,
+                config=getattr(term, "pme_config", None),
+                coulomb_constant=float(getattr(term, "coulomb_constant", 1.0)),
+            )
+            bound_terms.append(term)
+            continue
+        binder = getattr(term, "bind_pme_plan", None)
+        if not callable(binder):
+            msg = "production PME force term does not expose bind_pme_plan"
+            raise TypeError(msg)
+        bound_terms.append(binder(cell))
+    return tuple(bound_terms)
+
+
+def _pme_execution_plan_diagnostics(force_terms) -> list[dict[str, object]]:
+    diagnostics = []
+    for term in force_terms:
+        plan = getattr(term, "pme_plan", None)
+        if plan is None:
+            continue
+        diagnostics.append(
+            {
+                "force_term": str(getattr(term, "name", type(term).__name__)),
+                **plan.diagnostics,
+            }
         )
-    return None
+    return diagnostics
 
 
 def _compile_force_evaluator_safe(force_terms) -> bool:
@@ -478,12 +579,21 @@ def run_mlx(
     platform_boundary = _platform_boundary_metadata()
     if diagnostic_interval is None:
         diagnostic_interval = sample_interval if require_production else 1
-    pressure_diagnostics = artifact.atom_count <= PRESSURE_DIAGNOSTIC_ATOM_LIMIT
-
     system, force_terms, constraints = build_mlx_system_from_artifact(
         artifact,
         restraint_k=restraint_k,
         constraint_max_iterations=constraint_max_iterations,
+    )
+    use_npt = protocol_report.metadata["ensemble"] == "NPT"
+    force_terms = _bind_fixed_cell_pme_plans(
+        force_terms,
+        system.cell,
+        require_production=require_production,
+        use_npt=use_npt,
+    )
+    bound_pme_plan = any(getattr(term, "pme_plan", None) is not None for term in force_terms)
+    pressure_diagnostics = (
+        artifact.atom_count <= PRESSURE_DIAGNOSTIC_ATOM_LIMIT and not bound_pme_plan
     )
     hmr_state = artifact.hmr_state
     compile_force_evaluator = _compile_force_evaluator_safe(force_terms)
@@ -536,7 +646,6 @@ def run_mlx(
     )
 
     run_started = time.perf_counter()
-    use_npt = protocol_report.metadata["ensemble"] == "NPT"
     pressure_internal = (
         ATM_TO_KJ_PER_MOL_ANGSTROM3
         if unit_system is not None and unit_system.coordinates == "angstrom"
@@ -607,6 +716,7 @@ def run_mlx(
                 constraints=constraints,
                 unit_system=unit_system,
                 neighbor_manager=neighbor_manager,
+                pressure_diagnostics=pressure_diagnostics,
                 reporters=reporters,
             )
         else:
@@ -620,6 +730,7 @@ def run_mlx(
                 cell=system.cell,
                 constraints=constraints,
                 unit_system=unit_system,
+                pressure_diagnostics=pressure_diagnostics,
                 reporters=reporters,
             )
         result = protocol_result.production
@@ -655,6 +766,10 @@ def run_mlx(
             reporters=reporters,
         )
     elapsed_wall_seconds = time.perf_counter() - run_started
+    pme_execution_plans = _pme_execution_plan_diagnostics(force_terms)
+    if pme_execution_plans:
+        result.nonbonded_report["pme_execution_plan_count"] = len(pme_execution_plans)
+        result.nonbonded_report["pme_execution_plans"] = pme_execution_plans
     if out is None and prepared_dir is not None:
         out = prepared_dir / TRAJECTORY_NAME
     if checkpoint_out is not None:
@@ -687,6 +802,7 @@ def run_mlx(
                 },
                 "platform_boundary": platform_boundary,
                 "hydrogen_mass_repartitioning": hmr_state,
+                "pme_execution_plans": pme_execution_plans,
             },
             runtime_sync_report=result.runtime_sync_report,
             runtime_nonbonded_report=result.nonbonded_report,
@@ -721,7 +837,11 @@ def run_mlx(
             "pressure_diagnostics_reason": (
                 None
                 if pressure_diagnostics
-                else "disabled_large_system_finite_difference_virial"
+                else (
+                    "disabled_bound_pme_without_analytic_virial"
+                    if bound_pme_plan
+                    else "disabled_large_system_finite_difference_virial"
+                )
             ),
             "elapsed_wall_seconds": elapsed_wall_seconds,
             "integration_steps_per_second": (
@@ -739,6 +859,7 @@ def run_mlx(
             ),
             "warnings": prepared_system.metadata.warnings,
             "nonbonded_runtime": result.nonbonded_report,
+            "pme_execution_plans": pme_execution_plans,
             "resume_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
             "hydrogen_mass_repartitioning": hmr_state,
         }
@@ -1334,6 +1455,13 @@ def _gpcrmd_electrostatics_report(
 
     arrays = artifact.arrays
     config = _pme_config_from_artifact(artifact.metadata, arrays, required=False)
+    protocol_metadata = dict(artifact.metadata.get("protocol_metadata", {}))
+    nonbonded_metadata = dict(protocol_metadata.get("nonbonded", {}))
+    nonbonded_cutoff = float(
+        artifact.metadata.get("nonbonded_cutoff")
+        or nonbonded_metadata.get("cutoff")
+        or 10.0
+    )
     topology = Topology.from_sequences(
         n_atoms=artifact.atom_count,
         bonds=np.asarray(arrays["bonds"], dtype=np.int32),
@@ -1346,18 +1474,23 @@ def _gpcrmd_electrostatics_report(
             dtype=np.int32,
         ),
         exclude_bonds=True,
-        nonbonded_cutoff=float(artifact.metadata.get("nonbonded_cutoff", 10.0)),
+        nonbonded_cutoff=nonbonded_cutoff,
     )
     report = pme_readiness_report(
         atom_count=artifact.atom_count,
         charges=arrays["charges"],
         cell_lengths=arrays.get("cell_lengths", np.asarray([])),
         config=config,
-        nonbonded_cutoff=float(artifact.metadata.get("nonbonded_cutoff", 10.0)),
+        nonbonded_cutoff=nonbonded_cutoff,
         exclusion_count=len(topology.exclusion_set),
         one_four_count=len(topology.one_four_set),
         explicit_exception_count=int(
             np.asarray(arrays.get("nonbonded_exception_pairs", np.empty((0, 2)))).shape[0]
+        ),
+        cell_matrix=(
+            None
+            if np.asarray(arrays.get("cell_matrix", np.asarray([]))).size == 0
+            else arrays["cell_matrix"]
         ),
     )
     return {

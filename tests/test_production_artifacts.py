@@ -15,6 +15,8 @@ from mlx_atomistic.artifacts import (
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.minimize import minimize_energy
+from mlx_atomistic.neighbors import NeighborBlocks
+from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.prep.io import (
     load_prepared_system,
     save_prepared_system,
@@ -732,7 +734,7 @@ def test_gpcrmd_short_range_prototype_report_is_explicitly_non_production(tmp_pa
     assert "not production GPCRmd PME" in report["warnings"][0]
 
 
-def test_gpcrmd_production_neighbor_manager_requires_optimized_cutoff_route():
+def test_gpcrmd_production_neighbor_manager_accepts_scalable_pme_blocks():
     from mlx_atomistic.prep.runner import GPCRMD_NEIGHBOR_SKIN, _production_neighbor_manager
 
     system = SimpleNamespace(cell=Cell.cubic(4.0))
@@ -747,13 +749,27 @@ def test_gpcrmd_production_neighbor_manager_requires_optimized_cutoff_route():
     assert manager is not None
     assert manager.skin == GPCRMD_NEIGHBOR_SKIN
 
-    pme_term = SimpleNamespace(topology=topology, cutoff=1.0, electrostatics="pme")
-    with pytest.raises(ValueError, match="optimized cutoff neighbor route"):
-        _production_neighbor_manager(
-            system,
-            (pme_term,),
-            require_production=True,
+    pme_term = SimpleNamespace(
+        topology=topology,
+        cutoff=1.0,
+        electrostatics="pme",
+        pme_config=PMEConfig(mesh_shape=(8, 8, 8), alpha=0.35, real_cutoff=1.0),
+    )
+    pme_manager = _production_neighbor_manager(
+        system,
+        (pme_term,),
+        require_production=True,
+    )
+    pme_neighbors = pme_manager.update(
+        np.asarray(
+            [[0.2, 0.2, 0.2], [0.8, 0.2, 0.2], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0]],
+            dtype=np.float32,
         )
+    )
+    assert pme_manager.backend == "mlx_cell_blocks"
+    assert pme_neighbors.backend == "mlx_cell_blocks"
+    assert isinstance(pme_neighbors.interactions, NeighborBlocks)
+    assert topology._nonbonded_pairs is None
 
     no_cell_system = SimpleNamespace(cell=None)
     with pytest.raises(ValueError, match="periodic cell-list neighbors"):
@@ -830,6 +846,10 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
             "charge_tolerance": 1e-5,
             "background_policy": "reject_non_neutral",
         },
+        protocol_metadata={
+            **prepared.metadata.protocol_metadata,
+            "nonbonded": {"cutoff": 5.0},
+        },
         compatibility_report={
             **prepared.metadata.compatibility_report,
             "electrostatics_model": "pme",
@@ -871,6 +891,59 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
     assert np.isfinite(float(np.asarray(energy)))
     assert np.all(np.isfinite(np.asarray(forces)))
     assert "pme_diagnostics" in components
+
+
+def test_run_mlx_binds_one_fixed_cell_pme_execution_plan(tmp_path):
+    from mlx_atomistic.io import load_npz_trajectory
+    from mlx_atomistic.prep.runner import run_mlx
+
+    prepared = _pme_fixture_with_config_arrays()
+    trajectory_path = tmp_path / "trajectory.npz"
+
+    result = run_mlx(
+        prepared,
+        out=trajectory_path,
+        require_production=True,
+        steps=1,
+        minimize_steps=1,
+        equilibration_steps=1,
+        sample_interval=1,
+        diagnostic_interval=1,
+        restraint_k=0.0,
+        temperature=0.0,
+        friction=0.0,
+    )
+    record = load_npz_trajectory(trajectory_path)
+
+    assert result.nonbonded_report["pme_execution_plan_count"] == 1
+    plan = result.nonbonded_report["pme_execution_plans"][0]
+    assert plan["build_count"] == 1
+    assert plan["reuse_count"] >= 3
+    assert plan["fingerprint"]
+    recorded_plan = record.metadata["pme_execution_plans"][0]
+    assert recorded_plan["fingerprint"] == plan["fingerprint"]
+    assert recorded_plan["reuse_count"] == plan["reuse_count"]
+
+
+def test_production_pme_execution_plan_does_not_promote_npt():
+    from mlx_atomistic.prep.runner import (
+        _artifact_from_prepared_system,
+        _bind_fixed_cell_pme_plans,
+    )
+
+    artifact = _artifact_from_prepared_system(
+        _pme_fixture_with_config_arrays(),
+        require_production=True,
+    )
+    system, terms, _ = build_mlx_system_from_artifact(artifact)
+
+    with pytest.raises(ValueError, match="fixed-cell NVT only"):
+        _bind_fixed_cell_pme_plans(
+            terms,
+            system.cell,
+            require_production=True,
+            use_npt=True,
+        )
 
 
 @pytest.mark.parametrize("assignment_order", [2, 4, 5])
@@ -945,6 +1018,10 @@ def _pme_fixture_with_config_arrays(assignment_order=2):
             "assignment_order": assignment_order,
             "charge_tolerance": 1e-5,
             "background_policy": "reject_non_neutral",
+        },
+        protocol_metadata={
+            **prepared.metadata.protocol_metadata,
+            "nonbonded": {"cutoff": 5.0},
         },
         compatibility_report={
             **prepared.metadata.compatibility_report,

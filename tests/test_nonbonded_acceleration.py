@@ -8,7 +8,8 @@ from mlx_atomistic.benchmarks import md_acceleration, md_performance
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate_nvt
-from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
+from mlx_atomistic.minimize import minimize_energy
+from mlx_atomistic.neighbors import NeighborBlocks, NeighborListManager, build_neighbor_list
 from mlx_atomistic.nonbonded import (
     DEFAULT_FULL_LOOP_DENSE_THRESHOLD,
     NonbondedExecutionConfig,
@@ -740,6 +741,73 @@ def test_lazy_mlx_cell_pairs_match_dense_topology_energy_and_forces():
     assert lazy_topology._nonbonded_pairs is None
     np.testing.assert_allclose(np.asarray(lazy_energy), np.asarray(dense_energy), rtol=1e-6)
     np.testing.assert_allclose(np.asarray(lazy_forces), np.asarray(dense_forces), rtol=1e-5)
+
+
+def test_lazy_pme_plan_uses_neighbor_blocks_without_materializing_topology_cache():
+    positions = _positions()
+    cell = Cell.cubic(6.0)
+    topology_kwargs = {
+        "n_atoms": 4,
+        "bonds": [(0, 1)],
+        "one_four_pairs": [(0, 3)],
+    }
+    eager_topology = Topology.from_sequences(
+        **topology_kwargs,
+        eager_nonbonded_pair_limit=None,
+    )
+    lazy_topology = Topology.from_sequences(
+        **topology_kwargs,
+        eager_nonbonded_pair_limit=0,
+    )
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=2.5)
+    potential_kwargs = {
+        "sigma": [1.0, 1.1, 0.9, 1.05],
+        "epsilon": [0.2, 0.3, 0.25, 0.35],
+        "charges": [0.25, -0.25, 0.1, -0.1],
+        "cutoff": 2.5,
+        "electrostatics": "pme",
+        "pme_config": config,
+        "lj_one_four_scale": 0.5,
+        "coulomb_one_four_scale": 0.75,
+    }
+    dense = NonbondedPotential(**potential_kwargs, topology=eager_topology)
+    lazy = NonbondedPotential(**potential_kwargs, topology=lazy_topology).bind_pme_plan(cell)
+    manager = NeighborListManager(
+        cell,
+        cutoff=2.5,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+    )
+    neighbors = manager.update(positions)
+
+    dense_energy, dense_forces = dense.energy_forces(positions, cell)
+    lazy_energy, lazy_forces = lazy.energy_forces(
+        positions,
+        cell,
+        pairs=neighbors.interactions,
+    )
+    _, _, components = lazy.energy_forces_with_components(
+        positions,
+        cell,
+        pairs=neighbors.interactions,
+    )
+    minimized = minimize_energy(
+        positions,
+        lazy,
+        cell=cell,
+        max_steps=0,
+        neighbor_manager=manager,
+    )
+
+    mx.eval(dense_energy, dense_forces, lazy_energy, lazy_forces)
+    assert isinstance(neighbors.interactions, NeighborBlocks)
+    assert lazy_topology._nonbonded_pairs is None
+    assert lazy.pme_plan.reuse_count == 3
+    assert np.isfinite(float(np.asarray(minimized.energy)))
+    assert components["pme_diagnostics"].direct_space_representation == "blocks"
+    assert components["pme_diagnostics"].direct_space_policy == "block_candidate"
+    np.testing.assert_allclose(np.asarray(lazy_energy), np.asarray(dense_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(lazy_forces), np.asarray(dense_forces), atol=1e-5)
 
 
 def test_backend_validation_and_memory_policy():
