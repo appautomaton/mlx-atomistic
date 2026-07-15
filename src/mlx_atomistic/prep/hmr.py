@@ -52,14 +52,15 @@ def apply_hydrogen_mass_repartitioning(
         msg = "min_heavy_atom_mass must be finite and non-negative"
         raise ValueError(msg)
     constraint_pairs = _constraint_pair_set(prepared.constraints)
+    heavy_atom_by_hydrogen = _bonded_heavy_atom_indices(
+        selected,
+        symbols=symbols,
+        bonds=bonds,
+    )
     hydrogen_records: list[dict[str, Any]] = []
     heavy_atoms: set[int] = set()
     for hydrogen_index in selected:
-        heavy_index = _bonded_heavy_atom_index(
-            hydrogen_index,
-            symbols=symbols,
-            bonds=bonds,
-        )
+        heavy_index = heavy_atom_by_hydrogen[hydrogen_index]
         if require_constraints and (
             min(hydrogen_index, heavy_index),
             max(hydrogen_index, heavy_index),
@@ -102,11 +103,24 @@ def apply_hydrogen_mass_repartitioning(
         raise ValueError(msg)
     final_masses = transformed.astype(input_masses.dtype, copy=False)
     final_total = float(np.sum(final_masses, dtype=np.float64))
+    final_tolerance = 1e-6
     if not np.isclose(total_before, final_total, rtol=0.0, atol=1e-6):
-        msg = (
-            "HMR final mass dtype conversion failed to preserve total mass; "
-            "use a floating mass dtype with sufficient precision"
-        )
+        if input_masses.dtype == np.dtype(np.float32):
+            # Large systems can accumulate more than 1e-6 Da of independent
+            # float32 rounding even though every H-heavy group conserves mass
+            # in float64. Preserve the transformed masses in float64 rather
+            # than silently accepting a system-size-dependent mass drift.
+            final_masses = transformed.copy()
+            final_total = float(np.sum(final_masses, dtype=np.float64))
+            final_tolerance = 1e-10
+        else:
+            msg = (
+                "HMR final mass dtype conversion failed to preserve total mass; "
+                "use a floating mass dtype with sufficient precision"
+            )
+            raise ValueError(msg)
+    if not np.isclose(total_before, final_total, rtol=0.0, atol=final_tolerance):
+        msg = "HMR failed to preserve total mass after storage-dtype selection"
         raise ValueError(msg)
     provenance = {
         "status": "represented_by_masses",
@@ -133,6 +147,8 @@ def apply_hydrogen_mass_repartitioning(
         ],
         "total_mass_before": total_before,
         "total_mass_after": final_total,
+        "input_mass_dtype": str(input_masses.dtype),
+        "stored_mass_dtype": str(final_masses.dtype),
     }
     if hydrogen_indices is not None:
         provenance["policy"]["hydrogen_indices"] = [int(index) for index in selected]
@@ -211,22 +227,26 @@ def _hmr_selection_label(
     return "explicit_hydrogen_indices"
 
 
-def _bonded_heavy_atom_index(
-    hydrogen_index: int,
+def _bonded_heavy_atom_indices(
+    hydrogen_indices: Sequence[int],
     *,
     symbols: np.ndarray,
     bonds: np.ndarray,
-) -> int:
-    candidates: list[int] = []
-    for left, right in bonds.tolist():
-        if int(left) == hydrogen_index and symbols[int(right)] != "H":
-            candidates.append(int(right))
-        elif int(right) == hydrogen_index and symbols[int(left)] != "H":
-            candidates.append(int(left))
-    if not candidates:
-        msg = f"HMR selected hydrogen {hydrogen_index} has no bonded heavy atom"
+) -> dict[int, int]:
+    selected = set(int(index) for index in hydrogen_indices)
+    candidates: dict[int, list[int]] = {index: [] for index in selected}
+    for left, right in np.asarray(bonds, dtype=np.int32).tolist():
+        left_i = int(left)
+        right_i = int(right)
+        if left_i in selected and symbols[right_i] != "H":
+            candidates[left_i].append(right_i)
+        if right_i in selected and symbols[left_i] != "H":
+            candidates[right_i].append(left_i)
+    missing = [index for index, partners in candidates.items() if not partners]
+    if missing:
+        msg = f"HMR selected hydrogen {min(missing)} has no bonded heavy atom"
         raise ValueError(msg)
-    return min(candidates)
+    return {index: min(partners) for index, partners in candidates.items()}
 
 
 def _constraint_pair_set(constraints: np.ndarray) -> set[tuple[int, int]]:

@@ -57,6 +57,7 @@ SUPPORTED_FORCE_TERMS = frozenset(
         "periodic_dihedral",
         "periodic_torsion",
         "periodic_improper",
+        "charmm_harmonic_improper",
         "rb_dihedral",
         "nonbonded_lj_coulomb",
         "pair_restricted_lj_coulomb",
@@ -1141,8 +1142,9 @@ def _validate_electrostatics_arrays(
     mode = _metadata_electrostatics_mode(metadata)
     if mode not in {"ewald_reference", "pme"}:
         return
-    cell = _cell_from_artifact_arrays(arrays, mode=mode)
-    if not cell.is_orthorhombic:
+    cell_matrix = _cell_matrix_from_artifact_arrays(arrays, mode=mode)
+    off_diagonal = cell_matrix - np.diag(np.diag(cell_matrix))
+    if not np.allclose(off_diagonal, 0.0, atol=1e-7):
         msg = (
             f"{mode} artifacts require an orthorhombic cell; "
             "triclinic cell_matrix is not supported by this electrostatics path"
@@ -1171,16 +1173,21 @@ def _validate_electrostatics_arrays(
             raise MLXCompatibilityError(msg)
 
 
-def _cell_from_artifact_arrays(arrays: dict[str, np.ndarray], *, mode: str) -> Cell:
+def _cell_matrix_from_artifact_arrays(
+    arrays: dict[str, np.ndarray],
+    *,
+    mode: str,
+) -> np.ndarray:
     cell_matrix = np.asarray(arrays.get("cell_matrix", np.asarray([])), dtype=np.float32)
     if cell_matrix.size != 0:
         if cell_matrix.shape != (3, 3) or not np.all(np.isfinite(cell_matrix)):
             msg = f"{mode} artifacts must include finite cell_matrix with shape (3, 3)"
             raise MLXCompatibilityError(msg)
-        try:
-            return Cell.triclinic(cell_matrix.tolist())
-        except ValueError as err:
-            raise MLXCompatibilityError(str(err)) from err
+        determinant = float(np.linalg.det(cell_matrix.astype(np.float64)))
+        if not np.isfinite(determinant) or determinant <= 0.0:
+            msg = "cell matrix must have a positive non-singular determinant"
+            raise MLXCompatibilityError(msg)
+        return cell_matrix
     cell_lengths = np.asarray(arrays.get("cell_lengths", np.asarray([])), dtype=np.float32)
     if cell_lengths.shape != (3,) or not np.all(np.isfinite(cell_lengths)):
         msg = f"{mode} artifacts must include finite cell_lengths with shape (3,)"
@@ -1188,7 +1195,7 @@ def _cell_from_artifact_arrays(arrays: dict[str, np.ndarray], *, mode: str) -> C
     if np.any(cell_lengths <= 0.0):
         msg = f"{mode} artifacts must include positive cell_lengths"
         raise MLXCompatibilityError(msg)
-    return Cell.orthorhombic(cell_lengths.astype(np.float32).tolist())
+    return np.diag(cell_lengths)
 
 
 def _required_indices(
@@ -1502,6 +1509,9 @@ def build_mlx_system_from_artifact(
         or nonbonded_metadata.get("cutoff")
         or 10.0
     )
+    switch_distance = artifact.metadata.get("switch_distance")
+    if switch_distance is None:
+        switch_distance = nonbonded_metadata.get("switch_distance")
 
     virtual_sites, virtual_site_types = _virtual_sites_from_arrays(arrays)
     force_topology = Topology.from_sequences(
@@ -1758,7 +1768,7 @@ def build_mlx_system_from_artifact(
         "cutoff": nonbonded_cutoff,
         "lj_shift": False,
         "electrostatics": electrostatics_mode,
-        "switch_distance": artifact.metadata.get("switch_distance"),
+        "switch_distance": switch_distance,
         "topology": force_topology,
         "exception_pairs": exception_pairs,
         "exception_charge_products": charge_products,
@@ -1800,7 +1810,7 @@ def build_mlx_system_from_artifact(
     if "charmm_force_switch_nonbonded" in requested_terms:
         if (
             electrostatics_mode != "cutoff"
-            or artifact.metadata.get("switch_distance") is None
+            or switch_distance is None
             or exception_pairs.shape[0] > 0
             or np.asarray(arrays["bonds"]).shape[0] > 0
             or np.asarray(arrays["angles"]).shape[0] > 0
@@ -1821,7 +1831,7 @@ def build_mlx_system_from_artifact(
                 charges=np.asarray(arrays["charges"], dtype=np.float32),
                 coulomb_constant=coulomb_constant,
                 cutoff=nonbonded_cutoff,
-                switch_distance=float(artifact.metadata["switch_distance"]),
+                switch_distance=float(switch_distance),
             )
         )
     elif _metadata_terms(artifact.metadata) & {"pair_restricted_lj_coulomb"}:

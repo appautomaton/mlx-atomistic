@@ -682,9 +682,90 @@ class RBDihedralPotential:
 
 @dataclass(frozen=True)
 class ImproperDihedralPotential(PeriodicDihedralPotential):
-    """Periodic improper torsion potential using the same functional form."""
+    """Periodic or CHARMM-harmonic improper torsion potential.
+
+    A positive periodicity uses the periodic torsion form inherited from
+    :class:`PeriodicDihedralPotential`.  A zero periodicity is the artifact
+    sentinel for the CHARMM harmonic form ``k * wrap(phi - phase)**2``.
+    """
 
     name: str = "improper"
+
+    def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
+        """Return the mixed periodic and CHARMM-harmonic improper energy."""
+
+        positions = as_mx_array(positions)
+        if self.dihedrals.shape[0] == 0:
+            return _zero_energy(positions)
+        phi, _, _, _ = self._openmm_dihedral_components(positions, cell)
+        periodic_angle = self.periodicity * phi + self.phase
+        periodic_energy = self.k * (1.0 + mx.cos(periodic_angle))
+        harmonic_delta = mx.arctan2(mx.sin(phi - self.phase), mx.cos(phi - self.phase))
+        harmonic_energy = self.k * harmonic_delta * harmonic_delta
+        return mx.sum(mx.where(self.periodicity > 0.0, periodic_energy, harmonic_energy))
+
+    def energy_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None = None,
+        pairs: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Return the mixed improper energy and per-atom forces."""
+
+        del pairs
+        positions = as_mx_array(positions)
+        if self.dihedrals.shape[0] == 0:
+            return _zero_energy(positions), mx.zeros_like(positions)
+        i = self.dihedrals[:, 0]
+        j = self.dihedrals[:, 1]
+        k = self.dihedrals[:, 2]
+        m = self.dihedrals[:, 3]
+
+        phi, delta_ab, delta_bc, delta_cd = self._openmm_dihedral_components(positions, cell)
+        periodic_angle = self.periodicity * phi + self.phase
+        periodic_energy = self.k * (1.0 + mx.cos(periodic_angle))
+        periodic_force_derivative = self.k * self.periodicity * mx.sin(periodic_angle)
+        harmonic_delta = mx.arctan2(mx.sin(phi - self.phase), mx.cos(phi - self.phase))
+        harmonic_energy = self.k * harmonic_delta * harmonic_delta
+        harmonic_force_derivative = -2.0 * self.k * harmonic_delta
+        harmonic = self.periodicity == 0.0
+        energy = mx.sum(mx.where(harmonic, harmonic_energy, periodic_energy))
+        force_derivative = mx.where(
+            harmonic,
+            harmonic_force_derivative,
+            periodic_force_derivative,
+        )
+
+        cross_ab_bc = _cross(delta_ab, delta_bc)
+        cross_bc_cd = _cross(delta_bc, delta_cd)
+        norm_cross_1 = _norm2(cross_ab_bc)
+        norm_cross_2 = _norm2(cross_bc_cd)
+        norm_bc = _norm(delta_bc)
+        norm_bc2 = _norm2(delta_bc)
+
+        factor_i = (-force_derivative * norm_bc / norm_cross_1)[:, None]
+        factor_m = (force_derivative * norm_bc / norm_cross_2)[:, None]
+        force_i = factor_i * cross_ab_bc
+        force_m = factor_m * cross_bc_cd
+
+        factor_j = (mx.sum(delta_ab * delta_bc, axis=-1) / norm_bc2)[:, None]
+        factor_k = (mx.sum(delta_cd * delta_bc, axis=-1) / norm_bc2)[:, None]
+        shared = factor_j * force_i - factor_k * force_m
+        force_j = -(force_i - shared)
+        force_k = -(force_m + shared)
+
+        forces = (
+            mx.zeros_like(positions)
+            .at[i]
+            .add(force_i)
+            .at[j]
+            .add(force_j)
+            .at[k]
+            .add(force_k)
+            .at[m]
+            .add(force_m)
+        )
+        return energy, forces
 
 
 @dataclass(frozen=True)

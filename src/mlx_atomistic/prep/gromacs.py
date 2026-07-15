@@ -191,7 +191,7 @@ def import_gromacs_top_gro(
     constraints, constraint_distance = _hydrogen_bond_constraints(
         expanded["bonds"],
         symbols=symbols,
-        positions=positions,
+        bond_lengths=expanded["bond_length"],
     )
 
     supported_terms = ["nonbonded_lj_coulomb"]
