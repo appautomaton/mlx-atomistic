@@ -686,7 +686,9 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
 
     A positive periodicity uses the periodic torsion form inherited from
     :class:`PeriodicDihedralPotential`.  A zero periodicity is the artifact
-    sentinel for the CHARMM harmonic form ``k * wrap(phi - phase)**2``.
+    sentinel for the CHARMM harmonic form ``k * wrap(phi + phase)**2``.  The
+    plus sign maps the stored CHARMM/OpenMM equilibrium angle onto this
+    runtime's opposite signed dihedral convention.
     """
 
     name: str = "improper"
@@ -700,7 +702,7 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
         phi, _, _, _ = self._openmm_dihedral_components(positions, cell)
         periodic_angle = self.periodicity * phi + self.phase
         periodic_energy = self.k * (1.0 + mx.cos(periodic_angle))
-        harmonic_delta = mx.arctan2(mx.sin(phi - self.phase), mx.cos(phi - self.phase))
+        harmonic_delta = mx.arctan2(mx.sin(phi + self.phase), mx.cos(phi + self.phase))
         harmonic_energy = self.k * harmonic_delta * harmonic_delta
         return mx.sum(mx.where(self.periodicity > 0.0, periodic_energy, harmonic_energy))
 
@@ -725,7 +727,7 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
         periodic_angle = self.periodicity * phi + self.phase
         periodic_energy = self.k * (1.0 + mx.cos(periodic_angle))
         periodic_force_derivative = self.k * self.periodicity * mx.sin(periodic_angle)
-        harmonic_delta = mx.arctan2(mx.sin(phi - self.phase), mx.cos(phi - self.phase))
+        harmonic_delta = mx.arctan2(mx.sin(phi + self.phase), mx.cos(phi + self.phase))
         harmonic_energy = self.k * harmonic_delta * harmonic_delta
         harmonic_force_derivative = -2.0 * self.k * harmonic_delta
         harmonic = self.periodicity == 0.0

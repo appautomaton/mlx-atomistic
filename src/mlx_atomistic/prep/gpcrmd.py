@@ -61,7 +61,9 @@ GPCRMD_729_SOURCE_BASELINE = {
     "urey_bradley_terms": 49_223,
     "charmm_cmap_terms": 317,
     "constraints": 78_896,
-    "nonbonded_exceptions": 152_516,
+    "nonbonded_exclusions": 152_516,
+    "charmm_14_exceptions": 84_967,
+    "nonbonded_exceptions": 237_483,
     "source_nbfix_overrides": 95,
     "applicable_nbfix_overrides": 5,
     "hydrogen_count": 58_952,
@@ -819,6 +821,7 @@ def build_gpcrmd_mlx_workload_manifest(
     source_counts = dict(report.get("source_topology_counts", {}))
     term_details = dict(report.get("term_details", {}))
     nbfix_details = dict(term_details.get("nbfix_pair_overrides", {}))
+    exception_details = dict(term_details.get("nonbonded_exception", {}))
     protocol = dict(metadata.protocol_metadata)
     nonbonded = dict(protocol.get("nonbonded", {}))
     pme_source = dict(protocol.get("pme", {}))
@@ -990,6 +993,12 @@ def build_gpcrmd_mlx_workload_manifest(
                 "urey_bradley_terms": int(prepared.urey_bradley_terms.shape[0]),
                 "charmm_cmap_terms": int(prepared.charmm_cmap_terms.shape[0]),
                 "constraints": int(prepared.constraints.shape[0]),
+                "nonbonded_exclusions": int(
+                    exception_details.get("excluded_pair_count", -1)
+                ),
+                "charmm_14_exceptions": int(
+                    exception_details.get("one_four_pair_count", -1)
+                ),
                 "nonbonded_exceptions": int(
                     prepared.nonbonded_exception_pairs.shape[0]
                 ),
@@ -1051,7 +1060,16 @@ def build_gpcrmd_mlx_workload_manifest(
             "cutoff_angstrom": nonbonded.get("cutoff"),
             "switching": nonbonded.get("switching"),
             "switch_distance_angstrom": nonbonded.get("switch_distance"),
+            "exclusion_count": int(exception_details.get("excluded_pair_count", -1)),
+            "one_four_exception_count": int(
+                exception_details.get("one_four_pair_count", -1)
+            ),
             "exception_count": int(prepared.nonbonded_exception_pairs.shape[0]),
+            "nbxmod": exception_details.get("nbxmod"),
+            "e14fac": exception_details.get("e14fac"),
+            "electrostatic_14_scale": exception_details.get(
+                "electrostatic_14_scale"
+            ),
         },
         "pme": {
             **pme_arrays,
@@ -2900,6 +2918,7 @@ def _official_gpcrmd_729_baseline_blockers(
     source_counts = dict(report.get("source_topology_counts", {}))
     term_details = dict(report.get("term_details", {}))
     nbfix_details = dict(term_details.get("nbfix_pair_overrides", {}))
+    exception_details = dict(term_details.get("nonbonded_exception", {}))
     protocol = dict(prepared.metadata.protocol_metadata)
     nonbonded = dict(protocol.get("nonbonded", {}))
     source_pme = dict(protocol.get("pme", {}))
@@ -2925,6 +2944,12 @@ def _official_gpcrmd_729_baseline_blockers(
         "urey_bradley_terms": int(prepared.urey_bradley_terms.shape[0]),
         "charmm_cmap_terms": int(prepared.charmm_cmap_terms.shape[0]),
         "constraints": int(prepared.constraints.shape[0]),
+        "nonbonded_exclusions": int(
+            exception_details.get("excluded_pair_count", -1)
+        ),
+        "charmm_14_exceptions": int(
+            exception_details.get("one_four_pair_count", -1)
+        ),
         "nonbonded_exceptions": int(prepared.nonbonded_exception_pairs.shape[0]),
         "source_nbfix_overrides": int(
             nbfix_details.get("source_parameter_override_count", -1)

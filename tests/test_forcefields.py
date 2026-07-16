@@ -172,7 +172,7 @@ def test_improper_dihedral_zero_periodicity_uses_charmm_harmonic_form():
     )
 
     phi = reference_periodic_dihedral_angle(positions)
-    delta = np.arctan2(np.sin(phi - phase), np.cos(phi - phase))
+    delta = np.arctan2(np.sin(phi + phase), np.cos(phi + phase))
     energy, _ = term.energy_forces(positions)
 
     assert float(np.asarray(energy)) == pytest.approx(force_constant * delta**2, abs=1e-6)
