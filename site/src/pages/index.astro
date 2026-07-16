@@ -134,7 +134,10 @@ const stats = [
             </g>
           </g>
         </svg>
-        <span>mlx-atomistic</span>
+        <span class="brand-word">
+          <span class="brand-word__full">mlx-atomistic</span>
+          <span class="brand-word__short" aria-hidden="true">atomistic</span>
+        </span>
       </a>
       <div class="nav__links">
         <a href="/mlx-atomistic/overview/">Overview</a>
@@ -557,13 +560,15 @@ const stats = [
     border: 1px solid var(--border-soft);
     border-radius: 18px;
     box-shadow: var(--shadow-card);
-    transition: padding 0.28s ease, background 0.28s ease,
+    transition: width 0.32s ease, padding 0.28s ease, background 0.28s ease,
       box-shadow 0.28s ease, border-color 0.28s ease;
   }
-  /* Condensed state after scrolling past the top — the pill tightens, its glass
-     turns more opaque and its shadow deepens. Toggled by an IntersectionObserver
-     sentinel (see the inline script), so there is no per-frame scroll handler. */
+  /* Condensed state after scrolling past the top — the pill narrows and tightens,
+     its glass turns more opaque and its shadow deepens, and the wordmark morphs
+     to its short form. Toggled by an IntersectionObserver sentinel (see the
+     inline script), so there is no per-frame scroll handler. */
   .nav.is-scrolled {
+    width: min(860px, calc(100% - 2rem));
     padding-top: 0.42rem;
     padding-bottom: 0.42rem;
     background: var(--glass-strong);
@@ -604,6 +609,26 @@ const stats = [
   }
   .nav.is-scrolled .brand-atom { width: 26px; height: 26px; }
 
+  /* Wordmark morph: the full name collapses and the short form expands in place,
+     so the brand — and with it the pill — pulls in as you scroll. */
+  .brand-word {
+    display: inline-flex;
+    align-items: baseline;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .brand-word__full,
+  .brand-word__short {
+    display: inline-block;
+    overflow: hidden;
+    white-space: nowrap;
+    transition: max-width 0.3s ease, opacity 0.24s ease;
+  }
+  .brand-word__full { max-width: 10em; opacity: 1; }
+  .brand-word__short { max-width: 0; opacity: 0; }
+  .nav.is-scrolled .brand-word__full { max-width: 0; opacity: 0; }
+  .nav.is-scrolled .brand-word__short { max-width: 8em; opacity: 1; }
+
   .nav__brand:hover .brand-atom .sat { animation-duration: 0.5s; }
   .nav__brand:hover .brand-atom .cen { animation: brand-pulse 1.05s ease-in-out infinite; }
   .nav__brand:hover .brand-atom {
@@ -620,6 +645,10 @@ const stats = [
     .brand-atom .sat,
     .brand-atom .cen,
     .brand-atom__orbit { animation: none !important; }
+    .nav,
+    .brand-atom,
+    .brand-word__full,
+    .brand-word__short { transition: none !important; }
   }
 
   .nav__links {
