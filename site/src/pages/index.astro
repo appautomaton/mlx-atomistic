@@ -588,7 +588,8 @@ const stats = [
         const halos = [...svg.querySelectorAll(".halos circle")];
         const excs = [...svg.querySelectorAll(".excs circle")];
         const bondsG = svg.querySelector(".bonds");
-        const sites = JSON.parse(bondsG.getAttribute("data-sites"));
+        const sites0 = JSON.parse(bondsG.getAttribute("data-sites"));
+        const sites = sites0.map((s) => [...s]);
         const occ = new Array(sites.length).fill(-1);
         const atoms = [...group.querySelectorAll("circle")].map((el, i) => {
           const site = +el.getAttribute("data-s");
@@ -628,9 +629,10 @@ const stats = [
 
         const HOP_EVERY = 6500;  // idle ms between vacancy hops
         const EXC_EVERY = 4200;  // ms between exciton transfers
+        const SPIN = (2 * Math.PI) / (120 * 60); // grain rotation: one rev ~2min
 
         const mouse = { x: -999, y: -999, dx: 0, dy: 0, on: false, down: false };
-        let heat = 0, frame = 0, lEma = 0;
+        let heat = 0, frame = 0, lEma = 0, phi = 0;
         let lastPulse = performance.now() - PULSE_EVERY + 2500; // first pulse ~2.5s in
         let lastHop = performance.now() - HOP_EVERY + 3400;     // first hop ~3.4s in
         let lastExc = performance.now() - EXC_EVERY + 5300;     // first transfer ~5.3s in
@@ -672,6 +674,20 @@ const stats = [
           const sx = Math.max(-24, Math.min(24, mouse.dx)) * STIR;
           const sy = Math.max(-24, Math.min(24, mouse.dy)) * STIR;
           let ke = 0, msd = 0, brokenN = 0;
+
+          // Grain rotation: the crystal's ground state revolves imperceptibly
+          // slowly about the die centre and the atoms tether-follow, so the
+          // asymmetric silhouette presents every orientation over time. Real
+          // crystallites reorient like this while annealing. Rotation
+          // preserves distances, so bond rest lengths are untouched.
+          phi += SPIN * dtn;
+          const cph = Math.cos(phi), sph = Math.sin(phi);
+          for (let k = 0; k < sites.length; k++) {
+            const dx = sites0[k][0] - 160, dy = sites0[k][1] - 160;
+            sites[k][0] = 160 + dx * cph - dy * sph;
+            sites[k][1] = 160 + dx * sph + dy * cph;
+          }
+          for (const a of atoms) { a.hx = sites[a.site][0]; a.hy = sites[a.site][1]; }
 
           // Idle phonon pulse: a plane wavefront sweeps the lattice, giving
           // each atom a small coherent kick as it passes. Wall-clock timed so
@@ -715,7 +731,7 @@ const stats = [
               const s = cands[(Math.random() * cands.length) | 0];
               const a = atoms[occ[s]];
               occ[vac] = occ[s]; occ[s] = -1;
-              a.site = vac; a.hx = sites[vac][0]; a.hy = sites[vac][1];
+              a.site = vac; // home re-derives from the site next frame
               vac = s;
             }
           }
