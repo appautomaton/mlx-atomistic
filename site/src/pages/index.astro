@@ -6,24 +6,55 @@ import { jsonLd, OG_IMAGE, SITE, ORIGIN } from "../seo.mjs";
 
 // Inline monoline icon set — Apple-style 1.8px strokes, currentColor.
 function icon(name) {
-  const s = (p) =>
-    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+  const s = (cls, p) =>
+    `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
   switch (name) {
     case "chip":
-      return s(`<rect x="6" y="6" width="12" height="12" rx="2.5"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 6V3M15 6V3M9 21v-3M15 21v-3M6 9H3M6 15H3M21 9h-3M21 15h-3"/>`);
+      return s("ic-chip", `<rect class="chip-body" x="6" y="6" width="12" height="12" rx="2.5"/><rect class="chip-core" x="9.5" y="9.5" width="5" height="5" rx="1"/><path class="chip-pins" d="M9 6V3M15 6V3M9 21v-3M15 21v-3M6 9H3M6 15H3M21 9h-3M21 15h-3"/>`);
     case "wave":
-      return s(`<path d="M3 12c2.2 0 2.2-7 4.4-7S9.6 19 11.8 19 14 5 16.2 5 18.4 12 21 12"/>`);
+      return s("ic-wave", `<path class="wave-path" d="M3 12c2.2 0 2.2-7 4.4-7S9.6 19 11.8 19 14 5 16.2 5 18.4 12 21 12"/>`);
     case "bond":
-      return s(`<circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="18" r="2.6"/><circle cx="18" cy="6" r="2"/><path d="M8 8l8 8M8.3 6H16M6 8.3V16"/>`);
+      return s("ic-bond", `<circle class="atom a1" cx="6" cy="6" r="2.6"/><circle class="atom a2" cx="18" cy="18" r="2.6"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><path d="M8 8l8 8M8.3 6H16M6 8.3V16"/>`);
     case "lattice":
-      return s(`<circle cx="5" cy="5" r="1.4"/><circle cx="12" cy="5" r="1.4"/><circle cx="19" cy="5" r="1.4"/><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/><circle cx="5" cy="19" r="1.4"/><circle cx="12" cy="19" r="1.4"/><circle cx="19" cy="19" r="1.4"/>`);
+      return s("ic-lattice", `<circle class="dot r0" cx="5" cy="5" r="1.4"/><circle class="dot r1" cx="12" cy="5" r="1.4"/><circle class="dot r2" cx="19" cy="5" r="1.4"/><circle class="dot r1" cx="5" cy="12" r="1.4"/><circle class="dot r2" cx="12" cy="12" r="1.4"/><circle class="dot r3" cx="19" cy="12" r="1.4"/><circle class="dot r2" cx="5" cy="19" r="1.4"/><circle class="dot r3" cx="12" cy="19" r="1.4"/><circle class="dot r4" cx="19" cy="19" r="1.4"/>`);
     case "terminal":
-      return s(`<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3M13 15h4"/>`);
+      return s("ic-term", `<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path class="cursor" d="M13 15h4"/>`);
     case "check":
-      return s(`<path d="M20 7L10 17l-5-5"/>`);
+      return s("ic-check", `<path class="check-path" d="M20 7L10 17l-5-5"/>`);
     default:
-      return s(`<circle cx="12" cy="12" r="8"/>`);
+      return s("", `<circle cx="12" cy="12" r="8"/>`);
   }
+}
+
+// Plane-wave field for the tall DFT card: stacked sine waves that propagate
+// horizontally at different speeds (periodic over --wl, so translateX loops).
+// Built at compile time — the motion is pure CSS, no client JS.
+function planeWaveViz() {
+  const W = 360;
+  const rows = [
+    { y: 26, amp: 7, wl: 72, op: 0.2, dur: 7.5 },
+    { y: 60, amp: 10, wl: 84, op: 0.32, dur: 9.5 },
+    { y: 96, amp: 8, wl: 60, op: 0.5, dur: 5.5 },
+    { y: 132, amp: 13, wl: 90, op: 0.72, dur: 8 },
+    { y: 168, amp: 8, wl: 60, op: 0.5, dur: 6 },
+    { y: 204, amp: 10, wl: 84, op: 0.32, dur: 10 },
+    { y: 236, amp: 7, wl: 72, op: 0.2, dur: 8 },
+  ];
+  const sine = (yb, amp, wl) => {
+    let d = "";
+    for (let x = 0; x <= W; x += 4) {
+      const y = (yb + amp * Math.sin((x / wl) * 2 * Math.PI)).toFixed(1);
+      d += (x === 0 ? "M" : "L") + x + " " + y;
+    }
+    return d;
+  };
+  const paths = rows
+    .map(
+      (r) =>
+        `<g class="viz-row" style="--wl:${r.wl}px;animation-duration:${r.dur}s;opacity:${r.op}"><path d="${sine(r.y, r.amp, r.wl)}"/></g>`,
+    )
+    .join("");
+  return `<svg class="viz-wave" viewBox="0 0 240 262" preserveAspectRatio="none">${paths}</svg>`;
 }
 
 const features = [
@@ -198,10 +229,11 @@ const stats = [
             </defs>
             <!-- package pins -->
             <g class="pins">
-              <line x1="100" y1="40" x2="100" y2="14" /><line x1="160" y1="40" x2="160" y2="14" /><line x1="220" y1="40" x2="220" y2="14" />
-              <line x1="100" y1="280" x2="100" y2="306" /><line x1="160" y1="280" x2="160" y2="306" /><line x1="220" y1="280" x2="220" y2="306" />
-              <line x1="40" y1="100" x2="14" y2="100" /><line x1="40" y1="160" x2="14" y2="160" /><line x1="40" y1="220" x2="14" y2="220" />
-              <line x1="280" y1="100" x2="306" y2="100" /><line x1="280" y1="160" x2="306" y2="160" /><line x1="280" y1="220" x2="306" y2="220" />
+              <!-- Irregular package pins — varied count, spacing and length. -->
+              <line x1="118" y1="40" x2="118" y2="16" /><line x1="182" y1="40" x2="182" y2="22" />
+              <line x1="104" y1="280" x2="104" y2="308" /><line x1="150" y1="280" x2="150" y2="298" /><line x1="214" y1="280" x2="214" y2="304" />
+              <line x1="40" y1="128" x2="14" y2="128" /><line x1="40" y1="200" x2="20" y2="200" />
+              <line x1="280" y1="112" x2="302" y2="112" /><line x1="280" y1="164" x2="308" y2="164" /><line x1="280" y1="220" x2="304" y2="220" />
             </g>
             <!-- silicon die -->
             <rect x="40" y="40" width="240" height="240" rx="40" fill="url(#die)" />
@@ -211,28 +243,28 @@ const stats = [
             <!-- Lattice sites double as MD "home" positions; a script upgrades
                  this static lattice into an interactive molecular-dynamics toy. -->
             <g class="atoms">
-              <!-- outer shell -->
-              <circle cx="228" cy="160" r="8" fill="url(#atom)" />
-              <circle cx="194" cy="101" r="8" fill="url(#atom)" />
-              <circle cx="126" cy="101" r="8" fill="url(#atom)" />
-              <circle cx="92" cy="160" r="8" fill="url(#atom)" />
-              <circle cx="126" cy="219" r="8" fill="url(#atom)" />
-              <circle cx="194" cy="219" r="8" fill="url(#atom)" />
-              <circle cx="211" cy="131" r="8" fill="url(#atom)" />
-              <circle cx="160" cy="101" r="8" fill="url(#atom)" />
-              <circle cx="109" cy="131" r="8" fill="url(#atom)" />
-              <circle cx="109" cy="189" r="8" fill="url(#atomA)" />
-              <circle cx="160" cy="219" r="8" fill="url(#atom)" />
-              <circle cx="211" cy="189" r="8" fill="url(#atom)" />
-              <!-- first shell -->
-              <circle cx="194" cy="160" r="9" fill="url(#atom)" />
-              <circle cx="177" cy="131" r="9" fill="url(#atomA)" />
-              <circle cx="143" cy="131" r="9" fill="url(#atom)" />
-              <circle cx="126" cy="160" r="9" fill="url(#atom)" />
-              <circle cx="143" cy="189" r="9" fill="url(#atom)" />
-              <circle cx="177" cy="189" r="9" fill="url(#atomA)" />
-              <!-- center -->
-              <circle cx="160" cy="160" r="10.5" fill="url(#atomA)" />
+              <!-- Asymmetric crystallite: the close-packed patch is rotated ~9deg
+                   off-axis and nudged off-centre, with a trimmed left edge and one
+                   interior vacancy (a point defect). The excited (teal) atoms form
+                   an off-centre lobe rather than a symmetric ring. Each atom still
+                   springs to its own home site, so the MD toy is unchanged. -->
+              <circle cx="227.2" cy="173.6" r="8" fill="url(#atom)" />
+              <circle cx="202.8" cy="110" r="8" fill="url(#atomA)" />
+              <circle cx="135.6" cy="99.4" r="8" fill="url(#atom)" />
+              <circle cx="117.2" cy="216" r="8" fill="url(#atom)" />
+              <circle cx="184.4" cy="226.6" r="8" fill="url(#atom)" />
+              <circle cx="214.9" cy="142.3" r="8" fill="url(#atomA)" />
+              <circle cx="169.2" cy="104.7" r="8" fill="url(#atom)" />
+              <circle cx="114.2" cy="126.4" r="8" fill="url(#atom)" />
+              <circle cx="105.1" cy="183.7" r="8" fill="url(#atom)" />
+              <circle cx="150.8" cy="221.3" r="8" fill="url(#atom)" />
+              <circle cx="205.8" cy="199.6" r="8" fill="url(#atom)" />
+              <circle cx="193.6" cy="168.3" r="9" fill="url(#atomA)" />
+              <circle cx="181.3" cy="137" r="9" fill="url(#atomA)" />
+              <circle cx="147.7" cy="131.7" r="9" fill="url(#atom)" />
+              <circle cx="126.4" cy="157.7" r="9" fill="url(#atom)" />
+              <circle cx="172.3" cy="194.3" r="9" fill="url(#atom)" />
+              <circle cx="160" cy="163" r="10.5" fill="url(#atom)" />
             </g>
           </svg>
         </div>
@@ -259,6 +291,7 @@ const stats = [
                 <span class="card__icon" set:html={icon(f.icon)} />
                 <h3>{f.title}</h3>
                 <p>{f.desc}</p>
+                {f.span === "tall" && <div class="card__viz" set:html={planeWaveViz()} />}
               </article>
             ))
           }
@@ -486,6 +519,9 @@ const stats = [
     --glass: rgba(251, 251, 253, 0.72);
     --glass-strong: rgba(251, 251, 253, 0.9);
     --nav-shadow-scrolled: 0 8px 30px rgba(0, 0, 0, 0.12);
+    --icon-tile-bg: color-mix(in srgb, var(--accent) 10%, transparent);
+    --icon-tile-border: color-mix(in srgb, var(--accent) 22%, transparent);
+    --icon-glow: color-mix(in srgb, var(--accent) 30%, transparent);
 
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display",
       "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -512,6 +548,9 @@ const stats = [
     --glass: rgba(10, 10, 11, 0.7);
     --glass-strong: rgba(10, 10, 11, 0.86);
     --nav-shadow-scrolled: 0 10px 34px rgba(0, 0, 0, 0.55);
+    --icon-tile-bg: color-mix(in srgb, var(--accent) 14%, transparent);
+    --icon-tile-border: color-mix(in srgb, var(--accent) 26%, transparent);
+    --icon-glow: color-mix(in srgb, var(--accent) 50%, transparent);
   }
 
   * {
@@ -977,10 +1016,44 @@ const stats = [
     justify-content: center;
     border-radius: 13px;
     color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    background: var(--icon-tile-bg);
+    border: 1px solid var(--icon-tile-border);
     margin-bottom: 1.1rem;
+    transition: box-shadow 0.3s ease;
+  }
+  .card:hover .card__icon {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent),
+      0 6px 18px var(--icon-glow);
   }
   .card__icon svg { width: 24px; height: 24px; }
+
+  /* Concept-driven feature-icon motion — calm at rest, alive on hover. */
+  .ic, .ic * { transform-box: fill-box; transform-origin: center; }
+  .ic-wave .wave-path { stroke-dasharray: 5 4; animation: ic-waveflow 1.5s linear infinite; }
+  @keyframes ic-waveflow { to { stroke-dashoffset: -18; } }
+  .card:hover .ic-wave .wave-path { animation-duration: 0.7s; }
+  .ic-bond .atom { animation: ic-atomjit 1.8s ease-in-out infinite; }
+  .ic-bond .a2 { animation-delay: -0.9s; animation-duration: 1.5s; }
+  @keyframes ic-atomjit { 0%, 100% { transform: translate(0, 0); } 30% { transform: translate(0.9px, -0.7px); } 65% { transform: translate(-0.7px, 0.8px); } }
+  .card:hover .ic-bond .atom { animation-duration: 0.55s; }
+  .ic-lattice .dot { animation: ic-ripple 2.6s ease-in-out infinite; }
+  .ic-lattice .r0 { animation-delay: 0s; }
+  .ic-lattice .r1 { animation-delay: 0.18s; }
+  .ic-lattice .r2 { animation-delay: 0.36s; }
+  .ic-lattice .r3 { animation-delay: 0.54s; }
+  .ic-lattice .r4 { animation-delay: 0.72s; }
+  @keyframes ic-ripple { 0%, 70%, 100% { transform: scale(1); opacity: 0.85; } 35% { transform: scale(1.5); opacity: 1; } }
+  .card:hover .ic-lattice .dot { animation-duration: 1.3s; }
+  .ic-chip .chip-core { animation: ic-corepulse 2.2s ease-in-out infinite; }
+  @keyframes ic-corepulse { 0%, 100% { opacity: 0.55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.12); } }
+  .ic-chip .chip-pins { stroke-dasharray: 3 3; animation: ic-pinflicker 3s linear infinite; }
+  @keyframes ic-pinflicker { to { stroke-dashoffset: -12; } }
+  .card:hover .ic-chip .chip-core { animation-duration: 0.9s; }
+  .ic-term .cursor { animation: ic-cursblink 1.1s step-end infinite; }
+  @keyframes ic-cursblink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+  .ic-check .check-path { stroke-dasharray: 26; stroke-dashoffset: 0; }
+  .card:hover .ic-check .check-path { animation: ic-drawcheck 0.55s ease forwards; }
+  @keyframes ic-drawcheck { from { stroke-dashoffset: 26; } to { stroke-dashoffset: 0; } }
   .card h3 {
     font-size: 1.1875rem;
     font-weight: 600;
@@ -994,7 +1067,40 @@ const stats = [
     letter-spacing: -0.01em;
   }
   .card--tall { display: flex; flex-direction: column; }
-  .card--tall p { margin-top: auto; }
+
+  /* Plane-wave field filling the tall DFT card's lower half. */
+  .card__viz {
+    position: relative;
+    flex: 1;
+    min-height: 140px;
+    margin: 0.5rem -1.75rem -1.75rem;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, transparent, #000 20%, #000 80%, transparent);
+    mask-image: linear-gradient(to bottom, transparent, #000 20%, #000 80%, transparent);
+  }
+  .viz-wave {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    color: var(--accent);
+    display: block;
+  }
+  .viz-wave path {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+  }
+  .viz-row {
+    animation-name: viz-drift;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
+  }
+  @keyframes viz-drift { to { transform: translateX(calc(-1 * var(--wl))); } }
+  .card--tall:hover .viz-wave { filter: drop-shadow(0 0 5px var(--icon-glow)); }
+  .card--tall:hover .viz-row { animation-duration: 3.5s; }
 
   /* ---------- Stats ---------- */
   .stats {
