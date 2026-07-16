@@ -26,35 +26,60 @@ function icon(name) {
   }
 }
 
-// Plane-wave field for the tall DFT card: stacked sine waves that propagate
-// horizontally at different speeds (periodic over --wl, so translateX loops).
-// Built at compile time — the motion is pure CSS, no client JS.
-function planeWaveViz() {
-  const W = 360;
-  const rows = [
-    { y: 26, amp: 7, wl: 72, op: 0.2, dur: 7.5 },
-    { y: 60, amp: 10, wl: 84, op: 0.32, dur: 9.5 },
-    { y: 96, amp: 8, wl: 60, op: 0.5, dur: 5.5 },
-    { y: 132, amp: 13, wl: 90, op: 0.72, dur: 8 },
-    { y: 168, amp: 8, wl: 60, op: 0.5, dur: 6 },
-    { y: 204, amp: 10, wl: 84, op: 0.32, dur: 10 },
-    { y: 236, amp: 7, wl: 72, op: 0.2, dur: 8 },
-  ];
-  const sine = (yb, amp, wl) => {
+// Ambient card visuals — each bento card is a small kinetic diagram of its own
+// physics, in one cohesive teal line-art language. Built at compile time; the
+// motion is pure CSS (no client JS), masked into the card's empty space.
+function cardViz(type) {
+  const cores = () => {
+    const cols = 14, rows = 9, sp = 24, x0 = 16, y0 = 16;
     let d = "";
-    for (let x = 0; x <= W; x += 4) {
-      const y = (yb + amp * Math.sin((x / wl) * 2 * Math.PI)).toFixed(1);
-      d += (x === 0 ? "M" : "L") + x + " " + y;
-    }
-    return d;
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++)
+        d += `<circle class="core" cx="${x0 + c * sp}" cy="${y0 + r * sp}" r="1.7" style="animation-delay:${((c + r) % 8) * 0.2}s"/>`;
+    return `<svg class="viz viz-cores" viewBox="0 0 ${x0 * 2 + (cols - 1) * sp} ${y0 * 2 + (rows - 1) * sp}" preserveAspectRatio="xMidYMid slice">${d}</svg>`;
   };
-  const paths = rows
-    .map(
-      (r) =>
-        `<g class="viz-row" style="--wl:${r.wl}px;animation-duration:${r.dur}s;opacity:${r.op}"><path d="${sine(r.y, r.amp, r.wl)}"/></g>`,
-    )
-    .join("");
-  return `<svg class="viz-wave" viewBox="0 0 240 262" preserveAspectRatio="none">${paths}</svg>`;
+  const waves = () => {
+    const W = 360;
+    const rows = [
+      { y: 20, amp: 7, wl: 72, op: 0.2, dur: 7.5 }, { y: 52, amp: 10, wl: 84, op: 0.32, dur: 9.5 },
+      { y: 86, amp: 8, wl: 60, op: 0.5, dur: 5.5 }, { y: 122, amp: 13, wl: 90, op: 0.72, dur: 8 },
+      { y: 158, amp: 8, wl: 60, op: 0.5, dur: 6 }, { y: 192, amp: 10, wl: 84, op: 0.32, dur: 10 },
+      { y: 224, amp: 7, wl: 72, op: 0.2, dur: 8 },
+    ];
+    const sine = (yb, a, wl) => {
+      let s = "";
+      for (let x = 0; x <= W; x += 4) s += (x ? "L" : "M") + x + " " + (yb + a * Math.sin((x / wl) * 2 * Math.PI)).toFixed(1);
+      return s;
+    };
+    const p = rows.map((r) => `<g class="wrow" style="--wl:${r.wl}px;animation-duration:${r.dur}s;opacity:${r.op}"><path d="${sine(r.y, r.amp, r.wl)}"/></g>`).join("");
+    return `<svg class="viz viz-waves" viewBox="0 0 240 250" preserveAspectRatio="none">${p}</svg>`;
+  };
+  const network = () => {
+    const n = [[38, 58], [92, 36], [150, 66], [112, 108], [58, 120], [172, 116], [132, 152], [196, 74]];
+    const e = [[0, 1], [1, 2], [0, 4], [3, 4], [2, 5], [3, 5], [3, 6], [4, 6], [2, 7], [5, 7]];
+    const el = e.map(([a, b]) => `<line x1="${n[a][0]}" y1="${n[a][1]}" x2="${n[b][0]}" y2="${n[b][1]}"/>`).join("");
+    const nl = n.map((p, i) => `<circle class="node" cx="${p[0]}" cy="${p[1]}" r="3.2" style="animation-delay:${-i * 0.42}s"/>`).join("");
+    return `<svg class="viz viz-net" viewBox="0 0 224 190" preserveAspectRatio="xMidYMid slice"><g>${el}</g><g>${nl}</g></svg>`;
+  };
+  const rings = () => {
+    const cx = 170, cy = 118;
+    const c = [16, 30, 44, 58, 72].map((r, i) => `<circle class="ring" cx="${cx}" cy="${cy}" r="${r}" style="animation-delay:${-i * 0.72}s"/>`).join("");
+    return `<svg class="viz viz-rings" viewBox="0 0 240 200" preserveAspectRatio="xMidYMid slice">${c}</svg>`;
+  };
+  const streams = () => {
+    const l = [26, 54, 82, 110, 138, 166, 194].map((y, i) => `<line class="stream" x1="-20" y1="${y}" x2="320" y2="${y}" style="animation-duration:${(2.6 + (i % 3) * 0.9).toFixed(1)}s;animation-delay:${-i * 0.5}s"/>`).join("");
+    return `<svg class="viz viz-streams" viewBox="0 0 300 210" preserveAspectRatio="none">${l}</svg>`;
+  };
+  const lanes = () => {
+    let o = "";
+    [40, 86, 132, 178].forEach((y, i) => {
+      o += `<line class="lane-base" x1="0" y1="${y}" x2="300" y2="${y}"/>`;
+      o += `<line class="lane-run" x1="0" y1="${y - 7}" x2="0" y2="${y + 7}" style="animation-duration:${(3.4 + i * 0.7).toFixed(1)}s;animation-delay:${-i * 1.2}s"/>`;
+    });
+    return `<svg class="viz viz-lanes" viewBox="0 0 300 220" preserveAspectRatio="none">${o}</svg>`;
+  };
+  const map = { cores, waves, network, rings, streams, lanes };
+  return (map[type] || (() => ""))();
 }
 
 const features = [
@@ -63,36 +88,48 @@ const features = [
     desc: "MLX arrays execute through the Metal backend on your machine. No CUDA, no server, no cloud.",
     span: "wide",
     icon: "chip",
+    viz: "cores",
+    mask: "corner",
   },
   {
     title: "Plane-wave DFT",
     desc: "Γ-point Kohn–Sham SCF, LDA plus public-alpha PBE-PZ81 GGA diagnostics, non-SCF band paths.",
     span: "tall",
     icon: "wave",
+    viz: "waves",
+    mask: "lower",
   },
   {
     title: "Molecular mechanics",
     desc: "Lennard-Jones, Coulomb, harmonic bonds and angles, periodic + RB torsions, bounded PME, Langevin NVT.",
     span: "std",
     icon: "bond",
+    viz: "network",
+    mask: "lower",
   },
   {
     title: "Pseudopotentials",
     desc: "GTH and UPF readers, proof-level projector diagnostics, analytic local forces plus fixed-orbital nonlocal diagnostics.",
     span: "std",
     icon: "lattice",
+    viz: "rings",
+    mask: "lower",
   },
   {
     title: "Python 3.13 · uv",
     desc: "Reproducible environments, fast sync, Jupyter-first exploration.",
     span: "std",
     icon: "terminal",
+    viz: "streams",
+    mask: "lower",
   },
   {
     title: "Reference validation lanes",
     desc: "OpenMM and LAMMPS remain opt-in local reference surfaces, not package runtime dependencies.",
     span: "wide",
     icon: "check",
+    viz: "lanes",
+    mask: "corner",
   },
 ];
 
@@ -170,7 +207,7 @@ const stats = [
           <span class="brand-word__short" aria-hidden="true">atomistic</span>
         </span>
       </a>
-      <div class="nav__links">
+      <div class="nav__links" id="nav-links">
         <a href="/mlx-atomistic/overview/">Overview</a>
         <a href="/mlx-atomistic/dft/dft-scf-core/">DFT</a>
         <a href="/mlx-atomistic/mm/molecular-mechanics/">MD</a>
@@ -184,6 +221,10 @@ const stats = [
         <a class="icon-btn" href="https://github.com/appautomaton/mlx-atomistic" aria-label="GitHub repository">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.9 10.9c.6.1.8-.2.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z"/></svg>
         </a>
+        <button id="nav-menu-btn" class="icon-btn nav__menu-btn" aria-label="Open menu" aria-expanded="false" aria-controls="nav-links">
+          <svg class="icon-menu" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+          <svg class="icon-close" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
       </div>
     </nav>
 
@@ -290,10 +331,10 @@ const stats = [
           {
             features.map((f) => (
               <article class={`card card--${f.span}`}>
+                <div class={`card__bg card__bg--${f.mask}`} set:html={cardViz(f.viz)} />
                 <span class="card__icon" set:html={icon(f.icon)} />
                 <h3>{f.title}</h3>
                 <p>{f.desc}</p>
-                {f.span === "tall" && <div class="card__viz" set:html={planeWaveViz()} />}
               </article>
             ))
           }
@@ -370,6 +411,28 @@ const stats = [
           ([entry]) => nav.classList.toggle("is-scrolled", !entry.isIntersecting),
         ).observe(sentinel);
       }
+
+      // Mobile menu: the hamburger toggles a dropdown of the nav links.
+      // Closes on link tap, Escape, or a click outside the nav.
+      const menuBtn = document.getElementById("nav-menu-btn");
+      const setMenu = (open) => {
+        nav?.setAttribute("data-menu", open ? "open" : "closed");
+        menuBtn?.setAttribute("aria-expanded", String(open));
+        menuBtn?.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+      };
+      menuBtn?.addEventListener("click", () =>
+        setMenu(nav?.getAttribute("data-menu") !== "open"),
+      );
+      nav?.querySelectorAll(".nav__links a").forEach((a) =>
+        a.addEventListener("click", () => setMenu(false)),
+      );
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") setMenu(false);
+      });
+      document.addEventListener("click", (e) => {
+        if (nav?.getAttribute("data-menu") === "open" && !nav.contains(e.target))
+          setMenu(false);
+      });
     </script>
 
     <!-- Interactive molecular-dynamics toy on the hero lattice.
@@ -524,6 +587,7 @@ const stats = [
     --icon-tile-bg: color-mix(in srgb, var(--accent) 10%, transparent);
     --icon-tile-border: color-mix(in srgb, var(--accent) 22%, transparent);
     --icon-glow: color-mix(in srgb, var(--accent) 30%, transparent);
+    --viz-opacity: 0.5;
 
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display",
       "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -553,6 +617,7 @@ const stats = [
     --icon-tile-bg: color-mix(in srgb, var(--accent) 14%, transparent);
     --icon-tile-border: color-mix(in srgb, var(--accent) 26%, transparent);
     --icon-glow: color-mix(in srgb, var(--accent) 50%, transparent);
+    --viz-opacity: 0.6;
   }
 
   * {
@@ -729,6 +794,12 @@ const stats = [
   .icon-sun { display: none; }
   [data-theme="dark"] .icon-sun { display: block; }
   [data-theme="dark"] .icon-moon { display: none; }
+
+  /* Mobile menu button — hidden until the links collapse (<= 860px). */
+  .nav__menu-btn { display: none; }
+  .nav__menu-btn .icon-close { display: none; }
+  .nav[data-menu="open"] .nav__menu-btn .icon-menu { display: none; }
+  .nav[data-menu="open"] .nav__menu-btn .icon-close { display: block; }
 
   /* ---------- Hero ---------- */
   .hero {
@@ -1005,6 +1076,8 @@ const stats = [
     gap: 1rem;
   }
   .card {
+    position: relative;
+    overflow: hidden;
     background: var(--surface);
     border: 1px solid var(--border-soft);
     border-radius: 22px;
@@ -1021,6 +1094,8 @@ const stats = [
   .card--std { grid-column: span 2; }
 
   .card__icon {
+    position: relative;
+    z-index: 1;
     display: inline-flex;
     width: 46px;
     height: 46px;
@@ -1067,52 +1142,75 @@ const stats = [
   .card:hover .ic-check .check-path { animation: ic-drawcheck 0.55s ease forwards; }
   @keyframes ic-drawcheck { from { stroke-dashoffset: 26; } to { stroke-dashoffset: 0; } }
   .card h3 {
+    position: relative;
+    z-index: 1;
     font-size: 1.1875rem;
     font-weight: 600;
     letter-spacing: -0.02em;
     margin-bottom: 0.45rem;
   }
   .card p {
+    position: relative;
+    z-index: 1;
     font-size: 0.9375rem;
     color: var(--ink-2);
     line-height: 1.5;
     letter-spacing: -0.01em;
+    max-width: 42ch;
   }
   .card--tall { display: flex; flex-direction: column; }
 
-  /* Plane-wave field filling the tall DFT card's lower half. */
-  .card__viz {
-    position: relative;
-    flex: 1;
-    min-height: 140px;
-    margin: 0.5rem -1.75rem -1.75rem;
-    overflow: hidden;
-    -webkit-mask-image: linear-gradient(to bottom, transparent, #000 20%, #000 80%, transparent);
-    mask-image: linear-gradient(to bottom, transparent, #000 20%, #000 80%, transparent);
-  }
-  .viz-wave {
+  /* ---------- Ambient card visuals ----------
+     One background layer per card — a kinetic teal diagram of its physics,
+     masked into the card's empty space. Content sits above on z-index 1;
+     the layer is inert (pointer-events: none) so the toy/links stay usable. */
+  .card__bg {
     position: absolute;
     inset: 0;
-    width: 100%;
-    height: 100%;
+    z-index: 0;
     color: var(--accent);
-    display: block;
+    pointer-events: none;
+    opacity: var(--viz-opacity);
+    transition: opacity 0.4s ease;
   }
-  .viz-wave path {
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 2;
-    stroke-linecap: round;
-    vector-effect: non-scaling-stroke;
+  .card:hover .card__bg { opacity: calc(var(--viz-opacity) + 0.22); }
+  .card__bg svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .card__bg--lower {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 32%, #000 66%);
+    mask-image: linear-gradient(to bottom, transparent 32%, #000 66%);
   }
-  .viz-row {
-    animation-name: viz-drift;
-    animation-timing-function: linear;
-    animation-iteration-count: infinite;
+  .card__bg--corner {
+    -webkit-mask-image: radial-gradient(135% 150% at 100% 128%, #000 22%, transparent 66%);
+    mask-image: radial-gradient(135% 150% at 100% 128%, #000 22%, transparent 66%);
   }
-  @keyframes viz-drift { to { transform: translateX(calc(-1 * var(--wl))); } }
-  .card--tall:hover .viz-wave { filter: drop-shadow(0 0 5px var(--icon-glow)); }
-  .card--tall:hover .viz-row { animation-duration: 3.5s; }
+
+  /* GPU core matrix — diagonal activation sweep (Apple Silicon) */
+  .viz-cores .core { fill: currentColor; opacity: 0.1; animation: viz-core-sweep 3.4s ease-in-out infinite; }
+  @keyframes viz-core-sweep { 0%, 100% { opacity: 0.1; } 45% { opacity: 0.66; } }
+  .card:hover .viz-cores .core { animation-duration: 1.9s; }
+  /* plane waves (DFT) */
+  .viz-waves path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+  .viz-waves .wrow { animation-name: viz-wave-drift; animation-timing-function: linear; animation-iteration-count: infinite; }
+  @keyframes viz-wave-drift { to { transform: translateX(calc(-1 * var(--wl))); } }
+  .card:hover .viz-waves .wrow { animation-duration: 3.4s; }
+  /* force network (Molecular mechanics) */
+  .viz-net line { stroke: currentColor; stroke-width: 1.4; opacity: 0.16; vector-effect: non-scaling-stroke; }
+  .viz-net .node { fill: currentColor; transform-box: fill-box; transform-origin: center; animation: viz-node-glow 2.6s ease-in-out infinite; }
+  @keyframes viz-node-glow { 0%, 100% { opacity: 0.3; transform: scale(1); } 50% { opacity: 0.85; transform: scale(1.25); } }
+  .card:hover .viz-net .node { animation-duration: 1.4s; }
+  /* potential rings (Pseudopotentials) */
+  .viz-rings .ring { fill: none; stroke: currentColor; stroke-width: 1.6; vector-effect: non-scaling-stroke; transform-box: fill-box; transform-origin: center; animation: viz-ring-emit 3.6s ease-out infinite; }
+  @keyframes viz-ring-emit { 0% { opacity: 0; transform: scale(0.5); } 22% { opacity: 0.6; } 100% { opacity: 0; transform: scale(1.18); } }
+  .card:hover .viz-rings .ring { animation-duration: 2.1s; }
+  /* sync streams (Python · uv) */
+  .viz-streams .stream { stroke: currentColor; stroke-width: 2; stroke-dasharray: 5 11; opacity: 0.3; vector-effect: non-scaling-stroke; animation-name: viz-stream-flow; animation-timing-function: linear; animation-iteration-count: infinite; }
+  @keyframes viz-stream-flow { to { stroke-dashoffset: -32; } }
+  .card:hover .viz-streams .stream { opacity: 0.5; }
+  /* validation lanes — scan playheads (Reference validation) */
+  .viz-lanes .lane-base { stroke: currentColor; stroke-width: 1.4; opacity: 0.16; vector-effect: non-scaling-stroke; }
+  .viz-lanes .lane-run { stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; vector-effect: non-scaling-stroke; transform-box: fill-box; transform-origin: center; animation-name: viz-lane-run; animation-timing-function: linear; animation-iteration-count: infinite; }
+  @keyframes viz-lane-run { 0% { transform: translateX(0); opacity: 0; } 8% { opacity: 0.95; } 90% { opacity: 0.95; } 100% { transform: translateX(300px); opacity: 0; } }
+  .card:hover .viz-lanes .lane-run { animation-duration: 2.6s; }
 
   /* ---------- Stats ---------- */
   .stats {
@@ -1210,7 +1308,40 @@ const stats = [
 
   /* ---------- Responsive ---------- */
   @media (max-width: 860px) {
-    .nav__links { display: none; }
+    .nav__menu-btn { display: inline-flex; }
+    /* Links collapse into a dropdown panel below the nav pill, toggled by the
+       hamburger. Hidden state keeps it in the DOM for a fade/slide transition. */
+    .nav__links {
+      position: absolute;
+      top: calc(100% + 0.5rem);
+      left: 0;
+      right: 0;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.15rem;
+      padding: 0.5rem;
+      background: var(--glass-strong);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: var(--nav-shadow-scrolled);
+      font-size: 1rem;
+      opacity: 0;
+      transform: translateY(-8px);
+      pointer-events: none;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    .nav[data-menu="open"] .nav__links {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .nav__links a {
+      padding: 0.6rem 0.75rem;
+      border-radius: 10px;
+    }
+    .nav__links a:hover { background: var(--border-soft); color: var(--ink); }
     .hero {
       grid-template-columns: 1fr;
       text-align: center;
