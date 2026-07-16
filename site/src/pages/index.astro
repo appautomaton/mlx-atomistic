@@ -82,6 +82,27 @@ function cardViz(type) {
   return (map[type] || (() => ""))();
 }
 
+// A faint spectral signal beneath the hero die — a few thin drifting sine lines
+// that echo the DFT card's plane-wave motif, so the chip reads as "computing".
+// Kept low-opacity and masked so it adds atmosphere without noise.
+function heroSignal() {
+  const W = 320;
+  const lines = [
+    { y: 14, amp: 5, wl: 80, op: 0.26, dur: 9 },
+    { y: 24, amp: 7, wl: 96, op: 0.4, dur: 7 },
+    { y: 34, amp: 5, wl: 80, op: 0.26, dur: 11 },
+  ];
+  const sine = (yb, a, wl) => {
+    let s = "";
+    for (let x = 0; x <= W + 96; x += 4) s += (x ? "L" : "M") + x + " " + (yb + a * Math.sin((x / wl) * 2 * Math.PI)).toFixed(1);
+    return s;
+  };
+  const p = lines
+    .map((l) => `<g class="hsig-row" style="--wl:${l.wl}px;animation-duration:${l.dur}s;opacity:${l.op}"><path d="${sine(l.y, l.amp, l.wl)}"/></g>`)
+    .join("");
+  return `<svg class="hero__signal-svg" viewBox="0 0 ${W} 48" preserveAspectRatio="none">${p}</svg>`;
+}
+
 const features = [
   {
     title: "Apple Silicon native",
@@ -310,6 +331,9 @@ const stats = [
             </g>
           </svg>
         </div>
+
+        <!-- Faint spectral signal beneath the die (echoes the DFT plane-wave). -->
+        <div class="hero__signal" aria-hidden="true" set:html={heroSignal()} />
 
         <!-- Live MD readout: phase (Lindemann criterion) + temperature. -->
         <div class="hero__readout" hidden>
@@ -819,7 +843,7 @@ const stats = [
   .hero__inner {
     position: relative;
     z-index: 2;
-    max-width: 33rem;
+    max-width: 35rem;
   }
   .hero__inner::before {
     content: "";
@@ -833,13 +857,38 @@ const stats = [
     position: absolute;
     z-index: 0;
     top: 50%;
-    right: -3%;
+    right: -2%;
     transform: translateY(-50%);
-    width: min(500px, 47%);
+    width: clamp(260px, 34vw, 420px);
     display: flex;
     flex-direction: column;
     align-items: center;
     min-width: 0;
+  }
+  /* Faint drifting signal beneath the die (echoes the DFT plane-wave). */
+  .hero__signal {
+    position: relative;
+    width: 84%;
+    height: 30px;
+    margin: 0.5rem auto 0;
+    color: var(--accent);
+    pointer-events: none;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 24%, #000 76%, transparent);
+    mask-image: linear-gradient(90deg, transparent, #000 24%, #000 76%, transparent);
+  }
+  .hero__signal-svg { width: 100%; height: 100%; display: block; }
+  .hero__signal-svg path {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+  }
+  .hero__signal .hsig-row {
+    transform-box: fill-box;
+    animation-name: viz-wave-drift;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
   }
 
   .eyebrow {
@@ -852,7 +901,7 @@ const stats = [
   }
 
   .hero h1 {
-    font-size: clamp(2.8rem, 5.6vw, 5rem);
+    font-size: clamp(3.1rem, 6.4vw, 5.25rem);
     font-weight: 700;
     line-height: 1.04;
     letter-spacing: -0.035em;
