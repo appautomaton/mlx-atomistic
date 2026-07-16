@@ -118,11 +118,12 @@ const stats = [
     </script>
   </head>
   <body>
+    <div id="nav-sentinel" aria-hidden="true" style="position:absolute;top:44px;left:0;width:1px;height:1px;pointer-events:none;"></div>
     <nav class="nav" aria-label="Primary">
       <a class="nav__brand" href="/mlx-atomistic/">
-        <svg class="brand-atom" width="25" height="25" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+        <svg class="brand-atom" width="30" height="30" viewBox="0 0 64 64" fill="none" aria-hidden="true">
           <g class="brand-atom__orbit">
-            <g stroke="currentColor" stroke-width="2.4" opacity="0.34">
+            <g stroke="currentColor" stroke-width="2.4" opacity="0.4">
               <line x1="32" y1="32" x2="47" y2="32" /><line x1="32" y1="32" x2="39.5" y2="19" /><line x1="32" y1="32" x2="24.5" y2="19" />
               <line x1="32" y1="32" x2="17" y2="32" /><line x1="32" y1="32" x2="24.5" y2="45" /><line x1="32" y1="32" x2="39.5" y2="45" />
             </g>
@@ -320,6 +321,17 @@ const stats = [
         document.documentElement.dataset.theme = next;
         localStorage.setItem("starlight-theme", next);
       });
+
+      // Condense the floating nav once the page scrolls past the top. A 1px
+      // sentinel is cheaper and smoother than a scroll handler: the observer
+      // fires only as it crosses the viewport edge.
+      const nav = document.querySelector(".nav");
+      const sentinel = document.getElementById("nav-sentinel");
+      if (nav && sentinel && "IntersectionObserver" in window) {
+        new IntersectionObserver(
+          ([entry]) => nav.classList.toggle("is-scrolled", !entry.isIntersecting),
+        ).observe(sentinel);
+      }
     </script>
 
     <!-- Interactive molecular-dynamics toy on the hero lattice.
@@ -469,6 +481,8 @@ const stats = [
     --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.06);
     --shadow-float: 0 20px 60px rgba(0, 0, 0, 0.12);
     --glass: rgba(251, 251, 253, 0.72);
+    --glass-strong: rgba(251, 251, 253, 0.9);
+    --nav-shadow-scrolled: 0 8px 30px rgba(0, 0, 0, 0.12);
 
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display",
       "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -493,6 +507,8 @@ const stats = [
     --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4);
     --shadow-float: 0 24px 70px rgba(0, 0, 0, 0.6);
     --glass: rgba(10, 10, 11, 0.7);
+    --glass-strong: rgba(10, 10, 11, 0.86);
+    --nav-shadow-scrolled: 0 10px 34px rgba(0, 0, 0, 0.55);
   }
 
   * {
@@ -534,21 +550,33 @@ const stats = [
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
-    padding: 0.55rem 0.7rem 0.55rem 1.1rem;
+    padding: 0.6rem 0.75rem 0.6rem 1.15rem;
     background: var(--glass);
     backdrop-filter: saturate(180%) blur(20px);
     -webkit-backdrop-filter: saturate(180%) blur(20px);
     border: 1px solid var(--border-soft);
     border-radius: 18px;
     box-shadow: var(--shadow-card);
+    transition: padding 0.28s ease, background 0.28s ease,
+      box-shadow 0.28s ease, border-color 0.28s ease;
+  }
+  /* Condensed state after scrolling past the top — the pill tightens, its glass
+     turns more opaque and its shadow deepens. Toggled by an IntersectionObserver
+     sentinel (see the inline script), so there is no per-frame scroll handler. */
+  .nav.is-scrolled {
+    padding-top: 0.42rem;
+    padding-bottom: 0.42rem;
+    background: var(--glass-strong);
+    border-color: var(--border);
+    box-shadow: var(--nav-shadow-scrolled);
   }
 
   .nav__brand {
     display: flex;
     align-items: center;
-    gap: 0.55rem;
-    font-weight: 600;
-    font-size: 0.95rem;
+    gap: 0.6rem;
+    font-weight: 700;
+    font-size: 1.0625rem;
     letter-spacing: -0.02em;
   }
   .nav__brand svg { color: var(--accent); }
@@ -569,7 +597,12 @@ const stats = [
   .brand-atom .s4 { animation-name: brand-jitB; animation-duration: 2s; animation-delay: -0.5s; }
   .brand-atom .s5 { animation-name: brand-jitC; animation-duration: 1.55s; animation-delay: -0.9s; }
   .brand-atom .cen { animation: brand-jitA 2.6s ease-in-out infinite; }
-  .brand-atom { transition: filter 0.45s ease; }
+  .brand-atom {
+    width: 30px;
+    height: 30px;
+    transition: width 0.28s ease, height 0.28s ease, filter 0.45s ease;
+  }
+  .nav.is-scrolled .brand-atom { width: 26px; height: 26px; }
 
   .nav__brand:hover .brand-atom .sat { animation-duration: 0.5s; }
   .nav__brand:hover .brand-atom .cen { animation: brand-pulse 1.05s ease-in-out infinite; }
@@ -591,8 +624,10 @@ const stats = [
 
   .nav__links {
     display: flex;
-    gap: 1.6rem;
-    font-size: 0.875rem;
+    gap: 1.5rem;
+    font-size: 0.9375rem;
+    font-weight: 500;
+    letter-spacing: -0.01em;
     color: var(--ink-2);
   }
   .nav__links a {
