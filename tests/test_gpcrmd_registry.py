@@ -1480,6 +1480,7 @@ def test_gpcrmd_source_protocol_benchmark_module_cli_dispatches(
     assert captured["warmups"] == 1
     assert captured["measured_steps"] == 2
     assert captured["checkpoint_restart"] is True
+    assert captured["constraint_max_iterations"] == 20
     assert captured["force"] is True
 
 

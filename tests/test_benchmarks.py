@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1729,6 +1730,360 @@ def test_charged_pme_profile_resolves_new_report_schema(tmp_path):
     assert parity["schema"] == "charged_pme_parity_v1"
     assert parity["passed"] is True
     assert parity["total_energy_abs_error_kj_mol"] == pytest.approx(94.232)
+
+
+def _pme_profile_test_config(*, mesh_shape=(78, 78, 108), real_cutoff=9.0):
+    return {
+        "mesh_shape": list(mesh_shape),
+        "alpha": 0.292029,
+        "real_cutoff": real_cutoff,
+        "assignment_order": 5,
+        "charge_tolerance": 1e-4,
+        "deconvolve_assignment": True,
+        "background_policy": "reject_non_neutral",
+    }
+
+
+def _write_legacy_pme_profile_report(path, pme_config, *, atom_count=4):
+    path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "passed": True,
+                "fixture": "tiny-pme",
+                "atom_count": atom_count,
+                "pme_config": pme_config,
+            }
+        )
+    )
+
+
+def test_gpcrmd_pme_profile_resolves_report_schema_and_explicit_paths(tmp_path):
+    fixture_report = tmp_path / "fixture" / pme_performance.LEGACY_PARITY_REPORT_NAME
+    fixture_prepared = tmp_path / "fixture" / "prepared"
+    fixture_report.parent.mkdir()
+    fixture_report.write_text("{}")
+    fixture_prepared.mkdir()
+    report_path = tmp_path / pme_performance.GPCRMD_PARITY_REPORT_NAME
+    prepared = tmp_path / "explicit-prepared"
+    prepared.mkdir()
+    report_path.write_text(
+        json.dumps(
+            {
+                "kind": "mlx_atomistic.gpcrmd_pme_parity",
+                "status": "passed",
+                "passed": True,
+                "fixture": "gpcrmd-729-beta1-5f8u-cyanopindolol",
+                "atom_count": 92001,
+                "force_metrics": {
+                    "energy_error_per_atom_kj_mol": 1e-7,
+                    "maximum_absolute_kj_mol_nm": 11.0,
+                    "rms_absolute_kj_mol_nm": 0.1,
+                },
+                "mlx": {
+                    "pme_readiness": {
+                        "status": "ready",
+                        "production_executable": True,
+                        "atom_count": 92001,
+                        "mesh_shape": [78, 78, 108],
+                        "alpha": 0.292029,
+                        "real_cutoff": 9.0,
+                        "assignment_order": 5,
+                        "background_policy": "reject_non_neutral",
+                        "blockers": [],
+                    },
+                    "topology": {"pair_policy": "lazy"},
+                    "neighbor": {"representation": "blocks"},
+                },
+                "mlx_prepared": str(prepared),
+                "manifests": {"mlx": "mlx_workload_manifest.json"},
+                "manifest_comparison": {"matched": True},
+            }
+        )
+    )
+
+    fixture, resolved_report, resolved_prepared = (
+        pme_performance._resolve_profile_paths(
+            fixture_dir=fixture_report.parent,
+            parity_report=report_path,
+            prepared=prepared,
+        )
+    )
+    parity = pme_performance._load_parity_report(resolved_report)
+
+    assert fixture == fixture_report.parent
+    assert resolved_report == report_path
+    assert resolved_prepared == prepared
+    assert parity["schema"] == "gpcrmd_pme_parity_v1"
+    assert parity["prepared_dir"] == str(prepared)
+    assert parity["pme_config"] == {
+        "mesh_shape": [78, 78, 108],
+        "alpha": 0.292029,
+        "real_cutoff": 9.0,
+        "assignment_order": 5,
+        "background_policy": "reject_non_neutral",
+    }
+    assert parity["total_energy_abs_error_kj_mol"] == pytest.approx(0.0092001)
+
+
+def test_gpcrmd_pme_profile_admission_is_fail_closed(tmp_path):
+    runtime_pme = _pme_profile_test_config()
+    manifest = {
+        "kind": "gpcrmd_mlx_workload",
+        "workload": {
+            "name": "gpcrmd-729-beta1-5f8u-cyanopindolol",
+            "atom_count": 92001,
+        },
+        "pme": {
+            "mesh_shape": [78, 78, 108],
+            "alpha_per_angstrom": 0.292029,
+            "real_cutoff_angstrom": 9.0,
+            "assignment_order": 5,
+            "charge_tolerance_e": 1e-4,
+            "deconvolve_assignment": True,
+            "background_policy": "reject_non_neutral",
+        },
+        "runtime_contract": {
+            "topology_pair_policy": "lazy",
+            "eager_nonbonded_pair_limit": 0,
+            "neighbor_backend": "mlx_cell_blocks",
+            "neighbor_representation": "NeighborBlocks",
+            "fixed_cell_pme_plan_reuse": True,
+            "dense_or_tiled_fallback_allowed": False,
+        },
+    }
+    manifest["manifest_sha256"] = pme_performance.manifest_hash(manifest)
+    (tmp_path / pme_performance.GPCRMD_WORKLOAD_MANIFEST_NAME).write_text(
+        json.dumps(manifest)
+    )
+    parity = {
+        "schema": "gpcrmd_pme_parity_v1",
+        "fixture": "gpcrmd-729-beta1-5f8u-cyanopindolol",
+        "atom_count": 92001,
+        "pme_config": runtime_pme,
+        "manifest_comparison": {"matched": True},
+        "pme_readiness": {
+            "status": "ready",
+            "production_executable": True,
+            "atom_count": 92001,
+            "blockers": [],
+        },
+    }
+    nonbonded = SimpleNamespace(pme_config=SimpleNamespace(**runtime_pme))
+
+    blockers, diagnostics = pme_performance._profile_admission(
+        parity=parity,
+        artifact_atom_count=92001,
+        nonbonded=nonbonded,
+        prepared_dir=tmp_path,
+    )
+
+    assert blockers == []
+    assert diagnostics["manifest_comparison_matched"] is True
+    assert diagnostics["gpcrmd_workload_manifest"]["integrity"] is True
+    assert diagnostics["gpcrmd_workload_manifest"]["pme_matches_runtime"] is True
+
+    drifted_manifest = {
+        "kind": "gpcrmd_mlx_workload",
+        "workload": {"name": "wrong-fixture", "atom_count": 7},
+        "pme": {
+            "mesh_shape": [78, 78, 106],
+            "alpha_per_angstrom": 0.292029,
+            "real_cutoff_angstrom": 9.0,
+            "assignment_order": 5,
+            "charge_tolerance_e": 1e-4,
+            "deconvolve_assignment": True,
+            "background_policy": "reject_non_neutral",
+        },
+        "runtime_contract": {"topology_pair_policy": "eager"},
+    }
+    drifted_manifest["manifest_sha256"] = pme_performance.manifest_hash(
+        drifted_manifest
+    )
+    (tmp_path / pme_performance.GPCRMD_WORKLOAD_MANIFEST_NAME).write_text(
+        json.dumps(drifted_manifest)
+    )
+    drifted_parity = {
+        **parity,
+        "atom_count": 92000,
+        "manifest_comparison": {"matched": False},
+        "pme_readiness": {
+            "status": "blocked",
+            "production_executable": False,
+            "atom_count": 92000,
+            "blockers": ["drift"],
+        },
+    }
+
+    blockers, _ = pme_performance._profile_admission(
+        parity=drifted_parity,
+        artifact_atom_count=92001,
+        nonbonded=nonbonded,
+        prepared_dir=tmp_path,
+    )
+
+    assert any(item.startswith("atom_count_mismatch:") for item in blockers)
+    assert "parity_manifest_comparison:not_matched" in blockers
+    assert any("runtime_contract_mismatch" in item for item in blockers)
+    assert any("pme_config_mismatch:mesh_shape" in item for item in blockers)
+
+
+def test_pme_performance_build_payload_blocks_nonlazy_topology(tmp_path, monkeypatch):
+    report = tmp_path / "parity.json"
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    pme_config = _pme_profile_test_config(mesh_shape=(8, 8, 8), real_cutoff=4.0)
+    _write_legacy_pme_profile_report(report, pme_config)
+    artifact = SimpleNamespace(atom_count=4, base_dir=prepared)
+    system = SimpleNamespace(cell=object())
+    nonbonded = SimpleNamespace(
+        pme_config=SimpleNamespace(**pme_config),
+        topology=SimpleNamespace(
+            nonbonded_pair_policy="eager",
+            nonbonded_pair_count=6,
+            _nonbonded_pairs=None,
+        ),
+    )
+    monkeypatch.setattr(
+        pme_performance,
+        "load_prepared_mlx_artifact",
+        lambda *_args, **_kwargs: artifact,
+    )
+    monkeypatch.setattr(
+        pme_performance,
+        "build_mlx_system_from_artifact",
+        lambda *_args, **_kwargs: (system, [], None),
+    )
+    monkeypatch.setattr(
+        pme_performance,
+        "_find_pme_nonbonded",
+        lambda _terms: nonbonded,
+    )
+
+    payload = pme_performance.build_payload(
+        parity_report=report,
+        prepared=prepared,
+        iterations=1,
+        warmups=0,
+    )
+
+    assert payload["status"] == "blocked"
+    assert "prepared_topology:not_lazy" in payload["blocker"]
+
+
+def test_pme_performance_build_payload_blocks_neighbor_build_failure(
+    tmp_path,
+    monkeypatch,
+):
+    report = tmp_path / "parity.json"
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    pme_config = _pme_profile_test_config(mesh_shape=(8, 8, 8), real_cutoff=4.0)
+    _write_legacy_pme_profile_report(report, pme_config)
+
+    class FakeNonbonded:
+        def __init__(self):
+            self.pme_config = SimpleNamespace(**pme_config)
+            self.topology = SimpleNamespace(
+                nonbonded_pair_policy="lazy",
+                nonbonded_pair_count=6,
+                _nonbonded_pairs=None,
+            )
+            self.charges = object()
+
+        def bind_pme_plan(self, _cell):
+            return self
+
+    artifact = SimpleNamespace(atom_count=4, base_dir=prepared)
+    system = SimpleNamespace(cell=object(), positions=object())
+    nonbonded = FakeNonbonded()
+    monkeypatch.setattr(
+        pme_performance,
+        "load_prepared_mlx_artifact",
+        lambda *_args, **_kwargs: artifact,
+    )
+    monkeypatch.setattr(
+        pme_performance,
+        "build_mlx_system_from_artifact",
+        lambda *_args, **_kwargs: (system, [], None),
+    )
+    monkeypatch.setattr(
+        pme_performance,
+        "_find_pme_nonbonded",
+        lambda _terms: nonbonded,
+    )
+    monkeypatch.setattr(
+        pme_performance,
+        "_validate_inputs_mx",
+        lambda *_args, **_kwargs: (
+            object(),
+            object(),
+            object(),
+            [20.0, 20.0, 20.0],
+        ),
+    )
+
+    def fail_neighbor_build(*_args, **_kwargs):
+        raise RuntimeError("no NeighborBlocks")
+
+    monkeypatch.setattr(
+        pme_performance,
+        "build_neighbor_list",
+        fail_neighbor_build,
+    )
+
+    payload = pme_performance.build_payload(
+        parity_report=report,
+        prepared=prepared,
+        iterations=1,
+        warmups=0,
+    )
+
+    assert payload["status"] == "blocked"
+    assert "pme_direct_space_shared_neighbor_build_failed" in payload["blocker"]
+
+
+def test_pme_performance_cli_forwards_explicit_profile_paths(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    captured = {}
+
+    def fake_build_payload(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "parity": {}, "timings": []}
+
+    monkeypatch.setattr(pme_performance, "build_payload", fake_build_payload)
+    report = tmp_path / "parity.json"
+    prepared = tmp_path / "prepared"
+    out_dir = tmp_path / "profile"
+
+    pme_performance.main(
+        [
+            "--parity-report",
+            str(report),
+            "--prepared",
+            str(prepared),
+            "--iterations",
+            "2",
+            "--warmups",
+            "1",
+            "--out-dir",
+            str(out_dir),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert captured == {
+        "fixture_dir": None,
+        "parity_report": report,
+        "prepared": prepared,
+        "iterations": 2,
+        "warmups": 1,
+    }
+    assert payload["raw_output_path"] == str(out_dir / "pme-profile.json")
 
 
 def test_lammps_opencl_unsupported_fixture_reports_normalized_blocker():
