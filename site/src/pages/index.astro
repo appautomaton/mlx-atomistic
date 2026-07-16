@@ -82,26 +82,28 @@ function cardViz(type) {
   return (map[type] || (() => ""))();
 }
 
-// A faint spectral signal beneath the hero die — a few thin drifting sine lines
-// that echo the DFT card's plane-wave motif, so the chip reads as "computing".
-// Kept low-opacity and masked so it adds atmosphere without noise.
-function heroSignal() {
-  const W = 320;
-  const lines = [
-    { y: 14, amp: 5, wl: 80, op: 0.26, dur: 9 },
-    { y: 24, amp: 7, wl: 96, op: 0.4, dur: 7 },
-    { y: 34, amp: 5, wl: 80, op: 0.26, dur: 11 },
-  ];
-  const sine = (yb, a, wl) => {
-    let s = "";
-    for (let x = 0; x <= W + 96; x += 4) s += (x ? "L" : "M") + x + " " + (yb + a * Math.sin((x / wl) * 2 * Math.PI)).toFixed(1);
-    return s;
-  };
-  const p = lines
-    .map((l) => `<g class="hsig-row" style="--wl:${l.wl}px;animation-duration:${l.dur}s;opacity:${l.op}"><path d="${sine(l.y, l.amp, l.wl)}"/></g>`)
-    .join("");
-  return `<svg class="hero__signal-svg" viewBox="0 0 ${W} 48" preserveAspectRatio="none">${p}</svg>`;
-}
+// Board traces: the die's I/O, routed from the side pads with classic 45deg
+// PCB jogs, each ending in a via ring. Left runs are long and pass beneath
+// the hero copy (the scrim keeps the text legible — layered depth, not
+// decoration); right runs are short stubs toward the viewport edge. They
+// live in the lattice SVG itself (overflow: visible) so they register
+// exactly with the pads, and they add no height to the hero.
+const TRACES = [
+  { d: "M14 100 H-40 L-64 76 H-150", via: [-154, 76] },
+  { d: "M14 160 H-236", via: [-240, 160] },
+  { d: "M14 220 H-70 L-94 244 H-176", via: [-180, 244] },
+  { d: "M306 100 H356", via: [360, 100] },
+  { d: "M306 160 H372", via: [376, 160] },
+  { d: "M306 220 H356", via: [360, 220] },
+];
+// Signal packets: one every few seconds, travelling a trace. Outbound on the
+// left, inbound from the right — the chip is doing I/O. pathLength=100
+// normalizes travel so a single keyframe drives every packet.
+const PACKETS = [
+  { d: "M14 160 H-236", delay: 0 },
+  { d: "M372 160 H306", delay: 4.3 },
+  { d: "M14 100 H-40 L-64 76 H-150", delay: 8.6 },
+];
 
 // ---- Hero crystallite ----
 // Single source of truth for the MD toy's lattice art: an asymmetric
@@ -332,6 +334,18 @@ const stats = [
                 <stop offset="1" class="halo-stop" stop-opacity="0" />
               </radialGradient>
             </defs>
+            <!-- board traces: the die's I/O (see TRACES/PACKETS) -->
+            <g class="traces">
+              {TRACES.map((t) => (
+                <path class="trace" d={t.d} />
+              ))}
+              {TRACES.map((t) => (
+                <circle cx={t.via[0]} cy={t.via[1]} r="3" />
+              ))}
+              {PACKETS.map((p) => (
+                <path class="packet" d={p.d} pathLength="100" style={`animation-delay:${p.delay}s`} />
+              ))}
+            </g>
             <!-- package pins: pad-tipped, three per side (see PINS) -->
             <g class="pins">
               {PINS.map((p) => (
@@ -374,9 +388,6 @@ const stats = [
             </g>
           </svg>
         </div>
-
-        <!-- Faint spectral signal beneath the die (echoes the DFT plane-wave). -->
-        <div class="hero__signal" aria-hidden="true" set:html={heroSignal()} />
 
         <!-- Live MD readout: phase (Lindemann criterion) + temperature. -->
         <div class="hero__readout" hidden>
@@ -510,8 +521,7 @@ const stats = [
          in and heats the cell; over-strained bonds break (melting) and re-form
          as the lattice anneals home. The chip reads a smoothed Lindemann
          ratio; halos glow with per-atom kinetic energy; an occasional
-         plane-wave pulse rolls through the idle lattice, echoing the spectral
-         signal below the die. -->
+         plane-wave pulse rolls through the idle lattice. -->
     <script>
       const visual = document.querySelector(".hero__visual");
       const svg = visual?.querySelector("svg.lattice");
@@ -1034,30 +1044,42 @@ const stats = [
     align-items: center;
     min-width: 0;
   }
-  /* Faint drifting signal beneath the die (echoes the DFT plane-wave). */
-  .hero__signal {
-    position: relative;
-    width: 84%;
-    height: 30px;
-    margin: 0.5rem auto 0;
-    color: var(--accent);
+  /* Board traces: quieter than the pins (hierarchy: package > traces), with
+     via rings at the ends. Packets are teal dashes travelling the normalized
+     path (pathLength=100), one every few seconds. */
+  .lattice .traces {
     pointer-events: none;
-    -webkit-mask-image: linear-gradient(90deg, transparent, #000 24%, #000 76%, transparent);
-    mask-image: linear-gradient(90deg, transparent, #000 24%, #000 76%, transparent);
   }
-  .hero__signal-svg { width: 100%; height: 100%; display: block; }
-  .hero__signal-svg path {
+  .lattice .traces .trace {
+    stroke: var(--ink-3);
+    stroke-opacity: 0.35;
+    stroke-width: 2;
     fill: none;
-    stroke: currentColor;
-    stroke-width: 1.6;
     stroke-linecap: round;
-    vector-effect: non-scaling-stroke;
+    stroke-linejoin: round;
   }
-  .hero__signal .hsig-row {
-    transform-box: fill-box;
-    animation-name: viz-wave-drift;
-    animation-timing-function: linear;
-    animation-iteration-count: infinite;
+  .lattice .traces circle {
+    stroke: var(--ink-3);
+    stroke-opacity: 0.35;
+    stroke-width: 1.6;
+    fill: none;
+  }
+  .lattice .traces .packet {
+    stroke: var(--accent);
+    stroke-width: 2.2;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-dasharray: 7 100;
+    stroke-dashoffset: 107;
+    opacity: 0;
+    animation: trace-packet 13s linear infinite;
+  }
+  @keyframes trace-packet {
+    0% { stroke-dashoffset: 107; opacity: 0; }
+    2% { opacity: 0.85; }
+    22% { opacity: 0.85; }
+    26%, 100% { stroke-dashoffset: -107; opacity: 0; }
   }
 
   .eyebrow {
@@ -1187,6 +1209,8 @@ const stats = [
     position: relative;
     width: 100%;
     height: 100%;
+    /* Traces route past the viewBox on both sides. */
+    overflow: visible;
     /* Light, slightly cool shadow so the aurora's color reads through it. */
     filter: drop-shadow(0 14px 28px rgba(40, 52, 92, 0.1));
     animation: float 7s ease-in-out infinite;
@@ -1631,6 +1655,10 @@ const stats = [
       width: min(360px, 82%);
       margin: -1.5rem auto 0;
       opacity: 0.8;
+    }
+    /* No room for board routing on a phone; the die keeps just its pins. */
+    .lattice .traces {
+      display: none;
     }
     .lead { margin-left: auto; margin-right: auto; }
     .cta-row { justify-content: center; }
