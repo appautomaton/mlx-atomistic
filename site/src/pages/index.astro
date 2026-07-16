@@ -209,6 +209,7 @@ const stats = [
           </div>
         </div>
 
+        <div class="hero__stage">
         <!-- Hero visual: an orbital atom seated inside a silicon die. -->
         <div class="hero__visual" aria-hidden="true">
           <div class="hero__aurora"></div>
@@ -278,6 +279,7 @@ const stats = [
           Drag the lattice to add kinetic energy — heat it past melting, then
           let go and watch it re-crystallize.
         </p>
+        </div>
       </section>
 
       <!-- Bento -->
@@ -733,8 +735,18 @@ const stats = [
     position: relative;
     max-width: var(--maxw);
     margin: 0 auto;
-    padding: 9.5rem 1.5rem 2rem;
-    text-align: center;
+    padding: 8.5rem 1.5rem 3rem;
+    display: grid;
+    grid-template-columns: 1.05fr 0.95fr;
+    align-items: center;
+    gap: 2.5rem;
+    text-align: left;
+  }
+  .hero__stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 0;
   }
 
   .eyebrow {
@@ -747,7 +759,7 @@ const stats = [
   }
 
   .hero h1 {
-    font-size: clamp(2.6rem, 6.5vw, 4.75rem);
+    font-size: clamp(2.4rem, 4.6vw, 4rem);
     font-weight: 700;
     line-height: 1.04;
     letter-spacing: -0.035em;
@@ -756,19 +768,19 @@ const stats = [
   .accent { color: var(--accent); }
 
   .lead {
-    font-size: clamp(1.1rem, 2vw, 1.4rem);
+    font-size: clamp(1.05rem, 1.5vw, 1.3rem);
     font-weight: 400;
-    line-height: 1.45;
+    line-height: 1.5;
     color: var(--ink-2);
-    max-width: 660px;
-    margin: 0 auto 2rem;
+    max-width: 34rem;
+    margin: 0 0 2rem;
     letter-spacing: -0.015em;
   }
 
   .cta-row {
     display: flex;
     gap: 1.4rem;
-    justify-content: center;
+    justify-content: flex-start;
     align-items: center;
     flex-wrap: wrap;
   }
@@ -801,8 +813,8 @@ const stats = [
   /* ---------- Hero visual ---------- */
   .hero__visual {
     position: relative;
-    margin: 3.5rem auto 0;
-    width: min(440px, 80vw);
+    margin: 0 auto;
+    width: min(420px, 100%);
     aspect-ratio: 1;
     display: grid;
     place-items: center;
@@ -1199,6 +1211,14 @@ const stats = [
   /* ---------- Responsive ---------- */
   @media (max-width: 860px) {
     .nav__links { display: none; }
+    .hero {
+      grid-template-columns: 1fr;
+      text-align: center;
+      gap: 1rem;
+    }
+    .lead { margin-left: auto; margin-right: auto; }
+    .cta-row { justify-content: center; }
+    .hero__stage { margin-top: 2.5rem; }
     .bento { grid-template-columns: repeat(2, 1fr); }
     .card--wide, .card--tall, .card--std {
       grid-column: span 2;
