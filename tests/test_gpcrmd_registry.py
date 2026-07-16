@@ -1167,7 +1167,7 @@ def test_gpcrmd_pme_derivation_matches_openmm_tolerance_mapping():
         ewald_tolerance=5.0e-4,
     )
 
-    assert mesh == (78, 78, 106)
+    assert mesh == (78, 78, 108)
     assert alpha == pytest.approx(0.2920289872)
 
 

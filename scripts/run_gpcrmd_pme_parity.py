@@ -44,6 +44,7 @@ MANIFEST_COMPARISON_NAME = "manifest_comparison.json"
 FORCE_ARRAYS_NAME = "complete_force_comparison.npz"
 GENERATED_RTF_NAME = "openmm_source_types.rtf"
 OPENMM_REFERENCE_ROLE = "reference-only validation; not a product runtime dependency"
+OPENMM_OPENCL_FFT_PRIME_FACTORS = (2, 3, 5, 7, 11, 13)
 
 SUPPORTED_OPENMM_FORCE_CLASSES = (
     "HarmonicBondForce",
@@ -1703,7 +1704,16 @@ def _derive_source_pme_config(
     lengths = np.linalg.norm(cell_matrix, axis=1)
     alpha = math.sqrt(-math.log(2.0 * tolerance)) / cutoff
     mesh = tuple(
-        max(4, int(math.ceil(2.0 * alpha * float(length) / (3.0 * tolerance**0.2))))
+        _openmm_opencl_fft_legal_dimension(
+            max(
+                6,
+                int(
+                    math.ceil(
+                        2.0 * alpha * float(length) / (3.0 * tolerance**0.2)
+                    )
+                ),
+            )
+        )
         for length in lengths
     )
     return PMEConfig(
@@ -1715,6 +1725,18 @@ def _derive_source_pme_config(
         deconvolve_assignment=True,
         background_policy="reject_non_neutral",
     )
+
+
+def _openmm_opencl_fft_legal_dimension(minimum: int) -> int:
+    candidate = max(1, int(minimum))
+    while True:
+        unfactored = candidate
+        for factor in OPENMM_OPENCL_FFT_PRIME_FACTORS:
+            while unfactored > 1 and unfactored % factor == 0:
+                unfactored //= factor
+        if unfactored == 1:
+            return candidate
+        candidate += 1
 
 
 def _evaluate_openmm_reference(
