@@ -45,6 +45,7 @@ GPCRMD_WORKLOAD_MANIFEST_NAME = "mlx-workload-manifest.json"
 ACEMD_BINARY_VELOCITY_TO_ANGSTROM_PER_PS = 20.45482706
 GPCRMD_PME_ASSIGNMENT_ORDER = 5
 GPCRMD_NET_CHARGE_TOLERANCE_E = 1.0e-4
+GPCRMD_OPENCL_FFT_PRIME_FACTORS = (2, 3, 5, 7, 11, 13)
 
 GPCRMD_729_SOURCE_BASELINE = {
     "atom_count": 92_001,
@@ -77,7 +78,7 @@ GPCRMD_729_SOURCE_BASELINE = {
     "constraint_tolerance": 1.0e-6,
     "hmr_target_hydrogen_mass": 4.032,
     "trajectory_interval_steps": 50_000,
-    "pme_mesh_shape": (78, 78, 106),
+    "pme_mesh_shape": (78, 78, 108),
     "pme_alpha_per_A": 0.2920289872,
 }
 
@@ -2817,7 +2818,13 @@ def _gpcrmd_pme_config(
         "derivation": {
             "source": "OpenMM_PME_tolerance_mapping",
             "alpha_formula": "sqrt(-ln(2*tolerance))/real_cutoff",
-            "mesh_formula": "ceil(2*alpha*box_length/(3*tolerance^0.2))",
+            "mesh_minimum_formula": (
+                "ceil(2*alpha*box_length/(3*tolerance^0.2))"
+            ),
+            "mesh_formula": (
+                "smallest OpenCL/VkFFT-legal dimension at or above the minimum"
+            ),
+            "fft_legal_prime_factors": list(GPCRMD_OPENCL_FFT_PRIME_FACTORS),
             "assignment_order": "OpenMM cardinal B-spline order 5",
             "source_net_charge_e": source_net_charge,
         },
@@ -2873,8 +2880,25 @@ def _derive_gpcrmd_pme_parameters(
         raise GPCRmdInspectionError(msg)
     alpha = math.sqrt(-math.log(2.0 * ewald_tolerance)) / cutoff
     scale = 2.0 * alpha / (3.0 * ewald_tolerance**0.2)
-    mesh_shape = tuple(max(4, int(math.ceil(scale * float(length)))) for length in lengths)
+    mesh_shape = tuple(
+        _openmm_opencl_fft_legal_dimension(
+            max(6, int(math.ceil(scale * float(length))))
+        )
+        for length in lengths
+    )
     return mesh_shape, alpha
+
+
+def _openmm_opencl_fft_legal_dimension(minimum: int) -> int:
+    candidate = max(1, int(minimum))
+    while True:
+        unfactored = candidate
+        for factor in GPCRMD_OPENCL_FFT_PRIME_FACTORS:
+            while unfactored > 1 and unfactored % factor == 0:
+                unfactored //= factor
+        if unfactored == 1:
+            return candidate
+        candidate += 1
 
 
 def _prepared_import_blockers(

@@ -20,6 +20,17 @@ sys.modules[_SPEC.name] = _HELPER
 _SPEC.loader.exec_module(_HELPER)
 
 
+def test_source_pme_config_uses_opencl_fft_legal_mesh_dimensions():
+    config = _HELPER._derive_source_pme_config(
+        np.diag([87.17031860351562, 87.15242004394531, 118.58049774169922]),
+        cutoff=9.0,
+        tolerance=5.0e-4,
+    )
+
+    assert config.mesh_shape == (78, 78, 108)
+    assert config.alpha == pytest.approx(0.2920289872)
+
+
 @pytest.fixture
 def _metal_device(monkeypatch):
     monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
