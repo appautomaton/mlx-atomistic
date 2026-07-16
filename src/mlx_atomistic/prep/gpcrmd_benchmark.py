@@ -159,7 +159,7 @@ def benchmark_gpcrmd_source_protocol(
     measured_steps: int = 2,
     checkpoint_restart: bool = False,
     seed: int | None = 7,
-    constraint_max_iterations: int = 4,
+    constraint_max_iterations: int = 20,
     force: bool = False,
     write_json: bool = True,
     write_csv: bool = True,
@@ -1508,7 +1508,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--restraint-k", type=float, default=5.0)
     parser.add_argument("--minimize-steps", type=int, default=0)
     parser.add_argument("--equilibration-steps", type=int, default=0)
-    parser.add_argument("--constraint-max-iterations", type=int, default=4)
+    parser.add_argument("--constraint-max-iterations", type=int, default=None)
     parser.add_argument("--diagnostic-interval", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -1527,7 +1527,11 @@ def main(argv: list[str] | None = None) -> None:
             measured_steps=2 if args.measured_steps is None else args.measured_steps,
             checkpoint_restart=args.checkpoint_restart,
             seed=args.seed,
-            constraint_max_iterations=args.constraint_max_iterations,
+            constraint_max_iterations=(
+                20
+                if args.constraint_max_iterations is None
+                else args.constraint_max_iterations
+            ),
             force=args.force,
         )
     else:
@@ -1556,7 +1560,11 @@ def main(argv: list[str] | None = None) -> None:
             restraint_k=args.restraint_k,
             minimize_steps=args.minimize_steps,
             equilibration_steps=args.equilibration_steps,
-            constraint_max_iterations=args.constraint_max_iterations,
+            constraint_max_iterations=(
+                4
+                if args.constraint_max_iterations is None
+                else args.constraint_max_iterations
+            ),
             diagnostic_interval=args.diagnostic_interval,
             force=args.force,
         )
