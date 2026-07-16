@@ -806,14 +806,36 @@ const stats = [
     position: relative;
     max-width: var(--maxw);
     margin: 0 auto;
-    padding: 8.5rem 1.5rem 3rem;
-    display: grid;
-    grid-template-columns: 1.15fr 0.85fr;
+    padding: 9rem 1.5rem 4rem;
+    min-height: min(82vh, 760px);
+    display: flex;
     align-items: center;
-    gap: 3rem;
     text-align: left;
+    isolation: isolate;
+  }
+  /* Layered hero: the copy floats in front (z2); the silicon die is an ambient
+     stage behind it (z0). A soft page-colour scrim sits between them (::before)
+     so the text stays legible where it overlaps the die — depth, not a divider. */
+  .hero__inner {
+    position: relative;
+    z-index: 2;
+    max-width: 33rem;
+  }
+  .hero__inner::before {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    inset: -22% -60% -22% -45%;
+    background: radial-gradient(58% 62% at 32% 46%, var(--bg) 45%, transparent 78%);
+    pointer-events: none;
   }
   .hero__stage {
+    position: absolute;
+    z-index: 0;
+    top: 50%;
+    right: -3%;
+    transform: translateY(-50%);
+    width: min(500px, 47%);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -830,11 +852,12 @@ const stats = [
   }
 
   .hero h1 {
-    font-size: clamp(2.7rem, 5.4vw, 4.6rem);
+    font-size: clamp(2.8rem, 5.6vw, 5rem);
     font-weight: 700;
     line-height: 1.04;
     letter-spacing: -0.035em;
     margin-bottom: 1.4rem;
+    text-shadow: 0 1px 22px var(--bg);
   }
   .accent { color: var(--accent); }
 
@@ -885,7 +908,7 @@ const stats = [
   .hero__visual {
     position: relative;
     margin: 0 auto;
-    width: min(370px, 100%);
+    width: 100%;
     aspect-ratio: 1;
     display: grid;
     place-items: center;
@@ -1342,14 +1365,35 @@ const stats = [
       border-radius: 10px;
     }
     .nav__links a:hover { background: var(--border-soft); color: var(--ink); }
+    /* Short brand so the floating pill never overflows on phones. */
+    .brand-word__full { max-width: 0; opacity: 0; }
+    .brand-word__short { max-width: 8em; opacity: 1; }
+    /* Hero collapses to one centred column; the die stays in flow but is pulled
+       up (overlapping the CTAs), dimmed and smaller so it reads as an ambient
+       companion to the copy rather than a big stacked second block. */
     .hero {
-      grid-template-columns: 1fr;
+      display: block;
+      min-height: auto;
+      padding: 8rem 1.5rem 2rem;
       text-align: center;
-      gap: 1rem;
+    }
+    .hero__inner {
+      max-width: 100%;
+      margin: 0 auto;
+    }
+    .hero__inner::before {
+      inset: -14% -8% -14% -8%;
+      background: radial-gradient(72% 60% at 50% 42%, var(--bg) 54%, transparent 82%);
+    }
+    .hero__stage {
+      position: static;
+      transform: none;
+      width: min(360px, 82%);
+      margin: -1.5rem auto 0;
+      opacity: 0.8;
     }
     .lead { margin-left: auto; margin-right: auto; }
     .cta-row { justify-content: center; }
-    .hero__stage { margin-top: 2.5rem; }
     .bento { grid-template-columns: repeat(2, 1fr); }
     .card--wide, .card--tall, .card--std {
       grid-column: span 2;
