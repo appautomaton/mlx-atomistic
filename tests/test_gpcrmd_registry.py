@@ -224,11 +224,26 @@ def _write_source_backed_tiny_gpcrmd_amber_cache(tmp_path: Path):
     parameters.write_text("AMBER parameters are embedded in the prmtop fixture.\n")
     protocol.write_text("source protocol archive placeholder\n")
     positions = np.asarray(
-        [[float(index), 0.25, -0.5] for index in range(11)],
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [4.0, 1.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [7.0, 0.0, 0.0],
+            [8.0, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+        ],
         dtype=np.float64,
     )
     velocities = np.asarray(
-        [[0.5, -0.25, 0.125] for _ in range(11)],
+        [
+            [0.005 * (index + 1), -0.002 * ((index % 3) - 1), 0.001]
+            for index in range(11)
+        ],
         dtype=np.float64,
     )
     archive_members = _write_gpcrmd_protocol_bundle(
@@ -1417,6 +1432,57 @@ def test_gpcrmd_runtime_benchmark_module_cli(tmp_path: Path, capsys):
     assert (out / GPCRMD_BENCHMARK_JSON_NAME).exists()
 
 
+def test_gpcrmd_source_protocol_benchmark_module_cli_dispatches(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    from mlx_atomistic.prep import gpcrmd_benchmark
+
+    captured = {}
+
+    def fake_source_protocol(**kwargs):
+        captured.update(kwargs)
+        return {"case_count": 3, "blocked_case_count": 0, "status": "passed"}
+
+    monkeypatch.setattr(
+        gpcrmd_benchmark,
+        "benchmark_gpcrmd_source_protocol",
+        fake_source_protocol,
+    )
+    out = tmp_path / "source-cli"
+    prepared = tmp_path / "prepared"
+    manifest = tmp_path / "workload.json"
+
+    gpcrmd_benchmark.main(
+        [
+            "--target-id",
+            "fixture",
+            "--prepared",
+            str(prepared),
+            "--protocol-manifest",
+            str(manifest),
+            "--warmups",
+            "1",
+            "--measured-steps",
+            "2",
+            "--checkpoint-restart",
+            "--out",
+            str(out),
+            "--force",
+            "--json",
+        ]
+    )
+
+    assert json.loads(capsys.readouterr().out)["status"] == "passed"
+    assert captured["prepared"] == prepared
+    assert captured["protocol_manifest"] == manifest
+    assert captured["warmups"] == 1
+    assert captured["measured_steps"] == 2
+    assert captured["checkpoint_restart"] is True
+    assert captured["force"] is True
+
+
 def test_gpcrmd_runtime_benchmark_blocks_without_timing_placeholders(tmp_path: Path):
     from mlx_atomistic.prep.gpcrmd_benchmark import benchmark_gpcrmd_mlx
 
@@ -1442,3 +1508,164 @@ def test_gpcrmd_runtime_benchmark_blocks_without_timing_placeholders(tmp_path: P
     assert row["integration_steps_per_s"] is None
     assert row["ps_per_s"] is None
     assert row["atom_count"] is None
+
+
+def test_gpcrmd_source_protocol_benchmark_writes_restart_evidence(tmp_path: Path):
+    from mlx_atomistic.io import load_npz_trajectory, load_simulation_checkpoint
+    from mlx_atomistic.prep.gpcrmd_benchmark import (
+        GPCRMD_BENCHMARK_CSV_NAME,
+        GPCRMD_BENCHMARK_JSON_NAME,
+        benchmark_gpcrmd_source_protocol,
+    )
+
+    target, registry, cache, source_manifest, _, _ = (
+        _write_source_backed_tiny_gpcrmd_amber_cache(tmp_path)
+    )
+    prepared = tmp_path / "prepared-source-protocol"
+    prepare_gpcrmd_artifact(
+        cache_path=cache,
+        out_dir=prepared,
+        report_path=tmp_path / "preparation-report.json",
+        target_id=target.target_id,
+        registry_path=registry,
+        source_manifest_path=source_manifest,
+    )
+    protocol_manifest = prepared / GPCRMD_WORKLOAD_MANIFEST_NAME
+    out = tmp_path / "source-protocol-runtime"
+
+    payload = benchmark_gpcrmd_source_protocol(
+        out=out,
+        target_id=target.target_id,
+        registry_path=registry,
+        prepared=prepared,
+        protocol_manifest=protocol_manifest,
+        warmups=1,
+        measured_steps=2,
+        checkpoint_restart=True,
+        seed=31,
+        constraint_max_iterations=8,
+        force=True,
+    )
+
+    assert payload["status"] == "passed"
+    assert payload["protocol_validation"]["status"] == "ready"
+    assert payload["protocol_validation"]["manifest_matches_prepared"] is True
+    assert payload["config"]["dt_ps"] == pytest.approx(0.004)
+    assert payload["config"]["temperature_K"] == pytest.approx(310.0)
+    assert payload["config"]["friction_ps^-1"] == pytest.approx(0.1)
+    assert payload["config"]["minimize_steps"] == 0
+    assert payload["config"]["equilibration_steps"] == 0
+    assert payload["config"]["initial_velocity_policy"] == (
+        "prepared_constraint_projected"
+    )
+    assert payload["case_count"] == 3
+    assert payload["blocked_case_count"] == 0
+    assert payload["continuation"] == {
+        "status": "passed",
+        "warmup_to_measured": True,
+        "measured_to_restart": True,
+        "monotonic_step_time": True,
+        "fixed_cell_preserved": True,
+        "warmup_checkpoint": "warmup/checkpoint.npz",
+        "measured_checkpoint": "measured/checkpoint.npz",
+        "restart_checkpoint": "restart/checkpoint.npz",
+    }
+    warmup, measured, restart = payload["cases"]
+    assert [row["phase"] for row in payload["cases"]] == [
+        "warmup",
+        "measured",
+        "restart",
+    ]
+    assert [row["status"] for row in payload["cases"]] == ["ran", "ran", "ran"]
+    assert (warmup["start_step"], warmup["final_step"]) == (0, 1)
+    assert (measured["start_step"], measured["final_step"]) == (1, 3)
+    assert (restart["start_step"], restart["final_step"]) == (3, 4)
+    for row in payload["cases"]:
+        assert row["fixed_cell"] is True
+        assert row["hmr_status"] == "represented_by_masses"
+        assert row["hmr_preserved"] is True
+        assert row["neighbor_backend"] == "mlx_cell_blocks"
+        assert row["neighbor_representation"] == "NeighborBlocks"
+        assert row["topology_pair_policy"] == "lazy"
+        assert row["eager_nonbonded_pair_limit"] == 0
+        assert row["shared_direct_space_neighbors"] is True
+        assert row["dense_or_tiled_fallback_used"] is False
+        assert row["pme_execution_plan_count"] == 1
+        assert row["pme_execution_plan_build_count"] == 1
+        assert row["pme_execution_plan_reuse_count"] > 0
+        assert row["positions_finite"] is True
+        assert row["velocities_finite"] is True
+        assert row["forces_finite"] is True
+        assert row["total_energy_finite"] is True
+        assert row["temperature_finite"] is True
+        assert row["constraint_error_finite"] is True
+    measured_record = load_npz_trajectory(out / measured["trajectory_path"])
+    measured_checkpoint = load_simulation_checkpoint(out / measured["checkpoint_path"])
+    restart_record = load_npz_trajectory(out / restart["trajectory_path"])
+    assert measured_record.sampled_steps.tolist() == [1, 2, 3]
+    assert measured_record.metadata["minimize_steps"] == 0
+    assert measured_record.metadata["equilibration_steps"] == 0
+    assert measured_record.metadata["initial_velocity_policy"] == "checkpoint"
+    assert measured_checkpoint.step == 3
+    assert measured_checkpoint.time == pytest.approx(0.012)
+    assert measured_checkpoint.thermostat["rng_step_offset"] == 3
+    assert measured_checkpoint.metadata["run_metadata"]["source_protocol_phase"] == (
+        "measured"
+    )
+    assert restart_record.sampled_steps.tolist() == [3, 4]
+    assert (out / GPCRMD_BENCHMARK_JSON_NAME).exists()
+    assert (out / GPCRMD_BENCHMARK_CSV_NAME).read_text().startswith("phase,status")
+
+
+def test_gpcrmd_source_protocol_benchmark_blocks_manifest_drift(tmp_path: Path):
+    from mlx_atomistic.prep.gpcrmd_benchmark import benchmark_gpcrmd_source_protocol
+
+    target, registry, cache, source_manifest, _, _ = (
+        _write_source_backed_tiny_gpcrmd_amber_cache(tmp_path)
+    )
+    prepared = tmp_path / "prepared-manifest-drift"
+    prepare_gpcrmd_artifact(
+        cache_path=cache,
+        out_dir=prepared,
+        report_path=tmp_path / "preparation-report.json",
+        target_id=target.target_id,
+        registry_path=registry,
+        source_manifest_path=source_manifest,
+    )
+    workload_path = prepared / GPCRMD_WORKLOAD_MANIFEST_NAME
+    workload = json.loads(workload_path.read_text())
+    workload["protocol"]["temperature_K"] = 300.0
+    unsigned = {key: value for key, value in workload.items() if key != "manifest_sha256"}
+    workload["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    drifted_manifest = tmp_path / "drifted-workload.json"
+    drifted_manifest.write_text(json.dumps(workload, indent=2, sort_keys=True) + "\n")
+
+    payload = benchmark_gpcrmd_source_protocol(
+        out=tmp_path / "blocked-source-protocol",
+        target_id=target.target_id,
+        registry_path=registry,
+        prepared=prepared,
+        protocol_manifest=drifted_manifest,
+        warmups=1,
+        measured_steps=2,
+        checkpoint_restart=True,
+        force=True,
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["protocol_validation"]["status"] == "blocked"
+    assert payload["protocol_validation"]["manifest_matches_prepared"] is False
+    assert any(
+        blocker.startswith("prepared_manifest_mismatch:")
+        for blocker in payload["protocol_validation"]["blockers"]
+    )
+    assert payload["cases"][0]["phase"] == "validation"
+    assert payload["cases"][0]["integration_steps_per_s"] is None
+    assert not (tmp_path / "blocked-source-protocol" / "warmup" / "trajectory.npz").exists()

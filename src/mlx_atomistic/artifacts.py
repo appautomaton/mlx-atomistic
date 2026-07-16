@@ -418,9 +418,13 @@ def _metadata_electrostatics_mode(metadata: dict[str, Any]) -> str:
         or report.get("electrostatics")
         or report.get("electrostatics_model")
         or (
-            "ewald_reference"
-            if "ewald_reference_electrostatics" in requested_terms
-            else "cutoff"
+            "pme"
+            if "pme" in requested_terms
+            else (
+                "ewald_reference"
+                if "ewald_reference_electrostatics" in requested_terms
+                else "cutoff"
+            )
         )
     )
     try:

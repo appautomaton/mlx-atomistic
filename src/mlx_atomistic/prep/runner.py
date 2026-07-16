@@ -66,6 +66,7 @@ from mlx_atomistic.protocols import (
 )
 from mlx_atomistic.runtime import get_platform_boundary_report
 from mlx_atomistic.steering import SteeredCOMBiasPotential, simulate_steered_nvt
+from mlx_atomistic.topology import DEFAULT_EAGER_NONBONDED_PAIR_LIMIT
 from mlx_atomistic.trajectory_adapters import write_mdtraj_trajectory
 from mlx_atomistic.units import ATM_TO_KJ_PER_MOL_ANGSTROM3, MDUnitSystem
 
@@ -340,13 +341,14 @@ def _project_and_rescale_velocities(
     temperature: float,
     kinetic_energy_scale: float,
     boltzmann_constant: float,
+    rescale: bool = True,
 ) -> np.ndarray:
     if constraints is not None:
         velocities = np.asarray(
             constraints.apply_velocities(positions, velocities, masses, cell),
             dtype=np.float32,
         )
-    if temperature <= 0.0:
+    if temperature <= 0.0 or not rescale:
         return velocities.astype(np.float32)
     constraint_count = 0 if constraints is None else int(constraints.pairs.shape[0])
     dof = _temperature_degrees_of_freedom(len(masses), constraint_count)
@@ -495,6 +497,179 @@ def _pme_execution_plan_diagnostics(force_terms) -> list[dict[str, object]]:
     return diagnostics
 
 
+def _runtime_execution_contract(
+    force_terms,
+    *,
+    neighbor_manager: NeighborListManager | None,
+    nonbonded_report: dict[str, Any],
+    fixed_cell: bool,
+) -> dict[str, Any]:
+    topologies = {
+        id(topology): topology
+        for term in force_terms
+        if (topology := getattr(term, "topology", None)) is not None
+    }
+    pair_policies = sorted(
+        {
+            str(getattr(topology, "nonbonded_pair_policy", "unknown"))
+            for topology in topologies.values()
+        }
+    )
+    eager_limits = sorted(
+        {
+            getattr(topology, "eager_nonbonded_pair_limit", None)
+            for topology in topologies.values()
+        },
+        key=lambda value: (-1 if value is None else int(value)),
+    )
+    pme_term_count = sum(
+        getattr(term, "electrostatics", None) == "pme" for term in force_terms
+    )
+    representation_kind = nonbonded_report.get("representation_kind")
+    backend = nonbonded_report.get("backend")
+    fallback_reason = nonbonded_report.get("fallback_reason")
+    return {
+        "fixed_cell": bool(fixed_cell),
+        "topology_pair_policy": (
+            pair_policies[0] if len(pair_policies) == 1 else pair_policies
+        ),
+        "eager_nonbonded_pair_limit": (
+            eager_limits[0] if len(eager_limits) == 1 else eager_limits
+        ),
+        "neighbor_backend": backend,
+        "neighbor_representation": (
+            "NeighborBlocks" if representation_kind == "blocks" else representation_kind
+        ),
+        "shared_direct_space_neighbors": bool(
+            pme_term_count
+            and neighbor_manager is not None
+            and representation_kind == "blocks"
+        ),
+        "dense_or_tiled_fallback_used": bool(
+            backend in {"dense_all_pairs", "tiled_all_pairs"} or fallback_reason
+        ),
+        "neighbor_fallback_reason": fallback_reason,
+        "pme_force_term_count": pme_term_count,
+    }
+
+
+def _validate_resume_checkpoint(
+    checkpoint,
+    *,
+    system,
+    masses: np.ndarray,
+    force_terms,
+    fixed_cell: bool,
+    dt: float,
+    temperature: float,
+    friction: float,
+    seed: int | None,
+    neighbor_skin: float,
+    neighbor_check_interval: int,
+    hmr_state: dict[str, Any],
+) -> None:
+    expected_shape = np.asarray(system.positions).shape
+    for name in ("positions", "velocities", "forces"):
+        values = np.asarray(getattr(checkpoint, name))
+        if values.shape != expected_shape:
+            msg = (
+                f"resume checkpoint {name} shape {values.shape} does not match "
+                f"prepared artifact shape {expected_shape}"
+            )
+            raise ValueError(msg)
+        if not np.all(np.isfinite(values)):
+            msg = f"resume checkpoint {name} must be finite"
+            raise ValueError(msg)
+    checkpoint_masses = np.asarray(checkpoint.masses)
+    if checkpoint_masses.shape != masses.shape or not np.allclose(
+        checkpoint_masses,
+        masses,
+        rtol=1e-7,
+        atol=1e-7,
+    ):
+        msg = "resume checkpoint masses do not match the prepared artifact"
+        raise ValueError(msg)
+    if checkpoint.step < 0 or not np.isfinite(checkpoint.time) or checkpoint.time < 0.0:
+        msg = "resume checkpoint step/time must be finite and non-negative"
+        raise ValueError(msg)
+    if fixed_cell and system.cell is not None:
+        if checkpoint.cell is None:
+            msg = "fixed-cell resume checkpoint requires the prepared periodic cell"
+            raise ValueError(msg)
+        expected_cell = np.asarray(
+            system.cell.lengths if system.cell.is_orthorhombic else system.cell.matrix,
+            dtype=np.float32,
+        )
+        if np.asarray(checkpoint.cell).shape != expected_cell.shape or not np.allclose(
+            checkpoint.cell,
+            expected_cell,
+            rtol=1e-6,
+            atol=1e-6,
+        ):
+            msg = "resume checkpoint cell does not match the fixed prepared cell"
+            raise ValueError(msg)
+    elif fixed_cell and checkpoint.cell is not None:
+        msg = "resume checkpoint cell does not match the non-periodic prepared artifact"
+        raise ValueError(msg)
+    thermostat = checkpoint.thermostat
+    for name, requested in (
+        ("temperature", temperature),
+        ("friction", friction),
+    ):
+        if name in thermostat and not np.isclose(
+            float(thermostat[name]),
+            requested,
+            rtol=1e-8,
+            atol=1e-10,
+        ):
+            msg = f"resume checkpoint thermostat {name} does not match the requested run"
+            raise ValueError(msg)
+    if "seed" in thermostat and thermostat["seed"] != seed:
+        msg = "resume checkpoint thermostat seed does not match the requested run"
+        raise ValueError(msg)
+    rng_step_offset = int(thermostat.get("rng_step_offset", checkpoint.step))
+    if rng_step_offset < 0:
+        msg = "resume checkpoint thermostat RNG offset must be non-negative"
+        raise ValueError(msg)
+    neighbor_policy = checkpoint.neighbor_policy
+    if "skin" in neighbor_policy and not np.isclose(
+        float(neighbor_policy["skin"]),
+        neighbor_skin,
+        rtol=1e-8,
+        atol=1e-10,
+    ):
+        msg = "resume checkpoint neighbor skin does not match the requested run"
+        raise ValueError(msg)
+    if (
+        "check_interval" in neighbor_policy
+        and int(neighbor_policy["check_interval"]) != neighbor_check_interval
+    ):
+        msg = "resume checkpoint neighbor interval does not match the requested run"
+        raise ValueError(msg)
+    expected_force_terms = tuple(
+        str(getattr(term, "name", type(term).__name__)) for term in force_terms
+    )
+    if checkpoint.force_terms and checkpoint.force_terms != expected_force_terms:
+        msg = "resume checkpoint force terms do not match the prepared artifact"
+        raise ValueError(msg)
+    checkpoint_dt = checkpoint.metadata.get("dt")
+    if checkpoint_dt is not None and not np.isclose(
+        float(checkpoint_dt),
+        dt,
+        rtol=1e-8,
+        atol=1e-12,
+    ):
+        msg = "resume checkpoint timestep does not match the requested run"
+        raise ValueError(msg)
+    checkpoint_hmr = checkpoint.hmr_state
+    if (
+        checkpoint_hmr.get("status") != "absent"
+        and checkpoint_hmr.get("status") != hmr_state.get("status")
+    ):
+        msg = "resume checkpoint HMR state does not match the prepared artifact"
+        raise ValueError(msg)
+
+
 def _compile_force_evaluator_safe(force_terms) -> bool:
     return not any(
         getattr(term, "electrostatics", None) == "pme"
@@ -524,6 +699,8 @@ def run_mlx(
     diagnostic_interval: int | None = None,
     neighbor_skin: float = GPCRMD_NEIGHBOR_SKIN,
     neighbor_check_interval: int = 1,
+    eager_nonbonded_pair_limit: int | None = DEFAULT_EAGER_NONBONDED_PAIR_LIMIT,
+    rescale_initial_velocities: bool = True,
     metadata_overrides: dict[str, Any] | None = None,
     runtime_electrostatics_model: str | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
@@ -583,6 +760,7 @@ def run_mlx(
         artifact,
         restraint_k=restraint_k,
         constraint_max_iterations=constraint_max_iterations,
+        eager_nonbonded_pair_limit=eager_nonbonded_pair_limit,
     )
     use_npt = protocol_report.metadata["ensemble"] == "NPT"
     force_terms = _bind_fixed_cell_pme_plans(
@@ -611,6 +789,20 @@ def run_mlx(
     rng_step_offset = None
     if resume_checkpoint is not None:
         checkpoint = load_simulation_checkpoint(resume_checkpoint)
+        _validate_resume_checkpoint(
+            checkpoint,
+            system=system,
+            masses=masses,
+            force_terms=force_terms,
+            fixed_cell=not use_npt,
+            dt=dt,
+            temperature=temperature,
+            friction=friction,
+            seed=seed,
+            neighbor_skin=neighbor_skin,
+            neighbor_check_interval=neighbor_check_interval,
+            hmr_state=hmr_state,
+        )
         run_positions = np.asarray(checkpoint.positions, dtype=np.float32)
         velocities = np.asarray(checkpoint.velocities, dtype=np.float32)
         initial_step = checkpoint.step
@@ -636,6 +828,7 @@ def run_mlx(
             temperature=temperature,
             kinetic_energy_scale=kinetic_energy_scale,
             boltzmann_constant=boltzmann_constant,
+            rescale=rescale_initial_velocities,
         )
     neighbor_manager = _production_neighbor_manager(
         system,
@@ -770,6 +963,13 @@ def run_mlx(
     if pme_execution_plans:
         result.nonbonded_report["pme_execution_plan_count"] = len(pme_execution_plans)
         result.nonbonded_report["pme_execution_plans"] = pme_execution_plans
+    runtime_execution_contract = _runtime_execution_contract(
+        force_terms,
+        neighbor_manager=neighbor_manager,
+        nonbonded_report=result.nonbonded_report,
+        fixed_cell=not use_npt,
+    )
+    result.nonbonded_report.update(runtime_execution_contract)
     if out is None and prepared_dir is not None:
         out = prepared_dir / TRAJECTORY_NAME
     if checkpoint_out is not None:
@@ -795,7 +995,29 @@ def run_mlx(
             metadata={
                 "kind": "mlx_atomistic.checkpoint",
                 "source": "prep.run_mlx",
+                "prepared_artifact": (
+                    None if prepared_dir is None else str(prepared_dir)
+                ),
+                "prepared_artifact_version": prepared_system.metadata.artifact_version,
+                "parameter_source": prepared_system.metadata.parameter_source,
+                "atom_count": artifact.atom_count,
+                "dt": dt,
+                "initial_velocity_policy": (
+                    "checkpoint"
+                    if checkpoint is not None
+                    else (
+                        "prepared_constraint_projected_rescaled"
+                        if rescale_initial_velocities
+                        else "prepared_constraint_projected"
+                    )
+                ),
+                "initial_step": initial_step,
+                "initial_time_ps": initial_time,
+                "final_step": int(result.final_state.step),
+                "final_time_ps": float(result.final_state.time),
+                "fixed_cell": not use_npt,
                 "resumed_from": None if checkpoint is None else str(resume_checkpoint),
+                "run_metadata": dict(metadata_overrides or {}),
                 "platform_readiness": {
                     "artifact": artifact_readiness.to_dict(),
                     "protocol": protocol_readiness.to_dict(),
@@ -803,6 +1025,7 @@ def run_mlx(
                 "platform_boundary": platform_boundary,
                 "hydrogen_mass_repartitioning": hmr_state,
                 "pme_execution_plans": pme_execution_plans,
+                "runtime_execution_contract": runtime_execution_contract,
             },
             runtime_sync_report=result.runtime_sync_report,
             runtime_nonbonded_report=result.nonbonded_report,
@@ -834,6 +1057,17 @@ def run_mlx(
             "pressure_diagnostics": pressure_diagnostics,
             "neighbor_skin": neighbor_skin,
             "neighbor_check_interval": neighbor_check_interval,
+            "eager_nonbonded_pair_limit": eager_nonbonded_pair_limit,
+            "rescale_initial_velocities": rescale_initial_velocities,
+            "initial_velocity_policy": (
+                "checkpoint"
+                if checkpoint is not None
+                else (
+                    "prepared_constraint_projected_rescaled"
+                    if rescale_initial_velocities
+                    else "prepared_constraint_projected"
+                )
+            ),
             "pressure_diagnostics_reason": (
                 None
                 if pressure_diagnostics
@@ -850,6 +1084,15 @@ def run_mlx(
                 else None
             ),
             "simulated_time_ps": steps * dt,
+            "initial_step": initial_step,
+            "initial_time_ps": initial_time,
+            "final_step": int(result.final_state.step),
+            "final_time_ps": float(result.final_state.time),
+            "thermostat_rng_step_offset_start": (
+                initial_step if rng_step_offset is None else rng_step_offset
+            ),
+            "thermostat_rng_step_offset_end": int(result.final_state.step),
+            "fixed_cell": not use_npt,
             "simulated_ps_per_wall_second": (
                 (steps * dt) / elapsed_wall_seconds if elapsed_wall_seconds > 0.0 else None
             ),
@@ -861,7 +1104,9 @@ def run_mlx(
             "nonbonded_runtime": result.nonbonded_report,
             "pme_execution_plans": pme_execution_plans,
             "resume_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
+            "checkpoint_out": None if checkpoint_out is None else str(checkpoint_out),
             "hydrogen_mass_repartitioning": hmr_state,
+            "runtime_execution_contract": runtime_execution_contract,
         }
         if use_npt:
             metadata["kind"] = "mlx_atomistic.prep_npt"
