@@ -155,6 +155,37 @@ for (let i = 0; i < SITES.length; i++)
 const VAC0 = 3; // initial vacancy: site (-1, 1), lower-left of centre
 const EXC0 = [1, 6, 16, 17]; // initial exciton lobe: upper-right, off-centre
 const ATOMS0 = SITES.map((s, k) => ({ ...s, site: k })).filter((s) => s.site !== VAC0);
+
+// Superellipse ("squircle") rounded rect: |x|^n + |y|^n = 1 corners are
+// curvature-continuous (G2) — the corner eases out of the straight edge
+// instead of snapping onto a circular arc, so nested shapes read as one
+// corner language (Apple's "continuous" corners). Nesting follows the
+// concentric rule: r_inner = r_outer - gap, so the gap stays constant
+// around the whole corner.
+function squircle(x, y, w, h, rs, n = 4) {
+  const N = 16;
+  const e = 2 / n;
+  const q = (u) => [Math.sin((Math.PI / 2) * (u / N)) ** e, Math.cos((Math.PI / 2) * (u / N)) ** e];
+  let d = `M${(x + rs).toFixed(1)} ${y}L${(x + w - rs).toFixed(1)} ${y}`;
+  const corner = (cx, cy, fx, fy, swap) => {
+    for (let u = 1; u <= N; u++) {
+      let [s, c] = q(u);
+      if (swap) [s, c] = [c, s];
+      d += `L${(cx + fx * s * rs).toFixed(1)} ${(cy + fy * c * rs).toFixed(1)}`;
+    }
+  };
+  corner(x + w - rs, y + rs, 1, -1, false);        // top-right
+  d += `L${x + w} ${(y + h - rs).toFixed(1)}`;
+  corner(x + w - rs, y + h - rs, 1, 1, true);      // bottom-right
+  d += `L${(x + rs).toFixed(1)} ${y + h}`;
+  corner(x + rs, y + h - rs, -1, 1, false);        // bottom-left
+  d += `L${x} ${(y + rs).toFixed(1)}`;
+  corner(x + rs, y + rs, -1, -1, true);            // top-left
+  return d + "Z";
+}
+const DIE_RS = 54; // near Apple's icon proportion (54/240 ≈ 22.5%)
+const DIE_PATH = squircle(40, 40, 240, 240, DIE_RS);
+const INNER_PATH = squircle(74, 74, 172, 172, DIE_RS - 34); // concentric: 34px gap
 // Package pins: three per side, aligned across opposite edges, each ending in
 // a solder pad that echoes the atoms inside. The machined regularity of the
 // package is deliberate contrast to the organic asymmetry of the crystallite.
@@ -385,10 +416,10 @@ const stats = [
                 </>
               ))}
             </g>
-            <!-- silicon die -->
-            <rect x="40" y="40" width="240" height="240" rx="40" fill="url(#die)" />
-            <rect x="40" y="40" width="240" height="240" rx="40" class="die-edge" />
-            <rect x="74" y="74" width="172" height="172" rx="26" class="die-inner" />
+            <!-- silicon die: superellipse corners, concentric nesting -->
+            <path d={DIE_PATH} fill="url(#die)" />
+            <path d={DIE_PATH} class="die-edge" />
+            <path d={INNER_PATH} class="die-inner" />
             <!-- Bonded crystallite, generated from SITES/EDGES (see
                  frontmatter). Every edge of the site graph gets a line; an
                  edge only shows while both of its sites are occupied, so the
@@ -1348,11 +1379,13 @@ const stats = [
     fill: none;
     stroke: var(--border);
     stroke-width: 1.5;
+    stroke-linejoin: round;
   }
   .lattice .die-inner {
     fill: none;
     stroke: color-mix(in srgb, var(--accent) 26%, transparent);
     stroke-width: 1.5;
+    stroke-linejoin: round;
   }
   .lattice .pins {
     opacity: 0.55;
