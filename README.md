@@ -134,8 +134,8 @@ focus on local-first, Apple-Silicon-native execution.
 
 ## Community and acknowledgements
 
-We are grateful to the vibrant [LINUX DO](https://linux.do/) AI community for
-its support, thoughtful discussions, and enthusiasm for open, practical AI
+We are grateful to the vibrant AI community at ⚫️⚪️🟡 [LINUX DO](https://linux.do/)
+for its support, thoughtful discussions, and enthusiasm for open, practical AI
 engineering.
 
 ## License
