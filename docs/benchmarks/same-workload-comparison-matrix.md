@@ -2,22 +2,24 @@
 
 Date: 2026-07-15
 
-Scope: `.agent/work/2026-05-23-same-workload-openmm-benchmark-comparison`.
-This matrix defines the first MLX/OpenMM comparison pairs. It is a routing
-artifact for benchmark implementation, not a performance report.
+Origin: `.agent/work/2026-05-23-same-workload-openmm-benchmark-comparison`.
+This living matrix began with the first MLX/OpenMM comparison pairs and now
+also routes later at-scale PME evidence. It is not itself a performance report.
 
 ## Rules
 
 - Compare `mlx_atomistic` to OpenMM only when workload, physics, hardware, and
   metric family match.
-- Keep MLX commands under `src/mlx_atomistic/benchmarks/` module entry points.
+- Keep MLX commands under package-owned module entry points. The source-protocol
+  GPCRmd orchestrator remains in `mlx_atomistic.prep.gpcrmd_benchmark`.
 - Keep OpenMM commands under `scripts/`; OpenMM remains a reference/dev
   surface, not a product runtime dependency.
 - Write controlled-summary JSON/CSV under gitignored
-  `results/same-workload-openmm-comparison/`; large charged-PME evidence lives
-  under `results/scalable-charged-pme-runtime/`.
-- Mark rows as `comparable`, `diagnostic`, or `blocked`; do not compute a ratio
-  for diagnostic or blocked rows.
+  `results/same-workload-openmm-comparison/`; large PME evidence lives under
+  `results/scalable-charged-pme-runtime/` and
+  `results/gpcrmd-pme-runtime-closure/`.
+- Mark rows as `comparable`, `parity-passed`, `diagnostic`, or `blocked`. Compute
+  a ratio only for a `comparable` pair with matching runtime semantics.
 - For the synthetic-LJ scaling ladder, LAMMPS is a first-class third engine
   (reduced-unit `lj/cut/gpu`, same `fcc_lattice` geometry as MLX). For the
   semantic smoke pairs below (GBSA/TIP4P/DHFR), LAMMPS remains deferred.
@@ -32,6 +34,7 @@ artifact for benchmark implementation, not a performance report.
 | `dhfr-implicit` | DHFR implicit GBSA/OBC real-system stretch | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-implicit --steps 1 --json` | `uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-implicit --platform Reference --steps 1 --json` | `ns/day` | `comparable` for the one-step MLX/OpenMM Reference smoke row when both sides are `ok` and use `0.004 ps` | `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; `results/same-workload-openmm-comparison/summary.json` | Use as a narrow runtime/artifact smoke comparison. OpenMM OpenCL DHFR implicit remains context only. |
 | `dhfr-explicit-pme` | Charged AMBER20 JAC explicit PME, 23,558 atoms | `uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --amber-topology results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --json` | `uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/dhfr-artifacts/dhfr-explicit-pme --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 1,1,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-1x` | fixed-coordinate energy/complete-force parity; MLX `ns/day` diagnostic | `parity-passed`; runtime ratio suppressed until an OpenMM row confirms the same NVT operation, atom/step counts, and PME configuration | `results/scalable-charged-pme-runtime/jac-1x/charged_pme_parity_report.json`; `results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json` | Explicit `uniform_neutralizing_plasma` replaces the old charge blocker. Do not compare the MLX one-step timing with historical OpenMM OpenCL throughput. |
 | `jac-charged-pme-94k` | Deterministic charged AMBER20 JAC 2x2x1 supercell, 94,232 atoms | `uv run python -m mlx_atomistic.benchmarks.charged_pme runtime --prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --warmups 1 --steps 2 --out results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json` | `uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 2,2,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-2x2x1` | fixed-coordinate energy/complete-force parity; MLX bounded NVT and PME stage timings | `parity-passed`; MLX runtime diagnostic; no throughput ratio without a matching OpenMM NVT manifest | parity/runtime/profile JSON under `results/scalable-charged-pme-runtime/jac-2x2x1/`; [scalable-charged-pme-runtime-m5max.md](./scalable-charged-pme-runtime-m5max.md) | Validated only for the fixed orthorhombic JAC envelope. This is not GPCRmd, NPT, analytic virial, or triclinic validation. |
+| `gpcrmd-729-pme-92k` | Source-backed neutral CHARMM GPCRmd 729 membrane fixture, 92,001 atoms | `uv run python -m mlx_atomistic.prep.gpcrmd_benchmark --target-id gpcrmd-729-beta1-5f8u-cyanopindolol --prepared results/gpcrmd-pme-runtime-closure/prepared --protocol-manifest results/gpcrmd-pme-runtime-closure/prepared/mlx-workload-manifest.json --warmups 1 --measured-steps 2 --checkpoint-restart --out results/gpcrmd-pme-runtime-closure/runtime --force --json` | `uv run --with openmm python scripts/run_gpcrmd_pme_parity.py --source-manifest results/gpcrmd-pme-runtime-closure/source/fixture-manifest.json --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --mlx-prepared results/gpcrmd-pme-runtime-closure/prepared --platform OpenCL --out results/gpcrmd-pme-runtime-closure/parity` | fixed-coordinate total/component energy and complete-force parity; MLX bounded source-protocol NVT, checkpoint restart, and PME-stage timings | `parity-passed`; bounded MLX runtime/restart passed; no throughput ratio without a matching OpenMM NVT runtime manifest | source/prepared/parity/runtime/profile/matrix evidence under `results/gpcrmd-pme-runtime-closure/`; [gpcrmd-729-pme-runtime-m5max.md](./gpcrmd-729-pme-runtime-m5max.md) | Valid only for this fixed-cell orthorhombic NVT fixture and bounded four-step run. It does not establish NPT, analytic PME virial, triclinic PME, production-length stability, or broad membrane readiness. |
 | `neighbor-nonbonded-parity-92k` | heterogeneous LJ+Coulomb orthorhombic parity ladder with lazy topology | `uv run python -m mlx_atomistic.benchmarks.neighbor_nonbonded_parity --sizes 1000,4000,16000,50000,92001 --out results/scalable-neighbor-nonbonded-runtime/parity.json` | none | `dE`, max `dF`, build/eval wall time | `diagnostic`; internal MLX compact-pair versus tiled-oracle validation | `results/scalable-neighbor-nonbonded-runtime/parity.json`; [scalable-neighbor-nonbonded-runtime-m5max.md](./scalable-neighbor-nonbonded-runtime-m5max.md) | Existing reference rows use different physics; do not compute a cross-engine ratio. |
 
 ## Large-Scale Synthetic-LJ Scaling Ladder
@@ -53,9 +56,12 @@ The separate neighbor/nonbonded parity ladder reaches 92,001 atoms but remains
 `diagnostic` because its heterogeneous LJ+Coulomb topology workload does not
 have a matching OpenMM/LAMMPS row. Charged PME now has an independent
 manifest-matched JAC comparison at 94,232 atoms, but its two-step MLX NVT row
-still has no matching OpenMM runtime manifest. See
+still has no matching OpenMM runtime manifest. GPCRmd 729 separately passes
+source-backed manifest parity plus bounded MLX fixed-cell NVT and restart, also
+without an OpenMM throughput ratio. See
 `docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md` and
-`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`.
+`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`, and
+`docs/benchmarks/gpcrmd-729-pme-runtime-m5max.md`.
 
 ## Required Report Behavior
 

@@ -221,6 +221,8 @@ platforms produce a blocked result rather than a synthetic pass.
 - Admitted but not broadly certified: fixed-cell orthorhombic PME up to the
   runtime checks of 100,000 atoms and 1,048,576 mesh points when all other
   configuration checks pass.
-- Not claimed: the unavailable GPCRmd membrane fixture, production NPT or cell
-  changes, analytic PME virial, triclinic PME, universal charged-system
-  coverage, a long stability trajectory, or an OpenMM throughput ratio.
+- Not claimed by this JAC row: the separately measured GPCRmd membrane result,
+  production NPT or cell changes, analytic PME virial, triclinic PME, universal
+  charged-system coverage, a long stability trajectory, or an OpenMM
+  throughput ratio. The bounded GPCRmd result is documented independently in
+  [`gpcrmd-729-pme-runtime-m5max.md`](./gpcrmd-729-pme-runtime-m5max.md).
