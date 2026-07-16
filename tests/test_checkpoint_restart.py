@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -74,6 +76,95 @@ def _run_nose_hoover_nvt(
             chain_position=chain_position,
             chain_velocity=chain_velocity,
         ),
+    )
+
+
+def _production_pme_checkpoint_fixture():
+    from mlx_atomistic.prep.io import synthetic_prepared_system
+
+    prepared = synthetic_prepared_system()
+    metadata = replace(
+        prepared.metadata,
+        units={
+            "coordinates": "angstrom",
+            "mass": "dalton",
+            "charge": "elementary_charge",
+            "energy": "kilojoule_per_mole",
+            "time": "picosecond",
+            "temperature": "kelvin",
+        },
+        parameter_source="production_pme_checkpoint_fixture",
+        pme_config={
+            "mesh_shape": [8, 8, 8],
+            "alpha": 0.35,
+            "real_cutoff": 5.0,
+            "assignment_order": 2,
+            "charge_tolerance": 1e-5,
+            "background_policy": "reject_non_neutral",
+        },
+        protocol_metadata={
+            **prepared.metadata.protocol_metadata,
+            "nonbonded": {"cutoff": 5.0},
+        },
+        compatibility_report={
+            "production_force_field": True,
+            "hydrogens_present": True,
+            "hydrogen_count": 1,
+            "supported_terms": [
+                "harmonic_bond",
+                "nonbonded_lj_coulomb",
+                "nonbonded_exception",
+                "distance_constraint",
+                "pme_mesh_periodic_electrostatics",
+            ],
+            "required_terms": [
+                "harmonic_bond",
+                "nonbonded_lj_coulomb",
+                "nonbonded_exception",
+                "distance_constraint",
+                "pme_mesh_periodic_electrostatics",
+            ],
+            "unsupported_terms": [],
+            "electrostatics_model": "pme",
+        },
+    )
+    positions = np.asarray(
+        [[0.0, 0.0, 0.0], [1.25, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    return replace(
+        prepared,
+        metadata=metadata,
+        symbols=np.asarray(["H", "O", "C"], dtype=str),
+        atom_names=np.asarray(["H1", "O1", "C1"], dtype=str),
+        atom_types=np.asarray(["H", "O", "C"], dtype=str),
+        residue_names=np.asarray(["LIG", "LIG", "LIG"], dtype=str),
+        residue_ids=np.asarray([1, 1, 1], dtype=np.int32),
+        chain_ids=np.asarray(["A", "A", "A"], dtype=str),
+        positions=positions,
+        velocities=np.zeros((3, 3), dtype=np.float32),
+        masses=np.asarray([1.008, 15.999, 12.011], dtype=np.float32),
+        charges=np.asarray([0.1, -0.1, 0.0], dtype=np.float32),
+        sigma=np.asarray([3.0, 3.0, 3.4], dtype=np.float32),
+        epsilon=np.asarray([0.001, 0.001, 0.001], dtype=np.float32),
+        constraints=np.asarray([[0, 1]], dtype=np.int32),
+        constraint_distance=np.asarray([1.25], dtype=np.float32),
+        nonbonded_exception_pairs=np.asarray([[0, 1]], dtype=np.int32),
+        nonbonded_exception_charge_product=np.asarray([0.0], dtype=np.float32),
+        nonbonded_exception_sigma=np.asarray([0.0], dtype=np.float32),
+        nonbonded_exception_epsilon=np.asarray([0.0], dtype=np.float32),
+        ligand_mask=np.asarray([True, True, True]),
+        receptor_mask=np.asarray([False, False, False]),
+        restraint_mask=np.asarray([False, False, False]),
+        reference_positions=positions.copy(),
+        cell_lengths=np.asarray([12.0, 12.0, 12.0], dtype=np.float32),
+        pme_mesh_shape=np.asarray([8, 8, 8], dtype=np.int32),
+        pme_alpha=np.asarray([0.35], dtype=np.float32),
+        pme_real_cutoff=np.asarray([5.0], dtype=np.float32),
+        pme_assignment_order=np.asarray([2], dtype=np.int32),
+        pme_charge_tolerance=np.asarray([1e-5], dtype=np.float32),
+        pme_deconvolve_assignment=np.asarray([True], dtype=bool),
+        pme_background_policy=np.asarray(["reject_non_neutral"], dtype=str),
     )
 
 
@@ -231,6 +322,81 @@ def test_run_mlx_writes_and_resumes_checkpoint(tmp_path):
     assert resumed.final_state.step == 4
     assert record.sampled_steps.tolist() == [2, 4]
     assert record.metadata["resume_checkpoint"] == str(first_checkpoint)
+
+
+def test_production_pme_checkpoint_split_matches_uninterrupted_run(tmp_path):
+    from mlx_atomistic.prep.runner import run_mlx
+
+    prepared = _production_pme_checkpoint_fixture()
+    common = {
+        "require_production": True,
+        "sample_interval": 1,
+        "diagnostic_interval": 1,
+        "dt": 0.001,
+        "temperature": 1.0,
+        "friction": 0.1,
+        "seed": 29,
+        "restraint_k": 0.0,
+        "minimize_steps": 0,
+        "equilibration_steps": 0,
+        "eager_nonbonded_pair_limit": 0,
+    }
+    continuous = run_mlx(
+        prepared,
+        out=tmp_path / "continuous.npz",
+        steps=4,
+        **common,
+    )
+    split_checkpoint = tmp_path / "split-checkpoint.npz"
+    first = run_mlx(
+        prepared,
+        out=tmp_path / "split-first.npz",
+        checkpoint_out=split_checkpoint,
+        steps=2,
+        **common,
+    )
+    resumed = run_mlx(
+        prepared,
+        out=tmp_path / "split-resumed.npz",
+        resume_checkpoint=split_checkpoint,
+        steps=2,
+        **common,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(resumed.final_state.positions),
+        np.asarray(continuous.final_state.positions),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(resumed.final_state.velocities),
+        np.asarray(continuous.final_state.velocities),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert first.final_state.step == 2
+    assert resumed.final_state.step == 4
+    checkpoint = load_simulation_checkpoint(split_checkpoint)
+    assert checkpoint.step == 2
+    assert checkpoint.time == pytest.approx(0.002)
+    assert checkpoint.metadata["fixed_cell"] is True
+    assert checkpoint.metadata["runtime_execution_contract"] == {
+        "dense_or_tiled_fallback_used": False,
+        "eager_nonbonded_pair_limit": 0,
+        "fixed_cell": True,
+        "neighbor_backend": "mlx_cell_blocks",
+        "neighbor_fallback_reason": None,
+        "neighbor_representation": "NeighborBlocks",
+        "pme_force_term_count": 1,
+        "shared_direct_space_neighbors": True,
+        "topology_pair_policy": "lazy",
+    }
+    for result in (continuous, first, resumed):
+        assert result.nonbonded_report["pme_execution_plan_count"] == 1
+        plan = result.nonbonded_report["pme_execution_plans"][0]
+        assert plan["build_count"] == 1
+        assert plan["reuse_count"] > 0
 
 
 def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
