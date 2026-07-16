@@ -131,10 +131,12 @@ class CharmmParameterSetNative:
     angles: dict[tuple[str, str, str], tuple[float, float, float | None, float | None]]
     dihedrals: dict[tuple[str, str, str, str], tuple[tuple[float, float, float], ...]]
     impropers: dict[tuple[str, str, str, str], CharmmImproperParameter]
-    nonbonded: dict[str, tuple[float, float]]
+    nonbonded: dict[str, tuple[float, float, float, float]]
     nbfix: dict[tuple[str, str], tuple[float, float, float, float]]
     cmap_indices: dict[tuple[str, ...], int]
     cmap_grids: tuple[np.ndarray, ...]
+    nbxmod: int
+    e14fac: float
 
 
 def import_amber_prmtop(
@@ -514,11 +516,19 @@ def import_charmm_psf(
         _charmm_nbfix_type_overrides(parameters, atom_type_keys)
     )
 
-    exception_pairs = np.asarray(
-        sorted(_normalized_pairs(bonds) | _pairs_from_angles(angles)),
-        dtype=np.int32,
-    ).reshape((-1, 2))
-    exception_count = exception_pairs.shape[0]
+    (
+        exception_pairs,
+        exception_charge_product,
+        exception_sigma,
+        exception_epsilon,
+        exception_details,
+    ) = _charmm_exceptions(
+        topology=topology,
+        bonds=bonds,
+        atom_type_keys=atom_type_keys,
+        charges=charges,
+        parameters=parameters,
+    )
     ligand_mask = _ligand_mask_from_residues(residue_names)
     water_mask = _water_mask_from_residues(residue_names)
     ion_mask = _ion_mask_from_residues(residue_names)
@@ -566,9 +576,11 @@ def import_charmm_psf(
             "charmm_cmap_grids": int(charmm_cmap_grids.shape[0]),
             "urey_bradley_terms": int(urey_terms.shape[0]),
             "nbfix_pair_overrides": int(nbfix_type_pairs.shape[0]),
+            "nonbonded_exclusions": int(exception_details["excluded_pair_count"]),
+            "charmm_14_exceptions": int(exception_details["one_four_pair_count"]),
         }
     )
-    term_details = {}
+    term_details = {"nonbonded_exception": exception_details}
     if nbfix_details:
         term_details["nbfix_pair_overrides"] = nbfix_details
 
@@ -677,9 +689,9 @@ def import_charmm_psf(
         improper_periodicity=improper_periodicity,
         improper_phase=improper_phase,
         nonbonded_exception_pairs=exception_pairs,
-        nonbonded_exception_charge_product=np.zeros((exception_count,), dtype=np.float32),
-        nonbonded_exception_sigma=np.zeros((exception_count,), dtype=np.float32),
-        nonbonded_exception_epsilon=np.zeros((exception_count,), dtype=np.float32),
+        nonbonded_exception_charge_product=exception_charge_product,
+        nonbonded_exception_sigma=exception_sigma,
+        nonbonded_exception_epsilon=exception_epsilon,
         charmm_cmap_terms=charmm_cmap_terms,
         charmm_cmap_grid_indices=charmm_cmap_grid_indices,
         charmm_cmap_grids=charmm_cmap_grids,
@@ -922,10 +934,12 @@ def _read_charmm_parameters(paths: Sequence[Path]) -> CharmmParameterSetNative:
     angles: dict[tuple[str, str, str], tuple[float, float, float | None, float | None]] = {}
     dihedrals: dict[tuple[str, str, str, str], list[tuple[float, float, float]]] = {}
     impropers: dict[tuple[str, str, str, str], CharmmImproperParameter] = {}
-    nonbonded: dict[str, tuple[float, float]] = {}
+    nonbonded: dict[str, tuple[float, float, float, float]] = {}
     nbfix: dict[tuple[str, str], tuple[float, float, float, float]] = {}
     cmap_indices: dict[tuple[str, ...], int] = {}
     cmap_grids: list[np.ndarray] = []
+    nbxmod = 5
+    e14fac = 1.0
 
     for path in paths:
         lines = [
@@ -944,6 +958,9 @@ def _read_charmm_parameters(paths: Sequence[Path]) -> CharmmParameterSetNative:
             maybe_section = _charmm_parameter_section(keyword)
             if maybe_section is not None:
                 section = maybe_section
+                if section == "NONBONDED":
+                    nbxmod = _charmm_nbxmod(fields, current=nbxmod)
+                    e14fac = _charmm_e14fac(fields, current=e14fac)
                 if section in {"LONEPAIR", "DRUDE", "THOLE", "ANISOTROPY"}:
                     msg = f"unsupported_terms:charmm_parameter_{section.lower()}"
                     raise TopologyImportError(msg)
@@ -959,6 +976,9 @@ def _read_charmm_parameters(paths: Sequence[Path]) -> CharmmParameterSetNative:
 
             if keyword == "MASS":
                 continue
+            if section == "NONBONDED":
+                nbxmod = _charmm_nbxmod(fields, current=nbxmod)
+                e14fac = _charmm_e14fac(fields, current=e14fac)
             if section == "BONDS":
                 key, value = _parse_charmm_bond_parameter(fields)
                 bonds[key] = value
@@ -1000,11 +1020,51 @@ def _read_charmm_parameters(paths: Sequence[Path]) -> CharmmParameterSetNative:
         nbfix=nbfix,
         cmap_indices=cmap_indices,
         cmap_grids=tuple(cmap_grids),
+        nbxmod=nbxmod,
+        e14fac=e14fac,
     )
 
 
 def _strip_charmm_comment(line: str) -> str:
     return line.split("!", maxsplit=1)[0].strip()
+
+
+def _charmm_nbxmod(fields: Sequence[str], *, current: int) -> int:
+    upper = [str(field).upper() for field in fields]
+    if "NBXMOD" not in upper:
+        return current
+    index = upper.index("NBXMOD")
+    if index + 1 >= len(fields):
+        msg = "unsupported_terms:charmm_malformed_nbxmod"
+        raise TopologyImportError(msg)
+    try:
+        value = int(fields[index + 1])
+    except ValueError as exc:
+        msg = "unsupported_terms:charmm_malformed_nbxmod"
+        raise TopologyImportError(msg) from exc
+    if abs(value) != 5:
+        msg = f"unsupported_terms:charmm_nbxmod_{value}"
+        raise TopologyImportError(msg)
+    return value
+
+
+def _charmm_e14fac(fields: Sequence[str], *, current: float) -> float:
+    upper = [str(field).upper() for field in fields]
+    if "E14FAC" not in upper:
+        return current
+    index = upper.index("E14FAC")
+    if index + 1 >= len(fields):
+        msg = "unsupported_terms:charmm_malformed_e14fac"
+        raise TopologyImportError(msg)
+    try:
+        value = float(fields[index + 1])
+    except ValueError as exc:
+        msg = "unsupported_terms:charmm_malformed_e14fac"
+        raise TopologyImportError(msg) from exc
+    if not np.isfinite(value) or value < 0.0:
+        msg = "unsupported_terms:charmm_malformed_e14fac"
+        raise TopologyImportError(msg)
+    return value
 
 
 def _charmm_parameter_section(keyword: str) -> str | None:
@@ -1137,7 +1197,7 @@ def _parse_charmm_improper_parameter(
 
 def _parse_charmm_nonbonded_parameter(
     fields: Sequence[str],
-) -> tuple[str, tuple[float, float]] | None:
+) -> tuple[str, tuple[float, float, float, float]] | None:
     if len(fields) < 4:
         return None
     try:
@@ -1147,12 +1207,26 @@ def _parse_charmm_nonbonded_parameter(
         return None
     sigma = 2.0 * rmin_half * RMIN_TO_SIGMA
     epsilon = abs(epsilon_kcal) * KCAL_TO_KJ
+    if len(fields) >= 7:
+        try:
+            epsilon_14_kcal = float(fields[5])
+            rmin_half_14 = float(fields[6])
+        except ValueError as exc:
+            msg = "unsupported_terms:charmm_malformed_nonbonded_parameters"
+            raise TopologyImportError(msg) from exc
+    else:
+        epsilon_14_kcal = epsilon_kcal
+        rmin_half_14 = rmin_half
+    sigma_14 = 2.0 * rmin_half_14 * RMIN_TO_SIGMA
+    epsilon_14 = abs(epsilon_14_kcal) * KCAL_TO_KJ
     _validate_charmm_finite(
         "unsupported_terms:charmm_malformed_nonbonded_parameters",
         sigma,
         epsilon,
+        sigma_14,
+        epsilon_14,
     )
-    return _charmm_type_key(fields[0]), (sigma, epsilon)
+    return _charmm_type_key(fields[0]), (sigma, epsilon, sigma_14, epsilon_14)
 
 
 def _parse_charmm_nbfix_parameter(
@@ -1173,14 +1247,6 @@ def _parse_charmm_nbfix_parameter(
     _validate_charmm_finite("unsupported_terms:nbfix_pair_overrides:missing_values", *values)
     if rmin <= 0.0 or rmin14 <= 0.0:
         msg = "unsupported_terms:nbfix_pair_overrides:nonpositive_rmin"
-        raise TopologyImportError(msg)
-    if not np.isclose(rmin, rmin14, rtol=0.0, atol=1e-7) or not np.isclose(
-        epsilon,
-        epsilon14,
-        rtol=0.0,
-        atol=1e-7,
-    ):
-        msg = "unsupported_terms:nbfix_pair_overrides:distinct_1_4_values"
         raise TopologyImportError(msg)
     key = tuple(sorted((_charmm_type_key(fields[0]), _charmm_type_key(fields[1]))))
     return key, values
@@ -1216,8 +1282,22 @@ def _parse_charmm_cmap_parameter(
         raise TopologyImportError(msg)
     grid_values = np.asarray(values, dtype=np.float64) * KCAL_TO_KJ
     _validate_charmm_finite("unsupported_terms:charmm_cmap_terms", grid_values)
-    grid = grid_values.astype(np.float32).reshape((resolution, resolution))
+    raw_grid = grid_values.astype(np.float32).reshape((resolution, resolution))
+    grid = _charmm_cmap_runtime_grid(raw_grid)
     return tuple(_charmm_type_key(field) for field in fields[:8]), grid, index
+
+
+def _charmm_cmap_runtime_grid(raw_grid: np.ndarray) -> np.ndarray:
+    grid = np.asarray(raw_grid, dtype=np.float32)
+    if grid.ndim != 2 or grid.shape[0] != grid.shape[1]:
+        msg = "unsupported_terms:charmm_cmap_terms"
+        raise TopologyImportError(msg)
+    midpoint = grid.shape[0] // 2
+    return np.roll(
+        grid,
+        shift=(-midpoint, -midpoint),
+        axis=(0, 1),
+    ).copy()
 
 
 def _charmm_float_fields(fields: Sequence[str]) -> list[float]:
@@ -1509,6 +1589,70 @@ def _charmm_nbfix_type_overrides(
                 "epsilon": "kilocalorie_per_mole",
             },
             "atom_type_pairs": detail_rows,
+        },
+    )
+
+
+def _charmm_exceptions(
+    *,
+    topology: CharmmPsfTopology,
+    bonds: np.ndarray,
+    atom_type_keys: Sequence[str],
+    charges: np.ndarray,
+    parameters: CharmmParameterSetNative,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    pair_12, pair_13, pair_14 = _charmm_connectivity_pairs(
+        bonds,
+        atom_count=len(topology.atoms),
+    )
+    excluded_pairs = pair_12 | pair_13
+    one_four_pairs = pair_14 - excluded_pairs
+    exceptions: dict[tuple[int, int], tuple[float, float, float]] = {
+        pair: (0.0, 0.0, 0.0) for pair in excluded_pairs
+    }
+    electrostatic_scale = float(parameters.e14fac)
+    for i, j in sorted(one_four_pairs):
+        type_i = atom_type_keys[i]
+        type_j = atom_type_keys[j]
+        override = parameters.nbfix.get(tuple(sorted((type_i, type_j))))
+        if override is not None:
+            _rmin, _epsilon, rmin_14, epsilon_14_kcal = override
+            sigma_14 = rmin_14 * RMIN_TO_SIGMA
+            epsilon_14 = abs(epsilon_14_kcal) * KCAL_TO_KJ
+        else:
+            values_i = parameters.nonbonded[type_i]
+            values_j = parameters.nonbonded[type_j]
+            sigma_14 = 0.5 * (values_i[2] + values_j[2])
+            epsilon_14 = float(math.sqrt(values_i[3] * values_j[3]))
+        _validate_charmm_finite(
+            "unsupported_terms:charmm_malformed_14_parameters",
+            sigma_14,
+            epsilon_14,
+        )
+        if sigma_14 <= 0.0 or epsilon_14 < 0.0:
+            msg = "unsupported_terms:charmm_malformed_14_parameters"
+            raise TopologyImportError(msg)
+        exceptions[(i, j)] = (
+            float(charges[i] * charges[j]) * electrostatic_scale,
+            sigma_14,
+            epsilon_14,
+        )
+    pairs = np.asarray(sorted(exceptions), dtype=np.int32).reshape((-1, 2))
+    values = [exceptions[tuple(pair)] for pair in pairs.tolist()]
+    return (
+        pairs,
+        np.asarray([value[0] for value in values], dtype=np.float32),
+        np.asarray([value[1] for value in values], dtype=np.float32),
+        np.asarray([value[2] for value in values], dtype=np.float32),
+        {
+            "source": "CHARMM NBXMOD bond-connectivity exclusions and 1-4 pairs",
+            "excluded_pair_count": len(excluded_pairs),
+            "one_four_pair_count": len(one_four_pairs),
+            "total_exception_count": len(exceptions),
+            "nbxmod": int(parameters.nbxmod),
+            "e14fac": float(parameters.e14fac),
+            "electrostatic_14_scale": electrostatic_scale,
+            "lj_14_source": "per-type 1-4 parameters with NBFIX 1-4 overrides",
         },
     )
 
@@ -3120,6 +3264,44 @@ def _pairs_from_angles(angles: np.ndarray) -> set[tuple[int, int]]:
     return pairs
 
 
+def _pairs_from_dihedrals(dihedrals: np.ndarray) -> set[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    if dihedrals.size == 0:
+        return pairs
+    for i, _, _, m in np.asarray(dihedrals, dtype=np.int32):
+        pairs.add(_normalize_pair(int(i), int(m)))
+    return pairs
+
+
+def _charmm_connectivity_pairs(
+    bonds: np.ndarray,
+    *,
+    atom_count: int,
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]], set[tuple[int, int]]]:
+    pair_12 = _normalized_pairs(bonds)
+    neighbors = [set() for _ in range(atom_count)]
+    for i, j in pair_12:
+        neighbors[i].add(j)
+        neighbors[j].add(i)
+
+    pair_13: set[tuple[int, int]] = set()
+    for bonded_neighbors in neighbors:
+        ordered = sorted(bonded_neighbors)
+        for left_index, i in enumerate(ordered):
+            for j in ordered[left_index + 1 :]:
+                pair_13.add(_normalize_pair(i, j))
+    pair_13 -= pair_12
+
+    pair_14: set[tuple[int, int]] = set()
+    for j, k in pair_12:
+        for i in neighbors[j]:
+            for m in neighbors[k]:
+                if i != k and j != m and i != m:
+                    pair_14.add(_normalize_pair(i, m))
+    pair_14 -= pair_12 | pair_13
+    return pair_12, pair_13, pair_14
+
+
 def _normalize_pair(i: int, j: int) -> tuple[int, int]:
     return (min(i, j), max(i, j))
 
@@ -3217,11 +3399,11 @@ def _parmed_cmaps(cmaps: Iterable[Any]) -> tuple[np.ndarray, np.ndarray, np.ndar
             if resolution < 4 or raw_grid.size != resolution * resolution:
                 msg = "unsupported_terms:charmm_cmap_terms"
                 raise TopologyImportError(msg)
-            grid = raw_grid * KCAL_TO_KJ
+            grid = raw_grid.reshape((resolution, resolution)) * KCAL_TO_KJ
             _validate_charmm_finite("unsupported_terms:charmm_cmap_terms", grid)
             grid_index = len(grids)
             grid_ids[grid_id] = grid_index
-            grids.append(grid.astype(np.float32).reshape((resolution, resolution)))
+            grids.append(_charmm_cmap_runtime_grid(grid))
         atom_ids = [int(getattr(cmap, f"atom{index}").idx) for index in range(1, 6)]
         rows.append(
             (

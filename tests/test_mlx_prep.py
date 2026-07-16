@@ -114,6 +114,24 @@ def _pme_prepared_system(assignment_order: int):
     )
 
 
+def _nonbonded_exception_parameters(prepared, pair: tuple[int, int]) -> np.ndarray:
+    pairs = np.asarray(prepared.nonbonded_exception_pairs, dtype=np.int32)
+    normalized = tuple(sorted(pair))
+    matches = np.flatnonzero(
+        np.all(pairs == np.asarray(normalized, dtype=np.int32), axis=1)
+    )
+    assert matches.size == 1
+    index = int(matches[0])
+    return np.asarray(
+        [
+            prepared.nonbonded_exception_charge_product[index],
+            prepared.nonbonded_exception_sigma[index],
+            prepared.nonbonded_exception_epsilon[index],
+        ],
+        dtype=np.float64,
+    )
+
+
 def test_core_import_does_not_require_prep_dependencies():
     import mlx_atomistic
 
@@ -2440,7 +2458,35 @@ def test_import_charmm_psf_native_fixture_maps_supported_terms(tmp_path: Path):
     assert prepared.charmm_cmap_terms.tolist() == [[0, 1, 2, 4, 1, 2, 4, 5]]
     assert prepared.charmm_cmap_grid_indices.tolist() == [0]
     assert prepared.charmm_cmap_grids.shape == (1, 4, 4)
+    np.testing.assert_allclose(
+        prepared.charmm_cmap_grids[0],
+        np.asarray(
+            [
+                [1.0, 1.1, 0.8, 0.9],
+                [1.4, 1.5, 1.2, 1.3],
+                [0.2, 0.3, 0.0, 0.1],
+                [0.6, 0.7, 0.4, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        * 4.184,
+        rtol=1.0e-6,
+    )
     assert prepared.nbfix_type_pairs.tolist() == [["NH1", "O"]]
+    assert prepared.nonbonded_exception_pairs.shape == (25, 2)
+    np.testing.assert_allclose(
+        _nonbonded_exception_parameters(prepared, (0, 1)),
+        [0.0, 0.0, 0.0],
+    )
+    np.testing.assert_allclose(
+        _nonbonded_exception_parameters(prepared, (1, 4)),
+        [
+            0.3 * 0.5,
+            (0.2245 + 2.0) * 2 ** (-1.0 / 6.0),
+            np.sqrt(0.03 * 0.12) * 4.184,
+        ],
+        rtol=1.0e-6,
+    )
     np.testing.assert_allclose(prepared.cell_lengths, [24.0, 25.0, 26.0])
     np.testing.assert_allclose(prepared.charges.sum(), 0.0, atol=1e-6)
     assert "harmonic_bond" in report["supported_terms"]
@@ -2452,6 +2498,18 @@ def test_import_charmm_psf_native_fixture_maps_supported_terms(tmp_path: Path):
     assert report["term_counts"]["charmm_cmap_terms"] == 1
     assert report["term_counts"]["urey_bradley_terms"] == 1
     assert report["term_counts"]["nbfix_pair_overrides"] == 1
+    assert report["term_counts"]["nonbonded_exclusions"] == 16
+    assert report["term_counts"]["charmm_14_exceptions"] == 9
+    assert report["term_details"]["nonbonded_exception"] == {
+        "source": "CHARMM NBXMOD bond-connectivity exclusions and 1-4 pairs",
+        "excluded_pair_count": 16,
+        "one_four_pair_count": 9,
+        "total_exception_count": 25,
+        "nbxmod": 5,
+        "e14fac": 1.0,
+        "electrostatic_14_scale": 1.0,
+        "lj_14_source": "per-type 1-4 parameters with NBFIX 1-4 overrides",
+    }
     assert report["unsupported_terms"] == []
 
     save_prepared_system(prepared, tmp_path)
@@ -2459,6 +2517,100 @@ def test_import_charmm_psf_native_fixture_maps_supported_terms(tmp_path: Path):
     assert reloaded.metadata.source["parser"] == "native_charmm_psf"
     assert reloaded.charmm_cmap_terms.tolist() == prepared.charmm_cmap_terms.tolist()
     assert reloaded.nbfix_type_pairs.tolist() == [["NH1", "O"]]
+
+
+def test_import_charmm_psf_applies_e14fac_to_one_four_charge_products(
+    tmp_path: Path,
+):
+    from mlx_atomistic.prep import import_charmm_psf
+
+    fixture_root = Path("tests/fixtures/charmm")
+    prm = tmp_path / "e14fac.prm"
+    prm.write_text(
+        (fixture_root / "native-mini.prm")
+        .read_text()
+        .replace("e14fac 1.0", "e14fac 0.5")
+    )
+
+    prepared = import_charmm_psf(
+        psf_path=fixture_root / "native-mini.psf",
+        params=[prm],
+        coords_path=fixture_root / "native-mini.pdb",
+    )
+
+    parameters = _nonbonded_exception_parameters(prepared, (1, 4))
+    np.testing.assert_allclose(parameters[0], 0.3 * 0.5 * 0.5, rtol=1.0e-6)
+    details = prepared.metadata.compatibility_report["term_details"][
+        "nonbonded_exception"
+    ]
+    assert details["e14fac"] == 0.5
+    assert details["electrostatic_14_scale"] == 0.5
+
+
+def test_import_charmm_psf_uses_distinct_per_type_one_four_lj_values(
+    tmp_path: Path,
+):
+    from mlx_atomistic.prep import import_charmm_psf
+
+    fixture_root = Path("tests/fixtures/charmm")
+    prm = tmp_path / "one-four-lj.prm"
+    prm.write_text(
+        (fixture_root / "native-mini.prm")
+        .read_text()
+        .replace(
+            "H      0.0  -0.0300  0.2245",
+            "H      0.0  -0.0300  0.2245  0.0  -0.0123  0.5000",
+        )
+    )
+
+    prepared = import_charmm_psf(
+        psf_path=fixture_root / "native-mini.psf",
+        params=[prm],
+        coords_path=fixture_root / "native-mini.pdb",
+    )
+
+    parameters = _nonbonded_exception_parameters(prepared, (1, 4))
+    np.testing.assert_allclose(
+        parameters[1:],
+        [
+            (0.5 + 2.0) * 2 ** (-1.0 / 6.0),
+            np.sqrt(0.0123 * 0.12) * 4.184,
+        ],
+        rtol=1.0e-6,
+    )
+
+
+def test_import_charmm_psf_uses_distinct_nbfix_one_four_lj_values(
+    tmp_path: Path,
+):
+    from mlx_atomistic.prep import import_charmm_psf
+
+    fixture_root = Path("tests/fixtures/charmm")
+    prm = tmp_path / "nbfix-one-four.prm"
+    prm.write_text(
+        (fixture_root / "native-mini.prm")
+        .read_text()
+        .replace(
+            "NH1 O -0.1000 3.0000",
+            "NH1 O -0.1000 3.0000 -0.0250 3.4000",
+        )
+    )
+
+    prepared = import_charmm_psf(
+        psf_path=fixture_root / "native-mini.psf",
+        params=[prm],
+        coords_path=fixture_root / "native-mini.pdb",
+    )
+
+    np.testing.assert_allclose(
+        _nonbonded_exception_parameters(prepared, (0, 5)),
+        [
+            -0.3 * -0.5,
+            3.4 * 2 ** (-1.0 / 6.0),
+            0.025 * 4.184,
+        ],
+        rtol=1.0e-6,
+    )
 
 
 def test_import_charmm_psf_ignores_title_and_charge_group_metadata(tmp_path: Path):

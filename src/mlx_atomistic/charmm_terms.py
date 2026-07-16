@@ -113,35 +113,104 @@ def _dihedral_angle(
     return angle * sign
 
 
-def _catmull_rom(p0: mx.array, p1: mx.array, p2: mx.array, p3: mx.array, t: mx.array) -> mx.array:
-    t2 = t * t
-    t3 = t2 * t
-    return 0.5 * (
-        2.0 * p1
-        + (-p0 + p2) * t
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+def _periodic_spline_derivatives(values: np.ndarray, *, axis: int) -> np.ndarray:
+    size = values.shape[axis]
+    spacing = 2.0 * np.pi / size
+    matrix = np.zeros((size, size), dtype=np.float64)
+    row = np.arange(size)
+    matrix[row, row] = 4.0
+    matrix[row, (row - 1) % size] = 1.0
+    matrix[row, (row + 1) % size] = 1.0
+    moved = np.moveaxis(np.asarray(values, dtype=np.float64), axis, 0)
+    flat = moved.reshape((size, -1))
+    right = 6.0 * (
+        np.roll(flat, -1, axis=0) - 2.0 * flat + np.roll(flat, 1, axis=0)
+    ) / (spacing * spacing)
+    second = np.linalg.solve(matrix, right)
+    derivative = (
+        (np.roll(flat, -1, axis=0) - flat) / spacing
+        - spacing * (2.0 * second + np.roll(second, -1, axis=0)) / 6.0
     )
+    return np.moveaxis(derivative.reshape(moved.shape), 0, axis)
 
 
-def _periodic_cubic_grid_value(grid: mx.array, phi: mx.array, psi: mx.array) -> mx.array:
-    size = int(grid.shape[0])
-    phi_scaled = (phi + pi) * (size / (2.0 * pi))
-    psi_scaled = (psi + pi) * (size / (2.0 * pi))
-    phi_base = mx.floor(phi_scaled).astype(mx.int32)
-    psi_base = mx.floor(psi_scaled).astype(mx.int32)
-    phi_t = phi_scaled - mx.floor(phi_scaled)
-    psi_t = psi_scaled - mx.floor(psi_scaled)
+def _periodic_bicubic_coefficients(grids: np.ndarray) -> np.ndarray:
+    transform = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-3.0, 3.0, -2.0, -1.0],
+            [2.0, -2.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    map_count, size, _ = grids.shape
+    spacing = 2.0 * np.pi / size
+    coefficients = np.empty((map_count, size, size, 4, 4), dtype=np.float32)
+    for map_index, grid in enumerate(np.asarray(grids, dtype=np.float64)):
+        derivative_phi = _periodic_spline_derivatives(grid, axis=0)
+        derivative_psi = _periodic_spline_derivatives(grid, axis=1)
+        derivative_cross = _periodic_spline_derivatives(derivative_psi, axis=0)
+        for phi_index in range(size):
+            next_phi = (phi_index + 1) % size
+            for psi_index in range(size):
+                next_psi = (psi_index + 1) % size
+                values = np.asarray(
+                    [
+                        [
+                            grid[phi_index, psi_index],
+                            grid[phi_index, next_psi],
+                            derivative_psi[phi_index, psi_index] * spacing,
+                            derivative_psi[phi_index, next_psi] * spacing,
+                        ],
+                        [
+                            grid[next_phi, psi_index],
+                            grid[next_phi, next_psi],
+                            derivative_psi[next_phi, psi_index] * spacing,
+                            derivative_psi[next_phi, next_psi] * spacing,
+                        ],
+                        [
+                            derivative_phi[phi_index, psi_index] * spacing,
+                            derivative_phi[phi_index, next_psi] * spacing,
+                            derivative_cross[phi_index, psi_index] * spacing * spacing,
+                            derivative_cross[phi_index, next_psi] * spacing * spacing,
+                        ],
+                        [
+                            derivative_phi[next_phi, psi_index] * spacing,
+                            derivative_phi[next_phi, next_psi] * spacing,
+                            derivative_cross[next_phi, psi_index] * spacing * spacing,
+                            derivative_cross[next_phi, next_psi] * spacing * spacing,
+                        ],
+                    ]
+                )
+                coefficients[map_index, phi_index, psi_index] = (
+                    transform @ values @ transform.T
+                )
+    return coefficients
 
-    row_values = []
-    for phi_offset in (-1, 0, 1, 2):
-        values = []
-        phi_index = (phi_base + phi_offset) % size
-        for psi_offset in (-1, 0, 1, 2):
-            psi_index = (psi_base + psi_offset) % size
-            values.append(grid[phi_index, psi_index])
-        row_values.append(_catmull_rom(values[0], values[1], values[2], values[3], psi_t))
-    return _catmull_rom(row_values[0], row_values[1], row_values[2], row_values[3], phi_t)
+
+def _periodic_cubic_grid_value(
+    coefficients: mx.array,
+    phi: mx.array,
+    psi: mx.array,
+) -> mx.array:
+    size = int(coefficients.shape[0])
+    scale = size / (2.0 * pi)
+    phi_scaled = -phi * scale
+    psi_scaled = -psi * scale
+    phi_scaled = phi_scaled - mx.floor(phi_scaled / size) * size
+    psi_scaled = psi_scaled - mx.floor(psi_scaled / size) * size
+    phi_floor = mx.floor(phi_scaled)
+    psi_floor = mx.floor(psi_scaled)
+    patch = coefficients[
+        phi_floor.astype(mx.int32),
+        psi_floor.astype(mx.int32),
+    ]
+    phi_t = phi_scaled - phi_floor
+    psi_t = psi_scaled - psi_floor
+    phi_powers = mx.stack([mx.ones_like(phi_t), phi_t, phi_t * phi_t, phi_t**3])
+    psi_powers = mx.stack([mx.ones_like(psi_t), psi_t, psi_t * psi_t, psi_t**3])
+    return mx.sum(patch * phi_powers[:, None] * psi_powers[None, :])
 
 
 @dataclass(frozen=True)
@@ -233,7 +302,7 @@ class CHARMMUreyBradleyPotential:
 
 @dataclass(frozen=True)
 class CHARMMCMAPPotential:
-    """CHARMM CMAP two-dihedral correction term with periodic bicubic interpolation."""
+    """CHARMM CMAP correction with periodic natural bicubic interpolation."""
 
     charmm_cmap_terms: object
     cmap_grids: object
@@ -242,6 +311,7 @@ class CHARMMCMAPPotential:
     supports_virial: bool = True
     _terms_np: np.ndarray = field(init=False, repr=False)
     _indices_np: np.ndarray = field(init=False, repr=False)
+    _coefficients: mx.array = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         terms = _index_array(self.charmm_cmap_terms, width=8, name="charmm_cmap_terms")
@@ -273,6 +343,11 @@ class CHARMMCMAPPotential:
         object.__setattr__(self, "cmap_indices", mx.array(indices, dtype=mx.int32))
         object.__setattr__(self, "_terms_np", terms)
         object.__setattr__(self, "_indices_np", indices)
+        object.__setattr__(
+            self,
+            "_coefficients",
+            as_mx_array(_periodic_bicubic_coefficients(grids)),
+        )
 
     def potential_energy(self, positions: mx.array, cell: Cell | None = None) -> mx.array:
         """Return the CHARMM CMAP two-dihedral correction energy.
@@ -293,7 +368,11 @@ class CHARMMCMAPPotential:
         for term, map_index in zip(self._terms_np.tolist(), self._indices_np.tolist(), strict=True):
             phi = _dihedral_angle(positions, tuple(term[:4]), cell)
             psi = _dihedral_angle(positions, tuple(term[4:]), cell)
-            energy = energy + _periodic_cubic_grid_value(self.cmap_grids[int(map_index)], phi, psi)
+            energy = energy + _periodic_cubic_grid_value(
+                self._coefficients[int(map_index)],
+                phi,
+                psi,
+            )
         return energy
 
     def energy_forces(

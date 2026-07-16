@@ -159,8 +159,8 @@ def test_charmm_cmap_reference_energy_at_grid_node():
     grid = np.arange(36, dtype=np.float32).reshape(6, 6)
     phi_index = 1
     psi_index = 4
-    phi = -pi + 2.0 * pi * phi_index / 6
-    psi = -pi + 2.0 * pi * psi_index / 6
+    phi = -2.0 * pi * phi_index / 6
+    psi = -2.0 * pi * psi_index / 6
     term = CHARMMCMAPPotential(
         charmm_cmap_terms=[(0, 1, 2, 3, 4, 5, 6, 7)],
         cmap_grids=grid,
@@ -180,8 +180,8 @@ def test_charmm_cmap_reference_energy_is_periodic_across_seam():
         cmap_grids=grid,
     )
 
-    left = term.potential_energy(positions_for_cmap_angles(-pi + 0.02, pi / 4))
-    right = term.potential_energy(positions_for_cmap_angles(pi - 0.02, pi / 4))
+    left = term.potential_energy(positions_for_cmap_angles(-0.02, pi / 4))
+    right = term.potential_energy(positions_for_cmap_angles(0.02, pi / 4))
 
     assert float(np.array(left)) == pytest.approx(float(np.array(right)), abs=6e-2)
 
@@ -191,10 +191,10 @@ def test_charmm_cmap_uses_per_term_map_indices():
     grid1 = (100.0 + np.arange(36, dtype=np.float32)).reshape(6, 6)
     phi0_index, psi0_index = 2, 1
     phi1_index, psi1_index = 4, 3
-    phi0 = -pi + 2.0 * pi * phi0_index / 6
-    psi0 = -pi + 2.0 * pi * psi0_index / 6
-    phi1 = -pi + 2.0 * pi * phi1_index / 6
-    psi1 = -pi + 2.0 * pi * psi1_index / 6
+    phi0 = -2.0 * pi * phi0_index / 6
+    psi0 = -2.0 * pi * psi0_index / 6
+    phi1 = -2.0 * pi * phi1_index / 6
+    psi1 = -2.0 * pi * psi1_index / 6
     positions = np.vstack(
         [
             positions_for_cmap_angles(phi0, psi0),

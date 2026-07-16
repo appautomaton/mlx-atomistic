@@ -233,6 +233,7 @@ def test_external_engine_imports_stay_in_documented_reference_scripts():
         Path("scripts/run_openmm_mlx_npt_parity.py"),
         Path("scripts/run_openmm_gpcrmd_preview.py"),
         Path("scripts/run_openmm_gpcrmd_charmm_md.py"),
+        Path("scripts/run_gpcrmd_pme_parity.py"),
     }
     scanned_roots = [ROOT / "src", ROOT / "scripts", ROOT / "tests"]
     offenders: dict[Path, list[str]] = {}
