@@ -34,10 +34,10 @@
   --sl-color-gray-7: #f0f0f3;
   --sl-color-black: #ffffff;
 
-  --sl-color-accent: #6c5ce7;
-  --sl-color-accent-low: rgba(108, 92, 231, 0.1);
-  --sl-color-accent-high: #5343c9;
-  --sl-color-text-accent: #5a4bd4;
+  --sl-color-accent: #0c8c7e;
+  --sl-color-accent-low: rgba(12, 140, 126, 0.1);
+  --sl-color-accent-high: #0a6f63;
+  --sl-color-text-accent: #0a6f63;
   --sl-color-text-invert: #ffffff;
 
   --sl-color-hairline: #d2d2d7;
@@ -62,11 +62,11 @@
   --sl-color-gray-7: #161617;
   --sl-color-black: #000000;
 
-  --sl-color-accent: #b7abff;
-  --sl-color-accent-low: rgba(183, 171, 255, 0.14);
-  --sl-color-accent-high: #cfc6ff;
-  --sl-color-text-accent: #b7abff;
-  --sl-color-text-invert: #14122b;
+  --sl-color-accent: #4fd8c6;
+  --sl-color-accent-low: rgba(79, 216, 198, 0.14);
+  --sl-color-accent-high: #7fe6d8;
+  --sl-color-text-accent: #5fe0cf;
+  --sl-color-text-invert: #06231e;
 
   --sl-color-hairline: #2a2a2c;
   --sl-color-hairline-light: #1c1c1e;
