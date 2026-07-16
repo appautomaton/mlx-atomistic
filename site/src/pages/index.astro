@@ -737,9 +737,9 @@ const stats = [
     margin: 0 auto;
     padding: 8.5rem 1.5rem 3rem;
     display: grid;
-    grid-template-columns: 1.05fr 0.95fr;
+    grid-template-columns: 1.15fr 0.85fr;
     align-items: center;
-    gap: 2.5rem;
+    gap: 3rem;
     text-align: left;
   }
   .hero__stage {
@@ -759,7 +759,7 @@ const stats = [
   }
 
   .hero h1 {
-    font-size: clamp(2.4rem, 4.6vw, 4rem);
+    font-size: clamp(2.7rem, 5.4vw, 4.6rem);
     font-weight: 700;
     line-height: 1.04;
     letter-spacing: -0.035em;
@@ -768,11 +768,11 @@ const stats = [
   .accent { color: var(--accent); }
 
   .lead {
-    font-size: clamp(1.05rem, 1.5vw, 1.3rem);
+    font-size: clamp(1.1rem, 1.55vw, 1.35rem);
     font-weight: 400;
     line-height: 1.5;
     color: var(--ink-2);
-    max-width: 34rem;
+    max-width: 32rem;
     margin: 0 0 2rem;
     letter-spacing: -0.015em;
   }
@@ -814,7 +814,7 @@ const stats = [
   .hero__visual {
     position: relative;
     margin: 0 auto;
-    width: min(420px, 100%);
+    width: min(370px, 100%);
     aspect-ratio: 1;
     display: grid;
     place-items: center;
@@ -831,8 +831,8 @@ const stats = [
     position: absolute;
     left: 50%;
     top: 54%;
-    width: 92%;
-    height: 80%;
+    width: 84%;
+    height: 72%;
     transform: translate(-50%, -50%);
     border-radius: 50%;
     background: conic-gradient(
@@ -847,13 +847,13 @@ const stats = [
       #ff6f91
     );
     filter: blur(40px) saturate(165%);
-    opacity: 0.72;
+    opacity: 0.6;
     will-change: transform, filter;
     animation: aurora-spin 18s linear infinite,
       aurora-breathe 9s ease-in-out infinite;
   }
   [data-theme="dark"] .hero__aurora {
-    opacity: 0.78;
+    opacity: 0.6;
     filter: blur(46px) saturate(175%);
   }
   @keyframes aurora-spin {
@@ -864,11 +864,11 @@ const stats = [
   @keyframes aurora-breathe {
     0%, 100% {
       filter: blur(40px) saturate(160%) hue-rotate(0deg);
-      opacity: 0.66;
+      opacity: 0.46;
     }
     50% {
       filter: blur(46px) saturate(180%) hue-rotate(45deg);
-      opacity: 0.82;
+      opacity: 0.58;
     }
   }
   .lattice {
