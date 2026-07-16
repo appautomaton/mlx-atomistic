@@ -103,6 +103,40 @@ function heroSignal() {
   return `<svg class="hero__signal-svg" viewBox="0 0 ${W} 48" preserveAspectRatio="none">${p}</svg>`;
 }
 
+// ---- Hero crystallite ----
+// Single source of truth for the MD toy's lattice art: an asymmetric
+// close-packed patch (~9deg off-axis, trimmed left edge, one interior vacancy)
+// whose sites double as the "home" positions the inline MD script springs each
+// atom back to. Bonds connect first-shell neighbours (cutoff 46 < a*sqrt(3), so
+// only the first shell qualifies); the script re-reads the pairing from each
+// line's data-b indices, so the drawn network and the physics cannot drift.
+const CRYSTAL = [
+  { x: 227.2, y: 173.6, r: 8 },
+  { x: 202.8, y: 110, r: 8, excited: true },
+  { x: 135.6, y: 99.4, r: 8 },
+  { x: 117.2, y: 216, r: 8 },
+  { x: 184.4, y: 226.6, r: 8 },
+  { x: 214.9, y: 142.3, r: 8, excited: true },
+  { x: 169.2, y: 104.7, r: 8 },
+  { x: 114.2, y: 126.4, r: 8 },
+  { x: 105.1, y: 183.7, r: 8 },
+  { x: 150.8, y: 221.3, r: 8 },
+  { x: 205.8, y: 199.6, r: 8 },
+  { x: 193.6, y: 168.3, r: 9, excited: true },
+  { x: 181.3, y: 137, r: 9, excited: true },
+  { x: 147.7, y: 131.7, r: 9 },
+  { x: 126.4, y: 157.7, r: 9 },
+  { x: 172.3, y: 194.3, r: 9 },
+  { x: 160, y: 163, r: 10.5 },
+];
+const CRYSTAL_BONDS: [number, number][] = [];
+for (let i = 0; i < CRYSTAL.length; i++)
+  for (let j = i + 1; j < CRYSTAL.length; j++) {
+    const dx = CRYSTAL[j].x - CRYSTAL[i].x;
+    const dy = CRYSTAL[j].y - CRYSTAL[i].y;
+    if (Math.hypot(dx, dy) < 46) CRYSTAL_BONDS.push([i, j]);
+  }
+
 const features = [
   {
     title: "Apple Silicon native",
@@ -289,6 +323,10 @@ const stats = [
                 <stop class="atomA-a" />
                 <stop offset="1" class="atomA-b" />
               </radialGradient>
+              <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+                <stop class="halo-stop" stop-opacity="0.85" />
+                <stop offset="1" class="halo-stop" stop-opacity="0" />
+              </radialGradient>
             </defs>
             <!-- package pins -->
             <g class="pins">
@@ -302,32 +340,30 @@ const stats = [
             <rect x="40" y="40" width="240" height="240" rx="40" fill="url(#die)" />
             <rect x="40" y="40" width="240" height="240" rx="40" class="die-edge" />
             <rect x="74" y="74" width="172" height="172" rx="26" class="die-inner" />
-            <!-- close-packed atomic lattice (19-atom hex cluster) -->
-            <!-- Lattice sites double as MD "home" positions; a script upgrades
-                 this static lattice into an interactive molecular-dynamics toy. -->
+            <!-- Bonded crystallite, generated from CRYSTAL (see frontmatter).
+                 Bonds render beneath the spheres and carry visible strain;
+                 halos carry each atom's thermal glow. The MD script animates
+                 all three layers in lockstep. -->
+            <g class="bonds">
+              {CRYSTAL_BONDS.map(([i, j]) => (
+                <line
+                  data-b={`${i} ${j}`}
+                  x1={CRYSTAL[i].x}
+                  y1={CRYSTAL[i].y}
+                  x2={CRYSTAL[j].x}
+                  y2={CRYSTAL[j].y}
+                />
+              ))}
+            </g>
+            <g class="halos">
+              {CRYSTAL.map((a) => (
+                <circle cx={a.x} cy={a.y} r={a.r + 8} fill="url(#halo)" opacity="0" />
+              ))}
+            </g>
             <g class="atoms">
-              <!-- Asymmetric crystallite: the close-packed patch is rotated ~9deg
-                   off-axis and nudged off-centre, with a trimmed left edge and one
-                   interior vacancy (a point defect). The excited (teal) atoms form
-                   an off-centre lobe rather than a symmetric ring. Each atom still
-                   springs to its own home site, so the MD toy is unchanged. -->
-              <circle cx="227.2" cy="173.6" r="8" fill="url(#atom)" />
-              <circle cx="202.8" cy="110" r="8" fill="url(#atomA)" />
-              <circle cx="135.6" cy="99.4" r="8" fill="url(#atom)" />
-              <circle cx="117.2" cy="216" r="8" fill="url(#atom)" />
-              <circle cx="184.4" cy="226.6" r="8" fill="url(#atom)" />
-              <circle cx="214.9" cy="142.3" r="8" fill="url(#atomA)" />
-              <circle cx="169.2" cy="104.7" r="8" fill="url(#atom)" />
-              <circle cx="114.2" cy="126.4" r="8" fill="url(#atom)" />
-              <circle cx="105.1" cy="183.7" r="8" fill="url(#atom)" />
-              <circle cx="150.8" cy="221.3" r="8" fill="url(#atom)" />
-              <circle cx="205.8" cy="199.6" r="8" fill="url(#atom)" />
-              <circle cx="193.6" cy="168.3" r="9" fill="url(#atomA)" />
-              <circle cx="181.3" cy="137" r="9" fill="url(#atomA)" />
-              <circle cx="147.7" cy="131.7" r="9" fill="url(#atom)" />
-              <circle cx="126.4" cy="157.7" r="9" fill="url(#atom)" />
-              <circle cx="172.3" cy="194.3" r="9" fill="url(#atom)" />
-              <circle cx="160" cy="163" r="10.5" fill="url(#atom)" />
+              {CRYSTAL.map((a) => (
+                <circle cx={a.x} cy={a.y} r={a.r} fill={a.excited ? "url(#atomA)" : "url(#atom)"} />
+              ))}
             </g>
           </svg>
         </div>
@@ -341,8 +377,8 @@ const stats = [
           <span class="thermo" aria-hidden="true"><i class="thermo__fill" data-temp></i></span>
         </div>
         <p class="hero__hint" hidden>
-          Drag the lattice to add kinetic energy — heat it past melting, then
-          let go and watch it re-crystallize.
+          Drag to heat the lattice past melting, then let go and watch it
+          anneal back into a crystal.
         </p>
         </div>
       </section>
@@ -460,10 +496,15 @@ const stats = [
     </script>
 
     <!-- Interactive molecular-dynamics toy on the hero lattice.
-         Harmonic pull to each lattice site (Einstein crystal) + soft pairwise
-         repulsion (excluded volume) + Langevin-style damping & thermal noise.
-         Dragging injects kinetic energy (heat); the phase chip uses the
-         Lindemann criterion (RMS displacement / nearest-neighbour spacing). -->
+         A bonded crystal, not free spheres: harmonic bonds between first-shell
+         neighbours carry phonons, a weak Einstein tether anchors the
+         art-directed lattice, soft pair repulsion is the excluded volume, and
+         Langevin damping + noise set the temperature. Dragging stirs momentum
+         in and heats the cell; over-strained bonds break (melting) and re-form
+         as the lattice anneals home. The chip reads a smoothed Lindemann
+         ratio; halos glow with per-atom kinetic energy; an occasional
+         plane-wave pulse rolls through the idle lattice, echoing the spectral
+         signal below the die. -->
     <script>
       const visual = document.querySelector(".hero__visual");
       const svg = visual?.querySelector("svg.lattice");
@@ -477,27 +518,43 @@ const stats = [
         hero?.querySelector(".hero__readout")?.removeAttribute("hidden");
         hero?.querySelector(".hero__hint")?.removeAttribute("hidden");
 
-        const atoms = [...group.querySelectorAll("circle")].map((el) => {
+        const halos = [...svg.querySelectorAll(".halos circle")];
+        const atoms = [...group.querySelectorAll("circle")].map((el, i) => {
           const hx = parseFloat(el.getAttribute("cx"));
           const hy = parseFloat(el.getAttribute("cy"));
-          return { el, hx, hy, x: hx, y: hy, vx: 0, vy: 0 };
+          return { el, halo: halos[i], hx, hy, x: hx, y: hy, vx: 0, vy: 0, hop: 0 };
+        });
+        const bonds = [...svg.querySelectorAll(".bonds line")].map((el) => {
+          const [i, j] = el.getAttribute("data-b").split(" ").map(Number);
+          const a = atoms[i], b = atoms[j];
+          return { el, a, b, rest: Math.hypot(b.hx - a.hx, b.hy - a.hy), broken: false, op: 0.45 };
         });
 
-        const SPRING = 0.022;   // harmonic pull to lattice site
-        const DAMP = 0.88;      // cooling per frame (settle / recrystallize)
+        const TETHER = 0.02;    // weak Einstein anchor to each home site
+        const KBOND = 0.05;     // harmonic bond stiffness (carries phonons)
+        const BREAK = 1.42;     // a bond breaks past this stretch ratio
+        const REFORM = 1.12;    // ...and re-forms once back within this
+        const BOND_OP = 0.45;   // resting bond opacity (fades with strain)
+        const DAMP = 0.9;       // cooling per frame (anneal / recrystallize)
         const DAMP_HOT = 0.985; // barely cools while you stir
         const MOUSE_R = 72;     // cursor influence radius (viewBox units)
-        const MOUSE_F = 1.5;    // cursor push strength
-        const PAIR_R = 24;      // soft repulsion cutoff
+        const MOUSE_F = 1.3;    // hover push strength
+        const STIR = 0.16;      // fraction of drag momentum handed to atoms
+        const PAIR_R = 24;      // soft repulsion cutoff (excluded volume)
         const PAIR_F = 0.45;
-        const NOISE = 0.06;     // idle thermal vibration
+        const NOISE = 0.05;     // idle thermal vibration
         const MAXV = 14;        // velocity clamp (stability)
         const LO = 86, HI = 234; // simulation-cell walls
         const A_NN = 34;        // nearest-neighbour spacing
         const MELT = 0.16;      // Lindemann ratio at melting
+        const ANNEAL = 0.11;    // ...and where "annealing" begins
+        const PULSE_EVERY = 9000; // idle ms between phonon pulses
+        const PULSE_V = 0.19;   // wavefront speed, viewBox units per ms
 
-        const mouse = { x: -999, y: -999, on: false, down: false };
-        let heat = 0, frame = 0;
+        const mouse = { x: -999, y: -999, dx: 0, dy: 0, on: false, down: false };
+        let heat = 0, frame = 0, lEma = 0;
+        let lastPulse = performance.now() - PULSE_EVERY + 2500; // first pulse ~2.5s in
+        const pulse = { t0: -1, cos: 1, sin: 0, min: 0 };
 
         const toSvg = (cx, cy) => {
           const r = svg.getBoundingClientRect();
@@ -505,20 +562,68 @@ const stats = [
         };
         visual.addEventListener("pointermove", (e) => {
           const p = toSvg(e.clientX, e.clientY);
+          if (mouse.down && mouse.on) {
+            mouse.dx += p.x - mouse.x;
+            mouse.dy += p.y - mouse.y;
+            heat = Math.min(heat + 0.5, 6);
+          }
           mouse.x = p.x; mouse.y = p.y; mouse.on = true;
-          if (mouse.down) heat = Math.min(heat + 0.5, 6);
         });
         visual.addEventListener("pointerdown", () => { mouse.down = true; });
         window.addEventListener("pointerup", () => { mouse.down = false; });
         visual.addEventListener("pointerleave", () => { mouse.on = false; });
 
-        let raf = 0, running = false, inView = false;
+        let raf = 0, running = false, inView = false, lastT = 0;
         const tick = () => {
-          heat *= 0.95;
-          const damp = mouse.down ? DAMP_HOT : DAMP;
-          const springK = SPRING * (1 - Math.min(heat / 6, 0.82));
-          const temp = NOISE + heat;
-          let ke = 0, msd = 0;
+          // dt in 60fps-frame units: forces, damping and noise all scale with
+          // real elapsed time, so the toy behaves the same on a 60Hz panel,
+          // a 120Hz ProMotion display, or a throttled tab.
+          const now = performance.now();
+          const dtn = lastT ? Math.min((now - lastT) / 16.7, 2.5) : 1;
+          lastT = now;
+          heat *= Math.pow(0.97, dtn); // slow decay: the anneal is watchable
+          const damp = Math.pow(mouse.down ? DAMP_HOT : DAMP, dtn);
+          const hot = Math.min(heat / 6, 1);
+          // Hot lattice goes floppy; a cool one anchors firmly, so recovery
+          // can push through the excluded-volume barrier of swapped atoms.
+          const springK = TETHER * (1.8 - 1.65 * hot) * dtn;
+          const kBond = KBOND * (1 - Math.min(hot, 0.85)) * dtn;
+          const noiseAmp = (NOISE + heat) * Math.sqrt(dtn);
+          const sx = Math.max(-24, Math.min(24, mouse.dx)) * STIR;
+          const sy = Math.max(-24, Math.min(24, mouse.dy)) * STIR;
+          let ke = 0, msd = 0, brokenN = 0;
+
+          // Idle phonon pulse: a plane wavefront sweeps the lattice, giving
+          // each atom a small coherent kick as it passes. Wall-clock timed so
+          // the cadence is the same at any display refresh rate.
+          if (pulse.t0 >= 0) {
+            const front = pulse.min + (now - pulse.t0) * PULSE_V;
+            for (const a of atoms) {
+              const p = a.hx * pulse.cos + a.hy * pulse.sin;
+              if (Math.abs(p - front) < 16) {
+                a.vx += pulse.cos * 0.35 * dtn;
+                a.vy += pulse.sin * 0.35 * dtn;
+              }
+            }
+            if (now - pulse.t0 > 1300) pulse.t0 = -1;
+          } else if (!mouse.down && heat < 0.05 && now - lastPulse > PULSE_EVERY) {
+            lastPulse = now;
+            const th = Math.random() * Math.PI * 2;
+            pulse.cos = Math.cos(th); pulse.sin = Math.sin(th);
+            let m = 1e9;
+            for (const a of atoms) m = Math.min(m, a.hx * pulse.cos + a.hy * pulse.sin);
+            pulse.min = m; pulse.t0 = now;
+          }
+
+          // Self-anneal: a cool lattice frozen away from its ground state
+          // (a quenched defect after a hard stir) gets a gentle home-directed
+          // nudge, so the crystallite always finds its way back.
+          if ((frame & 63) === 0 && heat < 0.3 && lEma > 0.06) {
+            for (const a of atoms) {
+              const dx = a.hx - a.x, dy = a.hy - a.y;
+              if (dx * dx + dy * dy > 36) { a.vx += dx * 0.05; a.vy += dy * 0.05; }
+            }
+          }
 
           for (const a of atoms) {
             a.vx += (a.hx - a.x) * springK;
@@ -527,13 +632,39 @@ const stats = [
               const dx = a.x - mouse.x, dy = a.y - mouse.y;
               const d = Math.hypot(dx, dy);
               if (d < MOUSE_R && d > 0.001) {
-                const push = (1 - d / MOUSE_R) * MOUSE_F;
+                const w = 1 - d / MOUSE_R;
+                const push = w * MOUSE_F * dtn;
                 a.vx += (dx / d) * push;
                 a.vy += (dy / d) * push;
+                if (mouse.down) { a.vx += sx * w; a.vy += sy * w; } // stirring
               }
             }
-            a.vx += (Math.random() - 0.5) * temp;
-            a.vy += (Math.random() - 0.5) * temp;
+            a.vx += (Math.random() - 0.5) * noiseAmp;
+            a.vy += (Math.random() - 0.5) * noiseAmp;
+          }
+          mouse.dx = 0; mouse.dy = 0;
+
+          // Harmonic bonds: the lattice's real cohesion. Stretched bonds pull,
+          // compressed bonds push, over-strained bonds let go until the pair
+          // finds its rest distance again.
+          for (const bd of bonds) {
+            const dx = bd.b.x - bd.a.x, dy = bd.b.y - bd.a.y;
+            const d = Math.hypot(dx, dy) || 0.001;
+            if (bd.broken) {
+              if (d < bd.rest * REFORM) bd.broken = false;
+            } else if (d > bd.rest * BREAK) {
+              bd.broken = true;
+            }
+            if (bd.broken) {
+              brokenN++;
+              bd.op = 0;
+            } else {
+              const f = (kBond * (d - bd.rest)) / d;
+              bd.a.vx += f * dx; bd.a.vy += f * dy;
+              bd.b.vx -= f * dx; bd.b.vy -= f * dy;
+              const strain = Math.abs(d - bd.rest) / bd.rest;
+              bd.op = Math.max(0, BOND_OP * (1 - strain * 2.2));
+            }
           }
           for (let i = 0; i < atoms.length; i++) {
             for (let j = i + 1; j < atoms.length; j++) {
@@ -541,33 +672,60 @@ const stats = [
               const dx = b.x - a.x, dy = b.y - a.y;
               const d = Math.hypot(dx, dy);
               if (d < PAIR_R && d > 0.001) {
-                const push = (1 - d / PAIR_R) * PAIR_F;
+                const push = (1 - d / PAIR_R) * PAIR_F * dtn;
                 const fx = (dx / d) * push, fy = (dy / d) * push;
                 a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
               }
             }
           }
+
           for (const a of atoms) {
             a.vx *= damp; a.vy *= damp;
             a.vx = Math.max(-MAXV, Math.min(MAXV, a.vx));
             a.vy = Math.max(-MAXV, Math.min(MAXV, a.vy));
-            a.x += a.vx; a.y += a.vy;
+            a.x += a.vx * dtn; a.y += a.vy * dtn;
             if (a.x < LO) { a.x = LO; a.vx = Math.abs(a.vx) * 0.5; }
             else if (a.x > HI) { a.x = HI; a.vx = -Math.abs(a.vx) * 0.5; }
             if (a.y < LO) { a.y = LO; a.vy = Math.abs(a.vy) * 0.5; }
             else if (a.y > HI) { a.y = HI; a.vy = -Math.abs(a.vy) * 0.5; }
             a.el.setAttribute("cx", a.x.toFixed(2));
             a.el.setAttribute("cy", a.y.toFixed(2));
+            // Thermal halo: glow tracks kinetic energy, so heat is visible
+            // where it lives. Skipped while imperceptible to save attr churn.
+            const op = Math.min(0.6, (a.vx * a.vx + a.vy * a.vy) * 0.02);
+            if (op > 0.02 || a.hop > 0.02) {
+              a.halo.setAttribute("cx", a.x.toFixed(2));
+              a.halo.setAttribute("cy", a.y.toFixed(2));
+              a.halo.setAttribute("opacity", op.toFixed(2));
+            }
+            a.hop = op;
             ke += a.vx * a.vx + a.vy * a.vy;
             msd += (a.x - a.hx) ** 2 + (a.y - a.hy) ** 2;
+          }
+          for (const bd of bonds) {
+            bd.el.setAttribute("x1", bd.a.x.toFixed(1));
+            bd.el.setAttribute("y1", bd.a.y.toFixed(1));
+            bd.el.setAttribute("x2", bd.b.x.toFixed(1));
+            bd.el.setAttribute("y2", bd.b.y.toFixed(1));
+            bd.el.style.strokeOpacity = bd.op.toFixed(2);
           }
 
           if (phaseEl && (frame++ & 7) === 0) {
             const n = atoms.length;
-            const lindemann = Math.sqrt(msd / n) / A_NN;
-            const molten = lindemann > MELT;
-            phaseEl.textContent = molten ? "Molten" : "Crystalline";
-            phaseEl.dataset.phase = molten ? "molten" : "crystalline";
+            // Smoothed Lindemann ratio, so the chip narrates the transition
+            // instead of flickering across it.
+            lEma += 0.3 * (Math.sqrt(msd / n) / A_NN - lEma);
+            const phase =
+              lEma > MELT ? "molten"
+              : lEma > ANNEAL || brokenN > 2 ? "annealing"
+              : "crystalline";
+            if (phase !== phaseEl.dataset.phase) {
+              phaseEl.dataset.phase = phase;
+              phaseEl.textContent =
+                phase === "molten" ? "Molten"
+                : phase === "annealing" ? "Annealing"
+                : "Crystalline";
+            }
             if (tempEl) {
               const fill = Math.min(100, (Math.sqrt(ke / n) / 11) * 100);
               tempEl.style.width = Math.max(6, fill).toFixed(0) + "%";
@@ -576,7 +734,7 @@ const stats = [
           raf = requestAnimationFrame(tick);
         };
 
-        const start = () => { if (!running) { running = true; raf = requestAnimationFrame(tick); } };
+        const start = () => { if (!running) { running = true; lastT = 0; raf = requestAnimationFrame(tick); } };
         const stop = () => { running = false; cancelAnimationFrame(raf); };
         new IntersectionObserver((es) => {
           for (const e of es) { inView = e.isIntersecting; inView ? start() : stop(); }
@@ -601,6 +759,8 @@ const stats = [
     --accent: #0c8c7e;
     --accent-hover: #0a6f63;
     --on-accent: #ffffff;
+    --heat: #e8590c;
+    --heat-soft: #ff8a3d;
     --border: #d2d2d7;
     --border-soft: rgba(0, 0, 0, 0.08);
     --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.06);
@@ -631,6 +791,8 @@ const stats = [
     --accent: #4fd8c6;
     --accent-hover: #7fe6d8;
     --on-accent: #06231e;
+    --heat: #ff922b;
+    --heat-soft: #ffa94d;
     --border: #2a2a2c;
     --border-soft: rgba(255, 255, 255, 0.1);
     --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4);
@@ -1059,6 +1221,18 @@ const stats = [
   .lattice .atoms circle {
     filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.18));
   }
+  /* Harmonic bonds between first-shell neighbours. The stroke-opacity here is
+     only the no-JS resting state; the MD script drives it per-frame through
+     inline style (strain fades a bond, a broken bond disappears). */
+  .lattice .bonds line {
+    stroke: var(--ink-3);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-opacity: 0.45;
+  }
+  /* Thermal halos: an ember glow whose opacity the MD script ties to each
+     atom's kinetic energy. */
+  .lattice .halo-stop { stop-color: var(--heat-soft); }
   /* Atom motion is driven by the molecular-dynamics script (see below);
      no CSS keyframes so JS fully owns each atom's position. */
 
@@ -1082,9 +1256,14 @@ const stats = [
     transition: color 0.25s ease, background 0.25s ease, border-color 0.25s ease;
   }
   .hero__readout .phase[data-phase="molten"] {
-    color: #e8590c;
-    background: color-mix(in srgb, #ff8a3d 16%, transparent);
-    border-color: color-mix(in srgb, #ff8a3d 36%, transparent);
+    color: var(--heat);
+    background: color-mix(in srgb, var(--heat-soft) 16%, transparent);
+    border-color: color-mix(in srgb, var(--heat-soft) 36%, transparent);
+  }
+  .hero__readout .phase[data-phase="annealing"] {
+    color: var(--heat);
+    background: color-mix(in srgb, var(--heat-soft) 8%, transparent);
+    border-color: color-mix(in srgb, var(--heat-soft) 22%, transparent);
   }
   .hero__readout .thermo {
     width: 88px;
@@ -1098,7 +1277,7 @@ const stats = [
     height: 100%;
     width: 6%;
     border-radius: 999px;
-    background: linear-gradient(90deg, var(--accent), #ff8a3d);
+    background: linear-gradient(90deg, var(--accent), var(--heat-soft));
     transition: width 0.18s linear;
   }
   .hero__hint {
