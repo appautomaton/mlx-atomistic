@@ -960,16 +960,23 @@ def run_mlx(
         )
     elapsed_wall_seconds = time.perf_counter() - run_started
     pme_execution_plans = _pme_execution_plan_diagnostics(force_terms)
-    if pme_execution_plans:
-        result.nonbonded_report["pme_execution_plan_count"] = len(pme_execution_plans)
-        result.nonbonded_report["pme_execution_plans"] = pme_execution_plans
-    runtime_execution_contract = _runtime_execution_contract(
-        force_terms,
-        neighbor_manager=neighbor_manager,
-        nonbonded_report=result.nonbonded_report,
-        fixed_cell=not use_npt,
-    )
-    result.nonbonded_report.update(runtime_execution_contract)
+    nonbonded_report = getattr(result, "nonbonded_report", None)
+    if nonbonded_report is None:
+        if pme_execution_plans:
+            msg = "simulation result must expose nonbonded_report for production PME"
+            raise TypeError(msg)
+        runtime_execution_contract = {}
+    else:
+        if pme_execution_plans:
+            nonbonded_report["pme_execution_plan_count"] = len(pme_execution_plans)
+            nonbonded_report["pme_execution_plans"] = pme_execution_plans
+        runtime_execution_contract = _runtime_execution_contract(
+            force_terms,
+            neighbor_manager=neighbor_manager,
+            nonbonded_report=nonbonded_report,
+            fixed_cell=not use_npt,
+        )
+        nonbonded_report.update(runtime_execution_contract)
     if out is None and prepared_dir is not None:
         out = prepared_dir / TRAJECTORY_NAME
     if checkpoint_out is not None:

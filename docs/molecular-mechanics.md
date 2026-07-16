@@ -73,10 +73,19 @@ Production fixed-cell PME is currently admitted only for supported
 orthorhombic configurations within the measured 100,000-atom and 1,048,576
 mesh-point checks. Large lazy-topology PME uses shared
 `mlx_cell_blocks`/`NeighborBlocks` for LJ and direct-space Coulomb and refuses a
-dense fallback. The measured 94,232-atom charged JAC envelope is documented in
-[`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md).
-Production NPT/cell changes, analytic PME virial, and triclinic PME remain
-outside this boundary.
+dense fallback. Two measured workloads now anchor this boundary:
+
+- the 94,232-atom charged AMBER20 JAC envelope with explicit
+  `uniform_neutralizing_plasma`, documented in
+  [`scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md);
+- the neutral 92,001-atom GPCRmd 729 CHARMM membrane fixture with
+  `reject_non_neutral`, independent parity, bounded source-protocol NVT, and
+  checkpoint restart, documented in
+  [`gpcrmd-729-pme-runtime-m5max.md`](./benchmarks/gpcrmd-729-pme-runtime-m5max.md).
+
+These are workload-specific fixed-cell results. Production NPT/cell changes,
+analytic PME virial, triclinic PME, production-length stability, and broad
+membrane readiness remain outside this boundary.
 
 `NonbondedPotential` is the production-oriented direct pair path. It combines
 mixed LJ and direct Coulomb terms, supports explicit nonbonded exceptions and

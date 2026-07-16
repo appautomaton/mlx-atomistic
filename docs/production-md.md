@@ -38,33 +38,32 @@ accepted artifacts must provide complete configuration/readiness metadata and
 must fit the measured atom/mesh/cutoff/cell envelope. First-path NPT remains a
 proof surface, and unsupported production cases remain blockers.
 
-## Phase 3 GPCRmd Fixture Probe
+## Bounded GPCRmd 729 Fixed-Cell Result
 
-The active production-readiness probe uses
-`gpcrmd-729-beta1-5f8u-cyanopindolol`, a local GPCRmd 729 cache with `92001`
-atoms, CHARMM36, TIP3P water, sodium/chloride ions, and a POPC membrane.
+The fresh production-readiness row uses
+`gpcrmd-729-beta1-5f8u-cyanopindolol`: 92,001 atoms with receptor, ligand, POPC
+membrane, TIP3P water, and sodium/chloride ions. Official source files were
+reacquired with hashes, then parsed through the native CHARMM preparation path.
 
-The production-readiness result remains blocked, but the neighbor/topology axis
-is no longer the blocker:
+The fixed-cell orthorhombic NVT boundary now passes end to end:
 
-- OpenMM reference evidence is available as reference-only CHARMM/PME data.
-- MLX preparation, strict artifact loading, and readiness checks now pass for
-  the fixture.
-- Lazy topology now receives the production `NeighborListManager`; supported
-  PME selects `mlx_cell_blocks`/`NeighborBlocks`, while short-range-only large
-  systems retain the compact pair route. Neither path permits dense/tiled
-  production fallback.
-- The last bounded probe asserted that short-range frames complete and advanced
-  its blocker matrix from `topology_terms` to `electrostatics_pme`; that report
-  predates the charged scalable-PME implementation and needs a fresh fixture
-  rerun.
-- The scalable neighbor/nonbonded path matches its tiled oracle through 92,001
-  atoms; see
-  [the M5 Max report](./benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md).
-- The gitignored GPCRmd cache was absent for the 2026-07-13 rerun, so no fresh
-  real-fixture trajectory, checkpoint, or restart claim is made.
+- the strict prepared artifact and source workload manifest agree;
+- independent OpenMM/OpenCL and MLX/Metal manifests match before numerical
+  comparison;
+- total/component energy and complete-force bounds pass;
+- one warmup plus two measured 4 fs steps retain finite state with lazy
+  `mlx_cell_blocks`/`NeighborBlocks`, shared LJ/direct-PME neighbors, one
+  reusable PME plan, and no dense/tiled fallback;
+- trajectory and checkpoint artifacts reload, and restart advances step/time
+  from 3/0.012 ps to 4/0.016 ps without minimization or equilibration.
 
-This is one bounded fixture probe and is not broad production MD certification.
+The quantitative record is in
+[`gpcrmd-729-pme-runtime-m5max.md`](./benchmarks/gpcrmd-729-pme-runtime-m5max.md).
+The regenerated blocker matrix marks the bounded fixture passed; the stale
+`topology_terms` and `electrostatics_pme` blockers are no longer current.
+
+This remains one bounded four-step fixed-cell result, not broad production MD
+certification.
 
 ## Validated Charged Fixed-Cell PME Envelope
 
@@ -195,10 +194,10 @@ validated CHARMM/AMBER force-field parity, and enhanced sampling beyond simple
 SMD. The charged JAC PME result is a bounded fixed-cell validation surface, not
 evidence for a complete membrane-production workflow.
 
-For the GPCRmd 729 production-readiness probe, the next implementation blocker
-is no longer a universal 4,096-atom PME ceiling. The distinct JAC workload
-proves charged fixed-cell PME at 94,232 atoms, but the selected GPCRmd fixture
-still needs a fresh local-cache preparation and runtime rerun against the new
-admission checks. Production NPT, analytic PME virial, triclinic cells, and
-GPCRmd-specific parity/stability remain unproven, so production-MD readiness is
-still blocked for the selected membrane system.
+For GPCRmd 729, the selected fixed-cell NVT fixture now has source-backed
+preparation, independent parity, bounded finite execution, saved output, and
+checkpoint continuation. The next gaps are larger than this closure:
+production NPT and cell changes, analytic PME virial, triclinic PME,
+production-length stability, broader GPCRmd coverage, and a general
+membrane-production readiness claim. No OpenMM/MLX throughput ratio is valid
+until both engines run a matching runtime manifest.

@@ -71,18 +71,21 @@ Runtime proof paths now carry compact platform metadata:
 - charged-PME reports build the OpenMM workload independently from AMBER
   inputs, require a strict manifest match before energy/force metrics, and keep
   the reusable MLX PME plan on the product side;
-- the Phase 3 GPCRmd 729 fixture probe records OpenMM reference evidence,
-  MLX prep/load/readiness evidence, and a blocker matrix without turning OpenMM
-  or `vendors/` into runtime dependencies;
+- the GPCRmd 729 closure records source hashes, independent OpenMM parity,
+  bounded MLX fixed-cell NVT and restart evidence, and a fresh blocker matrix
+  without turning OpenMM or `vendors/` into runtime dependencies;
 - MD performance payloads record `platform_evidence` for finite-output proof
   cases;
 - DFT/QM scope is reported by `get_dft_qm_scope_report()` and
   `dft_qm_scope_readiness_report()`.
 
-The generic short-range neighbor axis and the distinct charged JAC fixed-cell
-PME axis now have at-scale MLX evidence. The charged result is documented in
-[`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md)
-and keeps OpenMM outside the product runtime. The selected GPCRmd membrane
-fixture itself still lacks a fresh local-cache rerun, so these results must not
-be relabeled as a GPCRmd production trajectory or broad production-MD
-certification.
+The generic short-range neighbor axis, the charged JAC fixed-cell PME axis, and
+the selected neutral GPCRmd membrane fixture now have distinct at-scale MLX
+evidence. The charged JAC result is documented in
+[`scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md),
+and the source-backed GPCRmd parity, bounded NVT, output, and restart result is
+documented in
+[`gpcrmd-729-pme-runtime-m5max.md`](./benchmarks/gpcrmd-729-pme-runtime-m5max.md).
+Both keep OpenMM outside the product runtime. Neither establishes production
+NPT, cell-changing dynamics, analytic PME virial, triclinic PME,
+production-length stability, or broad production-MD certification.

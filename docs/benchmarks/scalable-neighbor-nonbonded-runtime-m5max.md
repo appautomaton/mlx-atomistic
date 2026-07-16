@@ -74,20 +74,11 @@ uv run python -m mlx_atomistic.benchmarks.md_performance \
   --json-out results/scalable-neighbor-nonbonded-runtime/synthetic-runtime-92001.json
 ```
 
-When the gitignored GPCRmd 729 cache is available, the real-fixture diagnostic
-command is:
-
-```bash
-uv run python -m mlx_atomistic.prep.gpcrmd_benchmark \
-  --target-id gpcrmd-729-beta1-5f8u-cyanopindolol \
-  --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 \
-  --out results/scalable-neighbor-nonbonded-runtime/gpcrmd-729 \
-  --durations-ps 0.002 --dt 0.001 --sample-interval 1 \
-  --temperature 310 --restraint-k 0 --diagnostic-interval 1 --force
-```
-
-That cache was absent for this measurement, so no fresh real-fixture result is
-reported here.
+The GPCRmd cache was absent when this 2026-07-13 measurement was made, so this
+report contains no real-fixture result. A later source-backed run uses the
+source protocol and the production `NeighborBlocks` PME path; its commands and
+evidence are recorded separately in
+[`gpcrmd-729-pme-runtime-m5max.md`](./gpcrmd-729-pme-runtime-m5max.md).
 
 ## Comparison status and next blocker
 
@@ -101,5 +92,6 @@ The neighbor/topology axis is proven at the target atom count. A separate
 explicit neutralizing-plasma policy; see
 [`scalable-charged-pme-runtime-m5max.md`](./scalable-charged-pme-runtime-m5max.md).
 That does not turn this synthetic row into a GPCRmd result. The membrane fixture
-still needs a fresh local-cache rerun, and production NPT, analytic PME virial,
-and triclinic PME remain deferred.
+has since passed a separate bounded fixed-cell NVT parity/runtime/restart gate.
+Production NPT, analytic PME virial, triclinic PME, production-length stability,
+and broad membrane readiness remain deferred.
