@@ -140,10 +140,12 @@ const HEX: [number, number][] = [
 const ax = Math.cos(TILT) * A_NN, ay = Math.sin(TILT) * A_NN;
 const bx = Math.cos(TILT + Math.PI / 3) * A_NN, by = Math.sin(TILT + Math.PI / 3) * A_NN;
 // Centre chosen so the 18-site centroid lands on the die centre (160, 160).
-const SITES = HEX.map(([m, n], k) => ({
+// Atoms are identical (one species), so one radius — sized near 40% of the
+// bond length, the classic ball-and-stick diagram proportion.
+const SITES = HEX.map(([m, n]) => ({
   x: +(156.3 + m * ax + n * bx).toFixed(1),
   y: +(159.9 + m * ay + n * by).toFixed(1),
-  r: k === 0 ? 10.5 : k <= 6 ? 9 : 8,
+  r: 7,
 }));
 const EDGES: [number, number][] = [];
 for (let i = 0; i < SITES.length; i++)
@@ -336,11 +338,11 @@ const stats = [
                 <stop class="die-a" />
                 <stop offset="1" class="die-b" />
               </linearGradient>
-              <radialGradient id="atom" cx="0.35" cy="0.3" r="0.8">
+              <radialGradient id="atom" cx="0.5" cy="0.38" r="0.85">
                 <stop class="atom-a" />
                 <stop offset="1" class="atom-b" />
               </radialGradient>
-              <radialGradient id="atomA" cx="0.35" cy="0.3" r="0.85">
+              <radialGradient id="atomA" cx="0.5" cy="0.38" r="0.85">
                 <stop class="atomA-a" />
                 <stop offset="1" class="atomA-b" />
               </radialGradient>
@@ -407,7 +409,7 @@ const stats = [
             </g>
             <g class="halos">
               {ATOMS0.map((a) => (
-                <circle cx={a.x} cy={a.y} r={a.r + 8} fill="url(#halo)" opacity="0" />
+                <circle cx={a.x} cy={a.y} r={a.r + 6} fill="url(#halo)" opacity="0" />
               ))}
             </g>
             <g class="atoms">
@@ -1347,15 +1349,24 @@ const stats = [
   .lattice .pins circle {
     fill: var(--ink-3);
   }
-  /* atomic sphere shading */
-  .lattice .atom-a { stop-color: #fbfdff; }
-  .lattice .atom-b { stop-color: #aebbd0; }
-  [data-theme="dark"] .lattice .atom-a { stop-color: #50535c; }
-  [data-theme="dark"] .lattice .atom-b { stop-color: #1b1c22; }
-  .lattice .atomA-a { stop-color: #a7efe4; }
+  /* Atom shading: flat discs with one soft top-light gradient and a hairline
+     rim — depth as a whisper, matching the die's flat design language (no
+     specular spheres, no drop shadows). */
+  .lattice .atom-a { stop-color: #cfd7e4; }
+  .lattice .atom-b { stop-color: #aeb9cb; }
+  [data-theme="dark"] .lattice .atom-a { stop-color: #4b4e57; }
+  [data-theme="dark"] .lattice .atom-b { stop-color: #33353c; }
+  .lattice .atomA-a { stop-color: #52d3c0; }
+  [data-theme="dark"] .lattice .atomA-a { stop-color: #7ce8d8; }
   .lattice .atomA-b { stop-color: var(--accent); }
-  .lattice .atoms circle {
-    filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.18));
+  .lattice .atoms circle,
+  .lattice .excs circle {
+    stroke: rgba(29, 29, 31, 0.16);
+    stroke-width: 1;
+  }
+  [data-theme="dark"] .lattice .atoms circle,
+  [data-theme="dark"] .lattice .excs circle {
+    stroke: rgba(0, 0, 0, 0.45);
   }
   /* Harmonic bonds between first-shell neighbours. The stroke-opacity here is
      only the no-JS resting state; the MD script drives it per-frame through
