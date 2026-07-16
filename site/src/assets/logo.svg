@@ -1,19 +1,37 @@
 <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <g stroke="#7468e8" stroke-width="2.4" opacity="0.3">
-    <line x1="32" y1="32" x2="47" y2="32"/>
-    <line x1="32" y1="32" x2="39.5" y2="19"/>
-    <line x1="32" y1="32" x2="24.5" y2="19"/>
-    <line x1="32" y1="32" x2="17" y2="32"/>
-    <line x1="32" y1="32" x2="24.5" y2="45"/>
-    <line x1="32" y1="32" x2="39.5" y2="45"/>
-  </g>
-  <g fill="#7468e8">
-    <circle cx="47" cy="32" r="4" opacity="0.7"/>
-    <circle cx="39.5" cy="19" r="4" opacity="0.7"/>
-    <circle cx="24.5" cy="19" r="4" opacity="0.7"/>
-    <circle cx="17" cy="32" r="4" opacity="0.7"/>
-    <circle cx="24.5" cy="45" r="4" opacity="0.7"/>
-    <circle cx="39.5" cy="45" r="4" opacity="0.7"/>
-    <circle cx="32" cy="32" r="5.5"/>
+  <style>
+    .orbit { transform-box: fill-box; transform-origin: center; animation: spin 22s linear infinite; }
+    .sat, .cen { transform-box: fill-box; transform-origin: center; }
+    .sat { animation: jitA 1.7s ease-in-out infinite; }
+    .s1 { animation-name: jitB; animation-duration: 1.5s; animation-delay: -0.3s; }
+    .s2 { animation-name: jitC; animation-duration: 1.9s; animation-delay: -0.7s; }
+    .s3 { animation-duration: 1.6s; animation-delay: -1.1s; }
+    .s4 { animation-name: jitB; animation-duration: 2s; animation-delay: -0.5s; }
+    .s5 { animation-name: jitC; animation-duration: 1.55s; animation-delay: -0.9s; }
+    .cen { animation: jitA 2.6s ease-in-out infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes jitA { 0%,100% { transform: translate(0,0); } 30% { transform: translate(0.7px,-0.6px); } 60% { transform: translate(-0.5px,0.6px); } }
+    @keyframes jitB { 0%,100% { transform: translate(0,0); } 35% { transform: translate(-0.7px,-0.4px); } 70% { transform: translate(0.5px,0.6px); } }
+    @keyframes jitC { 0%,100% { transform: translate(0,0); } 40% { transform: translate(0.4px,0.7px); } 75% { transform: translate(0.6px,-0.4px); } }
+    @media (prefers-reduced-motion: reduce) { .orbit, .sat, .cen { animation: none; } }
+  </style>
+  <g class="orbit">
+    <g stroke="#0c8c7e" stroke-width="2.4" opacity="0.34">
+      <line x1="32" y1="32" x2="47" y2="32"/>
+      <line x1="32" y1="32" x2="39.5" y2="19"/>
+      <line x1="32" y1="32" x2="24.5" y2="19"/>
+      <line x1="32" y1="32" x2="17" y2="32"/>
+      <line x1="32" y1="32" x2="24.5" y2="45"/>
+      <line x1="32" y1="32" x2="39.5" y2="45"/>
+    </g>
+    <g fill="#0c8c7e">
+      <circle class="sat s0" cx="47" cy="32" r="4" opacity="0.85"/>
+      <circle class="sat s1" cx="39.5" cy="19" r="4" opacity="0.85"/>
+      <circle class="sat s2" cx="24.5" cy="19" r="4" opacity="0.85"/>
+      <circle class="sat s3" cx="17" cy="32" r="4" opacity="0.85"/>
+      <circle class="sat s4" cx="24.5" cy="45" r="4" opacity="0.85"/>
+      <circle class="sat s5" cx="39.5" cy="45" r="4" opacity="0.85"/>
+      <circle class="cen" cx="32" cy="32" r="5.5"/>
+    </g>
   </g>
 </svg>
