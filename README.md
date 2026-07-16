@@ -13,12 +13,12 @@
 </p>
 
 <p align="center">
-  <a href="https://appautomaton.github.io/mlx-atomistic/"><img alt="Documentation" src="https://img.shields.io/badge/docs-appautomaton.github.io-6c5ce7?style=flat-square&logo=readthedocs&logoColor=white"></a>
+  <a href="https://appautomaton.github.io/mlx-atomistic/"><img alt="Documentation" src="https://img.shields.io/badge/docs-appautomaton.github.io-0c8c7e?style=flat-square&logo=readthedocs&logoColor=white"></a>
   <a href="https://pypi.org/project/mlx-atomistic/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mlx-atomistic?style=flat-square&logo=pypi&logoColor=white"></a>
   <a href="https://github.com/appautomaton/mlx-atomistic/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/appautomaton/mlx-atomistic/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1d1d1f?style=flat-square">
-  <a href="https://appautomaton.github.io"><img alt="Part of App Automaton" src="https://img.shields.io/badge/part%20of-App%20Automaton-6c5ce7?style=flat-square"></a>
+  <a href="https://appautomaton.github.io"><img alt="Part of App Automaton" src="https://img.shields.io/badge/part%20of-App%20Automaton-0c8c7e?style=flat-square"></a>
 </p>
 
 <p align="center">
