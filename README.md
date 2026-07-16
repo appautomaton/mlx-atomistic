@@ -132,6 +132,12 @@ mlx-atomistic is part of **[App Automaton](https://appautomaton.github.io)** —
 skills, harnesses, and on-device tools for engineering with AI coding agents, with a
 focus on local-first, Apple-Silicon-native execution.
 
+## Community and acknowledgements
+
+We are grateful to the vibrant [LINUX DO](https://linux.do/) AI community for
+its support, thoughtful discussions, and enthusiasm for open, practical AI
+engineering.
+
 ## License
 
 [MIT](LICENSE).
