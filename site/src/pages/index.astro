@@ -104,40 +104,55 @@ const PACKETS = [
   { d: "M372 160 H306", delay: 4.3 },
   { d: "M14 100 H-40 L-64 76 H-150", delay: 8.6 },
 ];
+// Narrow-layout routing: short symmetric stubs that fit a phone (the die is
+// centred there, so both sides get equal room). Swapped in via media query.
+const TRACES_N = [
+  { d: "M14 100 H-42", via: [-46, 100] },
+  { d: "M14 160 H-64", via: [-68, 160] },
+  { d: "M14 220 H-42", via: [-46, 220] },
+  { d: "M306 100 H358", via: [362, 100] },
+  { d: "M306 160 H380", via: [384, 160] },
+  { d: "M306 220 H358", via: [362, 220] },
+];
+const PACKETS_N = [
+  { d: "M14 160 H-64", delay: 0 },
+  { d: "M384 160 H306", delay: 6.5 },
+];
 
 // ---- Hero crystallite ----
-// Single source of truth for the MD toy's lattice art: an asymmetric
-// close-packed patch (~9deg off-axis, trimmed left edge, one interior vacancy)
-// whose sites double as the "home" positions the inline MD script springs each
-// atom back to. Bonds connect first-shell neighbours (cutoff 46 < a*sqrt(3), so
-// only the first shell qualifies); the script re-reads the pairing from each
-// line's data-b indices, so the drawn network and the physics cannot drift.
-const CRYSTAL = [
-  { x: 227.2, y: 173.6, r: 8 },
-  { x: 202.8, y: 110, r: 8, excited: true },
-  { x: 135.6, y: 99.4, r: 8 },
-  { x: 117.2, y: 216, r: 8 },
-  { x: 184.4, y: 226.6, r: 8 },
-  { x: 214.9, y: 142.3, r: 8, excited: true },
-  { x: 169.2, y: 104.7, r: 8 },
-  { x: 114.2, y: 126.4, r: 8 },
-  { x: 105.1, y: 183.7, r: 8 },
-  { x: 150.8, y: 221.3, r: 8 },
-  { x: 205.8, y: 199.6, r: 8 },
-  { x: 193.6, y: 168.3, r: 9, excited: true },
-  { x: 181.3, y: 137, r: 9, excited: true },
-  { x: 147.7, y: 131.7, r: 9 },
-  { x: 126.4, y: 157.7, r: 9 },
-  { x: 172.3, y: 194.3, r: 9 },
-  { x: 160, y: 163, r: 10.5 },
+// Single source of truth for the MD toy's lattice: an EXACT triangular
+// lattice (the 2D close-packed ground state), rotated 9deg off-axis, as a
+// 19-site hex cluster with one edge site trimmed. Asymmetry comes from the
+// outline, the vacancy, and the motion — never from positional wobble, so
+// every bond renders dead straight. Atoms OCCUPY sites: the vacancy migrates
+// between sites (real solid-state diffusion) and the teal excitation hops
+// atom-to-atom (exciton transfer), so the cluster reshapes itself even with
+// nobody touching it. The script re-reads site indices from data attributes,
+// so the drawn network and the physics cannot drift.
+const A_NN = 34;
+const TILT = (9 * Math.PI) / 180;
+const HEX: [number, number][] = [
+  [0, 0],
+  [1, 0], [0, 1], [-1, 1], [-1, 0], [0, -1], [1, -1],
+  [2, 0], [1, 1], [0, 2], [-1, 2], [-2, 2], [-2, 1],
+  [-1, -1], [0, -2], [1, -2], [2, -2], [2, -1], // [-2, 0] trimmed
 ];
-const CRYSTAL_BONDS: [number, number][] = [];
-for (let i = 0; i < CRYSTAL.length; i++)
-  for (let j = i + 1; j < CRYSTAL.length; j++) {
-    const dx = CRYSTAL[j].x - CRYSTAL[i].x;
-    const dy = CRYSTAL[j].y - CRYSTAL[i].y;
-    if (Math.hypot(dx, dy) < 46) CRYSTAL_BONDS.push([i, j]);
-  }
+const ax = Math.cos(TILT) * A_NN, ay = Math.sin(TILT) * A_NN;
+const bx = Math.cos(TILT + Math.PI / 3) * A_NN, by = Math.sin(TILT + Math.PI / 3) * A_NN;
+// Centre chosen so the 18-site centroid lands on the die centre (160, 160).
+const SITES = HEX.map(([m, n], k) => ({
+  x: +(156.3 + m * ax + n * bx).toFixed(1),
+  y: +(159.9 + m * ay + n * by).toFixed(1),
+  r: k === 0 ? 10.5 : k <= 6 ? 9 : 8,
+}));
+const EDGES: [number, number][] = [];
+for (let i = 0; i < SITES.length; i++)
+  for (let j = i + 1; j < SITES.length; j++)
+    if (Math.hypot(SITES[j].x - SITES[i].x, SITES[j].y - SITES[i].y) < 40)
+      EDGES.push([i, j]);
+const VAC0 = 3; // initial vacancy: site (-1, 1), lower-left of centre
+const EXC0 = [1, 6, 16, 17]; // initial exciton lobe: upper-right, off-centre
+const ATOMS0 = SITES.map((s, k) => ({ ...s, site: k })).filter((s) => s.site !== VAC0);
 // Package pins: three per side, aligned across opposite edges, each ending in
 // a solder pad that echoes the atoms inside. The machined regularity of the
 // package is deliberate contrast to the organic asymmetry of the crystallite.
@@ -335,7 +350,7 @@ const stats = [
               </radialGradient>
             </defs>
             <!-- board traces: the die's I/O (see TRACES/PACKETS) -->
-            <g class="traces">
+            <g class="traces traces--wide">
               {TRACES.map((t) => (
                 <path class="trace" d={t.d} />
               ))}
@@ -343,6 +358,17 @@ const stats = [
                 <circle cx={t.via[0]} cy={t.via[1]} r="3" />
               ))}
               {PACKETS.map((p) => (
+                <path class="packet" d={p.d} pathLength="100" style={`animation-delay:${p.delay}s`} />
+              ))}
+            </g>
+            <g class="traces traces--narrow">
+              {TRACES_N.map((t) => (
+                <path class="trace" d={t.d} />
+              ))}
+              {TRACES_N.map((t) => (
+                <circle cx={t.via[0]} cy={t.via[1]} r="3" />
+              ))}
+              {PACKETS_N.map((p) => (
                 <path class="packet" d={p.d} pathLength="100" style={`animation-delay:${p.delay}s`} />
               ))}
             </g>
@@ -361,29 +387,44 @@ const stats = [
             <rect x="40" y="40" width="240" height="240" rx="40" fill="url(#die)" />
             <rect x="40" y="40" width="240" height="240" rx="40" class="die-edge" />
             <rect x="74" y="74" width="172" height="172" rx="26" class="die-inner" />
-            <!-- Bonded crystallite, generated from CRYSTAL (see frontmatter).
-                 Bonds render beneath the spheres and carry visible strain;
-                 halos carry each atom's thermal glow. The MD script animates
-                 all three layers in lockstep. -->
-            <g class="bonds">
-              {CRYSTAL_BONDS.map(([i, j]) => (
+            <!-- Bonded crystallite, generated from SITES/EDGES (see
+                 frontmatter). Every edge of the site graph gets a line; an
+                 edge only shows while both of its sites are occupied, so the
+                 network re-knits itself as the vacancy migrates. Halos carry
+                 the per-atom thermal glow; the .exc overlays carry the
+                 wandering exciton. The MD script animates every layer. -->
+            <g class="bonds" data-sites={JSON.stringify(SITES.map((s) => [s.x, s.y]))}>
+              {EDGES.map(([i, j]) => (
                 <line
-                  data-b={`${i} ${j}`}
-                  x1={CRYSTAL[i].x}
-                  y1={CRYSTAL[i].y}
-                  x2={CRYSTAL[j].x}
-                  y2={CRYSTAL[j].y}
+                  data-e={`${i} ${j}`}
+                  x1={SITES[i].x}
+                  y1={SITES[i].y}
+                  x2={SITES[j].x}
+                  y2={SITES[j].y}
+                  style={i === VAC0 || j === VAC0 ? "stroke-opacity:0" : undefined}
                 />
               ))}
             </g>
             <g class="halos">
-              {CRYSTAL.map((a) => (
+              {ATOMS0.map((a) => (
                 <circle cx={a.x} cy={a.y} r={a.r + 8} fill="url(#halo)" opacity="0" />
               ))}
             </g>
             <g class="atoms">
-              {CRYSTAL.map((a) => (
-                <circle cx={a.x} cy={a.y} r={a.r} fill={a.excited ? "url(#atomA)" : "url(#atom)"} />
+              {ATOMS0.map((a) => (
+                <circle data-s={a.site} cx={a.x} cy={a.y} r={a.r} fill="url(#atom)" />
+              ))}
+            </g>
+            <g class="excs">
+              {ATOMS0.map((a) => (
+                <circle
+                  class="exc"
+                  cx={a.x}
+                  cy={a.y}
+                  r={a.r}
+                  fill="url(#atomA)"
+                  style={`opacity:${EXC0.includes(a.site) ? 1 : 0}`}
+                />
               ))}
             </g>
           </svg>
@@ -520,8 +561,11 @@ const stats = [
          Langevin damping + noise set the temperature. Dragging stirs momentum
          in and heats the cell; over-strained bonds break (melting) and re-form
          as the lattice anneals home. The chip reads a smoothed Lindemann
-         ratio; halos glow with per-atom kinetic energy; an occasional
-         plane-wave pulse rolls through the idle lattice. -->
+         ratio; halos glow with per-atom kinetic energy. The idle lattice
+         stays alive on real solid-state physics: an occasional plane-wave
+         phonon pulse rolls through it, the vacancy migrates site-to-site
+         (an atom glides into the hole and the network re-knits), and the
+         teal exciton lobe wanders atom-to-atom. -->
     <script>
       const visual = document.querySelector(".hero__visual");
       const svg = visual?.querySelector("svg.lattice");
@@ -535,17 +579,29 @@ const stats = [
         hero?.querySelector(".hero__readout")?.removeAttribute("hidden");
         hero?.querySelector(".hero__hint")?.removeAttribute("hidden");
 
+        // Site/occupancy model: atoms occupy lattice sites; every edge of the
+        // site graph has a line that shows only while both ends are occupied.
+        // This is what lets the vacancy migrate with the network re-knitting
+        // itself around it.
         const halos = [...svg.querySelectorAll(".halos circle")];
+        const excs = [...svg.querySelectorAll(".excs circle")];
+        const bondsG = svg.querySelector(".bonds");
+        const sites = JSON.parse(bondsG.getAttribute("data-sites"));
+        const occ = new Array(sites.length).fill(-1);
         const atoms = [...group.querySelectorAll("circle")].map((el, i) => {
-          const hx = parseFloat(el.getAttribute("cx"));
-          const hy = parseFloat(el.getAttribute("cy"));
-          return { el, halo: halos[i], hx, hy, x: hx, y: hy, vx: 0, vy: 0, hop: 0 };
+          const site = +el.getAttribute("data-s");
+          const [hx, hy] = sites[site];
+          occ[site] = i;
+          return { el, halo: halos[i], exc: excs[i], site, hx, hy, x: hx, y: hy, vx: 0, vy: 0, hop: 0 };
         });
-        const bonds = [...svg.querySelectorAll(".bonds line")].map((el) => {
-          const [i, j] = el.getAttribute("data-b").split(" ").map(Number);
-          const a = atoms[i], b = atoms[j];
-          return { el, a, b, rest: Math.hypot(b.hx - a.hx, b.hy - a.hy), broken: false, op: 0.45 };
+        let vac = occ.indexOf(-1);
+        const excited = new Set(atoms.map((a, i) => (a.exc.style.opacity === "1" ? i : -1)).filter((i) => i >= 0));
+        const edges = [...bondsG.querySelectorAll("line")].map((el) => {
+          const [i, j] = el.getAttribute("data-e").split(" ").map(Number);
+          return { el, i, j, rest: Math.hypot(sites[j][0] - sites[i][0], sites[j][1] - sites[i][1]), broken: false, op: 0.45 };
         });
+        const nbrs = sites.map(() => []);
+        for (const e of edges) { nbrs[e.i].push(e.j); nbrs[e.j].push(e.i); }
 
         const TETHER = 0.02;    // weak Einstein anchor to each home site
         const KBOND = 0.05;     // harmonic bond stiffness (carries phonons)
@@ -568,9 +624,14 @@ const stats = [
         const PULSE_EVERY = 9000; // idle ms between phonon pulses
         const PULSE_V = 0.19;   // wavefront speed, viewBox units per ms
 
+        const HOP_EVERY = 6500;  // idle ms between vacancy hops
+        const EXC_EVERY = 4200;  // ms between exciton transfers
+
         const mouse = { x: -999, y: -999, dx: 0, dy: 0, on: false, down: false };
         let heat = 0, frame = 0, lEma = 0;
         let lastPulse = performance.now() - PULSE_EVERY + 2500; // first pulse ~2.5s in
+        let lastHop = performance.now() - HOP_EVERY + 3400;     // first hop ~3.4s in
+        let lastExc = performance.now() - EXC_EVERY + 5300;     // first transfer ~5.3s in
         const pulse = { t0: -1, cos: 1, sin: 0, min: 0 };
 
         const toSvg = (cx, cy) => {
@@ -642,6 +703,34 @@ const stats = [
             }
           }
 
+          // Vacancy migration: every few idle seconds a neighbouring atom is
+          // retargeted into the hole and glides over (canonical solid-state
+          // diffusion), so the crystallite reshapes with nobody touching it.
+          if (!mouse.down && heat < 0.2 && now - lastHop > HOP_EVERY) {
+            lastHop = now;
+            const cands = nbrs[vac].filter((s) => occ[s] >= 0);
+            if (cands.length) {
+              const s = cands[(Math.random() * cands.length) | 0];
+              const a = atoms[occ[s]];
+              occ[vac] = occ[s]; occ[s] = -1;
+              a.site = vac; a.hx = sites[vac][0]; a.hy = sites[vac][1];
+              vac = s;
+            }
+          }
+          // Exciton transfer: the teal excitation wanders atom-to-atom (the
+          // .exc overlays crossfade via CSS), so the lobe drifts and reshapes.
+          if (now - lastExc > EXC_EVERY && excited.size) {
+            lastExc = now;
+            const from = [...excited][(Math.random() * excited.size) | 0];
+            const targets = nbrs[atoms[from].site].filter((s) => occ[s] >= 0 && !excited.has(occ[s]));
+            if (targets.length) {
+              const to = occ[targets[(Math.random() * targets.length) | 0]];
+              excited.delete(from); excited.add(to);
+              atoms[from].exc.style.opacity = "0";
+              atoms[to].exc.style.opacity = "1";
+            }
+          }
+
           for (const a of atoms) {
             a.vx += (a.hx - a.x) * springK;
             a.vy += (a.hy - a.y) * springK;
@@ -663,9 +752,12 @@ const stats = [
 
           // Harmonic bonds: the lattice's real cohesion. Stretched bonds pull,
           // compressed bonds push, over-strained bonds let go until the pair
-          // finds its rest distance again.
-          for (const bd of bonds) {
-            const dx = bd.b.x - bd.a.x, dy = bd.b.y - bd.a.y;
+          // finds its rest distance again. An edge with a vacant end is
+          // dormant — it wakes when the vacancy moves on.
+          for (const bd of edges) {
+            if (occ[bd.i] < 0 || occ[bd.j] < 0) { bd.op = 0; continue; }
+            const A = atoms[occ[bd.i]], B = atoms[occ[bd.j]];
+            const dx = B.x - A.x, dy = B.y - A.y;
             const d = Math.hypot(dx, dy) || 0.001;
             if (bd.broken) {
               if (d < bd.rest * REFORM) bd.broken = false;
@@ -677,8 +769,8 @@ const stats = [
               bd.op = 0;
             } else {
               const f = (kBond * (d - bd.rest)) / d;
-              bd.a.vx += f * dx; bd.a.vy += f * dy;
-              bd.b.vx -= f * dx; bd.b.vy -= f * dy;
+              A.vx += f * dx; A.vy += f * dy;
+              B.vx -= f * dx; B.vy -= f * dy;
               const strain = Math.abs(d - bd.rest) / bd.rest;
               bd.op = Math.max(0, BOND_OP * (1 - strain * 2.2));
             }
@@ -707,6 +799,8 @@ const stats = [
             else if (a.y > HI) { a.y = HI; a.vy = -Math.abs(a.vy) * 0.5; }
             a.el.setAttribute("cx", a.x.toFixed(2));
             a.el.setAttribute("cy", a.y.toFixed(2));
+            a.exc.setAttribute("cx", a.x.toFixed(2));
+            a.exc.setAttribute("cy", a.y.toFixed(2));
             // Thermal halo: glow tracks kinetic energy, so heat is visible
             // where it lives. Skipped while imperceptible to save attr churn.
             const op = Math.min(0.6, (a.vx * a.vx + a.vy * a.vy) * 0.02);
@@ -719,11 +813,13 @@ const stats = [
             ke += a.vx * a.vx + a.vy * a.vy;
             msd += (a.x - a.hx) ** 2 + (a.y - a.hy) ** 2;
           }
-          for (const bd of bonds) {
-            bd.el.setAttribute("x1", bd.a.x.toFixed(1));
-            bd.el.setAttribute("y1", bd.a.y.toFixed(1));
-            bd.el.setAttribute("x2", bd.b.x.toFixed(1));
-            bd.el.setAttribute("y2", bd.b.y.toFixed(1));
+          for (const bd of edges) {
+            if (occ[bd.i] < 0 || occ[bd.j] < 0) { bd.el.style.strokeOpacity = "0"; continue; }
+            const A = atoms[occ[bd.i]], B = atoms[occ[bd.j]];
+            bd.el.setAttribute("x1", A.x.toFixed(1));
+            bd.el.setAttribute("y1", A.y.toFixed(1));
+            bd.el.setAttribute("x2", B.x.toFixed(1));
+            bd.el.setAttribute("y2", B.y.toFixed(1));
             bd.el.style.strokeOpacity = bd.op.toFixed(2);
           }
 
@@ -1050,6 +1146,10 @@ const stats = [
   .lattice .traces {
     pointer-events: none;
   }
+  /* Narrow routing swaps in via the mobile media query below. */
+  .lattice .traces--narrow {
+    display: none;
+  }
   .lattice .traces .trace {
     stroke: var(--ink-3);
     stroke-opacity: 0.35;
@@ -1269,6 +1369,12 @@ const stats = [
   /* Thermal halos: an ember glow whose opacity the MD script ties to each
      atom's kinetic energy. */
   .lattice .halo-stop { stop-color: var(--heat-soft); }
+  /* Exciton overlays: teal excitation that wanders atom-to-atom; the script
+     flips inline opacity, this transition is the crossfade. */
+  .lattice .excs circle {
+    pointer-events: none;
+    transition: opacity 0.9s ease;
+  }
   /* Atom motion is driven by the molecular-dynamics script (see below);
      no CSS keyframes so JS fully owns each atom's position. */
 
@@ -1652,13 +1758,17 @@ const stats = [
     .hero__stage {
       position: static;
       transform: none;
-      width: min(360px, 82%);
+      /* Slightly trimmed so the narrow side-routing fits the viewport. */
+      width: min(320px, 64%);
       margin: -1.5rem auto 0;
       opacity: 0.8;
     }
-    /* No room for board routing on a phone; the die keeps just its pins. */
-    .lattice .traces {
+    /* Swap the long asymmetric routing for short symmetric stubs. */
+    .lattice .traces--wide {
       display: none;
+    }
+    .lattice .traces--narrow {
+      display: block;
     }
     .lead { margin-left: auto; margin-right: auto; }
     .cta-row { justify-content: center; }
