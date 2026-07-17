@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from mlx_atomistic.benchmarks.dft_silicon import (
@@ -10,12 +11,17 @@ from mlx_atomistic.benchmarks.dft_silicon import (
     SOURCE_SCHEMA,
     TARGET_ID,
     WORKLOAD_SCHEMA,
+    _parse_pmset_power_mode,
+    finite_difference_force_array,
+    fit_lattice_curve,
     inspect_workload,
+    isotropic_stress_tensor,
     main,
     parse_gth_entry,
     prepare_workload,
     render_qe_gth,
     run_mlx_smoke,
+    run_mlx_workload,
 )
 
 
@@ -164,3 +170,78 @@ def test_dft_silicon_mlx_smoke_uses_full_periodic_path(tmp_path):
     report = json.loads(Path(payload["report"]).read_text())
     assert report["result"]["dense_full_hamiltonian"] is False
     assert report["result"]["kpoints"][0]["eigensolver"]["converged"]
+
+
+def test_finite_difference_force_array_matches_quadratic_gradient():
+    positions = np.array([[1.0, -2.0, 0.5], [0.25, 0.75, -1.0]])
+
+    def energy(values):
+        return 0.5 * float(np.sum(values * values))
+
+    forces = finite_difference_force_array(energy, positions, displacement_bohr=1e-4)
+
+    np.testing.assert_allclose(forces, -positions, atol=1e-10)
+
+
+def test_isotropic_stress_tensor_has_cubic_symmetry_and_expected_derivative():
+    lattice = 5.0
+
+    def energy(length):
+        return 2.0 * length**3
+
+    stress = isotropic_stress_tensor(energy, lattice, strain_step=1e-4)
+    expected = 2.0 * 29421.02648438959
+
+    np.testing.assert_allclose(np.diag(stress), expected, rtol=2e-8)
+    np.testing.assert_allclose(stress - np.diag(np.diag(stress)), 0.0, atol=0.0)
+
+
+def test_lattice_fit_requires_seven_points_and_interior_convex_minimum():
+    lattice = np.linspace(5.25, 5.61, 7)
+    energies = -10.0 + 3.0 * (lattice - 5.43) ** 2
+
+    fit = fit_lattice_curve(lattice, energies)
+
+    assert fit["status"] == "ok"
+    assert fit["equilibrium_lattice_constant_angstrom"] == pytest.approx(5.43, abs=1e-10)
+    with pytest.raises(ValueError, match="seven"):
+        fit_lattice_curve(lattice[:-1], energies[:-1])
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ("Currently in use:\n lowpowermode 1\n", ("lowpowermode", 1)),
+        ("Currently in use:\n powermode 0\n", ("powermode", 0)),
+        ("Currently in use:\n sleep 0\n", (None, None)),
+    ],
+)
+def test_parse_pmset_power_mode_supports_old_and_new_macos_keys(payload, expected):
+    assert _parse_pmset_power_mode(payload) == expected
+
+
+def test_dft_silicon_mlx_equilibrium_persists_reproducibility_and_profile(tmp_path):
+    source = _gth_database(tmp_path / "GTH_POTENTIALS")
+    prepared = prepare_workload(
+        gth_source=source,
+        out=tmp_path / "prepared",
+        command=["prepare"],
+    )
+
+    payload = run_mlx_workload(
+        manifest_path=prepared["workload_manifest"],
+        out=tmp_path / "mlx",
+        case="equilibrium",
+        repetitions=2,
+    )
+
+    assert payload["status"] == "ok"
+    report = json.loads(Path(payload["report"]).read_text())
+    assert report["cases"]["equilibrium"]["rerun_energy_delta_hartree_per_atom"] <= 1e-6
+    assert len(report["cases"]["equilibrium"]["repetitions"]) == 2
+    assert report["internal_gates"]["energy_accounting_consistent"] is True
+    assert report["run_protocol"]["synchronization"].startswith("mx.eval")
+    assert report["profile_rows"]
+    for row in report["cases"]["equilibrium"]["repetitions"]:
+        arrays = np.load(row["arrays"], allow_pickle=False)
+        assert arrays["density"].shape == (8, 8, 8)
