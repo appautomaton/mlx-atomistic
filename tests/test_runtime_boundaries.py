@@ -74,9 +74,7 @@ def _string_literals(path: Path) -> list[str]:
     ]
 
 
-def _resolve_dependency_group(
-    groups: dict, name: str, seen: set[str] | None = None
-) -> set[str]:
+def _resolve_dependency_group(groups: dict, name: str, seen: set[str] | None = None) -> set[str]:
     """Flatten a PEP 735 dependency group, resolving ``include-group`` entries."""
     seen = seen if seen is not None else set()
     if name in seen:
@@ -250,6 +248,20 @@ def test_external_engine_imports_stay_in_documented_reference_scripts():
                 offenders[relative] = sorted(imports)
 
     assert offenders == {}
+    assert observed == allowed
+
+
+def test_pwscf_execution_stays_in_the_reference_runner():
+    allowed = {Path("scripts/run_qe_silicon_reference.py")}
+    observed = {
+        path.relative_to(ROOT)
+        for root in (ROOT / "src", ROOT / "scripts")
+        for path in _python_files(root)
+        if any(
+            "pw.x" in literal or "PWscf executable" in literal for literal in _string_literals(path)
+        )
+    }
+
     assert observed == allowed
 
 

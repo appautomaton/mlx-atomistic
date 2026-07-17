@@ -1445,6 +1445,13 @@ def main(argv: list[str] | None = None) -> None:
     mlx.add_argument("--out", type=Path, required=True)
     mlx.add_argument("--json", action="store_true")
 
+    compare = subparsers.add_parser("compare", help="Compare normalized MLX and QE reports.")
+    compare.add_argument("--manifest", type=Path, required=True)
+    compare.add_argument("--mlx", type=Path, required=True)
+    compare.add_argument("--qe", type=Path, required=True)
+    compare.add_argument("--out", type=Path, required=True)
+    compare.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "prepare":
         payload = prepare_workload(
@@ -1459,7 +1466,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "inspect":
         payload = inspect_workload(args.manifest)
-    else:
+    elif args.command == "mlx":
         if args.smoke:
             if args.case != "equilibrium":
                 msg = "--smoke admits only --case equilibrium"
@@ -1473,6 +1480,17 @@ def main(argv: list[str] | None = None) -> None:
                 case=args.case,
                 repetitions=args.repetitions,
             )
+    else:
+        from mlx_atomistic.benchmarks.dft_silicon_parity import (
+            compare_silicon_reports,
+        )
+
+        payload = compare_silicon_reports(
+            manifest_path=args.manifest,
+            mlx_report_path=args.mlx,
+            qe_report_path=args.qe,
+            out=args.out,
+        )
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
