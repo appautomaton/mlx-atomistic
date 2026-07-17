@@ -553,6 +553,92 @@ def inspect_workload(path: str | Path) -> dict[str, Any]:
     }
 
 
+def run_mlx_smoke(
+    *,
+    manifest_path: str | Path,
+    out: str | Path,
+) -> dict[str, Any]:
+    """Run a compact full-GTH silicon periodic-SCF smoke case.
+
+    Args:
+        manifest_path: Prepared silicon workload manifest.
+        out: Caller-provided output directory.
+
+    Returns:
+        JSON-safe periodic SCF smoke summary.
+    """
+
+    from mlx_atomistic.dft import (
+        KPoint,
+        KPointMesh,
+        PeriodicDavidsonConfig,
+        PeriodicDFTSystem,
+        PeriodicSCFConfig,
+        read_gth,
+        run_periodic_scf,
+    )
+
+    inspect_workload(manifest_path)
+    manifest = json.loads(Path(manifest_path).read_text())
+    system_data = manifest["system"]
+    lattice = float(system_data["lattice_constant_bohr"])
+    positions = lattice * np.asarray(system_data["fractional_positions"], dtype=np.float64)
+    pseudopotential = read_gth(manifest["pseudopotential"]["path"], element=GTH_ELEMENT)
+    system = PeriodicDFTSystem(
+        (lattice, lattice, lattice),
+        (8, 8, 8),
+        positions,
+        pseudopotential,
+        electron_count=float(system_data["electron_count"]),
+    )
+    mesh = KPointMesh([KPoint((0.0, 0.0, 0.0), coordinate_system="reduced")])
+    result = run_periodic_scf(
+        system,
+        cutoff_hartree=2.0,
+        kpoint_mesh=mesh,
+        n_bands=int(system_data["occupied_band_count"]),
+        config=PeriodicSCFConfig(
+            max_iterations=8,
+            min_iterations=2,
+            density_tolerance=0.3,
+            energy_tolerance=0.5,
+            orbital_tolerance=5e-3,
+            mixing_beta=0.5,
+            mixer="linear",
+            davidson=PeriodicDavidsonConfig(
+                max_iterations=24,
+                tolerance=5e-3,
+                max_subspace_size=48,
+            ),
+        ),
+    )
+    output_root = Path(out)
+    output_root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": "mlx-atomistic.dft-silicon-mlx-smoke.v1",
+        "target_id": manifest["target_id"],
+        "manifest_fingerprint": manifest["fingerprint_sha256"],
+        "case": "equilibrium",
+        "smoke": True,
+        "grid_shape": list(system.grid.shape),
+        "cutoff_hartree": 2.0,
+        "kpoint_mesh": [1, 1, 1],
+        "pseudopotential_sha256": manifest["pseudopotential"]["sha256"],
+        "result": result.to_dict(),
+    }
+    report_path = output_root / "report.json"
+    report_path.write_bytes(_canonical_json(payload))
+    return {
+        "status": result.status,
+        "converged": result.converged,
+        "report": str(report_path),
+        "total_energy_hartree": result.total_energy,
+        "electron_count": result.electron_count,
+        "kpoint_count": len(result.kpoints),
+        "dense_full_hamiltonian": False,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the silicon workload preparation and inspection CLI.
 
@@ -572,6 +658,13 @@ def main(argv: list[str] | None = None) -> None:
     inspect.add_argument("--manifest", type=Path, required=True)
     inspect.add_argument("--json", action="store_true")
 
+    mlx = subparsers.add_parser("mlx", help="Run the MLX silicon workload.")
+    mlx.add_argument("--manifest", type=Path, required=True)
+    mlx.add_argument("--case", default="equilibrium")
+    mlx.add_argument("--smoke", action="store_true")
+    mlx.add_argument("--out", type=Path, required=True)
+    mlx.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "prepare":
         payload = prepare_workload(
@@ -584,8 +677,13 @@ def main(argv: list[str] | None = None) -> None:
                 *(argv or sys.argv[1:]),
             ],
         )
-    else:
+    elif args.command == "inspect":
         payload = inspect_workload(args.manifest)
+    else:
+        if args.case != "equilibrium" or not args.smoke:
+            msg = "Slice 4 admits only --case equilibrium --smoke"
+            raise ValueError(msg)
+        payload = run_mlx_smoke(manifest_path=args.manifest, out=args.out)
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
         return

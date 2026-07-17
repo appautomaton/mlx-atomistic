@@ -66,6 +66,17 @@ from mlx_atomistic.dft.periodic_gth import (
     periodic_ewald_energy,
     periodic_ewald_forces,
 )
+from mlx_atomistic.dft.periodic_scf import (
+    PeriodicDavidsonConfig,
+    PeriodicDFTSystem,
+    PeriodicEigenResult,
+    PeriodicKohnShamOperator,
+    PeriodicKPointResult,
+    PeriodicSCFConfig,
+    PeriodicSCFResult,
+    run_periodic_scf,
+    solve_periodic_eigenproblem,
+)
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
@@ -150,7 +161,14 @@ __all__ = [
     "NonlocalProjectorData",
     "OccupationResult",
     "PBEExchangeCorrelation",
+    "PeriodicDFTSystem",
+    "PeriodicDavidsonConfig",
+    "PeriodicEigenResult",
     "PeriodicGTHNonlocalOperator",
+    "PeriodicKPointResult",
+    "PeriodicKohnShamOperator",
+    "PeriodicSCFConfig",
+    "PeriodicSCFResult",
     "PlaneWaveBasis",
     "ProductionPBEExchangeCorrelation",
     "ProjectorSet",
@@ -207,9 +225,11 @@ __all__ = [
     "read_gth",
     "read_upf",
     "run_band_structure",
+    "run_periodic_scf",
     "run_scf",
     "save_dense_scf_restart",
     "save_geometry_optimization",
     "scf_total_energy_forces",
+    "solve_periodic_eigenproblem",
     "spin_density_from_orbitals",
 ]

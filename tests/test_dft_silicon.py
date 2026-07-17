@@ -15,6 +15,7 @@ from mlx_atomistic.benchmarks.dft_silicon import (
     parse_gth_entry,
     prepare_workload,
     render_qe_gth,
+    run_mlx_smoke,
 )
 
 
@@ -141,3 +142,25 @@ def test_dft_silicon_prepare_and_inspect_cli_json(tmp_path, capsys):
     inspected = json.loads(capsys.readouterr().out)
     assert inspected["status"] == "ready"
     assert inspected["target_chip"] == "Apple M5 Max"
+
+
+def test_dft_silicon_mlx_smoke_uses_full_periodic_path(tmp_path):
+    source = _gth_database(tmp_path / "GTH_POTENTIALS")
+    prepared = prepare_workload(
+        gth_source=source,
+        out=tmp_path / "prepared",
+        command=["prepare"],
+    )
+
+    payload = run_mlx_smoke(
+        manifest_path=prepared["workload_manifest"],
+        out=tmp_path / "smoke",
+    )
+
+    assert payload["converged"]
+    assert payload["status"] == "converged"
+    assert payload["electron_count"] == pytest.approx(32.0, abs=2e-4)
+    assert payload["dense_full_hamiltonian"] is False
+    report = json.loads(Path(payload["report"]).read_text())
+    assert report["result"]["dense_full_hamiltonian"] is False
+    assert report["result"]["kpoints"][0]["eigensolver"]["converged"]

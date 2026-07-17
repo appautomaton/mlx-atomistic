@@ -10,7 +10,11 @@ from mlx_atomistic.dft import (
     DiracExchange,
     GTHProjectorChannel,
     LDACorrelationPW92,
+    PeriodicDavidsonConfig,
+    PeriodicDFTSystem,
     PeriodicGTHNonlocalOperator,
+    PeriodicKohnShamOperator,
+    PeriodicSCFConfig,
     PlaneWaveBasis,
     ProductionPBEExchangeCorrelation,
     PseudopotentialData,
@@ -21,7 +25,10 @@ from mlx_atomistic.dft import (
     periodic_ewald_energy,
     periodic_ewald_forces,
     read_gth,
+    run_periodic_scf,
+    solve_periodic_eigenproblem,
 )
+from mlx_atomistic.dft.kpoints import KPoint, KPointMesh
 
 
 def test_plane_wave_basis_mask_and_metadata_are_deterministic():
@@ -290,3 +297,76 @@ def test_periodic_ewald_energy_translation_scaling_and_force_consistency():
     np.testing.assert_allclose(np.sum(forces, axis=0), 0.0, atol=2e-8)
     assert forces[0, 0] == pytest.approx(forces[0, 1], rel=2e-6)
     assert forces[0, 0] == pytest.approx(forces[0, 2], rel=2e-6)
+
+
+def test_periodic_davidson_matches_diagonal_kinetic_local_oracle():
+    grid = RealSpaceGrid((6, 6, 6), (6.0, 6.0, 6.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 3.0, (0.25, 0.0, 0.0))
+    constant = 0.7
+    operator = PeriodicKohnShamOperator(basis, mx.full(grid.shape, constant))
+
+    result = solve_periodic_eigenproblem(
+        operator,
+        n_bands=3,
+        config=PeriodicDavidsonConfig(
+            max_iterations=12,
+            tolerance=2e-5,
+            max_subspace_size=12,
+        ),
+    )
+    expected = np.sort(np.asarray(basis.kinetic_energies)[np.asarray(basis.mask)])[:3] + constant
+
+    assert result.converged
+    assert result.to_dict()["dense_full_hamiltonian"] is False
+    np.testing.assert_allclose(np.asarray(result.eigenvalues), expected, atol=3e-5)
+    assert result.orthonormality_error <= 2e-5
+
+
+def test_weighted_periodic_scf_conserves_electrons_without_dense_fallback():
+    pseudo = PseudopotentialData(
+        element="H",
+        format=PseudopotentialFormat.GTH,
+        valence_charge=1.0,
+        gth_rloc=0.25,
+        gth_coefficients=(-1.0,),
+        gth_channels=(GTHProjectorChannel(0, 0.3, ((0.5,),)),),
+    )
+    system = PeriodicDFTSystem(
+        (6.0, 6.0, 6.0),
+        (6, 6, 6),
+        ((2.0, 3.0, 3.0), (4.0, 3.0, 3.0)),
+        pseudo,
+    )
+    mesh = KPointMesh(
+        [
+            KPoint((-0.25, 0.0, 0.0), weight=0.5, coordinate_system="reduced"),
+            KPoint((0.25, 0.0, 0.0), weight=0.5, coordinate_system="reduced"),
+        ]
+    )
+    result = run_periodic_scf(
+        system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=mesh,
+        n_bands=1,
+        config=PeriodicSCFConfig(
+            max_iterations=6,
+            min_iterations=2,
+            density_tolerance=0.2,
+            energy_tolerance=0.1,
+            orbital_tolerance=2e-3,
+            mixing_beta=0.5,
+            mixer="linear",
+            davidson=PeriodicDavidsonConfig(
+                max_iterations=20,
+                tolerance=2e-3,
+                max_subspace_size=12,
+            ),
+        ),
+    )
+
+    assert result.converged
+    assert result.electron_count == pytest.approx(2.0, abs=2e-5)
+    assert len(result.kpoints) == 2
+    assert all(item.eigen.to_dict()["dense_full_hamiltonian"] is False for item in result.kpoints)
+    assert all(item.eigen.converged for item in result.kpoints)
+    assert np.isfinite(result.total_energy)
