@@ -9,7 +9,7 @@ from mlx_atomistic.dft.fft import (
     reciprocal_to_real,
 )
 from mlx_atomistic.dft.forces import SCFForceConsistencyResult, scf_total_energy_forces
-from mlx_atomistic.dft.gga import PBEExchangeCorrelation
+from mlx_atomistic.dft.gga import PBEExchangeCorrelation, ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.kpoints import (
     BandPath,
@@ -59,6 +59,7 @@ from mlx_atomistic.dft.optimization import (
     optimize_geometry,
     save_geometry_optimization,
 )
+from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
     electron_count,
@@ -98,6 +99,7 @@ from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_cen
 from mlx_atomistic.dft.xc import (
     DiracExchange,
     ExchangeCorrelationFunctional,
+    LDACorrelationPW92,
     LDACorrelationPZ81,
     LDAExchangeCorrelation,
     XCResult,
@@ -128,6 +130,7 @@ __all__ = [
     "KPointMesh",
     "KineticPreconditioner",
     "LDACorrelationPZ81",
+    "LDACorrelationPW92",
     "LDAExchangeCorrelation",
     "LinearMixer",
     "LocalGaussianPseudopotential",
@@ -138,6 +141,8 @@ __all__ = [
     "NonlocalProjectorData",
     "OccupationResult",
     "PBEExchangeCorrelation",
+    "PlaneWaveBasis",
+    "ProductionPBEExchangeCorrelation",
     "ProjectorSet",
     "PulayDIISMixer",
     "PseudopotentialData",

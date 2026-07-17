@@ -137,6 +137,80 @@ class LDACorrelationPZ81:
 
 
 @dataclass(frozen=True)
+class LDACorrelationPW92:
+    """Perdew-Wang 1992 unpolarized LDA correlation parameterization."""
+
+    name: str = "lda-correlation-pw92"
+    a: float = 0.0310907
+    alpha1: float = 0.21370
+    beta1: float = 7.5957
+    beta2: float = 3.5876
+    beta3: float = 1.6382
+    beta4: float = 0.49294
+
+    def correlation_per_particle(
+        self,
+        density: mx.array,
+        *,
+        density_floor: float = 1e-12,
+    ) -> mx.array:
+        """Return the PW92 correlation energy per electron.
+
+        Args:
+            density: Electron density ``rho``.
+            density_floor: Lower density clamp. Defaults to ``1e-12``.
+
+        Returns:
+            Correlation energy per electron in Hartree.
+        """
+
+        rho = mx.maximum(mx.array(density), density_floor)
+        rs = (3.0 / (4.0 * pi * rho)) ** (1.0 / 3.0)
+        denominator = 2.0 * self.a * (
+            self.beta1 * mx.sqrt(rs)
+            + self.beta2 * rs
+            + self.beta3 * rs ** 1.5
+            + self.beta4 * rs * rs
+        )
+        return -2.0 * self.a * (1.0 + self.alpha1 * rs) * mx.log1p(1.0 / denominator)
+
+    def evaluate(
+        self,
+        density: mx.array,
+        grid: RealSpaceGrid | None = None,
+        *,
+        density_floor: float = 1e-12,
+    ) -> XCResult:
+        """Evaluate PW92 energy density, potential, and total energy.
+
+        Args:
+            density: Electron density ``rho`` sampled on the grid.
+            grid: Real-space grid providing integration weight; ``None`` uses
+                unit weight. Defaults to ``None``.
+            density_floor: Lower density clamp. Defaults to ``1e-12``.
+
+        Returns:
+            PW92 correlation energy density, potential, and total energy.
+        """
+
+        rho = mx.maximum(mx.array(density), density_floor)
+        dv = 1.0 if grid is None else grid.dv
+
+        def total_energy(field: mx.array) -> mx.array:
+            safe = mx.maximum(field, density_floor)
+            return mx.sum(safe * self.correlation_per_particle(safe)) * dv
+
+        energy_density = rho * self.correlation_per_particle(rho)
+        potential = mx.grad(total_energy)(rho) / dv
+        return XCResult(
+            name=self.name,
+            energy_density=energy_density,
+            potential=potential,
+            total_energy=mx.sum(energy_density) * dv,
+        )
+
+
+@dataclass(frozen=True)
 class LDAExchangeCorrelation:
     """Combined Dirac exchange plus PZ81 LDA correlation."""
 

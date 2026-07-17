@@ -17,7 +17,7 @@ import mlx.core as mx
 
 from mlx_atomistic.dft.fft import fft3, ifft3
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
-from mlx_atomistic.dft.xc import LDACorrelationPZ81, XCResult
+from mlx_atomistic.dft.xc import LDACorrelationPW92, LDACorrelationPZ81, XCResult
 
 # PBE (Perdew-Burke-Ernzerhof 1996) gradient constants.
 _KAPPA = 0.804
@@ -124,6 +124,68 @@ class PBEExchangeCorrelation:
 
         potential = mx.grad(total_energy)(rho) / grid.dv
         energy_density = self._energy_density(rho, grid, density_floor)
+        return XCResult(
+            name=self.name,
+            energy_density=energy_density,
+            potential=potential,
+            total_energy=mx.sum(energy_density) * grid.dv,
+        )
+
+
+@dataclass(frozen=True)
+class ProductionPBEExchangeCorrelation:
+    """PBE GGA exchange-correlation with the PW92 uniform-gas baseline."""
+
+    name: str = "pbe-pw92-gga"
+
+    def _energy_density(
+        self, rho: mx.array, grid: RealSpaceGrid, density_floor: float
+    ) -> mx.array:
+        rho = mx.maximum(rho, density_floor)
+        gradient = density_gradient(rho, grid)
+        sigma = mx.sum(gradient * gradient, axis=0)
+        eps_c_unif = LDACorrelationPW92().correlation_per_particle(
+            rho,
+            density_floor=density_floor,
+        )
+        return _pbe_exchange_energy_density(rho, sigma) + _pbe_correlation_energy_density(
+            rho,
+            sigma,
+            eps_c_unif,
+        )
+
+    def evaluate(
+        self,
+        density: mx.array,
+        grid: RealSpaceGrid | None = None,
+        *,
+        density_floor: float = 1e-12,
+    ) -> XCResult:
+        """Evaluate production PBE energy density, potential, and total energy.
+
+        Args:
+            density: Electron density ``rho`` sampled on the grid.
+            grid: Real-space grid required for the GGA gradient. Defaults to
+                ``None``.
+            density_floor: Lower density clamp. Defaults to ``1e-12``.
+
+        Returns:
+            Production PBE energy density, potential, and total energy.
+
+        Raises:
+            ValueError: If no real-space grid is provided.
+        """
+
+        if grid is None:
+            msg = "production PBE requires a real-space grid"
+            raise ValueError(msg)
+        rho = mx.maximum(mx.array(density), density_floor)
+
+        def total_energy(field: mx.array) -> mx.array:
+            return mx.sum(self._energy_density(field, grid, density_floor)) * grid.dv
+
+        energy_density = self._energy_density(rho, grid, density_floor)
+        potential = mx.grad(total_energy)(rho) / grid.dv
         return XCResult(
             name=self.name,
             energy_density=energy_density,
