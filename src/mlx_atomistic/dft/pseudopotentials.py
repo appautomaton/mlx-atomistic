@@ -103,6 +103,48 @@ class NonlocalProjectorData:
 
 
 @dataclass(frozen=True)
+class GTHProjectorChannel:
+    """Complete GTH nonlocal channel with its symmetric coupling matrix."""
+
+    angular_momentum: int
+    radius: float
+    coupling_matrix: tuple[tuple[float, ...], ...]
+
+    def __init__(
+        self,
+        angular_momentum: int,
+        radius: float,
+        coupling_matrix: Sequence[Sequence[float]],
+    ):
+        if angular_momentum < 0:
+            msg = "GTH angular momentum must be non-negative"
+            raise ValueError(msg)
+        if radius <= 0.0:
+            msg = "GTH projector radius must be positive"
+            raise ValueError(msg)
+        matrix = np.asarray(coupling_matrix, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1]:
+            msg = "GTH coupling matrix must be non-empty and square"
+            raise ValueError(msg)
+        if not np.allclose(matrix, matrix.T, atol=1e-12, rtol=0.0):
+            msg = "GTH coupling matrix must be symmetric"
+            raise ValueError(msg)
+        object.__setattr__(self, "angular_momentum", int(angular_momentum))
+        object.__setattr__(self, "radius", float(radius))
+        object.__setattr__(
+            self,
+            "coupling_matrix",
+            tuple(tuple(float(value) for value in row) for row in matrix),
+        )
+
+    @property
+    def projector_count(self) -> int:
+        """Number of radial projectors in this channel."""
+
+        return len(self.coupling_matrix)
+
+
+@dataclass(frozen=True)
 class PseudopotentialData:
     """Parsed pseudopotential data used by ion-centered local fields."""
 
@@ -112,6 +154,7 @@ class PseudopotentialData:
     local_grid: RadialGrid | None = None
     gth_rloc: float | None = None
     gth_coefficients: tuple[float, ...] = ()
+    gth_channels: tuple[GTHProjectorChannel, ...] = ()
     nonlocal_projectors: tuple[NonlocalProjectorData, ...] = ()
     metadata: dict[str, str | int | float | bool] | None = None
 
@@ -119,7 +162,7 @@ class PseudopotentialData:
     def nonlocal_available(self) -> bool:
         """Whether the source file contained nonlocal projector metadata."""
 
-        return bool(self.nonlocal_projectors)
+        return bool(self.gth_channels or self.nonlocal_projectors)
 
     def local_potential(self, radius: np.ndarray) -> np.ndarray:
         """Evaluate the local potential in Hartree on radii in bohr."""
@@ -394,65 +437,37 @@ def read_gth(
     """Read a single GTH file or one entry from a CP2K-style GTH database."""
 
     path = Path(path_or_database)
-    lines = path.read_text().splitlines()
-    payload = _gth_entry_lines(lines, element=element, name=name)
-    if len(payload) < 4:
-        msg = "GTH entry is incomplete"
+    payload = _gth_payload(path.read_text().splitlines())
+    if not payload:
+        msg = "GTH source is empty"
         raise ValueError(msg)
-    title = payload[0].split()
     if payload[0].lower().startswith("goedecker"):
-        parsed_element = element or _element_from_filename(path)
-        parsed_name = path.name
-        cursor = 1
-    else:
-        parsed_element = title[0]
-        parsed_name = title[1] if len(title) > 1 else path.name
-        cursor = 1
-    charge_line = _numbers(payload[cursor])
-    cursor += 1
-    if payload[0].lower().startswith("goedecker"):
-        valence = float(charge_line[1])
-        cursor += 1  # psp metadata line
-    else:
-        valence = float(np.sum(charge_line))
-    local_parts = payload[cursor].split()
-    cursor += 1
-    if len(local_parts) < 3:
-        msg = "GTH local line is incomplete"
-        raise ValueError(msg)
-    rloc = float(local_parts[0])
-    n_local = int(local_parts[1])
-    coefficients = tuple(float(item) for item in local_parts[2 : 2 + n_local])
-    n_nonlocal = int(payload[cursor].split()[0])
-    cursor += 1
-    projectors = []
-    for angular in range(n_nonlocal):
-        if cursor >= len(payload):
-            msg = "GTH nonlocal projector block is incomplete"
-            raise ValueError(msg)
-        parts = payload[cursor].split()
-        cursor += 1
-        if len(parts) < 2:
-            msg = "GTH nonlocal projector line is incomplete"
-            raise ValueError(msg)
-        radius = float(parts[0])
-        n_projectors = int(parts[1])
-        coefficients_line = tuple(_leading_floats(parts[2:]))
-        projectors.append(
-            NonlocalProjectorData(
-                angular_momentum=angular,
-                cutoff_radius=radius,
-                coefficients=coefficients_line,
-                coupling=_first_nonzero(coefficients_line, default=1.0),
-                metadata={
-                    "source": "gth",
-                    "n_projectors": n_projectors,
-                },
-            )
+        parsed_element, parsed_name, valence, functional, rloc, coefficients, channels = (
+            _parse_standalone_gth(path, payload, element=element)
         )
+    else:
+        parsed_element, parsed_name, valence, functional, rloc, coefficients, channels = (
+            _parse_database_gth(payload, element=element, name=name)
+        )
+    projectors = tuple(
+        NonlocalProjectorData(
+            angular_momentum=channel.angular_momentum,
+            cutoff_radius=channel.radius,
+            coefficients=tuple(channel.coupling_matrix[index]),
+            coupling=float(channel.coupling_matrix[index][index]),
+            metadata={
+                "source": "gth",
+                "n_projectors": channel.projector_count,
+                "projector_index": index,
+            },
+        )
+        for channel in channels
+        for index in range(channel.projector_count)
+    )
     metadata: dict[str, str | int | float | bool] = {
         "source_path": str(path),
         "name": parsed_name,
+        "functional": functional,
         "nonlocal_applied": False,
     }
     return PseudopotentialData(
@@ -461,21 +476,129 @@ def read_gth(
         valence_charge=valence,
         gth_rloc=rloc,
         gth_coefficients=coefficients,
-        nonlocal_projectors=tuple(projectors),
+        gth_channels=channels,
+        nonlocal_projectors=projectors,
         metadata=metadata,
     )
 
 
-def _gth_entry_lines(
-    lines: Sequence[str],
+def _gth_payload(lines: Sequence[str]) -> list[str]:
+    return [
+        line
+        for raw in lines
+        if (line := raw.split("#", 1)[0].strip())
+    ]
+
+
+def _upper_matrix(
+    first_values: Sequence[float],
+    remaining_lines: Sequence[str],
+    count: int,
+) -> tuple[tuple[float, ...], ...]:
+    rows = [list(float(value) for value in first_values)]
+    rows.extend(_leading_floats(line.split()) for line in remaining_lines)
+    matrix = np.zeros((count, count), dtype=np.float64)
+    for row_index, values in enumerate(rows):
+        expected = count - row_index
+        if len(values) != expected:
+            msg = "GTH coupling matrix row length does not match projector count"
+            raise ValueError(msg)
+        matrix[row_index, row_index:] = values
+        matrix[row_index:, row_index] = values
+    return tuple(tuple(float(value) for value in row) for row in matrix)
+
+
+def _parse_channels(
+    payload: Sequence[str],
+    cursor: int,
+    count: int,
+    *,
+    standalone: bool,
+) -> tuple[tuple[GTHProjectorChannel, ...], int]:
+    channels: list[GTHProjectorChannel] = []
+    for angular in range(count):
+        if cursor >= len(payload):
+            msg = "GTH nonlocal projector block is incomplete"
+            raise ValueError(msg)
+        parts = payload[cursor].split()
+        cursor += 1
+        if len(parts) < 3:
+            msg = "GTH nonlocal projector line is incomplete"
+            raise ValueError(msg)
+        radius = float(parts[0])
+        projector_count = int(parts[1])
+        if projector_count <= 0:
+            msg = "GTH projector count must be positive"
+            raise ValueError(msg)
+        remaining = payload[cursor : cursor + projector_count - 1]
+        if len(remaining) != projector_count - 1:
+            msg = "GTH coupling matrix is incomplete"
+            raise ValueError(msg)
+        matrix = _upper_matrix(_leading_floats(parts[2:]), remaining, projector_count)
+        cursor += projector_count - 1
+        channels.append(GTHProjectorChannel(angular, radius, matrix))
+        if standalone and angular > 0:
+            # Standalone QE GTH files carry an additional spin-orbit coupling
+            # matrix after h_ij. The selected scalar-relativistic path records
+            # no spin-orbit operator, but the rows still have to be consumed.
+            cursor += projector_count
+            if cursor > len(payload):
+                msg = "GTH spin-orbit coupling matrix is incomplete"
+                raise ValueError(msg)
+    return tuple(channels), cursor
+
+
+def _parse_standalone_gth(
+    path: Path,
+    payload: Sequence[str],
+    *,
+    element: str | None,
+) -> tuple[str, str, float, str, float, tuple[float, ...], tuple[GTHProjectorChannel, ...]]:
+    if len(payload) < 5:
+        msg = "standalone GTH entry is incomplete"
+        raise ValueError(msg)
+    parsed_element = element or _element_from_filename(path)
+    charge_line = _numbers(payload[1])
+    if charge_line.size < 2:
+        msg = "standalone GTH charge line is incomplete"
+        raise ValueError(msg)
+    valence = float(charge_line[1])
+    metadata_parts = payload[2].split()
+    if len(metadata_parts) < 2:
+        msg = "standalone GTH metadata line is incomplete"
+        raise ValueError(msg)
+    functional = {
+        1: "PZ",
+        7: "PW",
+        11: "PBE",
+        18: "BLYP",
+        -101130: "PBE",
+    }.get(int(metadata_parts[1]), "unknown")
+    local_parts = payload[3].split()
+    local_count = int(local_parts[1])
+    coefficients = tuple(_leading_floats(local_parts[2:]))
+    if len(coefficients) != local_count:
+        msg = "GTH local coefficient count does not match its declaration"
+        raise ValueError(msg)
+    channel_count = int(payload[4].split()[0])
+    channels, _ = _parse_channels(payload, 5, channel_count, standalone=True)
+    return (
+        parsed_element,
+        path.name,
+        valence,
+        functional,
+        float(local_parts[0]),
+        coefficients,
+        channels,
+    )
+
+
+def _parse_database_gth(
+    payload: Sequence[str],
     *,
     element: str | None,
     name: str | None,
-) -> list[str]:
-    stripped = [line.split("#", 1)[0].rstrip() for line in lines]
-    payload = [line for line in stripped if line.strip()]
-    if payload and payload[0].lower().startswith("goedecker"):
-        return payload
+) -> tuple[str, str, float, str, float, tuple[float, ...], tuple[GTHProjectorChannel, ...]]:
     if element is None and name is None:
         msg = "element or name is required when reading a GTH database"
         raise ValueError(msg)
@@ -487,10 +610,39 @@ def _gth_entry_lines(
             continue
         if name is not None and name not in parts[1:]:
             continue
-        if index + 4 >= len(payload):
-            break
-        n_nonlocal = int(payload[index + 3].split()[0])
-        return payload[index : index + 4 + n_nonlocal]
+        cursor = index + 1
+        charge_shells = tuple(int(value) for value in payload[cursor].split())
+        cursor += 1
+        local_parts = payload[cursor].split()
+        cursor += 1
+        local_count = int(local_parts[1])
+        coefficients = tuple(float(value) for value in local_parts[2:])
+        if len(coefficients) != local_count:
+            msg = "GTH local coefficient count does not match its declaration"
+            raise ValueError(msg)
+        channel_count = int(payload[cursor].split()[0])
+        cursor += 1
+        channels, _ = _parse_channels(payload, cursor, channel_count, standalone=False)
+        selected_name = name or (parts[1] if len(parts) > 1 else "unknown")
+        upper_name = selected_name.upper()
+        functional = (
+            "PBE"
+            if "PBE" in upper_name
+            else "BLYP"
+            if "BLYP" in upper_name
+            else "PW"
+            if "PADE" in upper_name or "LDA" in upper_name
+            else "unknown"
+        )
+        return (
+            parts[0],
+            selected_name,
+            float(sum(charge_shells)),
+            functional,
+            float(local_parts[0]),
+            coefficients,
+            channels,
+        )
     msg = "requested GTH entry was not found"
     raise ValueError(msg)
 

@@ -59,6 +59,13 @@ from mlx_atomistic.dft.optimization import (
     optimize_geometry,
     save_geometry_optimization,
 )
+from mlx_atomistic.dft.periodic_gth import (
+    PeriodicGTHNonlocalOperator,
+    gth_local_potential_grid,
+    gth_local_reciprocal_coefficients,
+    periodic_ewald_energy,
+    periodic_ewald_forces,
+)
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
@@ -69,6 +76,7 @@ from mlx_atomistic.dft.potentials import (
     local_pseudopotential_forces,
 )
 from mlx_atomistic.dft.pseudopotentials import (
+    GTHProjectorChannel,
     Ion,
     IonCollection,
     LocalPseudopotentialField,
@@ -124,6 +132,7 @@ __all__ = [
     "GeometryOptimizationRecord",
     "GeometryOptimizationResult",
     "GeometryOptimizationStep",
+    "GTHProjectorChannel",
     "Ion",
     "IonCollection",
     "KPoint",
@@ -141,6 +150,7 @@ __all__ = [
     "NonlocalProjectorData",
     "OccupationResult",
     "PBEExchangeCorrelation",
+    "PeriodicGTHNonlocalOperator",
     "PlaneWaveBasis",
     "ProductionPBEExchangeCorrelation",
     "ProjectorSet",
@@ -175,6 +185,8 @@ __all__ = [
     "fft_backend",
     "finite_difference_stress",
     "geometry_demo_system",
+    "gth_local_potential_grid",
+    "gth_local_reciprocal_coefficients",
     "get_dft_qm_scope_report",
     "hartree_potential",
     "ifft3",
@@ -188,6 +200,8 @@ __all__ = [
     "optimize_geometry",
     "orbital_residuals",
     "orthonormality_error",
+    "periodic_ewald_energy",
+    "periodic_ewald_forces",
     "real_to_reciprocal",
     "reciprocal_to_real",
     "read_gth",

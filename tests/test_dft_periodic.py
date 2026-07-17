@@ -8,10 +8,19 @@ import pytest
 
 from mlx_atomistic.dft import (
     DiracExchange,
+    GTHProjectorChannel,
     LDACorrelationPW92,
+    PeriodicGTHNonlocalOperator,
     PlaneWaveBasis,
     ProductionPBEExchangeCorrelation,
+    PseudopotentialData,
+    PseudopotentialFormat,
     RealSpaceGrid,
+    gth_local_potential_grid,
+    gth_local_reciprocal_coefficients,
+    periodic_ewald_energy,
+    periodic_ewald_forces,
+    read_gth,
 )
 
 
@@ -126,3 +135,158 @@ def test_production_pbe_potential_matches_total_energy_finite_difference():
     finite_difference = (e_plus - e_minus) / (2.0 * step * grid.dv)
 
     assert float(result.potential[index]) == pytest.approx(finite_difference, abs=2e-3)
+
+
+def _silicon_gth() -> PseudopotentialData:
+    return PseudopotentialData(
+        element="Si",
+        format=PseudopotentialFormat.GTH,
+        valence_charge=4.0,
+        gth_rloc=0.44,
+        gth_coefficients=(-6.26928833,),
+        gth_channels=(
+            GTHProjectorChannel(
+                0,
+                0.43563383,
+                ((8.9517415, -2.70627082), (-2.70627082, 3.4937806)),
+            ),
+            GTHProjectorChannel(1, 0.49794218, ((2.43127673,),)),
+        ),
+    )
+
+
+def test_gth_channel_validation_and_standalone_parser_preserve_full_matrices(tmp_path):
+    path = tmp_path / "Si-q4-pbe.gth"
+    path.write_text(
+        """Goedecker pseudopotential for Si
+14 4 260716 zatom,zion,pspdat
+10 11 1 2 2001 0 pspcod,pspxc,lmax,lloc,mmax,r2well
+0.44 1 -6.26928833
+2
+0.43563383 2 8.9517415 -2.70627082
+3.4937806
+0.49794218 1 2.43127673
+0
+"""
+    )
+
+    parsed = read_gth(path, element="Si")
+
+    assert parsed.metadata["functional"] == "PBE"
+    assert parsed.gth_channels == _silicon_gth().gth_channels
+    assert len(parsed.nonlocal_projectors) == 3
+    with pytest.raises(ValueError, match="symmetric"):
+        GTHProjectorChannel(0, 0.4, ((1.0, 2.0), (0.0, 1.0)))
+
+
+def test_gth_local_reciprocal_formula_and_grid_are_real():
+    grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+    basis = PlaneWaveBasis(grid, 4.0)
+    pseudo = _silicon_gth()
+    position = ((1.0, 2.0, 3.0),)
+
+    coefficients = np.asarray(gth_local_reciprocal_coefficients(pseudo, basis, position))
+    potential = np.asarray(gth_local_potential_grid(pseudo, basis, position))
+    rloc = 0.44
+    c1 = -6.26928833
+    expected_zero = (
+        2.0 * pi * rloc**2 * 4.0 + (2.0 * pi) ** 1.5 * rloc**3 * c1
+    ) / grid.volume
+    g = 2.0 * pi / 8.0
+    rq2 = g * g * rloc * rloc
+    expected_g = (
+        4.0
+        * pi
+        * np.exp(-0.5 * rq2)
+        * (-4.0 / (g * g) + np.sqrt(pi / 2.0) * rloc**3 * c1)
+        / grid.volume
+        * np.exp(-1j * g * position[0][0])
+    )
+
+    assert coefficients[0, 0, 0].real == pytest.approx(expected_zero, rel=1e-6)
+    assert coefficients[1, 0, 0] == pytest.approx(expected_g, rel=2e-6)
+    assert np.max(np.abs(np.imag(np.fft.ifftn(coefficients) * grid.size))) < 2e-6
+    assert np.isfinite(potential).all()
+
+
+def test_periodic_gth_nonlocal_operator_is_hermitian_at_non_gamma_kpoint():
+    grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 4.0, (0.25, 0.25, -0.25))
+    operator = PeriodicGTHNonlocalOperator(_silicon_gth(), basis, ((1.0, 2.0, 3.0),))
+    rng = np.random.default_rng(44)
+    left = basis.normalize(
+        mx.array(
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
+                np.complex64
+            )
+        )
+    )
+    right = basis.normalize(
+        mx.array(
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
+                np.complex64
+            )
+        )
+    )
+
+    left_right = mx.sum(mx.conjugate(left) * operator.apply(right))
+    right_left = mx.sum(mx.conjugate(right) * operator.apply(left))
+
+    left_right_value = np.asarray(left_right).item()
+    right_left_value = np.asarray(mx.conjugate(right_left)).item()
+    assert left_right_value == pytest.approx(right_left_value, abs=2e-5)
+    assert abs(float(operator.energy(mx.stack([left, right]), occupations=[1.0, 0.5]))) > 0.0
+    assert operator.to_dict()["angular_projector_count_per_ion"] == 5
+
+
+def test_periodic_gth_nonlocal_operator_is_cell_translation_invariant():
+    grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 4.0, (0.25, 0.0, 0.0))
+    rng = np.random.default_rng(10)
+    orbital = basis.normalize(
+        mx.array(
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
+                np.complex64
+            )
+        )
+    )
+    first = PeriodicGTHNonlocalOperator(_silicon_gth(), basis, ((1.0, 2.0, 3.0),))
+    shifted = PeriodicGTHNonlocalOperator(_silicon_gth(), basis, ((9.0, 2.0, 3.0),))
+
+    first_energy = float(first.energy(orbital, occupations=[1.0]))
+    shifted_energy = float(shifted.energy(orbital, occupations=[1.0]))
+
+    assert shifted_energy == pytest.approx(first_energy, abs=2e-5)
+
+
+def test_periodic_ewald_energy_translation_scaling_and_force_consistency():
+    charges = [1.0, -1.0]
+    positions = np.array([[1.0, 1.0, 1.0], [3.0, 3.0, 3.0]])
+    lengths = np.array([6.0, 6.0, 6.0])
+    energy = periodic_ewald_energy(charges, positions, lengths, tolerance=1e-8)
+    translated = periodic_ewald_energy(
+        charges,
+        positions + np.array([6.0, 0.0, 0.0]),
+        lengths,
+        tolerance=1e-8,
+    )
+    scaled = periodic_ewald_energy(
+        charges,
+        2.0 * positions,
+        2.0 * lengths,
+        tolerance=1e-8,
+    )
+    forces = periodic_ewald_forces(
+        charges,
+        positions,
+        lengths,
+        displacement=2e-4,
+        tolerance=1e-8,
+    )
+
+    assert np.isfinite(energy)
+    assert translated == pytest.approx(energy, abs=2e-9)
+    assert scaled == pytest.approx(0.5 * energy, rel=2e-6)
+    np.testing.assert_allclose(np.sum(forces, axis=0), 0.0, atol=2e-8)
+    assert forces[0, 0] == pytest.approx(forces[0, 1], rel=2e-6)
+    assert forces[0, 0] == pytest.approx(forces[0, 2], rel=2e-6)
