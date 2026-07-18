@@ -94,7 +94,13 @@ P GTH-PBE-q5 GTH-PBE
     return path
 
 
-def _host_outputs(*, source: str = "AC Power", ac_mode: int = 1, battery_mode: int = 1):
+def _host_outputs(
+    *,
+    source: str = "AC Power",
+    ac_mode: int = 1,
+    battery_mode: int = 1,
+    mode_key: str = "lowpowermode",
+):
     return {
         ("system_profiler", "SPHardwareDataType"): {
             "status": "ok",
@@ -117,8 +123,8 @@ def _host_outputs(*, source: str = "AC Power", ac_mode: int = 1, battery_mode: i
         ("pmset", "-g", "custom"): {
             "status": "ok",
             "stdout": (
-                f"Battery Power:\n lowpowermode {battery_mode}\n sleep 1\n"
-                f"AC Power:\n lowpowermode {ac_mode}\n sleep 0\n"
+                f"Battery Power:\n {mode_key} {battery_mode}\n sleep 1\n"
+                f"AC Power:\n {mode_key} {ac_mode}\n sleep 0\n"
             ),
         },
         ("sysctl", "-n", "kern.thermal_pressure"): {
@@ -156,6 +162,13 @@ def _fake_fixed_report(
         "runtime_fingerprint": runtime,
         "execution_contract_fingerprint": runtime,
     }
+    host = {
+        "chip": TARGET_CHIP,
+        "power_source": power_source,
+        "active_power_profile": {"lowpowermode": 1},
+        "power_mode_key": "lowpowermode",
+        "low_power_mode": 1,
+    }
     comparison_protocol = {
         "workload_fingerprint": "w" * 64,
         "selected_gth_resource": {
@@ -164,9 +177,7 @@ def _fake_fixed_report(
             "sha256": "g" * 64,
         },
         "protocol_fingerprint": protocol,
-        "chip": TARGET_CHIP,
-        "power_source": power_source,
-        "low_power_mode": 1,
+        **runtime_core._host_protocol(host),
     }
     run_protocol = {
         "warmups": 1,
@@ -187,11 +198,7 @@ def _fake_fixed_report(
             "kind": "fixed-density",
             "identity": identity,
             "context": {"git": {"revision": revision, "dirty": dirty}},
-            "host": {
-                "chip": TARGET_CHIP,
-                "power_source": power_source,
-                "low_power_mode": 1,
-            },
+            "host": host,
             "comparison_protocol": comparison_protocol,
             "run_protocol": run_protocol,
             "samples": [{} for _ in range(5)],
@@ -205,7 +212,7 @@ def _fake_fixed_report(
                 producer_git={"revision": revision, "dirty": dirty},
                 run_protocol=run_protocol,
                 report_kind="fixed-density",
-                host_protocol=comparison_protocol,
+                host_protocol=host,
             ),
         }
     )
@@ -224,9 +231,16 @@ def _fake_baseline_seal(
     protocol: str,
     runtime: str,
     revision: str,
+    base_revision: str = PRE_ARCHITECTURE_REV,
+    parent_revision: str | None = None,
     extra: dict[str, object] | None = None,
 ) -> tuple[Path, str]:
     values = dict(extra or {})
+    parent = (
+        runtime_core.BASELINE_EXPECTED_PARENT_REV
+        if parent_revision is None
+        else parent_revision
+    )
     workload_fingerprint = str(values.get("workload_fingerprint", "w" * 64))
     identity = {
         "workload_fingerprint": workload_fingerprint,
@@ -242,13 +256,19 @@ def _fake_baseline_seal(
             "sha256": "g" * 64,
         },
     )
-    host_protocol = values.get(
-        "host_protocol",
+    host = values.get(
+        "host",
         {
             "chip": TARGET_CHIP,
             "power_source": "AC Power",
+            "active_power_profile": {"lowpowermode": 1},
+            "power_mode_key": "lowpowermode",
             "low_power_mode": 1,
         },
+    )
+    sealed_host_protocol = values.get(
+        "host_protocol",
+        runtime_core._host_protocol(host),
     )
     comparison_protocol = values.get(
         "comparison_protocol",
@@ -256,7 +276,7 @@ def _fake_baseline_seal(
             "workload_fingerprint": workload_fingerprint,
             "selected_gth_resource": selected_resource,
             "protocol_fingerprint": protocol,
-            **host_protocol,
+            **runtime_core._host_protocol(host),
         },
     )
     run_protocol = {
@@ -278,7 +298,7 @@ def _fake_baseline_seal(
         producer_git={"revision": revision, "dirty": False},
         run_protocol=run_protocol,
         report_kind="fixed-density",
-        host_protocol=comparison_protocol,
+        host_protocol=host,
     )
     median_elapsed = values.get("median_elapsed_seconds", 8.0)
     raw_elapsed = values.get("raw_elapsed_seconds", [median_elapsed] * 5)
@@ -300,7 +320,32 @@ def _fake_baseline_seal(
     )
     baseline_diff_audit = values.get(
         "baseline_diff_audit",
-        {"passed": True},
+        {
+            "base_revision": base_revision,
+            "baseline_revision": revision,
+            "baseline_parent_revision": parent,
+            "checks": {
+                "git_commands_succeeded": True,
+                "pre_architecture_revision_is_ancestor": True,
+                "baseline_history_has_no_merge_commits": True,
+                "baseline_parent_is_reviewed_slice1_revision": True,
+                "baseline_revision_is_distinct": True,
+                "diff_is_nonempty": True,
+                "diff_paths_are_allowed": True,
+                "diff_records_are_parseable_regular_files": True,
+            },
+            "allowed_paths": sorted(runtime_core.BASELINE_ALLOWED_DIFF_PATHS),
+            "changed_files": [
+                {
+                    "status": "M",
+                    "path": sorted(runtime_core.BASELINE_ALLOWED_DIFF_PATHS)[0],
+                    "byte_size": 1,
+                    "sha256": "d" * 64,
+                }
+            ],
+            "patch_sha256": "c" * 64,
+            "passed": True,
+        },
     )
     report = _finalize_report(
         {
@@ -312,11 +357,11 @@ def _fake_baseline_seal(
                 "runtime_inventory": [],
                 "git": {
                     "revision": revision,
-                    "parent": PRE_ARCHITECTURE_REV,
+                    "parent": parent,
                     "dirty": False,
                 }
             },
-            "host": host_protocol,
+            "host": host,
             "comparison_protocol": comparison_protocol,
             "run_protocol": run_protocol,
             "warmup_results": [{}],
@@ -341,7 +386,8 @@ def _fake_baseline_seal(
     unsigned = {
         "schema_version": runtime_core.SEAL_SCHEMA,
         "baseline_rev": revision,
-        "parent_rev": PRE_ARCHITECTURE_REV,
+        "base_rev": base_revision,
+        "parent_rev": parent,
         "dirty": False,
         "workload_fingerprint": workload_fingerprint,
         "selected_gth_resource": selected_resource,
@@ -350,7 +396,7 @@ def _fake_baseline_seal(
         "baseline_runtime_fingerprint": runtime,
         "baseline_runtime_inventory": [],
         "comparison_protocol": comparison_protocol,
-        "host_protocol": runtime_core._host_protocol(host_protocol),
+        "host_protocol": sealed_host_protocol,
         "median_elapsed_seconds": median_elapsed,
         "raw_elapsed_seconds": raw_elapsed,
         "representative_observation": representative_observation,
@@ -714,6 +760,65 @@ def test_report_loader_rejects_mismatched_generation_envelope(
         runtime_core._load_report(destination)
 
 
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    (
+        ("low_power_mode", None),
+        ("low_power_mode", 0),
+        ("power_mode_key", "lowpowermode"),
+    ),
+)
+def test_report_loader_rejects_laundered_raw_host_normalization(
+    tmp_path, field, forged
+):
+    identity = {
+        "workload_fingerprint": "w" * 64,
+        "protocol_fingerprint": "p" * 64,
+        "runtime_fingerprint": "r" * 64,
+        "execution_contract_fingerprint": "e" * 64,
+    }
+    host = {
+        "chip": TARGET_CHIP,
+        "power_source": "AC Power",
+        "active_power_profile": {"powermode": 1},
+        "power_mode_key": "powermode",
+        "low_power_mode": 1,
+    }
+    host[field] = forged
+    report = _finalize_report(
+        {
+            "schema_version": runtime_core.REPORT_SCHEMA,
+            "kind": "fixed-density",
+            "identity": identity,
+            "context": {"git": {"dirty": False}},
+            "host": host,
+            "run_protocol": {
+                "warmups": 1,
+                "samples": 5,
+                "fresh": True,
+                "resumed": False,
+                "diagnostic": False,
+            },
+            "statuses": {
+                "numerical_status": "passed",
+                "resume_integrity_status": "fresh-no-resume",
+                "timing_admission_status": "admitted",
+            },
+            "admission": {"passed": True, "blockers": []},
+            "formal_admission": {"passed": True, "blockers": []},
+        }
+    )
+    destination = tmp_path / f"laundered-host-{field}-{forged!s}"
+    _publish_report(
+        out=destination,
+        artifact_kind="dft-runtime-fixed-density",
+        artifact_schema=runtime_core.REPORT_SCHEMA,
+        report=report,
+    )
+    with pytest.raises(ValueError, match="formal admission is inconsistent"):
+        runtime_core._load_report(destination)
+
+
 def test_baseline_seal_requires_bound_report_and_generation_envelope(tmp_path):
     valid, _fingerprint = _fake_baseline_seal(
         tmp_path / "valid-seal",
@@ -833,6 +938,7 @@ def test_baseline_diff_audit_fails_closed_for_git_and_structure_drift(
     git(root, "add", "allowed.py")
     git(root, "commit", "-qm", "allowed change")
     monkeypatch.setattr(runtime_core, "PRE_ARCHITECTURE_REV", base)
+    monkeypatch.setattr(runtime_core, "BASELINE_EXPECTED_PARENT_REV", base)
     monkeypatch.setattr(
         runtime_core,
         "BASELINE_ALLOWED_DIFF_PATHS",
@@ -840,6 +946,15 @@ def test_baseline_diff_audit_fails_closed_for_git_and_structure_drift(
     )
     admitted = runtime_core._baseline_diff_audit(root)
     assert admitted["passed"] is True
+    admitted_git = {
+        "revision": admitted["baseline_revision"],
+        "parent": admitted["baseline_parent_revision"],
+    }
+    assert runtime_core._baseline_diff_audit_matches(admitted, admitted_git) is True
+    assert runtime_core._baseline_diff_audit_matches(
+        {"passed": True, "checks": {"made_up": True}},
+        admitted_git,
+    ) is False
     assert admitted["patch_sha256"] == runtime_core._baseline_diff_audit(root)[
         "patch_sha256"
     ]
@@ -853,6 +968,7 @@ def test_baseline_diff_audit_fails_closed_for_git_and_structure_drift(
     git(renamed_root, "mv", "allowed.py", "renamed.py")
     git(renamed_root, "commit", "-qm", "rename")
     monkeypatch.setattr(runtime_core, "PRE_ARCHITECTURE_REV", renamed_base)
+    monkeypatch.setattr(runtime_core, "BASELINE_EXPECTED_PARENT_REV", renamed_base)
     monkeypatch.setattr(
         runtime_core,
         "BASELINE_ALLOWED_DIFF_PATHS",
@@ -862,20 +978,49 @@ def test_baseline_diff_audit_fails_closed_for_git_and_structure_drift(
     assert renamed["passed"] is False
     assert renamed["checks"]["diff_records_are_parseable_regular_files"] is False
 
-    parent_root, parent_base = repository("wrong-parent")
+    parent_root, parent_base = repository("additive-gap-fix")
     (parent_root / "allowed.py").write_text("VALUE = 2\n")
     git(parent_root, "add", "allowed.py")
     git(parent_root, "commit", "-qm", "middle")
+    middle_revision = git(parent_root, "rev-parse", "HEAD")
     (parent_root / "allowed.py").write_text("VALUE = 3\n")
     git(parent_root, "add", "allowed.py")
     git(parent_root, "commit", "-qm", "final")
     monkeypatch.setattr(runtime_core, "PRE_ARCHITECTURE_REV", parent_base)
-    wrong_parent = runtime_core._baseline_diff_audit(parent_root)
-    assert wrong_parent["passed"] is False
-    assert wrong_parent["checks"]["direct_parent_is_pre_architecture_revision"] is False
+    monkeypatch.setattr(
+        runtime_core,
+        "BASELINE_EXPECTED_PARENT_REV",
+        middle_revision,
+    )
+    additive = runtime_core._baseline_diff_audit(parent_root)
+    assert additive["passed"] is True
+    assert additive["baseline_parent_revision"] == middle_revision
+    assert additive["checks"]["pre_architecture_revision_is_ancestor"] is True
+
+    sibling_root, sibling_base = repository("sibling-root")
+    main_branch = git(sibling_root, "branch", "--show-current")
+    git(sibling_root, "checkout", "-qb", "sibling", sibling_base)
+    (sibling_root / "allowed.py").write_text("VALUE = 20\n")
+    git(sibling_root, "add", "allowed.py")
+    git(sibling_root, "commit", "-qm", "sibling")
+    sibling_revision = git(sibling_root, "rev-parse", "HEAD")
+    git(sibling_root, "checkout", "-q", main_branch)
+    (sibling_root / "allowed.py").write_text("VALUE = 2\n")
+    git(sibling_root, "add", "allowed.py")
+    git(sibling_root, "commit", "-qm", "main")
+    monkeypatch.setattr(runtime_core, "PRE_ARCHITECTURE_REV", sibling_revision)
+    monkeypatch.setattr(
+        runtime_core,
+        "BASELINE_EXPECTED_PARENT_REV",
+        git(sibling_root, "rev-parse", "HEAD^"),
+    )
+    sibling = runtime_core._baseline_diff_audit(sibling_root)
+    assert sibling["passed"] is False
+    assert sibling["checks"]["pre_architecture_revision_is_ancestor"] is False
 
     empty_root, empty_base = repository("empty")
     monkeypatch.setattr(runtime_core, "PRE_ARCHITECTURE_REV", empty_base)
+    monkeypatch.setattr(runtime_core, "BASELINE_EXPECTED_PARENT_REV", None)
     empty = runtime_core._baseline_diff_audit(empty_root)
     assert empty["passed"] is False
     assert empty["checks"]["diff_is_nonempty"] is False
@@ -1515,10 +1660,19 @@ def test_cli_publishes_structured_failure_for_operational_setup_error(
 
 
 @pytest.mark.parametrize("source", ["AC Power", "Battery Power"])
-def test_host_admission_accepts_either_source_at_active_low_power(source):
+@pytest.mark.parametrize("mode_key", ["lowpowermode", "powermode"])
+def test_host_admission_accepts_either_source_at_active_low_power(source, mode_key):
     calls = []
     provenance = collect_host_provenance(
-        _runner(_host_outputs(source=source, ac_mode=1, battery_mode=1), calls)
+        _runner(
+            _host_outputs(
+                source=source,
+                ac_mode=1,
+                battery_mode=1,
+                mode_key=mode_key,
+            ),
+            calls,
+        )
     )
     admission = host_admission(
         provenance,
@@ -1527,6 +1681,7 @@ def test_host_admission_accepts_either_source_at_active_low_power(source):
     )
     assert admission == {"admitted": True, "blockers": []}
     assert provenance["power_source"] == source
+    assert provenance["power_mode_key"] == mode_key
     assert provenance["low_power_mode"] == 1
     assert provenance["inspection_policy"] == "read-only-getters-only"
     assert set(calls) == set(contract.READ_ONLY_HOST_COMMANDS)
@@ -1538,7 +1693,7 @@ def test_host_admission_selects_only_current_profile_and_fails_closed():
     battery = collect_host_provenance(
         _runner(_host_outputs(source="Battery Power", ac_mode=1, battery_mode=0), calls)
     )
-    assert "active_lowpowermode_not_one" in host_admission(
+    assert "active_power_mode_not_one" in host_admission(
         battery,
         required_chip=TARGET_CHIP,
         require_low_power=True,
@@ -1554,10 +1709,196 @@ def test_host_admission_selects_only_current_profile_and_fails_closed():
     assert parse_power_profiles("AC Power:\n lowpowermode 1\n")["AC Power"] == {
         "lowpowermode": 1
     }
+    assert parse_power_profiles("AC Power:\n powermode 1\n")["AC Power"] == {
+        "powermode": 1
+    }
     with pytest.raises(ValueError):
         parse_current_power_source("unknown")
     with pytest.raises(ValueError):
         parse_power_profiles("AC Power:\n lowpowermode nope\n")
+    with pytest.raises(ValueError):
+        parse_power_profiles("AC Power:\n powermode nope\n")
+
+
+def test_host_admission_rejects_missing_or_conflicting_power_mode_keys():
+    missing = {
+        "chip": TARGET_CHIP,
+        "power_source": "AC Power",
+        "active_power_profile": {"sleep": 0},
+        "blockers": [],
+    }
+    assert "active_power_mode_missing" in host_admission(
+        missing,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["blockers"]
+    conflicting = {
+        **missing,
+        "active_power_profile": {"lowpowermode": 1, "powermode": 0},
+    }
+    assert "active_power_mode_conflict" in host_admission(
+        conflicting,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["blockers"]
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    (
+        ("low_power_mode", None),
+        ("low_power_mode", 0),
+        ("low_power_mode", True),
+        ("power_mode_key", None),
+        ("power_mode_key", "lowpowermode"),
+    ),
+)
+def test_host_power_mode_declared_normalization_mismatch_blocks_formal_admission(
+    field, forged
+):
+    provenance = collect_host_provenance(
+        _runner(_host_outputs(mode_key="powermode"), [])
+    )
+    provenance[field] = forged
+    admission = host_admission(
+        provenance,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )
+    assert "active_power_mode_normalization_mismatch" in admission["blockers"]
+
+    formal = _formal_admission(
+        statuses={
+            "numerical_status": "passed",
+            "resume_integrity_status": "fresh-no-resume",
+            "timing_admission_status": "admitted",
+        },
+        command_admission={"passed": True, "blockers": []},
+        producer_git={"dirty": False},
+        run_protocol={
+            "warmups": 1,
+            "samples": 5,
+            "fresh": True,
+            "resumed": False,
+            "diagnostic": False,
+        },
+        report_kind="fixed-density",
+        host_protocol=provenance,
+    )
+    assert formal["passed"] is False
+    assert "formal_target_host_low_power_mismatch" in formal["blockers"]
+
+
+def test_host_power_mode_uses_only_active_source_and_alias_is_not_identity():
+    legacy_calls = []
+    current_calls = []
+    legacy_outputs = _host_outputs(mode_key="lowpowermode")
+    current_outputs = _host_outputs(mode_key="powermode")
+    current_outputs[("pmset", "-g", "custom")]["stdout"] = (
+        "Battery Power:\n lowpowermode 0\n sleep 1\n"
+        "AC Power:\n powermode 1\n sleep 0\n"
+    )
+    legacy = collect_host_provenance(_runner(legacy_outputs, legacy_calls))
+    current = collect_host_provenance(_runner(current_outputs, current_calls))
+    assert current["active_power_profile"] == {"powermode": 1, "sleep": 0}
+    assert current["power_mode_key"] == "powermode"
+    assert host_admission(
+        current,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["admitted"] is True
+    assert runtime_core._host_protocol(legacy) == runtime_core._host_protocol(current)
+    manifest = {
+        "workload_fingerprint": "w" * 64,
+        "resources": [{"role": "gth"}],
+        "solver": {},
+        "initialization": {},
+        "measurement": {"synchronization": "synchronized"},
+    }
+    context = {
+        "protocol_fingerprint": "p" * 64,
+        "execution_contract": {
+            "lock": {"sha256": "l" * 64},
+            "environment": {
+                "python_version": "3.13",
+                "mlx_version": "test",
+                "precision": "complex64/float32",
+                "selected_device": "Device(gpu, 0)",
+            },
+        },
+    }
+    assert runtime_core._comparison_protocol(
+        manifest, context, legacy
+    ) == runtime_core._comparison_protocol(manifest, context, current)
+
+
+@pytest.mark.parametrize(
+    "custom",
+    (
+        "AC Power:\n lowpowermode 1\n powermode 0\n",
+        "AC Power:\n powermode 0\n lowpowermode 1\n",
+    ),
+)
+def test_host_power_mode_conflict_from_pmset_fails_closed(custom):
+    outputs = _host_outputs()
+    outputs[("pmset", "-g", "custom")]["stdout"] = custom
+    provenance = collect_host_provenance(_runner(outputs, []))
+    assert provenance["low_power_mode"] is None
+    assert provenance["power_mode_key"] is None
+    assert "active_power_mode_conflict" in provenance["blockers"]
+    assert host_admission(
+        provenance,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["admitted"] is False
+
+
+@pytest.mark.parametrize(
+    ("custom", "expected_blocker"),
+    (
+        ("AC Power:\n sleep 0\n", "active_power_mode_missing"),
+        ("AC Power:\n lowpowermode 0\n", "active_power_mode_not_one"),
+        ("AC Power:\n powermode 0\n", "active_power_mode_not_one"),
+        ("AC Power:\n powermode 2\n", "active_power_mode_not_one"),
+    ),
+)
+def test_host_power_mode_missing_or_non_low_fails_closed(custom, expected_blocker):
+    outputs = _host_outputs()
+    outputs[("pmset", "-g", "custom")]["stdout"] = custom
+    provenance = collect_host_provenance(_runner(outputs, []))
+    assert expected_blocker in host_admission(
+        provenance,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["blockers"]
+
+
+def test_host_power_mode_equal_dual_aliases_are_unambiguous():
+    outputs = _host_outputs()
+    outputs[("pmset", "-g", "custom")]["stdout"] = (
+        "AC Power:\n lowpowermode 1\n powermode 1\n"
+    )
+    provenance = collect_host_provenance(_runner(outputs, []))
+    assert provenance["power_mode_key"] == "lowpowermode+powermode"
+    assert provenance["low_power_mode"] == 1
+    assert host_admission(
+        provenance,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["admitted"] is True
+
+
+def test_host_power_mode_malformed_current_key_is_unparsed():
+    outputs = _host_outputs()
+    outputs[("pmset", "-g", "custom")]["stdout"] = "AC Power:\n powermode nope\n"
+    provenance = collect_host_provenance(_runner(outputs, []))
+    assert provenance["low_power_mode"] is None
+    assert "power_profiles_unparsed" in provenance["blockers"]
+    assert host_admission(
+        provenance,
+        required_chip=TARGET_CHIP,
+        require_low_power=True,
+    )["admitted"] is False
 
 
 def test_compare_allows_runtime_drift_but_rejects_power_source_mismatch(
@@ -1572,6 +1913,7 @@ def test_compare_allows_runtime_drift_but_rejects_power_source_mismatch(
         protocol=protocol,
         runtime="b" * 64,
         revision=baseline_revision,
+        parent_revision=runtime_core.BASELINE_EXPECTED_PARENT_REV,
     )
     monkeypatch.setattr(
         runtime_core,
@@ -1763,6 +2105,7 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
         "macos": {"ProductVersion": "26.5.2"},
         "power_source": "Battery Power",
         "active_power_profile": {"lowpowermode": 1},
+        "power_mode_key": "lowpowermode",
         "low_power_mode": 1,
         "blockers": [],
     }
@@ -1783,7 +2126,7 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
         "runtime_fingerprint": "r" * 64,
         "git": {
             "revision": "b" * 40,
-            "parent": PRE_ARCHITECTURE_REV,
+            "parent": runtime_core.BASELINE_EXPECTED_PARENT_REV,
             "dirty": False,
         },
     }
@@ -1818,15 +2161,37 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
     monkeypatch.setattr(runtime_core, "collect_host_provenance", lambda: host)
     monkeypatch.setattr(runtime_core, "build_execution_context", lambda **kwargs: context)
     monkeypatch.setattr(runtime_core, "_fixed_density_sample", fake_sample)
-    monkeypatch.setattr(
-        runtime_core,
-        "_baseline_diff_audit",
-        lambda repo_root=None: {
+
+    def passing_diff_audit(repo_root=None):
+        del repo_root
+        return {
             "base_revision": PRE_ARCHITECTURE_REV,
-            "baseline_revision": "b" * 40,
+            "baseline_revision": context["git"]["revision"],
+            "baseline_parent_revision": context["git"]["parent"],
+            "checks": {
+                "git_commands_succeeded": True,
+                "pre_architecture_revision_is_ancestor": True,
+                "baseline_history_has_no_merge_commits": True,
+                "baseline_parent_is_reviewed_slice1_revision": True,
+                "baseline_revision_is_distinct": True,
+                "diff_is_nonempty": True,
+                "diff_paths_are_allowed": True,
+                "diff_records_are_parseable_regular_files": True,
+            },
+            "allowed_paths": sorted(runtime_core.BASELINE_ALLOWED_DIFF_PATHS),
+            "changed_files": [
+                {
+                    "status": "M",
+                    "path": sorted(runtime_core.BASELINE_ALLOWED_DIFF_PATHS)[0],
+                    "byte_size": 1,
+                    "sha256": "d" * 64,
+                }
+            ],
+            "patch_sha256": "c" * 64,
             "passed": True,
-        },
-    )
+        }
+
+    monkeypatch.setattr(runtime_core, "_baseline_diff_audit", passing_diff_audit)
     result = run_fixed_density(
         manifest_path=prepared["manifest"],
         gth_source=source,
@@ -1846,7 +2211,8 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
     seal = json.loads((tmp_path / "baseline/seal.json").read_text())
     assert seal["protocol_fingerprint"] == "p" * 64
     assert seal["baseline_runtime_fingerprint"] == "r" * 64
-    assert seal["parent_rev"] == PRE_ARCHITECTURE_REV
+    assert seal["base_rev"] == PRE_ARCHITECTURE_REV
+    assert seal["parent_rev"] == runtime_core.BASELINE_EXPECTED_PARENT_REV
     assert seal["host_protocol"]["power_source"] == "Battery Power"
     assert seal["baseline_structure_audit"]["passed"] is True
     assert seal["baseline_diff_audit"]["passed"] is True
@@ -1856,11 +2222,36 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
     ]
     assert inspect_generation(tmp_path / "baseline")["complete"] is True
 
-    context["git"]["parent"] = "038263e"
+    context["git"]["parent"] = "a" * 40
+    wrong_parent = run_fixed_density(
+        manifest_path=prepared["manifest"],
+        gth_source=source,
+        out=tmp_path / "wrong-parent",
+        warmups=1,
+        samples=5,
+        fresh=True,
+        diagnostic=False,
+        require_clean=True,
+        require_chip=TARGET_CHIP,
+        require_low_power=True,
+        require_numerical=True,
+        seal=True,
+    )
+    assert wrong_parent["admission"]["passed"] is False
+    assert "baseline_diff_audit_failed" in wrong_parent["admission"]["blockers"]
+    assert not (tmp_path / "wrong-parent/seal.json").exists()
+    context["git"]["parent"] = runtime_core.BASELINE_EXPECTED_PARENT_REV
+
+    def wrong_base_audit(repo_root=None):
+        audit = passing_diff_audit(repo_root)
+        audit["base_revision"] = "f" * 40
+        return audit
+
+    monkeypatch.setattr(runtime_core, "_baseline_diff_audit", wrong_base_audit)
     rejected = run_fixed_density(
         manifest_path=prepared["manifest"],
         gth_source=source,
-        out=tmp_path / "short-parent",
+        out=tmp_path / "wrong-base",
         warmups=1,
         samples=5,
         fresh=True,
@@ -1872,10 +2263,10 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
         seal=True,
     )
     assert rejected["admission"]["passed"] is False
-    assert "seal_parent_revision_mismatch" in rejected["admission"]["blockers"]
-    assert not (tmp_path / "short-parent/seal.json").exists()
+    assert "baseline_diff_audit_failed" in rejected["admission"]["blockers"]
+    assert not (tmp_path / "wrong-base/seal.json").exists()
 
-    context["git"]["parent"] = PRE_ARCHITECTURE_REV
+    context["git"]["parent"] = runtime_core.BASELINE_EXPECTED_PARENT_REV
 
     def failed_sample(**kwargs):
         del kwargs
@@ -1916,6 +2307,8 @@ def test_fixed_density_compare_seal_blocks_wrong_eigenvalues(tmp_path, monkeypat
         "machine": "arm64",
         "macos": {"ProductVersion": "26.5.2"},
         "power_source": "AC Power",
+        "active_power_profile": {"lowpowermode": 1},
+        "power_mode_key": "lowpowermode",
         "low_power_mode": 1,
     }
     context = {
@@ -1951,8 +2344,7 @@ def test_fixed_density_compare_seal_blocks_wrong_eigenvalues(tmp_path, monkeypat
         extra={
             "workload_fingerprint": manifest["workload_fingerprint"],
             "selected_gth_resource": manifest["resources"][0],
-            "baseline_diff_audit": {"passed": True},
-            "host_protocol": runtime_core._host_protocol(host),
+            "host": host,
             "comparison_protocol": runtime_core._comparison_protocol(
                 manifest,
                 context,
@@ -2172,6 +2564,8 @@ def test_full_scf_publication_deadline_is_part_of_formal_admission(
     host = {
         "chip": TARGET_CHIP,
         "power_source": "AC Power",
+        "active_power_profile": {"lowpowermode": 1},
+        "power_mode_key": "lowpowermode",
         "low_power_mode": 1,
         "macos": {"ProductVersion": "26.5.2"},
     }

@@ -53,6 +53,7 @@ READ_ONLY_HOST_COMMANDS = (
     ("pmset", "-g", "custom"),
     ("sysctl", "-n", "kern.thermal_pressure"),
 )
+POWER_MODE_KEYS = ("lowpowermode", "powermode")
 
 _SILICON_FRACTIONAL_POSITIONS = (
     (0.0, 0.0, 0.0),
@@ -556,7 +557,7 @@ def parse_power_profiles(output: str) -> dict[str, dict[str, int]]:
         try:
             value = int(raw_value)
         except ValueError:
-            if key == "lowpowermode":
+            if key in POWER_MODE_KEYS:
                 msg = f"active power profile has non-integer {key}"
                 raise ValueError(msg) from None
             continue
@@ -565,6 +566,24 @@ def parse_power_profiles(output: str) -> dict[str, dict[str, int]]:
             raise ValueError(msg)
         profiles[current][key] = value
     return profiles
+
+
+def _active_power_mode(profile: Mapping[str, object]) -> tuple[str | None, int | None]:
+    observed = [
+        (key, profile[key])
+        for key in POWER_MODE_KEYS
+        if key in profile
+    ]
+    if not observed:
+        return None, None
+    if any(type(value) is not int for _key, value in observed):
+        msg = "active power profile has a non-integer power-mode value"
+        raise ValueError(msg)
+    values = {value for _key, value in observed}
+    if len(values) != 1:
+        msg = "active power profile has conflicting power-mode keys"
+        raise ValueError(msg)
+    return "+".join(key for key, _value in observed), int(observed[0][1])
 
 
 HostRunner = Callable[[Sequence[str]], Mapping[str, object]]
@@ -641,7 +660,12 @@ def collect_host_provenance(runner: HostRunner | None = None) -> dict[str, objec
         if custom_text:
             blockers.append("power_profiles_unparsed")
     active_profile = profiles.get(power_source, {}) if power_source is not None else {}
-    low_power_mode = active_profile.get("lowpowermode")
+    try:
+        power_mode_key, low_power_mode = _active_power_mode(active_profile)
+    except ValueError:
+        power_mode_key = None
+        low_power_mode = None
+        blockers.append("active_power_mode_conflict")
     return {
         "model": model,
         "model_identifier": model_identifier,
@@ -651,6 +675,7 @@ def collect_host_provenance(runner: HostRunner | None = None) -> dict[str, objec
         "macos": _parse_sw_vers(os_text),
         "power_source": power_source,
         "active_power_profile": dict(active_profile),
+        "power_mode_key": power_mode_key,
         "low_power_mode": low_power_mode,
         "thermal_pressure": (
             str(thermal.get("stdout", "")).strip() if thermal.get("status") == "ok" else None
@@ -703,9 +728,24 @@ def host_admission(
         blockers.append("power_source_missing")
     if require_low_power:
         active = provenance.get("active_power_profile")
-        if not isinstance(active, dict) or "lowpowermode" not in active:
-            blockers.append("active_lowpowermode_missing")
-        elif active.get("lowpowermode") != 1:
-            blockers.append("active_lowpowermode_not_one")
+        if not isinstance(active, dict):
+            blockers.append("active_power_mode_missing")
+        else:
+            try:
+                _key, value = _active_power_mode(active)
+            except ValueError:
+                blockers.append("active_power_mode_conflict")
+            else:
+                if value is None:
+                    blockers.append("active_power_mode_missing")
+                elif value != 1:
+                    blockers.append("active_power_mode_not_one")
+                elif (
+                    type(provenance.get("low_power_mode")) is not int
+                    or provenance.get("low_power_mode") != value
+                    or type(provenance.get("power_mode_key")) is not str
+                    or provenance.get("power_mode_key") != _key
+                ):
+                    blockers.append("active_power_mode_normalization_mismatch")
     unique = sorted(set(str(blocker) for blocker in blockers))
     return {"admitted": not unique, "blockers": unique}

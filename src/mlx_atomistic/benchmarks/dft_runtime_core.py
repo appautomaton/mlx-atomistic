@@ -64,6 +64,7 @@ _REPORT_ENVELOPE_CONTRACTS = {
     "command-failure": ("dft-runtime-command-failure", COMMAND_FAILURE_SCHEMA),
 }
 PRE_ARCHITECTURE_REV = "038263effcd017b5ad47426fe5c2ff68077004f6"
+BASELINE_EXPECTED_PARENT_REV = "dea8f77e25d060188d4001013635b4e534885260"
 BASELINE_ALLOWED_DIFF_PATHS = frozenset(
     {
         "scripts/run_dft_runtime_oracle.py",
@@ -83,6 +84,18 @@ BASELINE_ABSENT_OPTIMIZATIONS = (
     "batched-fft-hpsi",
     "incremental-hv",
     "representative-only-execution",
+)
+BASELINE_DIFF_CHECK_NAMES = frozenset(
+    {
+        "git_commands_succeeded",
+        "pre_architecture_revision_is_ancestor",
+        "baseline_history_has_no_merge_commits",
+        "baseline_parent_is_reviewed_slice1_revision",
+        "baseline_revision_is_distinct",
+        "diff_is_nonempty",
+        "diff_paths_are_allowed",
+        "diff_records_are_parseable_regular_files",
+    }
 )
 
 ProgressCallback = Callable[[dict[str, object]], None]
@@ -122,6 +135,13 @@ def _baseline_diff_audit(repo_root: str | Path | None = None) -> dict[str, objec
     root = find_repo_root(repo_root)
     revision = _git_command(root, "rev-parse", "HEAD")
     parent = _git_command(root, "rev-parse", "HEAD^")
+    merge_base = _git_command(root, "merge-base", PRE_ARCHITECTURE_REV, "HEAD")
+    merge_commits = _git_command(
+        root,
+        "rev-list",
+        "--merges",
+        f"{PRE_ARCHITECTURE_REV}..HEAD",
+    )
     try:
         completed = subprocess.run(
             (
@@ -181,8 +201,14 @@ def _baseline_diff_audit(repo_root: str | Path | None = None) -> dict[str, objec
             and completed.returncode == 0
             and patch is not None
             and patch.returncode == 0
+            and merge_base is not None
+            and merge_commits is not None
         ),
-        "direct_parent_is_pre_architecture_revision": parent == PRE_ARCHITECTURE_REV,
+        "pre_architecture_revision_is_ancestor": merge_base == PRE_ARCHITECTURE_REV,
+        "baseline_history_has_no_merge_commits": merge_commits == "",
+        "baseline_parent_is_reviewed_slice1_revision": (
+            parent == BASELINE_EXPECTED_PARENT_REV
+        ),
         "baseline_revision_is_distinct": revision not in {None, PRE_ARCHITECTURE_REV},
         "diff_is_nonempty": bool(records),
         "diff_paths_are_allowed": all(
@@ -193,6 +219,7 @@ def _baseline_diff_audit(repo_root: str | Path | None = None) -> dict[str, objec
     return {
         "base_revision": PRE_ARCHITECTURE_REV,
         "baseline_revision": revision,
+        "baseline_parent_revision": parent,
         "allowed_paths": sorted(BASELINE_ALLOWED_DIFF_PATHS),
         "changed_files": records,
         "patch_sha256": (
@@ -203,6 +230,52 @@ def _baseline_diff_audit(repo_root: str | Path | None = None) -> dict[str, objec
         "checks": checks,
         "passed": all(checks.values()),
     }
+
+
+def _baseline_diff_audit_matches(
+    audit: object,
+    git: Mapping[str, object],
+) -> bool:
+    if not isinstance(audit, dict) or audit.get("passed") is not True:
+        return False
+    checks = audit.get("checks")
+    if (
+        not isinstance(checks, dict)
+        or set(checks) != BASELINE_DIFF_CHECK_NAMES
+        or any(value is not True for value in checks.values())
+        or audit.get("base_revision") != PRE_ARCHITECTURE_REV
+        or audit.get("baseline_revision") != git.get("revision")
+        or audit.get("baseline_parent_revision") != git.get("parent")
+        or audit.get("baseline_parent_revision") != BASELINE_EXPECTED_PARENT_REV
+        or audit.get("allowed_paths") != sorted(BASELINE_ALLOWED_DIFF_PATHS)
+        or not _is_sha256(audit.get("patch_sha256"))
+    ):
+        return False
+    records = audit.get("changed_files")
+    if not isinstance(records, list) or not records:
+        return False
+    paths: list[str] = []
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or record.get("status") not in {"A", "M"}
+            or not isinstance(record.get("path"), str)
+            or record.get("path") not in BASELINE_ALLOWED_DIFF_PATHS
+            or type(record.get("byte_size")) is not int
+            or record["byte_size"] < 0
+            or not _is_sha256(record.get("sha256"))
+        ):
+            return False
+        paths.append(str(record["path"]))
+    return len(paths) == len(set(paths))
+
+
+def _is_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _runtime_environment() -> dict[str, object]:
@@ -324,17 +397,28 @@ def _formal_admission(
             or run_protocol.get("new_process") is not True
         ):
             blockers.append("formal_full_scf_cadence_mismatch")
-    if report_kind in {
+    raw_host_report = report_kind in {
         "fixed-density",
         "full-scf",
         "full-scf-publication-attestation",
-        "fixed-density-comparison",
-    } and (
-        not isinstance(host_protocol, Mapping)
-        or host_protocol.get("chip") != TARGET_CHIP
-        or host_protocol.get("low_power_mode") != 1
-        or host_protocol.get("power_source") not in {"AC Power", "Battery Power"}
-    ):
+    }
+    comparison_report = report_kind == "fixed-density-comparison"
+    raw_host_matches = not raw_host_report or (
+        isinstance(host_protocol, Mapping)
+        and host_admission(
+            host_protocol,
+            required_chip=TARGET_CHIP,
+            require_low_power=True,
+        )["admitted"]
+        is True
+    )
+    comparison_host_matches = not comparison_report or (
+        isinstance(host_protocol, Mapping)
+        and host_protocol.get("chip") == TARGET_CHIP
+        and host_protocol.get("low_power_mode") == 1
+        and host_protocol.get("power_source") in {"AC Power", "Battery Power"}
+    )
+    if not raw_host_matches or not comparison_host_matches:
         blockers.append("formal_target_host_low_power_mismatch")
     return {"passed": not blockers, "blockers": blockers}
 
@@ -718,8 +802,8 @@ def _load_seal(path: str | Path) -> dict[str, object]:
         or not isinstance(summary, dict)
         or not isinstance(eigenvalues, dict)
         or seal.get("baseline_rev") != git.get("revision")
+        or seal.get("base_rev") != PRE_ARCHITECTURE_REV
         or seal.get("parent_rev") != git.get("parent")
-        or seal.get("parent_rev") != PRE_ARCHITECTURE_REV
         or seal.get("dirty") is not False
         or git.get("dirty") is not False
         or seal.get("workload_fingerprint") != identity.get("workload_fingerprint")
@@ -746,8 +830,7 @@ def _load_seal(path: str | Path) -> dict[str, object]:
         or seal.get("baseline_diff_audit") != summary.get("baseline_diff_audit")
         or not isinstance(seal.get("baseline_structure_audit"), dict)
         or seal.get("baseline_structure_audit", {}).get("passed") is not True
-        or not isinstance(seal.get("baseline_diff_audit"), dict)
-        or seal.get("baseline_diff_audit", {}).get("passed") is not True
+        or not _baseline_diff_audit_matches(seal.get("baseline_diff_audit"), git)
         or seal.get("target_optimizations_absent")
         != list(BASELINE_ABSENT_OPTIMIZATIONS)
     ):
@@ -774,8 +857,8 @@ def _seal_compatibility(
         blockers.append("seal_protocol_mismatch")
     if seal.get("dirty") is not False:
         blockers.append("seal_baseline_dirty")
-    if seal.get("parent_rev") != PRE_ARCHITECTURE_REV:
-        blockers.append("seal_parent_revision_mismatch")
+    if seal.get("base_rev") != PRE_ARCHITECTURE_REV:
+        blockers.append("seal_base_revision_mismatch")
     baseline_audit = seal.get("baseline_diff_audit")
     if not isinstance(baseline_audit, dict) or baseline_audit.get("passed") is not True:
         blockers.append("seal_baseline_diff_audit_failed")
@@ -1068,13 +1151,10 @@ def run_fixed_density(
         blockers.append("seal_requires_formal_numerical_success")
     if seal and (not require_clean or require_chip != TARGET_CHIP or not require_low_power):
         blockers.append("seal_requires_clean_target_host_low_power_gate")
-    if seal and context["git"].get("parent") != PRE_ARCHITECTURE_REV:
-        blockers.append("seal_parent_revision_mismatch")
     if seal and not baseline_audit["passed"]:
         blockers.append("baseline_structure_audit_failed")
     if seal and (
-        not isinstance(baseline_diff_audit, dict)
-        or baseline_diff_audit.get("passed") is not True
+        not _baseline_diff_audit_matches(baseline_diff_audit, context["git"])
     ):
         blockers.append("baseline_diff_audit_failed")
     unique_blockers = sorted(set(blockers))
@@ -1252,6 +1332,7 @@ def _build_baseline_seal(
     unsigned: dict[str, object] = {
         "schema_version": SEAL_SCHEMA,
         "baseline_rev": context["git"]["revision"],
+        "base_rev": PRE_ARCHITECTURE_REV,
         "parent_rev": context["git"]["parent"],
         "dirty": context["git"]["dirty"],
         "workload_fingerprint": manifest["workload_fingerprint"],
@@ -1354,8 +1435,8 @@ def _baseline_lineage_blockers(
         blockers.append("baseline_seal_runtime_mismatch")
     if seal.get("baseline_rev") != context.get("git", {}).get("revision"):
         blockers.append("baseline_seal_revision_mismatch")
-    if seal.get("parent_rev") != PRE_ARCHITECTURE_REV:
-        blockers.append("baseline_seal_parent_mismatch")
+    if seal.get("base_rev") != PRE_ARCHITECTURE_REV:
+        blockers.append("baseline_seal_base_mismatch")
     if seal.get("dirty") is not False:
         blockers.append("baseline_seal_dirty")
     return seal, blockers
