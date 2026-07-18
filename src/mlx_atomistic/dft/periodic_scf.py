@@ -9,6 +9,11 @@ from time import perf_counter
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.dft._runtime_observer import (
+    RuntimeObserver,
+    add_observed_work,
+    observed_phase,
+)
 from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.grids import RealSpaceGrid
 from mlx_atomistic.dft.kpoints import KPointMesh
@@ -180,30 +185,87 @@ class PeriodicKohnShamOperator:
     basis: PlaneWaveBasis
     effective_local_potential: mx.array
     nonlocal_operator: PeriodicGTHNonlocalOperator | None = None
+    observer: RuntimeObserver | None = None
 
-    def apply(self, coefficients: mx.array) -> mx.array:
+    def apply(
+        self,
+        coefficients: mx.array,
+        *,
+        observer: RuntimeObserver | None = None,
+    ) -> mx.array:
         """Apply kinetic, local, and optional nonlocal terms.
 
         Args:
             coefficients: One coefficient grid or an orbital stack.
+            observer: Optional observer overriding an absent operator observer.
 
         Returns:
             Hamiltonian action with matching shape.
         """
 
-        applied = self.basis.apply_kinetic(coefficients) + self.basis.apply_local(
-            coefficients,
-            self.effective_local_potential,
-        )
+        if observer is not None and self.observer is not None and observer is not self.observer:
+            msg = "operator apply observers must be the same object"
+            raise ValueError(msg)
+        runtime_observer = self.observer if observer is None else observer
+        values = mx.array(coefficients)
+        if values.shape == self.basis.grid.shape:
+            vector_count = 1
+        elif len(values.shape) == 4 and values.shape[1:] == self.basis.grid.shape:
+            vector_count = int(values.shape[0])
+        else:
+            msg = "coefficients must have shape grid.shape or (n, *grid.shape)"
+            raise ValueError(msg)
+        projector_elements = 0
         if self.nonlocal_operator is not None:
-            applied = applied + self.nonlocal_operator.apply(coefficients)
-        return self.basis.project(applied)
+            projector_count = sum(
+                channel.projector_count * (2 * channel.angular_momentum + 1)
+                for channel in self.nonlocal_operator.pseudopotential.gth_channels
+            )
+            projector_elements = (
+                vector_count
+                * self.basis.grid.size
+                * int(self.nonlocal_operator.positions.shape[0])
+                * projector_count
+            )
+        with observed_phase(runtime_observer, "hpsi"):
+            applied = self.basis.apply_kinetic(values) + self.basis.apply_local(
+                values,
+                self.effective_local_potential,
+            )
+            if self.nonlocal_operator is not None:
+                applied = applied + self.nonlocal_operator.apply(values)
+            result = self.basis.project(applied)
+        add_observed_work(
+            runtime_observer,
+            {
+                "hpsi_calls": 1,
+                "hpsi_vector_equivalents": vector_count,
+                "fft_submissions": 2 * vector_count,
+                "fft_vector_equivalents": 2 * vector_count,
+                "projector_elements_generated": projector_elements,
+                "projector_elements_loaded": 2 * projector_elements,
+                "projector_traffic_elements": 3 * projector_elements,
+            },
+        )
+        if runtime_observer is not None and projector_elements:
+            per_vector_projector_elements = projector_elements // vector_count
+            runtime_observer.record_memory(
+                "projector_payload_bytes",
+                per_vector_projector_elements * 8,
+            )
+        return result
 
-    def rayleigh_quotients(self, coefficients: mx.array) -> mx.array:
+    def rayleigh_quotients(
+        self,
+        coefficients: mx.array,
+        *,
+        observer: RuntimeObserver | None = None,
+    ) -> mx.array:
         """Return one Rayleigh quotient per orbital.
 
         Args:
             coefficients: Orbital stack in coefficient space.
+            observer: Optional runtime observer.
 
         Returns:
             Real energy estimates in Hartree.
@@ -212,7 +274,7 @@ class PeriodicKohnShamOperator:
         stack = mx.array(coefficients)
         if stack.shape == self.basis.grid.shape:
             stack = mx.reshape(stack, (1, *self.basis.grid.shape))
-        applied = self.apply(stack)
+        applied = self.apply(stack, observer=observer)
         numerator = mx.sum(mx.conjugate(stack) * applied, axis=(1, 2, 3))
         denominator = mx.sum(mx.abs(stack) ** 2, axis=(1, 2, 3))
         return mx.real(numerator / denominator)
@@ -266,6 +328,7 @@ def solve_periodic_eigenproblem(
     n_bands: int,
     config: PeriodicDavidsonConfig | None = None,
     initial_coefficients: mx.array | None = None,
+    observer: RuntimeObserver | None = None,
 ) -> PeriodicEigenResult:
     """Solve the lowest periodic eigenpairs with block Davidson/Rayleigh-Ritz.
 
@@ -275,11 +338,17 @@ def solve_periodic_eigenproblem(
         config: Davidson controls. Defaults to `PeriodicDavidsonConfig`.
         initial_coefficients: Optional initial orbital stack. Defaults to the
             lowest kinetic plane waves.
+        observer: Optional progress and work observer. Defaults to the
+            observer carried by ``operator``.
 
     Returns:
         Converged or exhausted periodic eigensolver result.
     """
 
+    if observer is not None and operator.observer is not None and observer is not operator.observer:
+        msg = "operator and solver observers must be the same object"
+        raise ValueError(msg)
+    runtime_observer = operator.observer if observer is None else observer
     solver_config = PeriodicDavidsonConfig() if config is None else config
     basis = operator.basis
     if n_bands <= 0 or n_bands > basis.active_count:
@@ -293,26 +362,49 @@ def solve_periodic_eigenproblem(
         if initial_coefficients is None
         else mx.array(initial_coefficients)
     )
-    subspace = basis.orthonormalize(trial)
+    with observed_phase(runtime_observer, "orthogonalization"):
+        subspace = basis.orthonormalize(trial)
+    add_observed_work(
+        runtime_observer,
+        {"orthogonalization_vectors": int(trial.shape[0])},
+    )
     restart_count = 0
     converged = False
-    eigenvalues = operator.rayleigh_quotients(subspace)
+    eigenvalues = operator.rayleigh_quotients(subspace, observer=runtime_observer)
     residuals = mx.full((n_bands,), float("inf"), dtype=mx.float32)
     ritz = subspace[:n_bands]
     iteration_count = 0
     for _iteration in range(1, solver_config.max_iterations + 1):
         iteration_count = _iteration
-        applied = operator.apply(subspace)
-        projected = _subspace_matrix(subspace, applied, basis)
-        values, vectors = _projected_eigh(projected)
-        selected_values = values[:n_bands]
-        selected_vectors = vectors[:, :n_bands]
-        ritz = _combine(selected_vectors, subspace, basis)
-        h_ritz = _combine(selected_vectors, applied, basis)
-        residual_stack = h_ritz - selected_values[:, None, None, None] * ritz
-        residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=(1, 2, 3)))
-        eigenvalues = mx.real(selected_values)
-        if float(mx.max(residuals)) <= solver_config.tolerance:
+        applied = operator.apply(subspace, observer=runtime_observer)
+        subspace_size = int(subspace.shape[0])
+        add_observed_work(
+            runtime_observer,
+            {
+                "davidson_hv_new_vectors": subspace_size,
+                "projected_old_old_rebuilds": subspace_size * subspace_size,
+            },
+        )
+        with observed_phase(runtime_observer, "rayleigh_ritz"):
+            projected = _subspace_matrix(subspace, applied, basis)
+            values, vectors = _projected_eigh(projected)
+            selected_values = values[:n_bands]
+            selected_vectors = vectors[:, :n_bands]
+            ritz = _combine(selected_vectors, subspace, basis)
+            h_ritz = _combine(selected_vectors, applied, basis)
+            residual_stack = h_ritz - selected_values[:, None, None, None] * ritz
+            residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=(1, 2, 3)))
+            eigenvalues = mx.real(selected_values)
+        max_residual = float(mx.max(residuals))
+        if runtime_observer is not None:
+            runtime_observer.emit(
+                "davidson_iteration",
+                iteration=_iteration,
+                subspace_size=subspace_size,
+                max_residual=max_residual,
+                converged=max_residual <= solver_config.tolerance,
+            )
+        if max_residual <= solver_config.tolerance:
             converged = True
             break
 
@@ -335,13 +427,25 @@ def solve_periodic_eigenproblem(
         correction_stack = mx.stack(corrections, axis=0)
         if int(subspace.shape[0]) + len(corrections) > solver_config.max_subspace_size:
             restart_count += 1
-            subspace = basis.orthonormalize(mx.concatenate([ritz, correction_stack], axis=0))
+            with observed_phase(runtime_observer, "orthogonalization"):
+                subspace = basis.orthonormalize(
+                    mx.concatenate([ritz, correction_stack], axis=0)
+                )
         else:
-            subspace = basis.orthonormalize(mx.concatenate([subspace, correction_stack], axis=0))
+            with observed_phase(runtime_observer, "orthogonalization"):
+                subspace = basis.orthonormalize(
+                    mx.concatenate([subspace, correction_stack], axis=0)
+                )
+        add_observed_work(
+            runtime_observer,
+            {"orthogonalization_vectors": int(subspace.shape[0])},
+        )
 
-    ritz = basis.orthonormalize(ritz)
-    final_applied = operator.apply(ritz)
-    eigenvalues = operator.rayleigh_quotients(ritz)
+    with observed_phase(runtime_observer, "orthogonalization"):
+        ritz = basis.orthonormalize(ritz)
+    add_observed_work(runtime_observer, {"orthogonalization_vectors": int(ritz.shape[0])})
+    final_applied = operator.apply(ritz, observer=runtime_observer)
+    eigenvalues = operator.rayleigh_quotients(ritz, observer=runtime_observer)
     residual_stack = final_applied - eigenvalues[:, None, None, None] * ritz
     residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=(1, 2, 3)))
     overlap = np.asarray(basis.overlap_matrix(ritz))
@@ -453,6 +557,7 @@ def run_periodic_scf(
     xc_functional: ExchangeCorrelationFunctional | None = None,
     initial_density: mx.array | None = None,
     initial_coefficients: Sequence[mx.array] | None = None,
+    observer: RuntimeObserver | None = None,
 ) -> PeriodicSCFResult:
     """Run weighted self-consistent periodic plane-wave DFT.
 
@@ -465,6 +570,7 @@ def run_periodic_scf(
         xc_functional: Exchange-correlation functional. Defaults to production PBE.
         initial_density: Optional starting density on the FFT grid.
         initial_coefficients: Optional orbital stack per k-point.
+        observer: Optional progress, synchronized timing, and work observer.
 
     Returns:
         Periodic SCF result with complete weighted k-point diagnostics.
@@ -484,44 +590,60 @@ def run_periodic_scf(
         msg = "initial_coefficients length must match the k-point mesh"
         raise ValueError(msg)
 
-    bases = [
-        PlaneWaveBasis.from_reduced_kpoint(system.grid, cutoff_hartree, point.vector)
-        for point in kpoint_mesh.points
-    ]
-    gamma_basis = PlaneWaveBasis(system.grid, cutoff_hartree)
-    local_potential = gth_local_potential_grid(
-        system.pseudopotential,
-        gamma_basis,
-        system.positions,
-    )
-    if initial_density is None:
-        density = mx.full(system.grid.shape, system.electron_count / system.grid.volume)
-    else:
-        density = mx.real(mx.array(initial_density))
-        if density.shape != system.grid.shape:
-            msg = "initial_density must have shape system.grid.shape"
-            raise ValueError(msg)
-        count = float(mx.sum(density) * system.grid.dv)
-        if count <= 0.0:
-            msg = "initial_density must integrate to a positive count"
-            raise ValueError(msg)
-        density = density * (system.electron_count / count)
-    mixer = (
-        PulayDIISMixer(beta=scf_config.mixing_beta)
-        if scf_config.mixer == "diis"
-        else LinearMixer(beta=scf_config.mixing_beta)
-    )
-    ewald = periodic_ewald_energy(
-        system.charges,
-        system.positions,
-        np.asarray(system.grid.lengths),
-    )
-    previous_energy: float | None = None
-    previous_states = (
-        list(initial_coefficients)
-        if initial_coefficients is not None
-        else [None] * len(bases)
-    )
+    if observer is not None:
+        observer.emit(
+            "setup",
+            status="started",
+            kpoint_count=len(kpoint_mesh.points),
+            grid_shape=list(system.grid.shape),
+        )
+    with observed_phase(observer, "setup"):
+        bases = [
+            PlaneWaveBasis.from_reduced_kpoint(system.grid, cutoff_hartree, point.vector)
+            for point in kpoint_mesh.points
+        ]
+        gamma_basis = PlaneWaveBasis(system.grid, cutoff_hartree)
+        local_potential = gth_local_potential_grid(
+            system.pseudopotential,
+            gamma_basis,
+            system.positions,
+        )
+        if initial_density is None:
+            density = mx.full(system.grid.shape, system.electron_count / system.grid.volume)
+        else:
+            density = mx.real(mx.array(initial_density))
+            if density.shape != system.grid.shape:
+                msg = "initial_density must have shape system.grid.shape"
+                raise ValueError(msg)
+            count = float(mx.sum(density) * system.grid.dv)
+            if count <= 0.0:
+                msg = "initial_density must integrate to a positive count"
+                raise ValueError(msg)
+            density = density * (system.electron_count / count)
+        mixer = (
+            PulayDIISMixer(beta=scf_config.mixing_beta)
+            if scf_config.mixer == "diis"
+            else LinearMixer(beta=scf_config.mixing_beta)
+        )
+        ewald = periodic_ewald_energy(
+            system.charges,
+            system.positions,
+            np.asarray(system.grid.lengths),
+        )
+        previous_energy: float | None = None
+        previous_states = (
+            list(initial_coefficients)
+            if initial_coefficients is not None
+            else [None] * len(bases)
+        )
+    if observer is not None:
+        observer.record_memory("shared_full_grid_bytes", system.grid.size * 4 * 4)
+        observer.record_memory("persistent_projector_bytes", 0)
+        observer.emit(
+            "setup",
+            status="completed",
+            active_counts=[basis.active_count for basis in bases],
+        )
     history: list[dict[str, float | int | str | None]] = []
     final_results: tuple[PeriodicKPointResult, ...] = ()
     energy_terms: dict[str, float] = {}
@@ -531,6 +653,13 @@ def run_periodic_scf(
     timings = {"hartree": 0.0, "xc": 0.0, "eigensolver": 0.0, "total": 0.0}
     total_start = perf_counter()
     for iteration in range(1, scf_config.max_iterations + 1):
+        if observer is not None:
+            observer.emit(
+                "scf_iteration",
+                status="started",
+                iteration=iteration,
+                total_iterations=scf_config.max_iterations,
+            )
         start = perf_counter()
         hartree = hartree_potential(density, system.grid)
         timings["hartree"] += (perf_counter() - start) * 1000.0
@@ -542,18 +671,34 @@ def run_periodic_scf(
         max_orbital_residual = 0.0
         start = perf_counter()
         for point_index, (point, basis) in enumerate(zip(kpoint_mesh.points, bases, strict=True)):
+            if observer is not None:
+                observer.emit(
+                    "kpoint_batch",
+                    status="started",
+                    scf_iteration=iteration,
+                    batch_index=point_index,
+                    batch_size=1,
+                    reduced_kpoints=[list(point.vector)],
+                )
             nonlocal_operator = PeriodicGTHNonlocalOperator(
                 system.pseudopotential,
                 basis,
                 system.positions,
             )
-            operator = PeriodicKohnShamOperator(basis, effective, nonlocal_operator)
+            operator = PeriodicKohnShamOperator(
+                basis,
+                effective,
+                nonlocal_operator,
+                observer,
+            )
             eigen = solve_periodic_eigenproblem(
                 operator,
                 n_bands=occupied_bands,
                 config=scf_config.davidson,
                 initial_coefficients=previous_states[point_index],
+                observer=observer,
             )
+            add_observed_work(observer, {"kpoint_lane_solves": 1})
             max_orbital_residual = max(
                 max_orbital_residual,
                 float(mx.max(eigen.residuals)),
@@ -566,12 +711,30 @@ def run_periodic_scf(
                     eigen=eigen,
                 )
             )
+            if observer is not None:
+                observer.emit(
+                    "kpoint_batch",
+                    status="completed",
+                    scf_iteration=iteration,
+                    batch_index=point_index,
+                    batch_size=1,
+                    reduced_kpoints=[list(point.vector)],
+                    converged=eigen.converged,
+                )
         timings["eigensolver"] += (perf_counter() - start) * 1000.0
         final_results = tuple(results)
-        target_density = _density_from_kpoints(final_results, occupation=2.0)
-        target_count = float(mx.sum(target_density) * system.grid.dv)
-        target_density = target_density * (system.electron_count / target_count)
-        density_residual = _density_residual(density, target_density, system.grid)
+        with observed_phase(observer, "density"):
+            target_density = _density_from_kpoints(final_results, occupation=2.0)
+            add_observed_work(
+                observer,
+                {
+                    "fft_submissions": sum(occupied_bands for _ in final_results),
+                    "fft_vector_equivalents": sum(occupied_bands for _ in final_results),
+                },
+            )
+            target_count = float(mx.sum(target_density) * system.grid.dv)
+            target_density = target_density * (system.electron_count / target_count)
+            density_residual = _density_residual(density, target_density, system.grid)
 
         band_energy = sum(
             result.weight * 2.0 * float(mx.sum(result.eigen.eigenvalues))
@@ -604,6 +767,17 @@ def run_periodic_scf(
             }
         )
         all_eigen_converged = all(result.eigen.converged for result in final_results)
+        if observer is not None:
+            observer.emit(
+                "scf_iteration",
+                status="completed",
+                iteration=iteration,
+                total_energy_hartree=total_energy,
+                energy_delta_hartree=energy_delta,
+                density_residual=density_residual,
+                max_orbital_residual=max_orbital_residual,
+                all_kpoints_converged=all_eigen_converged,
+            )
         if (
             iteration >= scf_config.min_iterations
             and all_eigen_converged
@@ -615,14 +789,31 @@ def run_periodic_scf(
             converged = True
             density = target_density
             break
-        mixed = mx.maximum(mixer.mix(density, target_density), 0.0)
-        mixed_count = float(mx.sum(mixed) * system.grid.dv)
-        density = mixed * (system.electron_count / mixed_count)
+        with observed_phase(observer, "mixing"):
+            mixed = mx.maximum(mixer.mix(density, target_density), 0.0)
+            mixed_count = float(mx.sum(mixed) * system.grid.dv)
+            density = mixed * (system.electron_count / mixed_count)
         previous_energy = total_energy
         previous_states = [result.eigen.coefficients for result in final_results]
 
     timings["total"] = (perf_counter() - total_start) * 1000.0
     electron_count = float(mx.sum(density) * system.grid.dv)
+    if observer is not None:
+        coefficient_bytes = sum(
+            int(np.prod(result.eigen.coefficients.shape)) * 8 for result in final_results
+        )
+        observer.record_memory("persistent_coefficient_bytes", coefficient_bytes)
+        observer.record_memory("coefficient_payload_bytes", coefficient_bytes)
+        observation = observer.snapshot()
+        traffic_elements = int(observation["work_counters"]["projector_traffic_elements"])
+        observer.record_memory("projector_traffic_bytes", traffic_elements * 8)
+        observer.emit(
+            "completion",
+            stage="scf",
+            status="converged" if converged else "max_iterations",
+            iterations=iteration,
+            total_energy_hartree=float(energy_terms["total"]),
+        )
     return PeriodicSCFResult(
         converged=converged,
         status="converged" if converged else "max_iterations",

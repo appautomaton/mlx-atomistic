@@ -99,6 +99,37 @@ def test_core_runtime_does_not_import_reference_engines():
     assert offenders == {}
 
 
+def test_dft_runtime_evidence_and_oracle_never_import_external_or_product_kernels():
+    harness_files = [
+        ROOT / "src/mlx_atomistic/benchmarks/dft_runtime.py",
+        ROOT / "src/mlx_atomistic/benchmarks/dft_runtime_contract.py",
+        ROOT / "src/mlx_atomistic/benchmarks/dft_runtime_core.py",
+    ]
+    oracle = ROOT / "scripts/run_dft_runtime_oracle.py"
+    assert all(not (_import_roots(path) & FORBIDDEN_ENGINE_ROOTS) for path in harness_files)
+    oracle_imports = _import_modules(oracle)
+    assert not (_import_roots(oracle) & FORBIDDEN_ENGINE_ROOTS)
+    assert not any(
+        module == "mlx_atomistic.dft" or module.startswith("mlx_atomistic.dft.")
+        for module in oracle_imports
+    )
+
+
+def test_dft_runtime_host_inspection_contains_no_state_changing_power_command():
+    from mlx_atomistic.benchmarks.dft_runtime_contract import READ_ONLY_HOST_COMMANDS
+
+    assert READ_ONLY_HOST_COMMANDS
+    assert all(
+        command[0] in {"pmset", "sw_vers", "system_profiler", "sysctl"}
+        for command in READ_ONLY_HOST_COMMANDS
+    )
+    assert all(
+        command[0] != "pmset"
+        or command[1:3] in {("-g", "batt"), ("-g", "custom")}
+        for command in READ_ONLY_HOST_COMMANDS
+    )
+
+
 def test_installed_package_does_not_hardcode_reference_tree_paths():
     offenders: dict[Path, list[str]] = {}
     for path in _python_files(ROOT / "src/mlx_atomistic"):
