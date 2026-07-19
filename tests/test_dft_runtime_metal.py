@@ -4,7 +4,15 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_atomistic.dft import PlaneWaveBasis, RealSpaceGrid
+from mlx_atomistic.dft import (
+    GTHProjectorChannel,
+    PeriodicGTHNonlocalOperator,
+    PeriodicKohnShamOperator,
+    PlaneWaveBasis,
+    PseudopotentialData,
+    PseudopotentialFormat,
+    RealSpaceGrid,
+)
 from mlx_atomistic.dft._compact import _CompactBatch
 
 
@@ -90,6 +98,64 @@ def test_metal_device_restore_and_stream_restore_after_failure(monkeypatch):
             raise RuntimeError("injected Metal test failure")
         finally:
             _restore_runtime(previous_device, previous_stream)
+
+    assert mx.default_device() == previous_device
+    assert mx.default_stream(previous_device) == previous_stream
+
+
+@pytest.mark.gpu
+def test_compact_gth_hpsi_cache_executes_on_real_metal(monkeypatch):
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    previous_device = mx.default_device()
+    previous_stream = mx.default_stream(previous_device)
+    gth = None
+    try:
+        metal_device = mx.Device(mx.gpu, 0)
+        mx.set_default_device(metal_device)
+        mx.set_default_stream(mx.new_stream(metal_device))
+        grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+        basis = PlaneWaveBasis.from_reduced_kpoint(
+            grid,
+            4.0,
+            (0.25, 0.0, 0.0),
+            lane_label="metal:gth",
+        )
+        pseudo = PseudopotentialData(
+            element="H",
+            format=PseudopotentialFormat.GTH,
+            valence_charge=1.0,
+            gth_rloc=0.25,
+            gth_coefficients=(-1.0,),
+            gth_channels=(GTHProjectorChannel(0, 0.3, ((0.5,),)),),
+        )
+        rng = np.random.default_rng(29)
+        values = rng.normal(size=(4, basis.active_count)) + 1j * rng.normal(
+            size=(4, basis.active_count)
+        )
+        state = basis._state_from_compact(mx.array(values.astype(np.complex64)))
+        gth = PeriodicGTHNonlocalOperator(
+            pseudo,
+            basis,
+            ((1.0, 2.0, 3.0),),
+        )
+        operator = PeriodicKohnShamOperator(
+            basis,
+            mx.full(grid.shape, 0.2),
+            gth,
+        )
+
+        first = operator._apply_compact(state)
+        second = operator._apply_compact(state)
+        mx.eval(first.values, second.values)
+        mx.synchronize()
+
+        assert bool(mx.all(mx.isfinite(first.values)))
+        assert gth.cache_info()["entry_count"] == 1
+        assert gth.cache_info()["current_bytes"] == basis.active_count * 8
+    finally:
+        if gth is not None:
+            gth.close()
+        _restore_runtime(previous_device, previous_stream)
 
     assert mx.default_device() == previous_device
     assert mx.default_stream(previous_device) == previous_stream

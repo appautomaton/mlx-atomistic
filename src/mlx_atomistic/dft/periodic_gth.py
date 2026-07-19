@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import OrderedDict
+from collections.abc import Sequence, Set
 from dataclasses import dataclass
+from hashlib import sha256
 from math import erfc, pi, sqrt
 
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.dft._compact import _CompactLaneState
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.pseudopotentials import GTHProjectorChannel, PseudopotentialData
 
@@ -23,10 +26,11 @@ def _validated_gth(pseudopotential: PseudopotentialData) -> None:
 
 
 def _positions(positions: Sequence[Sequence[float]]) -> np.ndarray:
-    values = np.asarray(positions, dtype=np.float64)
+    values = np.array(positions, dtype=np.float64, copy=True)
     if values.ndim != 2 or values.shape[1] != 3 or values.shape[0] == 0:
         msg = "positions must have shape (n_ions, 3)"
         raise ValueError(msg)
+    values.setflags(write=False)
     return values
 
 
@@ -110,10 +114,14 @@ def gth_local_potential_grid(
     return mx.real(mx.fft.ifftn(coefficients) * basis.grid.size)
 
 
-def _gth_radial(channel: GTHProjectorChannel, projector_index: int, q: np.ndarray) -> np.ndarray:
+def _gth_radial(
+    channel: GTHProjectorChannel,
+    projector_index: int,
+    q: mx.array,
+) -> mx.array:
     radius = channel.radius
     qr2 = (q * radius) ** 2
-    gaussian = np.exp(-0.5 * qr2)
+    gaussian = mx.exp(-0.5 * qr2)
     l_value = channel.angular_momentum
     index = projector_index + 1
     if l_value == 0 and index == 1:
@@ -144,11 +152,14 @@ def _gth_radial(channel: GTHProjectorChannel, projector_index: int, q: np.ndarra
     raise ValueError(msg)
 
 
-def _real_spherical_harmonics(l_value: int, vectors: np.ndarray) -> tuple[np.ndarray, ...]:
-    q = np.linalg.norm(vectors, axis=-1)
+def _real_spherical_harmonics(
+    l_value: int,
+    vectors: mx.array,
+    q: mx.array,
+) -> tuple[mx.array, ...]:
     if l_value == 0:
-        return (np.full(q.shape, 1.0 / sqrt(4.0 * pi), dtype=np.float64),)
-    safe = np.where(q > 1e-14, q, 1.0)
+        return (mx.full(q.shape, 1.0 / sqrt(4.0 * pi), dtype=mx.float32),)
+    safe = mx.where(q > 1e-14, q, 1.0)
     coefficient = sqrt(3.0 / (4.0 * pi))
     if l_value == 1:
         values = (
@@ -156,43 +167,254 @@ def _real_spherical_harmonics(l_value: int, vectors: np.ndarray) -> tuple[np.nda
             -coefficient * vectors[..., 0] / safe,
             -coefficient * vectors[..., 1] / safe,
         )
-        return tuple(np.where(q > 1e-14, value, 0.0) for value in values)
+        return tuple(mx.where(q > 1e-14, value, 0.0) for value in values)
     msg = f"periodic GTH spherical harmonics currently support l<=1, received {l_value}"
     raise ValueError(msg)
 
 
 @dataclass(frozen=True)
+class _ProjectorCacheEntry:
+    values: mx.array
+    byte_count: int
+
+
+class _GTHProjectorCache:
+    """Bounded context-owned LRU cache for compact GTH projector groups."""
+
+    DEFAULT_BUDGET_BYTES = 64 * 1024 * 1024
+
+    def __init__(self, byte_budget: int = DEFAULT_BUDGET_BYTES):
+        if byte_budget <= 0:
+            msg = "GTH projector cache byte budget must be positive"
+            raise ValueError(msg)
+        self.byte_budget = int(byte_budget)
+        self._entries: OrderedDict[tuple[object, ...], _ProjectorCacheEntry] = (
+            OrderedDict()
+        )
+        self._context_identity: str | None = None
+        self._current_bytes = 0
+        self._peak_bytes = 0
+        self._evictions = 0
+        self._invalidations = 0
+        self._closed = False
+
+    @property
+    def current_bytes(self) -> int:
+        """Return bytes currently retained by cache entries."""
+
+        return self._current_bytes
+
+    @property
+    def peak_bytes(self) -> int:
+        """Return the largest retained cache payload."""
+
+        return self._peak_bytes
+
+    @property
+    def entry_count(self) -> int:
+        """Return the current cache entry count."""
+
+        return len(self._entries)
+
+    @property
+    def evictions(self) -> int:
+        """Return the cumulative deterministic eviction count."""
+
+        return self._evictions
+
+    @property
+    def invalidations(self) -> int:
+        """Return the cumulative context invalidation count."""
+
+        return self._invalidations
+
+    def bind(self, context_identity: str) -> None:
+        """Bind the cache to one geometry/cell/pseudopotential context."""
+
+        if self._closed:
+            msg = "closed GTH projector cache cannot be rebound"
+            raise RuntimeError(msg)
+        if self._context_identity is None:
+            self._context_identity = context_identity
+        elif self._context_identity != context_identity:
+            self.clear()
+            self._context_identity = context_identity
+            self._invalidations += 1
+
+    def __enter__(self) -> _GTHProjectorCache:
+        """Enter this cache's deterministic lifetime boundary."""
+
+        if self._closed:
+            msg = "closed GTH projector cache cannot be entered"
+            raise RuntimeError(msg)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Close the cache when its owning runtime context exits."""
+
+        self.close()
+
+    def get(self, key: tuple[object, ...]) -> mx.array | None:
+        """Return and refresh one cached projector group."""
+
+        if self._closed:
+            msg = "closed GTH projector cache cannot be read"
+            raise RuntimeError(msg)
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._entries.move_to_end(key)
+        return entry.values
+
+    def put(
+        self,
+        key: tuple[object, ...],
+        values: mx.array,
+        *,
+        protected_keys: Set[tuple[object, ...]] = frozenset(),
+    ) -> tuple[int, bool]:
+        """Insert one group without evicting inputs of the active lazy action."""
+
+        if self._closed:
+            msg = "closed GTH projector cache cannot be written"
+            raise RuntimeError(msg)
+        payload = mx.array(values)
+        byte_count = int(np.prod(payload.shape)) * 8
+        if byte_count > self.byte_budget:
+            return 0, False
+        existing = self._entries.pop(key, None)
+        if existing is not None:
+            self._current_bytes -= existing.byte_count
+        removable_bytes = sum(
+            entry.byte_count
+            for candidate, entry in self._entries.items()
+            if candidate not in protected_keys
+        )
+        if self._current_bytes + byte_count - removable_bytes > self.byte_budget:
+            if existing is not None:
+                self._entries[key] = existing
+                self._current_bytes += existing.byte_count
+            return 0, False
+        evicted = 0
+        while self._entries and self._current_bytes + byte_count > self.byte_budget:
+            candidate = next(
+                candidate
+                for candidate in self._entries
+                if candidate not in protected_keys
+            )
+            entry = self._entries.pop(candidate)
+            self._current_bytes -= entry.byte_count
+            self._evictions += 1
+            evicted += 1
+        self._entries[key] = _ProjectorCacheEntry(payload, byte_count)
+        self._current_bytes += byte_count
+        self._peak_bytes = max(self._peak_bytes, self._current_bytes)
+        return evicted, True
+
+    def clear(self) -> None:
+        """Release every cached MLX projector buffer."""
+
+        self._entries.clear()
+        self._current_bytes = 0
+
+    def close(self) -> None:
+        """Clear and permanently close this runtime cache context."""
+
+        self.clear()
+        self._context_identity = None
+        self._closed = True
+
+
+def _pseudopotential_fingerprint(pseudopotential: PseudopotentialData) -> str:
+    digest = sha256()
+    digest.update(b"mlx-atomistic.gth-nonlocal.v1\0")
+    digest.update(pseudopotential.element.encode("utf-8"))
+    digest.update(str(pseudopotential.format).encode("utf-8"))
+    digest.update(
+        np.asarray(
+            [
+                pseudopotential.valence_charge,
+                float(pseudopotential.gth_rloc),
+                *pseudopotential.gth_coefficients,
+            ],
+            dtype=np.float64,
+        ).tobytes()
+    )
+    for channel in pseudopotential.gth_channels:
+        digest.update(np.asarray([channel.angular_momentum], dtype=np.int64).tobytes())
+        digest.update(np.asarray([channel.radius], dtype=np.float64).tobytes())
+        digest.update(np.asarray(channel.coupling_matrix, dtype=np.float64).tobytes())
+    return digest.hexdigest()
+
+
+def _projector_context_identity(
+    pseudopotential: PseudopotentialData,
+    basis: PlaneWaveBasis,
+    positions: np.ndarray,
+) -> str:
+    digest = sha256()
+    digest.update(b"mlx-atomistic.gth-projector-context.v1\0")
+    digest.update(_pseudopotential_fingerprint(pseudopotential).encode("ascii"))
+    digest.update(basis.reciprocal_grid.fingerprint.encode("ascii"))
+    digest.update(np.asarray(positions, dtype=np.float64).tobytes())
+    digest.update(b"complex64-float32\0")
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
 class PeriodicGTHNonlocalOperator:
-    """Complete separable GTH nonlocal operator at one Bloch k-point."""
+    """Complete compact separable GTH operator at one Bloch k-point."""
 
     pseudopotential: PseudopotentialData
     basis: PlaneWaveBasis
     positions: np.ndarray
+    _cache: _GTHProjectorCache
+    _context_identity: str
+    _owns_cache: bool
 
     def __init__(
         self,
         pseudopotential: PseudopotentialData,
         basis: PlaneWaveBasis,
         positions: Sequence[Sequence[float]],
+        *,
+        cache: _GTHProjectorCache | None = None,
+        cache_budget_bytes: int = _GTHProjectorCache.DEFAULT_BUDGET_BYTES,
     ):
         _validated_gth(pseudopotential)
         if not pseudopotential.gth_channels:
             msg = "GTH pseudopotential has no complete nonlocal channels"
             raise ValueError(msg)
+        centers = _positions(positions)
+        projector_cache = (
+            _GTHProjectorCache(cache_budget_bytes) if cache is None else cache
+        )
+        context_identity = _projector_context_identity(
+            pseudopotential,
+            basis,
+            centers,
+        )
+        projector_cache.bind(context_identity)
         object.__setattr__(self, "pseudopotential", pseudopotential)
         object.__setattr__(self, "basis", basis)
-        object.__setattr__(self, "positions", _positions(positions))
+        object.__setattr__(self, "positions", centers)
+        object.__setattr__(self, "_cache", projector_cache)
+        object.__setattr__(self, "_context_identity", context_identity)
+        object.__setattr__(self, "_owns_cache", cache is None)
 
     def _projector_group(
         self,
         position: np.ndarray,
         channel: GTHProjectorChannel,
-        harmonic: np.ndarray,
-        vectors: np.ndarray,
-        mask: np.ndarray,
+        harmonic: mx.array,
+        vectors: mx.array,
+        q: mx.array,
     ) -> mx.array:
-        q = np.linalg.norm(vectors, axis=-1)
-        phase = np.exp(-1j * np.einsum("...d,d->...", vectors, position, optimize=True))
+        center = mx.array(np.asarray(position, dtype=np.float32))
+        phase = mx.exp(
+            mx.array(-1j, dtype=mx.complex64)
+            * mx.sum(vectors * center[None, :], axis=-1)
+        )
         angular_phase = (-1j) ** channel.angular_momentum
         prefactor = (
             4.0
@@ -208,8 +430,124 @@ class PeriodicGTHNonlocalOperator:
         for projector_index in range(channel.projector_count):
             radial = _gth_radial(channel, projector_index, q)
             values = prefactor * radial * harmonic * phase * angular_phase
-            projectors.append(np.where(mask, values, 0.0).astype(np.complex64))
-        return mx.array(np.stack(projectors))
+            projectors.append(values.astype(mx.complex64))
+        return mx.stack(projectors, axis=0)
+
+    def _cache_key(
+        self,
+        ion_index: int,
+        channel_index: int,
+        harmonic_index: int,
+    ) -> tuple[object, ...]:
+        return (
+            self._context_identity,
+            self.basis.basis_fingerprint,
+            self.basis.order_fingerprint,
+            ion_index,
+            channel_index,
+            harmonic_index,
+            "complex64",
+        )
+
+    def _apply_compact(
+        self,
+        coefficients: _CompactLaneState,
+    ) -> tuple[_CompactLaneState, dict[str, int]]:
+        self._cache.bind(self._context_identity)
+        self.basis._validate_state(coefficients)
+        if coefficients.kind != "coefficients":
+            msg = "GTH input must be coefficient state"
+            raise ValueError(msg)
+        vectors = self.basis.active_shifted_vectors
+        q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
+        harmonics = {
+            channel.angular_momentum: _real_spherical_harmonics(
+                channel.angular_momentum,
+                vectors,
+                q,
+            )
+            for channel in self.pseudopotential.gth_channels
+        }
+        output = mx.zeros_like(coefficients.values)
+        generated_elements = 0
+        loaded_elements = 0
+        payload_elements = 0
+        cache_hits = 0
+        cache_misses = 0
+        cache_evictions = 0
+        protected_keys: set[tuple[object, ...]] = set()
+        peak_workspace_bytes = int(np.prod(output.shape)) * 8
+        vector_count = coefficients.vector_count
+        for ion_index, position in enumerate(self.positions):
+            for channel_index, channel in enumerate(
+                self.pseudopotential.gth_channels
+            ):
+                coupling = mx.array(
+                    np.asarray(channel.coupling_matrix, dtype=np.float32)
+                )
+                for harmonic_index, harmonic in enumerate(
+                    harmonics[channel.angular_momentum]
+                ):
+                    key = self._cache_key(
+                        ion_index,
+                        channel_index,
+                        harmonic_index,
+                    )
+                    beta = self._cache.get(key)
+                    group_elements = channel.projector_count * self.basis.active_count
+                    if beta is None:
+                        cache_misses += 1
+                        beta = self._projector_group(
+                            position,
+                            channel,
+                            harmonic,
+                            vectors,
+                            q,
+                        )
+                        generated_elements += group_elements
+                        evictions, inserted = self._cache.put(
+                            key,
+                            beta,
+                            protected_keys=protected_keys,
+                        )
+                        cache_evictions += evictions
+                        if inserted:
+                            protected_keys.add(key)
+                    else:
+                        cache_hits += 1
+                        protected_keys.add(key)
+                    payload_elements += group_elements
+                    loaded_elements += 2 * vector_count * group_elements
+                    overlaps = mx.conjugate(beta) @ mx.transpose(coefficients.values)
+                    mixed = coupling @ overlaps
+                    output = output + mx.transpose(mixed) @ beta
+                    peak_workspace_bytes = max(
+                        peak_workspace_bytes,
+                        (
+                            int(np.prod(output.shape))
+                            + 2 * int(np.prod(overlaps.shape))
+                        )
+                        * 8,
+                    )
+        # Projector cache entries must not remain dependencies of caller-owned
+        # lazy results: a later context rebind or LRU eviction must be able to
+        # release them without retaining hidden graph-owned projector buffers.
+        mx.eval(output)
+        action = self.basis._state_from_compact(
+            output,
+            kind="hamiltonian_action",
+        )
+        return action, {
+            "projector_payload_elements": payload_elements,
+            "projector_elements_generated": generated_elements,
+            "projector_elements_loaded": loaded_elements,
+            "projector_traffic_elements": generated_elements + loaded_elements,
+            "projector_cache_hits": cache_hits,
+            "projector_cache_misses": cache_misses,
+            "projector_cache_evictions": cache_evictions,
+            "projector_cache_bytes": self._cache.current_bytes,
+            "projector_peak_workspace_bytes": peak_workspace_bytes,
+        }
 
     def apply(self, coefficients: mx.array) -> mx.array:
         """Apply the nonlocal operator to one orbital or an orbital stack.
@@ -221,46 +559,9 @@ class PeriodicGTHNonlocalOperator:
             Nonlocal operator action with the same shape.
         """
 
-        values = mx.array(coefficients)
-        was_single = values.shape == self.basis.grid.shape
-        stack = mx.reshape(values, (1, *values.shape)) if was_single else values
-        if len(stack.shape) != 4 or stack.shape[1:] != self.basis.grid.shape:
-            msg = "coefficients must have shape grid.shape or (n, *grid.shape)"
-            raise ValueError(msg)
-        stack = self.basis.project(stack)
-        vectors = np.asarray(self.basis.shifted_vectors, dtype=np.float64)
-        mask = np.asarray(self.basis.mask)
-        outputs = []
-        for orbital_index in range(int(stack.shape[0])):
-            orbital = mx.reshape(stack[orbital_index], (self.basis.grid.size,))
-            output = mx.zeros((self.basis.grid.size,), dtype=stack.dtype)
-            for position in self.positions:
-                for channel in self.pseudopotential.gth_channels:
-                    coupling = mx.array(
-                        np.asarray(channel.coupling_matrix, dtype=np.float32)
-                    )
-                    for harmonic in _real_spherical_harmonics(
-                        channel.angular_momentum,
-                        vectors,
-                    ):
-                        beta = self._projector_group(
-                            position,
-                            channel,
-                            harmonic,
-                            vectors,
-                            mask,
-                        )
-                        beta_flat = mx.reshape(
-                            beta,
-                            (channel.projector_count, self.basis.grid.size),
-                        )
-                        overlaps = mx.sum(mx.conjugate(beta_flat) * orbital[None, :], axis=1)
-                        mixed = coupling @ overlaps
-                        applied = mx.sum(beta_flat * mixed[:, None], axis=0)
-                        output = output + applied
-            outputs.append(mx.reshape(output, self.basis.grid.shape))
-        projected = self.basis.project(mx.stack(outputs, axis=0))
-        return projected[0] if was_single else projected
+        state, was_single = self.basis._state_from_full(coefficients)
+        applied, _ = self._apply_compact(state)
+        return self.basis._layout.unpack_fresh(applied.values, single=was_single)
 
     def energy(
         self,
@@ -278,18 +579,40 @@ class PeriodicGTHNonlocalOperator:
             Real occupied nonlocal energy.
         """
 
-        stack = mx.array(coefficients)
-        if stack.shape == self.basis.grid.shape:
-            stack = mx.reshape(stack, (1, *self.basis.grid.shape))
-        if len(occupations) != int(stack.shape[0]):
+        state, _ = self.basis._state_from_full(coefficients)
+        if len(occupations) != state.vector_count:
             msg = "occupations length must match the orbital count"
             raise ValueError(msg)
-        applied = self.apply(stack)
-        energy = mx.array(0.0, dtype=mx.float32)
-        for index, occupation in enumerate(occupations):
-            expectation = mx.sum(mx.conjugate(stack[index]) * applied[index])
-            energy = energy + float(occupation) * mx.real(expectation)
-        return energy
+        applied, _ = self._apply_compact(state)
+        expectations = mx.real(
+            mx.sum(mx.conjugate(state.values) * applied.values, axis=1)
+        )
+        return mx.sum(
+            expectations
+            * mx.array(np.asarray(occupations, dtype=np.float32))
+        )
+
+    def cache_info(self) -> dict[str, int]:
+        """Return bounded projector-cache accounting.
+
+        Returns:
+            Budget, retained/peak bytes, entries, evictions, and invalidations.
+        """
+
+        return {
+            "byte_budget": self._cache.byte_budget,
+            "current_bytes": self._cache.current_bytes,
+            "peak_bytes": self._cache.peak_bytes,
+            "entry_count": self._cache.entry_count,
+            "evictions": self._cache.evictions,
+            "invalidations": self._cache.invalidations,
+        }
+
+    def close(self) -> None:
+        """Release an operator-owned projector cache context."""
+
+        if self._owns_cache:
+            self._cache.close()
 
     def to_dict(self) -> dict[str, object]:
         """Return JSON-safe nonlocal operator metadata.

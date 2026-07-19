@@ -29,7 +29,9 @@ from mlx_atomistic.dft._compact import (
     _CompactLaneState,
     _remap_initial_coefficients,
 )
+from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import KPoint, KPointMesh
+from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
 from mlx_atomistic.dft.periodic_scf import _density_from_kpoints
 from mlx_atomistic.dft.runtime_state import (
     fixed_density_state_metrics,
@@ -278,6 +280,197 @@ def test_compact_gth_compatibility_matches_dense_formula_boundary():
         "fft_workspace",
     }.intersection(vars(basis))
     assert not {"dense_coefficients", "fft_workspace"}.intersection(vars(operator))
+
+
+def test_gth_projector_vector_width_matches_independent_compact_oracle():
+    basis = _basis(cutoff=4.0)
+    state = _random_state(basis, vectors=3, seed=17)
+    pseudo = _hydrogen_gth()
+    position = np.asarray((1.0, 2.0, 3.0), dtype=np.float64)
+    operator = PeriodicGTHNonlocalOperator(pseudo, basis, (position,))
+
+    observed, metrics = operator._apply_compact(state)
+    vectors = np.asarray(basis.active_shifted_vectors, dtype=np.float64)
+    q = np.linalg.norm(vectors, axis=1)
+    channel = pseudo.gth_channels[0]
+    prefactor = (
+        4.0
+        * np.pi
+        * np.pi**0.25
+        * np.sqrt(2.0 * channel.radius**3 / basis.volume)
+    )
+    beta = (
+        prefactor
+        * np.exp(-0.5 * (q * channel.radius) ** 2)
+        / np.sqrt(4.0 * np.pi)
+        * np.exp(-1j * (vectors @ position))
+    ).astype(np.complex64)
+    coefficients = np.asarray(state.values)
+    overlaps = np.conjugate(beta)[None, :] @ coefficients.T
+    expected = (0.5 * overlaps).T @ beta[None, :]
+
+    np.testing.assert_allclose(
+        np.asarray(observed.values),
+        expected,
+        atol=3e-5,
+    )
+    assert metrics["projector_payload_elements"] == basis.active_count
+    assert metrics["projector_elements_generated"] == basis.active_count
+    assert metrics["projector_elements_loaded"] == 6 * basis.active_count
+    assert all(
+        entry.values.shape == (1, basis.active_count)
+        for entry in operator._cache._entries.values()
+    )
+
+
+def test_gth_projector_generation_count_cache_hits_and_hpsi_traffic():
+    basis = _basis(cutoff=4.0)
+    state = _random_state(basis, vectors=3, seed=23)
+    gth = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        basis,
+        ((1.0, 2.0, 3.0),),
+    )
+    observer = RuntimeObserver(synchronize=mx.synchronize)
+    operator = PeriodicKohnShamOperator(
+        basis,
+        mx.full(basis.grid.shape, 0.2),
+        gth,
+        observer,
+    )
+
+    first = operator._apply_compact(state)
+    second = operator._apply_compact(state)
+    mx.eval(first.values, second.values)
+    snapshot = observer.snapshot()
+    work = snapshot["work_counters"]
+    memory = snapshot["memory"]
+
+    assert work["hpsi_calls"] == 2
+    assert work["projector_cache_misses"] == 1
+    assert work["projector_cache_hits"] == 1
+    assert work["projector_elements_generated"] == basis.active_count
+    assert work["projector_elements_loaded"] == 12 * basis.active_count
+    assert work["projector_traffic_elements"] == 13 * basis.active_count
+    assert memory["projector_payload_bytes"] == basis.active_count * 8
+    assert memory["persistent_projector_bytes"] == basis.active_count * 8
+    assert memory["peak_temporary_bytes"] < 2 * 3 * basis.grid.size * 8 * 2
+
+
+def test_gth_projector_cache_eviction_invalidation_and_context_lifetime():
+    basis = _basis(cutoff=4.0)
+    entry_bytes = basis.active_count * 8
+    cache = _GTHProjectorCache(byte_budget=entry_bytes)
+    state = _random_state(basis, vectors=1, seed=31)
+    positions = np.asarray(
+        ((1.0, 2.0, 3.0), (3.0, 2.0, 1.0)),
+        dtype=np.float64,
+    )
+    first = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        basis,
+        positions,
+        cache=cache,
+    )
+    positions[0, 0] = 7.0
+
+    action, metrics = first._apply_compact(state)
+
+    assert first.positions[0, 0] == 1.0
+    assert not first.positions.flags.writeable
+    assert metrics["projector_cache_evictions"] == 0
+    assert cache.entry_count == 1
+    assert cache.current_bytes == entry_bytes
+    assert cache.current_bytes <= cache.byte_budget
+    assert all(not callable(entry) for entry in cache._entries.values())
+
+    second = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        basis,
+        ((1.5, 2.0, 3.0),),
+        cache=cache,
+    )
+    assert cache.invalidations == 1
+    assert cache.entry_count == 0
+    assert cache.current_bytes == 0
+
+    first._apply_compact(state)
+    assert cache.invalidations == 2
+    assert all(key[0] == first._context_identity for key in cache._entries)
+    second._apply_compact(state)
+    assert cache.invalidations == 3
+    assert all(key[0] == second._context_identity for key in cache._entries)
+
+    cache.close()
+    assert cache.current_bytes == 0
+    assert np.isfinite(np.asarray(action.values)).all()
+    with pytest.raises(RuntimeError, match="closed"):
+        cache.get(("closed",))
+
+
+def test_gth_projector_cache_evicts_lru_only_between_evaluated_actions():
+    first_basis = _basis(cutoff=4.0, kpoint=(0.25, 0.0, 0.0))
+    second_basis = _basis(cutoff=4.0, kpoint=(-0.25, 0.0, 0.0))
+    assert first_basis.active_count == second_basis.active_count
+    cache = _GTHProjectorCache(byte_budget=first_basis.active_count * 8)
+    first = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        first_basis,
+        ((1.0, 2.0, 3.0),),
+        cache=cache,
+    )
+    second = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        second_basis,
+        ((1.0, 2.0, 3.0),),
+        cache=cache,
+    )
+
+    first._apply_compact(_random_state(first_basis, vectors=1, seed=37))
+    _, metrics = second._apply_compact(
+        _random_state(second_basis, vectors=1, seed=41)
+    )
+
+    assert metrics["projector_cache_evictions"] == 1
+    assert cache.evictions == 1
+    assert cache.entry_count == 1
+    assert next(iter(cache._entries))[1] == second_basis.basis_fingerprint
+
+
+def test_scf_projector_cache_closes_when_runtime_context_raises(monkeypatch):
+    import importlib
+
+    periodic_scf = importlib.import_module("mlx_atomistic.dft.periodic_scf")
+    captured: dict[str, _GTHProjectorCache] = {}
+
+    def fail_with_cache(*args, projector_cache, **kwargs):
+        del args, kwargs
+        captured["cache"] = projector_cache
+        _, inserted = projector_cache.put(
+            ("held",),
+            mx.ones((1, 1), dtype=mx.complex64),
+        )
+        assert inserted
+        raise RuntimeError("injected SCF failure")
+
+    monkeypatch.setattr(
+        periodic_scf,
+        "_run_periodic_scf_with_projector_cache",
+        fail_with_cache,
+    )
+    with pytest.raises(RuntimeError, match="injected SCF failure"):
+        periodic_scf.run_periodic_scf(
+            object(),
+            cutoff_hartree=1.0,
+            kpoint_mesh=KPointMesh(
+                [KPoint((0.0, 0.0, 0.0), coordinate_system="reduced")]
+            ),
+        )
+
+    cache = captured["cache"]
+    assert cache.current_bytes == 0
+    with pytest.raises(RuntimeError, match="closed"):
+        cache.get(("held",))
 
 
 def test_eigen_result_memory_owns_compact_state_and_fresh_public_values():

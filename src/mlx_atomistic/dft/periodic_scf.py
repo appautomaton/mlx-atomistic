@@ -27,6 +27,7 @@ from mlx_atomistic.dft.kpoints import KPointMesh
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
+    _GTHProjectorCache,
     gth_local_potential_grid,
     periodic_ewald_energy,
 )
@@ -323,11 +324,23 @@ def _logical_hpsi_memory(
     grid_count: int,
     projector_elements: int,
 ) -> tuple[int, int]:
-    # Hpsi builds one lazy expression and synchronizes only at the observed
-    # phase boundary. Projector leaves for every vector/ion/channel therefore
-    # remain graph-owned together until that evaluation completes.
+    """Preserve the frozen full-grid Hpsi memory model for baseline audits."""
+
     fft_workspace_bytes = 2 * vector_count * grid_count * 8
     peak_temporary_bytes = fft_workspace_bytes + projector_elements * 8
+    return fft_workspace_bytes, peak_temporary_bytes
+
+
+def _compact_hpsi_memory(
+    *,
+    vector_count: int,
+    grid_count: int,
+    projector_workspace_bytes: int,
+) -> tuple[int, int]:
+    """Return compact FFT and GTH workspace bytes for one Hpsi batch."""
+
+    fft_workspace_bytes = 2 * vector_count * grid_count * 8
+    peak_temporary_bytes = fft_workspace_bytes + projector_workspace_bytes
     return fft_workspace_bytes, peak_temporary_bytes
 
 
@@ -363,18 +376,6 @@ class PeriodicKohnShamOperator:
         applied = self._apply_compact(state, observer=observer)
         return self.basis._layout.unpack_fresh(applied.values, single=was_single)
 
-    def _apply_legacy_gth_full_grid_compat(
-        self,
-        batch: _CompactBatch,
-        scattered: mx.array,
-    ) -> _CompactLaneState:
-        if self.nonlocal_operator is None:
-            msg = "legacy GTH compatibility requires a nonlocal operator"
-            raise ValueError(msg)
-        dense_action = self.nonlocal_operator.apply(scattered[0])
-        padded = batch.gather(dense_action[None, ...])
-        return batch.unpad(padded, kind="hamiltonian_action")[0]
-
     def _apply_compact(
         self,
         coefficients: _CompactLaneState,
@@ -390,31 +391,25 @@ class PeriodicKohnShamOperator:
             raise ValueError(msg)
         runtime_observer = self.observer if observer is None else observer
         vector_count = coefficients.vector_count
-        projector_elements = 0
-        if self.nonlocal_operator is not None:
-            projector_count = sum(
-                channel.projector_count * (2 * channel.angular_momentum + 1)
-                for channel in self.nonlocal_operator.pseudopotential.gth_channels
-            )
-            projector_elements = (
-                vector_count
-                * self.basis.grid.size
-                * int(self.nonlocal_operator.positions.shape[0])
-                * projector_count
-            )
+        projector_metrics = {
+            "projector_payload_elements": 0,
+            "projector_elements_generated": 0,
+            "projector_elements_loaded": 0,
+            "projector_traffic_elements": 0,
+            "projector_cache_hits": 0,
+            "projector_cache_misses": 0,
+            "projector_cache_bytes": 0,
+            "projector_peak_workspace_bytes": 0,
+        }
         if runtime_observer is not None:
-            fft_workspace_bytes, peak_temporary_bytes = _logical_hpsi_memory(
+            fft_workspace_bytes, _ = _compact_hpsi_memory(
                 vector_count=vector_count,
                 grid_count=self.basis.grid.size,
-                projector_elements=projector_elements,
+                projector_workspace_bytes=0,
             )
             runtime_observer.record_peak_memory(
                 "fft_workspace_bytes",
                 fft_workspace_bytes,
-            )
-            runtime_observer.record_peak_memory(
-                "peak_temporary_bytes",
-                peak_temporary_bytes,
             )
         with observed_phase(runtime_observer, "hpsi"):
             batch = _CompactBatch.from_states([coefficients])
@@ -432,9 +427,8 @@ class PeriodicKohnShamOperator:
             )[0]
             applied_values = kinetic + local.values
             if self.nonlocal_operator is not None:
-                nonlocal_action = self._apply_legacy_gth_full_grid_compat(
-                    batch,
-                    scattered,
+                nonlocal_action, projector_metrics = (
+                    self.nonlocal_operator._apply_compact(coefficients)
                 )
                 applied_values = applied_values + nonlocal_action.values
             result = self.basis._state_from_compact(
@@ -448,16 +442,40 @@ class PeriodicKohnShamOperator:
                 "hpsi_vector_equivalents": vector_count,
                 "fft_submissions": 2,
                 "fft_vector_equivalents": 2 * vector_count,
-                "projector_elements_generated": projector_elements,
-                "projector_elements_loaded": 2 * projector_elements,
-                "projector_traffic_elements": 3 * projector_elements,
+                "projector_elements_generated": projector_metrics[
+                    "projector_elements_generated"
+                ],
+                "projector_elements_loaded": projector_metrics[
+                    "projector_elements_loaded"
+                ],
+                "projector_traffic_elements": projector_metrics[
+                    "projector_traffic_elements"
+                ],
+                "projector_cache_hits": projector_metrics["projector_cache_hits"],
+                "projector_cache_misses": projector_metrics[
+                    "projector_cache_misses"
+                ],
             },
         )
-        if runtime_observer is not None and projector_elements:
-            per_vector_projector_elements = projector_elements // vector_count
+        if runtime_observer is not None:
+            _, peak_temporary_bytes = _compact_hpsi_memory(
+                vector_count=vector_count,
+                grid_count=self.basis.grid.size,
+                projector_workspace_bytes=projector_metrics[
+                    "projector_peak_workspace_bytes"
+                ],
+            )
+            runtime_observer.record_peak_memory(
+                "peak_temporary_bytes",
+                peak_temporary_bytes,
+            )
             runtime_observer.record_memory(
                 "projector_payload_bytes",
-                per_vector_projector_elements * 8,
+                projector_metrics["projector_payload_elements"] * 8,
+            )
+            runtime_observer.record_memory(
+                "persistent_projector_bytes",
+                projector_metrics["projector_cache_bytes"],
             )
         return result
 
@@ -799,7 +817,7 @@ def _density_residual(current: mx.array, target: mx.array, grid: RealSpaceGrid) 
     return float(mx.sqrt(mx.sum(delta * delta) * grid.dv))
 
 
-def run_periodic_scf(
+def _run_periodic_scf_with_projector_cache(
     system: PeriodicDFTSystem,
     *,
     cutoff_hartree: float,
@@ -810,8 +828,9 @@ def run_periodic_scf(
     initial_density: mx.array | None = None,
     initial_coefficients: Sequence[mx.array] | None = None,
     observer: RuntimeObserver | None = None,
+    projector_cache: _GTHProjectorCache,
 ) -> PeriodicSCFResult:
-    """Run weighted self-consistent periodic plane-wave DFT.
+    """Run periodic SCF inside a caller-owned projector-cache lifetime.
 
     Args:
         system: Periodic GTH system.
@@ -823,6 +842,7 @@ def run_periodic_scf(
         initial_density: Optional starting density on the FFT grid.
         initial_coefficients: Optional orbital stack per k-point.
         observer: Optional progress, synchronized timing, and work observer.
+        projector_cache: Cache closed by the public runtime-context wrapper.
 
     Returns:
         Periodic SCF result with complete weighted k-point diagnostics.
@@ -867,6 +887,15 @@ def run_periodic_scf(
             reciprocal_grid=shared_reciprocal,
             lane_label="gamma-local-potential",
         )
+        nonlocal_operators = [
+            PeriodicGTHNonlocalOperator(
+                system.pseudopotential,
+                basis,
+                system.positions,
+                cache=projector_cache,
+            )
+            for basis in bases
+        ]
         local_potential = gth_local_potential_grid(
             system.pseudopotential,
             gamma_basis,
@@ -934,7 +963,14 @@ def run_periodic_scf(
         results = []
         max_orbital_residual = 0.0
         start = perf_counter()
-        for point_index, (point, basis) in enumerate(zip(kpoint_mesh.points, bases, strict=True)):
+        for point_index, (point, basis, nonlocal_operator) in enumerate(
+            zip(
+                kpoint_mesh.points,
+                bases,
+                nonlocal_operators,
+                strict=True,
+            )
+        ):
             if observer is not None:
                 observer.emit(
                     "kpoint_batch",
@@ -944,11 +980,6 @@ def run_periodic_scf(
                     batch_size=1,
                     reduced_kpoints=[list(point.vector)],
                 )
-            nonlocal_operator = PeriodicGTHNonlocalOperator(
-                system.pseudopotential,
-                basis,
-                system.positions,
-            )
             operator = PeriodicKohnShamOperator(
                 basis,
                 effective,
@@ -1095,3 +1126,47 @@ def run_periodic_scf(
         history=tuple(history),
         timings=timings,
     )
+
+
+def run_periodic_scf(
+    system: PeriodicDFTSystem,
+    *,
+    cutoff_hartree: float,
+    kpoint_mesh: KPointMesh,
+    n_bands: int | None = None,
+    config: PeriodicSCFConfig | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
+    initial_density: mx.array | None = None,
+    initial_coefficients: Sequence[mx.array] | None = None,
+    observer: RuntimeObserver | None = None,
+) -> PeriodicSCFResult:
+    """Run weighted self-consistent periodic plane-wave DFT.
+
+    Args:
+        system: Periodic GTH system.
+        cutoff_hartree: Kinetic cutoff in Hartree.
+        kpoint_mesh: Weighted reduced-coordinate k-point mesh.
+        n_bands: Number of occupied bands. Defaults to half the electron count.
+        config: SCF controls. Defaults to `PeriodicSCFConfig`.
+        xc_functional: Exchange-correlation functional. Defaults to production PBE.
+        initial_density: Optional starting density on the FFT grid.
+        initial_coefficients: Optional orbital stack per k-point.
+        observer: Optional progress, synchronized timing, and work observer.
+
+    Returns:
+        Periodic SCF result with complete weighted k-point diagnostics.
+    """
+
+    with _GTHProjectorCache() as projector_cache:
+        return _run_periodic_scf_with_projector_cache(
+            system,
+            cutoff_hartree=cutoff_hartree,
+            kpoint_mesh=kpoint_mesh,
+            n_bands=n_bands,
+            config=config,
+            xc_functional=xc_functional,
+            initial_density=initial_density,
+            initial_coefficients=initial_coefficients,
+            observer=observer,
+            projector_cache=projector_cache,
+        )
