@@ -6,14 +6,17 @@ import pytest
 
 from mlx_atomistic.dft import (
     GTHProjectorChannel,
+    PeriodicDavidsonConfig,
     PeriodicGTHNonlocalOperator,
     PeriodicKohnShamOperator,
     PlaneWaveBasis,
     PseudopotentialData,
     PseudopotentialFormat,
     RealSpaceGrid,
+    solve_periodic_eigenproblem,
 )
 from mlx_atomistic.dft._compact import _CompactBatch
+from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
 
 def _restore_runtime(device: mx.Device, stream: mx.Stream) -> None:
@@ -155,6 +158,67 @@ def test_compact_gth_hpsi_cache_executes_on_real_metal(monkeypatch):
     finally:
         if gth is not None:
             gth.close()
+        _restore_runtime(previous_device, previous_stream)
+
+    assert mx.default_device() == previous_device
+    assert mx.default_stream(previous_device) == previous_stream
+
+
+@pytest.mark.gpu
+def test_incremental_davidson_reuses_paired_hv_on_real_metal(monkeypatch):
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    previous_device = mx.default_device()
+    previous_stream = mx.default_stream(previous_device)
+    try:
+        metal_device = mx.Device(mx.gpu, 0)
+        metal_stream = mx.new_stream(metal_device)
+        mx.set_default_device(metal_device)
+        mx.set_default_stream(metal_stream)
+        grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+        basis = PlaneWaveBasis.from_reduced_kpoint(
+            grid,
+            4.0,
+            (0.25, 0.125, 0.0),
+            lane_label="metal:davidson",
+        )
+        coordinates = grid.coordinates()
+        potential = (
+            0.3 * mx.cos(2.0 * np.pi * coordinates[..., 0] / 8.0)
+            + 0.1 * mx.sin(2.0 * np.pi * coordinates[..., 1] / 8.0)
+        )
+        observer = RuntimeObserver(synchronize=mx.synchronize)
+        operator = PeriodicKohnShamOperator(
+            basis,
+            potential,
+            observer=observer,
+        )
+
+        result = solve_periodic_eigenproblem(
+            operator,
+            n_bands=2,
+            config=PeriodicDavidsonConfig(
+                max_iterations=5,
+                tolerance=1e-9,
+                max_subspace_size=8,
+            ),
+            observer=observer,
+        )
+        mx.eval(
+            result.eigenvalues,
+            result.residuals,
+            result._compact_coefficients.values,
+        )
+        mx.synchronize()
+
+        work = observer.snapshot()["work_counters"]
+        assert bool(mx.all(mx.isfinite(result.eigenvalues)))
+        assert work["davidson_hv_reused_vectors"] > 0
+        assert work["projected_old_old_rebuilds"] == 0
+        assert work["hpsi_vector_equivalents"] == work["davidson_hv_new_vectors"]
+        assert work["hpsi_calls"] <= result.iterations
+        assert mx.default_device() == metal_device
+        assert mx.default_stream(metal_device) == metal_stream
+    finally:
         _restore_runtime(previous_device, previous_stream)
 
     assert mx.default_device() == previous_device

@@ -66,14 +66,15 @@ class _CompactBasisLayout:
     reciprocal: ReciprocalGrid
     cutoff_hartree: float
     kpoint_cartesian: tuple[float, float, float]
-    active_flat_indices: mx.array
-    active_integer_g: mx.array
-    active_shifted_vectors: mx.array
-    active_kinetic_energies: mx.array
+    _active_flat_indices: mx.array
+    _active_integer_g: mx.array
+    _active_shifted_vectors: mx.array
+    _active_kinetic_energies: mx.array
     active_count: int
     order_fingerprint: str
     basis_fingerprint: str
     lane_id: str
+    _volume_snapshot: float
     _active_flat_indices_np: np.ndarray
     _active_integer_g_np: np.ndarray
 
@@ -127,6 +128,12 @@ class _CompactBasisLayout:
         ).astype(np.int32)
         active_shifted = mx.take(shifted, active_indices, axis=0)
         active_kinetic = mx.take(kinetic, active_indices, axis=0)
+        mx.eval(
+            active_indices,
+            active_integer_g,
+            active_shifted,
+            active_kinetic,
+        )
         active.setflags(write=False)
         integer_g_np.setflags(write=False)
 
@@ -150,18 +157,20 @@ class _CompactBasisLayout:
         lane_digest.update(b"mlx-atomistic.compact-plane-wave-lane.v1\0")
         lane_digest.update(basis_fingerprint.encode("ascii"))
         lane_digest.update(lane_label.encode("utf-8"))
+        volume_snapshot = float(reciprocal.real_grid.volume)
         return cls(
             reciprocal=reciprocal,
             cutoff_hartree=float(cutoff_hartree),
             kpoint_cartesian=tuple(float(value) for value in kpoint),
-            active_flat_indices=active_indices,
-            active_integer_g=active_integer_g,
-            active_shifted_vectors=active_shifted,
-            active_kinetic_energies=active_kinetic,
+            _active_flat_indices=active_indices,
+            _active_integer_g=active_integer_g,
+            _active_shifted_vectors=active_shifted,
+            _active_kinetic_energies=active_kinetic,
             active_count=active_count,
             order_fingerprint=order_fingerprint,
             basis_fingerprint=basis_fingerprint,
             lane_id=lane_digest.hexdigest(),
+            _volume_snapshot=volume_snapshot,
             _active_flat_indices_np=active,
             _active_integer_g_np=integer_g_np,
         )
@@ -180,16 +189,42 @@ class _CompactBasisLayout:
 
     @property
     def volume(self) -> float:
-        """Return the shared cell volume."""
+        """Return the cell volume captured when the layout was built."""
 
-        return self.reciprocal.real_grid.volume
+        return self._volume_snapshot
+
+    @staticmethod
+    def _fresh(values: mx.array) -> mx.array:
+        copied = mx.array(values)
+        mx.eval(copied)
+        return copied
+
+    def active_flat_indices_fresh(self) -> mx.array:
+        """Return a caller-owned copy of active FFT indices."""
+
+        return self._fresh(self._active_flat_indices)
+
+    def active_integer_g_fresh(self) -> mx.array:
+        """Return a caller-owned copy of active integer reciprocal vectors."""
+
+        return self._fresh(self._active_integer_g)
+
+    def active_shifted_vectors_fresh(self) -> mx.array:
+        """Return a caller-owned copy of shifted active reciprocal vectors."""
+
+        return self._fresh(self._active_shifted_vectors)
+
+    def active_kinetic_energies_fresh(self) -> mx.array:
+        """Return a caller-owned copy of active kinetic energies."""
+
+        return self._fresh(self._active_kinetic_energies)
 
     def mask_fresh(self) -> mx.array:
         """Materialize a fresh full-grid cutoff mask."""
 
         flat = mx.put_along_axis(
             mx.zeros((self.grid_size,), dtype=mx.float32),
-            self.active_flat_indices,
+            self._active_flat_indices,
             mx.ones((self.active_count,), dtype=mx.float32),
             axis=0,
         )
@@ -219,7 +254,7 @@ class _CompactBasisLayout:
         else:
             msg = "coefficients must have shape grid.shape or (n, *grid.shape)"
             raise ValueError(msg)
-        return mx.take(stack, self.active_flat_indices, axis=1), was_single
+        return mx.take(stack, self._active_flat_indices, axis=1), was_single
 
     def unpack_fresh(self, coefficients: mx.array, *, single: bool = False) -> mx.array:
         """Scatter compact coefficients into a fresh exact-zero full grid."""
@@ -232,7 +267,7 @@ class _CompactBasisLayout:
             msg = "compact coefficients must have shape (vectors, active_count)"
             raise ValueError(msg)
         indices = mx.broadcast_to(
-            self.active_flat_indices[None, :],
+            self._active_flat_indices[None, :],
             values.shape,
         )
         flat = _scatter_complex_zeros(
@@ -441,15 +476,20 @@ class _CompactBatch:
             msg = "compact batch exceeds the transient byte budget"
             raise ValueError(msg)
         padded_values = []
-        padded_indices = []
-        masks = []
-        all_grid_indices = np.arange(first.layout.grid_size, dtype=np.int32)
+        padded_indices: list[mx.array] = []
+        masks: list[mx.array] = []
+        all_grid_indices: np.ndarray | None = None
         for state in states:
             count = state.layout.active_count
             padding = bucket - count
             if padding:
                 zeros = mx.zeros((vector_count, padding), dtype=mx.complex64)
                 padded_values.append(mx.concatenate([state.values, zeros], axis=1))
+                if all_grid_indices is None:
+                    all_grid_indices = np.arange(
+                        first.layout.grid_size,
+                        dtype=np.int32,
+                    )
                 inactive = np.setdiff1d(
                     all_grid_indices,
                     state.layout._active_flat_indices_np,
@@ -459,20 +499,24 @@ class _CompactBatch:
                     msg = "compact FFT bucket has insufficient distinct padding indices"
                     raise ValueError(msg)
                 padded_indices.append(
-                    np.concatenate(
-                        [state.layout._active_flat_indices_np, inactive[:padding]]
+                    mx.concatenate(
+                        [
+                            state.layout._active_flat_indices,
+                            mx.array(inactive[:padding]),
+                        ]
                     )
                 )
+                masks.append(mx.arange(bucket) < count)
             else:
                 padded_values.append(state.values)
-                padded_indices.append(state.layout._active_flat_indices_np)
-            masks.append(np.arange(bucket) < count)
+                padded_indices.append(state.layout._active_flat_indices)
+                masks.append(mx.ones((bucket,), dtype=mx.bool_))
         return cls(
             values=mx.stack(padded_values, axis=0),
             layouts=tuple(state.layout for state in states),
             active_counts=tuple(state.layout.active_count for state in states),
-            fft_indices=mx.array(np.stack(padded_indices).astype(np.int32)),
-            valid_mask=mx.array(np.stack(masks)),
+            fft_indices=mx.stack(padded_indices, axis=0).astype(mx.int32),
+            valid_mask=mx.stack(masks, axis=0),
             kinds=tuple(state.kind for state in states),
             padding_elements=padding_elements,
             estimated_transient_bytes=estimated_transient_bytes,

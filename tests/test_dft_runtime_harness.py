@@ -2723,10 +2723,14 @@ def test_periodic_davidson_observer_counts_single_hpsi_hook_without_numerical_dr
         observer=observer,
     )
     snapshot = observer.snapshot()
-    assert snapshot["work_counters"]["hpsi_calls"] == observed.iterations + 3
-    assert snapshot["work_counters"]["fft_vector_equivalents"] == (
-        2 * snapshot["work_counters"]["hpsi_vector_equivalents"]
-    )
+    work = snapshot["work_counters"]
+    assert observed.iterations == 1
+    assert work["hpsi_calls"] == 1
+    assert work["hpsi_vector_equivalents"] == 3
+    assert work["davidson_hv_new_vectors"] == 3
+    assert work["davidson_hv_reused_vectors"] == 0
+    assert work["projected_old_old_rebuilds"] == 0
+    assert work["fft_vector_equivalents"] == 2 * work["hpsi_vector_equivalents"]
     assert len([event for event in events if event["event"] == "davidson_iteration"]) == (
         observed.iterations
     )

@@ -129,6 +129,58 @@ def test_compact_layout_order_identity_and_shared_reciprocal_metadata():
     assert legacy_descriptor.fingerprint == first.reciprocal_grid.fingerprint
 
 
+def test_public_active_metadata_mutation_cannot_change_layout_kinetic_or_scatter():
+    basis = _basis(cutoff=4.0, lane_label="metadata-mutation")
+    state = _random_state(basis, vectors=2, seed=101)
+    coordinates = basis.grid.coordinates()
+    potential = 0.2 + 0.1 * mx.cos(
+        2.0 * np.pi * coordinates[..., 0] / basis.grid.lengths[0]
+    )
+    operator = PeriodicKohnShamOperator(basis, potential)
+    expected_action = operator._apply_compact(state)
+    expected_full = state.full_grid_fresh()
+    expected_mask = basis.mask
+    mx.eval(expected_action.values, expected_full, expected_mask)
+    expected_indices = np.asarray(basis.active_flat_indices).copy()
+    expected_integer_g = np.asarray(basis.active_integer_g).copy()
+    expected_kinetic = np.asarray(basis.active_kinetic_energies).copy()
+
+    leaked_indices = basis.active_flat_indices
+    leaked_integer_g = basis.active_integer_g
+    leaked_kinetic = basis.active_kinetic_energies
+    leaked_indices[:] = mx.zeros_like(leaked_indices)
+    leaked_integer_g[:] = mx.zeros_like(leaked_integer_g)
+    leaked_kinetic[:] = mx.full(leaked_kinetic.shape, 113.0)
+
+    observed_action = operator._apply_compact(state)
+    observed_full = state.full_grid_fresh()
+    repacked, _ = basis._state_from_full(expected_full)
+    np.testing.assert_allclose(
+        np.asarray(observed_action.values),
+        np.asarray(expected_action.values),
+        atol=3e-6,
+    )
+    np.testing.assert_array_equal(np.asarray(observed_full), np.asarray(expected_full))
+    np.testing.assert_allclose(
+        np.asarray(repacked.values),
+        np.asarray(state.values),
+        atol=0.0,
+    )
+    np.testing.assert_array_equal(np.asarray(basis.mask), np.asarray(expected_mask))
+    np.testing.assert_array_equal(
+        np.asarray(basis.active_flat_indices),
+        expected_indices,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(basis.active_integer_g),
+        expected_integer_g,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(basis.active_kinetic_energies),
+        expected_kinetic,
+    )
+
+
 def test_compact_scatter_gather_round_trip_handles_ragged_lanes():
     first = _basis(cutoff=2.5, lane_label="first")
     second = PlaneWaveBasis.from_reduced_kpoint(
@@ -179,6 +231,29 @@ def test_compact_batch_memory_rejects_unbounded_padding_and_transient_bytes():
             (narrow_state,),
             max_transient_bytes=1,
         )
+
+
+def test_singleton_compact_batch_keeps_private_indices_on_device(monkeypatch):
+    basis = _basis(cutoff=4.0, lane_label="device-index-batch")
+    state = _random_state(basis, vectors=2, seed=103)
+
+    def reject_numpy_index_work(*args, **kwargs):
+        raise AssertionError("singleton compact batch copied active indices through NumPy")
+
+    monkeypatch.setattr(np, "arange", reject_numpy_index_work)
+    monkeypatch.setattr(np, "setdiff1d", reject_numpy_index_work)
+    monkeypatch.setattr(np, "stack", reject_numpy_index_work)
+
+    batch = _CompactBatch.from_states((state,))
+    scattered = batch.scatter()
+    restored = batch.unpad(batch.gather(scattered))[0]
+    monkeypatch.undo()
+
+    np.testing.assert_allclose(
+        np.asarray(restored.values),
+        np.asarray(state.values),
+        atol=0.0,
+    )
 
 
 def test_compact_multilane_local_action_uses_one_fft_pair(monkeypatch):
@@ -321,6 +396,74 @@ def test_gth_projector_vector_width_matches_independent_compact_oracle():
         entry.values.shape == (1, basis.active_count)
         for entry in operator._cache._entries.values()
     )
+
+
+def test_public_shifted_vector_mutation_cannot_change_gth_regeneration():
+    basis = _basis(cutoff=4.0, lane_label="gth-vector-mutation")
+    state = _random_state(basis, vectors=2, seed=109)
+    operator = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        basis,
+        ((1.0, 2.0, 3.0),),
+    )
+    try:
+        expected, _ = operator._apply_compact(state)
+        mx.eval(expected.values)
+        expected_vectors = np.asarray(basis.active_shifted_vectors).copy()
+        leaked_vectors = basis.active_shifted_vectors
+        leaked_vectors[:] = mx.zeros_like(leaked_vectors)
+        operator._cache.clear()
+
+        regenerated, metrics = operator._apply_compact(state)
+
+        np.testing.assert_allclose(
+            np.asarray(regenerated.values),
+            np.asarray(expected.values),
+            atol=3e-6,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(basis.active_shifted_vectors),
+            expected_vectors,
+        )
+        assert metrics["projector_cache_misses"] == 1
+    finally:
+        operator.close()
+
+
+def test_public_cell_matrix_mutation_cannot_change_gth_regeneration():
+    basis = _basis(cutoff=4.0, lane_label="gth-volume-mutation")
+    state = _random_state(basis, vectors=2, seed=113)
+    operator = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        basis,
+        ((1.0, 2.0, 3.0),),
+        cache_budget_bytes=1,
+    )
+    original_volume = basis.volume
+    try:
+        expected, first_metrics = operator._apply_compact(state)
+        mx.eval(expected.values)
+
+        matrix = basis.grid.cell.matrix
+        matrix[0, :] = 2.0 * matrix[0, :]
+        mx.eval(matrix)
+
+        regenerated, second_metrics = operator._apply_compact(state)
+
+        assert basis.grid.volume == pytest.approx(2.0 * original_volume)
+        assert basis.volume == original_volume
+        np.testing.assert_allclose(
+            np.asarray(regenerated.values),
+            np.asarray(expected.values),
+            atol=3e-6,
+        )
+        assert first_metrics["projector_cache_misses"] == 1
+        assert second_metrics["projector_cache_misses"] == 1
+        assert first_metrics["projector_elements_generated"] == basis.active_count
+        assert second_metrics["projector_elements_generated"] == basis.active_count
+        assert operator.cache_info()["entry_count"] == 0
+    finally:
+        operator.close()
 
 
 def test_gth_projector_generation_count_cache_hits_and_hpsi_traffic():

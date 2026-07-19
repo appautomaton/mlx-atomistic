@@ -458,7 +458,7 @@ class PeriodicGTHNonlocalOperator:
         if coefficients.kind != "coefficients":
             msg = "GTH input must be coefficient state"
             raise ValueError(msg)
-        vectors = self.basis.active_shifted_vectors
+        vectors = self.basis._layout._active_shifted_vectors
         q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
         harmonics = {
             channel.angular_momentum: _real_spherical_harmonics(

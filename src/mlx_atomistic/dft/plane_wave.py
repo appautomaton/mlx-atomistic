@@ -155,7 +155,7 @@ class PlaneWaveBasis:
     def volume(self) -> float:
         """Cell volume in bohr cubed."""
 
-        return self.grid.volume
+        return self._layout.volume
 
     @property
     def reciprocal_grid(self) -> ReciprocalGrid:
@@ -195,27 +195,27 @@ class PlaneWaveBasis:
 
     @property
     def active_flat_indices(self) -> mx.array:
-        """Canonical ascending flat FFT indices."""
+        """Fresh canonical ascending flat FFT indices."""
 
-        return self._layout.active_flat_indices
+        return self._layout.active_flat_indices_fresh()
 
     @property
     def active_integer_g(self) -> mx.array:
-        """Ordered exact integer ``G`` coordinates."""
+        """Fresh ordered exact integer ``G`` coordinates."""
 
-        return self._layout.active_integer_g
+        return self._layout.active_integer_g_fresh()
 
     @property
     def active_shifted_vectors(self) -> mx.array:
-        """Shifted reciprocal vectors in compact order."""
+        """Fresh shifted reciprocal vectors in compact order."""
 
-        return self._layout.active_shifted_vectors
+        return self._layout.active_shifted_vectors_fresh()
 
     @property
     def active_kinetic_energies(self) -> mx.array:
-        """Kinetic energies in compact order."""
+        """Fresh kinetic energies in compact order."""
 
-        return self._layout.active_kinetic_energies
+        return self._layout.active_kinetic_energies_fresh()
 
     @property
     def order_fingerprint(self) -> str:
@@ -424,7 +424,7 @@ class PlaneWaveBasis:
         """
 
         state, was_single = self._state_from_full(coefficients)
-        applied = state.values * self.active_kinetic_energies[None, :]
+        applied = state.values * self._layout._active_kinetic_energies[None, :]
         return self._layout.unpack_fresh(applied, single=was_single)
 
     def apply_local(self, coefficients: mx.array, potential: mx.array) -> mx.array:
