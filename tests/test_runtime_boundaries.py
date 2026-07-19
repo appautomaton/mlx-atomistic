@@ -115,6 +115,21 @@ def test_dft_runtime_evidence_and_oracle_never_import_external_or_product_kernel
     )
 
 
+def test_dft_artifacts_cli_stays_outside_protocol_and_runtime_fingerprint_scopes():
+    from mlx_atomistic.benchmarks.dft_runtime_contract import build_source_fingerprints
+
+    sources = build_source_fingerprints(ROOT)
+    protocol_paths = {record["path"] for record in sources["protocol_inventory"]}
+    runtime_paths = {record["path"] for record in sources["runtime_inventory"]}
+    adapter = "src/mlx_atomistic/benchmarks/dft_artifacts.py"
+    codec = "src/mlx_atomistic/dft/artifacts.py"
+
+    assert adapter not in protocol_paths
+    assert adapter not in runtime_paths
+    assert codec not in protocol_paths
+    assert codec in runtime_paths
+
+
 def test_dft_runtime_host_inspection_contains_no_state_changing_power_command():
     from mlx_atomistic.benchmarks.dft_runtime_contract import READ_ONLY_HOST_COMMANDS
 

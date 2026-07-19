@@ -10,6 +10,25 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class _MixerCheckpointState:
+    name: str
+    beta: float
+    history_size: int
+    regularization: float
+    densities: tuple[mx.array, ...] = ()
+    residuals: tuple[mx.array, ...] = ()
+    last_coefficients: tuple[float, ...] = ()
+
+
+def _owned_float32(values: mx.array) -> mx.array:
+    copied = (mx.array(values).astype(mx.float32) + mx.zeros_like(values)).astype(
+        mx.float32
+    )
+    mx.eval(copied)
+    return copied
+
+
+@dataclass(frozen=True)
 class LinearMixer:
     """Simple linear density mixing."""
 
@@ -33,6 +52,25 @@ class LinearMixer:
         """Return JSON-safe mixer metadata."""
 
         return {"name": self.name, "beta": self.beta}
+
+    def _checkpoint_state(self) -> _MixerCheckpointState:
+        return _MixerCheckpointState(
+            name=self.name,
+            beta=self.beta,
+            history_size=0,
+            regularization=0.0,
+        )
+
+    def _restore_checkpoint_state(
+        self,
+        state: _MixerCheckpointState,
+        *,
+        expected_shape: tuple[int, ...],
+    ) -> None:
+        del expected_shape
+        if state != self._checkpoint_state():
+            msg = "linear mixer checkpoint state does not match the active mixer"
+            raise ValueError(msg)
 
 
 @dataclass
@@ -142,3 +180,65 @@ class PulayDIISMixer:
             "stored": len(self._densities),
             "last_coefficients": list(self._last_coefficients),
         }
+
+    def _checkpoint_state(self) -> _MixerCheckpointState:
+        if len(self._densities) != len(self._residuals):
+            msg = "DIIS density and residual histories are inconsistent"
+            raise RuntimeError(msg)
+        return _MixerCheckpointState(
+            name=self.name,
+            beta=self.beta,
+            history_size=self.history_size,
+            regularization=self.regularization,
+            densities=tuple(_owned_float32(values) for values in self._densities),
+            residuals=tuple(_owned_float32(values) for values in self._residuals),
+            last_coefficients=tuple(self._last_coefficients),
+        )
+
+    def _restore_checkpoint_state(
+        self,
+        state: _MixerCheckpointState,
+        *,
+        expected_shape: tuple[int, ...],
+    ) -> None:
+        if (
+            state.name != self.name
+            or state.beta != self.beta
+            or state.history_size != self.history_size
+            or state.regularization != self.regularization
+        ):
+            msg = "DIIS checkpoint settings do not match the active mixer"
+            raise ValueError(msg)
+        stored = len(state.densities)
+        if stored != len(state.residuals) or stored > self.history_size:
+            msg = "DIIS checkpoint history is inconsistent or exceeds its bound"
+            raise ValueError(msg)
+        allowed_coefficient_counts = {0} if stored == 0 else {1, stored}
+        if len(state.last_coefficients) not in allowed_coefficient_counts or not np.all(
+            np.isfinite(np.asarray(state.last_coefficients, dtype=np.float64))
+        ):
+            msg = "DIIS checkpoint coefficients are inconsistent or non-finite"
+            raise ValueError(msg)
+
+        restored_densities: list[mx.array] = []
+        restored_residuals: list[mx.array] = []
+        finite_checks: list[mx.array] = []
+        for values in (*state.densities, *state.residuals):
+            array = mx.array(values)
+            if array.shape != expected_shape or array.dtype != mx.float32:
+                msg = "DIIS checkpoint arrays have incompatible shape or dtype"
+                raise ValueError(msg)
+            copied = _owned_float32(array)
+            finite_checks.append(mx.all(mx.isfinite(copied)))
+            if len(restored_densities) < stored:
+                restored_densities.append(copied)
+            else:
+                restored_residuals.append(copied)
+        if finite_checks:
+            mx.eval(*finite_checks)
+            if not all(bool(finite) for finite in finite_checks):
+                msg = "DIIS checkpoint arrays must be finite"
+                raise ValueError(msg)
+        self._densities = restored_densities
+        self._residuals = restored_residuals
+        self._last_coefficients = list(state.last_coefficients)

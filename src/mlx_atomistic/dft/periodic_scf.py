@@ -32,7 +32,11 @@ from mlx_atomistic.dft.kpoints import (
     admit_time_reversal_bases,
     build_time_reversal_ownership,
 )
-from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.mixing import (
+    LinearMixer,
+    PulayDIISMixer,
+    _MixerCheckpointState,
+)
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
@@ -223,6 +227,24 @@ class PeriodicSCFConfig:
             ),
             "max_batch_transient_bytes": self.max_batch_transient_bytes,
         }
+
+
+@dataclass(frozen=True)
+class _PeriodicSCFContinuationState:
+    completed_iteration: int
+    density: mx.array
+    owned_coefficients: tuple[tuple[int, mx.array], ...]
+    owned_lanes: tuple[dict[str, object], ...]
+    previous_energy: float
+    energy_by_term: dict[str, float]
+    history: tuple[dict[str, float | int | str | None], ...]
+    mixer_state: _MixerCheckpointState
+    ownership: dict[str, object]
+    lineage: tuple[str, ...] = ()
+
+    @property
+    def coefficient_map(self) -> dict[int, mx.array]:
+        return dict(self.owned_coefficients)
 
 
 @dataclass(frozen=True, init=False)
@@ -2493,7 +2515,26 @@ class PeriodicSCFResult:
     timings: dict[str, float]
     time_reversal_ownership: TimeReversalOwnership | None = None
     batch_policy: dict[str, int | float] = field(default_factory=dict)
+    numerical_status: str = "not_evaluated"
+    resume_integrity_status: str = "fresh"
+    timing_admission_status: str = "fresh"
+    lineage: tuple[str, ...] = ()
     _owned_kpoints: tuple[PeriodicKPointResult, ...] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _checkpoint_state: _PeriodicSCFContinuationState | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _artifact_execution_contract_fingerprint: str | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _artifact_calculation_fingerprint: str | None = field(
         default=None,
         repr=False,
         compare=False,
@@ -2552,6 +2593,10 @@ class PeriodicSCFResult:
             "history": [dict(row) for row in self.history],
             "timings_ms": dict(self.timings),
             "batch_policy": dict(self.batch_policy),
+            "numerical_status": self.numerical_status,
+            "resume_integrity_status": self.resume_integrity_status,
+            "timing_admission_status": self.timing_admission_status,
+            "lineage": list(self.lineage),
             "dense_full_hamiltonian": False,
         }
 
@@ -2830,6 +2875,223 @@ def _publish_explicit_kpoints(
     return tuple(explicit)
 
 
+def _owned_device_copy(values: mx.array, *, dtype: mx.Dtype) -> mx.array:
+    source = mx.array(values).astype(dtype)
+    copied = (source + mx.zeros_like(source)).astype(dtype)
+    mx.eval(copied)
+    return copied
+
+
+def _continuation_state_from_boundary(
+    *,
+    completed_iteration: int,
+    density: mx.array,
+    owned_results: Sequence[PeriodicKPointResult],
+    previous_energy: float,
+    energy_by_term: dict[str, float],
+    history: Sequence[dict[str, float | int | str | None]],
+    mixer: LinearMixer | PulayDIISMixer,
+    ownership: TimeReversalOwnership,
+    lineage: tuple[str, ...],
+) -> _PeriodicSCFContinuationState:
+    owned_coefficients: list[tuple[int, mx.array]] = []
+    owned_lanes: list[dict[str, object]] = []
+    for result in owned_results:
+        if result.explicit_index is None:
+            msg = "checkpoint state requires explicit owner indices"
+            raise RuntimeError(msg)
+        compact = result.eigen._compact_coefficients
+        if not isinstance(compact, _CompactLaneState):
+            msg = "checkpoint state requires compact owner coefficients"
+            raise RuntimeError(msg)
+        owned_coefficients.append(
+            (
+                result.explicit_index,
+                _owned_device_copy(compact.values, dtype=mx.complex64),
+            )
+        )
+        owned_lanes.append(
+            {
+                "owner_index": result.explicit_index,
+                "reduced_kpoint": list(result.reduced_kpoint),
+                "active_count": result.basis.active_count,
+                "basis_fingerprint": result.basis.basis_fingerprint,
+                "basis_order_fingerprint": result.basis.order_fingerprint,
+                "lane_id": result.basis.lane_id,
+            }
+        )
+    return _PeriodicSCFContinuationState(
+        completed_iteration=completed_iteration,
+        density=_owned_device_copy(density, dtype=mx.float32),
+        owned_coefficients=tuple(owned_coefficients),
+        owned_lanes=tuple(owned_lanes),
+        previous_energy=float(previous_energy),
+        energy_by_term=dict(energy_by_term),
+        history=tuple(dict(row) for row in history),
+        mixer_state=mixer._checkpoint_state(),
+        ownership=ownership.to_dict(),
+        lineage=lineage,
+    )
+
+
+def _resume_ownership(
+    rebuilt: TimeReversalOwnership,
+    stored: dict[str, object],
+) -> TimeReversalOwnership:
+    if rebuilt.to_dict() == stored:
+        return rebuilt
+    stored_entries = stored.get("entries")
+    if not isinstance(stored_entries, list) or len(stored_entries) != len(
+        rebuilt.entries
+    ):
+        msg = "periodic resume ownership payload is malformed"
+        raise ValueError(msg)
+    candidate = rebuilt
+    for index, rebuilt_entry in enumerate(rebuilt.entries):
+        stored_entry = stored_entries[index]
+        if not isinstance(stored_entry, dict):
+            msg = "periodic resume ownership entry is malformed"
+            raise ValueError(msg)
+        if (
+            rebuilt_entry.role in {"owner", "partner"}
+            and stored_entry.get("role") == "independent"
+            and stored_entry.get("fallback_reason")
+            == "initial_coefficients_time_reversal_mismatch"
+        ):
+            candidate = _independent_pair(
+                candidate,
+                index,
+                "initial_coefficients_time_reversal_mismatch",
+            )
+    if candidate.to_dict() != stored:
+        msg = "periodic resume ownership is not a valid stored fallback refinement"
+        raise ValueError(msg)
+    return candidate
+
+
+def _restore_continuation_state(
+    state: _PeriodicSCFContinuationState,
+    *,
+    bases: Sequence[PlaneWaveBasis],
+    ownership: TimeReversalOwnership,
+    occupied_bands: int,
+    grid: RealSpaceGrid,
+    electron_count: float,
+    mixer: LinearMixer | PulayDIISMixer,
+) -> tuple[
+    mx.array,
+    dict[int, _CompactLaneState],
+    float,
+    list[dict[str, float | int | str | None]],
+    dict[str, float],
+]:
+    if state.completed_iteration <= 0:
+        msg = "periodic resume iteration must be positive"
+        raise ValueError(msg)
+    if state.ownership != ownership.to_dict():
+        msg = "periodic resume ownership does not match the rebuilt topology"
+        raise ValueError(msg)
+    if len(state.history) != state.completed_iteration or any(
+        row.get("iteration") != index
+        for index, row in enumerate(state.history, start=1)
+    ):
+        msg = "periodic resume history does not match its iteration cursor"
+        raise ValueError(msg)
+    if not np.isfinite(state.previous_energy):
+        msg = "periodic resume energy must be finite"
+        raise ValueError(msg)
+    if (
+        not state.history
+        or not np.isclose(
+            float(state.history[-1]["total_energy_hartree"]),
+            state.previous_energy,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        or not np.isclose(
+            float(state.energy_by_term.get("total", float("nan"))),
+            state.previous_energy,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    ):
+        msg = "periodic resume energy state is internally inconsistent"
+        raise ValueError(msg)
+
+    density = mx.array(state.density)
+    if density.shape != grid.shape or density.dtype != mx.float32:
+        msg = "periodic resume density has incompatible shape or dtype"
+        raise ValueError(msg)
+    density_finite = mx.all(mx.isfinite(density))
+    density_minimum = mx.min(density)
+    density_count = mx.sum(density) * grid.dv
+    mx.eval(density, density_finite, density_minimum, density_count)
+    if (
+        not bool(density_finite)
+        or float(density_minimum) < -1e-7
+        or abs(float(density_count) - electron_count) > 1e-4
+    ):
+        msg = "periodic resume density is non-finite, negative, or misnormalized"
+        raise ValueError(msg)
+    density = _owned_device_copy(density, dtype=mx.float32)
+
+    coefficient_map = state.coefficient_map
+    if len(coefficient_map) != len(state.owned_coefficients) or set(
+        coefficient_map
+    ) != set(ownership.owned_indices):
+        msg = "periodic resume owner coefficient inventory is inconsistent"
+        raise ValueError(msg)
+    lane_map = {
+        int(lane["owner_index"]): lane
+        for lane in state.owned_lanes
+        if isinstance(lane, dict) and "owner_index" in lane
+    }
+    if len(lane_map) != len(state.owned_lanes) or set(lane_map) != set(
+        ownership.owned_indices
+    ):
+        msg = "periodic resume owner lane inventory is inconsistent"
+        raise ValueError(msg)
+    previous_states: dict[int, _CompactLaneState] = {}
+    finite_checks: list[mx.array] = []
+    for owner_index in ownership.owned_indices:
+        basis = bases[owner_index]
+        lane = lane_map[owner_index]
+        expected_lane = {
+            "owner_index": owner_index,
+            "reduced_kpoint": list(ownership.entry_for(owner_index).reduced_kpoint),
+            "active_count": basis.active_count,
+            "basis_fingerprint": basis.basis_fingerprint,
+            "basis_order_fingerprint": basis.order_fingerprint,
+            "lane_id": basis.lane_id,
+        }
+        if lane != expected_lane:
+            msg = "periodic resume owner lane identity does not match rebuilt bases"
+            raise ValueError(msg)
+        values = mx.array(coefficient_map[owner_index])
+        if (
+            values.dtype != mx.complex64
+            or values.shape != (occupied_bands, basis.active_count)
+        ):
+            msg = "periodic resume owner coefficients have incompatible shape or dtype"
+            raise ValueError(msg)
+        copied = _owned_device_copy(values, dtype=mx.complex64)
+        finite_checks.append(mx.all(mx.isfinite(copied)))
+        previous_states[owner_index] = basis._state_from_compact(copied)
+    mx.eval(*finite_checks)
+    if not all(bool(finite) for finite in finite_checks):
+        msg = "periodic resume owner coefficients must be finite"
+        raise ValueError(msg)
+
+    mixer._restore_checkpoint_state(state.mixer_state, expected_shape=grid.shape)
+    return (
+        density,
+        previous_states,
+        float(state.previous_energy),
+        [dict(row) for row in state.history],
+        dict(state.energy_by_term),
+    )
+
+
 def _run_periodic_scf_with_projector_cache(
     system: PeriodicDFTSystem,
     *,
@@ -2842,6 +3104,9 @@ def _run_periodic_scf_with_projector_cache(
     initial_coefficients: Sequence[mx.array] | None = None,
     observer: RuntimeObserver | None = None,
     projector_cache: _GTHProjectorCache,
+    resume_state: _PeriodicSCFContinuationState | None = None,
+    checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None = None,
+    checkpoint_iteration: int | None = None,
 ) -> PeriodicSCFResult:
     """Run periodic SCF inside a caller-owned projector-cache lifetime.
 
@@ -2856,6 +3121,12 @@ def _run_periodic_scf_with_projector_cache(
         initial_coefficients: Optional orbital stack per k-point.
         observer: Optional progress, synchronized timing, and work observer.
         projector_cache: Cache closed by the public runtime-context wrapper.
+        resume_state: Validated internal next-iteration state. Defaults to fresh.
+        checkpoint_callback: Optional accepted-iteration publisher returning
+            whether execution should stop after publication.
+        checkpoint_iteration: Optional single iteration at which to materialize
+            callback state. Defaults to every accepted iteration when a callback
+            is present.
 
     Returns:
         Periodic SCF result with complete weighted k-point diagnostics.
@@ -2873,6 +3144,17 @@ def _run_periodic_scf_with_projector_cache(
             raise ValueError(msg)
     if initial_coefficients is not None and len(initial_coefficients) != len(kpoint_mesh.points):
         msg = "initial_coefficients length must match the k-point mesh"
+        raise ValueError(msg)
+    if resume_state is not None and (
+        initial_density is not None or initial_coefficients is not None
+    ):
+        msg = "periodic resume state is mutually exclusive with public initial guesses"
+        raise ValueError(msg)
+    if (
+        resume_state is not None
+        and resume_state.completed_iteration >= scf_config.max_iterations
+    ):
+        msg = "periodic resume state has no remaining SCF iteration"
         raise ValueError(msg)
     ownership = build_time_reversal_ownership(kpoint_mesh)
 
@@ -2896,12 +3178,15 @@ def _run_periodic_scf_with_projector_cache(
             for point_index, point in enumerate(kpoint_mesh.points)
         ]
         ownership = admit_time_reversal_bases(ownership, bases)
-        ownership, previous_states = _admit_initial_time_reversal(
-            ownership,
-            bases,
-            initial_coefficients,
-            n_bands=occupied_bands,
-        )
+        if resume_state is None:
+            ownership, previous_states = _admit_initial_time_reversal(
+                ownership,
+                bases,
+                initial_coefficients,
+                n_bands=occupied_bands,
+            )
+        else:
+            ownership = _resume_ownership(ownership, resume_state.ownership)
         owned_indices = ownership.owned_indices
         gamma_basis = PlaneWaveBasis(
             system.grid,
@@ -2923,29 +3208,56 @@ def _run_periodic_scf_with_projector_cache(
             gamma_basis,
             system.positions,
         )
-        if initial_density is None:
-            density = mx.full(system.grid.shape, system.electron_count / system.grid.volume)
-        else:
-            density = mx.real(mx.array(initial_density))
-            if density.shape != system.grid.shape:
-                msg = "initial_density must have shape system.grid.shape"
-                raise ValueError(msg)
-            count = float(mx.sum(density) * system.grid.dv)
-            if count <= 0.0:
-                msg = "initial_density must integrate to a positive count"
-                raise ValueError(msg)
-            density = density * (system.electron_count / count)
         mixer = (
             PulayDIISMixer(beta=scf_config.mixing_beta)
             if scf_config.mixer == "diis"
             else LinearMixer(beta=scf_config.mixing_beta)
         )
+        if resume_state is None:
+            if initial_density is None:
+                density = mx.full(
+                    system.grid.shape,
+                    system.electron_count / system.grid.volume,
+                )
+            else:
+                density = mx.real(mx.array(initial_density))
+                if density.shape != system.grid.shape:
+                    msg = "initial_density must have shape system.grid.shape"
+                    raise ValueError(msg)
+                count = float(mx.sum(density) * system.grid.dv)
+                if count <= 0.0:
+                    msg = "initial_density must integrate to a positive count"
+                    raise ValueError(msg)
+                density = density * (system.electron_count / count)
+            previous_energy: float | None = None
+            history: list[dict[str, float | int | str | None]] = []
+            energy_terms: dict[str, float] = {}
+            iteration_start = 1
+            lineage: tuple[str, ...] = ()
+        else:
+            (
+                density,
+                previous_states,
+                restored_energy,
+                history,
+                energy_terms,
+            ) = _restore_continuation_state(
+                resume_state,
+                bases=bases,
+                ownership=ownership,
+                occupied_bands=occupied_bands,
+                grid=system.grid,
+                electron_count=system.electron_count,
+                mixer=mixer,
+            )
+            previous_energy = restored_energy
+            iteration_start = resume_state.completed_iteration + 1
+            lineage = resume_state.lineage
         ewald = periodic_ewald_energy(
             system.charges,
             system.positions,
             np.asarray(system.grid.lengths),
         )
-        previous_energy: float | None = None
     if observer is not None:
         observer.record_memory("shared_full_grid_bytes", system.grid.size * 4 * 4)
         observer.record_memory("persistent_projector_bytes", 0)
@@ -2958,16 +3270,18 @@ def _run_periodic_scf_with_projector_cache(
             representative_count=len(ownership.representative_indices),
             fallback_reasons=ownership.fallback_reasons,
             batch_policy=scf_config.batch_policy(),
+            resumed=resume_state is not None,
+            iteration_start=iteration_start,
         )
-    history: list[dict[str, float | int | str | None]] = []
     final_owned_results: tuple[PeriodicKPointResult, ...] = ()
-    energy_terms: dict[str, float] = {}
     converged = False
+    stopped_for_checkpoint = False
+    final_checkpoint_state: _PeriodicSCFContinuationState | None = None
     density_residual = float("inf")
     energy_delta: float | None = None
     timings = {"hartree": 0.0, "xc": 0.0, "eigensolver": 0.0, "total": 0.0}
     total_start = perf_counter()
-    for iteration in range(1, scf_config.max_iterations + 1):
+    for iteration in range(iteration_start, scf_config.max_iterations + 1):
         if observer is not None:
             observer.emit(
                 "scf_iteration",
@@ -3204,6 +3518,53 @@ def _run_periodic_scf_with_projector_cache(
             for result in final_owned_results
             if result.explicit_index is not None
         }
+        capture_for_callback = checkpoint_callback is not None and (
+            checkpoint_iteration is None or checkpoint_iteration == iteration
+        )
+        if capture_for_callback:
+            if observer is not None:
+                observer.emit(
+                    "persistence",
+                    status="started",
+                    iteration=iteration,
+                    resume_eligible=True,
+                )
+            try:
+                with observed_phase(observer, "persistence"):
+                    final_checkpoint_state = _continuation_state_from_boundary(
+                        completed_iteration=iteration,
+                        density=density,
+                        owned_results=final_owned_results,
+                        previous_energy=total_energy,
+                        energy_by_term=energy_terms,
+                        history=history,
+                        mixer=mixer,
+                        ownership=ownership,
+                        lineage=lineage,
+                    )
+                    stop_after_checkpoint = bool(
+                        checkpoint_callback(final_checkpoint_state)
+                    )
+            except Exception as error:
+                if observer is not None:
+                    observer.emit(
+                        "persistence",
+                        status="failed",
+                        iteration=iteration,
+                        resume_eligible=True,
+                        error=str(error),
+                    )
+                raise
+            if observer is not None:
+                observer.emit(
+                    "persistence",
+                    status="completed",
+                    iteration=iteration,
+                    resume_eligible=True,
+                )
+            if stop_after_checkpoint:
+                stopped_for_checkpoint = True
+                break
 
     timings["total"] = (perf_counter() - total_start) * 1000.0
     final_owned_by_index = {
@@ -3232,13 +3593,27 @@ def _run_periodic_scf_with_projector_cache(
         observer.emit(
             "completion",
             stage="scf",
-            status="converged" if converged else "max_iterations",
+            status=(
+                "converged"
+                if converged
+                else "checkpointed" if stopped_for_checkpoint else "max_iterations"
+            ),
             iterations=iteration,
             total_energy_hartree=float(energy_terms["total"]),
         )
+    result_status = (
+        "converged"
+        if converged
+        else "checkpointed" if stopped_for_checkpoint else "max_iterations"
+    )
+    timing_admission_status = (
+        "ineligible_resumed_state"
+        if resume_state is not None
+        else "ineligible_checkpointed" if stopped_for_checkpoint else "fresh"
+    )
     return PeriodicSCFResult(
         converged=converged,
-        status="converged" if converged else "max_iterations",
+        status=result_status,
         iterations=iteration,
         total_energy=float(energy_terms["total"]),
         electron_count=electron_count,
@@ -3251,8 +3626,46 @@ def _run_periodic_scf_with_projector_cache(
         timings=timings,
         batch_policy=scf_config.batch_policy(),
         time_reversal_ownership=ownership,
+        numerical_status=result_status,
+        resume_integrity_status="validated" if resume_state is not None else "fresh",
+        timing_admission_status=timing_admission_status,
+        lineage=lineage,
         _owned_kpoints=final_owned_results,
+        _checkpoint_state=None if converged else final_checkpoint_state,
     )
+
+
+def _run_periodic_scf_controlled(
+    system: PeriodicDFTSystem,
+    *,
+    cutoff_hartree: float,
+    kpoint_mesh: KPointMesh,
+    n_bands: int | None = None,
+    config: PeriodicSCFConfig | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
+    initial_density: mx.array | None = None,
+    initial_coefficients: Sequence[mx.array] | None = None,
+    observer: RuntimeObserver | None = None,
+    resume_state: _PeriodicSCFContinuationState | None = None,
+    checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None = None,
+    checkpoint_iteration: int | None = None,
+) -> PeriodicSCFResult:
+    with _GTHProjectorCache() as projector_cache:
+        return _run_periodic_scf_with_projector_cache(
+            system,
+            cutoff_hartree=cutoff_hartree,
+            kpoint_mesh=kpoint_mesh,
+            n_bands=n_bands,
+            config=config,
+            xc_functional=xc_functional,
+            initial_density=initial_density,
+            initial_coefficients=initial_coefficients,
+            observer=observer,
+            projector_cache=projector_cache,
+            resume_state=resume_state,
+            checkpoint_callback=checkpoint_callback,
+            checkpoint_iteration=checkpoint_iteration,
+        )
 
 
 def run_periodic_scf(
@@ -3284,16 +3697,14 @@ def run_periodic_scf(
         Periodic SCF result with complete weighted k-point diagnostics.
     """
 
-    with _GTHProjectorCache() as projector_cache:
-        return _run_periodic_scf_with_projector_cache(
-            system,
-            cutoff_hartree=cutoff_hartree,
-            kpoint_mesh=kpoint_mesh,
-            n_bands=n_bands,
-            config=config,
-            xc_functional=xc_functional,
-            initial_density=initial_density,
-            initial_coefficients=initial_coefficients,
-            observer=observer,
-            projector_cache=projector_cache,
-        )
+    return _run_periodic_scf_controlled(
+        system,
+        cutoff_hartree=cutoff_hartree,
+        kpoint_mesh=kpoint_mesh,
+        n_bands=n_bands,
+        config=config,
+        xc_functional=xc_functional,
+        initial_density=initial_density,
+        initial_coefficients=initial_coefficients,
+        observer=observer,
+    )
