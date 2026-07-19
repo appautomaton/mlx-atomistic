@@ -6,12 +6,14 @@ import os
 import subprocess
 import sys
 import time
+import weakref
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.dft.periodic_scf as periodic_scf_module
 from mlx_atomistic import _artifact_identity as artifact_identity
 from mlx_atomistic._artifact_identity import (
     ArtifactIntegrityError,
@@ -328,7 +330,7 @@ def _fake_baseline_seal(
                 "git_commands_succeeded": True,
                 "pre_architecture_revision_is_ancestor": True,
                 "baseline_history_has_no_merge_commits": True,
-                "baseline_parent_is_reviewed_slice1_revision": True,
+                "baseline_parent_is_expected_prebaseline_revision": True,
                 "baseline_revision_is_distinct": True,
                 "diff_is_nonempty": True,
                 "diff_paths_are_allowed": True,
@@ -1823,13 +1825,16 @@ def test_host_power_mode_uses_only_active_source_and_alias_is_not_identity():
                 "python_version": "3.13",
                 "mlx_version": "test",
                 "precision": "complex64/float32",
+                **periodic_scf_module._eigensolve_provenance(),
                 "selected_device": "Device(gpu, 0)",
             },
         },
     }
-    assert runtime_core._comparison_protocol(
-        manifest, context, legacy
-    ) == runtime_core._comparison_protocol(manifest, context, current)
+    legacy_protocol = runtime_core._comparison_protocol(manifest, context, legacy)
+    current_protocol = runtime_core._comparison_protocol(manifest, context, current)
+    assert legacy_protocol == current_protocol
+    for field, value in periodic_scf_module._eigensolve_provenance().items():
+        assert legacy_protocol[field] == value
 
 
 @pytest.mark.parametrize(
@@ -2116,6 +2121,7 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
                 "python_version": "3.13",
                 "mlx_version": "test",
                 "precision": "complex64/float32",
+                **periodic_scf_module._eigensolve_provenance(),
                 "selected_device": "Device(gpu, 0)",
             },
         },
@@ -2131,17 +2137,34 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
         },
     }
     dense_bytes = 16 * 56**3 * 8
+    maximum_hpsi_width = 64
+    hpsi_vector_equivalents = 100
+    projector_payload_bytes = 56**3 * 8 * 5 * 8
+    projector_elements_generated = (
+        hpsi_vector_equivalents * projector_payload_bytes // 8
+    )
+    fft_workspace_bytes = 2 * maximum_hpsi_width * 56**3 * 8
     work = {
         "fft_submissions": 100,
         "fft_vector_equivalents": 100,
+        "hpsi_vector_equivalents": hpsi_vector_equivalents,
         "davidson_hv_reused_vectors": 0,
         "representative_lane_solves": 0,
         "partner_reconstructions": 0,
-        "projector_traffic_elements": 1000,
+        "projector_elements_generated": projector_elements_generated,
+        "projector_elements_loaded": 2 * projector_elements_generated,
+        "projector_traffic_elements": 3 * projector_elements_generated,
     }
     memory = {
         "coefficient_payload_bytes": dense_bytes,
-        "projector_payload_bytes": 4096,
+        "projector_payload_bytes": projector_payload_bytes,
+        "projector_traffic_bytes": 3 * projector_elements_generated * 8,
+        "peak_temporary_bytes": (
+            fft_workspace_bytes + maximum_hpsi_width * projector_payload_bytes
+        ),
+        "fft_workspace_bytes": fft_workspace_bytes,
+        "process_high_water_bytes": 4_500_000_000,
+        "unified_memory_high_water_bytes": 4_000_000_000,
     }
     calls = []
 
@@ -2151,9 +2174,19 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
             {
                 "status": "ok",
                 "numerical_passed": True,
+                **periodic_scf_module._eigensolve_provenance(),
                 "wall_elapsed_seconds": 2.0,
                 "eigenvalues_hartree": [float(index) for index in range(16)],
-                "observation": {"work_counters": dict(work), "memory": dict(memory)},
+                "observation": {
+                    "work_counters": dict(work),
+                    "memory": dict(memory),
+                    "events": [
+                        {
+                            "event": "davidson_iteration",
+                            "subspace_size": maximum_hpsi_width,
+                        }
+                    ],
+                },
             },
             object(),
         )
@@ -2172,7 +2205,7 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
                 "git_commands_succeeded": True,
                 "pre_architecture_revision_is_ancestor": True,
                 "baseline_history_has_no_merge_commits": True,
-                "baseline_parent_is_reviewed_slice1_revision": True,
+                "baseline_parent_is_expected_prebaseline_revision": True,
                 "baseline_revision_is_distinct": True,
                 "diff_is_nonempty": True,
                 "diff_paths_are_allowed": True,
@@ -2208,6 +2241,12 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
     )
     assert len(calls) == 6
     assert result["admission"]["passed"] is True
+    for sample in [
+        *result["report_payload"]["warmup_results"],
+        *result["report_payload"]["samples"],
+    ]:
+        for field, value in periodic_scf_module._eigensolve_provenance().items():
+            assert sample[field] == value
     seal = json.loads((tmp_path / "baseline/seal.json").read_text())
     assert seal["protocol_fingerprint"] == "p" * 64
     assert seal["baseline_runtime_fingerprint"] == "r" * 64
@@ -2221,6 +2260,76 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
         float(index) for index in range(16)
     ]
     assert inspect_generation(tmp_path / "baseline")["complete"] is True
+
+    calls.clear()
+
+    def missing_late_memory_sample(**kwargs):
+        sample, state = fake_sample(**kwargs)
+        if len(calls) == 6:
+            sample["observation"]["memory"]["unified_memory_high_water_bytes"] = None
+        return sample, state
+
+    monkeypatch.setattr(
+        runtime_core,
+        "_fixed_density_sample",
+        missing_late_memory_sample,
+    )
+    incomplete_memory = run_fixed_density(
+        manifest_path=prepared["manifest"],
+        gth_source=source,
+        out=tmp_path / "incomplete-memory",
+        warmups=1,
+        samples=5,
+        fresh=True,
+        diagnostic=False,
+        require_clean=True,
+        require_chip=TARGET_CHIP,
+        require_low_power=True,
+        require_numerical=True,
+        seal=True,
+    )
+    assert len(calls) == 6
+    assert incomplete_memory["admission"]["passed"] is False
+    assert "baseline_structure_audit_failed" in incomplete_memory["admission"][
+        "blockers"
+    ]
+    assert not (tmp_path / "incomplete-memory/seal.json").exists()
+    monkeypatch.setattr(runtime_core, "_fixed_density_sample", fake_sample)
+    calls.clear()
+
+    def mismatched_provenance_sample(**kwargs):
+        sample, state = fake_sample(**kwargs)
+        if len(calls) == 6:
+            sample["projected_eigensolve_backend"] = "forged"
+        return sample, state
+
+    monkeypatch.setattr(
+        runtime_core,
+        "_fixed_density_sample",
+        mismatched_provenance_sample,
+    )
+    mismatched_provenance = run_fixed_density(
+        manifest_path=prepared["manifest"],
+        gth_source=source,
+        out=tmp_path / "mismatched-provenance",
+        warmups=1,
+        samples=5,
+        fresh=True,
+        diagnostic=False,
+        require_clean=True,
+        require_chip=TARGET_CHIP,
+        require_low_power=True,
+        require_numerical=True,
+        seal=True,
+    )
+    assert len(calls) == 6
+    assert mismatched_provenance["admission"]["passed"] is False
+    assert "eigensolve_provenance_mismatch" in mismatched_provenance["admission"][
+        "blockers"
+    ]
+    assert not (tmp_path / "mismatched-provenance/seal.json").exists()
+    monkeypatch.setattr(runtime_core, "_fixed_density_sample", fake_sample)
+    calls.clear()
 
     context["git"]["parent"] = "a" * 40
     wrong_parent = run_fixed_density(
@@ -2274,9 +2383,19 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
             {
                 "status": "blocked",
                 "numerical_passed": False,
+                **periodic_scf_module._eigensolve_provenance(),
                 "wall_elapsed_seconds": 2.0,
                 "eigenvalues_hartree": [float(index) for index in range(16)],
-                "observation": {"work_counters": dict(work), "memory": dict(memory)},
+                "observation": {
+                    "work_counters": dict(work),
+                    "memory": dict(memory),
+                    "events": [
+                        {
+                            "event": "davidson_iteration",
+                            "subspace_size": maximum_hpsi_width,
+                        }
+                    ],
+                },
             },
             object(),
         )
@@ -2294,6 +2413,84 @@ def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
     )
     assert nonconverged["admission"]["passed"] is False
     assert "numerical_result_failed" in nonconverged["admission"]["blockers"]
+
+
+@pytest.mark.parametrize(("failed_call", "expected_calls"), ((0, 1), (1, 2)))
+def test_fixed_density_stops_after_first_numerical_failure(
+    tmp_path, monkeypatch, failed_call, expected_calls
+):
+    source = _gth_database(tmp_path / "GTH_POTENTIALS")
+    prepared = prepare_workload(gth_source=source, out=tmp_path / "workload")
+    host = {
+        "chip": TARGET_CHIP,
+        "power_source": "AC Power",
+        "active_power_profile": {"powermode": 1},
+        "power_mode_key": "powermode",
+        "low_power_mode": 1,
+    }
+    context = {
+        "execution_contract": {
+            "lock": {"sha256": "l" * 64},
+            "environment": {
+                "python_version": "3.13",
+                "mlx_version": "test",
+                "precision": "complex64/float32",
+                **periodic_scf_module._eigensolve_provenance(),
+                "selected_device": "Device(gpu, 0)",
+            },
+        },
+        "execution_contract_fingerprint": "e" * 64,
+        "protocol_inventory": [],
+        "protocol_fingerprint": "p" * 64,
+        "runtime_inventory": [],
+        "runtime_fingerprint": "r" * 64,
+        "git": {"revision": "r" * 40, "parent": "p" * 40, "dirty": False},
+    }
+    calls = []
+    state_refs = []
+
+    class SampleState:
+        pass
+
+    def sampled(**kwargs):
+        del kwargs
+        if state_refs:
+            assert state_refs[-1]() is None
+        call_index = len(calls)
+        calls.append(call_index)
+        passed = call_index != failed_call
+        state = SampleState()
+        state_refs.append(weakref.ref(state))
+        return (
+            {
+                "status": "ok" if passed else "blocked",
+                "numerical_passed": passed,
+                **periodic_scf_module._eigensolve_provenance(),
+                "wall_elapsed_seconds": 1.0,
+                "eigenvalues_hartree": [float(index) for index in range(16)],
+                "observation": {"work_counters": {}, "memory": {}},
+            },
+            state,
+        )
+
+    monkeypatch.setattr(runtime_core, "collect_host_provenance", lambda: host)
+    monkeypatch.setattr(runtime_core, "build_execution_context", lambda **kwargs: context)
+    monkeypatch.setattr(runtime_core, "_fixed_density_sample", sampled)
+    result = run_fixed_density(
+        manifest_path=prepared["manifest"],
+        gth_source=source,
+        out=tmp_path / f"failed-call-{failed_call}",
+        warmups=1,
+        samples=5,
+        fresh=True,
+        diagnostic=True,
+        require_numerical=True,
+    )
+
+    assert calls == list(range(expected_calls))
+    assert all(reference() is None for reference in state_refs)
+    assert result["admission"]["passed"] is False
+    assert "numerical_result_failed" in result["admission"]["blockers"]
 
 
 def test_fixed_density_compare_seal_blocks_wrong_eigenvalues(tmp_path, monkeypatch):
@@ -2318,6 +2515,7 @@ def test_fixed_density_compare_seal_blocks_wrong_eigenvalues(tmp_path, monkeypat
                 "python_version": "3.13",
                 "mlx_version": "test",
                 "precision": "complex64/float32",
+                **periodic_scf_module._eigensolve_provenance(),
                 "selected_device": "Device(gpu, 0)",
             },
         },
@@ -2364,6 +2562,7 @@ def test_fixed_density_compare_seal_blocks_wrong_eigenvalues(tmp_path, monkeypat
             {
                 "status": "ok",
                 "numerical_passed": True,
+                **periodic_scf_module._eigensolve_provenance(),
                 "wall_elapsed_seconds": 2.0,
                 "eigenvalues_hartree": current_eigenvalues,
                 "observation": baseline_observation,
@@ -2414,6 +2613,9 @@ def test_runtime_observer_reconciles_exclusive_phases_and_counters():
         current[0] += 1.0
     observer.add_work("hpsi_calls", 1)
     observer.record_memory("persistent_coefficient_bytes", 128)
+    observer.record_peak_memory("fft_workspace_bytes", 64)
+    observer.record_peak_memory("fft_workspace_bytes", 32)
+    observer.record_peak_memory("fft_workspace_bytes", 256)
     current[0] += 1.0
     snapshot = observer.snapshot()
     phases = snapshot["phase_seconds"]
@@ -2421,8 +2623,81 @@ def test_runtime_observer_reconciles_exclusive_phases_and_counters():
     assert phases["hpsi"] == pytest.approx(2.0)
     assert sum(phases.values()) == pytest.approx(snapshot["total_elapsed_seconds"])
     assert snapshot["work_counters"]["hpsi_calls"] == 1
+    assert snapshot["memory"]["fft_workspace_bytes"] == 256
     assert delivered[0]["sequence"] == 1
     assert len(synchronizations) == 4
+
+
+def test_logical_hpsi_memory_scales_with_observed_vector_width():
+    grid_count = 56**3
+    vector_count = 64
+    projector_payload_bytes = grid_count * 8 * 5 * 8
+    projector_elements = vector_count * projector_payload_bytes // 8
+    fft_workspace, peak_temporary = periodic_scf_module._logical_hpsi_memory(
+        vector_count=vector_count,
+        grid_count=grid_count,
+        projector_elements=projector_elements,
+    )
+    assert fft_workspace == 179_830_784
+    assert peak_temporary == 3_776_446_464
+
+
+def test_projected_eigh_uses_complex128_lapack_and_returns_runtime_precision(
+    monkeypatch,
+):
+    rng = np.random.default_rng(42)
+    raw = rng.normal(size=(64, 64)) + 1j * rng.normal(size=(64, 64))
+    unitary, _ = np.linalg.qr(raw)
+    clustered = np.concatenate(
+        [np.linspace(-2.0, -1.0, 16), 0.25 + np.arange(48) * 1e-8]
+    )
+    matrix = ((unitary * clustered[None, :]) @ unitary.conj().T).astype(
+        np.complex64
+    )
+    observed = {}
+    lapack_eigh = np.linalg.eigh
+
+    def capture_dtype(projected):
+        observed["dtype"] = projected.dtype
+        observed["shape"] = projected.shape
+        return lapack_eigh(projected)
+
+    converted = []
+
+    def capture_mlx_array(value):
+        array = np.asarray(value)
+        converted.append(array.dtype)
+        return array
+
+    monkeypatch.setattr(periodic_scf_module.np.linalg, "eigh", capture_dtype)
+    monkeypatch.setattr(periodic_scf_module.mx, "array", capture_mlx_array)
+    values_mx, vectors_mx = periodic_scf_module._projected_eigh(matrix)
+    values = np.asarray(values_mx)
+    vectors = np.asarray(vectors_mx)
+    residual = matrix @ vectors - vectors * values[None, :]
+    overlap = vectors.conj().T @ vectors
+
+    assert observed == {"dtype": np.dtype(np.complex128), "shape": (64, 64)}
+    assert converted == [np.dtype(np.float32), np.dtype(np.complex64)]
+    assert values_mx.dtype == np.float32
+    assert vectors_mx.dtype == np.complex64
+    assert np.max(np.abs(residual)) < 2e-6
+    assert np.max(np.abs(overlap - np.eye(64))) < 2e-6
+
+
+@pytest.mark.parametrize(
+    ("matrix", "message"),
+    (
+        (np.ones((2, 3), dtype=np.complex64), "non-empty and square"),
+        (
+            np.array([[1.0, np.nan], [np.nan, 2.0]], dtype=np.complex64),
+            "must be finite",
+        ),
+    ),
+)
+def test_projected_eigh_rejects_malformed_or_nonfinite_matrix(matrix, message):
+    with pytest.raises(ValueError, match=message):
+        periodic_scf_module._projected_eigh(matrix)
 
 
 @pytest.mark.gpu
@@ -2455,6 +2730,9 @@ def test_periodic_davidson_observer_counts_single_hpsi_hook_without_numerical_dr
     assert len([event for event in events if event["event"] == "davidson_iteration"]) == (
         observed.iterations
     )
+    observed_metadata = observed.to_dict()
+    for field, value in periodic_scf_module._eigensolve_provenance().items():
+        assert observed_metadata[field] == value
     np.testing.assert_allclose(np.asarray(observed.eigenvalues), np.asarray(plain.eigenvalues))
 
 

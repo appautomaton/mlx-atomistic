@@ -29,6 +29,16 @@ from mlx_atomistic.dft.pseudopotentials import PseudopotentialData
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
 
 
+def _eigensolve_provenance() -> dict[str, str]:
+    return {
+        "full_grid_precision": "complex64/float32",
+        "projected_eigensolve_device": "cpu",
+        "projected_eigensolve_backend": "numpy-lapack-cpu-complex128",
+        "projected_eigensolve_precision": "complex128",
+        "projected_eigensolve_output_precision": "float32/complex64",
+    }
+
+
 @dataclass(frozen=True)
 class PeriodicDFTSystem:
     """Orthorhombic periodic DFT system for a shared GTH pseudopotential.
@@ -173,9 +183,23 @@ class PeriodicEigenResult:
             "restart_count": self.restart_count,
             "solver": "block-davidson-rayleigh-ritz",
             "dense_full_hamiltonian": False,
-            "projected_eigensolve_device": "mlx-cpu",
+            **_eigensolve_provenance(),
             "full_grid_device": "default-mlx-device",
         }
+
+
+def _logical_hpsi_memory(
+    *,
+    vector_count: int,
+    grid_count: int,
+    projector_elements: int,
+) -> tuple[int, int]:
+    # Hpsi builds one lazy expression and synchronizes only at the observed
+    # phase boundary. Projector leaves for every vector/ion/channel therefore
+    # remain graph-owned together until that evaluation completes.
+    fft_workspace_bytes = 2 * vector_count * grid_count * 8
+    peak_temporary_bytes = fft_workspace_bytes + projector_elements * 8
+    return fft_workspace_bytes, peak_temporary_bytes
 
 
 @dataclass(frozen=True)
@@ -226,6 +250,20 @@ class PeriodicKohnShamOperator:
                 * self.basis.grid.size
                 * int(self.nonlocal_operator.positions.shape[0])
                 * projector_count
+            )
+        if runtime_observer is not None:
+            fft_workspace_bytes, peak_temporary_bytes = _logical_hpsi_memory(
+                vector_count=vector_count,
+                grid_count=self.basis.grid.size,
+                projector_elements=projector_elements,
+            )
+            runtime_observer.record_peak_memory(
+                "fft_workspace_bytes",
+                fft_workspace_bytes,
+            )
+            runtime_observer.record_peak_memory(
+                "peak_temporary_bytes",
+                peak_temporary_bytes,
             )
         with observed_phase(runtime_observer, "hpsi"):
             applied = self.basis.apply_kinetic(values) + self.basis.apply_local(
@@ -298,15 +336,33 @@ def _combine(weights: mx.array, vectors: mx.array, basis: PlaneWaveBasis) -> mx.
 
 
 def _projected_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
-    # MLX does not currently expose complex Hermitian eigensolves on Metal.
-    # The Rayleigh-Ritz matrix is small; solve it through the MLX CPU stream and
-    # return the eigenpairs to the default device for the full-grid operations.
-    with mx.stream(mx.cpu):
-        values_cpu, vectors_cpu = mx.linalg.eigh(matrix)
-        mx.eval(values_cpu, vectors_cpu)
-    values = mx.array(np.asarray(values_cpu))
-    vectors = mx.array(np.asarray(vectors_cpu))
-    return values, vectors
+    # Only the small projected Rayleigh-Ritz matrix crosses to the CPU. LAPACK's
+    # complex128 solve avoids the complex64 convergence floor while every
+    # full-grid operator, residual, and FFT remains on the default MLX device.
+    projected = np.asarray(matrix, dtype=np.complex128)
+    if (
+        projected.ndim != 2
+        or projected.shape[0] == 0
+        or projected.shape[0] != projected.shape[1]
+    ):
+        msg = "projected Rayleigh-Ritz matrix must be non-empty and square"
+        raise ValueError(msg)
+    if not np.all(np.isfinite(projected)):
+        msg = "projected Rayleigh-Ritz matrix must be finite"
+        raise ValueError(msg)
+    values, vectors = np.linalg.eigh(projected)
+    if (
+        values.shape != (projected.shape[0],)
+        or vectors.shape != projected.shape
+        or not np.all(np.isfinite(values))
+        or not np.all(np.isfinite(vectors))
+    ):
+        msg = "projected Rayleigh-Ritz eigensolve returned invalid eigenpairs"
+        raise ValueError(msg)
+    return (
+        mx.array(values.astype(np.float32)),
+        mx.array(vectors.astype(np.complex64)),
+    )
 
 
 def _initial_coefficients(basis: PlaneWaveBasis, count: int) -> mx.array:

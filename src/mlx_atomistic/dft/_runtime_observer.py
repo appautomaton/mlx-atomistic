@@ -142,6 +142,25 @@ class RuntimeObserver:
             raise ValueError(msg)
         self._memory[field_name] = byte_count
 
+    def record_peak_memory(self, field_name: str, byte_count: int) -> None:
+        """Retain the largest observed value for one memory field.
+
+        Args:
+            field_name: Memory field from the frozen schema.
+            byte_count: Non-negative candidate peak in bytes.
+        """
+
+        if field_name not in self._memory:
+            msg = f"unknown DFT runtime memory field: {field_name}"
+            raise ValueError(msg)
+        if not isinstance(byte_count, int) or byte_count < 0:
+            msg = "runtime peak-memory values must be non-negative integer bytes"
+            raise ValueError(msg)
+        current = self._memory[field_name]
+        self._memory[field_name] = (
+            byte_count if current is None else max(current, byte_count)
+        )
+
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
         """Measure one exclusive synchronized named phase.

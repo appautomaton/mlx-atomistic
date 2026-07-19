@@ -64,7 +64,7 @@ _REPORT_ENVELOPE_CONTRACTS = {
     "command-failure": ("dft-runtime-command-failure", COMMAND_FAILURE_SCHEMA),
 }
 PRE_ARCHITECTURE_REV = "038263effcd017b5ad47426fe5c2ff68077004f6"
-BASELINE_EXPECTED_PARENT_REV = "dea8f77e25d060188d4001013635b4e534885260"
+BASELINE_EXPECTED_PARENT_REV = "a0d85fdfd370595388355b8ec4bd8b857c671c3b"
 BASELINE_ALLOWED_DIFF_PATHS = frozenset(
     {
         "scripts/run_dft_runtime_oracle.py",
@@ -85,12 +85,19 @@ BASELINE_ABSENT_OPTIMIZATIONS = (
     "incremental-hv",
     "representative-only-execution",
 )
+_EIGENSOLVE_PROVENANCE_FIELDS = (
+    "full_grid_precision",
+    "projected_eigensolve_device",
+    "projected_eigensolve_backend",
+    "projected_eigensolve_precision",
+    "projected_eigensolve_output_precision",
+)
 BASELINE_DIFF_CHECK_NAMES = frozenset(
     {
         "git_commands_succeeded",
         "pre_architecture_revision_is_ancestor",
         "baseline_history_has_no_merge_commits",
-        "baseline_parent_is_reviewed_slice1_revision",
+        "baseline_parent_is_expected_prebaseline_revision",
         "baseline_revision_is_distinct",
         "diff_is_nonempty",
         "diff_paths_are_allowed",
@@ -206,7 +213,7 @@ def _baseline_diff_audit(repo_root: str | Path | None = None) -> dict[str, objec
         ),
         "pre_architecture_revision_is_ancestor": merge_base == PRE_ARCHITECTURE_REV,
         "baseline_history_has_no_merge_commits": merge_commits == "",
-        "baseline_parent_is_reviewed_slice1_revision": (
+        "baseline_parent_is_expected_prebaseline_revision": (
             parent == BASELINE_EXPECTED_PARENT_REV
         ),
         "baseline_revision_is_distinct": revision not in {None, PRE_ARCHITECTURE_REV},
@@ -281,6 +288,7 @@ def _is_sha256(value: object) -> bool:
 def _runtime_environment() -> dict[str, object]:
     import mlx.core as mx
 
+    from mlx_atomistic.dft.periodic_scf import _eigensolve_provenance
     from mlx_atomistic.runtime import get_runtime_info
 
     runtime = get_runtime_info()
@@ -292,6 +300,7 @@ def _runtime_environment() -> dict[str, object]:
         "metal_available": runtime.metal_available,
         "selected_device": str(mx.default_device()),
         "precision": "complex64/float32",
+        **_eigensolve_provenance(),
     }
 
 
@@ -613,8 +622,13 @@ def _fixed_density_sample(
         solve_periodic_eigenproblem,
     )
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
+    from mlx_atomistic.dft.periodic_scf import _eigensolve_provenance
     from mlx_atomistic.dft.runtime_state import fixed_density_state_metrics
 
+    track_metal_memory = bool(mx.metal.is_available())
+    if track_metal_memory:
+        mx.synchronize()
+        mx.reset_peak_memory()
     observer = RuntimeObserver(callback=progress, synchronize=mx.synchronize)
     wall_start = time.perf_counter()
     try:
@@ -689,16 +703,17 @@ def _fixed_density_sample(
         coefficient_bytes = int(state_metrics["coefficient_payload_bytes"])
         observer.record_memory("persistent_coefficient_bytes", coefficient_bytes)
         observer.record_memory("coefficient_payload_bytes", coefficient_bytes)
-        observer.record_memory(
-            "fft_workspace_bytes",
-            2 * bands * system.grid.size * 8,
-        )
         interim = observer.snapshot()
         projector_traffic = int(interim["work_counters"]["projector_traffic_elements"])
         observer.record_memory("projector_traffic_bytes", projector_traffic * 8)
-        observer.record_memory("process_high_water_bytes", _process_high_water_bytes())
         max_residual = float(mx.max(result.residuals))
         eigenvalues = np.asarray(result.eigenvalues, dtype=np.float64).tolist()
+        mx.synchronize()
+        observer.record_memory("process_high_water_bytes", _process_high_water_bytes())
+        observer.record_memory(
+            "unified_memory_high_water_bytes",
+            int(mx.get_peak_memory()) if track_metal_memory else None,
+        )
         numerical_passed = bool(
             result.converged
             and max_residual <= float(manifest["solver"]["davidson"]["tolerance"])
@@ -729,6 +744,7 @@ def _fixed_density_sample(
             "iterations": result.iterations,
             "subspace_size": result.subspace_size,
             "restart_count": result.restart_count,
+            **_eigensolve_provenance(),
             "observation": observation,
         }
         return sample, {
@@ -897,6 +913,10 @@ def _comparison_protocol(
         "mlx_version": execution["environment"]["mlx_version"],
         "macos": host.get("macos"),
         "precision": execution["environment"]["precision"],
+        **{
+            field: execution["environment"][field]
+            for field in _EIGENSOLVE_PROVENANCE_FIELDS
+        },
         "selected_device": execution["environment"]["selected_device"],
         "chip": host.get("chip"),
         "power_source": host.get("power_source"),
@@ -958,6 +978,98 @@ def _baseline_structure_audit(
     grid_count = int(np.prod(manifest["physics"]["fft_shape"]))
     band_count = int(manifest["system"]["occupied_band_count"])
     expected_dense_bytes = grid_count * band_count * 8
+    sample_memory_audits: list[dict[str, object]] = []
+    for index, sample in enumerate(samples):
+        observation = sample.get("observation", {})
+        sample_memory = (
+            observation.get("memory", {}) if isinstance(observation, Mapping) else {}
+        )
+        sample_work = (
+            observation.get("work_counters", {})
+            if isinstance(observation, Mapping)
+            else {}
+        )
+        events = (
+            observation.get("events", []) if isinstance(observation, Mapping) else []
+        )
+        widths = [
+            int(event["subspace_size"])
+            for event in events
+            if isinstance(event, Mapping)
+            and event.get("event") == "davidson_iteration"
+            and type(event.get("subspace_size")) is int
+            and int(event["subspace_size"]) > 0
+        ]
+        maximum_width = max([band_count, *widths])
+        hpsi_vectors = sample_work.get("hpsi_vector_equivalents")
+        projector_generated = sample_work.get("projector_elements_generated")
+        projector_loaded = sample_work.get("projector_elements_loaded")
+        projector_traffic = sample_work.get("projector_traffic_elements")
+        projector_work_is_integral = (
+            type(hpsi_vectors) is int
+            and hpsi_vectors > 0
+            and type(projector_generated) is int
+            and projector_generated > 0
+            and projector_generated % hpsi_vectors == 0
+        )
+        expected_projector_payload = (
+            projector_generated // hpsi_vectors * 8
+            if projector_work_is_integral
+            else None
+        )
+        expected_fft_workspace = 2 * maximum_width * grid_count * 8
+        expected_peak_temporary = (
+            expected_fft_workspace + maximum_width * expected_projector_payload
+            if expected_projector_payload is not None
+            else None
+        )
+        process_high_water = sample_memory.get("process_high_water_bytes")
+        unified_high_water = sample_memory.get("unified_memory_high_water_bytes")
+        memory_checks = {
+            "davidson_width_observed": bool(widths),
+            "dense_coefficient_payload": sample_memory.get(
+                "coefficient_payload_bytes"
+            )
+            == expected_dense_bytes,
+            "projector_work_relationships": (
+                projector_work_is_integral
+                and projector_loaded == 2 * projector_generated
+                and projector_traffic == 3 * projector_generated
+                and sample_memory.get("projector_traffic_bytes")
+                == projector_traffic * 8
+            ),
+            "projector_payload_matches_work": (
+                expected_projector_payload is not None
+                and sample_memory.get("projector_payload_bytes")
+                == expected_projector_payload
+            ),
+            "fft_workspace_matches_observed_width": sample_memory.get(
+                "fft_workspace_bytes"
+            )
+            == expected_fft_workspace,
+            "peak_temporary_matches_retained_lazy_graph": (
+                expected_peak_temporary is not None
+                and sample_memory.get("peak_temporary_bytes")
+                == expected_peak_temporary
+            ),
+            "process_high_water_recorded": (
+                type(process_high_water) is int and process_high_water > 0
+            ),
+            "unified_high_water_recorded": (
+                type(unified_high_water) is int and unified_high_water > 0
+            ),
+        }
+        sample_memory_audits.append(
+            {
+                "sample_index": index,
+                "maximum_hpsi_width": maximum_width,
+                "expected_projector_payload_bytes": expected_projector_payload,
+                "expected_fft_workspace_bytes": expected_fft_workspace,
+                "expected_peak_temporary_bytes": expected_peak_temporary,
+                "checks": memory_checks,
+                "passed": all(memory_checks.values()),
+            }
+        )
     checks = {
         "full_grid_coefficient_storage": memory.get("coefficient_payload_bytes")
         == expected_dense_bytes,
@@ -973,9 +1085,15 @@ def _baseline_structure_audit(
         "work_counters_stable": all(
             sample.get("observation", {}).get("work_counters") == work for sample in samples
         ),
+        "all_sample_memory_evidence_complete": (
+            len(sample_memory_audits) == len(samples)
+            and bool(sample_memory_audits)
+            and all(audit["passed"] is True for audit in sample_memory_audits)
+        ),
     }
     return {
         "expected_dense_coefficient_bytes": expected_dense_bytes,
+        "sample_memory_audits": sample_memory_audits,
         "checks": checks,
         "passed": all(checks.values()),
     }
@@ -1047,7 +1165,7 @@ def run_fixed_density(
     if not blockers:
         for index in range(warmups):
             try:
-                sample, _result = _fixed_density_sample(
+                sample, sample_state = _fixed_density_sample(
                     manifest=manifest,
                     gth_source=gth_source,
                     progress=_progress_wrapper(
@@ -1057,15 +1175,21 @@ def run_fixed_density(
                     ),
                 )
                 warmup_results.append(sample)
+                del sample_state
+                if sample.get("numerical_passed") is not True:
+                    break
             except Exception as error:
                 numerical_errors.append(
                     {"stage": "warmup", "type": type(error).__name__, "message": str(error)}
                 )
                 break
-        if not numerical_errors:
+        warmups_succeeded = len(warmup_results) == warmups and all(
+            sample.get("numerical_passed") is True for sample in warmup_results
+        )
+        if not numerical_errors and warmups_succeeded:
             for index in range(samples):
                 try:
-                    sample, _result = _fixed_density_sample(
+                    sample, sample_state = _fixed_density_sample(
                         manifest=manifest,
                         gth_source=gth_source,
                         progress=_progress_wrapper(
@@ -1075,6 +1199,9 @@ def run_fixed_density(
                         ),
                     )
                     measured.append(sample)
+                    del sample_state
+                    if sample.get("numerical_passed") is not True:
+                        break
                 except Exception as error:
                     numerical_errors.append(
                         {
@@ -1086,6 +1213,17 @@ def run_fixed_density(
                     break
     if numerical_errors:
         blockers.append("numerical_execution_failed")
+    expected_eigensolve_provenance = {
+        field: context["execution_contract"]["environment"][field]
+        for field in _EIGENSOLVE_PROVENANCE_FIELDS
+    }
+    produced_samples = [*warmup_results, *measured]
+    if produced_samples and any(
+        {field: sample.get(field) for field in _EIGENSOLVE_PROVENANCE_FIELDS}
+        != expected_eigensolve_provenance
+        for sample in produced_samples
+    ):
+        blockers.append("eigensolve_provenance_mismatch")
     eigenvalue_tolerance = float(
         manifest["numerical_gates"]["fixed_density_eigenvalue_abs_hartree"]
     )
