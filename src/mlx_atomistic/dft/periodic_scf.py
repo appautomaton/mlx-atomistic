@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
 
@@ -172,6 +172,9 @@ class PeriodicSCFConfig:
     mixing_beta: float = 0.35
     mixer: str = "diis"
     davidson: PeriodicDavidsonConfig = field(default_factory=PeriodicDavidsonConfig)
+    kpoint_batch_size: int = 4
+    max_batch_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
+    max_batch_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -192,6 +195,34 @@ class PeriodicSCFConfig:
         if self.mixer not in {"linear", "diis"}:
             msg = "mixer must be 'linear' or 'diis'"
             raise ValueError(msg)
+        if type(self.kpoint_batch_size) is not int or self.kpoint_batch_size <= 0:
+            msg = "kpoint_batch_size must be a positive non-bool integer"
+            raise ValueError(msg)
+        if (
+            not isinstance(self.max_batch_padding_fraction, int | float)
+            or isinstance(self.max_batch_padding_fraction, bool)
+            or not np.isfinite(float(self.max_batch_padding_fraction))
+            or not 0.0 <= float(self.max_batch_padding_fraction) < 1.0
+        ):
+            msg = "max_batch_padding_fraction must be finite and lie in [0, 1)"
+            raise ValueError(msg)
+        if (
+            type(self.max_batch_transient_bytes) is not int
+            or self.max_batch_transient_bytes <= 0
+        ):
+            msg = "max_batch_transient_bytes must be a positive non-bool integer"
+            raise ValueError(msg)
+
+    def batch_policy(self) -> dict[str, int | float]:
+        """Return the exact bounded compact-batch policy."""
+
+        return {
+            "kpoint_batch_size": self.kpoint_batch_size,
+            "max_batch_padding_fraction": float(
+                self.max_batch_padding_fraction
+            ),
+            "max_batch_transient_bytes": self.max_batch_transient_bytes,
+        }
 
 
 @dataclass(frozen=True, init=False)
@@ -446,17 +477,36 @@ def _logical_hpsi_memory(
     return fft_workspace_bytes, peak_temporary_bytes
 
 
-def _compact_hpsi_memory(
-    *,
-    vector_count: int,
-    grid_count: int,
-    projector_workspace_bytes: int,
-) -> tuple[int, int]:
-    """Return compact FFT and GTH workspace bytes for one Hpsi batch."""
+def _empty_projector_metrics() -> dict[str, int]:
+    return {
+        "projector_payload_elements": 0,
+        "projector_elements_generated": 0,
+        "projector_elements_loaded": 0,
+        "projector_traffic_elements": 0,
+        "projector_cache_hits": 0,
+        "projector_cache_misses": 0,
+        "projector_cache_bytes": 0,
+        "projector_peak_workspace_bytes": 0,
+    }
 
-    fft_workspace_bytes = 2 * vector_count * grid_count * 8
-    peak_temporary_bytes = fft_workspace_bytes + projector_workspace_bytes
-    return fft_workspace_bytes, peak_temporary_bytes
+
+@dataclass(frozen=True)
+class _CompactHamiltonianBatchResult:
+    """Lane-local outcomes from one physical compact Hamiltonian batch."""
+
+    actions: dict[int, _CompactLaneState]
+    failures: dict[int, Exception]
+    batch: _CompactBatch | None
+
+    def action_for(self, lane_index: int) -> _CompactLaneState:
+        failure = self.failures.get(lane_index)
+        if failure is not None:
+            raise _detached_failure(failure) from None
+        try:
+            return self.actions[lane_index]
+        except KeyError as error:
+            msg = f"compact Hamiltonian batch has no lane {lane_index}"
+            raise ValueError(msg) from error
 
 
 @dataclass(frozen=True, init=False)
@@ -487,6 +537,26 @@ class PeriodicKohnShamOperator:
         )
         object.__setattr__(self, "nonlocal_operator", nonlocal_operator)
         object.__setattr__(self, "observer", observer)
+
+    @classmethod
+    def _from_shared_potential(
+        cls,
+        basis: PlaneWaveBasis,
+        potential_snapshot: mx.array,
+        nonlocal_operator: PeriodicGTHNonlocalOperator | None = None,
+        observer: RuntimeObserver | None = None,
+    ) -> PeriodicKohnShamOperator:
+        """Bind a private SCF operator to one already evaluated potential."""
+
+        if potential_snapshot.shape != basis.grid.shape:
+            msg = "shared effective local potential must match the basis grid"
+            raise ValueError(msg)
+        result = object.__new__(cls)
+        object.__setattr__(result, "basis", basis)
+        object.__setattr__(result, "_effective_local_potential", potential_snapshot)
+        object.__setattr__(result, "nonlocal_operator", nonlocal_operator)
+        object.__setattr__(result, "observer", observer)
+        return result
 
     @property
     def effective_local_potential(self) -> mx.array:
@@ -524,103 +594,437 @@ class PeriodicKohnShamOperator:
         coefficients: _CompactLaneState,
         *,
         observer: RuntimeObserver | None = None,
+        max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
+        max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        prepared_batch: _CompactBatch | None = None,
     ) -> _CompactLaneState:
-        if observer is not None and self.observer is not None and observer is not self.observer:
-            msg = "operator apply observers must be the same object"
-            raise ValueError(msg)
-        self.basis._validate_state(coefficients)
-        if coefficients.kind != "coefficients":
-            msg = "Hamiltonian input must be coefficient state"
-            raise ValueError(msg)
-        runtime_observer = self.observer if observer is None else observer
-        vector_count = coefficients.vector_count
-        projector_metrics = {
-            "projector_payload_elements": 0,
-            "projector_elements_generated": 0,
-            "projector_elements_loaded": 0,
-            "projector_traffic_elements": 0,
-            "projector_cache_hits": 0,
-            "projector_cache_misses": 0,
-            "projector_cache_bytes": 0,
-            "projector_peak_workspace_bytes": 0,
-        }
-        if runtime_observer is not None:
-            fft_workspace_bytes, _ = _compact_hpsi_memory(
-                vector_count=vector_count,
-                grid_count=self.basis.grid.size,
-                projector_workspace_bytes=0,
-            )
-            runtime_observer.record_peak_memory(
-                "fft_workspace_bytes",
-                fft_workspace_bytes,
-            )
-        with observed_phase(runtime_observer, "hpsi"):
-            batch = _CompactBatch.from_states([coefficients])
-            scattered = batch.scatter()
-            kinetic = (
-                coefficients.values
-                * self.basis._layout._active_kinetic_energies[None, :]
-            )
-            local = batch.unpad(
-                batch.apply_local(
-                    self._effective_local_potential,
-                    scattered=scattered,
-                ),
-                kind="hamiltonian_action",
-            )[0]
-            applied_values = kinetic + local.values
-            if self.nonlocal_operator is not None:
-                nonlocal_action, projector_metrics = (
-                    self.nonlocal_operator._apply_compact(coefficients)
-                )
-                applied_values = applied_values + nonlocal_action.values
-            result = self.basis._state_from_compact(
-                applied_values,
-                kind="hamiltonian_action",
-            )
-        add_observed_work(
-            runtime_observer,
-            {
-                "hpsi_calls": 1,
-                "hpsi_vector_equivalents": vector_count,
-                "fft_submissions": 2,
-                "fft_vector_equivalents": 2 * vector_count,
-                "projector_elements_generated": projector_metrics[
-                    "projector_elements_generated"
-                ],
-                "projector_elements_loaded": projector_metrics[
-                    "projector_elements_loaded"
-                ],
-                "projector_traffic_elements": projector_metrics[
-                    "projector_traffic_elements"
-                ],
-                "projector_cache_hits": projector_metrics["projector_cache_hits"],
-                "projector_cache_misses": projector_metrics[
-                    "projector_cache_misses"
-                ],
-            },
+        outcome = self._apply_compact_batch(
+            (self,),
+            (coefficients,),
+            observer=observer,
+            max_padding_fraction=max_padding_fraction,
+            max_transient_bytes=max_transient_bytes,
+            prepared_batch=prepared_batch,
         )
-        if runtime_observer is not None:
-            _, peak_temporary_bytes = _compact_hpsi_memory(
-                vector_count=vector_count,
-                grid_count=self.basis.grid.size,
-                projector_workspace_bytes=projector_metrics[
-                    "projector_peak_workspace_bytes"
-                ],
+        return outcome.action_for(0)
+
+    @staticmethod
+    def _estimated_batch_transient_bytes(
+        operators: Sequence[PeriodicKohnShamOperator],
+        batch: _CompactBatch,
+    ) -> int:
+        """Return the complete logical transient bound for one Hpsi batch."""
+
+        if len(operators) != batch.lane_count:
+            msg = "Hamiltonian operator count must match the compact batch"
+            raise ValueError(msg)
+        lane_count = batch.lane_count
+        padded_complex_bytes = (
+            lane_count * batch.vector_count * batch.bucket_size * 8
+        )
+        kinetic_index_bytes = lane_count * batch.bucket_size * 4
+        estimate = (
+            batch.estimated_transient_bytes
+            + 5 * padded_complex_bytes
+            + kinetic_index_bytes
+        )
+        first_potential = operators[0]._effective_local_potential
+        if not all(
+            operator._effective_local_potential is first_potential
+            for operator in operators
+        ):
+            estimate += lane_count * batch.grid_size * 8
+
+        grouped_gth: dict[str, list[int]] = defaultdict(list)
+        for index, operator in enumerate(operators):
+            nonlocal_operator = operator.nonlocal_operator
+            if isinstance(nonlocal_operator, PeriodicGTHNonlocalOperator):
+                grouped_gth[nonlocal_operator._context_identity].append(index)
+            elif nonlocal_operator is not None:
+                estimate += padded_complex_bytes // lane_count
+        for indices in grouped_gth.values():
+            if len(indices) == lane_count:
+                gth_batch = batch
+            else:
+                states = [
+                    _CompactLaneState(
+                        batch.values[lane_index, :, : batch.active_counts[lane_index]],
+                        batch.layouts[lane_index],
+                        batch.kinds[lane_index],
+                    )
+                    for lane_index in indices
+                ]
+                gth_batch = _CompactBatch.from_states(
+                    states,
+                    max_padding_fraction=1.0 - np.finfo(np.float64).eps,
+                    max_transient_bytes=max(
+                        batch.estimated_transient_bytes,
+                        _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+                    ),
+                )
+            estimate += PeriodicGTHNonlocalOperator._estimated_batch_transient_bytes(
+                [operators[index].nonlocal_operator for index in indices],
+                gth_batch,
             )
-            runtime_observer.record_peak_memory(
-                "peak_temporary_bytes",
-                peak_temporary_bytes,
+        return estimate
+
+    @staticmethod
+    def _apply_compact_batch(
+        operators: Sequence[PeriodicKohnShamOperator],
+        coefficients: Sequence[_CompactLaneState],
+        *,
+        observer: RuntimeObserver | None = None,
+        max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
+        max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        prepared_batch: _CompactBatch | None = None,
+    ) -> _CompactHamiltonianBatchResult:
+        """Apply one bounded batch-first Hamiltonian submission."""
+
+        if not operators or len(operators) != len(coefficients):
+            msg = "compact Hamiltonian batches require matching non-empty lanes"
+            raise ValueError(msg)
+        if (
+            not isinstance(max_padding_fraction, int | float)
+            or isinstance(max_padding_fraction, bool)
+            or not np.isfinite(float(max_padding_fraction))
+            or not 0.0 <= float(max_padding_fraction) < 1.0
+        ):
+            msg = "max_padding_fraction must be finite and lie in [0, 1)"
+            raise ValueError(msg)
+        if type(max_transient_bytes) is not int or max_transient_bytes <= 0:
+            msg = "max_transient_bytes must be a positive non-bool integer"
+            raise ValueError(msg)
+        operator_observers = {
+            id(operator.observer): operator.observer
+            for operator in operators
+            if operator.observer is not None
+        }
+        if observer is None:
+            if len(operator_observers) > 1:
+                msg = "compact Hamiltonian batch operators must share one observer"
+                raise ValueError(msg)
+            runtime_observer = next(iter(operator_observers.values()), None)
+        else:
+            runtime_observer = observer
+
+        failures: dict[int, Exception] = {}
+        ready_indices: list[int] = []
+        projector_actions: dict[int, _CompactLaneState] = {}
+        projector_metrics: dict[int, dict[str, int]] = {}
+        estimated_transient_bytes = 0
+        executed_fft = False
+        with observed_phase(runtime_observer, "hpsi"):
+            for lane_index, (operator, state) in enumerate(
+                zip(operators, coefficients, strict=True)
+            ):
+                try:
+                    if (
+                        runtime_observer is not None
+                        and operator.observer is not None
+                        and operator.observer is not runtime_observer
+                    ):
+                        msg = "operator apply observers must be the same object"
+                        raise ValueError(msg)
+                    operator.basis._validate_state(state)
+                    if state.kind != "coefficients":
+                        msg = "Hamiltonian input must be coefficient state"
+                        raise ValueError(msg)
+                    if (
+                        operator._effective_local_potential.shape
+                        != state.layout.grid_shape
+                    ):
+                        msg = "effective local potential must match its lane grid"
+                        raise ValueError(msg)
+                    projector_metrics[lane_index] = _empty_projector_metrics()
+                    if (
+                        operator.nonlocal_operator is not None
+                        and not isinstance(
+                            operator.nonlocal_operator,
+                            PeriodicGTHNonlocalOperator,
+                        )
+                    ):
+                        action, metrics = operator.nonlocal_operator._apply_compact(
+                            state,
+                            evaluate=False,
+                        )
+                        projector_actions[lane_index] = action
+                        projector_metrics[lane_index] = metrics
+                    ready_indices.append(lane_index)
+                except Exception as error:
+                    failures[lane_index] = _detached_failure(error)
+
+            batch: _CompactBatch | None = None
+            if ready_indices:
+                ready_states = [coefficients[index] for index in ready_indices]
+                try:
+                    if (
+                        prepared_batch is not None
+                        and ready_indices == list(range(len(coefficients)))
+                        and len(prepared_batch.layouts) == len(ready_states)
+                        and all(
+                            layout is state.layout
+                            for layout, state in zip(
+                                prepared_batch.layouts,
+                                ready_states,
+                                strict=True,
+                            )
+                        )
+                        and prepared_batch.kinds
+                        == tuple(state.kind for state in ready_states)
+                        and prepared_batch.estimated_transient_bytes
+                        <= max_transient_bytes
+                        and max(
+                            (
+                                prepared_batch.bucket_size - count
+                            )
+                            / prepared_batch.bucket_size
+                            for count in prepared_batch.active_counts
+                        )
+                        <= max_padding_fraction
+                    ):
+                        batch = prepared_batch
+                    else:
+                        batch = _CompactBatch.from_states(
+                            ready_states,
+                            max_padding_fraction=max_padding_fraction,
+                            max_transient_bytes=max_transient_bytes,
+                        )
+                    ready_operators = [operators[index] for index in ready_indices]
+                    estimated_transient_bytes = (
+                        PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                            ready_operators,
+                            batch,
+                        )
+                    )
+                    if estimated_transient_bytes > max_transient_bytes:
+                        msg = (
+                            "compact Hpsi batch exceeds the complete transient "
+                            "byte budget"
+                        )
+                        raise ValueError(msg)
+
+                    grouped_gth: dict[str, list[int]] = defaultdict(list)
+                    for lane_index in ready_indices:
+                        nonlocal_operator = operators[lane_index].nonlocal_operator
+                        if isinstance(
+                            nonlocal_operator,
+                            PeriodicGTHNonlocalOperator,
+                        ):
+                            grouped_gth[
+                                nonlocal_operator._context_identity
+                            ].append(lane_index)
+                    for gth_indices in grouped_gth.values():
+                        gth_states = [coefficients[index] for index in gth_indices]
+                        if gth_indices == ready_indices:
+                            gth_batch = batch
+                        else:
+                            gth_batch = _CompactBatch.from_states(
+                                gth_states,
+                                max_padding_fraction=max_padding_fraction,
+                                max_transient_bytes=max_transient_bytes,
+                            )
+                        try:
+                            gth_actions, gth_metrics = (
+                                PeriodicGTHNonlocalOperator._apply_compact_batch(
+                                    [
+                                        operators[index].nonlocal_operator
+                                        for index in gth_indices
+                                    ],
+                                    gth_states,
+                                    batch=gth_batch,
+                                    evaluate=True,
+                                )
+                            )
+                        except Exception:
+                            for lane_index in gth_indices:
+                                nonlocal_operator = operators[
+                                    lane_index
+                                ].nonlocal_operator
+                                try:
+                                    action, metrics = (
+                                        nonlocal_operator._apply_compact(
+                                            coefficients[lane_index],
+                                            evaluate=True,
+                                        )
+                                    )
+                                    projector_actions[lane_index] = action
+                                    projector_metrics[lane_index] = metrics
+                                except Exception as error:
+                                    failures[lane_index] = _detached_failure(error)
+                        else:
+                            for lane_index, action, metrics in zip(
+                                gth_indices,
+                                gth_actions,
+                                gth_metrics,
+                                strict=True,
+                            ):
+                                projector_actions[lane_index] = action
+                                projector_metrics[lane_index] = metrics
+
+                    scattered = batch.scatter()
+                    kinetic_rows = []
+                    nonlocal_rows = []
+                    for lane_index, state in zip(
+                        ready_indices,
+                        ready_states,
+                        strict=True,
+                    ):
+                        padding = batch.bucket_size - state.layout.active_count
+                        kinetic = state.layout._active_kinetic_energies
+                        nonlocal_values = (
+                            projector_actions[lane_index].values
+                            if lane_index in projector_actions
+                            else mx.zeros_like(state.values)
+                        )
+                        if padding:
+                            kinetic = mx.concatenate(
+                                [kinetic, mx.zeros((padding,), dtype=mx.float32)]
+                            )
+                            nonlocal_values = mx.concatenate(
+                                [
+                                    nonlocal_values,
+                                    mx.zeros(
+                                        (state.vector_count, padding),
+                                        dtype=mx.complex64,
+                                    ),
+                                ],
+                                axis=1,
+                            )
+                        kinetic_rows.append(kinetic)
+                        nonlocal_rows.append(nonlocal_values)
+                    kinetic_action = batch.values * mx.stack(
+                        kinetic_rows,
+                        axis=0,
+                    )[:, None, :]
+                    first_potential = operators[
+                        ready_indices[0]
+                    ]._effective_local_potential
+                    if all(
+                        operators[index]._effective_local_potential
+                        is first_potential
+                        for index in ready_indices
+                    ):
+                        potentials = first_potential
+                    else:
+                        potentials = mx.stack(
+                            [
+                                operators[index]._effective_local_potential
+                                for index in ready_indices
+                            ],
+                            axis=0,
+                        )
+                    local_action = batch.apply_local(
+                        potentials,
+                        scattered=scattered,
+                    )
+                    executed_fft = True
+                    applied_values = (
+                        kinetic_action
+                        + local_action
+                        + mx.stack(nonlocal_rows, axis=0)
+                    )
+                    states = batch.unpad(
+                        applied_values,
+                        kind="hamiltonian_action",
+                    )
+                    finite = [mx.all(mx.isfinite(state.values)) for state in states]
+                    mx.eval(*(state.values for state in states), *finite)
+                    actions = {}
+                    for lane_index, state, is_finite in zip(
+                        ready_indices,
+                        states,
+                        finite,
+                        strict=True,
+                    ):
+                        if lane_index in failures:
+                            continue
+                        if bool(is_finite):
+                            actions[lane_index] = state
+                        else:
+                            failures[lane_index] = ValueError(
+                                "Davidson Hamiltonian action must be finite"
+                            )
+                except Exception as error:
+                    failure = _detached_failure(error)
+                    actions = {}
+                    for lane_index in ready_indices:
+                        failures[lane_index] = failure
+            else:
+                actions = {}
+
+        if batch is not None and executed_fft:
+            lane_count = len(ready_indices)
+            vector_count = batch.vector_count
+            generated = sum(
+                projector_metrics[index]["projector_elements_generated"]
+                for index in ready_indices
             )
-            runtime_observer.record_memory(
-                "projector_payload_bytes",
-                projector_metrics["projector_payload_elements"] * 8,
+            loaded = sum(
+                projector_metrics[index]["projector_elements_loaded"]
+                for index in ready_indices
             )
-            runtime_observer.record_memory(
-                "persistent_projector_bytes",
-                projector_metrics["projector_cache_bytes"],
+            traffic = sum(
+                projector_metrics[index]["projector_traffic_elements"]
+                for index in ready_indices
             )
-        return result
+            cache_hits = sum(
+                projector_metrics[index]["projector_cache_hits"]
+                for index in ready_indices
+            )
+            cache_misses = sum(
+                projector_metrics[index]["projector_cache_misses"]
+                for index in ready_indices
+            )
+            add_observed_work(
+                runtime_observer,
+                {
+                    "hpsi_calls": 1,
+                    "hpsi_vector_equivalents": lane_count * vector_count,
+                    "fft_submissions": 2,
+                    "fft_vector_equivalents": 2 * lane_count * vector_count,
+                    "projector_elements_generated": generated,
+                    "projector_elements_loaded": loaded,
+                    "projector_traffic_elements": traffic,
+                    "padding_elements": batch.padding_elements,
+                    "projector_cache_hits": cache_hits,
+                    "projector_cache_misses": cache_misses,
+                },
+            )
+            if runtime_observer is not None:
+                fft_workspace_bytes = (
+                    2 * lane_count * vector_count * batch.grid_size * 8
+                )
+                runtime_observer.record_peak_memory(
+                    "fft_workspace_bytes",
+                    fft_workspace_bytes,
+                )
+                runtime_observer.record_peak_memory(
+                    "peak_temporary_bytes",
+                    estimated_transient_bytes,
+                )
+                runtime_observer.record_peak_memory(
+                    "projector_payload_bytes",
+                    sum(
+                        projector_metrics[index]["projector_payload_elements"]
+                        for index in ready_indices
+                    )
+                    * 8,
+                )
+                runtime_observer.record_memory(
+                    "persistent_projector_bytes",
+                    max(
+                        (
+                            projector_metrics[index]["projector_cache_bytes"]
+                            for index in ready_indices
+                        ),
+                        default=0,
+                    ),
+                )
+        return _CompactHamiltonianBatchResult(
+            actions=actions,
+            failures=failures,
+            batch=batch if executed_fft else None,
+        )
 
     def rayleigh_quotients(
         self,
@@ -896,6 +1300,125 @@ class _FixedHamiltonianToken:
 
 
 @dataclass(frozen=True)
+class _CompactSubmission:
+    indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _CompactSubmissionPlan:
+    submissions: tuple[_CompactSubmission, ...]
+    failures: dict[int, Exception]
+    compatibility_groups: tuple[tuple[int, ...], ...]
+
+
+def _plan_compact_submissions(
+    states: Sequence[_CompactLaneState],
+    *,
+    batch_cap: int,
+    max_padding_fraction: float,
+    max_transient_bytes: int,
+    batch_byte_estimator: Callable[
+        [tuple[int, ...], _CompactBatch], int
+    ]
+    | None = None,
+) -> _CompactSubmissionPlan:
+    """Build deterministic active-count buckets within hard batch bounds."""
+
+    if type(batch_cap) is not int or batch_cap <= 0:
+        msg = "compact batch_cap must be a positive non-bool integer"
+        raise ValueError(msg)
+    if (
+        not isinstance(max_padding_fraction, int | float)
+        or isinstance(max_padding_fraction, bool)
+        or not np.isfinite(float(max_padding_fraction))
+        or not 0.0 <= float(max_padding_fraction) < 1.0
+    ):
+        msg = "compact max_padding_fraction must be finite and lie in [0, 1)"
+        raise ValueError(msg)
+    if type(max_transient_bytes) is not int or max_transient_bytes <= 0:
+        msg = "compact max_transient_bytes must be a positive non-bool integer"
+        raise ValueError(msg)
+
+    def build_candidate(indices: Sequence[int]) -> _CompactBatch:
+        candidate_batch = _CompactBatch.from_states(
+            [states[index] for index in indices],
+            max_padding_fraction=float(max_padding_fraction),
+            max_transient_bytes=max_transient_bytes,
+        )
+        estimated_bytes = (
+            candidate_batch.estimated_transient_bytes
+            if batch_byte_estimator is None
+            else batch_byte_estimator(tuple(indices), candidate_batch)
+        )
+        if estimated_bytes > max_transient_bytes:
+            msg = "compact batch exceeds the complete transient byte budget"
+            raise ValueError(msg)
+        return candidate_batch
+
+    grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
+    for index, state in enumerate(states):
+        grouped[
+            (
+                id(state.layout.reciprocal),
+                state.layout.grid_shape,
+                state.vector_count,
+            )
+        ].append(index)
+
+    submissions: list[_CompactSubmission] = []
+    failures: dict[int, Exception] = {}
+    compatibility_groups: list[tuple[int, ...]] = []
+    for compatible_indices in grouped.values():
+        compatibility_groups.append(tuple(compatible_indices))
+        ordered = sorted(
+            compatible_indices,
+            key=lambda index: (states[index].layout.active_count, index),
+        )
+        current: list[int] = []
+        current_batch: _CompactBatch | None = None
+        for index in ordered:
+            if len(current) == batch_cap:
+                if current_batch is None:
+                    msg = "compact submission planner lost its active batch"
+                    raise RuntimeError(msg)
+                submissions.append(_CompactSubmission(tuple(current)))
+                current = []
+                current_batch = None
+            candidate = [*current, index]
+            try:
+                candidate_batch = build_candidate(candidate)
+            except ValueError:
+                if current:
+                    if current_batch is None:
+                        msg = "compact submission planner lost its bounded batch"
+                        raise RuntimeError(msg) from None
+                    submissions.append(_CompactSubmission(tuple(current)))
+                    current = []
+                    current_batch = None
+                try:
+                    candidate_batch = build_candidate((index,))
+                except ValueError as error:
+                    failures[index] = _detached_failure(error)
+                    continue
+                current = [index]
+                current_batch = candidate_batch
+            else:
+                current = candidate
+                current_batch = candidate_batch
+        if current:
+            if current_batch is None:
+                msg = "compact submission planner lost its final batch"
+                raise RuntimeError(msg)
+            submissions.append(_CompactSubmission(tuple(current)))
+
+    return _CompactSubmissionPlan(
+        submissions=tuple(submissions),
+        failures=failures,
+        compatibility_groups=tuple(compatibility_groups),
+    )
+
+
+@dataclass(frozen=True)
 class _DavidsonApplicationTicket:
     """One lane's newly accepted block awaiting its only H application."""
 
@@ -907,6 +1430,18 @@ class _DavidsonApplicationTicket:
     token: _FixedHamiltonianToken
     vectors: _CompactLaneState
     observer: RuntimeObserver | None
+
+
+_DavidsonSubmissionCallback = Callable[
+    [
+        str,
+        int,
+        tuple[_DavidsonApplicationTicket, ...],
+        _CompactBatch,
+        dict[str, Exception],
+    ],
+    None,
+]
 
 
 @dataclass(frozen=True)
@@ -936,28 +1471,63 @@ class _DavidsonScheduleResult:
 class _DavidsonScheduler:
     """Submit compatible ragged tickets under an explicit batch-cap policy."""
 
-    def __init__(self, *, batch_cap: int = 1) -> None:
-        if type(batch_cap) is not int or batch_cap != 1:
-            msg = (
-                "Davidson cross-lane Hpsi lowering is unavailable; "
-                "batch_cap must be one"
-            )
-            raise ValueError(msg)
+    def __init__(
+        self,
+        *,
+        batch_cap: int = 1,
+        max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
+        max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        submission_callback: _DavidsonSubmissionCallback | None = None,
+    ) -> None:
+        _plan_compact_submissions(
+            (),
+            batch_cap=batch_cap,
+            max_padding_fraction=max_padding_fraction,
+            max_transient_bytes=max_transient_bytes,
+        )
         self._batch_cap = batch_cap
+        self._max_padding_fraction = float(max_padding_fraction)
+        self._max_transient_bytes = max_transient_bytes
+        self._submission_callback = submission_callback
+        self._submission_index = 0
 
     @property
     def batch_cap(self) -> int:
         return self._batch_cap
 
+    @property
+    def max_padding_fraction(self) -> float:
+        return self._max_padding_fraction
+
+    @property
+    def max_transient_bytes(self) -> int:
+        return self._max_transient_bytes
+
+    def reset(self) -> None:
+        """Reset solve-local submission numbering."""
+
+        self._submission_index = 0
+
+    @staticmethod
+    def _observer(ticket: _DavidsonApplicationTicket) -> RuntimeObserver | None:
+        return ticket.operator.observer if ticket.observer is None else ticket.observer
+
     @staticmethod
     def _group_key(ticket: _DavidsonApplicationTicket) -> tuple[object, ...]:
         layout = ticket.vectors.layout
+        nonlocal_operator = ticket.operator.nonlocal_operator
+        if nonlocal_operator is None:
+            nonlocal_context: object = None
+        elif isinstance(nonlocal_operator, PeriodicGTHNonlocalOperator):
+            nonlocal_context = ("gth", nonlocal_operator._context_identity)
+        else:
+            nonlocal_context = ("custom", id(nonlocal_operator))
         return (
             id(layout.reciprocal),
             layout.grid_shape,
-            layout.active_count,
             ticket.vectors.vector_count,
-            id(ticket.observer),
+            id(_DavidsonScheduler._observer(ticket)),
+            nonlocal_context,
         )
 
     def apply(
@@ -967,12 +1537,10 @@ class _DavidsonScheduler:
         if not tickets:
             msg = "Davidson scheduler requires at least one application ticket"
             raise ValueError(msg)
-        if self.batch_cap != 1:
-            msg = "Davidson scheduler batch-cap policy was mutated"
-            raise RuntimeError(msg)
         seen: set[str] = set()
         ready: list[_DavidsonApplicationTicket] = []
         failures: dict[str, Exception] = {}
+        validated: list[tuple[_DavidsonApplicationTicket, mx.array]] = []
         for ticket in tickets:
             if ticket.lane_id in seen:
                 msg = f"duplicate Davidson scheduler lane: {ticket.lane_id!r}"
@@ -989,12 +1557,27 @@ class _DavidsonScheduler:
                 if ticket.vectors.kind != "coefficients":
                     msg = "Davidson scheduler accepts coefficient blocks only"
                     raise ValueError(msg)
-                if not _all_finite(ticket.vectors.values):
-                    msg = "Davidson application block must be finite"
-                    raise ValueError(msg)
-                ready.append(ticket)
+                validated.append(
+                    (ticket, mx.all(mx.isfinite(ticket.vectors.values)))
+                )
             except Exception as error:
                 failures[ticket.lane_id] = _detached_failure(error)
+        if validated:
+            try:
+                mx.eval(*(finite for _, finite in validated))
+            except Exception as error:
+                failure = _detached_failure(error)
+                failures.update(
+                    {ticket.lane_id: failure for ticket, _ in validated}
+                )
+            else:
+                for ticket, finite in validated:
+                    if bool(finite):
+                        ready.append(ticket)
+                    else:
+                        failures[ticket.lane_id] = ValueError(
+                            "Davidson application block must be finite"
+                        )
 
         grouped: dict[tuple[object, ...], list[_DavidsonApplicationTicket]] = (
             defaultdict(list)
@@ -1009,26 +1592,118 @@ class _DavidsonScheduler:
             compatibility_groups.append(
                 tuple(ticket.lane_id for ticket in compatible)
             )
-            for start in range(0, len(compatible), self.batch_cap):
-                submission = compatible[start : start + self.batch_cap]
-                groups.append(tuple(ticket.lane_id for ticket in submission))
-                # The explicit cap-one fallback is one real Hpsi submission.
-                ticket = submission[0]
+
+            def estimate_submission(
+                indices: tuple[int, ...],
+                batch: _CompactBatch,
+                *,
+                _compatible: list[_DavidsonApplicationTicket] = compatible,
+            ) -> int:
+                return PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                    [_compatible[index].operator for index in indices],
+                    batch,
+                )
+
+            plan = _plan_compact_submissions(
+                [ticket.vectors for ticket in compatible],
+                batch_cap=self.batch_cap,
+                max_padding_fraction=self.max_padding_fraction,
+                max_transient_bytes=self.max_transient_bytes,
+                batch_byte_estimator=estimate_submission,
+            )
+            for lane_index, error in plan.failures.items():
+                failures[compatible[lane_index].lane_id] = error
+            for planned in plan.submissions:
+                submission = tuple(
+                    compatible[index] for index in planned.indices
+                )
+                prepared_batch = _CompactBatch.from_states(
+                    [ticket.vectors for ticket in submission],
+                    max_padding_fraction=self.max_padding_fraction,
+                    max_transient_bytes=self.max_transient_bytes,
+                )
+                lane_ids = tuple(ticket.lane_id for ticket in submission)
+                groups.append(lane_ids)
+                submission_index = self._submission_index
+                self._submission_index += 1
+                if self._submission_callback is not None:
+                    self._submission_callback(
+                        "started",
+                        submission_index,
+                        submission,
+                        prepared_batch,
+                        {},
+                    )
+                submission_failures: dict[str, Exception] = {}
                 try:
-                    applied = ticket.operator._apply_compact(
-                        ticket.vectors,
-                        observer=ticket.observer,
+                    if len(submission) == 1:
+                        ticket = submission[0]
+                        apply_kwargs: dict[str, object] = {
+                            "observer": ticket.observer,
+                            "prepared_batch": prepared_batch,
+                        }
+                        if (
+                            self.max_padding_fraction
+                            != _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
+                            or self.max_transient_bytes
+                            != _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
+                        ):
+                            apply_kwargs.update(
+                                max_padding_fraction=self.max_padding_fraction,
+                                max_transient_bytes=self.max_transient_bytes,
+                            )
+                        applied = ticket.operator._apply_compact(
+                            ticket.vectors,
+                            **apply_kwargs,
+                        )
+                        batch_actions = {ticket.lane_id: applied}
+                    else:
+                        outcome = PeriodicKohnShamOperator._apply_compact_batch(
+                            tuple(ticket.operator for ticket in submission),
+                            tuple(ticket.vectors for ticket in submission),
+                            observer=self._observer(submission[0]),
+                            max_padding_fraction=self.max_padding_fraction,
+                            max_transient_bytes=self.max_transient_bytes,
+                            prepared_batch=prepared_batch,
+                        )
+                        batch_actions = {
+                            ticket.lane_id: outcome.actions[index]
+                            for index, ticket in enumerate(submission)
+                            if index in outcome.actions
+                        }
+                        submission_failures.update(
+                            {
+                                submission[index].lane_id: error
+                                for index, error in outcome.failures.items()
+                            }
+                        )
+                    for ticket in submission:
+                        applied = batch_actions.get(ticket.lane_id)
+                        if applied is None:
+                            continue
+                        actions[ticket.lane_id] = applied
+                        add_observed_work(
+                            ticket.observer,
+                            {
+                                "davidson_hv_new_vectors": (
+                                    ticket.vectors.vector_count
+                                )
+                            },
+                        )
+                except Exception as error:
+                    failure = _detached_failure(error)
+                    submission_failures.update(
+                        {ticket.lane_id: failure for ticket in submission}
                     )
-                    if not _all_finite(applied.values):
-                        msg = "Davidson Hamiltonian action must be finite"
-                        raise ValueError(msg)
-                    actions[ticket.lane_id] = applied
-                    add_observed_work(
-                        ticket.observer,
-                        {"davidson_hv_new_vectors": ticket.vectors.vector_count},
+                failures.update(submission_failures)
+                if self._submission_callback is not None:
+                    self._submission_callback(
+                        "completed",
+                        submission_index,
+                        submission,
+                        prepared_batch,
+                        submission_failures,
                     )
-                except Exception as error:  # lane-local fail-closed result
-                    failures[ticket.lane_id] = _detached_failure(error)
         return _DavidsonScheduleResult(
             actions=actions,
             failures=failures,
@@ -1228,6 +1903,29 @@ def _initial_coefficients(basis: PlaneWaveBasis, count: int) -> _CompactLaneStat
     slots = mx.arange(basis.active_count, dtype=selected.dtype)[None, :]
     coefficients = (slots == selected[:, None]).astype(mx.complex64)
     return basis._state_from_compact(coefficients)
+
+
+def _initial_trial(
+    basis: PlaneWaveBasis,
+    n_bands: int,
+    initial_coefficients: object | None,
+) -> _CompactLaneState:
+    if isinstance(initial_coefficients, _PairedDavidsonState):
+        msg = "paired Davidson H(V) cannot seed a new fixed-Hamiltonian solve"
+        raise ValueError(msg)
+    if initial_coefficients is None:
+        return _initial_coefficients(basis, n_bands)
+    if isinstance(initial_coefficients, _CompactLaneState):
+        try:
+            _require_layout(initial_coefficients, basis._layout)
+            return initial_coefficients
+        except ValueError:
+            return _remap_initial_coefficients(
+                initial_coefficients,
+                basis._layout,
+            )
+    trial, _ = basis._state_from_full(initial_coefficients)
+    return trial
 
 
 @dataclass(frozen=True)
@@ -1563,6 +2261,7 @@ class _DavidsonEngine:
         self,
         requests: Sequence[_DavidsonLaneRequest],
     ) -> _DavidsonEngineResult:
+        self.scheduler.reset()
         self._ready_rounds.clear()
         self._compatibility_groups.clear()
         self._submission_groups.clear()
@@ -1719,19 +2418,7 @@ def solve_periodic_eigenproblem(
             "the active basis size"
         )
         raise ValueError(msg)
-    if isinstance(initial_coefficients, _PairedDavidsonState):
-        msg = "paired Davidson H(V) cannot seed a new fixed-Hamiltonian solve"
-        raise ValueError(msg)
-    if initial_coefficients is None:
-        trial = _initial_coefficients(basis, n_bands)
-    elif isinstance(initial_coefficients, _CompactLaneState):
-        try:
-            _require_layout(initial_coefficients, basis._layout)
-            trial = initial_coefficients
-        except ValueError:
-            trial = _remap_initial_coefficients(initial_coefficients, basis._layout)
-    else:
-        trial, _ = basis._state_from_full(initial_coefficients)
+    trial = _initial_trial(basis, n_bands, initial_coefficients)
     lane_id = basis._layout.lane_id
     request = _DavidsonLaneRequest(
         lane_id=lane_id,
@@ -1805,6 +2492,7 @@ class PeriodicSCFResult:
     history: tuple[dict[str, float | int | str | None], ...]
     timings: dict[str, float]
     time_reversal_ownership: TimeReversalOwnership | None = None
+    batch_policy: dict[str, int | float] = field(default_factory=dict)
     _owned_kpoints: tuple[PeriodicKPointResult, ...] | None = field(
         default=None,
         repr=False,
@@ -1863,6 +2551,7 @@ class PeriodicSCFResult:
             "energy_by_term_hartree": dict(self.energy_by_term),
             "history": [dict(row) for row in self.history],
             "timings_ms": dict(self.timings),
+            "batch_policy": dict(self.batch_policy),
             "dense_full_hamiltonian": False,
         }
 
@@ -1871,18 +2560,92 @@ def _density_from_kpoints(
     results: Sequence[PeriodicKPointResult],
     *,
     occupation: float,
+    batch_cap: int = 1,
+    max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
+    max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+    observer: RuntimeObserver | None = None,
 ) -> mx.array:
-    density = mx.zeros(results[0].basis.grid.shape, dtype=mx.float32)
+    if not results:
+        msg = "density construction requires at least one k-point result"
+        raise ValueError(msg)
+    grid_shape = results[0].basis.grid.shape
+    states: list[_CompactLaneState] = []
     for result in results:
+        if result.basis.grid.shape != grid_shape:
+            msg = "density k-point results must share one real-space grid"
+            raise ValueError(msg)
         compact = result.eigen._compact_coefficients
         if not isinstance(compact, _CompactLaneState):
             msg = "density construction requires owned compact k-point states"
             raise ValueError(msg)
-        orbitals = result.basis._to_real_compact(compact)
-        density = density + float(result.integration_weight * occupation) * mx.sum(
-            mx.abs(orbitals) ** 2,
-            axis=0,
+        states.append(compact)
+
+    def estimate_density_batch(
+        _indices: tuple[int, ...],
+        batch: _CompactBatch,
+    ) -> int:
+        return (
+            batch.estimated_transient_bytes
+            + batch.lane_count * batch.grid_size * 4
+            + batch.grid_size * 4
         )
+
+    plan = _plan_compact_submissions(
+        states,
+        batch_cap=batch_cap,
+        max_padding_fraction=max_padding_fraction,
+        max_transient_bytes=max_transient_bytes,
+        batch_byte_estimator=estimate_density_batch,
+    )
+    if plan.failures:
+        failed_index = min(plan.failures)
+        raise _detached_failure(plan.failures[failed_index]) from None
+
+    density = mx.zeros(grid_shape, dtype=mx.float32)
+    for submission in plan.submissions:
+        batch = _CompactBatch.from_states(
+            [states[index] for index in submission.indices],
+            max_padding_fraction=max_padding_fraction,
+            max_transient_bytes=max_transient_bytes,
+        )
+        estimated_transient_bytes = estimate_density_batch(
+            submission.indices,
+            batch,
+        )
+        if estimated_transient_bytes > max_transient_bytes:
+            msg = "density batch exceeds the complete transient byte budget"
+            raise ValueError(msg)
+        orbitals = batch.to_real()
+        weights = mx.array(
+            np.asarray(
+                [
+                    results[index].integration_weight * occupation
+                    for index in submission.indices
+                ],
+                dtype=np.float32,
+            )
+        )[:, None, None, None]
+        weighted_density = weights * mx.sum(mx.abs(orbitals) ** 2, axis=1)
+        density = density + mx.sum(weighted_density, axis=0)
+        mx.eval(density)
+        add_observed_work(
+            observer,
+            {
+                "fft_submissions": 1,
+                "fft_vector_equivalents": batch.lane_count * batch.vector_count,
+                "padding_elements": batch.padding_elements,
+            },
+        )
+        if observer is not None:
+            observer.record_peak_memory(
+                "fft_workspace_bytes",
+                batch.lane_count * batch.vector_count * batch.grid_size * 8,
+            )
+            observer.record_peak_memory(
+                "peak_temporary_bytes",
+                estimated_transient_bytes,
+            )
+
     return mx.real(density)
 
 
@@ -2194,6 +2957,7 @@ def _run_periodic_scf_with_projector_cache(
             owned_active_counts=[bases[index].active_count for index in owned_indices],
             representative_count=len(ownership.representative_indices),
             fallback_reasons=ownership.fallback_reasons,
+            batch_policy=scf_config.batch_policy(),
         )
     history: list[dict[str, float | int | str | None]] = []
     final_owned_results: tuple[PeriodicKPointResult, ...] = ()
@@ -2221,34 +2985,125 @@ def _run_periodic_scf_with_projector_cache(
         owned_by_index: dict[int, PeriodicKPointResult] = {}
         max_orbital_residual = 0.0
         start = perf_counter()
-        for batch_index, point_index in enumerate(owned_indices):
-            point = kpoint_mesh.points[point_index]
-            basis = bases[point_index]
-            nonlocal_operator = nonlocal_operators[point_index]
-            entry = ownership.entry_for(point_index)
-            if observer is not None:
-                observer.emit(
-                    "kpoint_batch",
-                    status="started",
-                    scf_iteration=iteration,
-                    batch_index=batch_index,
-                    batch_size=1,
-                    reduced_kpoints=[list(point.vector)],
-                    explicit_indices=[point_index],
-                )
-            operator = PeriodicKohnShamOperator(
-                basis,
-                effective,
-                nonlocal_operator,
+        effective_snapshot = mx.array(effective)
+        mx.eval(effective_snapshot)
+        operators_by_index = {
+            point_index: PeriodicKohnShamOperator._from_shared_potential(
+                bases[point_index],
+                effective_snapshot,
+                nonlocal_operators[point_index],
                 observer,
             )
-            eigen = solve_periodic_eigenproblem(
-                operator,
+            for point_index in owned_indices
+        }
+        lane_to_index = {
+            bases[point_index]._layout.lane_id: point_index
+            for point_index in owned_indices
+        }
+
+        def emit_submission(
+            status: str,
+            batch_index: int,
+            tickets: tuple[_DavidsonApplicationTicket, ...],
+            batch: _CompactBatch,
+            failures: dict[str, Exception],
+            *,
+            _iteration: int = iteration,
+            _lane_to_index: dict[str, int] = lane_to_index,
+        ) -> None:
+            if observer is None:
+                return
+            explicit_indices = [
+                _lane_to_index[ticket.lane_id] for ticket in tickets
+            ]
+            complete_transient_bytes = (
+                PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                    [ticket.operator for ticket in tickets],
+                    batch,
+                )
+            )
+            fields: dict[str, object] = {
+                "status": status,
+                "scf_iteration": _iteration,
+                "batch_index": batch_index,
+                "batch_size": len(tickets),
+                "lane_ids": [ticket.lane_id for ticket in tickets],
+                "reduced_kpoints": [
+                    list(kpoint_mesh.points[index].vector)
+                    for index in explicit_indices
+                ],
+                "explicit_indices": explicit_indices,
+                "active_counts": list(batch.active_counts),
+                "vector_count": batch.vector_count,
+                "padding_elements": batch.padding_elements,
+                "estimated_transient_bytes": complete_transient_bytes,
+                "compact_batch_transient_bytes": (
+                    batch.estimated_transient_bytes
+                ),
+                "batch_policy": scf_config.batch_policy(),
+                "synchronized": observer.synchronize is not None,
+            }
+            if failures:
+                fields["failed_explicit_indices"] = [
+                    _lane_to_index[lane_id] for lane_id in failures
+                ]
+                fields["failure_messages"] = {
+                    lane_id: str(error) for lane_id, error in failures.items()
+                }
+            observer.emit("kpoint_batch", **fields)
+
+        requests = tuple(
+            _DavidsonLaneRequest(
+                lane_id=bases[point_index]._layout.lane_id,
+                operator=operators_by_index[point_index],
                 n_bands=occupied_bands,
                 config=scf_config.davidson,
-                initial_coefficients=previous_states[point_index],
+                trial=_initial_trial(
+                    bases[point_index],
+                    occupied_bands,
+                    previous_states.get(point_index),
+                ),
                 observer=observer,
             )
+            for point_index in owned_indices
+        )
+        engine = _DavidsonEngine(
+            scheduler=_DavidsonScheduler(
+                batch_cap=scf_config.kpoint_batch_size,
+                max_padding_fraction=scf_config.max_batch_padding_fraction,
+                max_transient_bytes=scf_config.max_batch_transient_bytes,
+                submission_callback=emit_submission,
+            )
+        )
+        eigen_outcome = engine.solve(requests)
+        if eigen_outcome.failures:
+            if observer is not None:
+                observer.emit(
+                    "failure",
+                    stage="eigensolver",
+                    scf_iteration=iteration,
+                    failed_explicit_indices=[
+                        lane_to_index[lane_id]
+                        for lane_id in eigen_outcome.failures
+                    ],
+                    failure_messages={
+                        lane_id: str(error)
+                        for lane_id, error in eigen_outcome.failures.items()
+                    },
+                )
+            first_failed_lane = next(
+                request.lane_id
+                for request in requests
+                if request.lane_id in eigen_outcome.failures
+            )
+            raise _detached_failure(
+                eigen_outcome.failures[first_failed_lane]
+            ) from None
+
+        for point_index in owned_indices:
+            basis = bases[point_index]
+            entry = ownership.entry_for(point_index)
+            eigen = eigen_outcome.result_for(basis._layout.lane_id)
             add_observed_work(observer, {"kpoint_lane_solves": 1})
             if entry.role == "owner":
                 add_observed_work(observer, {"representative_lane_solves": 1})
@@ -2261,17 +3116,6 @@ def _run_periodic_scf_with_projector_cache(
                 basis=basis,
                 eigen=eigen,
             )
-            if observer is not None:
-                observer.emit(
-                    "kpoint_batch",
-                    status="completed",
-                    scf_iteration=iteration,
-                    batch_index=batch_index,
-                    batch_size=1,
-                    reduced_kpoints=[list(point.vector)],
-                    explicit_indices=[point_index],
-                    converged=eigen.converged,
-                )
         timings["eigensolver"] += (perf_counter() - start) * 1000.0
         final_owned_results = tuple(
             owned_by_index[index] for index in owned_indices
@@ -2280,15 +3124,10 @@ def _run_periodic_scf_with_projector_cache(
             target_density = _density_from_kpoints(
                 final_owned_results,
                 occupation=2.0,
-            )
-            add_observed_work(
-                observer,
-                {
-                    "fft_submissions": len(final_owned_results),
-                    "fft_vector_equivalents": sum(
-                        occupied_bands for _ in final_owned_results
-                    ),
-                },
+                batch_cap=scf_config.kpoint_batch_size,
+                max_padding_fraction=scf_config.max_batch_padding_fraction,
+                max_transient_bytes=scf_config.max_batch_transient_bytes,
+                observer=observer,
             )
             target_count = float(mx.sum(target_density) * system.grid.dv)
             target_density = target_density * (system.electron_count / target_count)
@@ -2353,6 +3192,12 @@ def _run_periodic_scf_with_projector_cache(
             mixed = mx.maximum(mixer.mix(density, target_density), 0.0)
             mixed_count = float(mx.sum(mixed) * system.grid.dv)
             density = mixed * (system.electron_count / mixed_count)
+            if observer is not None:
+                stored_history = int(mixer.metadata().get("stored", 0))
+                observer.record_peak_memory(
+                    "shared_full_grid_bytes",
+                    (4 + 2 * stored_history) * system.grid.size * 4,
+                )
         previous_energy = total_energy
         previous_states = {
             result.explicit_index: result.eigen._compact_coefficients
@@ -2404,6 +3249,7 @@ def _run_periodic_scf_with_projector_cache(
         energy_by_term=energy_terms,
         history=tuple(history),
         timings=timings,
+        batch_policy=scf_config.batch_policy(),
         time_reversal_ownership=ownership,
         _owned_kpoints=final_owned_results,
     )

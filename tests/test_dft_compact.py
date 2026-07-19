@@ -497,7 +497,11 @@ def test_gth_projector_generation_count_cache_hits_and_hpsi_traffic():
     assert work["projector_traffic_elements"] == 13 * basis.active_count
     assert memory["projector_payload_bytes"] == basis.active_count * 8
     assert memory["persistent_projector_bytes"] == basis.active_count * 8
-    assert memory["peak_temporary_bytes"] < 2 * 3 * basis.grid.size * 8 * 2
+    assert memory["peak_temporary_bytes"] >= memory["fft_workspace_bytes"]
+    assert (
+        memory["peak_temporary_bytes"]
+        < _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
+    )
 
 
 def test_gth_projector_cache_eviction_invalidation_and_context_lifetime():

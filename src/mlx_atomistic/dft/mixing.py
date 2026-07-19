@@ -54,8 +54,8 @@ class PulayDIISMixer:
         if self.regularization < 0.0:
             msg = "DIIS regularization must be non-negative"
             raise ValueError(msg)
-        self._densities: list[np.ndarray] = []
-        self._residuals: list[np.ndarray] = []
+        self._densities: list[mx.array] = []
+        self._residuals: list[mx.array] = []
         self._last_coefficients: list[float] = []
 
     def reset(self) -> None:
@@ -68,9 +68,25 @@ class PulayDIISMixer:
     def mix(self, current: mx.array, target: mx.array) -> mx.array:
         """Return a DIIS-mixed density, falling back to linear mixing early on."""
 
-        linear = (1.0 - self.beta) * current + self.beta * target
-        residual = np.array(target - current, dtype=np.float64).reshape(-1)
-        candidate = np.array(linear, dtype=np.float64).reshape(-1)
+        current_values = mx.array(current).astype(mx.float32)
+        target_values = mx.array(target).astype(mx.float32)
+        if current_values.shape != target_values.shape:
+            msg = "DIIS current and target densities must have matching shapes"
+            raise ValueError(msg)
+        linear = (
+            (1.0 - self.beta) * current_values
+            + self.beta * target_values
+        ).astype(mx.float32)
+        residual = (target_values - current_values).astype(mx.float32)
+        candidate = mx.array(linear)
+        # History is runtime-owned device state rather than a lazy alias of a
+        # caller buffer. Only the later, small residual Gram matrix crosses to
+        # NumPy/LAPACK.
+        finite = mx.all(mx.isfinite(candidate)) & mx.all(mx.isfinite(residual))
+        mx.eval(candidate, residual, finite)
+        if not bool(finite):
+            msg = "DIIS densities and residuals must be finite"
+            raise ValueError(msg)
         self._densities.append(candidate)
         self._residuals.append(residual)
         if len(self._densities) > self.history_size:
@@ -78,14 +94,17 @@ class PulayDIISMixer:
             self._residuals.pop(0)
         if len(self._densities) < 2:
             self._last_coefficients = [1.0]
-            return linear
+            return candidate
 
         count = len(self._residuals)
+        residual_stack = mx.stack(
+            [mx.reshape(values, (-1,)) for values in self._residuals],
+            axis=0,
+        )
+        gram = residual_stack @ mx.transpose(residual_stack)
+        mx.eval(gram)
         matrix = np.empty((count + 1, count + 1), dtype=np.float64)
-        matrix[:count, :count] = [
-            [float(np.dot(left, right)) for right in self._residuals]
-            for left in self._residuals
-        ]
+        matrix[:count, :count] = np.asarray(gram, dtype=np.float64)
         matrix[:count, :count] += self.regularization * np.eye(count)
         matrix[:count, count] = -1.0
         matrix[count, :count] = -1.0
@@ -96,17 +115,22 @@ class PulayDIISMixer:
             solution = np.linalg.solve(matrix, rhs)
         except np.linalg.LinAlgError:
             self._last_coefficients = [1.0]
-            return linear
+            return candidate
+        if not np.all(np.isfinite(solution)):
+            self._last_coefficients = [1.0]
+            return candidate
         coefficients = solution[:count]
-        mixed = np.sum(
-            [
-                coefficient * density
-                for coefficient, density in zip(coefficients, self._densities, strict=True)
-            ],
-            axis=0,
+        coefficient_shape = (count,) + (1,) * len(current_values.shape)
+        device_coefficients = mx.reshape(
+            mx.array(coefficients.astype(np.float32)),
+            coefficient_shape,
         )
+        mixed = mx.sum(
+            device_coefficients * mx.stack(self._densities, axis=0),
+            axis=0,
+        ).astype(mx.float32)
         self._last_coefficients = [float(value) for value in coefficients]
-        return mx.array(mixed.reshape(current.shape).astype(np.float32))
+        return mixed
 
     def metadata(self) -> dict[str, float | int | str | Sequence[float]]:
         """Return JSON-safe mixer metadata."""

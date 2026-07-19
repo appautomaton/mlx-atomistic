@@ -11,7 +11,7 @@ from math import erfc, pi, sqrt
 import mlx.core as mx
 import numpy as np
 
-from mlx_atomistic.dft._compact import _CompactLaneState
+from mlx_atomistic.dft._compact import _CompactBatch, _CompactLaneState
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.pseudopotentials import GTHProjectorChannel, PseudopotentialData
 
@@ -452,102 +452,240 @@ class PeriodicGTHNonlocalOperator:
     def _apply_compact(
         self,
         coefficients: _CompactLaneState,
+        *,
+        evaluate: bool = True,
     ) -> tuple[_CompactLaneState, dict[str, int]]:
-        self._cache.bind(self._context_identity)
-        self.basis._validate_state(coefficients)
-        if coefficients.kind != "coefficients":
-            msg = "GTH input must be coefficient state"
+        batch = _CompactBatch.from_states((coefficients,))
+        actions, metrics = self._apply_compact_batch(
+            (self,),
+            (coefficients,),
+            batch=batch,
+            evaluate=evaluate,
+        )
+        return actions[0], metrics[0]
+
+    @staticmethod
+    def _estimated_batch_transient_bytes(
+        operators: Sequence[PeriodicGTHNonlocalOperator],
+        batch: _CompactBatch,
+    ) -> int:
+        """Return a conservative logical workspace bound for batched GTH."""
+
+        if not operators:
+            return 0
+        lane_count = len(operators)
+        if lane_count != batch.lane_count:
+            msg = "GTH operator count must match the compact batch"
             raise ValueError(msg)
-        vectors = self.basis._layout._active_shifted_vectors
-        q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
-        harmonics = {
-            channel.angular_momentum: _real_spherical_harmonics(
-                channel.angular_momentum,
-                vectors,
-                q,
+        vector_count = batch.vector_count
+        bucket_size = batch.bucket_size
+        output_bytes = lane_count * vector_count * bucket_size * 8
+        reference = operators[0]
+        harmonic_width = sum(
+            2 * angular_momentum + 1
+            for angular_momentum in {
+                channel.angular_momentum
+                for channel in reference.pseudopotential.gth_channels
+            }
+        )
+        estimate = lane_count * bucket_size * (1 + harmonic_width) * 4
+        for channel in reference.pseudopotential.gth_channels:
+            harmonic_count = 2 * channel.angular_momentum + 1
+            group_count = reference.positions.shape[0] * harmonic_count
+            projector_bytes = (
+                lane_count * channel.projector_count * bucket_size * 8
             )
-            for channel in self.pseudopotential.gth_channels
-        }
-        output = mx.zeros_like(coefficients.values)
-        generated_elements = 0
-        loaded_elements = 0
-        payload_elements = 0
-        cache_hits = 0
-        cache_misses = 0
-        cache_evictions = 0
-        protected_keys: set[tuple[object, ...]] = set()
-        peak_workspace_bytes = int(np.prod(output.shape)) * 8
-        vector_count = coefficients.vector_count
-        for ion_index, position in enumerate(self.positions):
-            for channel_index, channel in enumerate(
-                self.pseudopotential.gth_channels
+            overlap_bytes = (
+                lane_count * channel.projector_count * vector_count * 8
+            )
+            estimate += group_count * (
+                4 * projector_bytes + 2 * overlap_bytes + output_bytes
+            )
+        return estimate
+
+    @staticmethod
+    def _apply_compact_batch(
+        operators: Sequence[PeriodicGTHNonlocalOperator],
+        coefficients: Sequence[_CompactLaneState],
+        *,
+        batch: _CompactBatch,
+        evaluate: bool = True,
+    ) -> tuple[tuple[_CompactLaneState, ...], tuple[dict[str, int], ...]]:
+        """Apply GTH projectors with one padded k-lane matrix path."""
+
+        if not operators or len(operators) != len(coefficients):
+            msg = "GTH batches require matching non-empty operator lanes"
+            raise ValueError(msg)
+        if batch.lane_count != len(operators):
+            msg = "GTH batch lane count does not match its operators"
+            raise ValueError(msg)
+        reference = operators[0]
+        context_identity = reference._context_identity
+        vector_count = batch.vector_count
+        lane_data = []
+        metrics = []
+        protected_by_cache: dict[
+            int,
+            tuple[_GTHProjectorCache, set[tuple[object, ...]]],
+        ] = {}
+        for operator, state, layout in zip(
+            operators,
+            coefficients,
+            batch.layouts,
+            strict=True,
+        ):
+            if operator._context_identity != context_identity:
+                msg = "GTH batch operators must share one physical context"
+                raise ValueError(msg)
+            if layout is not state.layout:
+                msg = "GTH batch layout does not match its coefficient lane"
+                raise ValueError(msg)
+            operator._cache.bind(operator._context_identity)
+            operator.basis._validate_state(state)
+            if state.kind != "coefficients":
+                msg = "GTH input must be coefficient state"
+                raise ValueError(msg)
+            if state.vector_count != vector_count:
+                msg = "GTH batch coefficient widths must match"
+                raise ValueError(msg)
+            vectors = operator.basis._layout._active_shifted_vectors
+            q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
+            harmonics = {
+                channel.angular_momentum: _real_spherical_harmonics(
+                    channel.angular_momentum,
+                    vectors,
+                    q,
+                )
+                for channel in operator.pseudopotential.gth_channels
+            }
+            lane_data.append((operator, vectors, q, harmonics))
+            metrics.append(
+                {
+                    "projector_payload_elements": 0,
+                    "projector_elements_generated": 0,
+                    "projector_elements_loaded": 0,
+                    "projector_traffic_elements": 0,
+                    "projector_cache_hits": 0,
+                    "projector_cache_misses": 0,
+                    "projector_cache_evictions": 0,
+                    "projector_cache_bytes": 0,
+                    "projector_peak_workspace_bytes": (
+                        state.vector_count * state.layout.active_count * 8
+                    ),
+                }
+            )
+            protected_by_cache.setdefault(
+                id(operator._cache),
+                (operator._cache, set()),
+            )
+
+        output = mx.zeros_like(batch.values)
+        for ion_index in range(reference.positions.shape[0]):
+            for channel_index, reference_channel in enumerate(
+                reference.pseudopotential.gth_channels
             ):
                 coupling = mx.array(
-                    np.asarray(channel.coupling_matrix, dtype=np.float32)
-                )
-                for harmonic_index, harmonic in enumerate(
-                    harmonics[channel.angular_momentum]
-                ):
-                    key = self._cache_key(
-                        ion_index,
-                        channel_index,
-                        harmonic_index,
+                    np.asarray(
+                        reference_channel.coupling_matrix,
+                        dtype=np.float32,
                     )
-                    beta = self._cache.get(key)
-                    group_elements = channel.projector_count * self.basis.active_count
-                    if beta is None:
-                        cache_misses += 1
-                        beta = self._projector_group(
-                            position,
-                            channel,
-                            harmonic,
-                            vectors,
-                            q,
+                )[None, :, :]
+                harmonic_count = 2 * reference_channel.angular_momentum + 1
+                for harmonic_index in range(harmonic_count):
+                    padded_projectors = []
+                    for lane_index, (operator, vectors, q, harmonics) in enumerate(
+                        lane_data
+                    ):
+                        channel = operator.pseudopotential.gth_channels[
+                            channel_index
+                        ]
+                        harmonic = harmonics[channel.angular_momentum][
+                            harmonic_index
+                        ]
+                        key = operator._cache_key(
+                            ion_index,
+                            channel_index,
+                            harmonic_index,
                         )
-                        generated_elements += group_elements
-                        evictions, inserted = self._cache.put(
-                            key,
-                            beta,
-                            protected_keys=protected_keys,
+                        cache, protected_keys = protected_by_cache[
+                            id(operator._cache)
+                        ]
+                        beta = cache.get(key)
+                        group_elements = (
+                            channel.projector_count
+                            * operator.basis.active_count
                         )
-                        cache_evictions += evictions
-                        if inserted:
+                        lane_metrics = metrics[lane_index]
+                        if beta is None:
+                            lane_metrics["projector_cache_misses"] += 1
+                            beta = operator._projector_group(
+                                operator.positions[ion_index],
+                                channel,
+                                harmonic,
+                                vectors,
+                                q,
+                            )
+                            lane_metrics["projector_elements_generated"] += (
+                                group_elements
+                            )
+                            evictions, inserted = cache.put(
+                                key,
+                                beta,
+                                protected_keys=protected_keys,
+                            )
+                            lane_metrics["projector_cache_evictions"] += evictions
+                            if inserted:
+                                protected_keys.add(key)
+                        else:
+                            lane_metrics["projector_cache_hits"] += 1
                             protected_keys.add(key)
-                    else:
-                        cache_hits += 1
-                        protected_keys.add(key)
-                    payload_elements += group_elements
-                    loaded_elements += 2 * vector_count * group_elements
-                    overlaps = mx.conjugate(beta) @ mx.transpose(coefficients.values)
-                    mixed = coupling @ overlaps
-                    output = output + mx.transpose(mixed) @ beta
-                    peak_workspace_bytes = max(
-                        peak_workspace_bytes,
-                        (
-                            int(np.prod(output.shape))
-                            + 2 * int(np.prod(overlaps.shape))
+                        lane_metrics["projector_payload_elements"] += group_elements
+                        lane_metrics["projector_elements_loaded"] += (
+                            2 * vector_count * group_elements
                         )
-                        * 8,
+                        padding = batch.bucket_size - operator.basis.active_count
+                        if padding:
+                            beta = mx.concatenate(
+                                [
+                                    beta,
+                                    mx.zeros(
+                                        (channel.projector_count, padding),
+                                        dtype=mx.complex64,
+                                    ),
+                                ],
+                                axis=1,
+                            )
+                        padded_projectors.append(beta)
+                        lane_metrics["projector_peak_workspace_bytes"] = max(
+                            lane_metrics["projector_peak_workspace_bytes"],
+                            (
+                                vector_count * operator.basis.active_count
+                                + 2 * vector_count * channel.projector_count
+                            )
+                            * 8,
+                        )
+                    beta_batch = mx.stack(padded_projectors, axis=0)
+                    overlaps = mx.matmul(
+                        mx.conjugate(beta_batch),
+                        mx.transpose(batch.values, (0, 2, 1)),
                     )
-        # Projector cache entries must not remain dependencies of caller-owned
-        # lazy results: a later context rebind or LRU eviction must be able to
-        # release them without retaining hidden graph-owned projector buffers.
-        mx.eval(output)
-        action = self.basis._state_from_compact(
-            output,
-            kind="hamiltonian_action",
-        )
-        return action, {
-            "projector_payload_elements": payload_elements,
-            "projector_elements_generated": generated_elements,
-            "projector_elements_loaded": loaded_elements,
-            "projector_traffic_elements": generated_elements + loaded_elements,
-            "projector_cache_hits": cache_hits,
-            "projector_cache_misses": cache_misses,
-            "projector_cache_evictions": cache_evictions,
-            "projector_cache_bytes": self._cache.current_bytes,
-            "projector_peak_workspace_bytes": peak_workspace_bytes,
-        }
+                    mixed = mx.matmul(coupling, overlaps)
+                    output = output + mx.matmul(
+                        mx.transpose(mixed, (0, 2, 1)),
+                        beta_batch,
+                    )
+
+        actions = batch.unpad(output, kind="hamiltonian_action")
+        if evaluate:
+            mx.eval(*(action.values for action in actions))
+        for lane_index, (operator, _, _, _) in enumerate(lane_data):
+            lane_metrics = metrics[lane_index]
+            lane_metrics["projector_traffic_elements"] = (
+                lane_metrics["projector_elements_generated"]
+                + lane_metrics["projector_elements_loaded"]
+            )
+            lane_metrics["projector_cache_bytes"] = operator._cache.current_bytes
+        return actions, tuple(metrics)
 
     def apply(self, coefficients: mx.array) -> mx.array:
         """Apply the nonlocal operator to one orbital or an orbital stack.

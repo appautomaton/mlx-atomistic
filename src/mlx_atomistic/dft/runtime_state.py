@@ -137,6 +137,7 @@ def serialize_periodic_scf_state(result: Any) -> dict[str, bytes]:
         "iterations": result.iterations,
         "total_energy_hartree": result.total_energy,
         "electron_count": result.electron_count,
+        "batch_policy": dict(result.batch_policy),
         "kpoint_count": len(result.kpoints),
         "owned_lane_count": len(owned_lanes),
         "owned_lanes": owned_lanes,

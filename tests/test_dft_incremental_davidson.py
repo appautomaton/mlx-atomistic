@@ -217,9 +217,9 @@ def test_incremental_hv_and_projected_blocks_are_reused(monkeypatch):
     original_apply = PeriodicKohnShamOperator._apply_compact
     original_project = periodic_scf._subspace_matrix
 
-    def recording_apply(self, coefficients, *, observer=None):
+    def recording_apply(self, coefficients, *, observer=None, **kwargs):
         application_widths.append(coefficients.vector_count)
-        return original_apply(self, coefficients, observer=observer)
+        return original_apply(self, coefficients, observer=observer, **kwargs)
 
     def recording_project(vectors, applied):
         projected_widths.append(int(vectors.shape[0]))
@@ -263,9 +263,9 @@ def test_restart_transforms_v_and_hv_without_reapplying_h(monkeypatch):
     original_apply = PeriodicKohnShamOperator._apply_compact
     original_transform = _PairedDavidsonState.transform
 
-    def recording_apply(self, coefficients, *, observer=None):
+    def recording_apply(self, coefficients, *, observer=None, **kwargs):
         application_widths.append(coefficients.vector_count)
-        return original_apply(self, coefficients, observer=observer)
+        return original_apply(self, coefficients, observer=observer, **kwargs)
 
     def recording_transform(self, transform, *, token):
         result = original_transform(self, transform, token=token)
@@ -599,9 +599,29 @@ def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():
     assert work["hpsi_calls"] == result.submission_count
     assert work["fft_submissions"] == 2 * result.submission_count
 
-    with pytest.raises(ValueError, match="batch_cap must be one"):
-        _DavidsonScheduler(batch_cap=2)
-    with pytest.raises(ValueError, match="batch_cap must be one"):
+    before_batch = observer.snapshot()["work_counters"]
+    batched = _DavidsonScheduler(batch_cap=2).apply(
+        [
+            _DavidsonApplicationTicket(
+                lane_id=lane_id,
+                operator=operator,
+                config=config,
+                n_bands=2,
+                rank_policy=rank_policy,
+                token=token,
+                vectors=one,
+                observer=observer,
+            )
+            for lane_id in ("batch-left", "batch-right")
+        ]
+    )
+    after_batch = observer.snapshot()["work_counters"]
+    assert batched.groups == (("batch-left", "batch-right"),)
+    assert set(batched.actions) == {"batch-left", "batch-right"}
+    assert after_batch["hpsi_calls"] - before_batch["hpsi_calls"] == 1
+    assert after_batch["fft_submissions"] - before_batch["fft_submissions"] == 2
+
+    with pytest.raises(ValueError, match="positive non-bool integer"):
         _DavidsonScheduler(batch_cap=True)
 
     singleton = scheduler.apply(
@@ -819,7 +839,7 @@ def test_incremental_failure_records_release_frames_and_raise_fresh_errors(monke
     sentinel_refs: list[weakref.ReferenceType[_FailureFrameSentinel]] = []
     original_apply = PeriodicKohnShamOperator._apply_compact
 
-    def injected_apply(self, coefficients, *, observer=None):
+    def injected_apply(self, coefficients, *, observer=None, **kwargs):
         if self is failed_operator:
             sentinel = _FailureFrameSentinel()
             sentinel_refs.append(weakref.ref(sentinel))
@@ -830,7 +850,7 @@ def test_incremental_failure_records_release_frames_and_raise_fresh_errors(monke
             if frame_scratch.shape[0] != coefficients.vector_count:
                 raise AssertionError("unreachable failure-frame scratch check")
             raise RuntimeError("injected detached-frame failure")
-        return original_apply(self, coefficients, observer=observer)
+        return original_apply(self, coefficients, observer=observer, **kwargs)
 
     monkeypatch.setattr(
         PeriodicKohnShamOperator,
@@ -883,9 +903,9 @@ def test_nonconverged_incremental_result_keeps_public_compatibility(monkeypatch)
     original_apply = PeriodicKohnShamOperator._apply_compact
     original_engine_solve = _DavidsonEngine.solve
 
-    def recording_apply(self, coefficients, *, observer=None):
+    def recording_apply(self, coefficients, *, observer=None, **kwargs):
         application_widths.append(coefficients.vector_count)
-        return original_apply(self, coefficients, observer=observer)
+        return original_apply(self, coefficients, observer=observer, **kwargs)
 
     def recording_engine_solve(self, requests):
         engine_lane_counts.append(len(requests))

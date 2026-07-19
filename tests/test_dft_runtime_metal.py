@@ -6,13 +6,18 @@ import pytest
 
 from mlx_atomistic.dft import (
     GTHProjectorChannel,
+    KPoint,
+    KPointMesh,
     PeriodicDavidsonConfig,
+    PeriodicDFTSystem,
     PeriodicGTHNonlocalOperator,
     PeriodicKohnShamOperator,
+    PeriodicSCFConfig,
     PlaneWaveBasis,
     PseudopotentialData,
     PseudopotentialFormat,
     RealSpaceGrid,
+    run_periodic_scf,
     solve_periodic_eigenproblem,
 )
 from mlx_atomistic.dft._compact import _CompactBatch
@@ -216,6 +221,101 @@ def test_incremental_davidson_reuses_paired_hv_on_real_metal(monkeypatch):
         assert work["projected_old_old_rebuilds"] == 0
         assert work["hpsi_vector_equivalents"] == work["davidson_hv_new_vectors"]
         assert work["hpsi_calls"] <= result.iterations
+        assert mx.default_device() == metal_device
+        assert mx.default_stream(metal_device) == metal_stream
+    finally:
+        _restore_runtime(previous_device, previous_stream)
+
+    assert mx.default_device() == previous_device
+    assert mx.default_stream(previous_device) == previous_stream
+
+
+@pytest.mark.gpu
+def test_representative_k_batch_scf_executes_on_real_metal(monkeypatch):
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    previous_device = mx.default_device()
+    previous_stream = mx.default_stream(previous_device)
+    try:
+        metal_device = mx.Device(mx.gpu, 0)
+        metal_stream = mx.new_stream(metal_device)
+        mx.set_default_device(metal_device)
+        mx.set_default_stream(metal_stream)
+        pseudo = PseudopotentialData(
+            element="H",
+            format=PseudopotentialFormat.GTH,
+            valence_charge=1.0,
+            gth_rloc=0.25,
+            gth_coefficients=(-1.0,),
+            gth_channels=(GTHProjectorChannel(0, 0.3, ((0.5,),)),),
+        )
+        system = PeriodicDFTSystem(
+            (6.0, 6.0, 6.0),
+            (6, 6, 6),
+            ((2.0, 3.0, 3.0), (4.0, 3.0, 3.0)),
+            pseudo,
+        )
+        mesh = KPointMesh(
+            [
+                KPoint(
+                    (-0.25, 0.0, 0.0),
+                    weight=0.25,
+                    coordinate_system="reduced",
+                ),
+                KPoint(
+                    (0.25, 0.0, 0.0),
+                    weight=0.25,
+                    coordinate_system="reduced",
+                ),
+                KPoint(
+                    (0.0, -0.25, 0.0),
+                    weight=0.25,
+                    coordinate_system="reduced",
+                ),
+                KPoint(
+                    (0.0, 0.25, 0.0),
+                    weight=0.25,
+                    coordinate_system="reduced",
+                ),
+            ]
+        )
+        observer = RuntimeObserver(synchronize=mx.synchronize)
+        result = run_periodic_scf(
+            system,
+            cutoff_hartree=2.5,
+            kpoint_mesh=mesh,
+            n_bands=1,
+            config=PeriodicSCFConfig(
+                max_iterations=3,
+                min_iterations=2,
+                density_tolerance=0.2,
+                energy_tolerance=0.1,
+                orbital_tolerance=3e-3,
+                mixer="linear",
+                davidson=PeriodicDavidsonConfig(
+                    max_iterations=12,
+                    tolerance=3e-3,
+                    max_subspace_size=10,
+                ),
+                kpoint_batch_size=2,
+            ),
+            observer=observer,
+        )
+        mx.eval(result.density)
+        mx.synchronize()
+
+        snapshot = observer.snapshot()
+        events = [
+            event
+            for event in snapshot["events"]
+            if event["event"] == "kpoint_batch"
+        ]
+        assert len(result.owned_kpoints) == 2
+        assert np.isfinite(result.total_energy)
+        assert any(
+            event["status"] == "completed" and event["batch_size"] == 2
+            for event in events
+        )
+        assert snapshot["work_counters"]["hpsi_calls"] > 0
         assert mx.default_device() == metal_device
         assert mx.default_stream(metal_device) == metal_stream
     finally:
