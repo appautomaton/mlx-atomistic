@@ -24,7 +24,14 @@ from mlx_atomistic.dft._runtime_observer import (
 )
 from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
-from mlx_atomistic.dft.kpoints import KPointMesh
+from mlx_atomistic.dft.kpoints import (
+    KPointMesh,
+    TimeReversalOwnership,
+    TimeReversalOwnershipEntry,
+    _independent_pair,
+    admit_time_reversal_bases,
+    build_time_reversal_ownership,
+)
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
@@ -55,6 +62,22 @@ def _is_finite_positive_control(value: object) -> bool:
         and np.isfinite(float(value))
         and float(value) > 0.0
     )
+
+
+def _time_reversed_compact_values(
+    values: mx.array,
+    permutation: np.ndarray,
+) -> mx.array:
+    """Map source compact coefficients into target time-reversal order."""
+
+    mapping = np.asarray(permutation, dtype=np.int32)
+    inverse = np.empty_like(mapping)
+    inverse[mapping] = np.arange(mapping.size, dtype=np.int32)
+    return mx.take(
+        mx.conjugate(values),
+        mx.array(inverse),
+        axis=1,
+    ).astype(mx.complex64)
 
 
 @dataclass(frozen=True)
@@ -194,8 +217,13 @@ class PeriodicEigenResult:
     """
 
     eigenvalues: mx.array
-    _compact_coefficients: _CompactLaneState | _CompatibilityCoefficientState
+    _compact_coefficients: (
+        _CompactLaneState | _CompatibilityCoefficientState | None
+    )
     _basis: PlaneWaveBasis | None
+    _time_reversal_owner: PeriodicEigenResult | None
+    _time_reversal_permutation: np.ndarray | None
+    _time_reversal_observer: RuntimeObserver | None
     residuals: mx.array
     orthonormality_error: float
     iterations: int
@@ -267,6 +295,9 @@ class PeriodicEigenResult:
         object.__setattr__(self, "converged", bool(converged))
         object.__setattr__(self, "subspace_size", int(subspace_size))
         object.__setattr__(self, "restart_count", int(restart_count))
+        object.__setattr__(self, "_time_reversal_owner", None)
+        object.__setattr__(self, "_time_reversal_permutation", None)
+        object.__setattr__(self, "_time_reversal_observer", None)
 
     @classmethod
     def _from_compact(
@@ -296,6 +327,59 @@ class PeriodicEigenResult:
         )
         return result
 
+    @classmethod
+    def _from_time_reversal_owner(
+        cls,
+        *,
+        owner: PeriodicEigenResult,
+        partner_basis: PlaneWaveBasis,
+        permutation: np.ndarray,
+        observer: RuntimeObserver | None,
+    ) -> PeriodicEigenResult:
+        owner_state = owner._compact_coefficients
+        if not isinstance(owner_state, _CompactLaneState) or owner._basis is None:
+            msg = "time-reversal views require a compact basis-bound owner"
+            raise ValueError(msg)
+        mapping = np.array(permutation, dtype=np.int32, copy=True)
+        if (
+            mapping.shape != (owner_state.layout.active_count,)
+            or partner_basis.active_count != mapping.size
+            or not np.array_equal(
+                np.sort(mapping),
+                np.arange(mapping.size, dtype=np.int32),
+            )
+        ):
+            msg = "time-reversal permutation must be a complete active-basis bijection"
+            raise ValueError(msg)
+        mapping.setflags(write=False)
+        result = object.__new__(cls)
+        eigenvalues = mx.array(owner.eigenvalues)
+        residuals = mx.array(owner.residuals)
+        mx.eval(eigenvalues, residuals)
+        object.__setattr__(result, "eigenvalues", eigenvalues)
+        object.__setattr__(result, "_compact_coefficients", None)
+        object.__setattr__(result, "_basis", partner_basis)
+        object.__setattr__(result, "residuals", residuals)
+        object.__setattr__(
+            result,
+            "orthonormality_error",
+            owner.orthonormality_error,
+        )
+        object.__setattr__(result, "iterations", owner.iterations)
+        object.__setattr__(result, "converged", owner.converged)
+        object.__setattr__(result, "subspace_size", owner.subspace_size)
+        object.__setattr__(result, "restart_count", owner.restart_count)
+        object.__setattr__(result, "_time_reversal_owner", owner)
+        object.__setattr__(result, "_time_reversal_permutation", mapping)
+        object.__setattr__(result, "_time_reversal_observer", observer)
+        return result
+
+    @property
+    def is_time_reversal_view(self) -> bool:
+        """Whether coefficients are an uncached time-reversed owner view."""
+
+        return self._time_reversal_owner is not None
+
     @property
     def coefficients(self) -> mx.array:
         """Materialize a fresh full-grid coefficient stack.
@@ -304,7 +388,28 @@ class PeriodicEigenResult:
             Caller-owned ``complex64`` coefficients with exact inactive zeros.
         """
 
-        return self._compact_coefficients.full_grid_fresh()
+        if self._time_reversal_owner is None:
+            if self._compact_coefficients is None:
+                msg = "periodic eigen result has no coefficient state"
+                raise RuntimeError(msg)
+            return self._compact_coefficients.full_grid_fresh()
+        owner_state = self._time_reversal_owner._compact_coefficients
+        if (
+            not isinstance(owner_state, _CompactLaneState)
+            or self._time_reversal_permutation is None
+            or self._basis is None
+        ):
+            msg = "time-reversal owner state is unavailable"
+            raise RuntimeError(msg)
+        values = _time_reversed_compact_values(
+            owner_state.values,
+            self._time_reversal_permutation,
+        )
+        add_observed_work(
+            self._time_reversal_observer,
+            {"partner_reconstructions": 1},
+        )
+        return self._basis._layout.unpack_fresh(values)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe eigensolver summary.
@@ -1648,6 +1753,20 @@ class PeriodicKPointResult:
     weight: float
     basis: PlaneWaveBasis
     eigen: PeriodicEigenResult
+    explicit_index: int | None = None
+    aggregated_weight: float | None = None
+    ownership_role: str = "independent"
+    fallback_reason: str | None = None
+
+    @property
+    def integration_weight(self) -> float:
+        """Return the owner-aggregated or original integration weight."""
+
+        return (
+            self.weight
+            if self.aggregated_weight is None
+            else self.aggregated_weight
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe k-point summary.
@@ -1662,6 +1781,11 @@ class PeriodicKPointResult:
             "basis": self.basis.to_dict(),
             "eigensolver": self.eigen.to_dict(),
         }
+
+
+@dataclass(frozen=True)
+class _TimeReversalContinuationSeed:
+    owner_index: int
 
 
 @dataclass(frozen=True)
@@ -1680,6 +1804,44 @@ class PeriodicSCFResult:
     energy_by_term: dict[str, float]
     history: tuple[dict[str, float | int | str | None], ...]
     timings: dict[str, float]
+    time_reversal_ownership: TimeReversalOwnership | None = None
+    _owned_kpoints: tuple[PeriodicKPointResult, ...] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def owned_kpoints(self) -> tuple[PeriodicKPointResult, ...]:
+        """Return the compact-state-owning k-point results.
+
+        Legacy manually constructed results without ownership metadata return
+        their explicit k-point tuple unchanged.
+        """
+
+        return self.kpoints if self._owned_kpoints is None else self._owned_kpoints
+
+    @property
+    def continuation_coefficients(self) -> tuple[object, ...]:
+        """Return an explicit owner-aware initial-coefficient sequence.
+
+        Owner and independent entries reference their compact state. Admitted
+        partners use lightweight time-reversal descriptors, so constructing the
+        sequence neither materializes nor retains partner coefficients.
+        """
+
+        if self.time_reversal_ownership is None:
+            return tuple(item.eigen._compact_coefficients for item in self.kpoints)
+        owned = {
+            item.explicit_index: item.eigen._compact_coefficients
+            for item in self.owned_kpoints
+        }
+        return tuple(
+            owned[entry.explicit_index]
+            if entry.owner_index == entry.explicit_index
+            else _TimeReversalContinuationSeed(entry.owner_index)
+            for entry in self.time_reversal_ownership.entries
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe periodic SCF summary.
@@ -1712,8 +1874,12 @@ def _density_from_kpoints(
 ) -> mx.array:
     density = mx.zeros(results[0].basis.grid.shape, dtype=mx.float32)
     for result in results:
-        orbitals = result.basis._to_real_compact(result.eigen._compact_coefficients)
-        density = density + float(result.weight * occupation) * mx.sum(
+        compact = result.eigen._compact_coefficients
+        if not isinstance(compact, _CompactLaneState):
+            msg = "density construction requires owned compact k-point states"
+            raise ValueError(msg)
+        orbitals = result.basis._to_real_compact(compact)
+        density = density + float(result.integration_weight * occupation) * mx.sum(
             mx.abs(orbitals) ** 2,
             axis=0,
         )
@@ -1723,6 +1889,182 @@ def _density_from_kpoints(
 def _density_residual(current: mx.array, target: mx.array, grid: RealSpaceGrid) -> float:
     delta = target - current
     return float(mx.sqrt(mx.sum(delta * delta) * grid.dv))
+
+
+def _pack_initial_states(
+    bases: Sequence[PlaneWaveBasis],
+    initial_coefficients: Sequence[mx.array],
+) -> list[_CompactLaneState | _TimeReversalContinuationSeed]:
+    states = []
+    for basis, coefficients in zip(bases, initial_coefficients, strict=True):
+        if isinstance(coefficients, _TimeReversalContinuationSeed):
+            state = coefficients
+        elif isinstance(coefficients, _CompactLaneState):
+            try:
+                _require_layout(coefficients, basis._layout)
+                state = coefficients
+            except ValueError:
+                state = _remap_initial_coefficients(coefficients, basis._layout)
+        else:
+            state, _ = basis._state_from_full(coefficients)
+        states.append(state)
+    return states
+
+
+def _time_reversal_subspaces_match(
+    owner_state: _CompactLaneState,
+    partner_state: _CompactLaneState,
+    partner_basis: PlaneWaveBasis,
+    permutation: np.ndarray,
+    *,
+    n_bands: int,
+    atol: float = 3e-4,
+) -> bool:
+    if (
+        owner_state.vector_count < n_bands
+        or partner_state.vector_count < n_bands
+    ):
+        return False
+    expected = _time_reversed_compact_values(
+        owner_state.values[:n_bands],
+        permutation,
+    )
+    partner_occupied = partner_state.values[:n_bands]
+    try:
+        expected_orthonormal = partner_basis._orthonormalize_compact(expected)
+        partner_orthonormal = partner_basis._orthonormalize_compact(
+            partner_occupied
+        )
+    except ValueError:
+        return False
+    overlap = expected_orthonormal @ mx.conjugate(
+        mx.transpose(partner_orthonormal)
+    )
+    singular_values = np.linalg.svd(
+        np.asarray(overlap, dtype=np.complex128),
+        compute_uv=False,
+    )
+    return bool(
+        singular_values.shape == (n_bands,)
+        and np.isfinite(singular_values).all()
+        and np.all(np.abs(singular_values - 1.0) <= atol)
+    )
+
+
+def _admit_initial_time_reversal(
+    ownership: TimeReversalOwnership,
+    bases: Sequence[PlaneWaveBasis],
+    initial_coefficients: Sequence[mx.array] | None,
+    *,
+    n_bands: int,
+) -> tuple[TimeReversalOwnership, dict[int, _CompactLaneState | None]]:
+    if initial_coefficients is None:
+        return ownership, dict.fromkeys(ownership.owned_indices)
+    states = _pack_initial_states(bases, initial_coefficients)
+    admitted = ownership
+    visited: set[int] = set()
+    for entry in ownership.entries:
+        if entry.explicit_index in visited or entry.role != "owner":
+            continue
+        partner_index = entry.partner_index
+        if partner_index is None or partner_index == entry.explicit_index:
+            visited.add(entry.explicit_index)
+            continue
+        owner_state = states[entry.explicit_index]
+        partner_state = states[partner_index]
+        descriptor_match = (
+            isinstance(partner_state, _TimeReversalContinuationSeed)
+            and partner_state.owner_index == entry.explicit_index
+            and isinstance(owner_state, _CompactLaneState)
+            and owner_state.vector_count >= n_bands
+        )
+        permutation = entry._time_reversal_permutation
+        subspace_match = (
+            descriptor_match
+            or (
+                permutation is not None
+                and isinstance(owner_state, _CompactLaneState)
+                and isinstance(partner_state, _CompactLaneState)
+                and _time_reversal_subspaces_match(
+                    owner_state,
+                    partner_state,
+                    bases[partner_index],
+                    permutation,
+                    n_bands=n_bands,
+                )
+            )
+        )
+        if not subspace_match:
+            admitted = _independent_pair(
+                admitted,
+                entry.explicit_index,
+                "initial_coefficients_time_reversal_mismatch",
+            )
+        visited.update({entry.explicit_index, partner_index})
+    return admitted, {
+        index: (
+            None
+            if isinstance(states[index], _TimeReversalContinuationSeed)
+            else states[index]
+        )
+        for index in admitted.owned_indices
+    }
+
+
+def _owned_kpoint_result(
+    *,
+    entry: TimeReversalOwnershipEntry,
+    basis: PlaneWaveBasis,
+    eigen: PeriodicEigenResult,
+) -> PeriodicKPointResult:
+    return PeriodicKPointResult(
+        reduced_kpoint=entry.reduced_kpoint,
+        weight=entry.original_weight,
+        basis=basis,
+        eigen=eigen,
+        explicit_index=entry.explicit_index,
+        aggregated_weight=entry.aggregated_weight,
+        ownership_role=entry.role,
+        fallback_reason=entry.fallback_reason,
+    )
+
+
+def _publish_explicit_kpoints(
+    ownership: TimeReversalOwnership,
+    bases: Sequence[PlaneWaveBasis],
+    owned_results: dict[int, PeriodicKPointResult],
+    observer: RuntimeObserver | None,
+) -> tuple[PeriodicKPointResult, ...]:
+    explicit: list[PeriodicKPointResult] = []
+    for entry, basis in zip(ownership.entries, bases, strict=True):
+        if entry.owner_index == entry.explicit_index:
+            explicit.append(owned_results[entry.explicit_index])
+            continue
+        owner_result = owned_results[entry.owner_index]
+        owner_entry = ownership.entry_for(entry.owner_index)
+        permutation = owner_entry._time_reversal_permutation
+        if permutation is None:
+            msg = "admitted time-reversal partner has no active-basis permutation"
+            raise RuntimeError(msg)
+        eigen = PeriodicEigenResult._from_time_reversal_owner(
+            owner=owner_result.eigen,
+            partner_basis=basis,
+            permutation=permutation,
+            observer=observer,
+        )
+        explicit.append(
+            PeriodicKPointResult(
+                reduced_kpoint=entry.reduced_kpoint,
+                weight=entry.original_weight,
+                basis=basis,
+                eigen=eigen,
+                explicit_index=entry.explicit_index,
+                aggregated_weight=entry.aggregated_weight,
+                ownership_role=entry.role,
+                fallback_reason=entry.fallback_reason,
+            )
+        )
+    return tuple(explicit)
 
 
 def _run_periodic_scf_with_projector_cache(
@@ -1769,6 +2111,7 @@ def _run_periodic_scf_with_projector_cache(
     if initial_coefficients is not None and len(initial_coefficients) != len(kpoint_mesh.points):
         msg = "initial_coefficients length must match the k-point mesh"
         raise ValueError(msg)
+    ownership = build_time_reversal_ownership(kpoint_mesh)
 
     if observer is not None:
         observer.emit(
@@ -1789,21 +2132,29 @@ def _run_periodic_scf_with_projector_cache(
             )
             for point_index, point in enumerate(kpoint_mesh.points)
         ]
+        ownership = admit_time_reversal_bases(ownership, bases)
+        ownership, previous_states = _admit_initial_time_reversal(
+            ownership,
+            bases,
+            initial_coefficients,
+            n_bands=occupied_bands,
+        )
+        owned_indices = ownership.owned_indices
         gamma_basis = PlaneWaveBasis(
             system.grid,
             cutoff_hartree,
             reciprocal_grid=shared_reciprocal,
             lane_label="gamma-local-potential",
         )
-        nonlocal_operators = [
-            PeriodicGTHNonlocalOperator(
+        nonlocal_operators = {
+            point_index: PeriodicGTHNonlocalOperator(
                 system.pseudopotential,
-                basis,
+                bases[point_index],
                 system.positions,
                 cache=projector_cache,
             )
-            for basis in bases
-        ]
+            for point_index in owned_indices
+        }
         local_potential = gth_local_potential_grid(
             system.pseudopotential,
             gamma_basis,
@@ -1832,11 +2183,6 @@ def _run_periodic_scf_with_projector_cache(
             np.asarray(system.grid.lengths),
         )
         previous_energy: float | None = None
-        previous_states = (
-            list(initial_coefficients)
-            if initial_coefficients is not None
-            else [None] * len(bases)
-        )
     if observer is not None:
         observer.record_memory("shared_full_grid_bytes", system.grid.size * 4 * 4)
         observer.record_memory("persistent_projector_bytes", 0)
@@ -1844,9 +2190,13 @@ def _run_periodic_scf_with_projector_cache(
             "setup",
             status="completed",
             active_counts=[basis.active_count for basis in bases],
+            owned_indices=list(owned_indices),
+            owned_active_counts=[bases[index].active_count for index in owned_indices],
+            representative_count=len(ownership.representative_indices),
+            fallback_reasons=ownership.fallback_reasons,
         )
     history: list[dict[str, float | int | str | None]] = []
-    final_results: tuple[PeriodicKPointResult, ...] = ()
+    final_owned_results: tuple[PeriodicKPointResult, ...] = ()
     energy_terms: dict[str, float] = {}
     converged = False
     density_residual = float("inf")
@@ -1868,25 +2218,23 @@ def _run_periodic_scf_with_projector_cache(
         xc_result = xc.evaluate(density, system.grid)
         timings["xc"] += (perf_counter() - start) * 1000.0
         effective = local_potential + hartree + xc_result.potential
-        results = []
+        owned_by_index: dict[int, PeriodicKPointResult] = {}
         max_orbital_residual = 0.0
         start = perf_counter()
-        for point_index, (point, basis, nonlocal_operator) in enumerate(
-            zip(
-                kpoint_mesh.points,
-                bases,
-                nonlocal_operators,
-                strict=True,
-            )
-        ):
+        for batch_index, point_index in enumerate(owned_indices):
+            point = kpoint_mesh.points[point_index]
+            basis = bases[point_index]
+            nonlocal_operator = nonlocal_operators[point_index]
+            entry = ownership.entry_for(point_index)
             if observer is not None:
                 observer.emit(
                     "kpoint_batch",
                     status="started",
                     scf_iteration=iteration,
-                    batch_index=point_index,
+                    batch_index=batch_index,
                     batch_size=1,
                     reduced_kpoints=[list(point.vector)],
+                    explicit_indices=[point_index],
                 )
             operator = PeriodicKohnShamOperator(
                 basis,
@@ -1902,37 +2250,44 @@ def _run_periodic_scf_with_projector_cache(
                 observer=observer,
             )
             add_observed_work(observer, {"kpoint_lane_solves": 1})
+            if entry.role == "owner":
+                add_observed_work(observer, {"representative_lane_solves": 1})
             max_orbital_residual = max(
                 max_orbital_residual,
                 float(mx.max(eigen.residuals)),
             )
-            results.append(
-                PeriodicKPointResult(
-                    reduced_kpoint=tuple(float(value) for value in point.vector),
-                    weight=float(point.weight),
-                    basis=basis,
-                    eigen=eigen,
-                )
+            owned_by_index[point_index] = _owned_kpoint_result(
+                entry=entry,
+                basis=basis,
+                eigen=eigen,
             )
             if observer is not None:
                 observer.emit(
                     "kpoint_batch",
                     status="completed",
                     scf_iteration=iteration,
-                    batch_index=point_index,
+                    batch_index=batch_index,
                     batch_size=1,
                     reduced_kpoints=[list(point.vector)],
+                    explicit_indices=[point_index],
                     converged=eigen.converged,
                 )
         timings["eigensolver"] += (perf_counter() - start) * 1000.0
-        final_results = tuple(results)
+        final_owned_results = tuple(
+            owned_by_index[index] for index in owned_indices
+        )
         with observed_phase(observer, "density"):
-            target_density = _density_from_kpoints(final_results, occupation=2.0)
+            target_density = _density_from_kpoints(
+                final_owned_results,
+                occupation=2.0,
+            )
             add_observed_work(
                 observer,
                 {
-                    "fft_submissions": len(final_results),
-                    "fft_vector_equivalents": sum(occupied_bands for _ in final_results),
+                    "fft_submissions": len(final_owned_results),
+                    "fft_vector_equivalents": sum(
+                        occupied_bands for _ in final_owned_results
+                    ),
                 },
             )
             target_count = float(mx.sum(target_density) * system.grid.dv)
@@ -1940,8 +2295,8 @@ def _run_periodic_scf_with_projector_cache(
             density_residual = _density_residual(density, target_density, system.grid)
 
         band_energy = sum(
-            result.weight * 2.0 * float(mx.sum(result.eigen.eigenvalues))
-            for result in final_results
+            result.integration_weight * 2.0 * float(mx.sum(result.eigen.eigenvalues))
+            for result in final_owned_results
         )
         hartree_energy = 0.5 * float(mx.sum(density * hartree) * system.grid.dv)
         xc_energy = float(xc_result.total_energy)
@@ -1965,11 +2320,13 @@ def _run_periodic_scf_with_projector_cache(
                 "electron_count": target_count,
                 "max_orbital_residual": max_orbital_residual,
                 "all_kpoints_converged": str(
-                    all(result.eigen.converged for result in final_results)
+                    all(result.eigen.converged for result in final_owned_results)
                 ).lower(),
             }
         )
-        all_eigen_converged = all(result.eigen.converged for result in final_results)
+        all_eigen_converged = all(
+            result.eigen.converged for result in final_owned_results
+        )
         if observer is not None:
             observer.emit(
                 "scf_iteration",
@@ -1997,16 +2354,30 @@ def _run_periodic_scf_with_projector_cache(
             mixed_count = float(mx.sum(mixed) * system.grid.dv)
             density = mixed * (system.electron_count / mixed_count)
         previous_energy = total_energy
-        previous_states = [
-            result.eigen._compact_coefficients for result in final_results
-        ]
+        previous_states = {
+            result.explicit_index: result.eigen._compact_coefficients
+            for result in final_owned_results
+            if result.explicit_index is not None
+        }
 
     timings["total"] = (perf_counter() - total_start) * 1000.0
+    final_owned_by_index = {
+        result.explicit_index: result
+        for result in final_owned_results
+        if result.explicit_index is not None
+    }
+    final_results = _publish_explicit_kpoints(
+        ownership,
+        bases,
+        final_owned_by_index,
+        observer,
+    )
     electron_count = float(mx.sum(density) * system.grid.dv)
     if observer is not None:
         coefficient_bytes = sum(
             int(np.prod(result.eigen._compact_coefficients.values.shape)) * 8
-            for result in final_results
+            for result in final_owned_results
+            if isinstance(result.eigen._compact_coefficients, _CompactLaneState)
         )
         observer.record_memory("persistent_coefficient_bytes", coefficient_bytes)
         observer.record_memory("coefficient_payload_bytes", coefficient_bytes)
@@ -2033,6 +2404,8 @@ def _run_periodic_scf_with_projector_cache(
         energy_by_term=energy_terms,
         history=tuple(history),
         timings=timings,
+        time_reversal_ownership=ownership,
+        _owned_kpoints=final_owned_results,
     )
 
 

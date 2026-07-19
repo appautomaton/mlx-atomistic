@@ -245,3 +245,45 @@ def test_dft_silicon_mlx_equilibrium_persists_reproducibility_and_profile(tmp_pa
     for row in report["cases"]["equilibrium"]["repetitions"]:
         arrays = np.load(row["arrays"], allow_pickle=False)
         assert arrays["density"].shape == (8, 8, 8)
+
+
+def test_dft_silicon_paired_continuation_persists_owner_arrays_only(
+    tmp_path,
+    monkeypatch,
+):
+    import mlx_atomistic.benchmarks.dft_silicon as silicon
+
+    source = _gth_database(tmp_path / "GTH_POTENTIALS")
+    prepared = prepare_workload(
+        gth_source=source,
+        out=tmp_path / "prepared",
+        command=["prepare"],
+    )
+    original_settings = silicon._periodic_settings
+
+    def paired_settings(profile):
+        settings = original_settings(profile)
+        return {**settings, "kpoint_mesh": (2, 1, 1)}
+
+    monkeypatch.setattr(silicon, "_periodic_settings", paired_settings)
+    payload = run_mlx_workload(
+        manifest_path=prepared["workload_manifest"],
+        out=tmp_path / "mlx-paired",
+        case="strain_minus",
+        repetitions=2,
+    )
+
+    report = json.loads(Path(payload["report"]).read_text())
+    case = report["cases"]["strain_minus"]
+    rows = [case["base"], *case["branches"]]
+    assert len(rows) > 1
+    for row in rows:
+        assert row["explicit_kpoint_count"] == 2
+        assert row["owned_kpoint_indices"] == [0]
+        arrays = np.load(row["arrays"], allow_pickle=False)
+        assert "coefficients_0" in arrays
+        assert "eigenvalues_0" in arrays
+        assert "residuals_0" in arrays
+        assert "coefficients_1" not in arrays
+        assert "eigenvalues_1" not in arrays
+        assert "residuals_1" not in arrays

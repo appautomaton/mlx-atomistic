@@ -1000,9 +1000,7 @@ def run_mlx_workload(
         initial_coefficients = (
             None
             if continuation is None
-            else [
-                item.eigen._compact_coefficients for item in continuation.kpoints
-            ]
+            else continuation.continuation_coefficients
         )
         start = perf_counter()
         result = run_periodic_scf(
@@ -1018,14 +1016,15 @@ def run_mlx_workload(
             result.density,
             *[
                 item.eigen._compact_coefficients.values
-                for item in result.kpoints
+                for item in result.owned_kpoints
             ],
         )
         elapsed = perf_counter() - start
         case_root = geometry_root / f"{key}-{label}"
         case_root.mkdir(parents=True, exist_ok=True)
         arrays = {"density": np.asarray(result.density)}
-        for index, item in enumerate(result.kpoints):
+        for owned_index, item in enumerate(result.owned_kpoints):
+            index = owned_index if item.explicit_index is None else item.explicit_index
             compact = item.eigen._compact_coefficients
             arrays[f"coefficients_{index}"] = np.asarray(
                 compact.layout.unpack_fresh(compact.values)
@@ -1042,6 +1041,10 @@ def run_mlx_workload(
             "elapsed_wall_seconds": elapsed,
             "energy_accounting_residual_hartree": _energy_accounting_residual(result),
             "result": result.to_dict(),
+            "explicit_kpoint_count": len(result.kpoints),
+            "owned_kpoint_indices": [
+                item.explicit_index for item in result.owned_kpoints
+            ],
             "arrays": str(array_path),
         }
         summary_path = case_root / "result.json"
@@ -1062,16 +1065,19 @@ def run_mlx_workload(
             "geometry_key": summary["geometry_key"],
             "result_path": summary["result_path"],
             "arrays": summary["arrays"],
+            "explicit_kpoint_count": summary["explicit_kpoint_count"],
+            "owned_kpoint_indices": summary["owned_kpoint_indices"],
             "total_energy_hartree": result.total_energy,
             "converged": bool(result.converged),
             "electron_count": result.electron_count,
             "density_residual": result.density_residual,
             "energy_delta_hartree": result.energy_delta,
             "max_orbital_residual": max(
-                float(np.max(np.asarray(item.eigen.residuals))) for item in result.kpoints
+                float(np.max(np.asarray(item.eigen.residuals)))
+                for item in result.owned_kpoints
             ),
             "max_orthonormality_error": max(
-                item.eigen.orthonormality_error for item in result.kpoints
+                item.eigen.orthonormality_error for item in result.owned_kpoints
             ),
         }
 
@@ -1333,7 +1339,11 @@ def run_mlx_workload(
         default=float("inf"),
     )
     max_orthonormality_error = max(
-        (item.eigen.orthonormality_error for result in all_scf for item in result.kpoints),
+        (
+            item.eigen.orthonormality_error
+            for result in all_scf
+            for item in result.owned_kpoints
+        ),
         default=float("inf"),
     )
     energy_accounting_consistent = max_energy_accounting_residual <= 1e-10
