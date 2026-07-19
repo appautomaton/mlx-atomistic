@@ -9,13 +9,20 @@ from time import perf_counter
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.dft._compact import (
+    _CompactBatch,
+    _CompactLaneState,
+    _CompatibilityCoefficientState,
+    _remap_initial_coefficients,
+    _require_layout,
+)
 from mlx_atomistic.dft._runtime_observer import (
     RuntimeObserver,
     add_observed_work,
     observed_phase,
 )
 from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
-from mlx_atomistic.dft.grids import RealSpaceGrid
+from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.kpoints import KPointMesh
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import (
@@ -153,18 +160,140 @@ class PeriodicSCFConfig:
             raise ValueError(msg)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PeriodicEigenResult:
-    """Lowest eigenspace result for one periodic k-point."""
+    """Lowest eigenspace result with compact runtime-owned coefficients.
+
+    Public construction accepts full-grid coefficients only with an explicit
+    basis. Runtime code uses the private compact factory, so no dense fallback
+    is retained.
+
+    Args:
+        eigenvalues: Lowest eigenvalues in Hartree.
+        coefficients: Public full-grid coefficient stack.
+        residuals: Residual norm per eigenpair.
+        orthonormality_error: Maximum overlap error.
+        iterations: Davidson iteration count.
+        converged: Whether the requested tolerance was reached.
+        subspace_size: Final Davidson subspace width.
+        restart_count: Number of Davidson restarts.
+        basis: Optional basis used to pack the public full-grid coefficient
+            input. When omitted, the legacy eight-argument constructor stores
+            only the input's exact nonzero support for round-trip compatibility.
+    """
 
     eigenvalues: mx.array
-    coefficients: mx.array
+    _compact_coefficients: _CompactLaneState | _CompatibilityCoefficientState
+    _basis: PlaneWaveBasis | None
     residuals: mx.array
     orthonormality_error: float
     iterations: int
     converged: bool
     subspace_size: int
     restart_count: int
+
+    def __init__(
+        self,
+        eigenvalues: mx.array,
+        coefficients: mx.array,
+        residuals: mx.array,
+        orthonormality_error: float,
+        iterations: int,
+        converged: bool,
+        subspace_size: int,
+        restart_count: int,
+        *,
+        basis: PlaneWaveBasis | None = None,
+    ) -> None:
+        compact: _CompactLaneState | _CompatibilityCoefficientState
+        if basis is None:
+            compact = _CompatibilityCoefficientState.from_full(coefficients)
+        else:
+            compact, _ = basis._state_from_full(coefficients)
+        self._set_fields(
+            eigenvalues=eigenvalues,
+            compact_coefficients=compact,
+            basis=basis,
+            residuals=residuals,
+            orthonormality_error=orthonormality_error,
+            iterations=iterations,
+            converged=converged,
+            subspace_size=subspace_size,
+            restart_count=restart_count,
+        )
+
+    def _set_fields(
+        self,
+        *,
+        eigenvalues: mx.array,
+        compact_coefficients: _CompactLaneState | _CompatibilityCoefficientState,
+        basis: PlaneWaveBasis | None,
+        residuals: mx.array,
+        orthonormality_error: float,
+        iterations: int,
+        converged: bool,
+        subspace_size: int,
+        restart_count: int,
+    ) -> None:
+        if basis is None:
+            if not isinstance(compact_coefficients, _CompatibilityCoefficientState):
+                msg = "basis-free public results require compatibility coefficient state"
+                raise ValueError(msg)
+        else:
+            if not isinstance(compact_coefficients, _CompactLaneState):
+                msg = "basis-bound results require compact lane state"
+                raise ValueError(msg)
+            basis._validate_state(compact_coefficients)
+            if compact_coefficients.kind != "coefficients":
+                msg = "periodic eigen results must own coefficient state"
+                raise ValueError(msg)
+        object.__setattr__(self, "eigenvalues", mx.array(eigenvalues))
+        object.__setattr__(self, "_compact_coefficients", compact_coefficients)
+        object.__setattr__(self, "_basis", basis)
+        object.__setattr__(self, "residuals", mx.array(residuals))
+        object.__setattr__(self, "orthonormality_error", float(orthonormality_error))
+        object.__setattr__(self, "iterations", int(iterations))
+        object.__setattr__(self, "converged", bool(converged))
+        object.__setattr__(self, "subspace_size", int(subspace_size))
+        object.__setattr__(self, "restart_count", int(restart_count))
+
+    @classmethod
+    def _from_compact(
+        cls,
+        *,
+        eigenvalues: mx.array,
+        compact_coefficients: _CompactLaneState,
+        basis: PlaneWaveBasis,
+        residuals: mx.array,
+        orthonormality_error: float,
+        iterations: int,
+        converged: bool,
+        subspace_size: int,
+        restart_count: int,
+    ) -> PeriodicEigenResult:
+        result = object.__new__(cls)
+        result._set_fields(
+            eigenvalues=eigenvalues,
+            compact_coefficients=compact_coefficients,
+            basis=basis,
+            residuals=residuals,
+            orthonormality_error=orthonormality_error,
+            iterations=iterations,
+            converged=converged,
+            subspace_size=subspace_size,
+            restart_count=restart_count,
+        )
+        return result
+
+    @property
+    def coefficients(self) -> mx.array:
+        """Materialize a fresh full-grid coefficient stack.
+
+        Returns:
+            Caller-owned ``complex64`` coefficients with exact inactive zeros.
+        """
+
+        return self._compact_coefficients.full_grid_fresh()
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe eigensolver summary.
@@ -230,15 +359,37 @@ class PeriodicKohnShamOperator:
         if observer is not None and self.observer is not None and observer is not self.observer:
             msg = "operator apply observers must be the same object"
             raise ValueError(msg)
-        runtime_observer = self.observer if observer is None else observer
-        values = mx.array(coefficients)
-        if values.shape == self.basis.grid.shape:
-            vector_count = 1
-        elif len(values.shape) == 4 and values.shape[1:] == self.basis.grid.shape:
-            vector_count = int(values.shape[0])
-        else:
-            msg = "coefficients must have shape grid.shape or (n, *grid.shape)"
+        state, was_single = self.basis._state_from_full(coefficients)
+        applied = self._apply_compact(state, observer=observer)
+        return self.basis._layout.unpack_fresh(applied.values, single=was_single)
+
+    def _apply_legacy_gth_full_grid_compat(
+        self,
+        batch: _CompactBatch,
+        scattered: mx.array,
+    ) -> _CompactLaneState:
+        if self.nonlocal_operator is None:
+            msg = "legacy GTH compatibility requires a nonlocal operator"
             raise ValueError(msg)
+        dense_action = self.nonlocal_operator.apply(scattered[0])
+        padded = batch.gather(dense_action[None, ...])
+        return batch.unpad(padded, kind="hamiltonian_action")[0]
+
+    def _apply_compact(
+        self,
+        coefficients: _CompactLaneState,
+        *,
+        observer: RuntimeObserver | None = None,
+    ) -> _CompactLaneState:
+        if observer is not None and self.observer is not None and observer is not self.observer:
+            msg = "operator apply observers must be the same object"
+            raise ValueError(msg)
+        self.basis._validate_state(coefficients)
+        if coefficients.kind != "coefficients":
+            msg = "Hamiltonian input must be coefficient state"
+            raise ValueError(msg)
+        runtime_observer = self.observer if observer is None else observer
+        vector_count = coefficients.vector_count
         projector_elements = 0
         if self.nonlocal_operator is not None:
             projector_count = sum(
@@ -266,19 +417,36 @@ class PeriodicKohnShamOperator:
                 peak_temporary_bytes,
             )
         with observed_phase(runtime_observer, "hpsi"):
-            applied = self.basis.apply_kinetic(values) + self.basis.apply_local(
-                values,
-                self.effective_local_potential,
+            batch = _CompactBatch.from_states([coefficients])
+            scattered = batch.scatter()
+            kinetic = (
+                coefficients.values
+                * self.basis.active_kinetic_energies[None, :]
             )
+            local = batch.unpad(
+                batch.apply_local(
+                    self.effective_local_potential,
+                    scattered=scattered,
+                ),
+                kind="hamiltonian_action",
+            )[0]
+            applied_values = kinetic + local.values
             if self.nonlocal_operator is not None:
-                applied = applied + self.nonlocal_operator.apply(values)
-            result = self.basis.project(applied)
+                nonlocal_action = self._apply_legacy_gth_full_grid_compat(
+                    batch,
+                    scattered,
+                )
+                applied_values = applied_values + nonlocal_action.values
+            result = self.basis._state_from_compact(
+                applied_values,
+                kind="hamiltonian_action",
+            )
         add_observed_work(
             runtime_observer,
             {
                 "hpsi_calls": 1,
                 "hpsi_vector_equivalents": vector_count,
-                "fft_submissions": 2 * vector_count,
+                "fft_submissions": 2,
                 "fft_vector_equivalents": 2 * vector_count,
                 "projector_elements_generated": projector_elements,
                 "projector_elements_loaded": 2 * projector_elements,
@@ -309,30 +477,29 @@ class PeriodicKohnShamOperator:
             Real energy estimates in Hartree.
         """
 
-        stack = mx.array(coefficients)
-        if stack.shape == self.basis.grid.shape:
-            stack = mx.reshape(stack, (1, *self.basis.grid.shape))
-        applied = self.apply(stack, observer=observer)
-        numerator = mx.sum(mx.conjugate(stack) * applied, axis=(1, 2, 3))
-        denominator = mx.sum(mx.abs(stack) ** 2, axis=(1, 2, 3))
+        state, _ = self.basis._state_from_full(coefficients)
+        return self._rayleigh_quotients_compact(state, observer=observer)
+
+    def _rayleigh_quotients_compact(
+        self,
+        coefficients: _CompactLaneState,
+        *,
+        observer: RuntimeObserver | None = None,
+    ) -> mx.array:
+        self.basis._validate_state(coefficients)
+        applied = self._apply_compact(coefficients, observer=observer)
+        numerator = mx.sum(mx.conjugate(coefficients.values) * applied.values, axis=1)
+        denominator = mx.sum(mx.abs(coefficients.values) ** 2, axis=1)
         return mx.real(numerator / denominator)
 
 
-def _flat(stack: mx.array, basis: PlaneWaveBasis) -> mx.array:
-    return mx.reshape(stack, (stack.shape[0], basis.grid.size))
-
-
-def _subspace_matrix(basis_vectors: mx.array, applied: mx.array, basis: PlaneWaveBasis) -> mx.array:
-    left = _flat(basis_vectors, basis)
-    right = _flat(applied, basis)
-    matrix = mx.conjugate(left) @ mx.transpose(right)
+def _subspace_matrix(basis_vectors: mx.array, applied: mx.array) -> mx.array:
+    matrix = mx.conjugate(basis_vectors) @ mx.transpose(applied)
     return 0.5 * (matrix + mx.conjugate(mx.transpose(matrix)))
 
 
-def _combine(weights: mx.array, vectors: mx.array, basis: PlaneWaveBasis) -> mx.array:
-    flat = _flat(vectors, basis)
-    combined = mx.transpose(weights) @ flat
-    return mx.reshape(combined, (weights.shape[1], *basis.grid.shape))
+def _combine(weights: mx.array, vectors: mx.array) -> mx.array:
+    return mx.transpose(weights) @ vectors
 
 
 def _projected_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
@@ -365,17 +532,15 @@ def _projected_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
     )
 
 
-def _initial_coefficients(basis: PlaneWaveBasis, count: int) -> mx.array:
+def _initial_coefficients(basis: PlaneWaveBasis, count: int) -> _CompactLaneState:
     if count > basis.active_count:
         msg = "orbital count exceeds the active plane-wave basis"
         raise ValueError(msg)
-    kinetic = np.asarray(basis.kinetic_energies, dtype=np.float64).reshape(-1)
-    mask = np.asarray(basis.mask).reshape(-1)
-    active = np.flatnonzero(mask)
-    selected = active[np.argsort(kinetic[active], kind="stable")[:count]]
-    coefficients = np.zeros((count, basis.grid.size), dtype=np.complex64)
+    kinetic = np.asarray(basis.active_kinetic_energies, dtype=np.float64)
+    selected = np.argsort(kinetic, kind="stable")[:count]
+    coefficients = np.zeros((count, basis.active_count), dtype=np.complex64)
     coefficients[np.arange(count), selected] = 1.0
-    return mx.array(coefficients.reshape((count, *basis.grid.shape)))
+    return basis._state_from_compact(mx.array(coefficients))
 
 
 def solve_periodic_eigenproblem(
@@ -413,27 +578,40 @@ def solve_periodic_eigenproblem(
     if solver_config.max_subspace_size < n_bands:
         msg = "max_subspace_size cannot be smaller than n_bands"
         raise ValueError(msg)
-    trial = (
-        _initial_coefficients(basis, n_bands)
-        if initial_coefficients is None
-        else mx.array(initial_coefficients)
-    )
+    if initial_coefficients is None:
+        trial = _initial_coefficients(basis, n_bands)
+    elif isinstance(initial_coefficients, _CompactLaneState):
+        try:
+            _require_layout(initial_coefficients, basis._layout)
+            trial = initial_coefficients
+        except ValueError:
+            trial = _remap_initial_coefficients(initial_coefficients, basis._layout)
+    else:
+        trial, _ = basis._state_from_full(initial_coefficients)
+    if trial.kind != "coefficients":
+        msg = "initial coefficients cannot be a cached Hamiltonian action"
+        raise ValueError(msg)
     with observed_phase(runtime_observer, "orthogonalization"):
-        subspace = basis.orthonormalize(trial)
+        subspace = basis._state_from_compact(
+            basis._orthonormalize_compact(trial.values)
+        )
     add_observed_work(
         runtime_observer,
-        {"orthogonalization_vectors": int(trial.shape[0])},
+        {"orthogonalization_vectors": trial.vector_count},
     )
     restart_count = 0
     converged = False
-    eigenvalues = operator.rayleigh_quotients(subspace, observer=runtime_observer)
+    eigenvalues = operator._rayleigh_quotients_compact(
+        subspace,
+        observer=runtime_observer,
+    )
     residuals = mx.full((n_bands,), float("inf"), dtype=mx.float32)
-    ritz = subspace[:n_bands]
+    ritz = basis._state_from_compact(subspace.values[:n_bands])
     iteration_count = 0
     for _iteration in range(1, solver_config.max_iterations + 1):
         iteration_count = _iteration
-        applied = operator.apply(subspace, observer=runtime_observer)
-        subspace_size = int(subspace.shape[0])
+        applied = operator._apply_compact(subspace, observer=runtime_observer)
+        subspace_size = subspace.vector_count
         add_observed_work(
             runtime_observer,
             {
@@ -442,14 +620,19 @@ def solve_periodic_eigenproblem(
             },
         )
         with observed_phase(runtime_observer, "rayleigh_ritz"):
-            projected = _subspace_matrix(subspace, applied, basis)
+            projected = _subspace_matrix(subspace.values, applied.values)
             values, vectors = _projected_eigh(projected)
             selected_values = values[:n_bands]
             selected_vectors = vectors[:, :n_bands]
-            ritz = _combine(selected_vectors, subspace, basis)
-            h_ritz = _combine(selected_vectors, applied, basis)
-            residual_stack = h_ritz - selected_values[:, None, None, None] * ritz
-            residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=(1, 2, 3)))
+            ritz = basis._state_from_compact(
+                _combine(selected_vectors, subspace.values)
+            )
+            h_ritz = basis._state_from_compact(
+                _combine(selected_vectors, applied.values),
+                kind="hamiltonian_action",
+            )
+            residual_stack = h_ritz.values - selected_values[:, None] * ritz.values
+            residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=1))
             eigenvalues = mx.real(selected_values)
         max_residual = float(mx.max(residuals))
         if runtime_observer is not None:
@@ -466,11 +649,11 @@ def solve_periodic_eigenproblem(
 
         corrections = []
         for band_index in range(n_bands):
-            denominator = basis.kinetic_energies - eigenvalues[band_index]
+            denominator = basis.active_kinetic_energies - eigenvalues[band_index]
             sign = mx.where(denominator < 0.0, -1.0, 1.0)
             safe = sign * mx.maximum(mx.abs(denominator), solver_config.preconditioner_floor)
-            correction = basis.project(-residual_stack[band_index] / safe)
-            candidate_vectors = [*list(subspace), *corrections]
+            correction = -residual_stack[band_index] / safe
+            candidate_vectors = [*list(subspace.values), *corrections]
             for _ in range(2):
                 for accepted in candidate_vectors:
                     overlap = mx.sum(mx.conjugate(accepted) * correction)
@@ -481,39 +664,52 @@ def solve_periodic_eigenproblem(
         if not corrections:
             break
         correction_stack = mx.stack(corrections, axis=0)
-        if int(subspace.shape[0]) + len(corrections) > solver_config.max_subspace_size:
+        if subspace.vector_count + len(corrections) > solver_config.max_subspace_size:
             restart_count += 1
             with observed_phase(runtime_observer, "orthogonalization"):
-                subspace = basis.orthonormalize(
-                    mx.concatenate([ritz, correction_stack], axis=0)
+                subspace = basis._state_from_compact(
+                    basis._orthonormalize_compact(
+                        mx.concatenate([ritz.values, correction_stack], axis=0)
+                    )
                 )
         else:
             with observed_phase(runtime_observer, "orthogonalization"):
-                subspace = basis.orthonormalize(
-                    mx.concatenate([subspace, correction_stack], axis=0)
+                subspace = basis._state_from_compact(
+                    basis._orthonormalize_compact(
+                        mx.concatenate([subspace.values, correction_stack], axis=0)
+                    )
                 )
         add_observed_work(
             runtime_observer,
-            {"orthogonalization_vectors": int(subspace.shape[0])},
+            {"orthogonalization_vectors": subspace.vector_count},
         )
 
     with observed_phase(runtime_observer, "orthogonalization"):
-        ritz = basis.orthonormalize(ritz)
-    add_observed_work(runtime_observer, {"orthogonalization_vectors": int(ritz.shape[0])})
-    final_applied = operator.apply(ritz, observer=runtime_observer)
-    eigenvalues = operator.rayleigh_quotients(ritz, observer=runtime_observer)
-    residual_stack = final_applied - eigenvalues[:, None, None, None] * ritz
-    residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=(1, 2, 3)))
-    overlap = np.asarray(basis.overlap_matrix(ritz))
+        ritz = basis._state_from_compact(
+            basis._orthonormalize_compact(ritz.values)
+        )
+    add_observed_work(
+        runtime_observer,
+        {"orthogonalization_vectors": ritz.vector_count},
+    )
+    final_applied = operator._apply_compact(ritz, observer=runtime_observer)
+    eigenvalues = operator._rayleigh_quotients_compact(
+        ritz,
+        observer=runtime_observer,
+    )
+    residual_stack = final_applied.values - eigenvalues[:, None] * ritz.values
+    residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=1))
+    overlap = np.asarray(basis._overlap_matrix_compact(ritz.values))
     orthonormality = float(np.max(np.abs(overlap - np.eye(n_bands))))
-    return PeriodicEigenResult(
+    return PeriodicEigenResult._from_compact(
         eigenvalues=eigenvalues,
-        coefficients=ritz,
+        compact_coefficients=ritz,
+        basis=basis,
         residuals=residuals,
         orthonormality_error=orthonormality,
         iterations=iteration_count,
         converged=converged or float(mx.max(residuals)) <= solver_config.tolerance,
-        subspace_size=int(subspace.shape[0]),
+        subspace_size=subspace.vector_count,
         restart_count=restart_count,
     )
 
@@ -590,7 +786,7 @@ def _density_from_kpoints(
 ) -> mx.array:
     density = mx.zeros(results[0].basis.grid.shape, dtype=mx.float32)
     for result in results:
-        orbitals = result.basis.to_real(result.eigen.coefficients)
+        orbitals = result.basis._to_real_compact(result.eigen._compact_coefficients)
         density = density + float(result.weight * occupation) * mx.sum(
             mx.abs(orbitals) ** 2,
             axis=0,
@@ -654,11 +850,23 @@ def run_periodic_scf(
             grid_shape=list(system.grid.shape),
         )
     with observed_phase(observer, "setup"):
+        shared_reciprocal = ReciprocalGrid.from_real_space(system.grid)
         bases = [
-            PlaneWaveBasis.from_reduced_kpoint(system.grid, cutoff_hartree, point.vector)
-            for point in kpoint_mesh.points
+            PlaneWaveBasis.from_reduced_kpoint(
+                system.grid,
+                cutoff_hartree,
+                point.vector,
+                reciprocal_grid=shared_reciprocal,
+                lane_label=f"kpoint:{point_index}",
+            )
+            for point_index, point in enumerate(kpoint_mesh.points)
         ]
-        gamma_basis = PlaneWaveBasis(system.grid, cutoff_hartree)
+        gamma_basis = PlaneWaveBasis(
+            system.grid,
+            cutoff_hartree,
+            reciprocal_grid=shared_reciprocal,
+            lane_label="gamma-local-potential",
+        )
         local_potential = gth_local_potential_grid(
             system.pseudopotential,
             gamma_basis,
@@ -784,7 +992,7 @@ def run_periodic_scf(
             add_observed_work(
                 observer,
                 {
-                    "fft_submissions": sum(occupied_bands for _ in final_results),
+                    "fft_submissions": len(final_results),
                     "fft_vector_equivalents": sum(occupied_bands for _ in final_results),
                 },
             )
@@ -850,13 +1058,16 @@ def run_periodic_scf(
             mixed_count = float(mx.sum(mixed) * system.grid.dv)
             density = mixed * (system.electron_count / mixed_count)
         previous_energy = total_energy
-        previous_states = [result.eigen.coefficients for result in final_results]
+        previous_states = [
+            result.eigen._compact_coefficients for result in final_results
+        ]
 
     timings["total"] = (perf_counter() - total_start) * 1000.0
     electron_count = float(mx.sum(density) * system.grid.dv)
     if observer is not None:
         coefficient_bytes = sum(
-            int(np.prod(result.eigen.coefficients.shape)) * 8 for result in final_results
+            int(np.prod(result.eigen._compact_coefficients.values.shape)) * 8
+            for result in final_results
         )
         observer.record_memory("persistent_coefficient_bytes", coefficient_bytes)
         observer.record_memory("coefficient_payload_bytes", coefficient_bytes)

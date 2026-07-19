@@ -1000,7 +1000,9 @@ def run_mlx_workload(
         initial_coefficients = (
             None
             if continuation is None
-            else [item.eigen.coefficients for item in continuation.kpoints]
+            else [
+                item.eigen._compact_coefficients for item in continuation.kpoints
+            ]
         )
         start = perf_counter()
         result = run_periodic_scf(
@@ -1012,13 +1014,22 @@ def run_mlx_workload(
             initial_density=initial_density,
             initial_coefficients=initial_coefficients,
         )
-        mx.eval(result.density, *[item.eigen.coefficients for item in result.kpoints])
+        mx.eval(
+            result.density,
+            *[
+                item.eigen._compact_coefficients.values
+                for item in result.kpoints
+            ],
+        )
         elapsed = perf_counter() - start
         case_root = geometry_root / f"{key}-{label}"
         case_root.mkdir(parents=True, exist_ok=True)
         arrays = {"density": np.asarray(result.density)}
         for index, item in enumerate(result.kpoints):
-            arrays[f"coefficients_{index}"] = np.asarray(item.eigen.coefficients)
+            compact = item.eigen._compact_coefficients
+            arrays[f"coefficients_{index}"] = np.asarray(
+                compact.layout.unpack_fresh(compact.values)
+            )
             arrays[f"eigenvalues_{index}"] = np.asarray(item.eigen.eigenvalues)
             arrays[f"residuals_{index}"] = np.asarray(item.eigen.residuals)
         array_path = case_root / "arrays.npz"

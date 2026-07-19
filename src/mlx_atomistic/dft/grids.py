@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 from math import pi
 
 import mlx.core as mx
@@ -87,7 +88,33 @@ class RealSpaceGrid:
         return as_mx_array(np.stack(mesh, axis=-1).astype(np.float32))
 
 
-@dataclass(frozen=True)
+def _fft_integer_g(shape: tuple[int, int, int]) -> mx.array:
+    integer_axes = []
+    for count in shape:
+        indices = mx.arange(count, dtype=mx.int32)
+        integer_axes.append(
+            mx.where(indices <= (count - 1) // 2, indices, indices - count)
+        )
+    return mx.stack(
+        [
+            mx.broadcast_to(integer_axes[0][:, None, None], shape),
+            mx.broadcast_to(integer_axes[1][None, :, None], shape),
+            mx.broadcast_to(integer_axes[2][None, None, :], shape),
+        ],
+        axis=-1,
+    )
+
+
+def _reciprocal_fingerprint(grid: RealSpaceGrid) -> str:
+    digest = sha256()
+    digest.update(b"mlx-atomistic.reciprocal-grid.v1\0")
+    digest.update(np.asarray(grid.shape, dtype=np.int64).tobytes())
+    digest.update(np.asarray(grid.cell.matrix, dtype=np.float64).tobytes())
+    digest.update(b"exact-numpy-fftfreq-integer-order-v1\0")
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, init=False)
 class ReciprocalGrid:
     """Reciprocal-space vectors matching a `RealSpaceGrid` FFT layout."""
 
@@ -95,23 +122,68 @@ class ReciprocalGrid:
     vectors: mx.array
     g2: mx.array
     zero_mask: mx.array
+    integer_g: mx.array
+    fingerprint: str
+
+    def __init__(
+        self,
+        real_grid: RealSpaceGrid,
+        vectors: mx.array,
+        g2: mx.array,
+        zero_mask: mx.array,
+        integer_g: mx.array | None = None,
+        fingerprint: str | None = None,
+    ) -> None:
+        object.__setattr__(self, "real_grid", real_grid)
+        object.__setattr__(self, "vectors", mx.array(vectors))
+        object.__setattr__(self, "g2", mx.array(g2))
+        object.__setattr__(self, "zero_mask", mx.array(zero_mask))
+        object.__setattr__(
+            self,
+            "integer_g",
+            _fft_integer_g(real_grid.shape) if integer_g is None else mx.array(integer_g),
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            _reciprocal_fingerprint(real_grid) if fingerprint is None else fingerprint,
+        )
 
     @classmethod
     def from_real_space(cls, grid: RealSpaceGrid) -> ReciprocalGrid:
-        """Build reciprocal vectors in NumPy FFT frequency order."""
+        """Build reciprocal vectors in exact NumPy FFT frequency order.
 
-        spacing = np.array(grid.spacing, dtype=np.float64)
-        axes = [
-            2.0 * pi * np.fft.fftfreq(count, d=delta)
+        Args:
+            grid: Real-space grid whose FFT ordering and cell define the
+                reciprocal descriptor.
+
+        Returns:
+            Reciprocal metadata with exact integer ``G`` coordinates and a
+            deterministic grid fingerprint.
+        """
+
+        integer_g = _fft_integer_g(grid.shape)
+        spacing = np.asarray(grid.spacing, dtype=np.float64)
+        reciprocal_axes = [
+            mx.array(
+                (2.0 * pi * np.fft.fftfreq(count, d=delta)).astype(np.float32)
+            )
             for count, delta in zip(grid.shape, spacing, strict=True)
         ]
-        mesh = np.meshgrid(*axes, indexing="ij")
-        vectors_np = np.stack(mesh, axis=-1).astype(np.float32)
-        g2_np = np.sum(vectors_np * vectors_np, axis=-1, dtype=np.float32)
-        zero_mask_np = g2_np == 0.0
+        vectors = mx.stack(
+            [
+                mx.broadcast_to(reciprocal_axes[0][:, None, None], grid.shape),
+                mx.broadcast_to(reciprocal_axes[1][None, :, None], grid.shape),
+                mx.broadcast_to(reciprocal_axes[2][None, None, :], grid.shape),
+            ],
+            axis=-1,
+        )
+        g2 = mx.sum(vectors * vectors, axis=-1)
         return cls(
             real_grid=grid,
-            vectors=as_mx_array(vectors_np),
-            g2=as_mx_array(g2_np),
-            zero_mask=mx.array(zero_mask_np),
+            vectors=vectors,
+            g2=g2,
+            zero_mask=g2 == 0.0,
+            integer_g=integer_g,
+            fingerprint=_reciprocal_fingerprint(grid),
         )

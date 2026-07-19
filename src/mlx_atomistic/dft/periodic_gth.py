@@ -188,8 +188,9 @@ class PeriodicGTHNonlocalOperator:
         position: np.ndarray,
         channel: GTHProjectorChannel,
         harmonic: np.ndarray,
+        vectors: np.ndarray,
+        mask: np.ndarray,
     ) -> mx.array:
-        vectors = np.asarray(self.basis.shifted_vectors, dtype=np.float64)
         q = np.linalg.norm(vectors, axis=-1)
         phase = np.exp(-1j * np.einsum("...d,d->...", vectors, position, optimize=True))
         angular_phase = (-1j) ** channel.angular_momentum
@@ -204,7 +205,6 @@ class PeriodicGTHNonlocalOperator:
             )
         )
         projectors = []
-        mask = np.asarray(self.basis.mask)
         for projector_index in range(channel.projector_count):
             radial = _gth_radial(channel, projector_index, q)
             values = prefactor * radial * harmonic * phase * angular_phase
@@ -229,6 +229,7 @@ class PeriodicGTHNonlocalOperator:
             raise ValueError(msg)
         stack = self.basis.project(stack)
         vectors = np.asarray(self.basis.shifted_vectors, dtype=np.float64)
+        mask = np.asarray(self.basis.mask)
         outputs = []
         for orbital_index in range(int(stack.shape[0])):
             orbital = mx.reshape(stack[orbital_index], (self.basis.grid.size,))
@@ -242,7 +243,13 @@ class PeriodicGTHNonlocalOperator:
                         channel.angular_momentum,
                         vectors,
                     ):
-                        beta = self._projector_group(position, channel, harmonic)
+                        beta = self._projector_group(
+                            position,
+                            channel,
+                            harmonic,
+                            vectors,
+                            mask,
+                        )
                         beta_flat = mx.reshape(
                             beta,
                             (channel.projector_count, self.basis.grid.size),
