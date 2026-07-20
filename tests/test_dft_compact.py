@@ -133,9 +133,7 @@ def test_public_active_metadata_mutation_cannot_change_layout_kinetic_or_scatter
     basis = _basis(cutoff=4.0, lane_label="metadata-mutation")
     state = _random_state(basis, vectors=2, seed=101)
     coordinates = basis.grid.coordinates()
-    potential = 0.2 + 0.1 * mx.cos(
-        2.0 * np.pi * coordinates[..., 0] / basis.grid.lengths[0]
-    )
+    potential = 0.2 + 0.1 * mx.cos(2.0 * np.pi * coordinates[..., 0] / basis.grid.lengths[0])
     operator = PeriodicKohnShamOperator(basis, potential)
     expected_action = operator._apply_compact(state)
     expected_full = state.full_grid_fresh()
@@ -304,9 +302,7 @@ def test_explicit_integer_g_remap_rejects_hamiltonian_action():
         reciprocal_grid=source.reciprocal_grid,
         lane_label="target",
     )
-    values = np.arange(source.active_count, dtype=np.float32)[None, :].astype(
-        np.complex64
-    )
+    values = np.arange(source.active_count, dtype=np.float32)[None, :].astype(np.complex64)
     state = source._state_from_compact(mx.array(values))
 
     remapped = _remap_initial_coefficients(state, target._layout)
@@ -342,9 +338,7 @@ def test_compact_gth_compatibility_matches_dense_formula_boundary():
     observed_state = operator._apply_compact(state)
     observed = observed_state.full_grid_fresh()
     expected = basis.project(
-        basis.apply_kinetic(dense)
-        + basis.apply_local(dense, potential)
-        + gth.apply(dense)
+        basis.apply_kinetic(dense) + basis.apply_local(dense, potential) + gth.apply(dense)
     )
 
     np.testing.assert_allclose(np.asarray(observed), np.asarray(expected), atol=2e-5)
@@ -368,12 +362,7 @@ def test_gth_projector_vector_width_matches_independent_compact_oracle():
     vectors = np.asarray(basis.active_shifted_vectors, dtype=np.float64)
     q = np.linalg.norm(vectors, axis=1)
     channel = pseudo.gth_channels[0]
-    prefactor = (
-        4.0
-        * np.pi
-        * np.pi**0.25
-        * np.sqrt(2.0 * channel.radius**3 / basis.volume)
-    )
+    prefactor = 4.0 * np.pi * np.pi**0.25 * np.sqrt(2.0 * channel.radius**3 / basis.volume)
     beta = (
         prefactor
         * np.exp(-0.5 * (q * channel.radius) ** 2)
@@ -393,9 +382,51 @@ def test_gth_projector_vector_width_matches_independent_compact_oracle():
     assert metrics["projector_elements_generated"] == basis.active_count
     assert metrics["projector_elements_loaded"] == 6 * basis.active_count
     assert all(
-        entry.values.shape == (1, basis.active_count)
-        for entry in operator._cache._entries.values()
+        entry.values.shape == (1, basis.active_count) for entry in operator._cache._entries.values()
     )
+
+
+def test_gth_long_overlap_is_linear_under_unitary_vector_rotation():
+    grid = RealSpaceGrid((20, 20, 20), (20.0, 20.0, 20.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(
+        grid,
+        4.0,
+        (0.25, 0.0, 0.0),
+        lane_label="gth-long-overlap",
+    )
+    assert basis.active_count > 2048
+    rng = np.random.default_rng(20260720)
+    raw_vectors = rng.normal(size=(basis.active_count, 16)) + 1j * rng.normal(
+        size=(basis.active_count, 16)
+    )
+    orthonormal, _ = np.linalg.qr(raw_vectors.astype(np.complex128))
+    vectors = orthonormal.T.astype(np.complex64)
+    raw_rotation = rng.normal(size=(16, 16)) + 1j * rng.normal(size=(16, 16))
+    rotation, _ = np.linalg.qr(raw_rotation.astype(np.complex128))
+    rotation = rotation.astype(np.complex64)
+    state = basis._state_from_compact(mx.array(vectors))
+    rotated = basis._state_from_compact(mx.array(rotation @ vectors))
+    positions = tuple(
+        (2.0 + 4.0 * x, 2.0 + 4.0 * y, 2.0 + 4.0 * z)
+        for x in range(2)
+        for y in range(2)
+        for z in range(2)
+    )
+    operator = PeriodicGTHNonlocalOperator(
+        _hydrogen_gth(),
+        basis,
+        positions,
+    )
+    try:
+        action, _ = operator._apply_compact(state)
+        rotated_action, _ = operator._apply_compact(rotated)
+        defect = rotated_action.values - mx.array(rotation) @ action.values
+        maximum = mx.max(mx.sqrt(mx.sum(mx.abs(defect) ** 2, axis=1)))
+        mx.eval(maximum)
+
+        assert float(maximum) < 1e-6
+    finally:
+        operator.close()
 
 
 def test_public_shifted_vector_mutation_cannot_change_gth_regeneration():
@@ -498,10 +529,7 @@ def test_gth_projector_generation_count_cache_hits_and_hpsi_traffic():
     assert memory["projector_payload_bytes"] == basis.active_count * 8
     assert memory["persistent_projector_bytes"] == basis.active_count * 8
     assert memory["peak_temporary_bytes"] >= memory["fft_workspace_bytes"]
-    assert (
-        memory["peak_temporary_bytes"]
-        < _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
-    )
+    assert memory["peak_temporary_bytes"] < _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
 
 
 def test_gth_projector_cache_eviction_invalidation_and_context_lifetime():
@@ -574,9 +602,7 @@ def test_gth_projector_cache_evicts_lru_only_between_evaluated_actions():
     )
 
     first._apply_compact(_random_state(first_basis, vectors=1, seed=37))
-    _, metrics = second._apply_compact(
-        _random_state(second_basis, vectors=1, seed=41)
-    )
+    _, metrics = second._apply_compact(_random_state(second_basis, vectors=1, seed=41))
 
     assert metrics["projector_cache_evictions"] == 1
     assert cache.evictions == 1
@@ -609,9 +635,7 @@ def test_scf_projector_cache_closes_when_runtime_context_raises(monkeypatch):
         periodic_scf.run_periodic_scf(
             object(),
             cutoff_hartree=1.0,
-            kpoint_mesh=KPointMesh(
-                [KPoint((0.0, 0.0, 0.0), coordinate_system="reduced")]
-            ),
+            kpoint_mesh=KPointMesh([KPoint((0.0, 0.0, 0.0), coordinate_system="reduced")]),
         )
 
     cache = captured["cache"]
@@ -731,9 +755,7 @@ def test_internal_density_continuation_and_serialization_never_read_public_adapt
     trajectory = run_periodic_scf(
         system,
         cutoff_hartree=2.5,
-        kpoint_mesh=KPointMesh(
-            [KPoint((0.0, 0.0, 0.0), weight=1.0, coordinate_system="reduced")]
-        ),
+        kpoint_mesh=KPointMesh([KPoint((0.0, 0.0, 0.0), weight=1.0, coordinate_system="reduced")]),
         n_bands=1,
         config=PeriodicSCFConfig(
             max_iterations=2,
@@ -756,9 +778,7 @@ def test_internal_density_continuation_and_serialization_never_read_public_adapt
     assert trajectory.iterations == 2
     assert trajectory.timings["eigensolver"] > 0.0
     dense_fixed = np.load(io.BytesIO(fixed_payloads["coefficients.npy"]))
-    dense_periodic = np.load(
-        io.BytesIO(periodic_payloads["kpoints/0000-coefficients.npy"])
-    )
+    dense_periodic = np.load(io.BytesIO(periodic_payloads["kpoints/0000-coefficients.npy"]))
     assert dense_fixed.shape == (3, *basis.grid.shape)
     np.testing.assert_array_equal(dense_fixed, dense_periodic)
 

@@ -144,6 +144,21 @@ def test_production_pbe_potential_matches_total_energy_finite_difference():
     assert float(result.potential[index]) == pytest.approx(finite_difference, abs=2e-3)
 
 
+@pytest.mark.parametrize("low_density", [0.0, 1e-8])
+def test_production_pbe_low_density_step_has_finite_energy_and_potential(
+    low_density,
+):
+    grid = RealSpaceGrid((8, 8, 8), (10.0, 10.0, 10.0))
+    density = np.full(grid.shape, low_density, dtype=np.float32)
+    density[:4] = 0.03
+
+    result = ProductionPBEExchangeCorrelation().evaluate(mx.array(density), grid)
+
+    assert np.isfinite(np.asarray(result.energy_density)).all()
+    assert np.isfinite(np.asarray(result.potential)).all()
+    assert np.isfinite(float(result.total_energy))
+
+
 def _silicon_gth() -> PseudopotentialData:
     return PseudopotentialData(
         element="Si",
@@ -196,9 +211,7 @@ def test_gth_local_reciprocal_formula_and_grid_are_real():
     potential = np.asarray(gth_local_potential_grid(pseudo, basis, position))
     rloc = 0.44
     c1 = -6.26928833
-    expected_zero = (
-        2.0 * pi * rloc**2 * 4.0 + (2.0 * pi) ** 1.5 * rloc**3 * c1
-    ) / grid.volume
+    expected_zero = (2.0 * pi * rloc**2 * 4.0 + (2.0 * pi) ** 1.5 * rloc**3 * c1) / grid.volume
     g = 2.0 * pi / 8.0
     rq2 = g * g * rloc * rloc
     expected_g = (
@@ -223,16 +236,12 @@ def test_periodic_gth_nonlocal_operator_is_hermitian_at_non_gamma_kpoint():
     rng = np.random.default_rng(44)
     left = basis.normalize(
         mx.array(
-            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
-                np.complex64
-            )
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(np.complex64)
         )
     )
     right = basis.normalize(
         mx.array(
-            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
-                np.complex64
-            )
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(np.complex64)
         )
     )
 
@@ -252,9 +261,7 @@ def test_periodic_gth_nonlocal_operator_is_cell_translation_invariant():
     rng = np.random.default_rng(10)
     orbital = basis.normalize(
         mx.array(
-            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
-                np.complex64
-            )
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(np.complex64)
         )
     )
     first = PeriodicGTHNonlocalOperator(_silicon_gth(), basis, ((1.0, 2.0, 3.0),))

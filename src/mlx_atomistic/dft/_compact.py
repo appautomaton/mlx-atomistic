@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
-from math import sqrt
+from math import ceil, sqrt
 
 import mlx.core as mx
 import numpy as np
@@ -59,6 +59,35 @@ def _ascending_true_indices(mask: mx.array) -> tuple[mx.array, int]:
     return mx.sort(partitioned).astype(mx.int32), count
 
 
+def _first_inactive_indices(
+    active: np.ndarray,
+    *,
+    grid_size: int,
+    count: int,
+) -> np.ndarray:
+    """Return the first distinct FFT slots outside one sorted active set."""
+
+    result = np.empty((count,), dtype=np.int32)
+    if count == 0:
+        result.setflags(write=False)
+        return result
+    active_index = 0
+    result_index = 0
+    for candidate in range(grid_size):
+        if active_index < active.size and active[active_index] == candidate:
+            active_index += 1
+            continue
+        result[result_index] = candidate
+        result_index += 1
+        if result_index == count:
+            break
+    if result_index != count:
+        msg = "compact FFT layout has insufficient inactive padding indices"
+        raise ValueError(msg)
+    result.setflags(write=False)
+    return result
+
+
 @dataclass(frozen=True)
 class _CompactBasisLayout:
     """Immutable active-plane-wave ordering for one k-point lane."""
@@ -77,6 +106,8 @@ class _CompactBasisLayout:
     _volume_snapshot: float
     _active_flat_indices_np: np.ndarray
     _active_integer_g_np: np.ndarray
+    _padding_flat_indices: mx.array
+    _padding_flat_indices_np: np.ndarray
 
     @classmethod
     def build(
@@ -128,11 +159,22 @@ class _CompactBasisLayout:
         ).astype(np.int32)
         active_shifted = mx.take(shifted, active_indices, axis=0)
         active_kinetic = mx.take(kinetic, active_indices, axis=0)
+        padding_count = min(
+            reciprocal.real_grid.size - active_count,
+            ceil(active_count / 3),
+        )
+        padding_indices_np = _first_inactive_indices(
+            active,
+            grid_size=reciprocal.real_grid.size,
+            count=padding_count,
+        )
+        padding_indices = mx.array(padding_indices_np)
         mx.eval(
             active_indices,
             active_integer_g,
             active_shifted,
             active_kinetic,
+            padding_indices,
         )
         active.setflags(write=False)
         integer_g_np.setflags(write=False)
@@ -173,6 +215,8 @@ class _CompactBasisLayout:
             _volume_snapshot=volume_snapshot,
             _active_flat_indices_np=active,
             _active_integer_g_np=integer_g_np,
+            _padding_flat_indices=padding_indices,
+            _padding_flat_indices_np=padding_indices_np,
         )
 
     @property
@@ -417,10 +461,13 @@ class _CompactBatch:
     values: mx.array
     layouts: tuple[_CompactBasisLayout, ...]
     active_counts: tuple[int, ...]
+    vector_counts: tuple[int, ...]
     fft_indices: mx.array
     valid_mask: mx.array
     kinds: tuple[str, ...]
     padding_elements: int
+    lane_padding_elements: int
+    vector_padding_elements: int
     estimated_transient_bytes: int
 
     _DEFAULT_MAX_PADDING_FRACTION = 0.25
@@ -433,8 +480,11 @@ class _CompactBatch:
         *,
         max_padding_fraction: float = _DEFAULT_MAX_PADDING_FRACTION,
         max_transient_bytes: int = _DEFAULT_MAX_TRANSIENT_BYTES,
+        lane_capacity: int | None = None,
+        vector_capacity: int | None = None,
+        active_capacity: int | None = None,
     ) -> _CompactBatch:
-        """Bucket compatible unpadded lane states into one transient batch."""
+        """Pack logical lane states into one capacity-stable transient batch."""
 
         if not states:
             msg = "a compact batch requires at least one lane"
@@ -446,16 +496,26 @@ class _CompactBatch:
             msg = "max_transient_bytes must be positive"
             raise ValueError(msg)
         first = states[0]
-        vector_count = first.vector_count
         reciprocal = first.layout.reciprocal
         for state in states:
-            if state.vector_count != vector_count:
-                msg = "compact batch lanes must have the same vector count"
-                raise ValueError(msg)
             if state.layout.reciprocal is not reciprocal:
                 msg = "compact batch lanes must share one reciprocal descriptor"
                 raise ValueError(msg)
-        bucket = max(state.layout.active_count for state in states)
+        logical_lane_count = len(states)
+        lane_bucket = logical_lane_count if lane_capacity is None else lane_capacity
+        if type(lane_bucket) is not int or lane_bucket < logical_lane_count:
+            msg = "compact lane capacity must cover every logical lane"
+            raise ValueError(msg)
+        logical_vector_counts = tuple(state.vector_count for state in states)
+        vector_bucket = max(logical_vector_counts) if vector_capacity is None else vector_capacity
+        if type(vector_bucket) is not int or vector_bucket < max(logical_vector_counts):
+            msg = "compact vector capacity must cover every logical vector"
+            raise ValueError(msg)
+        largest_active_count = max(state.layout.active_count for state in states)
+        bucket = largest_active_count if active_capacity is None else active_capacity
+        if type(bucket) is not int or bucket < largest_active_count:
+            msg = "compact active capacity must cover every logical coefficient"
+            raise ValueError(msg)
         padding_elements = sum(bucket - state.layout.active_count for state in states)
         worst_padding_fraction = max(
             (bucket - state.layout.active_count) / bucket for state in states
@@ -463,12 +523,13 @@ class _CompactBatch:
         if worst_padding_fraction > max_padding_fraction:
             msg = "compact batch active counts exceed the padding-fraction cap"
             raise ValueError(msg)
-        lane_count = len(states)
-        compact_payload_bytes = lane_count * vector_count * bucket * 8
-        index_and_mask_bytes = lane_count * bucket * (4 + 1)
-        fft_workspace_bytes = (
-            2 * lane_count * vector_count * first.layout.grid_size * 8
+        lane_padding_elements = (lane_bucket - logical_lane_count) * vector_bucket * bucket
+        vector_padding_elements = (
+            sum(vector_bucket - count for count in logical_vector_counts) * bucket
         )
+        compact_payload_bytes = lane_bucket * vector_bucket * bucket * 8
+        index_and_mask_bytes = lane_bucket * bucket * (4 + 1)
+        fft_workspace_bytes = 2 * lane_bucket * vector_bucket * first.layout.grid_size * 8
         estimated_transient_bytes = (
             compact_payload_bytes + index_and_mask_bytes + fft_workspace_bytes
         )
@@ -478,61 +539,95 @@ class _CompactBatch:
         padded_values = []
         padded_indices: list[mx.array] = []
         masks: list[mx.array] = []
-        all_grid_indices: np.ndarray | None = None
         for state in states:
             count = state.layout.active_count
             padding = bucket - count
+            values = state.values
             if padding:
-                zeros = mx.zeros((vector_count, padding), dtype=mx.complex64)
-                padded_values.append(mx.concatenate([state.values, zeros], axis=1))
-                if all_grid_indices is None:
-                    all_grid_indices = np.arange(
-                        first.layout.grid_size,
-                        dtype=np.int32,
-                    )
-                inactive = np.setdiff1d(
-                    all_grid_indices,
-                    state.layout._active_flat_indices_np,
-                    assume_unique=True,
+                zeros = mx.zeros(
+                    (state.vector_count, padding),
+                    dtype=mx.complex64,
                 )
-                if inactive.size < padding:
+                values = mx.concatenate([values, zeros], axis=1)
+                if state.layout._padding_flat_indices_np.size >= padding:
+                    inactive = state.layout._padding_flat_indices[:padding]
+                else:
+                    inactive = mx.array(
+                        _first_inactive_indices(
+                            state.layout._active_flat_indices_np,
+                            grid_size=state.layout.grid_size,
+                            count=padding,
+                        )
+                    )
+                if int(inactive.size) < padding:
                     msg = "compact FFT bucket has insufficient distinct padding indices"
                     raise ValueError(msg)
                 padded_indices.append(
                     mx.concatenate(
                         [
                             state.layout._active_flat_indices,
-                            mx.array(inactive[:padding]),
+                            inactive,
                         ]
                     )
                 )
                 masks.append(mx.arange(bucket) < count)
             else:
-                padded_values.append(state.values)
                 padded_indices.append(state.layout._active_flat_indices)
                 masks.append(mx.ones((bucket,), dtype=mx.bool_))
+            vector_padding = vector_bucket - state.vector_count
+            if vector_padding:
+                values = mx.concatenate(
+                    [
+                        values,
+                        mx.zeros(
+                            (vector_padding, bucket),
+                            dtype=mx.complex64,
+                        ),
+                    ],
+                    axis=0,
+                )
+            padded_values.append(values)
+        for _ in range(lane_bucket - logical_lane_count):
+            padded_values.append(mx.zeros((vector_bucket, bucket), dtype=mx.complex64))
+            padded_indices.append(padded_indices[0])
+            masks.append(mx.zeros((bucket,), dtype=mx.bool_))
         return cls(
             values=mx.stack(padded_values, axis=0),
             layouts=tuple(state.layout for state in states),
             active_counts=tuple(state.layout.active_count for state in states),
+            vector_counts=logical_vector_counts,
             fft_indices=mx.stack(padded_indices, axis=0).astype(mx.int32),
             valid_mask=mx.stack(masks, axis=0),
             kinds=tuple(state.kind for state in states),
             padding_elements=padding_elements,
+            lane_padding_elements=lane_padding_elements,
+            vector_padding_elements=vector_padding_elements,
             estimated_transient_bytes=estimated_transient_bytes,
         )
 
     @property
     def lane_count(self) -> int:
-        """Return the number of batched lanes."""
+        """Return the number of logical lanes."""
+
+        return len(self.layouts)
+
+    @property
+    def lane_capacity(self) -> int:
+        """Return the stable submitted lane width."""
 
         return int(self.values.shape[0])
 
     @property
     def vector_count(self) -> int:
-        """Return the shared vector width."""
+        """Return the stable submitted vector width."""
 
         return int(self.values.shape[1])
+
+    @property
+    def logical_vector_count(self) -> int:
+        """Return the total number of non-padding vectors."""
+
+        return sum(self.vector_counts)
 
     @property
     def bucket_size(self) -> int:
@@ -570,25 +665,28 @@ class _CompactBatch:
             mx.zeros_like(self.values),
         )
         flat = _scatter_complex_zeros(
-            (self.lane_count, self.vector_count, self.grid_size),
+            (self.lane_capacity, self.vector_count, self.grid_size),
             self._expanded_indices(),
             masked,
             axis=2,
         )
         return mx.reshape(
             flat,
-            (self.lane_count, self.vector_count, *self.grid_shape),
+            (self.lane_capacity, self.vector_count, *self.grid_shape),
         )
 
     def gather(self, full_grid: mx.array) -> mx.array:
         """Gather a batch-first full grid into padded compact slots."""
 
         values = mx.array(full_grid).astype(mx.complex64)
-        expected = (self.lane_count, self.vector_count, *self.grid_shape)
+        expected = (self.lane_capacity, self.vector_count, *self.grid_shape)
         if values.shape != expected:
             msg = "full-grid batch shape does not match the compact batch"
             raise ValueError(msg)
-        flat = mx.reshape(values, (self.lane_count, self.vector_count, self.grid_size))
+        flat = mx.reshape(
+            values,
+            (self.lane_capacity, self.vector_count, self.grid_size),
+        )
         gathered = mx.take_along_axis(flat, self._expanded_indices(), axis=2)
         return mx.where(
             self.valid_mask[:, None, :],
@@ -600,31 +698,37 @@ class _CompactBatch:
         """Run one inverse FFT across the final three spatial axes."""
 
         full_grid = self.scatter() if scattered is None else mx.array(scattered)
-        expected = (self.lane_count, self.vector_count, *self.grid_shape)
+        expected = (self.lane_capacity, self.vector_count, *self.grid_shape)
         if full_grid.shape != expected:
             msg = "scattered coefficient workspace has the wrong shape"
             raise ValueError(msg)
         scale = self.grid_size / sqrt(self.volume)
-        return mx.fft.ifftn(
-            full_grid,
-            s=self.grid_shape,
-            axes=(-3, -2, -1),
-        ) * scale
+        return (
+            mx.fft.ifftn(
+                full_grid,
+                s=self.grid_shape,
+                axes=(-3, -2, -1),
+            )
+            * scale
+        )
 
     def from_real(self, orbitals: mx.array) -> mx.array:
         """Run one forward FFT and gather the canonical compact slots."""
 
         values = mx.array(orbitals).astype(mx.complex64)
-        expected = (self.lane_count, self.vector_count, *self.grid_shape)
+        expected = (self.lane_capacity, self.vector_count, *self.grid_shape)
         if values.shape != expected:
             msg = "real-space orbital batch has the wrong shape"
             raise ValueError(msg)
         scale = sqrt(self.volume) / self.grid_size
-        reciprocal = mx.fft.fftn(
-            values,
-            s=self.grid_shape,
-            axes=(-3, -2, -1),
-        ) * scale
+        reciprocal = (
+            mx.fft.fftn(
+                values,
+                s=self.grid_shape,
+                axes=(-3, -2, -1),
+            )
+            * scale
+        )
         return self.gather(reciprocal)
 
     def apply_local(
@@ -639,6 +743,20 @@ class _CompactBatch:
         if field.shape == self.grid_shape:
             batched_field = field[None, None, ...]
         elif field.shape == (self.lane_count, *self.grid_shape):
+            if self.lane_capacity > self.lane_count:
+                field = mx.concatenate(
+                    [
+                        field,
+                        mx.zeros(
+                            (
+                                self.lane_capacity - self.lane_count,
+                                *self.grid_shape,
+                            ),
+                            dtype=field.dtype,
+                        ),
+                    ],
+                    axis=0,
+                )
             batched_field = field[:, None, ...]
         else:
             msg = "local potential must be shared grid-shaped or lane-batched"
@@ -654,9 +772,20 @@ class _CompactBatch:
             msg = "compact batch payload shape does not match the bucket"
             raise ValueError(msg)
         states = []
-        for index, (layout, count) in enumerate(
-            zip(self.layouts, self.active_counts, strict=True)
+        for index, (layout, active_count, vector_count) in enumerate(
+            zip(
+                self.layouts,
+                self.active_counts,
+                self.vector_counts,
+                strict=True,
+            )
         ):
             state_kind = self.kinds[index] if kind is None else kind
-            states.append(_CompactLaneState(payload[index, :, :count], layout, state_kind))
+            states.append(
+                _CompactLaneState(
+                    payload[index, :vector_count, :active_count],
+                    layout,
+                    state_kind,
+                )
+            )
         return tuple(states)

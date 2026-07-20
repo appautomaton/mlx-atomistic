@@ -6,14 +6,19 @@ from collections import OrderedDict
 from collections.abc import Sequence, Set
 from dataclasses import dataclass
 from hashlib import sha256
-from math import erfc, pi, sqrt
+from math import ceil, erfc, pi, sqrt
 
 import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft._compact import _CompactBatch, _CompactLaneState
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
-from mlx_atomistic.dft.pseudopotentials import GTHProjectorChannel, PseudopotentialData
+from mlx_atomistic.dft.pseudopotentials import (
+    GTHProjectorChannel,
+    PseudopotentialData,
+)
+
+_GTH_OVERLAP_CHUNK_SIZE = 1024
 
 
 def _validated_gth(pseudopotential: PseudopotentialData) -> None:
@@ -80,10 +85,7 @@ def gth_local_reciprocal_coefficients(
         4.0
         * pi
         * gaussian[nonzero]
-        * (
-            -zion / g2[nonzero]
-            + sqrt(pi / 2.0) * rloc**3 * polynomial[nonzero]
-        )
+        * (-zion / g2[nonzero] + sqrt(pi / 2.0) * rloc**3 * polynomial[nonzero])
         / basis.volume
     )
     epsatm = 2.0 * pi * rloc * rloc * zion + (2.0 * pi) ** 1.5 * rloc**3 * (
@@ -135,13 +137,7 @@ def _gth_radial(
     if l_value == 1 and index == 2:
         return 2.0 / sqrt(105.0) * gaussian * q * (5.0 - qr2)
     if l_value == 1 and index == 3:
-        return (
-            4.0
-            / (3.0 * sqrt(1155.0))
-            * gaussian
-            * q
-            * (35.0 - 14.0 * qr2 + qr2**2)
-        )
+        return 4.0 / (3.0 * sqrt(1155.0)) * gaussian * q * (35.0 - 14.0 * qr2 + qr2**2)
     if l_value == 2 and index == 1:
         return gaussian * q**2 / sqrt(15.0)
     if l_value == 2 and index == 2:
@@ -181,16 +177,14 @@ class _ProjectorCacheEntry:
 class _GTHProjectorCache:
     """Bounded context-owned LRU cache for compact GTH projector groups."""
 
-    DEFAULT_BUDGET_BYTES = 64 * 1024 * 1024
+    DEFAULT_BUDGET_BYTES = 256 * 1024 * 1024
 
     def __init__(self, byte_budget: int = DEFAULT_BUDGET_BYTES):
         if byte_budget <= 0:
             msg = "GTH projector cache byte budget must be positive"
             raise ValueError(msg)
         self.byte_budget = int(byte_budget)
-        self._entries: OrderedDict[tuple[object, ...], _ProjectorCacheEntry] = (
-            OrderedDict()
-        )
+        self._entries: OrderedDict[tuple[object, ...], _ProjectorCacheEntry] = OrderedDict()
         self._context_identity: str | None = None
         self._current_bytes = 0
         self._peak_bytes = 0
@@ -298,9 +292,7 @@ class _GTHProjectorCache:
         evicted = 0
         while self._entries and self._current_bytes + byte_count > self.byte_budget:
             candidate = next(
-                candidate
-                for candidate in self._entries
-                if candidate not in protected_keys
+                candidate for candidate in self._entries if candidate not in protected_keys
             )
             entry = self._entries.pop(candidate)
             self._current_bytes -= entry.byte_count
@@ -361,6 +353,28 @@ def _projector_context_identity(
     return digest.hexdigest()
 
 
+def _flattened_gth_coupling(
+    pseudopotential: PseudopotentialData,
+    ion_count: int,
+) -> tuple[mx.array, int]:
+    """Return the block coupling for the canonical flattened projector order."""
+
+    blocks = [
+        np.asarray(channel.coupling_matrix, dtype=np.float32)
+        for _ion_index in range(ion_count)
+        for channel in pseudopotential.gth_channels
+        for _harmonic_index in range(2 * channel.angular_momentum + 1)
+    ]
+    projector_count = sum(int(block.shape[0]) for block in blocks)
+    coupling = np.zeros((projector_count, projector_count), dtype=np.float32)
+    offset = 0
+    for block in blocks:
+        width = int(block.shape[0])
+        coupling[offset : offset + width, offset : offset + width] = block
+        offset += width
+    return mx.array(coupling), projector_count
+
+
 @dataclass(frozen=True)
 class PeriodicGTHNonlocalOperator:
     """Complete compact separable GTH operator at one Bloch k-point."""
@@ -371,6 +385,8 @@ class PeriodicGTHNonlocalOperator:
     _cache: _GTHProjectorCache
     _context_identity: str
     _owns_cache: bool
+    _flattened_coupling: mx.array
+    _projector_count: int
 
     def __init__(
         self,
@@ -386,13 +402,15 @@ class PeriodicGTHNonlocalOperator:
             msg = "GTH pseudopotential has no complete nonlocal channels"
             raise ValueError(msg)
         centers = _positions(positions)
-        projector_cache = (
-            _GTHProjectorCache(cache_budget_bytes) if cache is None else cache
-        )
+        projector_cache = _GTHProjectorCache(cache_budget_bytes) if cache is None else cache
         context_identity = _projector_context_identity(
             pseudopotential,
             basis,
             centers,
+        )
+        flattened_coupling, projector_count = _flattened_gth_coupling(
+            pseudopotential,
+            int(centers.shape[0]),
         )
         projector_cache.bind(context_identity)
         object.__setattr__(self, "pseudopotential", pseudopotential)
@@ -401,6 +419,8 @@ class PeriodicGTHNonlocalOperator:
         object.__setattr__(self, "_cache", projector_cache)
         object.__setattr__(self, "_context_identity", context_identity)
         object.__setattr__(self, "_owns_cache", cache is None)
+        object.__setattr__(self, "_flattened_coupling", flattened_coupling)
+        object.__setattr__(self, "_projector_count", projector_count)
 
     def _projector_group(
         self,
@@ -412,8 +432,7 @@ class PeriodicGTHNonlocalOperator:
     ) -> mx.array:
         center = mx.array(np.asarray(position, dtype=np.float32))
         phase = mx.exp(
-            mx.array(-1j, dtype=mx.complex64)
-            * mx.sum(vectors * center[None, :], axis=-1)
+            mx.array(-1j, dtype=mx.complex64) * mx.sum(vectors * center[None, :], axis=-1)
         )
         angular_phase = (-1j) ** channel.angular_momentum
         prefactor = (
@@ -473,10 +492,11 @@ class PeriodicGTHNonlocalOperator:
 
         if not operators:
             return 0
-        lane_count = len(operators)
-        if lane_count != batch.lane_count:
-            msg = "GTH operator count must match the compact batch"
+        logical_lane_count = len(operators)
+        if logical_lane_count > batch.lane_capacity:
+            msg = "GTH operator count exceeds the compact capacity"
             raise ValueError(msg)
+        lane_count = batch.lane_capacity
         vector_count = batch.vector_count
         bucket_size = batch.bucket_size
         output_bytes = lane_count * vector_count * bucket_size * 8
@@ -484,23 +504,19 @@ class PeriodicGTHNonlocalOperator:
         harmonic_width = sum(
             2 * angular_momentum + 1
             for angular_momentum in {
-                channel.angular_momentum
-                for channel in reference.pseudopotential.gth_channels
+                channel.angular_momentum for channel in reference.pseudopotential.gth_channels
             }
         )
         estimate = lane_count * bucket_size * (1 + harmonic_width) * 4
-        for channel in reference.pseudopotential.gth_channels:
-            harmonic_count = 2 * channel.angular_momentum + 1
-            group_count = reference.positions.shape[0] * harmonic_count
-            projector_bytes = (
-                lane_count * channel.projector_count * bucket_size * 8
-            )
-            overlap_bytes = (
-                lane_count * channel.projector_count * vector_count * 8
-            )
-            estimate += group_count * (
-                4 * projector_bytes + 2 * overlap_bytes + output_bytes
-            )
+        projector_bytes = lane_count * reference._projector_count * bucket_size * 8
+        overlap_bytes = lane_count * reference._projector_count * vector_count * 8
+        overlap_chunks = ceil(bucket_size / _GTH_OVERLAP_CHUNK_SIZE)
+        estimate += (
+            2 * projector_bytes
+            + (4 * overlap_chunks + 3) * overlap_bytes
+            + 2 * output_bytes
+            + reference._projector_count**2 * 4
+        )
         return estimate
 
     @staticmethod
@@ -523,6 +539,7 @@ class PeriodicGTHNonlocalOperator:
         context_identity = reference._context_identity
         vector_count = batch.vector_count
         lane_data = []
+        projector_inputs: list[tuple[mx.array, dict[int, tuple[mx.array, ...]]] | None] = []
         metrics = []
         protected_by_cache: dict[
             int,
@@ -545,20 +562,12 @@ class PeriodicGTHNonlocalOperator:
             if state.kind != "coefficients":
                 msg = "GTH input must be coefficient state"
                 raise ValueError(msg)
-            if state.vector_count != vector_count:
-                msg = "GTH batch coefficient widths must match"
+            if state.vector_count > vector_count:
+                msg = "GTH batch coefficient width exceeds its capacity"
                 raise ValueError(msg)
             vectors = operator.basis._layout._active_shifted_vectors
-            q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
-            harmonics = {
-                channel.angular_momentum: _real_spherical_harmonics(
-                    channel.angular_momentum,
-                    vectors,
-                    q,
-                )
-                for channel in operator.pseudopotential.gth_channels
-            }
-            lane_data.append((operator, vectors, q, harmonics))
+            lane_data.append((operator, vectors))
+            projector_inputs.append(None)
             metrics.append(
                 {
                     "projector_payload_elements": 0,
@@ -579,45 +588,43 @@ class PeriodicGTHNonlocalOperator:
                 (operator._cache, set()),
             )
 
-        output = mx.zeros_like(batch.values)
+        projector_rows: list[list[mx.array]] = [[] for _lane_index in range(len(lane_data))]
         for ion_index in range(reference.positions.shape[0]):
             for channel_index, reference_channel in enumerate(
                 reference.pseudopotential.gth_channels
             ):
-                coupling = mx.array(
-                    np.asarray(
-                        reference_channel.coupling_matrix,
-                        dtype=np.float32,
-                    )
-                )[None, :, :]
                 harmonic_count = 2 * reference_channel.angular_momentum + 1
                 for harmonic_index in range(harmonic_count):
-                    padded_projectors = []
-                    for lane_index, (operator, vectors, q, harmonics) in enumerate(
-                        lane_data
-                    ):
-                        channel = operator.pseudopotential.gth_channels[
-                            channel_index
-                        ]
-                        harmonic = harmonics[channel.angular_momentum][
-                            harmonic_index
-                        ]
+                    for lane_index, (operator, vectors) in enumerate(lane_data):
+                        channel = operator.pseudopotential.gth_channels[channel_index]
                         key = operator._cache_key(
                             ion_index,
                             channel_index,
                             harmonic_index,
                         )
-                        cache, protected_keys = protected_by_cache[
-                            id(operator._cache)
-                        ]
+                        cache, protected_keys = protected_by_cache[id(operator._cache)]
                         beta = cache.get(key)
-                        group_elements = (
-                            channel.projector_count
-                            * operator.basis.active_count
-                        )
+                        group_elements = channel.projector_count * operator.basis.active_count
                         lane_metrics = metrics[lane_index]
                         if beta is None:
                             lane_metrics["projector_cache_misses"] += 1
+                            inputs = projector_inputs[lane_index]
+                            if inputs is None:
+                                q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
+                                harmonics = {
+                                    candidate.angular_momentum: (
+                                        _real_spherical_harmonics(
+                                            candidate.angular_momentum,
+                                            vectors,
+                                            q,
+                                        )
+                                    )
+                                    for candidate in (operator.pseudopotential.gth_channels)
+                                }
+                                inputs = (q, harmonics)
+                                projector_inputs[lane_index] = inputs
+                            q, harmonics = inputs
+                            harmonic = harmonics[channel.angular_momentum][harmonic_index]
                             beta = operator._projector_group(
                                 operator.positions[ion_index],
                                 channel,
@@ -625,9 +632,7 @@ class PeriodicGTHNonlocalOperator:
                                 vectors,
                                 q,
                             )
-                            lane_metrics["projector_elements_generated"] += (
-                                group_elements
-                            )
+                            lane_metrics["projector_elements_generated"] += group_elements
                             evictions, inserted = cache.put(
                                 key,
                                 beta,
@@ -641,7 +646,7 @@ class PeriodicGTHNonlocalOperator:
                             protected_keys.add(key)
                         lane_metrics["projector_payload_elements"] += group_elements
                         lane_metrics["projector_elements_loaded"] += (
-                            2 * vector_count * group_elements
+                            2 * coefficients[lane_index].vector_count * group_elements
                         )
                         padding = batch.bucket_size - operator.basis.active_count
                         if padding:
@@ -655,30 +660,76 @@ class PeriodicGTHNonlocalOperator:
                                 ],
                                 axis=1,
                             )
-                        padded_projectors.append(beta)
+                        projector_rows[lane_index].append(beta)
                         lane_metrics["projector_peak_workspace_bytes"] = max(
                             lane_metrics["projector_peak_workspace_bytes"],
                             (
-                                vector_count * operator.basis.active_count
-                                + 2 * vector_count * channel.projector_count
+                                coefficients[lane_index].vector_count * operator.basis.active_count
+                                + 2
+                                * coefficients[lane_index].vector_count
+                                * channel.projector_count
                             )
                             * 8,
                         )
-                    beta_batch = mx.stack(padded_projectors, axis=0)
-                    overlaps = mx.matmul(
-                        mx.conjugate(beta_batch),
-                        mx.transpose(batch.values, (0, 2, 1)),
-                    )
-                    mixed = mx.matmul(coupling, overlaps)
-                    output = output + mx.matmul(
-                        mx.transpose(mixed, (0, 2, 1)),
-                        beta_batch,
-                    )
+
+        flattened_projectors = []
+        for lane_index, rows in enumerate(projector_rows):
+            beta = mx.concatenate(rows, axis=0)
+            if int(beta.shape[0]) != reference._projector_count:
+                msg = "flattened GTH projector count is inconsistent"
+                raise RuntimeError(msg)
+            flattened_projectors.append(beta)
+            metrics[lane_index]["projector_peak_workspace_bytes"] = max(
+                metrics[lane_index]["projector_peak_workspace_bytes"],
+                (
+                    reference._projector_count * batch.bucket_size
+                    + 4 * reference._projector_count * vector_count
+                    + vector_count * batch.bucket_size
+                )
+                * 8,
+            )
+        beta_batch = mx.stack(flattened_projectors, axis=0)
+        lane_padding = batch.lane_capacity - batch.lane_count
+        if lane_padding:
+            beta_batch = mx.concatenate(
+                [
+                    beta_batch,
+                    mx.zeros(
+                        (
+                            lane_padding,
+                            reference._projector_count,
+                            batch.bucket_size,
+                        ),
+                        dtype=mx.complex64,
+                    ),
+                ],
+                axis=0,
+            )
+
+        overlap_shape = (
+            batch.lane_capacity,
+            reference._projector_count,
+            vector_count,
+        )
+        overlaps = mx.zeros(overlap_shape, dtype=mx.complex64)
+        compensation = mx.zeros_like(overlaps)
+        for start in range(0, batch.bucket_size, _GTH_OVERLAP_CHUNK_SIZE):
+            stop = min(start + _GTH_OVERLAP_CHUNK_SIZE, batch.bucket_size)
+            partial = mx.matmul(
+                mx.conjugate(beta_batch[:, :, start:stop]),
+                mx.transpose(batch.values[:, :, start:stop], (0, 2, 1)),
+            )
+            adjusted = partial - compensation
+            updated = overlaps + adjusted
+            compensation = (updated - overlaps) - adjusted
+            overlaps = updated
+        mixed = mx.matmul(reference._flattened_coupling[None, :, :], overlaps)
+        output = mx.matmul(mx.transpose(mixed, (0, 2, 1)), beta_batch)
 
         actions = batch.unpad(output, kind="hamiltonian_action")
         if evaluate:
             mx.eval(*(action.values for action in actions))
-        for lane_index, (operator, _, _, _) in enumerate(lane_data):
+        for lane_index, (operator, _) in enumerate(lane_data):
             lane_metrics = metrics[lane_index]
             lane_metrics["projector_traffic_elements"] = (
                 lane_metrics["projector_elements_generated"]
@@ -722,13 +773,8 @@ class PeriodicGTHNonlocalOperator:
             msg = "occupations length must match the orbital count"
             raise ValueError(msg)
         applied, _ = self._apply_compact(state)
-        expectations = mx.real(
-            mx.sum(mx.conjugate(state.values) * applied.values, axis=1)
-        )
-        return mx.sum(
-            expectations
-            * mx.array(np.asarray(occupations, dtype=np.float32))
-        )
+        expectations = mx.real(mx.sum(mx.conjugate(state.values) * applied.values, axis=1))
+        return mx.sum(expectations * mx.array(np.asarray(occupations, dtype=np.float32)))
 
     def cache_info(self) -> dict[str, int]:
         """Return bounded projector-cache accounting.
@@ -831,9 +877,9 @@ def periodic_ewald_energy(
                 distance = float(np.linalg.norm(displacement))
                 if distance <= 1e-14 or distance > real_cutoff:
                     continue
-                real_energy += charge[ion_index] * charge[other_index] * erfc(
-                    eta_value * distance
-                ) / distance
+                real_energy += (
+                    charge[ion_index] * charge[other_index] * erfc(eta_value * distance) / distance
+                )
     real_energy *= 0.5
 
     reciprocal_cutoff = 2.0 * eta_value * cutoff_factor
@@ -850,9 +896,7 @@ def periodic_ewald_energy(
                     continue
                 structure = np.sum(charge * np.exp(-1j * (centers @ vector)))
                 reciprocal_energy += (
-                    np.exp(-g2 / (4.0 * eta_value * eta_value))
-                    * float(abs(structure) ** 2)
-                    / g2
+                    np.exp(-g2 / (4.0 * eta_value * eta_value)) * float(abs(structure) ** 2) / g2
                 )
     volume = float(np.prod(lengths))
     reciprocal_energy *= 2.0 * pi / volume

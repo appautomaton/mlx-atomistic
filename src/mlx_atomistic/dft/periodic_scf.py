@@ -17,6 +17,7 @@ from mlx_atomistic.dft._compact import (
     _remap_initial_coefficients,
     _require_layout,
 )
+from mlx_atomistic.dft._memory import _bounded_dft_allocator
 from mlx_atomistic.dft._runtime_observer import (
     RuntimeObserver,
     add_observed_work,
@@ -176,7 +177,7 @@ class PeriodicSCFConfig:
     mixing_beta: float = 0.35
     mixer: str = "diis"
     davidson: PeriodicDavidsonConfig = field(default_factory=PeriodicDavidsonConfig)
-    kpoint_batch_size: int = 4
+    kpoint_batch_size: int = 6
     max_batch_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
     max_batch_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
 
@@ -210,10 +211,7 @@ class PeriodicSCFConfig:
         ):
             msg = "max_batch_padding_fraction must be finite and lie in [0, 1)"
             raise ValueError(msg)
-        if (
-            type(self.max_batch_transient_bytes) is not int
-            or self.max_batch_transient_bytes <= 0
-        ):
+        if type(self.max_batch_transient_bytes) is not int or self.max_batch_transient_bytes <= 0:
             msg = "max_batch_transient_bytes must be a positive non-bool integer"
             raise ValueError(msg)
 
@@ -222,9 +220,7 @@ class PeriodicSCFConfig:
 
         return {
             "kpoint_batch_size": self.kpoint_batch_size,
-            "max_batch_padding_fraction": float(
-                self.max_batch_padding_fraction
-            ),
+            "max_batch_padding_fraction": float(self.max_batch_padding_fraction),
             "max_batch_transient_bytes": self.max_batch_transient_bytes,
         }
 
@@ -258,7 +254,7 @@ class PeriodicEigenResult:
     Args:
         eigenvalues: Lowest eigenvalues in Hartree.
         coefficients: Public full-grid coefficient stack.
-        residuals: Residual norm per eigenpair.
+        residuals: Direct ``H(X) - epsilon X`` norm per returned eigenpair.
         orthonormality_error: Maximum overlap error.
         iterations: Davidson iteration count.
         converged: Whether the requested tolerance was reached.
@@ -270,9 +266,7 @@ class PeriodicEigenResult:
     """
 
     eigenvalues: mx.array
-    _compact_coefficients: (
-        _CompactLaneState | _CompatibilityCoefficientState | None
-    )
+    _compact_coefficients: _CompactLaneState | _CompatibilityCoefficientState | None
     _basis: PlaneWaveBasis | None
     _time_reversal_owner: PeriodicEigenResult | None
     _time_reversal_permutation: np.ndarray | None
@@ -609,7 +603,10 @@ class PeriodicKohnShamOperator:
             raise ValueError(msg)
         state, was_single = self.basis._state_from_full(coefficients)
         applied = self._apply_compact(state, observer=observer)
-        return self.basis._layout.unpack_fresh(applied.values, single=was_single)
+        return self.basis._layout.unpack_fresh(
+            applied.values,
+            single=was_single,
+        )
 
     def _apply_compact(
         self,
@@ -637,23 +634,16 @@ class PeriodicKohnShamOperator:
     ) -> int:
         """Return the complete logical transient bound for one Hpsi batch."""
 
-        if len(operators) != batch.lane_count:
-            msg = "Hamiltonian operator count must match the compact batch"
+        if len(operators) > batch.lane_capacity:
+            msg = "Hamiltonian operator count exceeds the compact capacity"
             raise ValueError(msg)
-        lane_count = batch.lane_count
-        padded_complex_bytes = (
-            lane_count * batch.vector_count * batch.bucket_size * 8
-        )
+        lane_count = batch.lane_capacity
+        padded_complex_bytes = lane_count * batch.vector_count * batch.bucket_size * 8
         kinetic_index_bytes = lane_count * batch.bucket_size * 4
-        estimate = (
-            batch.estimated_transient_bytes
-            + 5 * padded_complex_bytes
-            + kinetic_index_bytes
-        )
+        estimate = batch.estimated_transient_bytes + 5 * padded_complex_bytes + kinetic_index_bytes
         first_potential = operators[0]._effective_local_potential
         if not all(
-            operator._effective_local_potential is first_potential
-            for operator in operators
+            operator._effective_local_potential is first_potential for operator in operators
         ):
             estimate += lane_count * batch.grid_size * 8
 
@@ -665,28 +655,9 @@ class PeriodicKohnShamOperator:
             elif nonlocal_operator is not None:
                 estimate += padded_complex_bytes // lane_count
         for indices in grouped_gth.values():
-            if len(indices) == lane_count:
-                gth_batch = batch
-            else:
-                states = [
-                    _CompactLaneState(
-                        batch.values[lane_index, :, : batch.active_counts[lane_index]],
-                        batch.layouts[lane_index],
-                        batch.kinds[lane_index],
-                    )
-                    for lane_index in indices
-                ]
-                gth_batch = _CompactBatch.from_states(
-                    states,
-                    max_padding_fraction=1.0 - np.finfo(np.float64).eps,
-                    max_transient_bytes=max(
-                        batch.estimated_transient_bytes,
-                        _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
-                    ),
-                )
             estimate += PeriodicGTHNonlocalOperator._estimated_batch_transient_bytes(
                 [operators[index].nonlocal_operator for index in indices],
-                gth_batch,
+                batch,
             )
         return estimate
 
@@ -751,19 +722,13 @@ class PeriodicKohnShamOperator:
                     if state.kind != "coefficients":
                         msg = "Hamiltonian input must be coefficient state"
                         raise ValueError(msg)
-                    if (
-                        operator._effective_local_potential.shape
-                        != state.layout.grid_shape
-                    ):
+                    if operator._effective_local_potential.shape != state.layout.grid_shape:
                         msg = "effective local potential must match its lane grid"
                         raise ValueError(msg)
                     projector_metrics[lane_index] = _empty_projector_metrics()
-                    if (
-                        operator.nonlocal_operator is not None
-                        and not isinstance(
-                            operator.nonlocal_operator,
-                            PeriodicGTHNonlocalOperator,
-                        )
+                    if operator.nonlocal_operator is not None and not isinstance(
+                        operator.nonlocal_operator,
+                        PeriodicGTHNonlocalOperator,
                     ):
                         action, metrics = operator.nonlocal_operator._apply_compact(
                             state,
@@ -791,15 +756,12 @@ class PeriodicKohnShamOperator:
                                 strict=True,
                             )
                         )
-                        and prepared_batch.kinds
-                        == tuple(state.kind for state in ready_states)
-                        and prepared_batch.estimated_transient_bytes
-                        <= max_transient_bytes
+                        and prepared_batch.kinds == tuple(state.kind for state in ready_states)
+                        and prepared_batch.vector_counts
+                        == tuple(state.vector_count for state in ready_states)
+                        and prepared_batch.estimated_transient_bytes <= max_transient_bytes
                         and max(
-                            (
-                                prepared_batch.bucket_size - count
-                            )
-                            / prepared_batch.bucket_size
+                            (prepared_batch.bucket_size - count) / prepared_batch.bucket_size
                             for count in prepared_batch.active_counts
                         )
                         <= max_padding_fraction
@@ -819,12 +781,8 @@ class PeriodicKohnShamOperator:
                         )
                     )
                     if estimated_transient_bytes > max_transient_bytes:
-                        msg = (
-                            "compact Hpsi batch exceeds the complete transient "
-                            "byte budget"
-                        )
+                        msg = "compact Hpsi batch exceeds the complete transient byte budget"
                         raise ValueError(msg)
-
                     grouped_gth: dict[str, list[int]] = defaultdict(list)
                     for lane_index in ready_indices:
                         nonlocal_operator = operators[lane_index].nonlocal_operator
@@ -832,9 +790,7 @@ class PeriodicKohnShamOperator:
                             nonlocal_operator,
                             PeriodicGTHNonlocalOperator,
                         ):
-                            grouped_gth[
-                                nonlocal_operator._context_identity
-                            ].append(lane_index)
+                            grouped_gth[nonlocal_operator._context_identity].append(lane_index)
                     for gth_indices in grouped_gth.values():
                         gth_states = [coefficients[index] for index in gth_indices]
                         if gth_indices == ready_indices:
@@ -848,10 +804,7 @@ class PeriodicKohnShamOperator:
                         try:
                             gth_actions, gth_metrics = (
                                 PeriodicGTHNonlocalOperator._apply_compact_batch(
-                                    [
-                                        operators[index].nonlocal_operator
-                                        for index in gth_indices
-                                    ],
+                                    [operators[index].nonlocal_operator for index in gth_indices],
                                     gth_states,
                                     batch=gth_batch,
                                     evaluate=True,
@@ -859,15 +812,11 @@ class PeriodicKohnShamOperator:
                             )
                         except Exception:
                             for lane_index in gth_indices:
-                                nonlocal_operator = operators[
-                                    lane_index
-                                ].nonlocal_operator
+                                nonlocal_operator = operators[lane_index].nonlocal_operator
                                 try:
-                                    action, metrics = (
-                                        nonlocal_operator._apply_compact(
-                                            coefficients[lane_index],
-                                            evaluate=True,
-                                        )
+                                    action, metrics = nonlocal_operator._apply_compact(
+                                        coefficients[lane_index],
+                                        evaluate=True,
                                     )
                                     projector_actions[lane_index] = action
                                     projector_metrics[lane_index] = metrics
@@ -912,18 +861,52 @@ class PeriodicKohnShamOperator:
                                 ],
                                 axis=1,
                             )
+                        vector_padding = batch.vector_count - state.vector_count
+                        if vector_padding:
+                            nonlocal_values = mx.concatenate(
+                                [
+                                    nonlocal_values,
+                                    mx.zeros(
+                                        (vector_padding, batch.bucket_size),
+                                        dtype=mx.complex64,
+                                    ),
+                                ],
+                                axis=0,
+                            )
                         kinetic_rows.append(kinetic)
                         nonlocal_rows.append(nonlocal_values)
-                    kinetic_action = batch.values * mx.stack(
-                        kinetic_rows,
-                        axis=0,
-                    )[:, None, :]
-                    first_potential = operators[
-                        ready_indices[0]
-                    ]._effective_local_potential
+                    lane_padding = batch.lane_capacity - batch.lane_count
+                    kinetic_values = mx.stack(kinetic_rows, axis=0)
+                    nonlocal_values = mx.stack(nonlocal_rows, axis=0)
+                    if lane_padding:
+                        kinetic_values = mx.concatenate(
+                            [
+                                kinetic_values,
+                                mx.zeros(
+                                    (lane_padding, batch.bucket_size),
+                                    dtype=mx.float32,
+                                ),
+                            ],
+                            axis=0,
+                        )
+                        nonlocal_values = mx.concatenate(
+                            [
+                                nonlocal_values,
+                                mx.zeros(
+                                    (
+                                        lane_padding,
+                                        batch.vector_count,
+                                        batch.bucket_size,
+                                    ),
+                                    dtype=mx.complex64,
+                                ),
+                            ],
+                            axis=0,
+                        )
+                    kinetic_action = batch.values * kinetic_values[:, None, :]
+                    first_potential = operators[ready_indices[0]]._effective_local_potential
                     if all(
-                        operators[index]._effective_local_potential
-                        is first_potential
+                        operators[index]._effective_local_potential is first_potential
                         for index in ready_indices
                     ):
                         potentials = first_potential
@@ -940,11 +923,7 @@ class PeriodicKohnShamOperator:
                         scattered=scattered,
                     )
                     executed_fft = True
-                    applied_values = (
-                        kinetic_action
-                        + local_action
-                        + mx.stack(nonlocal_rows, axis=0)
-                    )
+                    applied_values = kinetic_action + local_action + nonlocal_values
                     states = batch.unpad(
                         applied_values,
                         kind="hamiltonian_action",
@@ -975,35 +954,29 @@ class PeriodicKohnShamOperator:
                 actions = {}
 
         if batch is not None and executed_fft:
-            lane_count = len(ready_indices)
-            vector_count = batch.vector_count
+            logical_vector_count = batch.logical_vector_count
             generated = sum(
-                projector_metrics[index]["projector_elements_generated"]
-                for index in ready_indices
+                projector_metrics[index]["projector_elements_generated"] for index in ready_indices
             )
             loaded = sum(
-                projector_metrics[index]["projector_elements_loaded"]
-                for index in ready_indices
+                projector_metrics[index]["projector_elements_loaded"] for index in ready_indices
             )
             traffic = sum(
-                projector_metrics[index]["projector_traffic_elements"]
-                for index in ready_indices
+                projector_metrics[index]["projector_traffic_elements"] for index in ready_indices
             )
             cache_hits = sum(
-                projector_metrics[index]["projector_cache_hits"]
-                for index in ready_indices
+                projector_metrics[index]["projector_cache_hits"] for index in ready_indices
             )
             cache_misses = sum(
-                projector_metrics[index]["projector_cache_misses"]
-                for index in ready_indices
+                projector_metrics[index]["projector_cache_misses"] for index in ready_indices
             )
             add_observed_work(
                 runtime_observer,
                 {
                     "hpsi_calls": 1,
-                    "hpsi_vector_equivalents": lane_count * vector_count,
+                    "hpsi_vector_equivalents": logical_vector_count,
                     "fft_submissions": 2,
-                    "fft_vector_equivalents": 2 * lane_count * vector_count,
+                    "fft_vector_equivalents": 2 * logical_vector_count,
                     "projector_elements_generated": generated,
                     "projector_elements_loaded": loaded,
                     "projector_traffic_elements": traffic,
@@ -1014,7 +987,7 @@ class PeriodicKohnShamOperator:
             )
             if runtime_observer is not None:
                 fft_workspace_bytes = (
-                    2 * lane_count * vector_count * batch.grid_size * 8
+                    2 * batch.lane_capacity * batch.vector_count * batch.grid_size * 8
                 )
                 runtime_observer.record_peak_memory(
                     "fft_workspace_bytes",
@@ -1160,6 +1133,158 @@ class _Complex64RankPolicy:
             raise ValueError(msg)
         return error
 
+    def _try_batched_choleskyqr2(
+        self,
+        stack: mx.array,
+        *,
+        original_norms: np.ndarray,
+        locked_count: int,
+        required_count: int,
+        limit: int,
+    ) -> _RankResult | None:
+        """Admit a well-resolved row block through CholeskyQR2."""
+
+        input_count = int(stack.shape[0])
+        candidate_count = min(input_count - locked_count, limit - locked_count)
+        retained_count = locked_count + candidate_count
+        if (
+            candidate_count <= 0
+            or candidate_count != input_count - locked_count
+            or retained_count < required_count
+        ):
+            return None
+
+        identity = mx.eye(input_count, dtype=mx.float32).astype(mx.complex64)
+        locked_values = stack[:locked_count]
+        locked_transforms = identity[:locked_count]
+        candidate_values = stack[locked_count:retained_count]
+        candidate_transforms = identity[locked_count:retained_count]
+        for _ in range(2):
+            overlaps = mx.conjugate(locked_values) @ mx.transpose(candidate_values)
+            candidate_values = candidate_values - mx.transpose(overlaps) @ locked_values
+            candidate_transforms = candidate_transforms - mx.transpose(overlaps) @ locked_transforms
+
+        candidate_norms = original_norms[locked_count:retained_count]
+        if not np.all(np.isfinite(candidate_norms)) or np.any(candidate_norms <= 0.0):
+            return None
+        scale = mx.array(candidate_norms.astype(np.float32))[:, None]
+        candidate_values = candidate_values / scale
+        candidate_transforms = candidate_transforms / scale
+
+        def cholesky_step(values: mx.array) -> tuple[mx.array, np.ndarray] | None:
+            gram = values @ mx.conjugate(mx.transpose(values))
+            gram_np = np.asarray(gram, dtype=np.complex64).astype(np.complex128)
+            if not np.all(np.isfinite(gram_np)):
+                return None
+            gram_np = 0.5 * (gram_np + np.conjugate(gram_np.T))
+            try:
+                lower = np.linalg.cholesky(gram_np)
+                solve = np.linalg.solve(
+                    lower,
+                    np.eye(candidate_count, dtype=np.complex128),
+                )
+            except np.linalg.LinAlgError:
+                return None
+            if not np.all(np.isfinite(solve)):
+                return None
+            return mx.array(solve.astype(np.complex64)), lower
+
+        first = cholesky_step(candidate_values)
+        if first is None:
+            return None
+        first_solve, first_lower = first
+        pivot_floor = 8.0 * float(np.sqrt(np.finfo(np.float32).eps))
+        first_pivots = np.real(np.diag(first_lower))
+        first_condition = np.linalg.cond(first_lower)
+        if (
+            np.any(first_pivots <= pivot_floor)
+            or not np.isfinite(first_condition)
+            or first_condition > 256.0
+        ):
+            return None
+        candidate_values = first_solve @ candidate_values
+        candidate_transforms = first_solve @ candidate_transforms
+
+        second = cholesky_step(candidate_values)
+        if second is None:
+            return None
+        second_solve, _second_lower = second
+        candidate_values = second_solve @ candidate_values
+        candidate_transforms = second_solve @ candidate_transforms
+
+        result_values = mx.concatenate(
+            [locked_values, candidate_values],
+            axis=0,
+        )
+        result_transform = mx.concatenate(
+            [locked_transforms, candidate_transforms],
+            axis=0,
+        )
+        if self.overlap_error(result_values) > self.orthonormality_tolerance(retained_count):
+            return None
+        return _RankResult(
+            values=result_values,
+            transform=result_transform,
+            deflated_count=input_count - retained_count,
+        )
+
+    def _sequential_mgs2(
+        self,
+        stack: mx.array,
+        *,
+        original_norms: np.ndarray,
+        locked_count: int,
+        required_count: int,
+        limit: int,
+    ) -> _RankResult:
+        """Recover a rare unstable block projection with ordered MGS2."""
+
+        input_count = int(stack.shape[0])
+        identity = mx.eye(input_count, dtype=mx.float32).astype(mx.complex64)
+        accepted = [stack[index] for index in range(locked_count)]
+        transforms = [identity[index] for index in range(locked_count)]
+        for index in range(locked_count, input_count):
+            if len(accepted) >= limit:
+                break
+            original_norm = float(original_norms[index])
+            if original_norm == 0.0:
+                continue
+            vector = stack[index]
+            transform = identity[index]
+            for _ in range(2):
+                for accepted_vector, accepted_transform in zip(
+                    accepted,
+                    transforms,
+                    strict=True,
+                ):
+                    overlap = mx.sum(mx.conjugate(accepted_vector) * vector)
+                    vector = vector - overlap * accepted_vector
+                    transform = transform - overlap * accepted_transform
+            norm = float(mx.sqrt(mx.real(mx.sum(mx.conjugate(vector) * vector))))
+            if not np.isfinite(norm):
+                msg = "Davidson rank norm must be finite"
+                raise ValueError(msg)
+            if norm <= self.relative_tolerance * original_norm:
+                continue
+            accepted.append(vector / norm)
+            transforms.append(transform / norm)
+
+        retained_count = len(accepted)
+        if retained_count < required_count:
+            msg = (
+                "Davidson rank policy retained "
+                f"{retained_count} vectors but {required_count} are required"
+            )
+            raise ValueError(msg)
+        result_values = mx.stack(accepted, axis=0)
+        result_transform = mx.stack(transforms, axis=0)
+        self.validate(result_values, required_count=required_count)
+        return _RankResult(
+            values=result_values,
+            transform=result_transform,
+            deflated_count=input_count - retained_count,
+        )
+
     def orthonormalize(
         self,
         values: mx.array,
@@ -1185,41 +1310,50 @@ class _Complex64RankPolicy:
         if required_count < 0 or required_count > limit:
             msg = "required Davidson rank exceeds the rank limit"
             raise ValueError(msg)
-        if not _all_finite(stack):
+
+        candidate_stack = stack[locked_count:]
+        candidate_norms = mx.sqrt(
+            mx.real(mx.sum(mx.conjugate(candidate_stack) * candidate_stack, axis=1))
+        )
+        candidate_norms_np = np.asarray(candidate_norms, dtype=np.float32)
+        if not np.all(np.isfinite(candidate_norms_np)):
             msg = "Davidson rank input must be finite"
             raise ValueError(msg)
+        original_norms_np = np.ones((input_count,), dtype=np.float32)
+        original_norms_np[locked_count:] = candidate_norms_np
 
-        accepted = [stack[index] for index in range(locked_count)]
+        accepted_values = stack[:locked_count]
+
+        batched = self._try_batched_choleskyqr2(
+            stack,
+            original_norms=original_norms_np,
+            locked_count=locked_count,
+            required_count=required_count,
+            limit=limit,
+        )
+        if batched is not None:
+            return batched
+
         identity = mx.eye(input_count, dtype=mx.float32).astype(mx.complex64)
-        transforms = [identity[index] for index in range(locked_count)]
-        if locked_count:
-            self.validate(mx.stack(accepted, axis=0), required_count=locked_count)
+        accepted_transforms = identity[:locked_count]
 
         deflated = 0
         for index in range(locked_count, input_count):
-            if len(accepted) >= limit:
+            if int(accepted_values.shape[0]) >= limit:
                 deflated += input_count - index
                 break
-            vector = stack[index]
-            transform = identity[index]
-            original_norm = float(
-                mx.sqrt(mx.real(mx.sum(mx.conjugate(vector) * vector)))
-            )
-            if not np.isfinite(original_norm):
-                msg = "Davidson rank norm must be finite"
-                raise ValueError(msg)
+            original_norm = float(original_norms_np[index])
             if original_norm == 0.0:
                 deflated += 1
                 continue
+            vector = stack[index : index + 1]
+            transform = identity[index : index + 1]
             for _ in range(2):
-                for accepted_vector, accepted_transform in zip(
-                    accepted,
-                    transforms,
-                    strict=True,
-                ):
-                    overlap = mx.sum(mx.conjugate(accepted_vector) * vector)
-                    vector = vector - overlap * accepted_vector
-                    transform = transform - overlap * accepted_transform
+                if int(accepted_values.shape[0]) == 0:
+                    break
+                overlaps = mx.conjugate(accepted_values) @ mx.transpose(vector)
+                vector = vector - mx.transpose(overlaps) @ accepted_values
+                transform = transform - mx.transpose(overlaps) @ accepted_transforms
             norm = float(mx.sqrt(mx.real(mx.sum(mx.conjugate(vector) * vector))))
             if not np.isfinite(norm):
                 msg = "Davidson rank norm must be finite"
@@ -1227,18 +1361,42 @@ class _Complex64RankPolicy:
             if norm <= self.relative_tolerance * original_norm:
                 deflated += 1
                 continue
-            accepted.append(vector / norm)
-            transforms.append(transform / norm)
-
-        if len(accepted) < required_count:
-            msg = (
-                "Davidson rank policy retained "
-                f"{len(accepted)} vectors but {required_count} are required"
+            accepted_values = mx.concatenate(
+                [accepted_values, vector / norm],
+                axis=0,
             )
+            accepted_transforms = mx.concatenate(
+                [accepted_transforms, transform / norm],
+                axis=0,
+            )
+
+        retained_count = int(accepted_values.shape[0])
+        if retained_count < required_count:
+            return self._sequential_mgs2(
+                stack,
+                original_norms=original_norms_np,
+                locked_count=locked_count,
+                required_count=required_count,
+                limit=limit,
+            )
+
+        result_transform = accepted_transforms
+        # Preserve the incrementally reorthogonalized values. Collapsing the
+        # accumulated transform into one complex64 matmul can reintroduce a
+        # deflated component through cancellation for nearly dependent rows.
+        result_values = accepted_values
+        if not _all_finite(result_values):
+            msg = "Davidson state must be finite"
             raise ValueError(msg)
-        result_values = mx.stack(accepted, axis=0)
-        result_transform = mx.stack(transforms, axis=0)
-        self.validate(result_values, required_count=required_count)
+        overlap_error = self.overlap_error(result_values)
+        if overlap_error > self.orthonormality_tolerance(retained_count):
+            return self._sequential_mgs2(
+                stack,
+                original_norms=original_norms_np,
+                locked_count=locked_count,
+                required_count=required_count,
+                limit=limit,
+            )
         return _RankResult(
             values=result_values,
             transform=result_transform,
@@ -1282,7 +1440,7 @@ def _hamiltonian_context(
         config.max_subspace_size,
         config.preconditioner_floor,
         n_bands,
-        "complex64-mgs2-rank-v1",
+        "complex64-choleskyqr2-cgs2-mgs2-rank-v5",
         rank_policy.relative_tolerance,
     )
 
@@ -1322,8 +1480,18 @@ class _FixedHamiltonianToken:
 
 
 @dataclass(frozen=True)
+class _CompactBatchCapacity:
+    """Solve-local physical shape shared by compatible logical submissions."""
+
+    lanes: int
+    vectors: int
+    active: int
+
+
+@dataclass(frozen=True)
 class _CompactSubmission:
     indices: tuple[int, ...]
+    capacity: _CompactBatchCapacity | None = None
 
 
 @dataclass(frozen=True)
@@ -1339,10 +1507,8 @@ def _plan_compact_submissions(
     batch_cap: int,
     max_padding_fraction: float,
     max_transient_bytes: int,
-    batch_byte_estimator: Callable[
-        [tuple[int, ...], _CompactBatch], int
-    ]
-    | None = None,
+    batch_byte_estimator: Callable[[tuple[int, ...], _CompactBatch], int] | None = None,
+    capacity: _CompactBatchCapacity | None = None,
 ) -> _CompactSubmissionPlan:
     """Build deterministic active-count buckets within hard batch bounds."""
 
@@ -1360,13 +1526,52 @@ def _plan_compact_submissions(
     if type(max_transient_bytes) is not int or max_transient_bytes <= 0:
         msg = "compact max_transient_bytes must be a positive non-bool integer"
         raise ValueError(msg)
+    if capacity is not None and (
+        type(capacity.lanes) is not int
+        or type(capacity.vectors) is not int
+        or type(capacity.active) is not int
+        or capacity.lanes <= 0
+        or capacity.vectors <= 0
+        or capacity.active <= 0
+        or capacity.lanes > batch_cap
+    ):
+        msg = "compact capacity must contain positive bounded integers"
+        raise ValueError(msg)
+
+    capacity_prototype: _CompactBatch | None = None
 
     def build_candidate(indices: Sequence[int]) -> _CompactBatch:
-        candidate_batch = _CompactBatch.from_states(
-            [states[index] for index in indices],
-            max_padding_fraction=float(max_padding_fraction),
-            max_transient_bytes=max_transient_bytes,
-        )
+        nonlocal capacity_prototype
+        selected = [states[index] for index in indices]
+        if capacity is None:
+            candidate_batch = _CompactBatch.from_states(
+                selected,
+                max_padding_fraction=float(max_padding_fraction),
+                max_transient_bytes=max_transient_bytes,
+            )
+        else:
+            if len(selected) > capacity.lanes:
+                msg = "compact candidate exceeds its stable lane capacity"
+                raise ValueError(msg)
+            if any(
+                state.vector_count > capacity.vectors
+                or state.layout.active_count > capacity.active
+                or (capacity.active - state.layout.active_count) / capacity.active
+                > max_padding_fraction
+                for state in selected
+            ):
+                msg = "compact candidate exceeds its stable shape policy"
+                raise ValueError(msg)
+            if capacity_prototype is None:
+                capacity_prototype = _CompactBatch.from_states(
+                    selected[:1],
+                    max_padding_fraction=float(max_padding_fraction),
+                    max_transient_bytes=max_transient_bytes,
+                    lane_capacity=capacity.lanes,
+                    vector_capacity=capacity.vectors,
+                    active_capacity=capacity.active,
+                )
+            candidate_batch = capacity_prototype
         estimated_bytes = (
             candidate_batch.estimated_transient_bytes
             if batch_byte_estimator is None
@@ -1383,7 +1588,7 @@ def _plan_compact_submissions(
             (
                 id(state.layout.reciprocal),
                 state.layout.grid_shape,
-                state.vector_count,
+                (state.vector_count if capacity is None else capacity.vectors),
             )
         ].append(index)
 
@@ -1403,7 +1608,7 @@ def _plan_compact_submissions(
                 if current_batch is None:
                     msg = "compact submission planner lost its active batch"
                     raise RuntimeError(msg)
-                submissions.append(_CompactSubmission(tuple(current)))
+                submissions.append(_CompactSubmission(tuple(current), capacity))
                 current = []
                 current_batch = None
             candidate = [*current, index]
@@ -1414,7 +1619,7 @@ def _plan_compact_submissions(
                     if current_batch is None:
                         msg = "compact submission planner lost its bounded batch"
                         raise RuntimeError(msg) from None
-                    submissions.append(_CompactSubmission(tuple(current)))
+                    submissions.append(_CompactSubmission(tuple(current), capacity))
                     current = []
                     current_batch = None
                 try:
@@ -1431,7 +1636,7 @@ def _plan_compact_submissions(
             if current_batch is None:
                 msg = "compact submission planner lost its final batch"
                 raise RuntimeError(msg)
-            submissions.append(_CompactSubmission(tuple(current)))
+            submissions.append(_CompactSubmission(tuple(current), capacity))
 
     return _CompactSubmissionPlan(
         submissions=tuple(submissions),
@@ -1440,9 +1645,55 @@ def _plan_compact_submissions(
     )
 
 
+def _stable_compact_capacity_groups(
+    states: Sequence[_CompactLaneState],
+    indices: Sequence[int],
+    *,
+    lane_capacity: int,
+    vector_capacity: int,
+    max_padding_fraction: float,
+) -> tuple[tuple[tuple[int, ...], _CompactBatchCapacity], ...]:
+    """Partition compatible lanes into stable active-width capacity groups."""
+
+    ordered = sorted(indices, key=lambda index: states[index].layout.active_count)
+    groups: list[tuple[tuple[int, ...], _CompactBatchCapacity]] = []
+    current: list[int] = []
+    for index in ordered:
+        candidate = [*current, index]
+        smallest = states[candidate[0]].layout.active_count
+        largest = states[candidate[-1]].layout.active_count
+        if current and (largest - smallest) / largest > max_padding_fraction:
+            active_capacity = states[current[-1]].layout.active_count
+            groups.append(
+                (
+                    tuple(current),
+                    _CompactBatchCapacity(
+                        lane_capacity,
+                        vector_capacity,
+                        active_capacity,
+                    ),
+                )
+            )
+            current = [index]
+        else:
+            current = candidate
+    if current:
+        groups.append(
+            (
+                tuple(current),
+                _CompactBatchCapacity(
+                    lane_capacity,
+                    vector_capacity,
+                    states[current[-1]].layout.active_count,
+                ),
+            )
+        )
+    return tuple(groups)
+
+
 @dataclass(frozen=True)
 class _DavidsonApplicationTicket:
-    """One lane's newly accepted block awaiting its only H application."""
+    """One lane's coefficient block awaiting a scheduled H application."""
 
     lane_id: str
     operator: PeriodicKohnShamOperator
@@ -1452,6 +1703,7 @@ class _DavidsonApplicationTicket:
     token: _FixedHamiltonianToken
     vectors: _CompactLaneState
     observer: RuntimeObserver | None
+    purpose: str = "basis"
 
 
 _DavidsonSubmissionCallback = Callable[
@@ -1512,6 +1764,7 @@ class _DavidsonScheduler:
         self._max_transient_bytes = max_transient_bytes
         self._submission_callback = submission_callback
         self._submission_index = 0
+        self._capacity_by_lane: dict[str, _CompactBatchCapacity] = {}
 
     @property
     def batch_cap(self) -> int:
@@ -1529,13 +1782,16 @@ class _DavidsonScheduler:
         """Reset solve-local submission numbering."""
 
         self._submission_index = 0
+        self._capacity_by_lane.clear()
 
     @staticmethod
     def _observer(ticket: _DavidsonApplicationTicket) -> RuntimeObserver | None:
         return ticket.operator.observer if ticket.observer is None else ticket.observer
 
     @staticmethod
-    def _group_key(ticket: _DavidsonApplicationTicket) -> tuple[object, ...]:
+    def _physical_group_key(
+        ticket: _DavidsonApplicationTicket,
+    ) -> tuple[object, ...]:
         layout = ticket.vectors.layout
         nonlocal_operator = ticket.operator.nonlocal_operator
         if nonlocal_operator is None:
@@ -1547,10 +1803,50 @@ class _DavidsonScheduler:
         return (
             id(layout.reciprocal),
             layout.grid_shape,
-            ticket.vectors.vector_count,
             id(_DavidsonScheduler._observer(ticket)),
             nonlocal_context,
         )
+
+    def _group_key(
+        self,
+        ticket: _DavidsonApplicationTicket,
+    ) -> tuple[object, ...]:
+        capacity = self._capacity_by_lane.get(ticket.lane_id)
+        if capacity is None:
+            shape: object = ("dynamic", ticket.vectors.vector_count)
+        else:
+            shape = (
+                "stable",
+                capacity.lanes,
+                capacity.vectors,
+                capacity.active,
+            )
+        return (*self._physical_group_key(ticket), shape)
+
+    def bind(self, tickets: Sequence[_DavidsonApplicationTicket]) -> None:
+        """Freeze compatible submission capacities for one Davidson solve."""
+
+        self._capacity_by_lane.clear()
+        grouped: dict[
+            tuple[object, ...],
+            list[_DavidsonApplicationTicket],
+        ] = defaultdict(list)
+        for ticket in tickets:
+            grouped[self._physical_group_key(ticket)].append(ticket)
+        for compatible in grouped.values():
+            states = [ticket.vectors for ticket in compatible]
+            vector_capacity = max(
+                max(ticket.n_bands, ticket.vectors.vector_count) for ticket in compatible
+            )
+            for indices, capacity in _stable_compact_capacity_groups(
+                states,
+                range(len(states)),
+                lane_capacity=self.batch_cap,
+                vector_capacity=vector_capacity,
+                max_padding_fraction=self.max_padding_fraction,
+            ):
+                for index in indices:
+                    self._capacity_by_lane[compatible[index].lane_id] = capacity
 
     def apply(
         self,
@@ -1569,6 +1865,9 @@ class _DavidsonScheduler:
                 raise ValueError(msg)
             seen.add(ticket.lane_id)
             try:
+                if ticket.purpose not in {"basis", "direct_validation"}:
+                    msg = "Davidson application purpose is invalid"
+                    raise ValueError(msg)
                 ticket.token.validate(
                     ticket.operator,
                     ticket.config,
@@ -1579,9 +1878,7 @@ class _DavidsonScheduler:
                 if ticket.vectors.kind != "coefficients":
                     msg = "Davidson scheduler accepts coefficient blocks only"
                     raise ValueError(msg)
-                validated.append(
-                    (ticket, mx.all(mx.isfinite(ticket.vectors.values)))
-                )
+                validated.append((ticket, mx.all(mx.isfinite(ticket.vectors.values))))
             except Exception as error:
                 failures[ticket.lane_id] = _detached_failure(error)
         if validated:
@@ -1589,9 +1886,7 @@ class _DavidsonScheduler:
                 mx.eval(*(finite for _, finite in validated))
             except Exception as error:
                 failure = _detached_failure(error)
-                failures.update(
-                    {ticket.lane_id: failure for ticket, _ in validated}
-                )
+                failures.update({ticket.lane_id: failure for ticket, _ in validated})
             else:
                 for ticket, finite in validated:
                     if bool(finite):
@@ -1601,9 +1896,7 @@ class _DavidsonScheduler:
                             "Davidson application block must be finite"
                         )
 
-        grouped: dict[tuple[object, ...], list[_DavidsonApplicationTicket]] = (
-            defaultdict(list)
-        )
+        grouped: dict[tuple[object, ...], list[_DavidsonApplicationTicket]] = defaultdict(list)
         for ticket in ready:
             grouped[self._group_key(ticket)].append(ticket)
 
@@ -1611,9 +1904,7 @@ class _DavidsonScheduler:
         groups: list[tuple[str, ...]] = []
         compatibility_groups: list[tuple[str, ...]] = []
         for compatible in grouped.values():
-            compatibility_groups.append(
-                tuple(ticket.lane_id for ticket in compatible)
-            )
+            compatibility_groups.append(tuple(ticket.lane_id for ticket in compatible))
 
             def estimate_submission(
                 indices: tuple[int, ...],
@@ -1626,23 +1917,33 @@ class _DavidsonScheduler:
                     batch,
                 )
 
+            capacity = self._capacity_by_lane.get(compatible[0].lane_id)
+            if capacity is not None and any(
+                self._capacity_by_lane.get(ticket.lane_id) != capacity for ticket in compatible
+            ):
+                msg = "Davidson stable-shape group has inconsistent capacities"
+                raise RuntimeError(msg)
             plan = _plan_compact_submissions(
                 [ticket.vectors for ticket in compatible],
                 batch_cap=self.batch_cap,
                 max_padding_fraction=self.max_padding_fraction,
                 max_transient_bytes=self.max_transient_bytes,
                 batch_byte_estimator=estimate_submission,
+                capacity=capacity,
             )
             for lane_index, error in plan.failures.items():
                 failures[compatible[lane_index].lane_id] = error
             for planned in plan.submissions:
-                submission = tuple(
-                    compatible[index] for index in planned.indices
-                )
+                submission = tuple(compatible[index] for index in planned.indices)
                 prepared_batch = _CompactBatch.from_states(
                     [ticket.vectors for ticket in submission],
                     max_padding_fraction=self.max_padding_fraction,
                     max_transient_bytes=self.max_transient_bytes,
+                    lane_capacity=(None if planned.capacity is None else planned.capacity.lanes),
+                    vector_capacity=(
+                        None if planned.capacity is None else planned.capacity.vectors
+                    ),
+                    active_capacity=(None if planned.capacity is None else planned.capacity.active),
                 )
                 lane_ids = tuple(ticket.lane_id for ticket in submission)
                 groups.append(lane_ids)
@@ -1665,8 +1966,7 @@ class _DavidsonScheduler:
                             "prepared_batch": prepared_batch,
                         }
                         if (
-                            self.max_padding_fraction
-                            != _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
+                            self.max_padding_fraction != _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
                             or self.max_transient_bytes
                             != _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
                         ):
@@ -1704,19 +2004,14 @@ class _DavidsonScheduler:
                         if applied is None:
                             continue
                         actions[ticket.lane_id] = applied
-                        add_observed_work(
-                            ticket.observer,
-                            {
-                                "davidson_hv_new_vectors": (
-                                    ticket.vectors.vector_count
-                                )
-                            },
-                        )
+                        if ticket.purpose == "basis":
+                            add_observed_work(
+                                ticket.observer,
+                                {"davidson_hv_new_vectors": (ticket.vectors.vector_count)},
+                            )
                 except Exception as error:
                     failure = _detached_failure(error)
-                    submission_failures.update(
-                        {ticket.lane_id: failure for ticket in submission}
-                    )
+                    submission_failures.update({ticket.lane_id: failure for ticket in submission})
                 failures.update(submission_failures)
                 if self._submission_callback is not None:
                     self._submission_callback(
@@ -1832,11 +2127,7 @@ class _PairedDavidsonState:
             raise ValueError(msg)
         vectors = weights @ self.vectors.values
         applied = weights @ self.applied.values
-        projected = (
-            mx.conjugate(weights)
-            @ self.projected
-            @ mx.transpose(weights)
-        )
+        projected = mx.conjugate(weights) @ self.projected @ mx.transpose(weights)
         return _PairedDavidsonState(
             _CompactLaneState(vectors, self.vectors.layout),
             _CompactLaneState(
@@ -1848,6 +2139,38 @@ class _PairedDavidsonState:
             token,
         )
 
+    def rebase_ranked(
+        self,
+        rank: _RankResult,
+        source_applied: _CompactLaneState,
+        *,
+        token: _FixedHamiltonianToken,
+    ) -> _PairedDavidsonState:
+        """Rebase H(V) onto authoritative rank-filtered coefficient values."""
+
+        self.require_token(token)
+        _require_layout(source_applied, self.vectors.layout)
+        if source_applied.kind != "hamiltonian_action":
+            msg = "Davidson ranked rebase requires Hamiltonian actions"
+            raise ValueError(msg)
+        transform = mx.array(rank.transform).astype(mx.complex64)
+        values = mx.array(rank.values).astype(mx.complex64)
+        if (
+            len(transform.shape) != 2
+            or len(values.shape) != 2
+            or int(transform.shape[0]) != int(values.shape[0])
+            or int(transform.shape[1]) != source_applied.vector_count
+        ):
+            msg = "Davidson ranked rebase transform has incompatible dimensions"
+            raise ValueError(msg)
+        vectors = _CompactLaneState(values, self.vectors.layout)
+        applied = _CompactLaneState(
+            transform @ source_applied.values,
+            self.applied.layout,
+            "hamiltonian_action",
+        )
+        return _PairedDavidsonState.initialize(vectors, applied, token)
+
 
 @dataclass(frozen=True)
 class _DavidsonRitzPair:
@@ -1858,7 +2181,24 @@ class _DavidsonRitzPair:
     applied: _CompactLaneState
     residual_stack: mx.array
     residuals: mx.array
+    max_residual: float
     transform: mx.array
+
+
+def _ritz_residual_data(
+    eigenvalues: mx.array,
+    vectors: _CompactLaneState,
+    applied: _CompactLaneState,
+) -> tuple[mx.array, mx.array, float]:
+    residual_stack = applied.values - eigenvalues[:, None] * vectors.values
+    residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=1))
+    max_residual_array = mx.max(residuals)
+    finite = mx.all(mx.isfinite(eigenvalues)) & mx.all(mx.isfinite(residuals))
+    mx.eval(max_residual_array, finite)
+    if not bool(finite):
+        msg = "Davidson Ritz data must be finite"
+        raise ValueError(msg)
+    return residual_stack, residuals, float(max_residual_array)
 
 
 def _ritz_pair(state: _PairedDavidsonState, n_bands: int) -> _DavidsonRitzPair:
@@ -1866,24 +2206,57 @@ def _ritz_pair(state: _PairedDavidsonState, n_bands: int) -> _DavidsonRitzPair:
     selected_values = mx.real(values[:n_bands])
     selected_vectors = eigenvectors[:, :n_bands]
     transform = mx.transpose(selected_vectors)
-    ritz_values = transform @ state.vectors.values
-    h_ritz_values = transform @ state.applied.values
-    residual_stack = h_ritz_values - selected_values[:, None] * ritz_values
-    residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=1))
-    if not _all_finite(selected_values) or not _all_finite(residuals):
-        msg = "Davidson Ritz data must be finite"
-        raise ValueError(msg)
+    vectors = _CompactLaneState(
+        transform @ state.vectors.values,
+        state.vectors.layout,
+    )
+    applied = _CompactLaneState(
+        transform @ state.applied.values,
+        state.applied.layout,
+        "hamiltonian_action",
+    )
+    residual_stack, residuals, max_residual = _ritz_residual_data(
+        selected_values,
+        vectors,
+        applied,
+    )
     return _DavidsonRitzPair(
         eigenvalues=selected_values,
-        vectors=_CompactLaneState(ritz_values, state.vectors.layout),
-        applied=_CompactLaneState(
-            h_ritz_values,
-            state.applied.layout,
-            "hamiltonian_action",
-        ),
+        vectors=vectors,
+        applied=applied,
         residual_stack=residual_stack,
         residuals=residuals,
+        max_residual=max_residual,
         transform=transform,
+    )
+
+
+def _ritz_pair_with_direct_action(
+    candidate: _DavidsonRitzPair,
+    applied: _CompactLaneState,
+) -> _DavidsonRitzPair:
+    """Return one Ritz pair whose residuals use the exact scheduled H(X)."""
+
+    _require_layout(applied, candidate.vectors.layout)
+    if applied.kind != "hamiltonian_action":
+        msg = "Davidson direct validation requires Hamiltonian actions"
+        raise ValueError(msg)
+    if applied.vector_count != candidate.vectors.vector_count:
+        msg = "Davidson direct validation width does not match its Ritz vectors"
+        raise ValueError(msg)
+    residual_stack, residuals, max_residual = _ritz_residual_data(
+        candidate.eigenvalues,
+        candidate.vectors,
+        applied,
+    )
+    return _DavidsonRitzPair(
+        eigenvalues=candidate.eigenvalues,
+        vectors=candidate.vectors,
+        applied=applied,
+        residual_stack=residual_stack,
+        residuals=residuals,
+        max_residual=max_residual,
+        transform=candidate.transform,
     )
 
 
@@ -1892,11 +2265,7 @@ def _projected_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
     # complex128 solve avoids the complex64 convergence floor while every
     # full-grid operator, residual, and FFT remains on the default MLX device.
     projected = np.asarray(matrix, dtype=np.complex128)
-    if (
-        projected.ndim != 2
-        or projected.shape[0] == 0
-        or projected.shape[0] != projected.shape[1]
-    ):
+    if projected.ndim != 2 or projected.shape[0] == 0 or projected.shape[0] != projected.shape[1]:
         msg = "projected Rayleigh-Ritz matrix must be non-empty and square"
         raise ValueError(msg)
     if not np.all(np.isfinite(projected)):
@@ -1963,6 +2332,30 @@ class _DavidsonLaneRequest:
     rank_policy: _Complex64RankPolicy = _DAVIDSON_RANK_POLICY
 
 
+@dataclass(frozen=True)
+class _DavidsonPendingAction:
+    """One scheduled Davidson action and the state needed to consume it."""
+
+    purpose: str
+    vectors: _CompactLaneState
+    reused_width: int = 0
+    ritz_pair: _DavidsonRitzPair | None = None
+    terminal: bool = False
+
+    def __post_init__(self) -> None:
+        if self.purpose == "correction":
+            if self.ritz_pair is not None or self.terminal:
+                msg = "Davidson correction action has invalid validation state"
+                raise ValueError(msg)
+        elif self.purpose == "direct_validation":
+            if self.ritz_pair is None or self.reused_width != 0:
+                msg = "Davidson direct validation action is incomplete"
+                raise ValueError(msg)
+        else:
+            msg = "Davidson pending action purpose is invalid"
+            raise ValueError(msg)
+
+
 @dataclass
 class _DavidsonLaneProgress:
     """Mutable lane-local Davidson progression owned by the shared engine."""
@@ -1975,8 +2368,8 @@ class _DavidsonLaneProgress:
     iteration_count: int = 0
     restart_count: int = 0
     correction_width: int = 0
-    pending_vectors: _CompactLaneState | None = None
-    pending_reused_width: int = 0
+    pending_action: _DavidsonPendingAction | None = None
+    direct_validated: bool = False
     converged: bool = False
     done: bool = False
     failure: Exception | None = None
@@ -2008,9 +2401,7 @@ class _DavidsonEngine:
     """Advance ragged Davidson lanes and collectively schedule ready H blocks."""
 
     def __init__(self, *, scheduler: _DavidsonScheduler | None = None) -> None:
-        self.scheduler = (
-            _DavidsonScheduler(batch_cap=1) if scheduler is None else scheduler
-        )
+        self.scheduler = _DavidsonScheduler(batch_cap=1) if scheduler is None else scheduler
         self._ready_rounds: list[tuple[str, ...]] = []
         self._compatibility_groups: list[tuple[str, ...]] = []
         self._submission_groups: list[tuple[str, ...]] = []
@@ -2033,10 +2424,7 @@ class _DavidsonEngine:
             or request.n_bands <= 0
             or request.n_bands > basis.active_count
         ):
-            msg = (
-                "n_bands must be a positive non-bool integer no larger "
-                "than the active basis size"
-            )
+            msg = "n_bands must be a positive non-bool integer no larger than the active basis size"
             raise ValueError(msg)
         if request.config.max_subspace_size < request.n_bands:
             msg = "max_subspace_size cannot be smaller than n_bands"
@@ -2050,6 +2438,8 @@ class _DavidsonEngine:
     def _ticket(
         progress: _DavidsonLaneProgress,
         vectors: _CompactLaneState,
+        *,
+        purpose: str = "basis",
     ) -> _DavidsonApplicationTicket:
         request = progress.request
         return _DavidsonApplicationTicket(
@@ -2061,6 +2451,7 @@ class _DavidsonEngine:
             token=progress.token,
             vectors=vectors,
             observer=request.observer,
+            purpose=purpose,
         )
 
     def _schedule(
@@ -2118,51 +2509,121 @@ class _DavidsonEngine:
         )
 
     @staticmethod
-    def _advance_lane(
+    def _unconverged_indices(
+        ritz_pair: _DavidsonRitzPair,
+        tolerance: float,
+    ) -> np.ndarray:
+        residual_values = np.asarray(ritz_pair.residuals, dtype=np.float32)
+        return np.flatnonzero(residual_values > tolerance).astype(np.int32)
+
+    @staticmethod
+    def _emit_iteration(
         progress: _DavidsonLaneProgress,
-    ) -> tuple[_CompactLaneState, int] | None:
+        ritz_pair: _DavidsonRitzPair,
+        *,
+        residual_source: str,
+    ) -> None:
+        request = progress.request
+        unconverged = _DavidsonEngine._unconverged_indices(
+            ritz_pair,
+            request.config.tolerance,
+        )
+        if request.observer is not None:
+            request.observer.emit(
+                "davidson_iteration",
+                lane_id=request.lane_id,
+                iteration=progress.iteration_count,
+                subspace_size=(0 if progress.paired is None else progress.paired.vector_count),
+                max_residual=ritz_pair.max_residual,
+                unconverged_band_count=int(unconverged.size),
+                residual_source=residual_source,
+                converged=ritz_pair.max_residual <= request.config.tolerance,
+            )
+
+    @staticmethod
+    def _prepare_direct_validation(
+        progress: _DavidsonLaneProgress,
+        ritz_pair: _DavidsonRitzPair,
+        *,
+        terminal: bool,
+    ) -> _DavidsonPendingAction:
         request = progress.request
         paired = progress.paired
         if paired is None:
             msg = "Davidson lane has no paired V/HV state"
             raise RuntimeError(msg)
-        progress.iteration_count += 1
-        iteration = progress.iteration_count
-        with observed_phase(request.observer, "rayleigh_ritz"):
-            ritz_pair = _ritz_pair(paired, request.n_bands)
-        progress.ritz_pair = ritz_pair
-        max_residual = float(mx.max(ritz_pair.residuals))
-        if not np.isfinite(max_residual):
-            msg = "Davidson maximum residual must be finite"
-            raise ValueError(msg)
-        if request.observer is not None:
-            request.observer.emit(
-                "davidson_iteration",
-                lane_id=request.lane_id,
-                iteration=iteration,
-                subspace_size=paired.vector_count,
-                max_residual=max_residual,
-                converged=max_residual <= request.config.tolerance,
+        orthonormality = request.rank_policy.overlap_error(ritz_pair.vectors.values)
+        if orthonormality > request.rank_policy.guard_tolerance(request.n_bands):
+            with observed_phase(request.observer, "orthogonalization"):
+                final_rank = request.rank_policy.orthonormalize(
+                    ritz_pair.vectors.values,
+                    required_count=request.n_bands,
+                    max_count=request.n_bands,
+                )
+                paired = paired.rebase_ranked(
+                    final_rank,
+                    ritz_pair.applied,
+                    token=progress.token,
+                )
+                ritz_pair = _ritz_pair(paired, request.n_bands)
+            add_observed_work(
+                request.observer,
+                {"orthogonalization_vectors": request.n_bands},
             )
-        progress.converged = max_residual <= request.config.tolerance
-        if progress.converged or iteration >= request.config.max_iterations:
-            progress.done = True
-            return None
+            progress.paired = paired
+        request.rank_policy.validate(
+            ritz_pair.vectors.values,
+            required_count=request.n_bands,
+        )
+        pending = _DavidsonPendingAction(
+            purpose="direct_validation",
+            vectors=ritz_pair.vectors,
+            ritz_pair=ritz_pair,
+            terminal=terminal,
+        )
+        progress.ritz_pair = ritz_pair
+        progress.pending_action = pending
+        progress.direct_validated = False
+        return pending
 
-        basis = request.operator.basis
+    @staticmethod
+    def _prepare_correction(
+        progress: _DavidsonLaneProgress,
+        ritz_pair: _DavidsonRitzPair,
+    ) -> _DavidsonPendingAction | None:
+        request = progress.request
+        paired = progress.paired
+        if paired is None:
+            msg = "Davidson lane has no paired V/HV state"
+            raise RuntimeError(msg)
+        unconverged = _DavidsonEngine._unconverged_indices(
+            ritz_pair,
+            request.config.tolerance,
+        )
+        if unconverged.size == 0:
+            msg = "Davidson residual decision disagrees with its maximum"
+            raise RuntimeError(msg)
+        unconverged_indices = mx.array(unconverged)
+        unconverged_eigenvalues = mx.take(
+            ritz_pair.eigenvalues,
+            unconverged_indices,
+            axis=0,
+        )
+        unconverged_residuals = mx.take(
+            ritz_pair.residual_stack,
+            unconverged_indices,
+            axis=0,
+        )
         denominator = (
-            basis._layout._active_kinetic_energies[None, :]
-            - ritz_pair.eigenvalues[:, None]
+            request.operator.basis._layout._active_kinetic_energies[None, :]
+            - unconverged_eigenvalues[:, None]
         )
         sign = mx.where(denominator < 0.0, -1.0, 1.0)
         safe = sign * mx.maximum(
             mx.abs(denominator),
             request.config.preconditioner_floor,
         )
-        raw_corrections = -ritz_pair.residual_stack / safe
-        if not _all_finite(raw_corrections):
-            msg = "Davidson preconditioned corrections must be finite"
-            raise ValueError(msg)
+        raw_corrections = -unconverged_residuals / safe
 
         with observed_phase(request.observer, "orthogonalization"):
             append_rank = request.rank_policy.orthonormalize(
@@ -2172,14 +2633,20 @@ class _DavidsonEngine:
             )
         add_observed_work(
             request.observer,
-            {"orthogonalization_vectors": request.n_bands},
+            {"orthogonalization_vectors": int(unconverged.size)},
         )
         correction_values = append_rank.values[paired.vector_count :]
         correction_count = int(correction_values.shape[0])
         progress.correction_width = correction_count
         if correction_count == 0:
-            progress.done = True
-            return None
+            if progress.direct_validated:
+                progress.done = True
+                return None
+            return _DavidsonEngine._prepare_direct_validation(
+                progress,
+                ritz_pair,
+                terminal=True,
+            )
 
         if paired.vector_count + correction_count > request.config.max_subspace_size:
             progress.restart_count += 1
@@ -2189,8 +2656,9 @@ class _DavidsonEngine:
                     required_count=request.n_bands,
                     max_count=request.n_bands,
                 )
-                paired = paired.transform(
-                    restart_rank.transform @ ritz_pair.transform,
+                paired = paired.rebase_ranked(
+                    restart_rank,
+                    ritz_pair.applied,
                     token=progress.token,
                 )
                 progress.paired = paired
@@ -2198,10 +2666,15 @@ class _DavidsonEngine:
                 request.observer,
                 {"orthogonalization_vectors": request.n_bands},
             )
-            capacity = request.config.max_subspace_size - paired.vector_count
-            if capacity <= 0:
-                progress.done = True
-                return None
+            if request.config.max_subspace_size - paired.vector_count <= 0:
+                if progress.direct_validated:
+                    progress.done = True
+                    return None
+                return _DavidsonEngine._prepare_direct_validation(
+                    progress,
+                    ritz_pair,
+                    terminal=True,
+                )
             with observed_phase(request.observer, "orthogonalization"):
                 restarted_append = request.rank_policy.orthonormalize(
                     mx.concatenate(
@@ -2220,12 +2693,109 @@ class _DavidsonEngine:
             correction_count = int(correction_values.shape[0])
             progress.correction_width = correction_count
             if correction_count == 0:
-                progress.done = True
-                return None
+                if progress.direct_validated:
+                    progress.done = True
+                    return None
+                return _DavidsonEngine._prepare_direct_validation(
+                    progress,
+                    ritz_pair,
+                    terminal=True,
+                )
 
-        progress.pending_vectors = basis._state_from_compact(correction_values)
-        progress.pending_reused_width = paired.vector_count
-        return progress.pending_vectors, progress.pending_reused_width
+        pending = _DavidsonPendingAction(
+            purpose="correction",
+            vectors=request.operator.basis._state_from_compact(correction_values),
+            reused_width=paired.vector_count,
+        )
+        progress.pending_action = pending
+        return pending
+
+    @staticmethod
+    def _advance_lane(
+        progress: _DavidsonLaneProgress,
+    ) -> _DavidsonPendingAction | None:
+        request = progress.request
+        paired = progress.paired
+        if paired is None:
+            msg = "Davidson lane has no paired V/HV state"
+            raise RuntimeError(msg)
+        if progress.pending_action is not None:
+            msg = "Davidson lane cannot advance with an unconsumed action"
+            raise RuntimeError(msg)
+        progress.iteration_count += 1
+        progress.direct_validated = False
+        with observed_phase(request.observer, "rayleigh_ritz"):
+            ritz_pair = _ritz_pair(paired, request.n_bands)
+        progress.ritz_pair = ritz_pair
+        if (
+            ritz_pair.max_residual <= request.config.tolerance
+            or progress.iteration_count >= request.config.max_iterations
+        ):
+            return _DavidsonEngine._prepare_direct_validation(
+                progress,
+                ritz_pair,
+                terminal=(progress.iteration_count >= request.config.max_iterations),
+            )
+        pending = _DavidsonEngine._prepare_correction(progress, ritz_pair)
+        if pending is not None and pending.purpose == "correction":
+            _DavidsonEngine._emit_iteration(
+                progress,
+                ritz_pair,
+                residual_source="paired_subspace",
+            )
+        return pending
+
+    @staticmethod
+    def _consume_action(
+        progress: _DavidsonLaneProgress,
+        ticket: _DavidsonApplicationTicket,
+        applied: _CompactLaneState,
+    ) -> _DavidsonPendingAction | None:
+        pending = progress.pending_action
+        if pending is None or pending.vectors is not ticket.vectors:
+            msg = "Davidson scheduled action does not match lane state"
+            raise RuntimeError(msg)
+        progress.pending_action = None
+        if pending.purpose == "correction":
+            paired = progress.paired
+            if paired is None:
+                msg = "Davidson lane lost paired V/HV state"
+                raise RuntimeError(msg)
+            progress.paired = paired.append(
+                pending.vectors,
+                applied,
+                token=progress.token,
+            )
+            add_observed_work(
+                progress.request.observer,
+                {"davidson_hv_reused_vectors": pending.reused_width},
+            )
+            progress.direct_validated = False
+            return None
+
+        candidate = pending.ritz_pair
+        if candidate is None:
+            msg = "Davidson direct validation lost its Ritz state"
+            raise RuntimeError(msg)
+        direct_pair = _ritz_pair_with_direct_action(candidate, applied)
+        progress.ritz_pair = direct_pair
+        progress.direct_validated = True
+        progress.converged = direct_pair.max_residual <= progress.request.config.tolerance
+        _DavidsonEngine._emit_iteration(
+            progress,
+            direct_pair,
+            residual_source="direct_operator",
+        )
+        if progress.converged or pending.terminal:
+            progress.done = True
+            return None
+
+        progress.paired = _PairedDavidsonState.initialize(
+            candidate.vectors,
+            applied,
+            progress.token,
+        )
+        return _DavidsonEngine._prepare_correction(progress, direct_pair)
 
     @staticmethod
     def _finalize_lane(
@@ -2237,36 +2807,17 @@ class _DavidsonEngine:
         if paired is None or ritz_pair is None:
             msg = "Davidson solver produced no Ritz state"
             raise RuntimeError(msg)
-        orthonormality = request.rank_policy.overlap_error(
-            ritz_pair.vectors.values
-        )
-        if orthonormality > request.rank_policy.guard_tolerance(request.n_bands):
-            with observed_phase(request.observer, "orthogonalization"):
-                final_rank = request.rank_policy.orthonormalize(
-                    ritz_pair.vectors.values,
-                    required_count=request.n_bands,
-                    max_count=request.n_bands,
-                )
-                ritz_state = paired.transform(
-                    ritz_pair.transform,
-                    token=progress.token,
-                ).transform(final_rank.transform, token=progress.token)
-                ritz_pair = _ritz_pair(ritz_state, request.n_bands)
-            add_observed_work(
-                request.observer,
-                {"orthogonalization_vectors": request.n_bands},
-            )
-            orthonormality = request.rank_policy.overlap_error(
-                ritz_pair.vectors.values
-            )
-        request.rank_policy.validate(
+        if progress.pending_action is not None or not progress.direct_validated:
+            msg = "Davidson result was not sealed by a direct residual"
+            raise RuntimeError(msg)
+        orthonormality = request.rank_policy.validate(
             ritz_pair.vectors.values,
             required_count=request.n_bands,
         )
-        final_max_residual = float(mx.max(ritz_pair.residuals))
-        if not np.isfinite(final_max_residual):
-            msg = "Davidson final residual must be finite"
-            raise ValueError(msg)
+        final_max_residual = ritz_pair.max_residual
+        if progress.converged != (final_max_residual <= request.config.tolerance):
+            msg = "Davidson convergence disagrees with its direct residual"
+            raise RuntimeError(msg)
         return PeriodicEigenResult._from_compact(
             eigenvalues=ritz_pair.eigenvalues,
             compact_coefficients=ritz_pair.vectors,
@@ -2274,7 +2825,7 @@ class _DavidsonEngine:
             residuals=ritz_pair.residuals,
             orthonormality_error=orthonormality,
             iterations=progress.iteration_count,
-            converged=final_max_residual <= request.config.tolerance,
+            converged=progress.converged,
             subspace_size=paired.vector_count,
             restart_count=progress.restart_count,
         )
@@ -2303,13 +2854,12 @@ class _DavidsonEngine:
             try:
                 progress = self._prepare_lane(request)
                 progress_by_lane[request.lane_id] = progress
-                initial_tickets.append(
-                    self._ticket(progress, progress.initial_vectors)
-                )
+                initial_tickets.append(self._ticket(progress, progress.initial_vectors))
             except Exception as error:
                 failures[request.lane_id] = _detached_failure(error)
 
         if initial_tickets:
+            self.scheduler.bind(initial_tickets)
             initial_schedule = self._schedule(initial_tickets)
             for ticket in initial_tickets:
                 lane_id = ticket.lane_id
@@ -2331,64 +2881,62 @@ class _DavidsonEngine:
             ]
             if not active:
                 break
-            correction_tickets: list[_DavidsonApplicationTicket] = []
+            pending_tickets: list[_DavidsonApplicationTicket] = []
             for progress in active:
                 try:
-                    correction = self._advance_lane(progress)
-                    if correction is not None:
-                        correction_tickets.append(
-                            self._ticket(progress, correction[0])
+                    pending = self._advance_lane(progress)
+                    if pending is not None:
+                        pending_tickets.append(
+                            self._ticket(
+                                progress,
+                                pending.vectors,
+                                purpose=(
+                                    "direct_validation"
+                                    if pending.purpose == "direct_validation"
+                                    else "basis"
+                                ),
+                            )
                         )
                 except Exception as error:
                     self._fail_lane(progress, failures, error)
-            if not correction_tickets:
+            if not pending_tickets:
                 continue
 
-            correction_schedule = self._schedule(correction_tickets)
-            for ticket in correction_tickets:
-                lane_id = ticket.lane_id
-                failure = correction_schedule.failures.get(lane_id)
-                if failure is not None:
-                    self._fail_lane(progress_by_lane[lane_id], failures, failure)
-                    continue
-                progress = progress_by_lane[lane_id]
-                paired = progress.paired
-                if paired is None:
-                    self._fail_lane(
-                        progress,
-                        failures,
-                        RuntimeError("Davidson lane lost paired V/HV state"),
-                    )
-                    continue
-                corrections = progress.pending_vectors
-                reused_width = progress.pending_reused_width
-                if corrections is None:
-                    self._fail_lane(
-                        progress,
-                        failures,
-                        RuntimeError(
-                            "Davidson lane lost its pending correction block"
-                        ),
-                    )
-                    continue
-                try:
-                    progress.paired = paired.append(
-                        corrections,
-                        correction_schedule.actions[lane_id],
-                        token=progress.token,
-                    )
-                    progress.request.rank_policy.validate(
-                        progress.paired.vectors.values,
-                        required_count=progress.request.n_bands,
-                    )
-                    add_observed_work(
-                        progress.request.observer,
-                        {"davidson_hv_reused_vectors": reused_width},
-                    )
-                    progress.pending_vectors = None
-                    progress.pending_reused_width = 0
-                except Exception as error:
-                    self._fail_lane(progress, failures, error)
+            while pending_tickets:
+                scheduled = self._schedule(pending_tickets)
+                followup_tickets: list[_DavidsonApplicationTicket] = []
+                for ticket in pending_tickets:
+                    lane_id = ticket.lane_id
+                    failure = scheduled.failures.get(lane_id)
+                    if failure is not None:
+                        self._fail_lane(
+                            progress_by_lane[lane_id],
+                            failures,
+                            failure,
+                        )
+                        continue
+                    progress = progress_by_lane[lane_id]
+                    try:
+                        followup = self._consume_action(
+                            progress,
+                            ticket,
+                            scheduled.action_for(lane_id),
+                        )
+                        if followup is not None:
+                            followup_tickets.append(
+                                self._ticket(
+                                    progress,
+                                    followup.vectors,
+                                    purpose=(
+                                        "direct_validation"
+                                        if followup.purpose == "direct_validation"
+                                        else "basis"
+                                    ),
+                                )
+                            )
+                    except Exception as error:
+                        self._fail_lane(progress, failures, error)
+                pending_tickets = followup_tickets
 
         results: dict[str, PeriodicEigenResult] = {}
         for lane_id, progress in progress_by_lane.items():
@@ -2428,17 +2976,14 @@ def solve_periodic_eigenproblem(
             observer carried by ``operator``.
 
     Returns:
-        Converged or exhausted periodic eigensolver result.
+        Converged or exhausted result sealed by direct final residuals.
     """
 
     runtime_observer = operator.observer if observer is None else observer
     solver_config = PeriodicDavidsonConfig() if config is None else config
     basis = operator.basis
     if type(n_bands) is not int or n_bands <= 0 or n_bands > basis.active_count:
-        msg = (
-            "n_bands must be a positive non-bool integer no larger than "
-            "the active basis size"
-        )
+        msg = "n_bands must be a positive non-bool integer no larger than the active basis size"
         raise ValueError(msg)
     trial = _initial_trial(basis, n_bands, initial_coefficients)
     lane_id = basis._layout.lane_id
@@ -2471,11 +3016,7 @@ class PeriodicKPointResult:
     def integration_weight(self) -> float:
         """Return the owner-aggregated or original integration weight."""
 
-        return (
-            self.weight
-            if self.aggregated_weight is None
-            else self.aggregated_weight
-        )
+        return self.weight if self.aggregated_weight is None else self.aggregated_weight
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe k-point summary.
@@ -2562,8 +3103,7 @@ class PeriodicSCFResult:
         if self.time_reversal_ownership is None:
             return tuple(item.eigen._compact_coefficients for item in self.kpoints)
         owned = {
-            item.explicit_index: item.eigen._compact_coefficients
-            for item in self.owned_kpoints
+            item.explicit_index: item.eigen._compact_coefficients for item in self.owned_kpoints
         }
         return tuple(
             owned[entry.explicit_index]
@@ -2631,65 +3171,96 @@ def _density_from_kpoints(
     ) -> int:
         return (
             batch.estimated_transient_bytes
-            + batch.lane_count * batch.grid_size * 4
+            + batch.lane_capacity * batch.grid_size * 4
             + batch.grid_size * 4
         )
 
-    plan = _plan_compact_submissions(
-        states,
-        batch_cap=batch_cap,
-        max_padding_fraction=max_padding_fraction,
-        max_transient_bytes=max_transient_bytes,
-        batch_byte_estimator=estimate_density_batch,
-    )
-    if plan.failures:
-        failed_index = min(plan.failures)
-        raise _detached_failure(plan.failures[failed_index]) from None
-
     density = mx.zeros(grid_shape, dtype=mx.float32)
-    for submission in plan.submissions:
-        batch = _CompactBatch.from_states(
-            [states[index] for index in submission.indices],
+    compatible: dict[tuple[object, ...], list[int]] = defaultdict(list)
+    for index, state in enumerate(states):
+        compatible[(id(state.layout.reciprocal), state.layout.grid_shape)].append(index)
+    for compatible_indices in compatible.values():
+        vector_capacity = max(states[index].vector_count for index in compatible_indices)
+        capacity_groups = _stable_compact_capacity_groups(
+            states,
+            compatible_indices,
+            lane_capacity=batch_cap,
+            vector_capacity=vector_capacity,
             max_padding_fraction=max_padding_fraction,
-            max_transient_bytes=max_transient_bytes,
         )
-        estimated_transient_bytes = estimate_density_batch(
-            submission.indices,
-            batch,
-        )
-        if estimated_transient_bytes > max_transient_bytes:
-            msg = "density batch exceeds the complete transient byte budget"
-            raise ValueError(msg)
-        orbitals = batch.to_real()
-        weights = mx.array(
-            np.asarray(
-                [
-                    results[index].integration_weight * occupation
-                    for index in submission.indices
-                ],
-                dtype=np.float32,
+        for capacity_indices, capacity in capacity_groups:
+            capacity_states = [states[index] for index in capacity_indices]
+            plan = _plan_compact_submissions(
+                capacity_states,
+                batch_cap=batch_cap,
+                max_padding_fraction=max_padding_fraction,
+                max_transient_bytes=max_transient_bytes,
+                batch_byte_estimator=estimate_density_batch,
+                capacity=capacity,
             )
-        )[:, None, None, None]
-        weighted_density = weights * mx.sum(mx.abs(orbitals) ** 2, axis=1)
-        density = density + mx.sum(weighted_density, axis=0)
-        mx.eval(density)
-        add_observed_work(
-            observer,
-            {
-                "fft_submissions": 1,
-                "fft_vector_equivalents": batch.lane_count * batch.vector_count,
-                "padding_elements": batch.padding_elements,
-            },
-        )
-        if observer is not None:
-            observer.record_peak_memory(
-                "fft_workspace_bytes",
-                batch.lane_count * batch.vector_count * batch.grid_size * 8,
-            )
-            observer.record_peak_memory(
-                "peak_temporary_bytes",
-                estimated_transient_bytes,
-            )
+            if plan.failures:
+                failed_index = min(plan.failures)
+                raise _detached_failure(plan.failures[failed_index]) from None
+            for submission in plan.submissions:
+                logical_indices = tuple(capacity_indices[index] for index in submission.indices)
+                batch = _CompactBatch.from_states(
+                    [states[index] for index in logical_indices],
+                    max_padding_fraction=max_padding_fraction,
+                    max_transient_bytes=max_transient_bytes,
+                    lane_capacity=capacity.lanes,
+                    vector_capacity=capacity.vectors,
+                    active_capacity=capacity.active,
+                )
+                estimated_transient_bytes = estimate_density_batch(
+                    logical_indices,
+                    batch,
+                )
+                if estimated_transient_bytes > max_transient_bytes:
+                    msg = "density batch exceeds the complete transient byte budget"
+                    raise ValueError(msg)
+                orbitals = batch.to_real()
+                weights = mx.array(
+                    np.asarray(
+                        [
+                            results[index].integration_weight * occupation
+                            for index in logical_indices
+                        ],
+                        dtype=np.float32,
+                    )
+                )
+                if batch.lane_capacity > batch.lane_count:
+                    weights = mx.concatenate(
+                        [
+                            weights,
+                            mx.zeros(
+                                (batch.lane_capacity - batch.lane_count,),
+                                dtype=mx.float32,
+                            ),
+                        ]
+                    )
+                weighted_density = weights[:, None, None, None] * mx.sum(
+                    mx.abs(orbitals) ** 2,
+                    axis=1,
+                )
+                density = density + mx.sum(weighted_density, axis=0)
+                mx.eval(density)
+                add_observed_work(
+                    observer,
+                    {
+                        "fft_submissions": 1,
+                        "fft_vector_equivalents": batch.logical_vector_count,
+                        "padding_elements": batch.padding_elements,
+                    },
+                )
+                if observer is not None:
+                    observer.record_peak_memory(
+                        "fft_workspace_bytes",
+                        batch.lane_capacity * batch.vector_count * batch.grid_size * 8,
+                    )
+                    observer.record_peak_memory(
+                        "peak_temporary_bytes",
+                        estimated_transient_bytes,
+                    )
 
     return mx.real(density)
 
@@ -2728,10 +3299,7 @@ def _time_reversal_subspaces_match(
     n_bands: int,
     atol: float = 3e-4,
 ) -> bool:
-    if (
-        owner_state.vector_count < n_bands
-        or partner_state.vector_count < n_bands
-    ):
+    if owner_state.vector_count < n_bands or partner_state.vector_count < n_bands:
         return False
     expected = _time_reversed_compact_values(
         owner_state.values[:n_bands],
@@ -2740,14 +3308,10 @@ def _time_reversal_subspaces_match(
     partner_occupied = partner_state.values[:n_bands]
     try:
         expected_orthonormal = partner_basis._orthonormalize_compact(expected)
-        partner_orthonormal = partner_basis._orthonormalize_compact(
-            partner_occupied
-        )
+        partner_orthonormal = partner_basis._orthonormalize_compact(partner_occupied)
     except ValueError:
         return False
-    overlap = expected_orthonormal @ mx.conjugate(
-        mx.transpose(partner_orthonormal)
-    )
+    overlap = expected_orthonormal @ mx.conjugate(mx.transpose(partner_orthonormal))
     singular_values = np.linalg.svd(
         np.asarray(overlap, dtype=np.complex128),
         compute_uv=False,
@@ -2787,19 +3351,16 @@ def _admit_initial_time_reversal(
             and owner_state.vector_count >= n_bands
         )
         permutation = entry._time_reversal_permutation
-        subspace_match = (
-            descriptor_match
-            or (
-                permutation is not None
-                and isinstance(owner_state, _CompactLaneState)
-                and isinstance(partner_state, _CompactLaneState)
-                and _time_reversal_subspaces_match(
-                    owner_state,
-                    partner_state,
-                    bases[partner_index],
-                    permutation,
-                    n_bands=n_bands,
-                )
+        subspace_match = descriptor_match or (
+            permutation is not None
+            and isinstance(owner_state, _CompactLaneState)
+            and isinstance(partner_state, _CompactLaneState)
+            and _time_reversal_subspaces_match(
+                owner_state,
+                partner_state,
+                bases[partner_index],
+                permutation,
+                n_bands=n_bands,
             )
         )
         if not subspace_match:
@@ -2810,11 +3371,7 @@ def _admit_initial_time_reversal(
             )
         visited.update({entry.explicit_index, partner_index})
     return admitted, {
-        index: (
-            None
-            if isinstance(states[index], _TimeReversalContinuationSeed)
-            else states[index]
-        )
+        index: (None if isinstance(states[index], _TimeReversalContinuationSeed) else states[index])
         for index in admitted.owned_indices
     }
 
@@ -2941,9 +3498,7 @@ def _resume_ownership(
     if rebuilt.to_dict() == stored:
         return rebuilt
     stored_entries = stored.get("entries")
-    if not isinstance(stored_entries, list) or len(stored_entries) != len(
-        rebuilt.entries
-    ):
+    if not isinstance(stored_entries, list) or len(stored_entries) != len(rebuilt.entries):
         msg = "periodic resume ownership payload is malformed"
         raise ValueError(msg)
     candidate = rebuilt
@@ -2955,8 +3510,7 @@ def _resume_ownership(
         if (
             rebuilt_entry.role in {"owner", "partner"}
             and stored_entry.get("role") == "independent"
-            and stored_entry.get("fallback_reason")
-            == "initial_coefficients_time_reversal_mismatch"
+            and stored_entry.get("fallback_reason") == "initial_coefficients_time_reversal_mismatch"
         ):
             candidate = _independent_pair(
                 candidate,
@@ -2992,8 +3546,7 @@ def _restore_continuation_state(
         msg = "periodic resume ownership does not match the rebuilt topology"
         raise ValueError(msg)
     if len(state.history) != state.completed_iteration or any(
-        row.get("iteration") != index
-        for index, row in enumerate(state.history, start=1)
+        row.get("iteration") != index for index, row in enumerate(state.history, start=1)
     ):
         msg = "periodic resume history does not match its iteration cursor"
         raise ValueError(msg)
@@ -3036,9 +3589,9 @@ def _restore_continuation_state(
     density = _owned_device_copy(density, dtype=mx.float32)
 
     coefficient_map = state.coefficient_map
-    if len(coefficient_map) != len(state.owned_coefficients) or set(
-        coefficient_map
-    ) != set(ownership.owned_indices):
+    if len(coefficient_map) != len(state.owned_coefficients) or set(coefficient_map) != set(
+        ownership.owned_indices
+    ):
         msg = "periodic resume owner coefficient inventory is inconsistent"
         raise ValueError(msg)
     lane_map = {
@@ -3046,9 +3599,7 @@ def _restore_continuation_state(
         for lane in state.owned_lanes
         if isinstance(lane, dict) and "owner_index" in lane
     }
-    if len(lane_map) != len(state.owned_lanes) or set(lane_map) != set(
-        ownership.owned_indices
-    ):
+    if len(lane_map) != len(state.owned_lanes) or set(lane_map) != set(ownership.owned_indices):
         msg = "periodic resume owner lane inventory is inconsistent"
         raise ValueError(msg)
     previous_states: dict[int, _CompactLaneState] = {}
@@ -3068,10 +3619,7 @@ def _restore_continuation_state(
             msg = "periodic resume owner lane identity does not match rebuilt bases"
             raise ValueError(msg)
         values = mx.array(coefficient_map[owner_index])
-        if (
-            values.dtype != mx.complex64
-            or values.shape != (occupied_bands, basis.active_count)
-        ):
+        if values.dtype != mx.complex64 or values.shape != (occupied_bands, basis.active_count):
             msg = "periodic resume owner coefficients have incompatible shape or dtype"
             raise ValueError(msg)
         copied = _owned_device_copy(values, dtype=mx.complex64)
@@ -3150,10 +3698,7 @@ def _run_periodic_scf_with_projector_cache(
     ):
         msg = "periodic resume state is mutually exclusive with public initial guesses"
         raise ValueError(msg)
-    if (
-        resume_state is not None
-        and resume_state.completed_iteration >= scf_config.max_iterations
-    ):
+    if resume_state is not None and resume_state.completed_iteration >= scf_config.max_iterations:
         msg = "periodic resume state has no remaining SCF iteration"
         raise ValueError(msg)
     ownership = build_time_reversal_ownership(kpoint_mesh)
@@ -3296,11 +3841,23 @@ def _run_periodic_scf_with_projector_cache(
         xc_result = xc.evaluate(density, system.grid)
         timings["xc"] += (perf_counter() - start) * 1000.0
         effective = local_potential + hartree + xc_result.potential
+        effective_snapshot = mx.array(effective)
+        xc_finite = (
+            mx.all(mx.isfinite(xc_result.energy_density))
+            & mx.all(mx.isfinite(xc_result.potential))
+            & mx.isfinite(xc_result.total_energy)
+        )
+        effective_finite = mx.all(mx.isfinite(effective_snapshot))
+        mx.eval(effective_snapshot, xc_finite, effective_finite)
+        if not bool(xc_finite):
+            msg = "SCF exchange-correlation result is non-finite"
+            raise ValueError(msg)
+        if not bool(effective_finite):
+            msg = "SCF effective potential is non-finite"
+            raise ValueError(msg)
         owned_by_index: dict[int, PeriodicKPointResult] = {}
         max_orbital_residual = 0.0
         start = perf_counter()
-        effective_snapshot = mx.array(effective)
-        mx.eval(effective_snapshot)
         operators_by_index = {
             point_index: PeriodicKohnShamOperator._from_shared_potential(
                 bases[point_index],
@@ -3311,8 +3868,7 @@ def _run_periodic_scf_with_projector_cache(
             for point_index in owned_indices
         }
         lane_to_index = {
-            bases[point_index]._layout.lane_id: point_index
-            for point_index in owned_indices
+            bases[point_index]._layout.lane_id: point_index for point_index in owned_indices
         }
 
         def emit_submission(
@@ -3327,33 +3883,31 @@ def _run_periodic_scf_with_projector_cache(
         ) -> None:
             if observer is None:
                 return
-            explicit_indices = [
-                _lane_to_index[ticket.lane_id] for ticket in tickets
-            ]
-            complete_transient_bytes = (
-                PeriodicKohnShamOperator._estimated_batch_transient_bytes(
-                    [ticket.operator for ticket in tickets],
-                    batch,
-                )
+            explicit_indices = [_lane_to_index[ticket.lane_id] for ticket in tickets]
+            complete_transient_bytes = PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                [ticket.operator for ticket in tickets],
+                batch,
             )
             fields: dict[str, object] = {
                 "status": status,
                 "scf_iteration": _iteration,
                 "batch_index": batch_index,
                 "batch_size": len(tickets),
+                "lane_capacity": batch.lane_capacity,
                 "lane_ids": [ticket.lane_id for ticket in tickets],
                 "reduced_kpoints": [
-                    list(kpoint_mesh.points[index].vector)
-                    for index in explicit_indices
+                    list(kpoint_mesh.points[index].vector) for index in explicit_indices
                 ],
                 "explicit_indices": explicit_indices,
                 "active_counts": list(batch.active_counts),
+                "active_capacity": batch.bucket_size,
                 "vector_count": batch.vector_count,
+                "logical_vector_counts": list(batch.vector_counts),
                 "padding_elements": batch.padding_elements,
+                "lane_padding_elements": batch.lane_padding_elements,
+                "vector_padding_elements": batch.vector_padding_elements,
                 "estimated_transient_bytes": complete_transient_bytes,
-                "compact_batch_transient_bytes": (
-                    batch.estimated_transient_bytes
-                ),
+                "compact_batch_transient_bytes": (batch.estimated_transient_bytes),
                 "batch_policy": scf_config.batch_policy(),
                 "synchronized": observer.synchronize is not None,
             }
@@ -3397,22 +3951,16 @@ def _run_periodic_scf_with_projector_cache(
                     stage="eigensolver",
                     scf_iteration=iteration,
                     failed_explicit_indices=[
-                        lane_to_index[lane_id]
-                        for lane_id in eigen_outcome.failures
+                        lane_to_index[lane_id] for lane_id in eigen_outcome.failures
                     ],
                     failure_messages={
-                        lane_id: str(error)
-                        for lane_id, error in eigen_outcome.failures.items()
+                        lane_id: str(error) for lane_id, error in eigen_outcome.failures.items()
                     },
                 )
             first_failed_lane = next(
-                request.lane_id
-                for request in requests
-                if request.lane_id in eigen_outcome.failures
+                request.lane_id for request in requests if request.lane_id in eigen_outcome.failures
             )
-            raise _detached_failure(
-                eigen_outcome.failures[first_failed_lane]
-            ) from None
+            raise _detached_failure(eigen_outcome.failures[first_failed_lane]) from None
 
         for point_index in owned_indices:
             basis = bases[point_index]
@@ -3431,9 +3979,7 @@ def _run_periodic_scf_with_projector_cache(
                 eigen=eigen,
             )
         timings["eigensolver"] += (perf_counter() - start) * 1000.0
-        final_owned_results = tuple(
-            owned_by_index[index] for index in owned_indices
-        )
+        final_owned_results = tuple(owned_by_index[index] for index in owned_indices)
         with observed_phase(observer, "density"):
             target_density = _density_from_kpoints(
                 final_owned_results,
@@ -3477,9 +4023,7 @@ def _run_periodic_scf_with_projector_cache(
                 ).lower(),
             }
         )
-        all_eigen_converged = all(
-            result.eigen.converged for result in final_owned_results
-        )
+        all_eigen_converged = all(result.eigen.converged for result in final_owned_results)
         if observer is not None:
             observer.emit(
                 "scf_iteration",
@@ -3503,9 +4047,44 @@ def _run_periodic_scf_with_projector_cache(
             density = target_density
             break
         with observed_phase(observer, "mixing"):
-            mixed = mx.maximum(mixer.mix(density, target_density), 0.0)
-            mixed_count = float(mx.sum(mixed) * system.grid.dv)
-            density = mixed * (system.electron_count / mixed_count)
+            mixed = mixer.mix(density, target_density)
+            mixed_finite = mx.all(mx.isfinite(mixed))
+            mixed_minimum_array = mx.min(mixed)
+            mixed_count_array = mx.sum(mixed) * system.grid.dv
+            mx.eval(
+                mixed,
+                mixed_finite,
+                mixed_minimum_array,
+                mixed_count_array,
+            )
+            mixed_minimum = float(mixed_minimum_array)
+            mixed_count = float(mixed_count_array)
+            if (
+                not bool(mixed_finite)
+                or not np.isfinite(mixed_minimum)
+                or mixed_minimum < 0.0
+                or not np.isfinite(mixed_count)
+                or mixed_count <= 0.0
+            ):
+                msg = "SCF mixer produced a non-finite, negative, or empty density"
+                raise ValueError(msg)
+            normalized_density = mixed * (system.electron_count / mixed_count)
+            normalized_finite = mx.all(mx.isfinite(normalized_density))
+            normalized_count_array = mx.sum(normalized_density) * system.grid.dv
+            mx.eval(
+                normalized_density,
+                normalized_finite,
+                normalized_count_array,
+            )
+            normalized_count = float(normalized_count_array)
+            if (
+                not bool(normalized_finite)
+                or not np.isfinite(normalized_count)
+                or abs(normalized_count - system.electron_count) > 1e-4
+            ):
+                msg = "SCF mixer density normalization failed"
+                raise ValueError(msg)
+            density = normalized_density
             if observer is not None:
                 stored_history = int(mixer.metadata().get("stored", 0))
                 observer.record_peak_memory(
@@ -3542,9 +4121,7 @@ def _run_periodic_scf_with_projector_cache(
                         ownership=ownership,
                         lineage=lineage,
                     )
-                    stop_after_checkpoint = bool(
-                        checkpoint_callback(final_checkpoint_state)
-                    )
+                    stop_after_checkpoint = bool(checkpoint_callback(final_checkpoint_state))
             except Exception as error:
                 if observer is not None:
                     observer.emit(
@@ -3596,20 +4173,22 @@ def _run_periodic_scf_with_projector_cache(
             status=(
                 "converged"
                 if converged
-                else "checkpointed" if stopped_for_checkpoint else "max_iterations"
+                else "checkpointed"
+                if stopped_for_checkpoint
+                else "max_iterations"
             ),
             iterations=iteration,
             total_energy_hartree=float(energy_terms["total"]),
         )
     result_status = (
-        "converged"
-        if converged
-        else "checkpointed" if stopped_for_checkpoint else "max_iterations"
+        "converged" if converged else "checkpointed" if stopped_for_checkpoint else "max_iterations"
     )
     timing_admission_status = (
         "ineligible_resumed_state"
         if resume_state is not None
-        else "ineligible_checkpointed" if stopped_for_checkpoint else "fresh"
+        else "ineligible_checkpointed"
+        if stopped_for_checkpoint
+        else "fresh"
     )
     return PeriodicSCFResult(
         converged=converged,
@@ -3650,7 +4229,7 @@ def _run_periodic_scf_controlled(
     checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None = None,
     checkpoint_iteration: int | None = None,
 ) -> PeriodicSCFResult:
-    with _GTHProjectorCache() as projector_cache:
+    with _bounded_dft_allocator(), _GTHProjectorCache() as projector_cache:
         return _run_periodic_scf_with_projector_cache(
             system,
             cutoff_hartree=cutoff_hartree,

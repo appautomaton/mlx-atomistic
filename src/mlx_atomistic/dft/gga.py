@@ -32,9 +32,7 @@ def density_gradient(rho: mx.array, grid: RealSpaceGrid) -> mx.array:
     reciprocal = ReciprocalGrid.from_real_space(grid)
     rho_reciprocal = fft3(rho)
     vectors = reciprocal.vectors
-    components = [
-        mx.real(ifft3(1j * vectors[..., axis] * rho_reciprocal)) for axis in range(3)
-    ]
+    components = [mx.real(ifft3(1j * vectors[..., axis] * rho_reciprocal)) for axis in range(3)]
     return mx.stack(components, axis=0)
 
 
@@ -44,8 +42,9 @@ def _pbe_exchange_energy_density(rho: mx.array, sigma: mx.array) -> mx.array:
     cx = (3.0 / pi) ** (1.0 / 3.0)
     dirac = -0.75 * cx * rho ** (4.0 / 3.0)
     kf = (3.0 * pi * pi * rho) ** (1.0 / 3.0)
-    s2 = sigma / (4.0 * kf * kf * rho * rho)  # reduced gradient squared, s²
-    enhancement = 1.0 + _KAPPA - _KAPPA / (1.0 + _MU * s2 / _KAPPA)
+    numerator = _MU * sigma
+    denominator = 4.0 * _KAPPA * kf * kf * rho * rho + numerator
+    enhancement = 1.0 + _KAPPA * numerator / denominator
     return dirac * enhancement
 
 
@@ -56,12 +55,11 @@ def _pbe_correlation_energy_density(
 
     kf = (3.0 * pi * pi * rho) ** (1.0 / 3.0)
     ks = mx.sqrt(4.0 * kf / pi)
-    t2 = sigma / (4.0 * ks * ks * rho * rho)  # reduced gradient squared, t²
-    a = (_BETA / _GAMMA) / (mx.exp(-eps_c_unif / _GAMMA) - 1.0)
-    at2 = a * t2
-    h = _GAMMA * mx.log(
-        1.0 + (_BETA / _GAMMA) * t2 * (1.0 + at2) / (1.0 + at2 + at2 * at2)
-    )
+    a = (_BETA / _GAMMA) / mx.expm1(-eps_c_unif / _GAMMA)
+    numerator = a * sigma
+    z = numerator / (4.0 * ks * ks * rho * rho + numerator)
+    reduced_gradient_term = z / (a * (1.0 - z + z * z))
+    h = _GAMMA * mx.log1p((_BETA / _GAMMA) * reduced_gradient_term)
     return rho * (eps_c_unif + h)
 
 
@@ -77,9 +75,7 @@ class PBEExchangeCorrelation:
 
     name: str = "pbe-pz81-gga-alpha"
 
-    def _energy_density(
-        self, rho: mx.array, grid: RealSpaceGrid, density_floor: float
-    ) -> mx.array:
+    def _energy_density(self, rho: mx.array, grid: RealSpaceGrid, density_floor: float) -> mx.array:
         rho = mx.maximum(rho, density_floor)
         gradient = density_gradient(rho, grid)
         sigma = mx.sum(gradient * gradient, axis=0)
@@ -138,9 +134,7 @@ class ProductionPBEExchangeCorrelation:
 
     name: str = "pbe-pw92-gga"
 
-    def _energy_density(
-        self, rho: mx.array, grid: RealSpaceGrid, density_floor: float
-    ) -> mx.array:
+    def _energy_density(self, rho: mx.array, grid: RealSpaceGrid, density_floor: float) -> mx.array:
         rho = mx.maximum(rho, density_floor)
         gradient = density_gradient(rho, grid)
         sigma = mx.sum(gradient * gradient, axis=0)

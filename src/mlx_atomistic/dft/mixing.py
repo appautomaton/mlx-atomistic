@@ -21,9 +21,7 @@ class _MixerCheckpointState:
 
 
 def _owned_float32(values: mx.array) -> mx.array:
-    copied = (mx.array(values).astype(mx.float32) + mx.zeros_like(values)).astype(
-        mx.float32
-    )
+    copied = (mx.array(values).astype(mx.float32) + mx.zeros_like(values)).astype(mx.float32)
     mx.eval(copied)
     return copied
 
@@ -103,6 +101,16 @@ class PulayDIISMixer:
         self._residuals.clear()
         self._last_coefficients = []
 
+    def _restart_from_linear(
+        self,
+        candidate: mx.array,
+        residual: mx.array,
+    ) -> mx.array:
+        self._densities = [candidate]
+        self._residuals = [residual]
+        self._last_coefficients = [1.0]
+        return candidate
+
     def mix(self, current: mx.array, target: mx.array) -> mx.array:
         """Return a DIIS-mixed density, falling back to linear mixing early on."""
 
@@ -111,10 +119,7 @@ class PulayDIISMixer:
         if current_values.shape != target_values.shape:
             msg = "DIIS current and target densities must have matching shapes"
             raise ValueError(msg)
-        linear = (
-            (1.0 - self.beta) * current_values
-            + self.beta * target_values
-        ).astype(mx.float32)
+        linear = ((1.0 - self.beta) * current_values + self.beta * target_values).astype(mx.float32)
         residual = (target_values - current_values).astype(mx.float32)
         candidate = mx.array(linear)
         # History is runtime-owned device state rather than a lazy alias of a
@@ -152,12 +157,12 @@ class PulayDIISMixer:
         try:
             solution = np.linalg.solve(matrix, rhs)
         except np.linalg.LinAlgError:
-            self._last_coefficients = [1.0]
-            return candidate
+            return self._restart_from_linear(candidate, residual)
         if not np.all(np.isfinite(solution)):
-            self._last_coefficients = [1.0]
-            return candidate
+            return self._restart_from_linear(candidate, residual)
         coefficients = solution[:count]
+        if np.max(np.abs(coefficients), initial=0.0) > np.finfo(np.float32).max:
+            return self._restart_from_linear(candidate, residual)
         coefficient_shape = (count,) + (1,) * len(current_values.shape)
         device_coefficients = mx.reshape(
             mx.array(coefficients.astype(np.float32)),
@@ -167,6 +172,12 @@ class PulayDIISMixer:
             device_coefficients * mx.stack(self._densities, axis=0),
             axis=0,
         ).astype(mx.float32)
+        minimum = mx.min(mixed)
+        positive_mass = mx.sum(mx.maximum(mixed, 0.0))
+        valid = mx.all(mx.isfinite(mixed)) & mx.isfinite(minimum) & mx.isfinite(positive_mass)
+        mx.eval(mixed, minimum, positive_mass, valid)
+        if not bool(valid) or float(minimum) < 0.0 or float(positive_mass) <= 0.0:
+            return self._restart_from_linear(candidate, residual)
         self._last_coefficients = [float(value) for value in coefficients]
         return mixed
 

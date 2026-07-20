@@ -20,6 +20,7 @@ from mlx_atomistic.dft import (
     PseudopotentialFormat,
     RealSpaceGrid,
     ReciprocalGrid,
+    XCResult,
     run_periodic_scf,
 )
 from mlx_atomistic.dft._compact import _CompactBatch
@@ -35,6 +36,7 @@ from mlx_atomistic.dft.periodic_scf import (
     _density_from_kpoints,
     _initial_coefficients,
     _plan_compact_submissions,
+    _stable_compact_capacity_groups,
 )
 from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
 
@@ -146,6 +148,17 @@ def _paired_scf_problem(
     return system, mesh, config
 
 
+def test_default_batch_and_projector_cache_policy_stays_bounded():
+    config = PeriodicSCFConfig()
+
+    assert config.batch_policy() == {
+        "kpoint_batch_size": 6,
+        "max_batch_padding_fraction": 0.25,
+        "max_batch_transient_bytes": 512 * 1024 * 1024,
+    }
+    assert _GTHProjectorCache.DEFAULT_BUDGET_BYTES == 256 * 1024 * 1024
+
+
 def test_compact_hpsi_batches_ragged_lanes_with_one_fft_pair(monkeypatch):
     first, second = _bases()
     states = (_state(first, seed=10), _state(second, seed=11))
@@ -156,8 +169,7 @@ def test_compact_hpsi_batches_ragged_lanes_with_one_fft_pair(monkeypatch):
         for basis in (first, second)
     )
     expected = tuple(
-        operator._apply_compact(state)
-        for operator, state in zip(operators, states, strict=True)
+        operator._apply_compact(state) for operator, state in zip(operators, states, strict=True)
     )
     observer = RuntimeObserver()
     observed_operators = tuple(
@@ -212,9 +224,71 @@ def test_compact_hpsi_batches_ragged_lanes_with_one_fft_pair(monkeypatch):
     assert work["hpsi_calls"] == 1
     assert work["fft_submissions"] == 2
     assert work["fft_vector_equivalents"] == 8
-    assert work["padding_elements"] == abs(
-        first.active_count - second.active_count
+    assert work["padding_elements"] == abs(first.active_count - second.active_count)
+
+
+def test_compact_hpsi_stable_capacity_masks_lane_vector_and_active_padding():
+    first, second = _bases()
+    states = (
+        _state(first, vectors=1, seed=112),
+        _state(second, vectors=2, seed=113),
     )
+    potential = mx.full(first.grid.shape, 0.35, dtype=mx.float32)
+    mx.eval(potential)
+    operators = tuple(
+        PeriodicKohnShamOperator._from_shared_potential(basis, potential)
+        for basis in (first, second)
+    )
+    expected = tuple(
+        operator._apply_compact(state) for operator, state in zip(operators, states, strict=True)
+    )
+    active_capacity = max(first.active_count, second.active_count)
+    prepared = _CompactBatch.from_states(
+        states,
+        lane_capacity=3,
+        vector_capacity=2,
+        active_capacity=active_capacity,
+    )
+    observer = RuntimeObserver()
+
+    outcome = PeriodicKohnShamOperator._apply_compact_batch(
+        tuple(
+            PeriodicKohnShamOperator._from_shared_potential(
+                basis,
+                potential,
+                observer=observer,
+            )
+            for basis in (first, second)
+        ),
+        states,
+        observer=observer,
+        prepared_batch=prepared,
+    )
+
+    assert not outcome.failures
+    assert outcome.batch is prepared
+    assert prepared.values.shape == (3, 2, active_capacity)
+    assert prepared.lane_count == 2
+    assert prepared.lane_capacity == 3
+    assert prepared.vector_counts == (1, 2)
+    assert prepared.lane_padding_elements == 2 * active_capacity
+    assert prepared.vector_padding_elements == active_capacity
+    np.testing.assert_array_equal(
+        np.asarray(prepared.values[2]),
+        np.zeros((2, active_capacity), dtype=np.complex64),
+    )
+    for index, reference in enumerate(expected):
+        observed = outcome.action_for(index)
+        assert observed.values.shape == reference.values.shape
+        np.testing.assert_allclose(
+            np.asarray(observed.values),
+            np.asarray(reference.values),
+            atol=3e-6,
+        )
+    work = observer.snapshot()["work_counters"]
+    assert work["hpsi_calls"] == 1
+    assert work["hpsi_vector_equivalents"] == 3
+    assert work["fft_vector_equivalents"] == 6
 
 
 def test_compact_submission_planner_respects_byte_and_padding_bounds():
@@ -266,6 +340,53 @@ def test_compact_submission_planner_respects_byte_and_padding_bounds():
     ]
 
 
+def test_stable_capacity_groups_split_only_when_padding_bound_requires_it():
+    first, second = _bases()
+    nearby_states = (
+        _state(first, vectors=1, seed=114),
+        _state(second, vectors=1, seed=115),
+    )
+    nearby = _stable_compact_capacity_groups(
+        nearby_states,
+        range(2),
+        lane_capacity=2,
+        vector_capacity=1,
+        max_padding_fraction=0.25,
+    )
+
+    assert len(nearby) == 1
+    assert nearby[0][0] == tuple(
+        sorted(range(2), key=lambda index: nearby_states[index].layout.active_count)
+    )
+    assert nearby[0][1].active == max(state.layout.active_count for state in nearby_states)
+
+    narrow = PlaneWaveBasis.from_reduced_kpoint(
+        first.grid,
+        0.5,
+        (0.0, 0.0, 0.0),
+        reciprocal_grid=first.reciprocal_grid,
+        lane_label="batch:stable-narrow",
+    )
+    wide_states = (
+        _state(narrow, vectors=1, seed=116),
+        _state(second, vectors=1, seed=117),
+    )
+    split = _stable_compact_capacity_groups(
+        wide_states,
+        range(2),
+        lane_capacity=2,
+        vector_capacity=1,
+        max_padding_fraction=0.25,
+    )
+
+    assert len(split) == 2
+    assert [indices for indices, _capacity in split] == [(0,), (1,)]
+    assert [capacity.active for _indices, capacity in split] == [
+        narrow.active_count,
+        second.active_count,
+    ]
+
+
 def test_gth_projectors_use_one_k_batched_matrix_path_and_batch_cache_guard(
     monkeypatch,
 ):
@@ -289,9 +410,7 @@ def test_gth_projectors_use_one_k_batched_matrix_path_and_batch_cache_guard(
             )._apply_compact(state)
         )
 
-    cache = _GTHProjectorCache(
-        byte_budget=max(first.active_count, second.active_count) * 8
-    )
+    cache = _GTHProjectorCache(byte_budget=max(first.active_count, second.active_count) * 8)
     observer = RuntimeObserver()
     potential = mx.full(first.grid.shape, 0.2)
     mx.eval(potential)
@@ -382,12 +501,11 @@ def test_gth_projectors_use_one_k_batched_matrix_path_and_batch_cache_guard(
     assert cache.current_bytes <= cache.byte_budget
     work = observer.snapshot()["work_counters"]
     assert work["projector_cache_misses"] == 2
-    assert work["projector_elements_generated"] == (
-        first.active_count + second.active_count
+    assert work["projector_elements_generated"] == (first.active_count + second.active_count)
+    assert (
+        observer.snapshot()["memory"]["projector_payload_bytes"]
+        == (first.active_count + second.active_count) * 8
     )
-    assert observer.snapshot()["memory"]["projector_payload_bytes"] == (
-        first.active_count + second.active_count
-    ) * 8
 
     cache.close()
     for gth in reference_gth:
@@ -435,9 +553,7 @@ def test_batched_davidson_keeps_divergent_lane_restart_and_convergence_local():
     first, second = _bases()
     observer = RuntimeObserver()
     coordinates = first.grid.coordinates()
-    potential = 0.3 * mx.cos(
-        2.0 * np.pi * coordinates[..., 0] / first.grid.lengths[0]
-    )
+    potential = 0.3 * mx.cos(2.0 * np.pi * coordinates[..., 0] / first.grid.lengths[0])
     mx.eval(potential)
     operators = tuple(
         PeriodicKohnShamOperator._from_shared_potential(
@@ -473,9 +589,7 @@ def test_batched_davidson_keeps_divergent_lane_restart_and_convergence_local():
             observer=observer,
         ),
     )
-    outcome = _DavidsonEngine(
-        scheduler=_DavidsonScheduler(batch_cap=2)
-    ).solve(requests)
+    outcome = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=2)).solve(requests)
 
     assert not outcome.failures
     assert outcome.result_for("fast").converged
@@ -484,10 +598,11 @@ def test_batched_davidson_keeps_divergent_lane_restart_and_convergence_local():
     assert outcome.result_for("slow").iterations == 4
     assert outcome.result_for("slow").restart_count > 0
     assert outcome.ready_rounds[0] == ("fast", "slow")
-    assert outcome.submission_groups[0] == ("fast", "slow")
-    assert all(
-        group == ("slow",) for group in outcome.submission_groups[1:]
+    assert outcome.submission_groups[:2] == (
+        ("fast", "slow"),
+        ("fast", "slow"),
     )
+    assert all(group == ("slow",) for group in outcome.submission_groups[2:])
 
 
 def test_density_batch_one_and_many_have_the_same_ordered_sum():
@@ -553,6 +668,117 @@ def test_pulay_diis_only_moves_the_small_gram_matrix_to_numpy(monkeypatch):
     assert all(isinstance(values, array_type) for values in mixer._densities)
     assert all(isinstance(values, array_type) for values in mixer._residuals)
     assert np.isfinite(np.asarray(second)).all()
+
+
+def test_pulay_diis_restarts_when_coefficients_exceed_float32(monkeypatch):
+    mixer = PulayDIISMixer(beta=0.4)
+    current = mx.full((4, 4, 4), 0.2, dtype=mx.float32)
+    first_target = current + 0.01
+    first = mixer.mix(current, first_target)
+    second_target = first + 0.02
+    expected = (0.6 * first + 0.4 * second_target).astype(mx.float32)
+
+    monkeypatch.setattr(
+        np.linalg,
+        "solve",
+        lambda matrix, rhs: np.array([1e300, -1e300, 0.0]),
+    )
+    second = mixer.mix(first, second_target)
+
+    np.testing.assert_allclose(np.asarray(second), np.asarray(expected), atol=1e-7)
+    assert mixer.metadata()["stored"] == 1
+    assert mixer.metadata()["last_coefficients"] == [1.0]
+
+
+def test_pulay_diis_restarts_when_combination_has_no_positive_mass(monkeypatch):
+    mixer = PulayDIISMixer(beta=0.4)
+    high = mx.full((4, 4, 4), 10.0, dtype=mx.float32)
+    low = mx.full((4, 4, 4), 1.0, dtype=mx.float32)
+    mixer.mix(high, high)
+
+    monkeypatch.setattr(
+        np.linalg,
+        "solve",
+        lambda matrix, rhs: np.array([-1.0, 2.0, 0.0]),
+    )
+    mixed = mixer.mix(low, low)
+
+    np.testing.assert_array_equal(np.asarray(mixed), np.asarray(low))
+    assert mixer.metadata()["stored"] == 1
+    assert mixer.metadata()["last_coefficients"] == [1.0]
+
+
+def test_pulay_diis_restarts_when_combination_has_mixed_signs(monkeypatch):
+    mixer = PulayDIISMixer(beta=0.4)
+    first = mx.array([10.0, 1.0], dtype=mx.float32)
+    second = mx.array([1.0, 10.0], dtype=mx.float32)
+    mixer.mix(first, first)
+
+    monkeypatch.setattr(
+        np.linalg,
+        "solve",
+        lambda matrix, rhs: np.array([2.0, -1.0, 0.0]),
+    )
+    mixed = mixer.mix(second, second)
+
+    np.testing.assert_array_equal(np.asarray(mixed), np.asarray(second))
+    assert mixer.metadata()["stored"] == 1
+    assert mixer.metadata()["last_coefficients"] == [1.0]
+
+
+def test_pulay_diis_restarts_when_finite_coefficients_overflow_product(monkeypatch):
+    mixer = PulayDIISMixer(beta=0.4)
+    maximum = np.finfo(np.float32).max
+    high = mx.array([float(maximum)], dtype=mx.float32)
+    low = mx.array([1.0], dtype=mx.float32)
+    mixer.mix(high, high)
+
+    monkeypatch.setattr(
+        np.linalg,
+        "solve",
+        lambda matrix, rhs: np.array([2.0, -1.0, 0.0]),
+    )
+    mixed = mixer.mix(low, low)
+
+    np.testing.assert_array_equal(np.asarray(mixed), np.asarray(low))
+    assert mixer.metadata()["stored"] == 1
+    assert mixer.metadata()["last_coefficients"] == [1.0]
+
+
+def test_periodic_scf_rejects_nonfinite_xc_before_hpsi():
+    system, mesh, config = _paired_scf_problem(batch_size=2)
+    observer = RuntimeObserver(synchronize=mx.synchronize)
+
+    class NonFiniteXC:
+        name = "non-finite-test-xc"
+
+        def evaluate(self, density, grid=None, *, density_floor=1e-12):
+            del density_floor
+            assert grid is not None
+            return XCResult(
+                name=self.name,
+                energy_density=mx.zeros_like(density),
+                potential=mx.full(grid.shape, float("nan")),
+                total_energy=mx.array(0.0),
+            )
+
+    with pytest.raises(
+        ValueError,
+        match="SCF exchange-correlation result is non-finite",
+    ):
+        run_periodic_scf(
+            system,
+            cutoff_hartree=2.5,
+            kpoint_mesh=mesh,
+            n_bands=1,
+            config=config,
+            xc_functional=NonFiniteXC(),
+            observer=observer,
+        )
+
+    snapshot = observer.snapshot()
+    assert snapshot["work_counters"]["hpsi_calls"] == 0
+    assert not any(event["event"] == "kpoint_batch" for event in snapshot["events"])
 
 
 def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
@@ -621,9 +847,7 @@ def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
     metadata = json.loads(serialize_periodic_scf_state(batched)["metadata.json"])
     assert metadata["batch_policy"] == batched.batch_policy
     events = [
-        event
-        for event in batched_observer.snapshot()["events"]
-        if event["event"] == "kpoint_batch"
+        event for event in batched_observer.snapshot()["events"] if event["event"] == "kpoint_batch"
     ]
     assert events
     assert [event["status"] for event in events].count("started") == [
@@ -632,22 +856,17 @@ def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
     assert any(event["batch_size"] == 2 for event in events)
     assert all("padding_elements" in event for event in events)
     assert all(
-        event["estimated_transient_bytes"]
-        >= event["compact_batch_transient_bytes"]
+        event["estimated_transient_bytes"] >= event["compact_batch_transient_bytes"]
         for event in events
     )
     assert all(
-        event["estimated_transient_bytes"]
-        <= event["batch_policy"]["max_batch_transient_bytes"]
+        event["estimated_transient_bytes"] <= event["batch_policy"]["max_batch_transient_bytes"]
         for event in events
     )
     singleton_work = singleton_observer.snapshot()["work_counters"]
     batched_work = batched_observer.snapshot()["work_counters"]
     assert batched_work["hpsi_calls"] < singleton_work["hpsi_calls"]
-    assert (
-        batched_work["hpsi_vector_equivalents"]
-        == singleton_work["hpsi_vector_equivalents"]
-    )
+    assert batched_work["hpsi_vector_equivalents"] == singleton_work["hpsi_vector_equivalents"]
     assert batched_work["fft_submissions"] < singleton_work["fft_submissions"]
 
 
