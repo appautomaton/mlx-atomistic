@@ -144,6 +144,15 @@ def _execution_context(
                 "mixer": calculation["config"]["mixer"],
                 "mixing_beta": calculation["config"]["mixing_beta"],
                 "orbital_tolerance": calculation["config"]["orbital_tolerance"],
+                "adaptive_eigensolver_tolerance": calculation["config"][
+                    "adaptive_eigensolver_tolerance"
+                ],
+                "initial_eigensolver_tolerance": calculation["config"][
+                    "initial_eigensolver_tolerance"
+                ],
+                "eigensolver_tolerance_scale": calculation["config"][
+                    "eigensolver_tolerance_scale"
+                ],
             },
         },
         "initialization": periodic_scf_initialization_identity(
@@ -237,8 +246,15 @@ def _republish_checkpoint(
         return generation.publish()
 
 
-def _run_to_checkpoint(tmp_path: Path, *, mixer: str = "diis"):
+def _run_to_checkpoint(tmp_path: Path, *, mixer: str = "diis", adaptive: bool = False):
     system, mesh, config = _problem(mixer=mixer)
+    if adaptive:
+        config = replace(
+            config,
+            adaptive_eigensolver_tolerance=True,
+            initial_eigensolver_tolerance=5e-2,
+            eigensolver_tolerance_scale=0.1,
+        )
     context = _execution_context(system, mesh, config)
     destination = tmp_path / f"{mixer}-checkpoint"
     partial = run_periodic_scf_checkpointed(
@@ -255,11 +271,15 @@ def _run_to_checkpoint(tmp_path: Path, *, mixer: str = "diis"):
     return system, mesh, config, context, destination, partial
 
 
-@pytest.mark.parametrize("mixer", ["linear", "diis"])
-def test_resume_trajectory_equivalence_and_timing_admission(tmp_path, mixer):
+@pytest.mark.parametrize(
+    ("mixer", "adaptive"),
+    [("linear", False), ("diis", False), ("diis", True)],
+)
+def test_resume_trajectory_equivalence_and_timing_admission(tmp_path, mixer, adaptive):
     system, mesh, config, context, checkpoint, partial = _run_to_checkpoint(
         tmp_path,
         mixer=mixer,
+        adaptive=adaptive,
     )
     uninterrupted = run_periodic_scf(
         system,

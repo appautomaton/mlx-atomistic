@@ -629,7 +629,7 @@ def _fixed_density_sample(
     if track_metal_memory:
         mx.synchronize()
         mx.reset_peak_memory()
-    observer = RuntimeObserver(callback=progress, synchronize=mx.synchronize)
+    observer = RuntimeObserver(callback=progress)
     wall_start = time.perf_counter()
     try:
         observer.emit("setup", status="started", stage="fixed_density")
@@ -993,12 +993,29 @@ def _baseline_structure_audit(
             observation.get("events", []) if isinstance(observation, Mapping) else []
         )
         widths = [
-            int(event["subspace_size"])
+            int(
+                event.get(
+                    "subspace_size",
+                    event.get("maximum_subspace_size", 0),
+                )
+            )
             for event in events
             if isinstance(event, Mapping)
-            and event.get("event") == "davidson_iteration"
-            and type(event.get("subspace_size")) is int
-            and int(event["subspace_size"]) > 0
+            and event.get("event") in {"davidson_iteration", "davidson_round"}
+            and type(
+                event.get(
+                    "subspace_size",
+                    event.get("maximum_subspace_size"),
+                )
+            )
+            is int
+            and int(
+                event.get(
+                    "subspace_size",
+                    event.get("maximum_subspace_size", 0),
+                )
+            )
+            > 0
         ]
         maximum_width = max([band_count, *widths])
         hpsi_vectors = sample_work.get("hpsi_vector_equivalents")
@@ -2350,7 +2367,7 @@ def _full_scf_science(
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
     from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
 
-    observer = RuntimeObserver(callback=progress, synchronize=mx.synchronize)
+    observer = RuntimeObserver(callback=progress, detail_events=False)
     start = time.perf_counter()
     try:
         observer.emit("setup", status="started", stage="full_scf_worker")
@@ -2395,6 +2412,15 @@ def _full_scf_science(
                 orbital_tolerance=float(scf["orbital_tolerance"]),
                 mixing_beta=float(scf["mixing_beta"]),
                 mixer=str(scf["mixer"]),
+                adaptive_eigensolver_tolerance=bool(
+                    scf["adaptive_eigensolver_tolerance"]
+                ),
+                initial_eigensolver_tolerance=float(
+                    scf["initial_eigensolver_tolerance"]
+                ),
+                eigensolver_tolerance_scale=float(
+                    scf["eigensolver_tolerance_scale"]
+                ),
                 davidson=_davidson_config(manifest),
             )
         observer.emit("setup", status="completed", stage="full_scf_worker")

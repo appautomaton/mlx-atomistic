@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import mlx.core as mx
 import numpy as np
@@ -35,7 +36,9 @@ from mlx_atomistic.dft.periodic_scf import (
     _DavidsonScheduler,
     _density_from_kpoints,
     _initial_coefficients,
+    _next_scf_eigensolver_tolerance,
     _plan_compact_submissions,
+    _scf_eigensolver_tolerance,
     _stable_compact_capacity_groups,
 )
 from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
@@ -151,12 +154,98 @@ def _paired_scf_problem(
 def test_default_batch_and_projector_cache_policy_stays_bounded():
     config = PeriodicSCFConfig()
 
+    assert config.adaptive_eigensolver_tolerance is False
     assert config.batch_policy() == {
-        "kpoint_batch_size": 6,
+        "kpoint_batch_size": 8,
         "max_batch_padding_fraction": 0.25,
         "max_batch_transient_bytes": 512 * 1024 * 1024,
     }
     assert _GTHProjectorCache.DEFAULT_BUDGET_BYTES == 256 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("adaptive_eigensolver_tolerance", 1, "must be a bool"),
+        ("initial_eigensolver_tolerance", 0.0, "finite and positive"),
+        ("initial_eigensolver_tolerance", float("nan"), "finite and positive"),
+        ("eigensolver_tolerance_scale", False, "finite and positive"),
+        ("eigensolver_tolerance_scale", float("inf"), "finite and positive"),
+    ],
+)
+def test_adaptive_eigensolver_controls_reject_malformed_values(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        PeriodicSCFConfig(**{field: value})
+
+
+def test_adaptive_eigensolver_tolerance_is_monotone_and_strictly_floored():
+    config = PeriodicSCFConfig(
+        adaptive_eigensolver_tolerance=True,
+        initial_eigensolver_tolerance=1e-2,
+        eigensolver_tolerance_scale=0.1,
+        davidson=PeriodicDavidsonConfig(tolerance=1e-6),
+    )
+    history = [
+        {"eigensolver_tolerance": 1e-2, "density_residual": 1.0},
+        {"eigensolver_tolerance": 3.125e-3, "density_residual": 0.1},
+        {"eigensolver_tolerance": 3.125e-4, "density_residual": 1e-8},
+    ]
+
+    assert _scf_eigensolver_tolerance(config, history, 32.0) == pytest.approx(1e-6)
+    assert _next_scf_eigensolver_tolerance(config, 1e-4, 1.0, 32.0) == 1e-4
+    assert _next_scf_eigensolver_tolerance(config, 1e-4, 0.0, 32.0) == 1e-6
+
+
+def test_adaptive_eigensolver_resume_requires_an_exact_recorded_schedule():
+    config = PeriodicSCFConfig(
+        adaptive_eigensolver_tolerance=True,
+        davidson=PeriodicDavidsonConfig(tolerance=1e-6),
+    )
+
+    with pytest.raises(ValueError, match="malformed tolerance schedule"):
+        _scf_eigensolver_tolerance(config, [{"density_residual": 0.1}], 32.0)
+    with pytest.raises(ValueError, match="inconsistent tolerance schedule"):
+        _scf_eigensolver_tolerance(
+            config,
+            [{"eigensolver_tolerance": 1e-3, "density_residual": 0.1}],
+            32.0,
+        )
+
+
+def test_adaptive_scf_records_the_tolerance_and_keeps_the_strict_final_gate():
+    system, mesh, fixed = _paired_scf_problem(batch_size=2)
+    config = replace(
+        fixed,
+        adaptive_eigensolver_tolerance=True,
+        initial_eigensolver_tolerance=5e-2,
+        eigensolver_tolerance_scale=0.1,
+    )
+    observer = RuntimeObserver(detail_events=False)
+
+    result = run_periodic_scf(
+        system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=mesh,
+        n_bands=1,
+        config=config,
+        observer=observer,
+    )
+
+    tolerances = [float(row["eigensolver_tolerance"]) for row in result.history]
+    assert tolerances[0] == 5e-2
+    assert tolerances == sorted(tolerances, reverse=True)
+    assert all(value >= config.davidson.tolerance for value in tolerances)
+    assert result.converged
+    assert max(point.eigen.residuals.item() for point in result.kpoints) <= (
+        config.orbital_tolerance
+    )
+    iteration_events = [
+        event
+        for event in observer.snapshot()["events"]
+        if event["event"] == "scf_iteration"
+    ]
+    assert [event["eigensolver_tolerance"] for event in iteration_events[::2]] == tolerances
+    assert [event["eigensolver_tolerance"] for event in iteration_events[1::2]] == tolerances
 
 
 def test_compact_hpsi_batches_ragged_lanes_with_one_fft_pair(monkeypatch):

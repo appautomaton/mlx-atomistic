@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 
 import mlx.core as mx
@@ -67,6 +67,43 @@ def _is_finite_positive_control(value: object) -> bool:
         and np.isfinite(float(value))
         and float(value) > 0.0
     )
+
+
+def _materialize(
+    observer: RuntimeObserver | None,
+    *values: mx.array,
+) -> None:
+    """Evaluate one intentional device boundary and account for it."""
+
+    if not values:
+        return
+    add_observed_work(
+        observer,
+        {
+            "device_materializations": 1,
+            "device_materialized_arrays": len(values),
+        },
+    )
+    mx.eval(*values)
+
+
+def _to_numpy(
+    values: mx.array,
+    *,
+    dtype: np.dtype | type,
+    observer: RuntimeObserver | None,
+) -> np.ndarray:
+    """Cross one already-bounded MLX array to NumPy with telemetry."""
+
+    _materialize(observer, values)
+    add_observed_work(
+        observer,
+        {
+            "cpu_bridge_calls": 1,
+            "cpu_bridge_elements": int(np.prod(values.shape)),
+        },
+    )
+    return np.asarray(values, dtype=dtype)
 
 
 def _time_reversed_compact_values(
@@ -148,7 +185,7 @@ class PeriodicDavidsonConfig:
     max_iterations: int = 30
     tolerance: float = 1e-5
     max_subspace_size: int = 64
-    preconditioner_floor: float = 0.5
+    preconditioner_floor: float = 0.25
 
     def __post_init__(self) -> None:
         if type(self.max_iterations) is not int or self.max_iterations <= 0:
@@ -177,9 +214,12 @@ class PeriodicSCFConfig:
     mixing_beta: float = 0.35
     mixer: str = "diis"
     davidson: PeriodicDavidsonConfig = field(default_factory=PeriodicDavidsonConfig)
-    kpoint_batch_size: int = 6
+    kpoint_batch_size: int = 8
     max_batch_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
     max_batch_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
+    adaptive_eigensolver_tolerance: bool = False
+    initial_eigensolver_tolerance: float = 1e-2
+    eigensolver_tolerance_scale: float = 0.1
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -199,6 +239,24 @@ class PeriodicSCFConfig:
             raise ValueError(msg)
         if self.mixer not in {"linear", "diis"}:
             msg = "mixer must be 'linear' or 'diis'"
+            raise ValueError(msg)
+        if type(self.adaptive_eigensolver_tolerance) is not bool:
+            msg = "adaptive_eigensolver_tolerance must be a bool"
+            raise ValueError(msg)
+        if not _is_finite_positive_control(self.initial_eigensolver_tolerance):
+            msg = "initial_eigensolver_tolerance must be finite and positive"
+            raise ValueError(msg)
+        if not _is_finite_positive_control(self.eigensolver_tolerance_scale):
+            msg = "eigensolver_tolerance_scale must be finite and positive"
+            raise ValueError(msg)
+        if (
+            self.adaptive_eigensolver_tolerance
+            and self.initial_eigensolver_tolerance < self.davidson.tolerance
+        ):
+            msg = (
+                "initial_eigensolver_tolerance must not be tighter than the "
+                "final Davidson tolerance"
+            )
             raise ValueError(msg)
         if type(self.kpoint_batch_size) is not int or self.kpoint_batch_size <= 0:
             msg = "kpoint_batch_size must be a positive non-bool integer"
@@ -223,6 +281,56 @@ class PeriodicSCFConfig:
             "max_batch_padding_fraction": float(self.max_batch_padding_fraction),
             "max_batch_transient_bytes": self.max_batch_transient_bytes,
         }
+
+
+def _next_scf_eigensolver_tolerance(
+    config: PeriodicSCFConfig,
+    current_tolerance: float,
+    density_residual: float,
+    electron_count: float,
+) -> float:
+    if not config.adaptive_eigensolver_tolerance:
+        return float(config.davidson.tolerance)
+    return max(
+        float(config.davidson.tolerance),
+        min(
+            float(current_tolerance),
+            float(config.eigensolver_tolerance_scale)
+            * float(density_residual)
+            / max(1.0, float(electron_count)),
+        ),
+    )
+
+
+def _scf_eigensolver_tolerance(
+    config: PeriodicSCFConfig,
+    history: Sequence[Mapping[str, object]],
+    electron_count: float,
+) -> float:
+    if not config.adaptive_eigensolver_tolerance:
+        return float(config.davidson.tolerance)
+    tolerance = float(config.initial_eigensolver_tolerance)
+    for row in history:
+        recorded = row.get("eigensolver_tolerance")
+        residual = row.get("density_residual")
+        if not _is_finite_positive_control(recorded) or not (
+            not isinstance(residual, (bool, np.bool_))
+            and isinstance(residual, (int, float, np.integer, np.floating))
+            and np.isfinite(float(residual))
+            and float(residual) >= 0.0
+        ):
+            msg = "adaptive periodic resume history has a malformed tolerance schedule"
+            raise ValueError(msg)
+        if not np.isclose(float(recorded), tolerance, rtol=1e-12, atol=0.0):
+            msg = "adaptive periodic resume history has an inconsistent tolerance schedule"
+            raise ValueError(msg)
+        tolerance = _next_scf_eigensolver_tolerance(
+            config,
+            tolerance,
+            float(residual),
+            electron_count,
+        )
+    return tolerance
 
 
 @dataclass(frozen=True)
@@ -807,7 +915,10 @@ class PeriodicKohnShamOperator:
                                     [operators[index].nonlocal_operator for index in gth_indices],
                                     gth_states,
                                     batch=gth_batch,
-                                    evaluate=True,
+                                    # The combined Hpsi result is materialized
+                                    # below; evaluating this contribution alone
+                                    # would add a redundant device barrier.
+                                    evaluate=False,
                                 )
                             )
                         except Exception:
@@ -929,7 +1040,11 @@ class PeriodicKohnShamOperator:
                         kind="hamiltonian_action",
                     )
                     finite = [mx.all(mx.isfinite(state.values)) for state in states]
-                    mx.eval(*(state.values for state in states), *finite)
+                    _materialize(
+                        runtime_observer,
+                        *(state.values for state in states),
+                        *finite,
+                    )
                     actions = {}
                     for lane_index, state, is_finite in zip(
                         ready_indices,
@@ -1137,7 +1252,7 @@ class _Complex64RankPolicy:
         self,
         stack: mx.array,
         *,
-        original_norms: np.ndarray,
+        candidate_norms: mx.array,
         locked_count: int,
         required_count: int,
         limit: int,
@@ -1164,15 +1279,29 @@ class _Complex64RankPolicy:
             candidate_values = candidate_values - mx.transpose(overlaps) @ locked_values
             candidate_transforms = candidate_transforms - mx.transpose(overlaps) @ locked_transforms
 
-        candidate_norms = original_norms[locked_count:retained_count]
-        if not np.all(np.isfinite(candidate_norms)) or np.any(candidate_norms <= 0.0):
-            return None
-        scale = mx.array(candidate_norms.astype(np.float32))[:, None]
+        norms = mx.array(candidate_norms).astype(mx.float32)
+        if norms.shape != (input_count - locked_count,):
+            msg = "Davidson candidate norms must match the unlocked row count"
+            raise ValueError(msg)
+        norms = norms[:candidate_count]
+        norms_valid = mx.all(mx.isfinite(norms)) & mx.all(norms > 0.0)
+        scale = norms[:, None]
         candidate_values = candidate_values / scale
         candidate_transforms = candidate_transforms / scale
 
-        def cholesky_step(values: mx.array) -> tuple[mx.array, np.ndarray] | None:
+        def cholesky_step(
+            values: mx.array,
+            *,
+            additional_validity: mx.array | None = None,
+        ) -> tuple[mx.array, np.ndarray] | None:
             gram = values @ mx.conjugate(mx.transpose(values))
+            if additional_validity is not None:
+                # Materialize the norm guard with the Gram matrix. The common
+                # fast path therefore crosses to the CPU once, not once for
+                # norms and again for the small Cholesky factorization.
+                mx.eval(gram, additional_validity)
+                if not bool(additional_validity):
+                    return None
             gram_np = np.asarray(gram, dtype=np.complex64).astype(np.complex128)
             if not np.all(np.isfinite(gram_np)):
                 return None
@@ -1189,7 +1318,10 @@ class _Complex64RankPolicy:
                 return None
             return mx.array(solve.astype(np.complex64)), lower
 
-        first = cholesky_step(candidate_values)
+        first = cholesky_step(
+            candidate_values,
+            additional_validity=norms_valid,
+        )
         if first is None:
             return None
         first_solve, first_lower = first
@@ -1315,6 +1447,17 @@ class _Complex64RankPolicy:
         candidate_norms = mx.sqrt(
             mx.real(mx.sum(mx.conjugate(candidate_stack) * candidate_stack, axis=1))
         )
+
+        batched = self._try_batched_choleskyqr2(
+            stack,
+            candidate_norms=candidate_norms,
+            locked_count=locked_count,
+            required_count=required_count,
+            limit=limit,
+        )
+        if batched is not None:
+            return batched
+
         candidate_norms_np = np.asarray(candidate_norms, dtype=np.float32)
         if not np.all(np.isfinite(candidate_norms_np)):
             msg = "Davidson rank input must be finite"
@@ -1323,16 +1466,6 @@ class _Complex64RankPolicy:
         original_norms_np[locked_count:] = candidate_norms_np
 
         accepted_values = stack[:locked_count]
-
-        batched = self._try_batched_choleskyqr2(
-            stack,
-            original_norms=original_norms_np,
-            locked_count=locked_count,
-            required_count=required_count,
-            limit=limit,
-        )
-        if batched is not None:
-            return batched
 
         identity = mx.eye(input_count, dtype=mx.float32).astype(mx.complex64)
         accepted_transforms = identity[:locked_count]
@@ -1945,6 +2078,18 @@ class _DavidsonScheduler:
                     ),
                     active_capacity=(None if planned.capacity is None else planned.capacity.active),
                 )
+                complete_transient_bytes = (
+                    PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                        [ticket.operator for ticket in submission],
+                        prepared_batch,
+                    )
+                )
+                runtime_observer = self._observer(submission[0])
+                if runtime_observer is not None:
+                    runtime_observer.record_peak_memory(
+                        "peak_temporary_bytes",
+                        complete_transient_bytes,
+                    )
                 lane_ids = tuple(ticket.lane_id for ticket in submission)
                 groups.append(lane_ids)
                 submission_index = self._submission_index
@@ -2054,9 +2199,8 @@ class _PairedDavidsonState:
         if matrix.shape != (width, width):
             msg = "Davidson projected matrix must match the paired width"
             raise ValueError(msg)
-        if not _all_finite(matrix):
-            msg = "Davidson projected matrix must be finite"
-            raise ValueError(msg)
+        # Finiteness is checked collectively at the Rayleigh-Ritz boundary.
+        # Materializing here would serialize every lane after each append.
         object.__setattr__(self, "projected", matrix)
 
     @classmethod
@@ -2185,15 +2329,42 @@ class _DavidsonRitzPair:
     transform: mx.array
 
 
+@dataclass(frozen=True)
+class _DavidsonRitzCandidate:
+    """Lazy Ritz data awaiting one collective finite/residual materialization."""
+
+    eigenvalues: mx.array
+    vectors: _CompactLaneState
+    applied: _CompactLaneState
+    residual_stack: mx.array
+    residuals: mx.array
+    max_residual: mx.array
+    finite: mx.array
+    transform: mx.array
+
+
+def _ritz_residual_arrays(
+    eigenvalues: mx.array,
+    vectors: _CompactLaneState,
+    applied: _CompactLaneState,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    residual_stack = applied.values - eigenvalues[:, None] * vectors.values
+    residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=1))
+    max_residual = mx.max(residuals)
+    finite = mx.all(mx.isfinite(eigenvalues)) & mx.all(mx.isfinite(residuals))
+    return residual_stack, residuals, max_residual, finite
+
+
 def _ritz_residual_data(
     eigenvalues: mx.array,
     vectors: _CompactLaneState,
     applied: _CompactLaneState,
 ) -> tuple[mx.array, mx.array, float]:
-    residual_stack = applied.values - eigenvalues[:, None] * vectors.values
-    residuals = mx.sqrt(mx.sum(mx.abs(residual_stack) ** 2, axis=1))
-    max_residual_array = mx.max(residuals)
-    finite = mx.all(mx.isfinite(eigenvalues)) & mx.all(mx.isfinite(residuals))
+    residual_stack, residuals, max_residual_array, finite = _ritz_residual_arrays(
+        eigenvalues,
+        vectors,
+        applied,
+    )
     mx.eval(max_residual_array, finite)
     if not bool(finite):
         msg = "Davidson Ritz data must be finite"
@@ -2201,8 +2372,29 @@ def _ritz_residual_data(
     return residual_stack, residuals, float(max_residual_array)
 
 
-def _ritz_pair(state: _PairedDavidsonState, n_bands: int) -> _DavidsonRitzPair:
-    values, eigenvectors = _projected_eigh(state.projected)
+def _seal_ritz_candidate(candidate: _DavidsonRitzCandidate) -> _DavidsonRitzPair:
+    if not bool(candidate.finite):
+        msg = "Davidson Ritz data must be finite"
+        raise ValueError(msg)
+    return _DavidsonRitzPair(
+        eigenvalues=candidate.eigenvalues,
+        vectors=candidate.vectors,
+        applied=candidate.applied,
+        residual_stack=candidate.residual_stack,
+        residuals=candidate.residuals,
+        max_residual=float(candidate.max_residual),
+        transform=candidate.transform,
+    )
+
+
+def _ritz_candidate_from_projected_eigensystem(
+    state: _PairedDavidsonState,
+    n_bands: int,
+    values: mx.array,
+    eigenvectors: mx.array,
+) -> _DavidsonRitzCandidate:
+    """Build lazy Ritz data from an already solved projected eigensystem."""
+
     selected_values = mx.real(values[:n_bands])
     selected_vectors = eigenvectors[:, :n_bands]
     transform = mx.transpose(selected_vectors)
@@ -2215,19 +2407,78 @@ def _ritz_pair(state: _PairedDavidsonState, n_bands: int) -> _DavidsonRitzPair:
         state.applied.layout,
         "hamiltonian_action",
     )
-    residual_stack, residuals, max_residual = _ritz_residual_data(
+    residual_stack, residuals, max_residual, finite = _ritz_residual_arrays(
         selected_values,
         vectors,
         applied,
     )
-    return _DavidsonRitzPair(
+    return _DavidsonRitzCandidate(
         eigenvalues=selected_values,
         vectors=vectors,
         applied=applied,
         residual_stack=residual_stack,
         residuals=residuals,
         max_residual=max_residual,
+        finite=finite,
         transform=transform,
+    )
+
+
+def _ritz_pair_from_projected_eigensystem(
+    state: _PairedDavidsonState,
+    n_bands: int,
+    values: mx.array,
+    eigenvectors: mx.array,
+) -> _DavidsonRitzPair:
+    """Build one Ritz pair from an already solved projected eigensystem."""
+
+    candidate = _ritz_candidate_from_projected_eigensystem(
+        state,
+        n_bands,
+        values,
+        eigenvectors,
+    )
+    mx.eval(candidate.max_residual, candidate.finite)
+    return _seal_ritz_candidate(candidate)
+
+
+def _ritz_pair(state: _PairedDavidsonState, n_bands: int) -> _DavidsonRitzPair:
+    values, eigenvectors = _projected_eigh(state.projected)
+    return _ritz_pair_from_projected_eigensystem(
+        state,
+        n_bands,
+        values,
+        eigenvectors,
+    )
+
+
+def _ritz_candidate_with_direct_action(
+    candidate: _DavidsonRitzPair,
+    applied: _CompactLaneState,
+) -> _DavidsonRitzCandidate:
+    """Build lazy Ritz data whose residual uses the exact scheduled H(X)."""
+
+    _require_layout(applied, candidate.vectors.layout)
+    if applied.kind != "hamiltonian_action":
+        msg = "Davidson direct validation requires Hamiltonian actions"
+        raise ValueError(msg)
+    if applied.vector_count != candidate.vectors.vector_count:
+        msg = "Davidson direct validation width does not match its Ritz vectors"
+        raise ValueError(msg)
+    residual_stack, residuals, max_residual, finite = _ritz_residual_arrays(
+        candidate.eigenvalues,
+        candidate.vectors,
+        applied,
+    )
+    return _DavidsonRitzCandidate(
+        eigenvalues=candidate.eigenvalues,
+        vectors=candidate.vectors,
+        applied=applied,
+        residual_stack=residual_stack,
+        residuals=residuals,
+        max_residual=max_residual,
+        finite=finite,
+        transform=candidate.transform,
     )
 
 
@@ -2237,34 +2488,20 @@ def _ritz_pair_with_direct_action(
 ) -> _DavidsonRitzPair:
     """Return one Ritz pair whose residuals use the exact scheduled H(X)."""
 
-    _require_layout(applied, candidate.vectors.layout)
-    if applied.kind != "hamiltonian_action":
-        msg = "Davidson direct validation requires Hamiltonian actions"
-        raise ValueError(msg)
-    if applied.vector_count != candidate.vectors.vector_count:
-        msg = "Davidson direct validation width does not match its Ritz vectors"
-        raise ValueError(msg)
-    residual_stack, residuals, max_residual = _ritz_residual_data(
-        candidate.eigenvalues,
-        candidate.vectors,
-        applied,
-    )
-    return _DavidsonRitzPair(
-        eigenvalues=candidate.eigenvalues,
-        vectors=candidate.vectors,
-        applied=applied,
-        residual_stack=residual_stack,
-        residuals=residuals,
-        max_residual=max_residual,
-        transform=candidate.transform,
-    )
+    direct = _ritz_candidate_with_direct_action(candidate, applied)
+    mx.eval(direct.max_residual, direct.finite)
+    return _seal_ritz_candidate(direct)
 
 
-def _projected_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
+def _projected_eigh(
+    matrix: mx.array,
+    *,
+    observer: RuntimeObserver | None = None,
+) -> tuple[mx.array, mx.array]:
     # Only the small projected Rayleigh-Ritz matrix crosses to the CPU. LAPACK's
     # complex128 solve avoids the complex64 convergence floor while every
     # full-grid operator, residual, and FFT remains on the default MLX device.
-    projected = np.asarray(matrix, dtype=np.complex128)
+    projected = _to_numpy(matrix, dtype=np.complex128, observer=observer)
     if projected.ndim != 2 or projected.shape[0] == 0 or projected.shape[0] != projected.shape[1]:
         msg = "projected Rayleigh-Ritz matrix must be non-empty and square"
         raise ValueError(msg)
@@ -2283,6 +2520,58 @@ def _projected_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
     return (
         mx.array(values.astype(np.float32)),
         mx.array(vectors.astype(np.complex64)),
+    )
+
+
+def _projected_eigh_batch(
+    matrices: Sequence[mx.array],
+    *,
+    observer: RuntimeObserver | None = None,
+) -> tuple[tuple[mx.array, mx.array], ...]:
+    """Solve equal-width projected eigensystems through one device-to-CPU transfer."""
+
+    if not matrices:
+        msg = "projected Rayleigh-Ritz batch must be non-empty"
+        raise ValueError(msg)
+    shape = tuple(int(value) for value in matrices[0].shape)
+    if len(shape) != 2 or shape[0] == 0 or shape[0] != shape[1]:
+        msg = "projected Rayleigh-Ritz matrices must be non-empty and square"
+        raise ValueError(msg)
+    if any(tuple(int(value) for value in matrix.shape) != shape for matrix in matrices):
+        msg = "projected Rayleigh-Ritz batch matrices must have equal shapes"
+        raise ValueError(msg)
+    projected_stack = mx.stack(
+        [
+            matrix if isinstance(matrix, mx.array) else mx.array(matrix)
+            for matrix in matrices
+        ],
+        axis=0,
+    )
+    projected = _to_numpy(
+        projected_stack,
+        dtype=np.complex128,
+        observer=observer,
+    )
+    if not np.all(np.isfinite(projected)):
+        msg = "projected Rayleigh-Ritz batch must be finite"
+        raise ValueError(msg)
+    values, vectors = np.linalg.eigh(projected)
+    expected_values = (len(matrices), shape[0])
+    expected_vectors = (len(matrices), *shape)
+    if (
+        values.shape != expected_values
+        or vectors.shape != expected_vectors
+        or not np.all(np.isfinite(values))
+        or not np.all(np.isfinite(vectors))
+    ):
+        msg = "projected Rayleigh-Ritz batch returned invalid eigenpairs"
+        raise ValueError(msg)
+    return tuple(
+        (
+            mx.array(values[index].astype(np.float32)),
+            mx.array(vectors[index].astype(np.complex64)),
+        )
+        for index in range(len(matrices))
     )
 
 
@@ -2330,6 +2619,7 @@ class _DavidsonLaneRequest:
     trial: _CompactLaneState
     observer: RuntimeObserver | None
     rank_policy: _Complex64RankPolicy = _DAVIDSON_RANK_POLICY
+    trial_is_orthonormal: bool = False
 
 
 @dataclass(frozen=True)
@@ -2433,6 +2723,12 @@ class _DavidsonEngine:
         if request.trial.kind != "coefficients":
             msg = "initial coefficients cannot be a cached Hamiltonian action"
             raise ValueError(msg)
+        if request.trial.vector_count < request.n_bands:
+            msg = "initial coefficients contain fewer vectors than requested bands"
+            raise ValueError(msg)
+        if type(request.trial_is_orthonormal) is not bool:
+            msg = "trial_is_orthonormal must be a bool"
+            raise ValueError(msg)
 
     @staticmethod
     def _ticket(
@@ -2482,20 +2778,33 @@ class _DavidsonEngine:
     ) -> _DavidsonLaneProgress:
         self._validate_request(request)
         basis = request.operator.basis
-        with observed_phase(request.observer, "orthogonalization"):
-            initial_rank = request.rank_policy.orthonormalize(
-                request.trial.values,
-                required_count=request.n_bands,
-                max_count=min(
-                    request.config.max_subspace_size,
-                    basis.active_count,
-                ),
+        if request.trial_is_orthonormal:
+            if request.trial.vector_count > min(
+                request.config.max_subspace_size,
+                basis.active_count,
+            ):
+                msg = "trusted initial coefficients exceed the Davidson subspace limit"
+                raise ValueError(msg)
+            initial_vectors = request.trial
+        else:
+            with observed_phase(
+                request.observer,
+                "orthogonalization",
+                synchronize=False,
+            ):
+                initial_rank = request.rank_policy.orthonormalize(
+                    request.trial.values,
+                    required_count=request.n_bands,
+                    max_count=min(
+                        request.config.max_subspace_size,
+                        basis.active_count,
+                    ),
+                )
+                initial_vectors = basis._state_from_compact(initial_rank.values)
+            add_observed_work(
+                request.observer,
+                {"orthogonalization_vectors": request.trial.vector_count},
             )
-            initial_vectors = basis._state_from_compact(initial_rank.values)
-        add_observed_work(
-            request.observer,
-            {"orthogonalization_vectors": request.trial.vector_count},
-        )
         token = _FixedHamiltonianToken.create(
             request.operator,
             request.config,
@@ -2528,7 +2837,7 @@ class _DavidsonEngine:
             ritz_pair,
             request.config.tolerance,
         )
-        if request.observer is not None:
+        if request.observer is not None and request.observer.detail_events:
             request.observer.emit(
                 "davidson_iteration",
                 lane_id=request.lane_id,
@@ -2554,7 +2863,11 @@ class _DavidsonEngine:
             raise RuntimeError(msg)
         orthonormality = request.rank_policy.overlap_error(ritz_pair.vectors.values)
         if orthonormality > request.rank_policy.guard_tolerance(request.n_bands):
-            with observed_phase(request.observer, "orthogonalization"):
+            with observed_phase(
+                request.observer,
+                "orthogonalization",
+                synchronize=False,
+            ):
                 final_rank = request.rank_policy.orthonormalize(
                     ritz_pair.vectors.values,
                     required_count=request.n_bands,
@@ -2587,15 +2900,11 @@ class _DavidsonEngine:
         return pending
 
     @staticmethod
-    def _prepare_correction(
+    def _raw_corrections(
         progress: _DavidsonLaneProgress,
         ritz_pair: _DavidsonRitzPair,
-    ) -> _DavidsonPendingAction | None:
+    ) -> tuple[mx.array, int]:
         request = progress.request
-        paired = progress.paired
-        if paired is None:
-            msg = "Davidson lane has no paired V/HV state"
-            raise RuntimeError(msg)
         unconverged = _DavidsonEngine._unconverged_indices(
             ritz_pair,
             request.config.tolerance,
@@ -2624,16 +2933,64 @@ class _DavidsonEngine:
             request.config.preconditioner_floor,
         )
         raw_corrections = -unconverged_residuals / safe
+        return raw_corrections, int(unconverged.size)
 
-        with observed_phase(request.observer, "orthogonalization"):
+    @staticmethod
+    def _prepare_correction(
+        progress: _DavidsonLaneProgress,
+        ritz_pair: _DavidsonRitzPair,
+    ) -> _DavidsonPendingAction | None:
+        request = progress.request
+        paired = progress.paired
+        if paired is None:
+            msg = "Davidson lane has no paired V/HV state"
+            raise RuntimeError(msg)
+        raw_corrections, unconverged_count = _DavidsonEngine._raw_corrections(
+            progress,
+            ritz_pair,
+        )
+
+        if paired.vector_count + unconverged_count > request.config.max_subspace_size:
+            progress.restart_count += 1
+            # The Ritz vectors and their H(V) values were formed together from
+            # an orthonormal paired state by a unitary projected eigensolve.
+            # Re-orthogonalizing them here changed both through an avoidable
+            # complex64 round trip. Rebase directly onto that certified pair.
+            paired = _PairedDavidsonState.initialize(
+                ritz_pair.vectors,
+                ritz_pair.applied,
+                progress.token,
+            )
+            progress.paired = paired
+            if request.config.max_subspace_size - paired.vector_count <= 0:
+                if progress.direct_validated:
+                    progress.done = True
+                    return None
+                return _DavidsonEngine._prepare_direct_validation(
+                    progress,
+                    ritz_pair,
+                    terminal=True,
+                )
+
+        # A restart changes only the retained basis, not the Ritz residuals
+        # from which this correction block was built. Orthogonalize those raw
+        # corrections once against the authoritative current basis. The old
+        # flow first processed them against the discarded basis and then
+        # processed the resulting block again after every restart.
+        with observed_phase(
+            request.observer,
+            "orthogonalization",
+            synchronize=False,
+        ):
             append_rank = request.rank_policy.orthonormalize(
                 mx.concatenate([paired.vectors.values, raw_corrections], axis=0),
                 locked_count=paired.vector_count,
                 required_count=paired.vector_count,
+                max_count=request.config.max_subspace_size,
             )
         add_observed_work(
             request.observer,
-            {"orthogonalization_vectors": int(unconverged.size)},
+            {"orthogonalization_vectors": unconverged_count},
         )
         correction_values = append_rank.values[paired.vector_count :]
         correction_count = int(correction_values.shape[0])
@@ -2648,60 +3005,6 @@ class _DavidsonEngine:
                 terminal=True,
             )
 
-        if paired.vector_count + correction_count > request.config.max_subspace_size:
-            progress.restart_count += 1
-            with observed_phase(request.observer, "orthogonalization"):
-                restart_rank = request.rank_policy.orthonormalize(
-                    ritz_pair.vectors.values,
-                    required_count=request.n_bands,
-                    max_count=request.n_bands,
-                )
-                paired = paired.rebase_ranked(
-                    restart_rank,
-                    ritz_pair.applied,
-                    token=progress.token,
-                )
-                progress.paired = paired
-            add_observed_work(
-                request.observer,
-                {"orthogonalization_vectors": request.n_bands},
-            )
-            if request.config.max_subspace_size - paired.vector_count <= 0:
-                if progress.direct_validated:
-                    progress.done = True
-                    return None
-                return _DavidsonEngine._prepare_direct_validation(
-                    progress,
-                    ritz_pair,
-                    terminal=True,
-                )
-            with observed_phase(request.observer, "orthogonalization"):
-                restarted_append = request.rank_policy.orthonormalize(
-                    mx.concatenate(
-                        [paired.vectors.values, correction_values],
-                        axis=0,
-                    ),
-                    locked_count=paired.vector_count,
-                    required_count=paired.vector_count,
-                    max_count=request.config.max_subspace_size,
-                )
-            add_observed_work(
-                request.observer,
-                {"orthogonalization_vectors": correction_count},
-            )
-            correction_values = restarted_append.values[paired.vector_count :]
-            correction_count = int(correction_values.shape[0])
-            progress.correction_width = correction_count
-            if correction_count == 0:
-                if progress.direct_validated:
-                    progress.done = True
-                    return None
-                return _DavidsonEngine._prepare_direct_validation(
-                    progress,
-                    ritz_pair,
-                    terminal=True,
-                )
-
         pending = _DavidsonPendingAction(
             purpose="correction",
             vectors=request.operator.basis._state_from_compact(correction_values),
@@ -2711,8 +3014,102 @@ class _DavidsonEngine:
         return pending
 
     @staticmethod
+    def _batched_ritz_pairs(
+        progresses: Sequence[_DavidsonLaneProgress],
+    ) -> tuple[dict[str, _DavidsonRitzPair], dict[str, Exception]]:
+        """Build equal-width lane Ritz pairs with one LAPACK bridge per group."""
+
+        grouped: dict[tuple[int, int], list[_DavidsonLaneProgress]] = defaultdict(list)
+        failures: dict[str, Exception] = {}
+        pairs: dict[str, _DavidsonRitzPair] = {}
+        for progress in progresses:
+            paired = progress.paired
+            if paired is None:
+                failures[progress.request.lane_id] = RuntimeError(
+                    "Davidson lane has no paired V/HV state"
+                )
+                continue
+            grouped[(id(progress.request.observer), paired.vector_count)].append(progress)
+
+        for compatible in grouped.values():
+            observer = compatible[0].request.observer
+            try:
+                with observed_phase(
+                    observer,
+                    "rayleigh_ritz",
+                    synchronize=False,
+                ):
+                    paired_states = tuple(
+                        progress.paired
+                        for progress in compatible
+                        if progress.paired is not None
+                    )
+                    with observed_phase(
+                        observer,
+                        "cpu_small_solve",
+                        synchronize=False,
+                    ):
+                        eigensystems = _projected_eigh_batch(
+                            tuple(state.projected for state in paired_states),
+                            observer=observer,
+                        )
+                    candidates = []
+                    for progress, state, (values, eigenvectors) in zip(
+                        compatible,
+                        paired_states,
+                        eigensystems,
+                        strict=True,
+                    ):
+                        candidates.append(
+                            (
+                                progress,
+                                _ritz_candidate_from_projected_eigensystem(
+                                    state,
+                                    progress.request.n_bands,
+                                    values,
+                                    eigenvectors,
+                                ),
+                            )
+                        )
+                    _materialize(
+                        observer,
+                        *(
+                            value
+                            for _progress, candidate in candidates
+                            for value in (candidate.max_residual, candidate.finite)
+                        )
+                    )
+                    for progress, candidate in candidates:
+                        pairs[progress.request.lane_id] = _seal_ritz_candidate(
+                            candidate
+                        )
+            except Exception:
+                # Preserve lane-local failure isolation. The single-lane path is
+                # only a recovery path for malformed or numerically failed data.
+                for progress in compatible:
+                    try:
+                        paired = progress.paired
+                        if paired is None:
+                            msg = "Davidson lane has no paired V/HV state"
+                            raise RuntimeError(msg)
+                        with observed_phase(
+                            progress.request.observer,
+                            "rayleigh_ritz",
+                            synchronize=False,
+                        ):
+                            pairs[progress.request.lane_id] = _ritz_pair(
+                                paired,
+                                progress.request.n_bands,
+                            )
+                    except Exception as error:
+                        failures[progress.request.lane_id] = _detached_failure(error)
+        return pairs, failures
+
+    @staticmethod
     def _advance_lane(
         progress: _DavidsonLaneProgress,
+        *,
+        ritz_pair: _DavidsonRitzPair | None = None,
     ) -> _DavidsonPendingAction | None:
         request = progress.request
         paired = progress.paired
@@ -2724,8 +3121,13 @@ class _DavidsonEngine:
             raise RuntimeError(msg)
         progress.iteration_count += 1
         progress.direct_validated = False
-        with observed_phase(request.observer, "rayleigh_ritz"):
-            ritz_pair = _ritz_pair(paired, request.n_bands)
+        if ritz_pair is None:
+            with observed_phase(
+                request.observer,
+                "rayleigh_ritz",
+                synchronize=False,
+            ):
+                ritz_pair = _ritz_pair(paired, request.n_bands)
         progress.ritz_pair = ritz_pair
         if (
             ritz_pair.max_residual <= request.config.tolerance
@@ -2746,10 +3148,73 @@ class _DavidsonEngine:
         return pending
 
     @staticmethod
+    def _batched_direct_pairs(
+        tickets: Sequence[_DavidsonApplicationTicket],
+        scheduled: _DavidsonScheduleResult,
+        progress_by_lane: Mapping[str, _DavidsonLaneProgress],
+    ) -> tuple[dict[str, _DavidsonRitzPair], dict[str, Exception]]:
+        """Materialize scheduled direct residuals through one MLX boundary."""
+
+        candidates: list[tuple[str, _DavidsonRitzCandidate]] = []
+        failures: dict[str, Exception] = {}
+        for ticket in tickets:
+            lane_id = ticket.lane_id
+            if ticket.purpose != "direct_validation" or lane_id in scheduled.failures:
+                continue
+            try:
+                progress = progress_by_lane[lane_id]
+                pending = progress.pending_action
+                if pending is None or pending.ritz_pair is None:
+                    msg = "Davidson direct validation lost its Ritz state"
+                    raise RuntimeError(msg)
+                candidates.append(
+                    (
+                        lane_id,
+                        _ritz_candidate_with_direct_action(
+                            pending.ritz_pair,
+                            scheduled.action_for(lane_id),
+                        ),
+                    )
+                )
+            except Exception as error:
+                failures[lane_id] = _detached_failure(error)
+        if candidates:
+            try:
+                observer = tickets[0].observer if tickets else None
+                _materialize(
+                    observer,
+                    *(
+                        value
+                        for _lane_id, candidate in candidates
+                        for value in (candidate.max_residual, candidate.finite)
+                    )
+                )
+            except Exception as error:
+                failure = _detached_failure(error)
+                failures.update(
+                    {
+                        lane_id: failure
+                        for lane_id, _candidate in candidates
+                        if lane_id not in failures
+                    }
+                )
+        pairs: dict[str, _DavidsonRitzPair] = {}
+        for lane_id, candidate in candidates:
+            if lane_id in failures:
+                continue
+            try:
+                pairs[lane_id] = _seal_ritz_candidate(candidate)
+            except Exception as error:
+                failures[lane_id] = _detached_failure(error)
+        return pairs, failures
+
+    @staticmethod
     def _consume_action(
         progress: _DavidsonLaneProgress,
         ticket: _DavidsonApplicationTicket,
         applied: _CompactLaneState,
+        *,
+        direct_pair: _DavidsonRitzPair | None = None,
     ) -> _DavidsonPendingAction | None:
         pending = progress.pending_action
         if pending is None or pending.vectors is not ticket.vectors:
@@ -2777,7 +3242,11 @@ class _DavidsonEngine:
         if candidate is None:
             msg = "Davidson direct validation lost its Ritz state"
             raise RuntimeError(msg)
-        direct_pair = _ritz_pair_with_direct_action(candidate, applied)
+        if direct_pair is None:
+            direct_pair = _ritz_pair_with_direct_action(candidate, applied)
+        elif direct_pair.applied is not applied:
+            msg = "Davidson batched direct residual does not match its scheduled action"
+            raise RuntimeError(msg)
         progress.ritz_pair = direct_pair
         progress.direct_validated = True
         progress.converged = direct_pair.max_residual <= progress.request.config.tolerance
@@ -2882,9 +3351,59 @@ class _DavidsonEngine:
             if not active:
                 break
             pending_tickets: list[_DavidsonApplicationTicket] = []
+            ritz_pairs, ritz_failures = self._batched_ritz_pairs(active)
+            summarized_observers = {
+                id(progress.request.observer): progress.request.observer
+                for progress in active
+                if progress.request.observer is not None
+                and not progress.request.observer.detail_events
+            }
+            for summarized in summarized_observers.values():
+                summarized_progress = [
+                    progress
+                    for progress in active
+                    if progress.request.observer is summarized
+                    and progress.request.lane_id in ritz_pairs
+                ]
+                if summarized_progress:
+                    summarized.emit(
+                        "davidson_round",
+                        iteration_min=min(
+                            progress.iteration_count + 1
+                            for progress in summarized_progress
+                        ),
+                        iteration_max=max(
+                            progress.iteration_count + 1
+                            for progress in summarized_progress
+                        ),
+                        active_lane_count=len(summarized_progress),
+                        maximum_subspace_size=max(
+                            progress.paired.vector_count
+                            for progress in summarized_progress
+                            if progress.paired is not None
+                        ),
+                        maximum_residual=max(
+                            ritz_pairs[progress.request.lane_id].max_residual
+                            for progress in summarized_progress
+                        ),
+                        converged_candidate_count=sum(
+                            ritz_pairs[progress.request.lane_id].max_residual
+                            <= progress.request.config.tolerance
+                            for progress in summarized_progress
+                        ),
+                        residual_source="paired_subspace",
+                    )
             for progress in active:
+                lane_id = progress.request.lane_id
+                failure = ritz_failures.get(lane_id)
+                if failure is not None:
+                    self._fail_lane(progress, failures, failure)
+                    continue
                 try:
-                    pending = self._advance_lane(progress)
+                    pending = self._advance_lane(
+                        progress,
+                        ritz_pair=ritz_pairs[lane_id],
+                    )
                     if pending is not None:
                         pending_tickets.append(
                             self._ticket(
@@ -2904,10 +3423,15 @@ class _DavidsonEngine:
 
             while pending_tickets:
                 scheduled = self._schedule(pending_tickets)
+                direct_pairs, direct_failures = self._batched_direct_pairs(
+                    pending_tickets,
+                    scheduled,
+                    progress_by_lane,
+                )
                 followup_tickets: list[_DavidsonApplicationTicket] = []
                 for ticket in pending_tickets:
                     lane_id = ticket.lane_id
-                    failure = scheduled.failures.get(lane_id)
+                    failure = scheduled.failures.get(lane_id) or direct_failures.get(lane_id)
                     if failure is not None:
                         self._fail_lane(
                             progress_by_lane[lane_id],
@@ -2921,6 +3445,7 @@ class _DavidsonEngine:
                             progress,
                             ticket,
                             scheduled.action_for(lane_id),
+                            direct_pair=direct_pairs.get(lane_id),
                         )
                         if followup is not None:
                             followup_tickets.append(
@@ -2954,6 +3479,8 @@ class _DavidsonEngine:
             submission_groups=tuple(self._submission_groups),
             scheduler_calls=self._scheduler_calls,
         )
+
+
 
 
 def solve_periodic_eigenproblem(
@@ -2994,6 +3521,7 @@ def solve_periodic_eigenproblem(
         config=solver_config,
         trial=trial,
         observer=runtime_observer,
+        trial_is_orthonormal=initial_coefficients is None,
     )
     engine = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=1))
     return engine.solve([request]).result_for(lane_id)
@@ -3803,6 +4331,11 @@ def _run_periodic_scf_with_projector_cache(
             system.positions,
             np.asarray(system.grid.lengths),
         )
+        eigensolver_tolerance = _scf_eigensolver_tolerance(
+            scf_config,
+            history,
+            system.electron_count,
+        )
     if observer is not None:
         observer.record_memory("shared_full_grid_bytes", system.grid.size * 4 * 4)
         observer.record_memory("persistent_projector_bytes", 0)
@@ -3833,6 +4366,7 @@ def _run_periodic_scf_with_projector_cache(
                 status="started",
                 iteration=iteration,
                 total_iterations=scf_config.max_iterations,
+                eigensolver_tolerance=eigensolver_tolerance,
             )
         start = perf_counter()
         hartree = hartree_potential(density, system.grid)
@@ -3881,7 +4415,7 @@ def _run_periodic_scf_with_projector_cache(
             _iteration: int = iteration,
             _lane_to_index: dict[str, int] = lane_to_index,
         ) -> None:
-            if observer is None:
+            if observer is None or not observer.detail_events:
                 return
             explicit_indices = [_lane_to_index[ticket.lane_id] for ticket in tickets]
             complete_transient_bytes = PeriodicKohnShamOperator._estimated_batch_transient_bytes(
@@ -3920,30 +4454,45 @@ def _run_periodic_scf_with_projector_cache(
                 }
             observer.emit("kpoint_batch", **fields)
 
+        iteration_davidson = replace(
+            scf_config.davidson,
+            tolerance=eigensolver_tolerance,
+        )
         requests = tuple(
             _DavidsonLaneRequest(
                 lane_id=bases[point_index]._layout.lane_id,
                 operator=operators_by_index[point_index],
                 n_bands=occupied_bands,
-                config=scf_config.davidson,
+                config=iteration_davidson,
                 trial=_initial_trial(
                     bases[point_index],
                     occupied_bands,
                     previous_states.get(point_index),
                 ),
                 observer=observer,
+                trial_is_orthonormal=(
+                    previous_states.get(point_index) is None
+                    or resume_state is not None
+                    or iteration > iteration_start
+                ),
             )
             for point_index in owned_indices
         )
-        engine = _DavidsonEngine(
-            scheduler=_DavidsonScheduler(
+        def new_scheduler() -> _DavidsonScheduler:
+            return _DavidsonScheduler(
                 batch_cap=scf_config.kpoint_batch_size,
                 max_padding_fraction=scf_config.max_batch_padding_fraction,
                 max_transient_bytes=scf_config.max_batch_transient_bytes,
                 submission_callback=emit_submission,
             )
-        )
-        eigen_outcome = engine.solve(requests)
+        with observed_phase(
+            observer,
+            "eigensolver_control",
+            synchronize=False,
+        ):
+            eigen_outcome = _DavidsonEngine(
+                scheduler=new_scheduler(),
+            ).solve(requests)
         if eigen_outcome.failures:
             if observer is not None:
                 observer.emit(
@@ -3954,11 +4503,14 @@ def _run_periodic_scf_with_projector_cache(
                         lane_to_index[lane_id] for lane_id in eigen_outcome.failures
                     ],
                     failure_messages={
-                        lane_id: str(error) for lane_id, error in eigen_outcome.failures.items()
+                        lane_id: str(error)
+                        for lane_id, error in eigen_outcome.failures.items()
                     },
                 )
             first_failed_lane = next(
-                request.lane_id for request in requests if request.lane_id in eigen_outcome.failures
+                request.lane_id
+                for request in requests
+                if request.lane_id in eigen_outcome.failures
             )
             raise _detached_failure(eigen_outcome.failures[first_failed_lane]) from None
 
@@ -4018,6 +4570,8 @@ def _run_periodic_scf_with_projector_cache(
                 "density_residual": density_residual,
                 "electron_count": target_count,
                 "max_orbital_residual": max_orbital_residual,
+                "eigensolver_tolerance": eigensolver_tolerance,
+                "eigensolver_method": "davidson",
                 "all_kpoints_converged": str(
                     all(result.eigen.converged for result in final_owned_results)
                 ).lower(),
@@ -4033,6 +4587,8 @@ def _run_periodic_scf_with_projector_cache(
                 energy_delta_hartree=energy_delta,
                 density_residual=density_residual,
                 max_orbital_residual=max_orbital_residual,
+                eigensolver_tolerance=eigensolver_tolerance,
+                eigensolver_method="davidson",
                 all_kpoints_converged=all_eigen_converged,
             )
         if (
@@ -4046,6 +4602,12 @@ def _run_periodic_scf_with_projector_cache(
             converged = True
             density = target_density
             break
+        eigensolver_tolerance = _next_scf_eigensolver_tolerance(
+            scf_config,
+            eigensolver_tolerance,
+            density_residual,
+            system.electron_count,
+        )
         with observed_phase(observer, "mixing"):
             mixed = mixer.mix(density, target_density)
             mixed_finite = mx.all(mx.isfinite(mixed))

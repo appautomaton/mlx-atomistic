@@ -28,6 +28,10 @@ WORK_COUNTER_NAMES = (
     "padding_elements",
     "projector_cache_hits",
     "projector_cache_misses",
+    "device_materializations",
+    "device_materialized_arrays",
+    "cpu_bridge_calls",
+    "cpu_bridge_elements",
 )
 MEMORY_FIELD_NAMES = (
     "persistent_coefficient_bytes",
@@ -49,6 +53,8 @@ PHASE_NAMES = (
     "density",
     "mixing",
     "persistence",
+    "eigensolver_control",
+    "cpu_small_solve",
 )
 
 EventCallback = Callable[[dict[str, object]], None]
@@ -64,11 +70,15 @@ class RuntimeObserver:
         callback: Optional callback invoked synchronously for every event.
         synchronize: Optional MLX synchronization callable around measured phases.
         clock: Monotonic clock callable. Defaults to ``perf_counter``.
+        detail_events: Whether callers should emit lane- and batch-level detail.
+            Defaults to ``True``; full production runs can disable it in favor of
+            collective progress summaries.
     """
 
     callback: EventCallback | None = None
     synchronize: Synchronize | None = None
     clock: Clock = perf_counter
+    detail_events: bool = True
     _started: float = field(init=False, repr=False)
     _sequence: int = field(default=0, init=False, repr=False)
     _events: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
@@ -78,6 +88,9 @@ class RuntimeObserver:
     _phase_stack: list[list[object]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if type(self.detail_events) is not bool:
+            msg = "detail_events must be a bool"
+            raise ValueError(msg)
         self._started = self.clock()
         self._work = dict.fromkeys(WORK_COUNTER_NAMES, 0)
         self._memory = dict.fromkeys(MEMORY_FIELD_NAMES)
@@ -162,11 +175,14 @@ class RuntimeObserver:
         )
 
     @contextmanager
-    def phase(self, name: str) -> Iterator[None]:
+    def phase(self, name: str, *, synchronize: bool = True) -> Iterator[None]:
         """Measure one exclusive synchronized named phase.
 
         Args:
             name: Phase name from the frozen schema.
+            synchronize: Whether to place device barriers around this phase.
+                Lane-local phases that already materialize their results should
+                disable these redundant barriers. Defaults to ``True``.
 
         Yields:
             Control to the measured operation.
@@ -175,14 +191,15 @@ class RuntimeObserver:
         if name not in self._phases:
             msg = f"unknown DFT runtime phase: {name}"
             raise ValueError(msg)
-        if self.synchronize is not None:
+        should_synchronize = synchronize and self.synchronize is not None
+        if should_synchronize:
             self.synchronize()
         frame: list[object] = [name, self.clock(), 0.0]
         self._phase_stack.append(frame)
         try:
             yield
         finally:
-            if self.synchronize is not None:
+            if should_synchronize:
                 self.synchronize()
             elapsed = max(self.clock() - float(frame[1]), 0.0)
             child_elapsed = float(frame[2])
@@ -216,18 +233,29 @@ class RuntimeObserver:
         }
 
 
-def observed_phase(observer: RuntimeObserver | None, name: str):
+def observed_phase(
+    observer: RuntimeObserver | None,
+    name: str,
+    *,
+    synchronize: bool = True,
+):
     """Return an observer phase or a no-op context manager.
 
     Args:
         observer: Optional runtime observer.
         name: Frozen phase name.
+        synchronize: Whether the observer should place device barriers around
+            the phase. Defaults to ``True``.
 
     Returns:
         Context manager suitable for a ``with`` statement.
     """
 
-    return nullcontext() if observer is None else observer.phase(name)
+    return (
+        nullcontext()
+        if observer is None
+        else observer.phase(name, synchronize=synchronize)
+    )
 
 
 def add_observed_work(

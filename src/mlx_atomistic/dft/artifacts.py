@@ -272,6 +272,9 @@ def _config_payload(config: PeriodicSCFConfig) -> dict[str, object]:
         "min_iterations": config.min_iterations,
         "mixing_beta": config.mixing_beta,
         "mixer": config.mixer,
+        "adaptive_eigensolver_tolerance": config.adaptive_eigensolver_tolerance,
+        "initial_eigensolver_tolerance": config.initial_eigensolver_tolerance,
+        "eigensolver_tolerance_scale": config.eigensolver_tolerance_scale,
         "davidson": {
             "max_iterations": config.davidson.max_iterations,
             "tolerance": config.davidson.tolerance,
@@ -311,6 +314,15 @@ def _solver_identity(config_payload: Mapping[str, object]) -> dict[str, object]:
             "mixer": config_payload["mixer"],
             "mixing_beta": config_payload["mixing_beta"],
             "orbital_tolerance": config_payload["orbital_tolerance"],
+            "adaptive_eigensolver_tolerance": config_payload[
+                "adaptive_eigensolver_tolerance"
+            ],
+            "initial_eigensolver_tolerance": config_payload[
+                "initial_eigensolver_tolerance"
+            ],
+            "eigensolver_tolerance_scale": config_payload[
+                "eigensolver_tolerance_scale"
+            ],
         },
     }
 

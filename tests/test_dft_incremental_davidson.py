@@ -357,36 +357,59 @@ def test_incremental_hv_and_projected_blocks_are_reused(monkeypatch):
     assert work["projected_old_old_rebuilds"] == 0
 
 
-def test_restart_transforms_v_and_hv_without_reapplying_h(monkeypatch):
+def test_restart_reuses_ritz_v_and_hv_without_reapplying_h(monkeypatch):
     _, operator = _problem(lane_label="restart")
     observer = RuntimeObserver()
     application_widths: list[int] = []
-    paired_rebases: list[tuple[int, int, int]] = []
+    paired_initializations: list[tuple[int, int, int]] = []
+    rank_calls: list[tuple[int, int, int | None]] = []
     original_apply = PeriodicKohnShamOperator._apply_compact
-    original_rebase = _PairedDavidsonState.rebase_ranked
+    original_initialize = _PairedDavidsonState.initialize.__func__
+    original_orthonormalize = _Complex64RankPolicy.orthonormalize
 
     def recording_apply(self, coefficients, *, observer=None, **kwargs):
         application_widths.append(coefficients.vector_count)
         return original_apply(self, coefficients, observer=observer, **kwargs)
 
-    def recording_rebase(self, rank, source_applied, *, token):
-        result = original_rebase(
-            self,
-            rank,
-            source_applied,
-            token=token,
-        )
-        paired_rebases.append(
+    def recording_initialize(cls, vectors, applied, token):
+        result = original_initialize(cls, vectors, applied, token)
+        paired_initializations.append(
             (
-                int(rank.values.shape[0]),
-                source_applied.vector_count,
+                vectors.vector_count,
+                applied.vector_count,
                 result.vector_count,
             )
         )
         return result
 
+    def recording_orthonormalize(
+        self,
+        values,
+        *,
+        locked_count=0,
+        required_count=0,
+        max_count=None,
+    ):
+        rank_calls.append((int(values.shape[0]), locked_count, max_count))
+        return original_orthonormalize(
+            self,
+            values,
+            locked_count=locked_count,
+            required_count=required_count,
+            max_count=max_count,
+        )
+
     monkeypatch.setattr(PeriodicKohnShamOperator, "_apply_compact", recording_apply)
-    monkeypatch.setattr(_PairedDavidsonState, "rebase_ranked", recording_rebase)
+    monkeypatch.setattr(
+        _PairedDavidsonState,
+        "initialize",
+        classmethod(recording_initialize),
+    )
+    monkeypatch.setattr(
+        _Complex64RankPolicy,
+        "orthonormalize",
+        recording_orthonormalize,
+    )
 
     result = solve_periodic_eigenproblem(
         operator,
@@ -405,8 +428,16 @@ def test_restart_transforms_v_and_hv_without_reapplying_h(monkeypatch):
     assert application_widths[-1] == 2
     assert application_widths[1:-1]
     assert set(application_widths[1:-1]) == {1}
-    assert all(v_width == hv_width for v_width, hv_width, _ in paired_rebases)
-    assert any(output_width == 2 for _, _, output_width in paired_rebases)
+    assert all(
+        v_width == hv_width == output_width
+        for v_width, hv_width, output_width in paired_initializations
+    )
+    assert len(paired_initializations) >= result.restart_count + 1
+    assert not any(locked_count == 3 for _, locked_count, _ in rank_calls)
+    assert not any(
+        row_count == 2 and locked_count == 0 and max_count == 2
+        for row_count, locked_count, max_count in rank_calls
+    )
     assert work["davidson_hv_new_vectors"] == sum(application_widths[:-1])
     assert work["projected_old_old_rebuilds"] == 0
 
@@ -880,13 +911,19 @@ def test_complex64_rank_policy_admits_complex_choleskyqr2_append():
     ).astype(np.complex64)
     candidates += locked_components @ locked
     stack_np = np.concatenate([locked, candidates]).astype(np.complex64)
-    original_norms = np.sqrt(np.real(np.sum(np.conjugate(stack_np) * stack_np, axis=1))).astype(
-        np.float32
+    candidate_norms = mx.sqrt(
+        mx.real(
+            mx.sum(
+                mx.conjugate(mx.array(stack_np[locked_count:]))
+                * mx.array(stack_np[locked_count:]),
+                axis=1,
+            )
+        )
     )
 
     result = policy._try_batched_choleskyqr2(
         mx.array(stack_np),
-        original_norms=original_norms,
+        candidate_norms=candidate_norms,
         locked_count=locked_count,
         required_count=locked_count + candidate_count,
         limit=locked_count + candidate_count,
@@ -901,6 +938,56 @@ def test_complex64_rank_policy_admits_complex_choleskyqr2_append():
         np.asarray(result.values[:locked_count]),
         locked,
     )
+
+
+def test_engine_reuses_solver_validated_orthonormal_trial_without_reprocessing():
+    basis, operator = _problem(lane_label="trusted-trial")
+    observer = RuntimeObserver()
+    trial = periodic_scf._initial_coefficients(basis, 2)
+    request = _DavidsonLaneRequest(
+        lane_id="trusted-trial",
+        operator=operator,
+        n_bands=2,
+        config=PeriodicDavidsonConfig(max_iterations=2, max_subspace_size=4),
+        trial=trial,
+        observer=observer,
+        trial_is_orthonormal=True,
+    )
+
+    progress = _DavidsonEngine()._prepare_lane(request)
+
+    assert progress.initial_vectors is trial
+    assert observer.snapshot()["work_counters"]["orthogonalization_vectors"] == 0
+
+
+def test_engine_emits_collective_round_progress_when_detail_is_disabled():
+    basis, operator = _problem(lane_label="round-summary")
+    observer = RuntimeObserver(detail_events=False)
+    config = PeriodicDavidsonConfig(max_iterations=1, max_subspace_size=3)
+    requests = tuple(
+        _DavidsonLaneRequest(
+            lane_id=lane_id,
+            operator=operator,
+            n_bands=1,
+            config=config,
+            trial=periodic_scf._initial_coefficients(basis, 1),
+            observer=observer,
+            trial_is_orthonormal=True,
+        )
+        for lane_id in ("left", "right")
+    )
+
+    result = _DavidsonEngine(
+        scheduler=_DavidsonScheduler(batch_cap=2)
+    ).solve(requests)
+    events = observer.snapshot()["events"]
+
+    assert not result.failures
+    assert not any(event["event"] == "davidson_iteration" for event in events)
+    rounds = [event for event in events if event["event"] == "davidson_round"]
+    assert len(rounds) == 1
+    assert rounds[0]["active_lane_count"] == 2
+    assert rounds[0]["maximum_subspace_size"] == 1
 
 
 def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():

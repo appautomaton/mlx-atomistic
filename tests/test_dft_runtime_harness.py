@@ -1127,6 +1127,9 @@ def test_prepare_workload_is_path_independent_and_pins_complete_mesh(tmp_path):
     assert manifest["system"]["occupied_band_count"] == 16
     assert manifest["physics"]["fft_shape"] == [56, 56, 56]
     assert manifest["solver"]["scf"]["orbital_tolerance"] == 1e-6
+    assert manifest["solver"]["scf"]["adaptive_eigensolver_tolerance"] is True
+    assert manifest["solver"]["scf"]["initial_eigensolver_tolerance"] == 1e-2
+    assert manifest["solver"]["scf"]["eigensolver_tolerance_scale"] == 0.1
     assert manifest["solver"]["davidson"]["tolerance"] == 1e-6
     assert manifest["solver"]["davidson"]["max_iterations"] == 48
     assert len(manifest["physics"]["kpoints"]) == 216
@@ -2628,6 +2631,21 @@ def test_runtime_observer_reconciles_exclusive_phases_and_counters():
     assert len(synchronizations) == 4
 
 
+def test_runtime_observer_can_measure_materialized_phase_without_device_barriers():
+    current = [0.0]
+    synchronizations = []
+    observer = RuntimeObserver(
+        synchronize=lambda: synchronizations.append(current[0]),
+        clock=lambda: current[0],
+    )
+
+    with observer.phase("orthogonalization", synchronize=False):
+        current[0] += 2.0
+
+    assert synchronizations == []
+    assert observer.snapshot()["phase_seconds"]["orthogonalization"] == pytest.approx(2.0)
+
+
 def test_logical_hpsi_memory_scales_with_observed_vector_width():
     grid_count = 56**3
     vector_count = 64
@@ -2683,6 +2701,35 @@ def test_projected_eigh_uses_complex128_lapack_and_returns_runtime_precision(
     assert vectors_mx.dtype == np.complex64
     assert np.max(np.abs(residual)) < 2e-6
     assert np.max(np.abs(overlap - np.eye(64))) < 2e-6
+
+
+def test_projected_eigh_batch_uses_one_complex128_lapack_bridge(monkeypatch):
+    matrices = (
+        np.diag(np.array([-2.0, -1.0, 0.5], dtype=np.float32)).astype(np.complex64),
+        np.array(
+            [[-1.5, 0.2j, 0.0], [-0.2j, -0.25, 0.1], [0.0, 0.1, 0.75]],
+            dtype=np.complex64,
+        ),
+    )
+    observed_shapes = []
+    lapack_eigh = np.linalg.eigh
+
+    def capture_batch(projected):
+        observed_shapes.append((projected.dtype, projected.shape))
+        return lapack_eigh(projected)
+
+    monkeypatch.setattr(periodic_scf_module.np.linalg, "eigh", capture_batch)
+
+    solved = periodic_scf_module._projected_eigh_batch(matrices)
+
+    assert observed_shapes == [(np.dtype(np.complex128), (2, 3, 3))]
+    for matrix, (values, vectors) in zip(matrices, solved, strict=True):
+        values_np = np.asarray(values)
+        vectors_np = np.asarray(vectors)
+        residual = matrix @ vectors_np - vectors_np * values_np[None, :]
+        assert values.dtype == mx.float32
+        assert vectors.dtype == mx.complex64
+        assert np.max(np.abs(residual)) < 1e-6
 
 
 @pytest.mark.parametrize(

@@ -201,12 +201,15 @@ def _unsigned_workload(gth_bytes: bytes) -> dict[str, object]:
                 "orbital_tolerance": 1e-6,
                 "mixing_beta": 0.35,
                 "mixer": "diis",
+                "adaptive_eigensolver_tolerance": True,
+                "initial_eigensolver_tolerance": 1e-2,
+                "eigensolver_tolerance_scale": 0.1,
             },
             "davidson": {
                 "max_iterations": 48,
                 "tolerance": 1e-6,
                 "max_subspace_size": 64,
-                "preconditioner_floor": 0.5,
+                "preconditioner_floor": 0.25,
             },
         },
         "initialization": {
@@ -217,7 +220,7 @@ def _unsigned_workload(gth_bytes: bytes) -> dict[str, object]:
         "measurement": {
             "warmups": 1,
             "samples": 5,
-            "synchronization": "mx.synchronize-before-after-named-phases",
+            "synchronization": "materialized-operation-boundaries-and-final-synchronize",
             "target_chip": TARGET_CHIP,
             "required_lowpowermode": 1,
             "power_source_policy": "record-and-match-ac-or-battery",
@@ -438,6 +441,9 @@ def _validate_workload_invariants(manifest: Mapping[str, object]) -> None:
         or scf.get("density_tolerance") != 1e-6
         or scf.get("energy_tolerance_hartree") != 8e-6
         or scf.get("orbital_tolerance") != 1e-6
+        or scf.get("adaptive_eigensolver_tolerance") is not True
+        or scf.get("initial_eigensolver_tolerance") != 1e-2
+        or scf.get("eigensolver_tolerance_scale") != 0.1
         or davidson.get("max_iterations") != 48
         or davidson.get("tolerance") != 1e-6
     ):

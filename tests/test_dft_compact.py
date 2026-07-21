@@ -535,7 +535,8 @@ def test_gth_projector_generation_count_cache_hits_and_hpsi_traffic():
 def test_gth_projector_cache_eviction_invalidation_and_context_lifetime():
     basis = _basis(cutoff=4.0)
     entry_bytes = basis.active_count * 8
-    cache = _GTHProjectorCache(byte_budget=entry_bytes)
+    flattened_bytes = 2 * entry_bytes
+    cache = _GTHProjectorCache(byte_budget=flattened_bytes)
     state = _random_state(basis, vectors=1, seed=31)
     positions = np.asarray(
         ((1.0, 2.0, 3.0), (3.0, 2.0, 1.0)),
@@ -555,7 +556,7 @@ def test_gth_projector_cache_eviction_invalidation_and_context_lifetime():
     assert not first.positions.flags.writeable
     assert metrics["projector_cache_evictions"] == 0
     assert cache.entry_count == 1
-    assert cache.current_bytes == entry_bytes
+    assert cache.current_bytes == flattened_bytes
     assert cache.current_bytes <= cache.byte_budget
     assert all(not callable(entry) for entry in cache._entries.values())
 

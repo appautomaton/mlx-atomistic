@@ -452,19 +452,12 @@ class PeriodicGTHNonlocalOperator:
             projectors.append(values.astype(mx.complex64))
         return mx.stack(projectors, axis=0)
 
-    def _cache_key(
-        self,
-        ion_index: int,
-        channel_index: int,
-        harmonic_index: int,
-    ) -> tuple[object, ...]:
+    def _flattened_cache_key(self) -> tuple[object, ...]:
         return (
             self._context_identity,
             self.basis.basis_fingerprint,
             self.basis.order_fingerprint,
-            ion_index,
-            channel_index,
-            harmonic_index,
+            "flattened-projectors",
             "complex64",
         )
 
@@ -539,7 +532,6 @@ class PeriodicGTHNonlocalOperator:
         context_identity = reference._context_identity
         vector_count = batch.vector_count
         lane_data = []
-        projector_inputs: list[tuple[mx.array, dict[int, tuple[mx.array, ...]]] | None] = []
         metrics = []
         protected_by_cache: dict[
             int,
@@ -567,7 +559,6 @@ class PeriodicGTHNonlocalOperator:
                 raise ValueError(msg)
             vectors = operator.basis._layout._active_shifted_vectors
             lane_data.append((operator, vectors))
-            projector_inputs.append(None)
             metrics.append(
                 {
                     "projector_payload_elements": 0,
@@ -588,99 +579,76 @@ class PeriodicGTHNonlocalOperator:
                 (operator._cache, set()),
             )
 
-        projector_rows: list[list[mx.array]] = [[] for _lane_index in range(len(lane_data))]
-        for ion_index in range(reference.positions.shape[0]):
-            for channel_index, reference_channel in enumerate(
-                reference.pseudopotential.gth_channels
-            ):
-                harmonic_count = 2 * reference_channel.angular_momentum + 1
-                for harmonic_index in range(harmonic_count):
-                    for lane_index, (operator, vectors) in enumerate(lane_data):
-                        channel = operator.pseudopotential.gth_channels[channel_index]
-                        key = operator._cache_key(
-                            ion_index,
-                            channel_index,
-                            harmonic_index,
-                        )
-                        cache, protected_keys = protected_by_cache[id(operator._cache)]
-                        beta = cache.get(key)
-                        group_elements = channel.projector_count * operator.basis.active_count
-                        lane_metrics = metrics[lane_index]
-                        if beta is None:
-                            lane_metrics["projector_cache_misses"] += 1
-                            inputs = projector_inputs[lane_index]
-                            if inputs is None:
-                                q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
-                                harmonics = {
-                                    candidate.angular_momentum: (
-                                        _real_spherical_harmonics(
-                                            candidate.angular_momentum,
-                                            vectors,
-                                            q,
-                                        )
-                                    )
-                                    for candidate in (operator.pseudopotential.gth_channels)
-                                }
-                                inputs = (q, harmonics)
-                                projector_inputs[lane_index] = inputs
-                            q, harmonics = inputs
-                            harmonic = harmonics[channel.angular_momentum][harmonic_index]
-                            beta = operator._projector_group(
-                                operator.positions[ion_index],
-                                channel,
-                                harmonic,
-                                vectors,
-                                q,
-                            )
-                            lane_metrics["projector_elements_generated"] += group_elements
-                            evictions, inserted = cache.put(
-                                key,
-                                beta,
-                                protected_keys=protected_keys,
-                            )
-                            lane_metrics["projector_cache_evictions"] += evictions
-                            if inserted:
-                                protected_keys.add(key)
-                        else:
-                            lane_metrics["projector_cache_hits"] += 1
-                            protected_keys.add(key)
-                        lane_metrics["projector_payload_elements"] += group_elements
-                        lane_metrics["projector_elements_loaded"] += (
-                            2 * coefficients[lane_index].vector_count * group_elements
-                        )
-                        padding = batch.bucket_size - operator.basis.active_count
-                        if padding:
-                            beta = mx.concatenate(
-                                [
-                                    beta,
-                                    mx.zeros(
-                                        (channel.projector_count, padding),
-                                        dtype=mx.complex64,
-                                    ),
-                                ],
-                                axis=1,
-                            )
-                        projector_rows[lane_index].append(beta)
-                        lane_metrics["projector_peak_workspace_bytes"] = max(
-                            lane_metrics["projector_peak_workspace_bytes"],
-                            (
-                                coefficients[lane_index].vector_count * operator.basis.active_count
-                                + 2
-                                * coefficients[lane_index].vector_count
-                                * channel.projector_count
-                            )
-                            * 8,
-                        )
-
         flattened_projectors = []
-        for lane_index, rows in enumerate(projector_rows):
-            beta = mx.concatenate(rows, axis=0)
+        group_count = int(reference.positions.shape[0]) * sum(
+            2 * channel.angular_momentum + 1
+            for channel in reference.pseudopotential.gth_channels
+        )
+        for lane_index, (operator, vectors) in enumerate(lane_data):
+            cache, protected_keys = protected_by_cache[id(operator._cache)]
+            key = operator._flattened_cache_key()
+            beta = cache.get(key)
+            lane_metrics = metrics[lane_index]
+            payload_elements = operator._projector_count * operator.basis.active_count
+            lane_metrics["projector_payload_elements"] = payload_elements
+            lane_metrics["projector_elements_loaded"] = (
+                2 * coefficients[lane_index].vector_count * payload_elements
+            )
+            if beta is None:
+                lane_metrics["projector_cache_misses"] = group_count
+                q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
+                harmonics = {
+                    channel.angular_momentum: _real_spherical_harmonics(
+                        channel.angular_momentum,
+                        vectors,
+                        q,
+                    )
+                    for channel in operator.pseudopotential.gth_channels
+                }
+                rows = []
+                for ion_index in range(operator.positions.shape[0]):
+                    for channel in operator.pseudopotential.gth_channels:
+                        for harmonic in harmonics[channel.angular_momentum]:
+                            rows.append(
+                                operator._projector_group(
+                                    operator.positions[ion_index],
+                                    channel,
+                                    harmonic,
+                                    vectors,
+                                    q,
+                                )
+                            )
+                beta = mx.concatenate(rows, axis=0)
+                lane_metrics["projector_elements_generated"] = payload_elements
+                evictions, inserted = cache.put(
+                    key,
+                    beta,
+                    protected_keys=protected_keys,
+                )
+                lane_metrics["projector_cache_evictions"] = evictions
+                if inserted:
+                    protected_keys.add(key)
+            else:
+                lane_metrics["projector_cache_hits"] = group_count
+                protected_keys.add(key)
             if int(beta.shape[0]) != reference._projector_count:
                 msg = "flattened GTH projector count is inconsistent"
                 raise RuntimeError(msg)
+            padding = batch.bucket_size - operator.basis.active_count
+            if padding:
+                beta = mx.concatenate(
+                    [
+                        beta,
+                        mx.zeros(
+                            (operator._projector_count, padding),
+                            dtype=mx.complex64,
+                        ),
+                    ],
+                    axis=1,
+                )
             flattened_projectors.append(beta)
-            metrics[lane_index]["projector_peak_workspace_bytes"] = max(
-                metrics[lane_index]["projector_peak_workspace_bytes"],
+            lane_metrics["projector_peak_workspace_bytes"] = max(
+                lane_metrics["projector_peak_workspace_bytes"],
                 (
                     reference._projector_count * batch.bucket_size
                     + 4 * reference._projector_count * vector_count
