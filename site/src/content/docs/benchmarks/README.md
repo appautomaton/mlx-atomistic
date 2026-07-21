@@ -36,6 +36,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [mlx-dft-silicon-m5max.md](./mlx-dft-silicon-m5max.md) | mlx_atomistic | 8-atom periodic silicon DFT, 6³ k-point mesh | Metal | Apple M5 Max |
 | [inventory-gap-matrix.md](./inventory-gap-matrix.md) | mlx_atomistic | benchmark inventory and Phase 3 gaps | N/A | N/A |
 | [benchmark-ladder.md](./benchmark-ladder.md) | mlx_atomistic/openmm-reference/lammps-reference | benchmark ladder and row decision value | Metal/OpenCL where available | local |
 | [same-workload-comparison-matrix.md](./same-workload-comparison-matrix.md) | mlx_atomistic/openmm-reference | planned same-workload comparison pairs | Metal/OpenCL where available | local |
@@ -75,6 +76,7 @@ Markdown summaries should cite those raw paths and reproduction commands.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
+| `uv run python -m mlx_atomistic.benchmarks.dft_scf_smell --manifest results/mlx-dft-runtime-architecture/workload-slice1/manifest.json --gth-source results/mlx-dft-runtime-architecture/workload-slice1/resources/Si-GTH-PBE-q4.gth --mode adaptive --representatives 8 --out results/mlx-dft-runtime-architecture/smell/adaptive-8.json --json` | mlx_atomistic | opt-in bounded DFT development gate | partial-zone SCF JSON under `results/`; not a production full-SCF timing |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --include-large --steps 100 --json > results/mlx-md-performance.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --include-large --evaluations 10 --json > results/mlx-md-acceleration.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.neighbor_nonbonded_parity --sizes 1000,4000,16000,50000,92001 --out results/scalable-neighbor-nonbonded-runtime/parity.json` | mlx_atomistic | opt-in correctness/performance | parity and timing JSON under `results/` |
