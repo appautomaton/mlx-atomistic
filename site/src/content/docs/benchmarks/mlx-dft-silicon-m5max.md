@@ -99,6 +99,7 @@ allowed.
 | Davidson maximum subspace 64 → 48 | 2.192 s; more iterations and Hψ | Removed |
 | Hybrid RMM-DIIS prototype | One point: 5.550 → 8.458 s; 14 → 21 cycles | Removed |
 | Safe converged-subspace locking | One point: 5.180 → 6.902 s; 14 → 17 cycles; 4.09 → 3.92 GB peak | Removed before the eight-point gate |
+| Power-of-two Hψ shape buckets | Eight points: 5.937 → 5.098 s but 4.44 → 4.86 GB; refined: 6.777 → 6.072 s but 4.44 → 5.29 GB | Removed after the first qualified pair; runtime passed, process-memory gate failed |
 
 The symbols associated with rejected implementations must remain absent:
 `finite_certified`, `projected_eigh_ragged`, `prediction_tolerance`,
