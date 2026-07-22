@@ -90,6 +90,11 @@ class RuntimeObserver:
     _work: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _memory: dict[str, int | None] = field(default_factory=dict, init=False, repr=False)
     _phases: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _hpsi_shapes: dict[tuple[int, int], int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     _phase_stack: list[list[object]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -179,6 +184,25 @@ class RuntimeObserver:
             byte_count if current is None else max(current, byte_count)
         )
 
+    def record_hpsi_shape(self, lane_capacity: int, vector_capacity: int) -> None:
+        """Count one physically submitted Hpsi lane/vector capacity.
+
+        Args:
+            lane_capacity: Positive physical lane count.
+            vector_capacity: Positive physical vectors per lane.
+        """
+
+        if (
+            type(lane_capacity) is not int
+            or type(vector_capacity) is not int
+            or lane_capacity <= 0
+            or vector_capacity <= 0
+        ):
+            msg = "Hpsi shape capacities must be positive non-bool integers"
+            raise ValueError(msg)
+        shape = (lane_capacity, vector_capacity)
+        self._hpsi_shapes[shape] = self._hpsi_shapes.get(shape, 0) + 1
+
     @contextmanager
     def phase(self, name: str, *, synchronize: bool = True) -> Iterator[None]:
         """Measure one exclusive synchronized named phase.
@@ -234,6 +258,14 @@ class RuntimeObserver:
             "phase_seconds": phases,
             "work_counters": dict(self._work),
             "memory": dict(self._memory),
+            "hpsi_shapes": [
+                {
+                    "lane_capacity": lanes,
+                    "vector_capacity": vectors,
+                    "calls": calls,
+                }
+                for (lanes, vectors), calls in sorted(self._hpsi_shapes.items())
+            ],
             "events": [dict(event) for event in self._events],
         }
 

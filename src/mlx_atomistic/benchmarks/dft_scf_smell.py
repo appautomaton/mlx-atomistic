@@ -48,6 +48,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--gth-source", type=Path, required=True)
     parser.add_argument("--mode", choices=("fixed", "adaptive"), required=True)
+    parser.add_argument(
+        "--hpsi-shape-policy",
+        choices=("stable", "finite-buckets"),
+        default="stable",
+    )
     parser.add_argument("--representatives", type=_positive_integer, default=8)
     parser.add_argument(
         "--shape-profile",
@@ -218,6 +223,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             preconditioner_floor=0.25,
         ),
         kpoint_batch_size=8,
+        hpsi_shape_policy=arguments.hpsi_shape_policy,
     )
     started = perf_counter()
     result = run_periodic_scf(
@@ -245,6 +251,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         "manifest_sha256": sha256_bytes(workload_bytes),
         "gth_source": str(arguments.gth_source),
         "mode": arguments.mode,
+        "hpsi_shape_policy": arguments.hpsi_shape_policy,
         "elapsed_seconds": elapsed,
         "converged": result.converged,
         "iterations": result.iterations,
@@ -267,6 +274,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         "work_counters": observation["work_counters"],
         "phase_seconds": observation["phase_seconds"],
         "memory": observation["memory"],
+        "hpsi_shapes": observation["hpsi_shapes"],
     }
     if arguments.shape_profile:
         report["hpsi_shape_profile"] = _hpsi_shape_profile(observation["events"])

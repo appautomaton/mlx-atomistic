@@ -26,6 +26,8 @@ from mlx_atomistic.dft.periodic_scf import (
     _DavidsonEngine,
     _DavidsonLaneRequest,
     _DavidsonScheduler,
+    _finite_lane_capacity,
+    _finite_vector_capacity,
     _FixedHamiltonianToken,
     _PairedDavidsonState,
     _RankResult,
@@ -1104,6 +1106,78 @@ def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():
         ]
     )
     assert singleton.groups == (("single",),)
+
+
+def test_finite_capacity_buckets_are_bounded_and_reject_invalid_counts():
+    assert [_finite_lane_capacity(value, 8) for value in range(1, 9)] == [
+        1,
+        2,
+        4,
+        4,
+        8,
+        8,
+        8,
+        8,
+    ]
+    assert [_finite_vector_capacity(value, 16) for value in (1, 4, 5, 8, 9, 16)] == [
+        4,
+        4,
+        8,
+        8,
+        16,
+        16,
+    ]
+    with pytest.raises(ValueError, match="no larger than its maximum"):
+        _finite_lane_capacity(9, 8)
+    with pytest.raises(ValueError, match="no larger than its maximum"):
+        _finite_vector_capacity(17, 16)
+
+
+def test_finite_bucket_scheduler_uses_only_smallest_fitting_physical_shapes():
+    basis, operator = _problem(lane_label="finite-buckets")
+    observer = RuntimeObserver()
+    observed_operator = PeriodicKohnShamOperator(
+        basis,
+        operator.effective_local_potential,
+        observer=observer,
+    )
+    config = PeriodicDavidsonConfig(max_iterations=1, max_subspace_size=32)
+    rank_policy = _Complex64RankPolicy()
+    token = _FixedHamiltonianToken.create(observed_operator, config, 16, rank_policy)
+    tickets = tuple(
+        _DavidsonApplicationTicket(
+            lane_id=f"width-{width}",
+            operator=observed_operator,
+            config=config,
+            n_bands=16,
+            rank_policy=rank_policy,
+            token=token,
+            vectors=periodic_scf._initial_coefficients(basis, width),
+            observer=observer,
+        )
+        for width in (1, 3, 5, 9)
+    )
+    scheduler = _DavidsonScheduler(batch_cap=8, shape_policy="finite-buckets")
+    scheduler.bind(tickets)
+
+    outcome = scheduler.apply(tickets)
+    snapshot = observer.snapshot()
+
+    assert not outcome.failures
+    assert set(outcome.actions) == {"width-1", "width-3", "width-5", "width-9"}
+    assert snapshot["hpsi_shapes"] == [
+        {"lane_capacity": 1, "vector_capacity": 8, "calls": 1},
+        {"lane_capacity": 1, "vector_capacity": 16, "calls": 1},
+        {"lane_capacity": 2, "vector_capacity": 4, "calls": 1},
+    ]
+    work = snapshot["work_counters"]
+    assert work["hpsi_vector_equivalents"] == 18
+    assert work["hpsi_submitted_vector_equivalents"] == 32
+
+
+def test_scheduler_rejects_unknown_shape_policy():
+    with pytest.raises(ValueError, match="shape_policy"):
+        _DavidsonScheduler(shape_policy="unbounded")
 
 
 def test_engine_tail_submission_reuses_solve_local_physical_shape(monkeypatch):

@@ -147,6 +147,7 @@ def _paired_scf_problem(
             max_subspace_size=12,
         ),
         kpoint_batch_size=batch_size,
+        hpsi_shape_policy="stable",
     )
     return system, mesh, config
 
@@ -159,6 +160,9 @@ def test_default_batch_and_projector_cache_policy_stays_bounded():
         "kpoint_batch_size": 8,
         "max_batch_padding_fraction": 0.25,
         "max_batch_transient_bytes": 512 * 1024 * 1024,
+        "hpsi_shape_policy": "finite-buckets",
+        "hpsi_lane_capacity_buckets": [1, 2, 4, 8],
+        "hpsi_vector_capacity_buckets": [4, 8, 16],
     }
     assert _GTHProjectorCache.DEFAULT_BUDGET_BYTES == 256 * 1024 * 1024
 
@@ -171,6 +175,7 @@ def test_default_batch_and_projector_cache_policy_stays_bounded():
         ("initial_eigensolver_tolerance", float("nan"), "finite and positive"),
         ("eigensolver_tolerance_scale", False, "finite and positive"),
         ("eigensolver_tolerance_scale", float("inf"), "finite and positive"),
+        ("hpsi_shape_policy", "dynamic", "must be 'stable' or 'finite-buckets'"),
     ],
 )
 def test_adaptive_eigensolver_controls_reject_malformed_values(field, value, message):
@@ -942,6 +947,9 @@ def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
         "kpoint_batch_size": 2,
         "max_batch_padding_fraction": 0.25,
         "max_batch_transient_bytes": 512 * 1024 * 1024,
+        "hpsi_shape_policy": "stable",
+        "hpsi_lane_capacity_buckets": [1, 2, 4, 8],
+        "hpsi_vector_capacity_buckets": [4, 8, 16],
     }
     assert batched.to_dict()["batch_policy"] == batched.batch_policy
     metadata = json.loads(serialize_periodic_scf_state(batched)["metadata.json"])
@@ -968,6 +976,47 @@ def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
     assert batched_work["hpsi_calls"] < singleton_work["hpsi_calls"]
     assert batched_work["hpsi_vector_equivalents"] == singleton_work["hpsi_vector_equivalents"]
     assert batched_work["fft_submissions"] < singleton_work["fft_submissions"]
+
+
+def test_finite_hpsi_buckets_preserve_small_scf_trajectory():
+    stable_system, stable_mesh, stable_config = _paired_scf_problem(batch_size=2)
+    finite_system, finite_mesh, finite_config = _paired_scf_problem(batch_size=2)
+    stable_observer = RuntimeObserver(synchronize=mx.synchronize)
+    finite_observer = RuntimeObserver(synchronize=mx.synchronize)
+
+    stable = run_periodic_scf(
+        stable_system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=stable_mesh,
+        n_bands=1,
+        config=stable_config,
+        observer=stable_observer,
+    )
+    finite = run_periodic_scf(
+        finite_system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=finite_mesh,
+        n_bands=1,
+        config=replace(finite_config, hpsi_shape_policy="finite-buckets"),
+        observer=finite_observer,
+    )
+
+    assert stable.iterations == finite.iterations
+    assert stable.total_energy == pytest.approx(finite.total_energy, abs=5e-5)
+    assert stable.electron_count == pytest.approx(finite.electron_count, abs=5e-6)
+    np.testing.assert_allclose(
+        np.asarray(stable.density),
+        np.asarray(finite.density),
+        atol=5e-5,
+    )
+    for left, right in zip(stable.owned_kpoints, finite.owned_kpoints, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(left.eigen.eigenvalues),
+            np.asarray(right.eigen.eigenvalues),
+            atol=5e-5,
+        )
+    assert finite.batch_policy["hpsi_shape_policy"] == "finite-buckets"
+    assert finite_observer.snapshot()["hpsi_shapes"]
 
 
 def test_representative_k_batch_failure_event_identifies_only_failed_lane(

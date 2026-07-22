@@ -217,6 +217,7 @@ class PeriodicSCFConfig:
     kpoint_batch_size: int = 8
     max_batch_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
     max_batch_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
+    hpsi_shape_policy: str = "finite-buckets"
     adaptive_eigensolver_tolerance: bool = False
     initial_eigensolver_tolerance: float = 1e-2
     eigensolver_tolerance_scale: float = 0.1
@@ -272,14 +273,20 @@ class PeriodicSCFConfig:
         if type(self.max_batch_transient_bytes) is not int or self.max_batch_transient_bytes <= 0:
             msg = "max_batch_transient_bytes must be a positive non-bool integer"
             raise ValueError(msg)
+        if self.hpsi_shape_policy not in {"stable", "finite-buckets"}:
+            msg = "hpsi_shape_policy must be 'stable' or 'finite-buckets'"
+            raise ValueError(msg)
 
-    def batch_policy(self) -> dict[str, int | float]:
+    def batch_policy(self) -> dict[str, int | float | str | list[int]]:
         """Return the exact bounded compact-batch policy."""
 
         return {
             "kpoint_batch_size": self.kpoint_batch_size,
             "max_batch_padding_fraction": float(self.max_batch_padding_fraction),
             "max_batch_transient_bytes": self.max_batch_transient_bytes,
+            "hpsi_shape_policy": self.hpsi_shape_policy,
+            "hpsi_lane_capacity_buckets": [1, 2, 4, 8],
+            "hpsi_vector_capacity_buckets": [4, 8, 16],
         }
 
 
@@ -1121,6 +1128,10 @@ class PeriodicKohnShamOperator:
                 },
             )
             if runtime_observer is not None:
+                runtime_observer.record_hpsi_shape(
+                    batch.lane_capacity,
+                    batch.vector_count,
+                )
                 fft_workspace_bytes = (
                     2 * batch.lane_capacity * batch.vector_count * batch.grid_size * 8
                 )
@@ -1649,6 +1660,33 @@ class _CompactBatchCapacity:
     active: int
 
 
+def _finite_lane_capacity(lane_count: int, maximum: int) -> int:
+    """Return the smallest bounded power-of-two lane capacity."""
+
+    if type(lane_count) is not int or type(maximum) is not int:
+        msg = "finite lane capacities require non-bool integers"
+        raise ValueError(msg)
+    if lane_count <= 0 or maximum <= 0 or lane_count > maximum:
+        msg = "finite lane capacity must be positive and no larger than its maximum"
+        raise ValueError(msg)
+    return min(1 << (lane_count - 1).bit_length(), maximum)
+
+
+def _finite_vector_capacity(vector_count: int, maximum: int) -> int:
+    """Return a 4/8/16-style vector bucket bounded by the solve maximum."""
+
+    if type(vector_count) is not int or type(maximum) is not int:
+        msg = "finite vector capacities require non-bool integers"
+        raise ValueError(msg)
+    if vector_count <= 0 or maximum <= 0 or vector_count > maximum:
+        msg = "finite vector capacity must be positive and no larger than its maximum"
+        raise ValueError(msg)
+    capacity = min(4, maximum)
+    while capacity < vector_count:
+        capacity = min(2 * capacity, maximum)
+    return capacity
+
+
 @dataclass(frozen=True)
 class _CompactSubmission:
     indices: tuple[int, ...]
@@ -1912,6 +1950,7 @@ class _DavidsonScheduler:
         batch_cap: int = 1,
         max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
         max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        shape_policy: str = "stable",
         submission_callback: _DavidsonSubmissionCallback | None = None,
     ) -> None:
         _plan_compact_submissions(
@@ -1923,6 +1962,10 @@ class _DavidsonScheduler:
         self._batch_cap = batch_cap
         self._max_padding_fraction = float(max_padding_fraction)
         self._max_transient_bytes = max_transient_bytes
+        if shape_policy not in {"stable", "finite-buckets"}:
+            msg = "Davidson shape_policy must be 'stable' or 'finite-buckets'"
+            raise ValueError(msg)
+        self._shape_policy = shape_policy
         self._submission_callback = submission_callback
         self._submission_index = 0
         self._capacity_by_lane: dict[str, _CompactBatchCapacity] = {}
@@ -1938,6 +1981,10 @@ class _DavidsonScheduler:
     @property
     def max_transient_bytes(self) -> int:
         return self._max_transient_bytes
+
+    @property
+    def shape_policy(self) -> str:
+        return self._shape_policy
 
     def reset(self) -> None:
         """Reset solve-local submission numbering."""
@@ -1975,6 +2022,12 @@ class _DavidsonScheduler:
         capacity = self._capacity_by_lane.get(ticket.lane_id)
         if capacity is None:
             shape: object = ("dynamic", ticket.vectors.vector_count)
+        elif self.shape_policy == "finite-buckets":
+            shape = (
+                "finite-buckets",
+                _finite_vector_capacity(ticket.vectors.vector_count, capacity.vectors),
+                capacity.active,
+            )
         else:
             shape = (
                 "stable",
@@ -2061,10 +2114,20 @@ class _DavidsonScheduler:
         for ticket in ready:
             grouped[self._group_key(ticket)].append(ticket)
 
+        compatible_batches: list[list[_DavidsonApplicationTicket]] = []
+        for compatible in grouped.values():
+            if self.shape_policy == "finite-buckets":
+                compatible_batches.extend(
+                    compatible[start : start + self.batch_cap]
+                    for start in range(0, len(compatible), self.batch_cap)
+                )
+            else:
+                compatible_batches.append(compatible)
+
         actions: dict[str, _CompactLaneState] = {}
         groups: list[tuple[str, ...]] = []
         compatibility_groups: list[tuple[str, ...]] = []
-        for compatible in grouped.values():
+        for compatible in compatible_batches:
             compatibility_groups.append(tuple(ticket.lane_id for ticket in compatible))
 
             def estimate_submission(
@@ -2078,12 +2141,23 @@ class _DavidsonScheduler:
                     batch,
                 )
 
-            capacity = self._capacity_by_lane.get(compatible[0].lane_id)
-            if capacity is not None and any(
-                self._capacity_by_lane.get(ticket.lane_id) != capacity for ticket in compatible
+            bound_capacity = self._capacity_by_lane.get(compatible[0].lane_id)
+            if bound_capacity is not None and any(
+                self._capacity_by_lane.get(ticket.lane_id) != bound_capacity
+                for ticket in compatible
             ):
                 msg = "Davidson stable-shape group has inconsistent capacities"
                 raise RuntimeError(msg)
+            capacity = bound_capacity
+            if capacity is not None and self.shape_policy == "finite-buckets":
+                capacity = _CompactBatchCapacity(
+                    lanes=_finite_lane_capacity(len(compatible), capacity.lanes),
+                    vectors=_finite_vector_capacity(
+                        compatible[0].vectors.vector_count,
+                        capacity.vectors,
+                    ),
+                    active=capacity.active,
+                )
             plan = _plan_compact_submissions(
                 [ticket.vectors for ticket in compatible],
                 batch_cap=self.batch_cap,
@@ -3611,7 +3685,7 @@ class PeriodicSCFResult:
     history: tuple[dict[str, float | int | str | None], ...]
     timings: dict[str, float]
     time_reversal_ownership: TimeReversalOwnership | None = None
-    batch_policy: dict[str, int | float] = field(default_factory=dict)
+    batch_policy: dict[str, int | float | str | list[int]] = field(default_factory=dict)
     numerical_status: str = "not_evaluated"
     resume_integrity_status: str = "fresh"
     timing_admission_status: str = "fresh"
@@ -4511,6 +4585,7 @@ def _run_periodic_scf_with_projector_cache(
                 batch_cap=scf_config.kpoint_batch_size,
                 max_padding_fraction=scf_config.max_batch_padding_fraction,
                 max_transient_bytes=scf_config.max_batch_transient_bytes,
+                shape_policy=scf_config.hpsi_shape_policy,
                 submission_callback=emit_submission,
             )
         with observed_phase(
