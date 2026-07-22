@@ -80,6 +80,10 @@ uv run python -m mlx_atomistic.benchmarks.dft_scf_smell \
   --out results/mlx-dft-runtime-architecture/smell/adaptive-8.json --json
 ```
 
+Add `--shape-profile` only for scheduler-design diagnostics. It enables detailed
+batch events, emits an aggregated Hψ shape inventory and one-tail replay table,
+and therefore does not produce an admissible timing sample.
+
 Run it through the repository's bounded process-tree wrapper when collecting
 performance evidence. The hard process-tree memory limit is 40 GB. A one-point
 gate precedes three interleaved eight-point baseline/candidate pairs. A candidate
@@ -100,6 +104,7 @@ allowed.
 | Hybrid RMM-DIIS prototype | One point: 5.550 → 8.458 s; 14 → 21 cycles | Removed |
 | Safe converged-subspace locking | One point: 5.180 → 6.902 s; 14 → 17 cycles; 4.09 → 3.92 GB peak | Removed before the eight-point gate |
 | Power-of-two Hψ shape buckets | Eight points: 5.937 → 5.098 s but 4.44 → 4.86 GB; refined: 6.777 → 6.072 s but 4.44 → 5.29 GB | Removed after the first qualified pair; runtime passed, process-memory gate failed |
+| One main plus one Hψ tail shape | Stable profile: 17,024 submitted versus 8,980 logical vector equivalents; the best candidate within the call-growth bound removed 23.0%, below the 25% implementation gate | Stopped before scheduler implementation or timing gates |
 
 The symbols associated with rejected implementations must remain absent:
 `finite_certified`, `projected_eigh_ragged`, `prediction_tolerance`,

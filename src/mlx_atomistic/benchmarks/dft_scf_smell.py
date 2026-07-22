@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from time import perf_counter
@@ -47,6 +49,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gth-source", type=Path, required=True)
     parser.add_argument("--mode", choices=("fixed", "adaptive"), required=True)
     parser.add_argument("--representatives", type=_positive_integer, default=8)
+    parser.add_argument(
+        "--shape-profile",
+        action="store_true",
+        help="Collect completed Hpsi batch shapes; profiled timings are diagnostic only.",
+    )
     parser.add_argument("--out", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
@@ -67,6 +74,100 @@ def _owner_points(
         )
         raise ValueError(msg)
     return owners[:representatives]
+
+
+def _hpsi_shape_profile(events: Sequence[dict[str, object]]) -> dict[str, object]:
+    """Summarize completed Hpsi submissions and select one bounded tail shape."""
+
+    signatures: Counter[tuple[tuple[int, ...], int, int]] = Counter()
+    for event in events:
+        if event.get("event") != "kpoint_batch" or event.get("status") != "completed":
+            continue
+        logical = tuple(int(value) for value in event["logical_vector_counts"])
+        signatures[(logical, int(event["lane_capacity"]), int(event["vector_count"]))] += 1
+    submissions = [
+        {
+            "logical_vector_counts": list(logical),
+            "logical_lane_count": len(logical),
+            "physical_lane_capacity": lanes,
+            "physical_vector_capacity": vectors,
+            "count": count,
+        }
+        for (logical, lanes, vectors), count in sorted(signatures.items())
+    ]
+    baseline_calls = sum(int(row["count"]) for row in submissions)
+    baseline_submitted = sum(
+        int(row["physical_lane_capacity"])
+        * int(row["physical_vector_capacity"])
+        * int(row["count"])
+        for row in submissions
+    )
+    logical_vectors = sum(
+        sum(int(value) for value in row["logical_vector_counts"])
+        * int(row["count"])
+        for row in submissions
+    )
+    candidates: list[dict[str, int | float | bool]] = []
+    for tail_lanes in (1, 2, 4):
+        for tail_vectors in (4, 8, 16):
+            calls = 0
+            submitted = 0
+            for row in submissions:
+                count = int(row["count"])
+                main_lanes = int(row["physical_lane_capacity"])
+                main_vectors = int(row["physical_vector_capacity"])
+                logical = [int(value) for value in row["logical_vector_counts"]]
+                tail_capacity_lanes = min(tail_lanes, main_lanes)
+                tail_capacity_vectors = min(tail_vectors, main_vectors)
+                if logical and max(logical) <= tail_capacity_vectors:
+                    tail_calls = math.ceil(len(logical) / tail_capacity_lanes)
+                    calls += count * tail_calls
+                    submitted += (
+                        count * tail_calls * tail_capacity_lanes * tail_capacity_vectors
+                    )
+                else:
+                    main_calls = math.ceil(len(logical) / main_lanes)
+                    calls += count * main_calls
+                    submitted += count * main_calls * main_lanes * main_vectors
+            reduction = (
+                0.0
+                if baseline_submitted == 0
+                else 1.0 - submitted / baseline_submitted
+            )
+            call_ratio = 0.0 if baseline_calls == 0 else calls / baseline_calls
+            candidates.append(
+                {
+                    "lanes": tail_lanes,
+                    "vectors": tail_vectors,
+                    "predicted_calls": calls,
+                    "predicted_submitted_vector_equivalents": submitted,
+                    "predicted_submitted_reduction": reduction,
+                    "predicted_call_ratio": call_ratio,
+                    "qualifies": reduction >= 0.25 and call_ratio <= 1.35,
+                }
+            )
+    qualified = [candidate for candidate in candidates if bool(candidate["qualifies"])]
+    selected = min(
+        qualified,
+        key=lambda candidate: (
+            int(candidate["predicted_submitted_vector_equivalents"]),
+            int(candidate["predicted_calls"]),
+            int(candidate["lanes"]) * int(candidate["vectors"]),
+        ),
+        default=None,
+    )
+    return {
+        "submissions": submissions,
+        "baseline_calls": baseline_calls,
+        "baseline_logical_vector_equivalents": logical_vectors,
+        "baseline_submitted_vector_equivalents": baseline_submitted,
+        "tail_candidates": candidates,
+        "selected_tail_capacity": (
+            None
+            if selected is None
+            else {"lanes": int(selected["lanes"]), "vectors": int(selected["vectors"])}
+        ),
+    }
 
 
 def _run(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -95,7 +196,10 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             for point in selected
         ]
     )
-    observer = RuntimeObserver(synchronize=mx.synchronize, detail_events=False)
+    observer = RuntimeObserver(
+        synchronize=mx.synchronize,
+        detail_events=arguments.shape_profile,
+    )
     config = PeriodicSCFConfig(
         max_iterations=80,
         min_iterations=2,
@@ -131,7 +235,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         float(mx.max(point.eigen.residuals)) for point in result.kpoints
     )
     maximum_overlap = max(point.eigen.orthonormality_error for point in result.kpoints)
-    return {
+    report = {
         "schema": SCHEMA,
         "scope": "partial-brillouin-zone-development-gate",
         "production_full_scf_result": False,
@@ -164,6 +268,9 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         "phase_seconds": observation["phase_seconds"],
         "memory": observation["memory"],
     }
+    if arguments.shape_profile:
+        report["hpsi_shape_profile"] = _hpsi_shape_profile(observation["events"])
+    return report
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 
 class _RUsageInfoV0(ctypes.Structure):
@@ -117,11 +118,50 @@ def _terminate_processes(pids: set[int]) -> None:
     _signal_processes(_alive_processes(pids), signal.SIGKILL)
 
 
+def _percentile90(values: Sequence[int]) -> int:
+    if not values:
+        raise ValueError("memory percentile requires at least one sample")
+    ordered = sorted(values)
+    return ordered[max(0, (9 * len(ordered) + 9) // 10 - 1)]
+
+
+def _memory_trace_summary(samples: Sequence[dict[str, float | int]]) -> dict[str, object]:
+    """Summarize late-run physical-memory growth without hiding raw samples."""
+
+    peak = max((int(sample["physical_bytes"]) for sample in samples), default=0)
+    if len(samples) < 8:
+        return {
+            "peak_physical_bytes": peak,
+            "plateau_evaluated": False,
+            "plateau_passed": None,
+        }
+    midpoint = len(samples) // 2
+    third_quarter = samples[midpoint : midpoint + (len(samples) - midpoint) // 2]
+    fourth_quarter = samples[midpoint + (len(samples) - midpoint) // 2 :]
+    preceding = _percentile90(
+        [int(sample["physical_bytes"]) for sample in third_quarter]
+    )
+    final = _percentile90(
+        [int(sample["physical_bytes"]) for sample in fourth_quarter]
+    )
+    allowance = max(512 * 1024 * 1024, int(0.15 * preceding))
+    return {
+        "peak_physical_bytes": peak,
+        "plateau_evaluated": True,
+        "preceding_quarter_p90_bytes": preceding,
+        "final_quarter_p90_bytes": final,
+        "late_growth_allowance_bytes": allowance,
+        "plateau_passed": final - preceding <= allowance,
+    }
+
+
 def run_bounded(
     command: Sequence[str],
     *,
     max_bytes: int,
     poll_seconds: float,
+    timeout_seconds: float | None = None,
+    trace_out: str | Path | None = None,
 ) -> int:
     """Run ``command`` and terminate its process tree above ``max_bytes``."""
 
@@ -131,9 +171,14 @@ def run_bounded(
         raise ValueError("bounded process max_bytes must be positive")
     if not 0.05 <= poll_seconds <= 5.0:
         raise ValueError("bounded process poll_seconds must lie in [0.05, 5]")
+    if timeout_seconds is not None and timeout_seconds <= 0.0:
+        raise ValueError("bounded process timeout_seconds must be positive")
     process = subprocess.Popen(tuple(command), start_new_session=True)
+    started = time.monotonic()
     peak_bytes = 0
     exceeded = False
+    timed_out = False
+    samples: list[dict[str, float | int]] = []
     observed_pids: set[int] = {process.pid}
     tracked_pids: set[int] = {process.pid}
     try:
@@ -141,8 +186,20 @@ def run_bounded(
             physical_bytes, observed_pids = _process_tree_physical_bytes(process.pid)
             tracked_pids.update(observed_pids)
             peak_bytes = max(peak_bytes, physical_bytes)
+            elapsed = time.monotonic() - started
+            samples.append(
+                {
+                    "elapsed_seconds": elapsed,
+                    "physical_bytes": physical_bytes,
+                    "process_count": len(observed_pids),
+                }
+            )
             if physical_bytes > max_bytes:
                 exceeded = True
+                _terminate_processes(tracked_pids)
+                break
+            if timeout_seconds is not None and elapsed > timeout_seconds:
+                timed_out = True
                 _terminate_processes(tracked_pids)
                 break
             time.sleep(poll_seconds)
@@ -158,27 +215,39 @@ def run_bounded(
     returncode = process.wait()
     orphans = _alive_processes(tracked_pids - {process.pid})
     _terminate_processes(orphans)
+    trace_summary = _memory_trace_summary(samples)
+    report = {
+        "bounded_process_exceeded": exceeded,
+        "bounded_process_limit_bytes": max_bytes,
+        "bounded_process_orphans_terminated": len(orphans),
+        "bounded_process_peak_physical_bytes": peak_bytes,
+        "bounded_process_returncode": returncode,
+        "bounded_process_timed_out": timed_out,
+        "bounded_process_timeout_seconds": timeout_seconds,
+        "memory_trace_summary": trace_summary,
+    }
+    if trace_out is not None:
+        destination = Path(trace_out)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+        temporary.write_text(
+            json.dumps({**report, "samples": samples}, indent=2, sort_keys=True) + "\n"
+        )
+        temporary.replace(destination)
     print(
-        json.dumps(
-            {
-                "bounded_process_exceeded": exceeded,
-                "bounded_process_limit_bytes": max_bytes,
-                "bounded_process_orphans_terminated": len(orphans),
-                "bounded_process_peak_physical_bytes": peak_bytes,
-                "bounded_process_returncode": returncode,
-            },
-            sort_keys=True,
-        ),
+        json.dumps(report, sort_keys=True),
         file=sys.stderr,
         flush=True,
     )
-    return 137 if exceeded else returncode
+    return 137 if exceeded else 124 if timed_out else returncode
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-bytes", type=int, required=True)
     parser.add_argument("--poll-seconds", type=float, default=0.25)
+    parser.add_argument("--timeout-seconds", type=float)
+    parser.add_argument("--trace-out", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
     command = arguments.command
@@ -188,6 +257,8 @@ def main() -> int:
         command,
         max_bytes=arguments.max_bytes,
         poll_seconds=arguments.poll_seconds,
+        timeout_seconds=arguments.timeout_seconds,
+        trace_out=arguments.trace_out,
     )
 
 

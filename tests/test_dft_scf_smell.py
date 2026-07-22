@@ -7,6 +7,7 @@ import argparse
 import pytest
 
 from mlx_atomistic.benchmarks.dft_scf_smell import (
+    _hpsi_shape_profile,
     _owner_points,
     _parser,
     _positive_integer,
@@ -42,3 +43,52 @@ def test_owner_points_fails_closed_when_request_exceeds_manifest() -> None:
 
     with pytest.raises(ValueError, match="contains only 1 owners"):
         _owner_points(workload, 2)
+
+
+def test_hpsi_shape_profile_ignores_started_events_and_selects_one_tail() -> None:
+    events = [
+        {
+            "event": "kpoint_batch",
+            "status": "started",
+            "logical_vector_counts": [2],
+            "lane_capacity": 8,
+            "vector_count": 16,
+        },
+        *[
+            {
+                "event": "kpoint_batch",
+                "status": "completed",
+                "logical_vector_counts": [2],
+                "lane_capacity": 8,
+                "vector_count": 16,
+            }
+            for _ in range(4)
+        ],
+        {
+            "event": "completion",
+            "status": "converged",
+        },
+    ]
+
+    profile = _hpsi_shape_profile(events)
+
+    assert profile["baseline_calls"] == 4
+    assert profile["baseline_logical_vector_equivalents"] == 8
+    assert profile["baseline_submitted_vector_equivalents"] == 512
+    assert profile["selected_tail_capacity"] == {"lanes": 1, "vectors": 4}
+
+
+def test_hpsi_shape_profile_stops_when_no_tail_meets_reduction_gate() -> None:
+    profile = _hpsi_shape_profile(
+        [
+            {
+                "event": "kpoint_batch",
+                "status": "completed",
+                "logical_vector_counts": [16] * 8,
+                "lane_capacity": 8,
+                "vector_count": 16,
+            }
+        ]
+    )
+
+    assert profile["selected_tail_capacity"] is None
