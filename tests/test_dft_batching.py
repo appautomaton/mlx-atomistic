@@ -377,7 +377,18 @@ def test_compact_hpsi_stable_capacity_masks_lane_vector_and_active_padding():
     work = observer.snapshot()["work_counters"]
     assert work["hpsi_calls"] == 1
     assert work["hpsi_vector_equivalents"] == 3
+    assert work["hpsi_submitted_vector_equivalents"] == 6
+    assert work["hpsi_lane_padding_vector_equivalents"] == 2
+    assert work["hpsi_vector_padding_equivalents"] == 1
+    assert work["hpsi_submitted_vector_equivalents"] == (
+        work["hpsi_vector_equivalents"]
+        + work["hpsi_lane_padding_vector_equivalents"]
+        + work["hpsi_vector_padding_equivalents"]
+    )
     assert work["fft_vector_equivalents"] == 6
+    memory = observer.snapshot()["memory"]
+    assert memory["hpsi_fft_workspace_bytes"] == memory["fft_workspace_bytes"]
+    assert memory["hpsi_peak_temporary_bytes"] == memory["peak_temporary_bytes"]
 
 
 def test_compact_submission_planner_respects_byte_and_padding_bounds():

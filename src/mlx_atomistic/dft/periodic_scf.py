@@ -1070,6 +1070,21 @@ class PeriodicKohnShamOperator:
 
         if batch is not None and executed_fft:
             logical_vector_count = batch.logical_vector_count
+            submitted_vector_count = batch.lane_capacity * batch.vector_count
+            lane_padding_vector_count = (
+                batch.lane_capacity - batch.lane_count
+            ) * batch.vector_count
+            vector_padding_count = sum(
+                batch.vector_count - count for count in batch.vector_counts
+            )
+            if (
+                logical_vector_count
+                + lane_padding_vector_count
+                + vector_padding_count
+                != submitted_vector_count
+            ):
+                msg = "compact Hpsi physical-vector accounting is inconsistent"
+                raise RuntimeError(msg)
             generated = sum(
                 projector_metrics[index]["projector_elements_generated"] for index in ready_indices
             )
@@ -1090,6 +1105,11 @@ class PeriodicKohnShamOperator:
                 {
                     "hpsi_calls": 1,
                     "hpsi_vector_equivalents": logical_vector_count,
+                    "hpsi_submitted_vector_equivalents": submitted_vector_count,
+                    "hpsi_lane_padding_vector_equivalents": (
+                        lane_padding_vector_count
+                    ),
+                    "hpsi_vector_padding_equivalents": vector_padding_count,
                     "fft_submissions": 2,
                     "fft_vector_equivalents": 2 * logical_vector_count,
                     "projector_elements_generated": generated,
@@ -1109,7 +1129,15 @@ class PeriodicKohnShamOperator:
                     fft_workspace_bytes,
                 )
                 runtime_observer.record_peak_memory(
+                    "hpsi_fft_workspace_bytes",
+                    fft_workspace_bytes,
+                )
+                runtime_observer.record_peak_memory(
                     "peak_temporary_bytes",
+                    estimated_transient_bytes,
+                )
+                runtime_observer.record_peak_memory(
+                    "hpsi_peak_temporary_bytes",
                     estimated_transient_bytes,
                 )
                 runtime_observer.record_peak_memory(

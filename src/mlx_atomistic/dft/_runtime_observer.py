@@ -13,6 +13,9 @@ OBSERVATION_SCHEMA = "mlx-atomistic.dft-runtime-observation.v1"
 WORK_COUNTER_NAMES = (
     "hpsi_calls",
     "hpsi_vector_equivalents",
+    "hpsi_submitted_vector_equivalents",
+    "hpsi_lane_padding_vector_equivalents",
+    "hpsi_vector_padding_equivalents",
     "fft_submissions",
     "fft_vector_equivalents",
     "projector_elements_generated",
@@ -42,6 +45,8 @@ MEMORY_FIELD_NAMES = (
     "shared_full_grid_bytes",
     "peak_temporary_bytes",
     "fft_workspace_bytes",
+    "hpsi_fft_workspace_bytes",
+    "hpsi_peak_temporary_bytes",
     "process_high_water_bytes",
     "unified_memory_high_water_bytes",
 )
