@@ -522,13 +522,18 @@ def _parse_channels(
             raise ValueError(msg)
         parts = payload[cursor].split()
         cursor += 1
-        if len(parts) < 3:
+        if len(parts) < 2:
             msg = "GTH nonlocal projector line is incomplete"
             raise ValueError(msg)
         radius = float(parts[0])
         projector_count = int(parts[1])
-        if projector_count <= 0:
-            msg = "GTH projector count must be positive"
+        if projector_count < 0:
+            msg = "GTH projector count must be non-negative"
+            raise ValueError(msg)
+        if projector_count == 0:
+            continue
+        if len(parts) < 3:
+            msg = "GTH nonlocal projector line is incomplete"
             raise ValueError(msg)
         remaining = payload[cursor : cursor + projector_count - 1]
         if len(remaining) != projector_count - 1:

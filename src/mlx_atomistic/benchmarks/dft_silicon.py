@@ -182,13 +182,18 @@ def parse_gth_entry(
     for angular_momentum in range(channel_count):
         first = payload[cursor].split()
         cursor += 1
-        if len(first) < 3:
+        if len(first) < 2:
             msg = f"GTH channel l={angular_momentum} is incomplete"
             raise ValueError(msg)
         radius = float(first[0])
         projector_count = int(first[1])
-        if projector_count <= 0:
-            msg = "GTH projector count must be positive"
+        if projector_count < 0:
+            msg = "GTH projector count must be non-negative"
+            raise ValueError(msg)
+        if projector_count == 0:
+            continue
+        if len(first) < 3:
+            msg = f"GTH channel l={angular_momentum} is incomplete"
             raise ValueError(msg)
         upper_rows = [[float(value) for value in first[2:]]]
         for _ in range(1, projector_count):
