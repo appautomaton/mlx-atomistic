@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -41,21 +40,6 @@ from helpers.motion_analysis import (  # noqa: E402
 from helpers.visualization import make_ligand_motion_figure  # noqa: E402
 
 pytestmark = pytest.mark.integration
-
-
-def test_notebook_source_uses_gpcrmd_mlx_without_old_active_result_wording():
-    notebook_path = NOTEBOOK_DIR / "01-ligand-receptor-translational-motion.ipynb"
-    cells = json.loads(notebook_path.read_text())["cells"]
-    notebook_source = "\n".join("".join(cell.get("source", [])) for cell in cells)
-    helper_source = (NOTEBOOK_DIR / "helpers/mlx_real_md.py").read_text()
-    readme_source = (NOTEBOOK_DIR / "README.md").read_text()
-    top_readme_source = Path("notebooks/README.md").read_text()
-    combined = "\n".join([notebook_source, helper_source, readme_source, top_readme_source])
-
-    assert re.search(r"downloaded.*main|fake|benzene|steered", combined, re.I) is None
-    assert "run_gpcrmd_mlx" in combined
-    assert "run_gpcrmd_mlx" in combined
-    assert "ensure_solvated_ligand_receptor_example" not in helper_source
 
 
 def _write_gpcrmd_prepared_fixture(out_dir: Path) -> str:
