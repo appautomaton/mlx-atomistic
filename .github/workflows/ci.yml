@@ -50,7 +50,7 @@ jobs:
       # lane fast. The gpu, reference, and data tests skip unless their opt-in
       # flags are passed, so this lane never needs the engines either.
       - name: CPU test suite (not slow)
-        run: uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow" --deselect tests/test_nvt.py::test_batched_langevin_matches_per_step -rf --tb=short -q --durations=15
+        run: uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow" -n auto --dist worksteal --max-worker-restart=200 -rf --tb=line -q
 
   full:
     # Comprehensive scheduled and manual run: the entire CPU suite including slow
