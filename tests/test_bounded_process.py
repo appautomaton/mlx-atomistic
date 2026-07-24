@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
+
+import pytest
+
+# The bounded-process tracer reads macOS process memory through libproc, which
+# it dlopens at import time. That is macOS-only by design, so this module skips
+# on other platforms (the Linux CI runner) rather than failing collection.
+if sys.platform != "darwin":
+    pytest.skip(
+        "bounded-process memory tracing uses the macOS libproc API",
+        allow_module_level=True,
+    )
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "run_bounded_process.py"
 _SPEC = importlib.util.spec_from_file_location("run_bounded_process", _SCRIPT)
