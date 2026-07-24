@@ -1478,6 +1478,34 @@ def main(argv: list[str] | None = None) -> None:
     compare.add_argument("--out", type=Path, required=True)
     compare.add_argument("--json", action="store_true")
 
+    validate_eos = subparsers.add_parser(
+        "validate-eos",
+        help="Run the bounded, source-backed silicon equation-of-state ladder.",
+    )
+    validate_eos.add_argument("--manifest", type=Path, required=True)
+    validate_eos.add_argument("--gth-source", type=Path, required=True)
+    validate_eos.add_argument("--level", choices=("screen", "admission"), required=True)
+    validate_eos.add_argument("--out", type=Path, required=True)
+    validate_eos.add_argument("--dry-run", action="store_true")
+    validate_eos.add_argument("--include-combined", action="store_true")
+    validate_eos.add_argument("--summarize-only", action="store_true")
+    validate_eos.add_argument("--json", action="store_true")
+
+    eos_point = subparsers.add_parser(
+        "eos-point",
+        help="Run one supervised silicon EOS point (normally invoked by validate-eos).",
+    )
+    eos_point.add_argument("--manifest", type=Path, required=True)
+    eos_point.add_argument("--gth-source", type=Path, required=True)
+    eos_point.add_argument(
+        "--profile",
+        choices=("baseline", "cutoff", "kpoint", "combined"),
+        required=True,
+    )
+    eos_point.add_argument("--volume-index", type=int, required=True)
+    eos_point.add_argument("--out", type=Path, required=True)
+    eos_point.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "prepare":
         payload = prepare_workload(
@@ -1506,7 +1534,7 @@ def main(argv: list[str] | None = None) -> None:
                 case=args.case,
                 repetitions=args.repetitions,
             )
-    else:
+    elif args.command == "compare":
         from mlx_atomistic.benchmarks.dft_silicon_parity import (
             compare_silicon_reports,
         )
@@ -1515,6 +1543,32 @@ def main(argv: list[str] | None = None) -> None:
             manifest_path=args.manifest,
             mlx_report_path=args.mlx,
             qe_report_path=args.qe,
+            out=args.out,
+        )
+    elif args.command == "validate-eos":
+        from mlx_atomistic.benchmarks.dft_silicon_eos_runner import (
+            run_silicon_eos_validation,
+        )
+
+        payload = run_silicon_eos_validation(
+            manifest_path=args.manifest,
+            gth_source=args.gth_source,
+            out=args.out,
+            level=args.level,
+            dry_run=args.dry_run,
+            include_combined=args.include_combined,
+            summarize_only=args.summarize_only,
+        )
+    else:
+        from mlx_atomistic.benchmarks.dft_silicon_eos_runner import (
+            run_silicon_eos_point,
+        )
+
+        payload = run_silicon_eos_point(
+            manifest_path=args.manifest,
+            gth_source=args.gth_source,
+            profile=args.profile,
+            volume_index=args.volume_index,
             out=args.out,
         )
     if getattr(args, "json", False):

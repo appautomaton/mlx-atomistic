@@ -643,8 +643,22 @@ class BandPath:
         count: int,
         start_label: str | None = None,
         end_label: str | None = None,
+        coordinate_system: str = "cartesian",
     ) -> BandPath:
-        """Build a linear path between two k points."""
+        """Build a linear path between two k points.
+
+        Args:
+            start: Starting three-component k-point vector.
+            end: Ending three-component k-point vector.
+            count: Number of points, including both endpoints.
+            start_label: Optional label for the first point.
+            end_label: Optional label for the last point.
+            coordinate_system: ``"cartesian"`` or ``"reduced"``. Defaults
+                to ``"cartesian"`` for compatibility with the toy band path.
+
+        Returns:
+            Explicit uniformly sampled band path.
+        """
 
         if count <= 0:
             msg = "count must be positive"
@@ -655,7 +669,13 @@ class BandPath:
         for index in range(count):
             fraction = 0.0 if count == 1 else index / (count - 1)
             label = start_label if index == 0 else end_label if index == count - 1 else None
-            points.append(KPoint((1.0 - fraction) * start_np + fraction * end_np, label=label))
+            points.append(
+                KPoint(
+                    (1.0 - fraction) * start_np + fraction * end_np,
+                    label=label,
+                    coordinate_system=coordinate_system,
+                )
+            )
         return cls(points)
 
 

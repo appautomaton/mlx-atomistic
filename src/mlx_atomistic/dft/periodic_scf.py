@@ -27,6 +27,8 @@ from mlx_atomistic.dft._runtime_observer import (
 from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.kpoints import (
+    BandPath,
+    KPoint,
     KPointMesh,
     TimeReversalOwnership,
     TimeReversalOwnershipEntry,
@@ -3833,6 +3835,119 @@ class PeriodicSCFResult:
             "resume_integrity_status": self.resume_integrity_status,
             "timing_admission_status": self.timing_admission_status,
             "lineage": list(self.lineage),
+            "system_fingerprint": self.system_fingerprint,
+            "dense_full_hamiltonian": False,
+        }
+
+
+@dataclass(frozen=True)
+class PeriodicFrozenDensity:
+    """Portable fixed-density input for a periodic non-SCF calculation.
+
+    Args:
+        density: Converged electron density on ``system.grid``.
+        cutoff_hartree: Plane-wave kinetic cutoff used by the source SCF.
+        electron_count: Electron count represented by the density.
+        system_fingerprint: Optional source-system identity. Required when the
+            density is reused for a multi-element calculation.
+    """
+
+    density: mx.array
+    cutoff_hartree: float
+    electron_count: float
+    system_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _is_finite_positive_control(self.cutoff_hartree):
+            msg = "cutoff_hartree must be finite and positive"
+            raise ValueError(msg)
+        if not _is_finite_positive_control(self.electron_count):
+            msg = "electron_count must be finite and positive"
+            raise ValueError(msg)
+        object.__setattr__(self, "density", mx.real(mx.array(self.density)))
+        object.__setattr__(self, "cutoff_hartree", float(self.cutoff_hartree))
+        object.__setattr__(self, "electron_count", float(self.electron_count))
+        if self.system_fingerprint is not None and (
+            len(self.system_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in self.system_fingerprint)
+        ):
+            msg = "system_fingerprint must be a lowercase SHA-256 digest"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class PeriodicBandPointResult:
+    """One fixed-density periodic eigensolve along a band path.
+
+    Args:
+        requested_kpoint: Reduced-coordinate path point requested by the caller.
+        basis: Point-specific cutoff-projected plane-wave basis.
+        eigen: Lowest periodic eigenpairs returned by Davidson.
+    """
+
+    requested_kpoint: KPoint
+    basis: PlaneWaveBasis
+    eigen: PeriodicEigenResult
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe point summary."""
+
+        return {
+            "kpoint": self.requested_kpoint.to_dict(),
+            "basis": self.basis.to_dict(),
+            "eigensolver": self.eigen.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class PeriodicBandStructureResult:
+    """Production non-self-consistent bands from one frozen periodic density.
+
+    Args:
+        kpoints: Evaluated reduced-coordinate path points.
+        eigenvalues: Eigenvalues in Hartree with shape ``(n_kpoints, n_bands)``.
+        residuals: Direct eigensolver residuals with the same shape.
+        points: Basis and compact eigenspace retained for each path point.
+        occupied_band_count: Number of doubly occupied bands in the source SCF.
+        cutoff_hartree: Plane-wave kinetic cutoff in Hartree.
+        density_source: ``"scf_result"`` or ``"frozen_density"``.
+        timings: Wall-clock phase timings in milliseconds.
+        guard_band_count: Additional unpublished states used to stabilize the
+            requested eigenspace boundary.
+    """
+
+    kpoints: tuple[KPoint, ...]
+    eigenvalues: mx.array
+    residuals: mx.array
+    points: tuple[PeriodicBandPointResult, ...]
+    occupied_band_count: int
+    cutoff_hartree: float
+    density_source: str
+    timings: dict[str, float]
+    guard_band_count: int = 0
+
+    @property
+    def n_bands(self) -> int:
+        """Return the number of bands solved at every k-point."""
+
+        return int(self.eigenvalues.shape[1])
+
+    def to_dict(self) -> dict[str, object]:
+        """Return JSON-safe bands without materializing orbital coefficients."""
+
+        return {
+            "kpoints": [point.to_dict() for point in self.kpoints],
+            "eigenvalues_hartree": np.asarray(self.eigenvalues).tolist(),
+            "residuals": np.asarray(self.residuals).tolist(),
+            "points": [point.to_dict() for point in self.points],
+            "occupied_band_count": self.occupied_band_count,
+            "n_bands": self.n_bands,
+            "cutoff_hartree": self.cutoff_hartree,
+            "density_source": self.density_source,
+            "guard_band_count": self.guard_band_count,
+            "timings_ms": dict(self.timings),
+            "reused_density": True,
+            "self_consistency_iterations": 0,
             "dense_full_hamiltonian": False,
         }
 
@@ -5018,4 +5133,300 @@ def run_periodic_scf(
         initial_density=initial_density,
         initial_coefficients=initial_coefficients,
         observer=observer,
+    )
+
+
+def _periodic_band_density_source(
+    system: PeriodicDFTSystem,
+    source: PeriodicSCFResult | PeriodicFrozenDensity,
+) -> tuple[mx.array, float, float, str]:
+    """Validate and normalize one frozen-density source."""
+
+    if isinstance(source, PeriodicSCFResult):
+        if not source.converged:
+            msg = "periodic band structure requires a converged SCF result"
+            raise ValueError(msg)
+        if not source.kpoints:
+            msg = "periodic SCF result has no k-point basis metadata"
+            raise ValueError(msg)
+        if any(
+            point.basis.grid.shape != system.grid.shape
+            or not np.array_equal(
+                np.asarray(point.basis.grid.cell.matrix, dtype=np.float64),
+                np.asarray(system.grid.cell.matrix, dtype=np.float64),
+            )
+            for point in source.kpoints
+        ):
+            msg = "periodic SCF result basis grid and cell must match the system"
+            raise ValueError(msg)
+        cutoffs = np.asarray(
+            [point.basis.cutoff_hartree for point in source.kpoints],
+            dtype=np.float64,
+        )
+        if not np.allclose(cutoffs, cutoffs[0], rtol=0.0, atol=1e-12):
+            msg = "periodic SCF result contains inconsistent plane-wave cutoffs"
+            raise ValueError(msg)
+        density = source.density
+        cutoff_hartree = float(cutoffs[0])
+        electron_count = float(source.electron_count)
+        source_kind = "scf_result"
+        source_fingerprint = source.system_fingerprint
+    elif isinstance(source, PeriodicFrozenDensity):
+        density = source.density
+        cutoff_hartree = source.cutoff_hartree
+        electron_count = source.electron_count
+        source_kind = "frozen_density"
+        source_fingerprint = source.system_fingerprint
+    else:
+        msg = "source must be PeriodicSCFResult or PeriodicFrozenDensity"
+        raise TypeError(msg)
+
+    if source_fingerprint is None:
+        if not system.is_homogeneous:
+            msg = "multi-element frozen density requires an exact system fingerprint"
+            raise ValueError(msg)
+    elif source_fingerprint != system.fingerprint:
+        msg = "frozen density pseudopotential assignment must match the periodic system"
+        raise ValueError(msg)
+
+    if density.shape != system.grid.shape:
+        msg = "frozen density shape must match system.grid.shape"
+        raise ValueError(msg)
+    if not np.isclose(
+        electron_count,
+        system.electron_count,
+        rtol=0.0,
+        atol=1e-4,
+    ):
+        msg = "frozen density electron count must match the periodic system"
+        raise ValueError(msg)
+    density_snapshot = mx.real(mx.array(density))
+    finite = mx.all(mx.isfinite(density_snapshot))
+    minimum = mx.min(density_snapshot)
+    integrated = mx.sum(density_snapshot) * system.grid.dv
+    mx.eval(density_snapshot, finite, minimum, integrated)
+    if not bool(finite):
+        msg = "frozen density must contain only finite values"
+        raise ValueError(msg)
+    if float(minimum) < -1e-6:
+        msg = "frozen density must be nonnegative within numerical tolerance"
+        raise ValueError(msg)
+    count_tolerance = max(1e-4, 1e-5 * electron_count)
+    if not np.isclose(
+        float(integrated),
+        electron_count,
+        rtol=0.0,
+        atol=count_tolerance,
+    ):
+        msg = "frozen density integral does not match its electron count"
+        raise ValueError(msg)
+    return density_snapshot, cutoff_hartree, electron_count, source_kind
+
+
+def run_periodic_band_structure(
+    system: PeriodicDFTSystem,
+    source: PeriodicSCFResult | PeriodicFrozenDensity,
+    band_path: BandPath,
+    *,
+    n_bands: int | None = None,
+    guard_bands: int = 0,
+    config: PeriodicDavidsonConfig | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
+    observer: RuntimeObserver | None = None,
+) -> PeriodicBandStructureResult:
+    """Solve production periodic bands on top of a converged frozen density.
+
+    This is a non-self-consistent calculation: the ionic, Hartree, and
+    exchange-correlation potentials are built once from ``source`` and reused
+    unchanged at every path point. Each k-point still receives its own
+    cutoff-projected plane-wave basis and complete local plus nonlocal GTH
+    Hamiltonian.
+
+    Args:
+        system: Periodic GTH system matching the source SCF calculation.
+        source: Converged periodic SCF result or validated portable density.
+        band_path: Explicit reduced-coordinate k-point path.
+        n_bands: Lowest bands to return. Defaults to occupied bands plus eight.
+        guard_bands: Extra unpublished states used to contain degeneracies at
+            the requested eigenspace boundary. Defaults to zero.
+        config: Davidson controls. Defaults to ``PeriodicDavidsonConfig``.
+        xc_functional: Exchange-correlation functional. Defaults to production
+            PBE, matching ``run_periodic_scf``.
+        observer: Optional progress and work observer.
+
+    Returns:
+        Fixed-density band energies, residuals, bases, and compact eigenstates.
+
+    Raises:
+        RuntimeError: If a path-point Davidson solve does not converge.
+        TypeError: If ``source`` has an unsupported type.
+        ValueError: If source, path, density, or band metadata are inconsistent.
+    """
+
+    for point in band_path.points:
+        if point.coordinate_system != "reduced":
+            msg = "periodic band structure requires reduced-coordinate k-points"
+            raise ValueError(msg)
+    density, cutoff_hartree, _electron_count, source_kind = _periodic_band_density_source(
+        system,
+        source,
+    )
+    physical_electron_count = float(system.electron_count)
+    occupied_bands = int(round(physical_electron_count / 2.0))
+    if (
+        occupied_bands <= 0
+        or abs(2.0 * occupied_bands - physical_electron_count) > 1e-8
+    ):
+        msg = "periodic band structure requires two electrons per occupied band"
+        raise ValueError(msg)
+    requested_bands = occupied_bands + 8 if n_bands is None else n_bands
+    if type(requested_bands) is not int or requested_bands < occupied_bands:
+        msg = "n_bands must be an integer no smaller than the occupied band count"
+        raise ValueError(msg)
+    if type(guard_bands) is not int or guard_bands < 0:
+        msg = "guard_bands must be a nonnegative integer"
+        raise ValueError(msg)
+    solved_bands = requested_bands + guard_bands
+
+    solver_config = PeriodicDavidsonConfig() if config is None else config
+    xc = ProductionPBEExchangeCorrelation() if xc_functional is None else xc_functional
+    timings = {"setup": 0.0, "eigensolver": 0.0, "total": 0.0}
+    total_start = perf_counter()
+    with _bounded_dft_allocator(), _GTHProjectorCache() as projector_cache:
+        setup_start = perf_counter()
+        shared_reciprocal = ReciprocalGrid.from_real_space(system.grid)
+        gamma_basis = PlaneWaveBasis(
+            system.grid,
+            cutoff_hartree,
+            reciprocal_grid=shared_reciprocal,
+            lane_label="band:local-potential",
+        )
+        local_potential = gth_local_potential_grid(
+            system.pseudopotentials,
+            gamma_basis,
+            system.positions,
+        )
+        hartree = hartree_potential(density, system.grid)
+        xc_result = xc.evaluate(density, system.grid)
+        effective_snapshot = mx.array(local_potential + hartree + xc_result.potential)
+        finite = (
+            mx.all(mx.isfinite(xc_result.energy_density))
+            & mx.all(mx.isfinite(xc_result.potential))
+            & mx.isfinite(xc_result.total_energy)
+            & mx.all(mx.isfinite(effective_snapshot))
+        )
+        mx.eval(effective_snapshot, finite)
+        if not bool(finite):
+            msg = "frozen-density effective potential is non-finite"
+            raise ValueError(msg)
+        timings["setup"] = (perf_counter() - setup_start) * 1000.0
+
+        point_results: list[PeriodicBandPointResult] = []
+        for point_index, point in enumerate(band_path.points):
+            basis = PlaneWaveBasis.from_reduced_kpoint(
+                system.grid,
+                cutoff_hartree,
+                point.vector,
+                reciprocal_grid=shared_reciprocal,
+                lane_label=f"band:kpoint:{point_index}",
+            )
+            if solved_bands > basis.active_count:
+                msg = (
+                    f"n_bands plus guard_bands={solved_bands} exceeds active basis size "
+                    f"{basis.active_count} at path point {point_index}"
+                )
+                raise ValueError(msg)
+            nonlocal_operator = PeriodicGTHNonlocalOperator(
+                system.pseudopotentials,
+                basis,
+                system.positions,
+                cache=projector_cache,
+            )
+            operator = PeriodicKohnShamOperator._from_shared_potential(
+                basis,
+                effective_snapshot,
+                nonlocal_operator,
+                observer,
+            )
+            if observer is not None:
+                observer.emit(
+                    "band_kpoint",
+                    status="started",
+                    point_index=point_index,
+                    point_count=len(band_path.points),
+                    reduced_kpoint=list(point.vector),
+                )
+            solve_start = perf_counter()
+            eigen = solve_periodic_eigenproblem(
+                operator,
+                n_bands=solved_bands,
+                config=solver_config,
+                observer=observer,
+            )
+            timings["eigensolver"] += (perf_counter() - solve_start) * 1000.0
+            if guard_bands:
+                compact = eigen._compact_coefficients
+                if not isinstance(compact, _CompactLaneState):
+                    msg = "guard-band trimming requires compact eigenvectors"
+                    raise RuntimeError(msg)
+                requested_residuals = eigen.residuals[:requested_bands]
+                requested_converged = bool(
+                    mx.all(requested_residuals <= solver_config.tolerance)
+                )
+                eigen = PeriodicEigenResult._from_compact(
+                    eigenvalues=eigen.eigenvalues[:requested_bands],
+                    compact_coefficients=basis._state_from_compact(
+                        compact.values[:requested_bands]
+                    ),
+                    basis=basis,
+                    residuals=requested_residuals,
+                    orthonormality_error=eigen.orthonormality_error,
+                    iterations=eigen.iterations,
+                    converged=requested_converged,
+                    subspace_size=eigen.subspace_size,
+                    restart_count=eigen.restart_count,
+                )
+            values_finite = mx.all(mx.isfinite(eigen.eigenvalues))
+            residuals_finite = mx.all(mx.isfinite(eigen.residuals))
+            mx.eval(values_finite, residuals_finite)
+            if not bool(values_finite) or not bool(residuals_finite):
+                msg = f"periodic band eigensolve is non-finite at path point {point_index}"
+                raise RuntimeError(msg)
+            if not eigen.converged:
+                worst = float(mx.max(eigen.residuals))
+                msg = (
+                    f"periodic band eigensolve did not converge at path point "
+                    f"{point_index}; worst residual={worst:.6e}"
+                )
+                raise RuntimeError(msg)
+            point_results.append(
+                PeriodicBandPointResult(
+                    requested_kpoint=point,
+                    basis=basis,
+                    eigen=eigen,
+                )
+            )
+            if observer is not None:
+                observer.emit(
+                    "band_kpoint",
+                    status="completed",
+                    point_index=point_index,
+                    iterations=eigen.iterations,
+                    worst_residual=float(mx.max(eigen.residuals)),
+                )
+
+    eigenvalues = mx.stack([point.eigen.eigenvalues for point in point_results])
+    residuals = mx.stack([point.eigen.residuals for point in point_results])
+    mx.eval(eigenvalues, residuals)
+    timings["total"] = (perf_counter() - total_start) * 1000.0
+    return PeriodicBandStructureResult(
+        kpoints=band_path.points,
+        eigenvalues=eigenvalues,
+        residuals=residuals,
+        points=tuple(point_results),
+        occupied_band_count=occupied_bands,
+        cutoff_hartree=cutoff_hartree,
+        density_source=source_kind,
+        timings=timings,
+        guard_band_count=guard_bands,
     )

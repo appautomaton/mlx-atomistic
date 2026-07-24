@@ -14,6 +14,12 @@ from mlx_atomistic.dft.artifacts import (
     publish_periodic_scf_checkpoint,
     run_periodic_scf_checkpointed,
 )
+from mlx_atomistic.dft.band_unfolding import (
+    FoldedBandPath,
+    PeriodicUnfoldedBandStructureResult,
+    fold_band_path_to_supercell,
+    unfold_periodic_band_structure,
+)
 from mlx_atomistic.dft.density import density_from_orbitals, normalize_orbitals
 from mlx_atomistic.dft.fft import (
     fft3,
@@ -85,13 +91,17 @@ from mlx_atomistic.dft.periodic_gth import (
     periodic_ewald_forces,
 )
 from mlx_atomistic.dft.periodic_scf import (
+    PeriodicBandPointResult,
+    PeriodicBandStructureResult,
     PeriodicDavidsonConfig,
     PeriodicDFTSystem,
     PeriodicEigenResult,
+    PeriodicFrozenDensity,
     PeriodicKohnShamOperator,
     PeriodicKPointResult,
     PeriodicSCFConfig,
     PeriodicSCFResult,
+    run_periodic_band_structure,
     run_periodic_scf,
     solve_periodic_eigenproblem,
 )
@@ -157,6 +167,7 @@ __all__ = [
     "ExchangeCorrelationFunctional",
     "FermiDiracOccupations",
     "FixedOccupations",
+    "FoldedBandPath",
     "GeometryOptimizationConfig",
     "GeometryOptimizationRecord",
     "GeometryOptimizationResult",
@@ -183,8 +194,11 @@ __all__ = [
     "PERIODIC_SCF_CHECKPOINT_SCHEMA",
     "PERIODIC_SCF_COMMAND_KIND",
     "PeriodicDFTSystem",
+    "PeriodicBandPointResult",
+    "PeriodicBandStructureResult",
     "PeriodicDavidsonConfig",
     "PeriodicEigenResult",
+    "PeriodicFrozenDensity",
     "PeriodicGTHNonlocalOperator",
     "PeriodicKPointResult",
     "PeriodicKohnShamOperator",
@@ -192,6 +206,7 @@ __all__ = [
     "PeriodicSCFCheckpoint",
     "PeriodicSCFExecutionIdentity",
     "PeriodicSCFResult",
+    "PeriodicUnfoldedBandStructureResult",
     "PlaneWaveBasis",
     "ProductionPBEExchangeCorrelation",
     "ProjectorSet",
@@ -229,6 +244,7 @@ __all__ = [
     "fft3",
     "fft_backend",
     "finite_difference_stress",
+    "fold_band_path_to_supercell",
     "geometry_demo_system",
     "gth_local_potential_grid",
     "gth_local_reciprocal_coefficients",
@@ -258,6 +274,7 @@ __all__ = [
     "read_gth",
     "read_upf",
     "run_band_structure",
+    "run_periodic_band_structure",
     "run_periodic_scf",
     "run_periodic_scf_checkpointed",
     "run_scf",
@@ -266,4 +283,5 @@ __all__ = [
     "scf_total_energy_forces",
     "solve_periodic_eigenproblem",
     "spin_density_from_orbitals",
+    "unfold_periodic_band_structure",
 ]

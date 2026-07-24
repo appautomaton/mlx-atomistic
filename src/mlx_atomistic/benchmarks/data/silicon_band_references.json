@@ -1,0 +1,79 @@
+{
+  "schema_version": "mlx-atomistic.silicon-band-references.v1",
+  "material": {
+    "name": "diamond silicon",
+    "functional": "PBE",
+    "spin": "unpolarized",
+    "primitive_atom_count": 2,
+    "primitive_valence_electron_count": 8,
+    "primitive_occupied_band_count": 4
+  },
+  "primary_reference": {
+    "citation": "Linscott et al., Phys. Rev. Materials 7, 123803 (2023), supplementary benchmark table",
+    "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC10601481/",
+    "method_scope": "PBE plane-wave pseudopotential silicon; values are physical validation targets, not bitwise parity data",
+    "energies_ev_relative_to_vbm": {
+      "indirect_gap": 0.49,
+      "gamma_valence_bottom": -11.97,
+      "gamma_conduction": [2.48, 3.28],
+      "x_valence": [-7.82, -2.85],
+      "x_conduction": 0.62,
+      "l_valence": [-9.63, -6.98, -1.19],
+      "l_conduction": [1.45, 3.24]
+    }
+  },
+  "path_convention": {
+    "citation": "Setyawan and Curtarolo, Comput. Mater. Sci. 49, 299-312 (2010)",
+    "url": "https://arxiv.org/abs/1004.2974",
+    "coordinate_system": "primitive reciprocal reduced coordinates",
+    "segments": [
+      ["GAMMA", "X"],
+      ["X", "W"],
+      ["W", "K"],
+      ["K", "GAMMA"],
+      ["GAMMA", "L"]
+    ],
+    "points": {
+      "GAMMA": [0.0, 0.0, 0.0],
+      "X": [0.5, 0.0, 0.5],
+      "W": [0.5, 0.25, 0.75],
+      "K": [0.375, 0.375, 0.75],
+      "L": [0.5, 0.5, 0.5]
+    }
+  },
+  "secondary_local_qe_reference": {
+    "path": "vendors/quantum-espresso/PP/examples/exx_interpolated_bands_example/pbe_reference_bands",
+    "engine": "Quantum ESPRESSO 7.0 pw.x",
+    "hardware": "4 MPI CPU ranks; processor model unspecified",
+    "primitive_atom_count": 2,
+    "cutoff_rydberg": 40.0,
+    "cutoff_hartree": 20.0,
+    "bands": 8,
+    "scf_kpoint_mesh": [8, 8, 8],
+    "pseudopotential": "Si.pz-vbc.UPF norm-conserving PBE",
+    "precision": "double-precision CPU build",
+    "eigensolver": "QE iterative diagonalization; exact variant not recorded in bundled output",
+    "timing_scope": "not used as a runtime comparison",
+    "input_sha256": {
+      "pbe.scf.in": "1e2553051896497fe202c244a425c6df060040bcedbc764c367b8070476c44b4",
+      "pbe.bands.in": "efc886562ec04dd55369aeeb2d715cc2922c326426540145fc68ddd021ea7b97",
+      "pbe.bands.dat": "d1d0a1d1d4d5085a9f527e303d6e1579767bcaada9593548cfd3ffb669a5a034"
+    },
+    "limitations": [
+      "different pseudopotential family",
+      "20 Ha rather than 25 Ha cutoff",
+      "two-atom primitive cell rather than the eight-atom conventional cell",
+      "different plotted path",
+      "reference files are read-only and no external engine is executed"
+    ]
+  },
+  "validation_thresholds": {
+    "max_eigensolver_residual": 1e-6,
+    "max_overlap_error": 1e-5,
+    "indirect_gap_ev": [0.4, 0.75],
+    "gamma_x_cbm_fraction": [0.7, 1.0],
+    "valence_bandwidth_ev": [11.4, 12.5],
+    "high_symmetry_energy_tolerance_ev": 0.35,
+    "primitive_occupied_weight_tolerance": 0.002
+  }
+}

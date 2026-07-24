@@ -64,6 +64,147 @@ not less accurate physics or fewer SCF cycles.
 The largest remaining cost is still applying the Hamiltonian. The next
 optimization should reduce useful solver work, not add more scheduler shapes.
 
+## Scientific EOS validation
+
+Runtime convergence is not scientific validation. The repository now carries a
+separate, source-backed equation-of-state (EOS) gate for the existing
+zero-temperature, fixed-occupation silicon method. It fits seven energies over
+`0.94–1.06 V₀` to a third-order Birch–Murnaghan equation and reports:
+
+| Quantity | Primary all-electron PBE reference |
+| --- | ---: |
+| Conventional lattice constant | 5.469916 Å |
+| Bulk modulus | 88.511 GPa |
+| Pressure derivative `B₀′` | 4.3118 |
+
+The primary values are the curated FLEUR/WIEN2k average from the
+[Materials Cloud ACWF verification archive](https://archive.materialscloud.org/records/yf0rj-w3r97).
+The pinned bundle also includes the CP2K Quickstep TZV2P/GTH curve from the same
+archive as a same-pseudopotential-family check, Quantum ESPRESSO SSSP as context,
+and the NIST experimental lattice parameter as context only. The reference JSON
+is hash-locked and retains source filenames, DOI, URLs, and CC-BY attribution.
+
+The gate deliberately does **not** claim exact ACWF protocol parity. ACWF uses
+0.0045 Ry Fermi–Dirac smearing and the `E-TS` free energy; the current product
+solver uses 16 fixed occupied bands for insulating silicon. This first gate asks
+whether that existing method produces the correct silicon energy curve.
+
+| Admission tier | Δ factor | Lattice | Bulk modulus | `B₀′` |
+| --- | ---: | ---: | ---: | ---: |
+| Verified | ≤ 3 meV/atom | ≤ 0.5% | ≤ 10% | ≤ 15% |
+| Excellent | ≤ 1 meV/atom | ≤ 0.2% | ≤ 5% | ≤ 10% |
+
+The independent numerical-convergence gates are ≤ 1 meV/atom maximum EOS-curve
+change, ≤ 0.1% lattice drift, ≤ 3% bulk-modulus drift, and ≤ 10% `B₀′` drift
+for the complete 30 Ha / 64³ cutoff curve. A separate three-volume 8³ spot
+check requires its central energy shape to remain within 1 meV/atom of the 6³
+baseline. A combined 30 Ha / 64³ / 8³ profile remains an optional stress
+diagnostic and is not part of the admitted scientific claim. Tolerances are
+fixed; a failure is reported rather than widened.
+
+Each geometry runs in a fresh supervised process with a 40 GB process-tree
+ceiling. Baseline and cutoff points time out at 180 seconds; 8³ points time out
+at 240 seconds. The runner stops on the first numerical failure or nonphysical
+central energy triad. Fingerprinted point artifacts make the longer admission
+ladder resumable without silently accepting mismatched inputs.
+
+The 56³ profiles retain the production solver's 512 MiB logical compact-batch
+ceiling. The 64³ convergence profiles use 768 MiB, matching the 1.49× FFT-volume
+increase; this changes only workspace admission, not the Hamiltonian or physics.
+The external 40 GB process-tree ceiling remains authoritative.
+
+Inspect the exact three-point screen without running SCF:
+
+```sh
+uv run python -m mlx_atomistic.benchmarks.dft_silicon validate-eos \
+  --manifest results/mlx-dft-science/workload/manifest.json \
+  --gth-source results/mlx-dft-science/workload/resources/Si-GTH-PBE-q4.gth \
+  --level screen --dry-run \
+  --out results/mlx-dft-science/eos-screen --json
+```
+
+Remove `--dry-run` to execute the bounded three-point screen. Use
+`--level admission` only after that screen passes. Admission schedules 17
+points: complete seven-point baseline and cutoff curves plus the three central
+8³ spot checks. Add `--include-combined` only to append the optional three-point
+64³/8³ interaction stress profile; it is not required for admission.
+Use `--summarize-only` to rebuild the partial scientific report from existing
+fingerprinted point artifacts and bounded-failure traces without launching SCF.
+
+The real baseline screen passed on 2026-07-22:
+
+| Volume factor | Lattice | Relative energy | SCF cycles | Wall time | Peak process tree |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.98 | 5.433491 Å | 1.158 meV/atom | 14 | 59.96 s | 7.12 GB |
+| 1.00 | 5.470205 Å | 0 | 14 | 60.64 s | 7.85 GB |
+| 1.02 | 5.506433 Å | 3.286 meV/atom | 14 | 61.88 s | 7.60 GB |
+
+All three points passed the residual, overlap, electron-count, timeout, and
+memory gates. The center is lower than both neighbors. A diagnostic quadratic
+through only these three points places the minimum near 5.4613 Å, 0.158% below
+the all-electron PBE reference. This is encouraging screening evidence, not an
+admitted EOS: seven points are still required for the Birch–Murnaghan fit,
+bulk modulus, pressure derivative, Δ factor, and basis convergence.
+Raw evidence is under `results/mlx-dft-science/eos-screen/`.
+
+The subsequent admission run completed all 17 required points.
+The first 64³ point exposed a 512 MiB compact-workspace ceiling inherited from
+the 56³ production profile. The science harness now assigns 768 MiB only to
+64³ profiles, proportional to their 1.49× FFT-volume increase. A focused rerun
+passed in 119.49 seconds with 8.28 GB peak process-tree memory and a stable
+plateau.
+
+All three central convergence triads then passed:
+
+| Profile | Diagnostic minimum | Maximum central-curve change vs baseline |
+| --- | ---: | ---: |
+| 25 Ha / 56³ / 6³ | 5.461259 Å | — |
+| 30 Ha / 64³ / 6³ | 5.461136 Å | 0.0215 meV/atom |
+| 25 Ha / 56³ / 8³ | 5.461261 Å | 0.0010 meV/atom |
+
+The complete seven-point baseline curve is scientifically verified against the
+all-electron PBE reference:
+
+| Quantity | MLX result | Difference from reference |
+| --- | ---: | ---: |
+| Conventional lattice constant | 5.460859 Å | 0.166% |
+| Bulk modulus | 88.306 GPa | 0.232% |
+| Pressure derivative `B₀′` | 4.3052 | 0.153% |
+| Lejaeghere Δ factor | 1.942 meV/atom | verified tier |
+
+The Birch–Murnaghan fit has 0.0051 meV/atom RMSE and 0.0103 meV/atom maximum
+residual. It passes every verified-tier threshold, but not the stricter
+1 meV/atom excellent Δ threshold.
+
+The complete seven-point 30 Ha / 64³ / 6³ curve also passes numerical
+convergence against the baseline:
+
+| Convergence metric | Observed | Limit |
+| --- | ---: | ---: |
+| Maximum EOS-curve change | 0.0583 meV/atom | 1 meV/atom |
+| Lattice drift | 0.00086% | 0.1% |
+| Bulk-modulus drift | 0.0793% | 3% |
+| `B₀′` drift | 1.019% | 10% |
+
+The three-point 8³ spot check passes and tracks the 6³ baseline central curve
+within 0.0010 meV/atom, far inside its 1 meV/atom limit. Together with the
+complete cutoff curve and all-electron comparison, this admits the 6³ EOS for
+the stated practical scope. A full seven-point 8³ curve is deliberately outside
+that scope and is not a pending task.
+
+One additional outer 8³ diagnostic is retained as supporting evidence. It first
+reached the 240-second limit in low-power mode, then completed an identical
+full-power run in 123.19 seconds and 14 SCF cycles with a 9.20 GB peak. No other
+outer 8³ points are scheduled.
+
+The optional combined 30 Ha / 64³ / 8³ stress point independently reached the
+same 240-second limit, at an 11.44 GB peak with a stable memory plateau. The
+timeout was not raised into the excluded 300–445 second range or relabeled as a
+scientific pass because this optional profile is outside the admission claim.
+The persisted report therefore says **scientifically verified baseline,
+cutoff-converged, and 8³ spot-check passed**. Artifacts are under
+`results/mlx-dft-science/eos-admission/`.
+
 ## Bounded development evidence
 
 These rows are intentionally not comparable to the complete production result.
