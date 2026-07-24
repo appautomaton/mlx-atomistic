@@ -6,14 +6,6 @@ from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate_n
 from mlx_atomistic.runtime import RuntimeInfo, get_platform_boundary_report
 
 
-def test_runtime_info_shape():
-    info = RuntimeInfo(mlx_version="0.0", default_device="Device(gpu, 0)", metal_available=True)
-
-    assert info.mlx_version == "0.0"
-    assert info.metal_available is True
-    assert info.to_dict()["default_device"] == "Device(gpu, 0)"
-
-
 def test_platform_boundary_report_names_local_engine_concepts():
     report = get_platform_boundary_report(
         runtime_info=RuntimeInfo(

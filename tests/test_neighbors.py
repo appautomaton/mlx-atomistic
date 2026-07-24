@@ -419,7 +419,11 @@ def test_default_backend_switch_preserves_lj_physics():
     e_blocks, f_blocks = lj.energy_forces(pos, cell, pairs=nl_blocks.interactions)
     mx.eval(e_pairs, f_pairs, e_blocks, f_blocks)
 
-    assert abs(float(e_pairs) - float(e_blocks)) < 1e-2
+    # Identical pairs across backends => identical physics; the residual is float32
+    # summation-order ULPs from MLX's non-deterministic scatter-add. Use a relative
+    # band: at this energy magnitude (~1e4) an absolute tolerance is backend-fragile
+    # (mlx-cpu reorders more than the Metal build), the same fix as the sibling below.
+    assert abs(float(e_pairs) - float(e_blocks)) < 1e-5 * abs(float(e_pairs))
     assert float(mx.max(mx.abs(f_pairs - f_blocks))) < 1e-3
 
 
