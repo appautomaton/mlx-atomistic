@@ -30,6 +30,27 @@ def _validated_gth(pseudopotential: PseudopotentialData) -> None:
         raise ValueError(msg)
 
 
+def _per_ion_pseudopotentials(
+    pseudopotential: PseudopotentialData | Sequence[PseudopotentialData],
+    ion_count: int,
+) -> tuple[PseudopotentialData, ...]:
+    """Return one validated GTH pseudopotential per ion."""
+
+    if isinstance(pseudopotential, PseudopotentialData):
+        values = (pseudopotential,) * ion_count
+    else:
+        values = tuple(pseudopotential)
+        if len(values) != ion_count:
+            msg = "pseudopotentials length must match the ion count"
+            raise ValueError(msg)
+    if any(not isinstance(value, PseudopotentialData) for value in values):
+        msg = "pseudopotentials must contain PseudopotentialData values"
+        raise TypeError(msg)
+    for value in values:
+        _validated_gth(value)
+    return values
+
+
 def _positions(positions: Sequence[Sequence[float]]) -> np.ndarray:
     values = np.array(positions, dtype=np.float64, copy=True)
     if values.ndim != 2 or values.shape[1] != 3 or values.shape[0] == 0:
@@ -45,7 +66,7 @@ def _structure_factor(vectors: np.ndarray, positions: np.ndarray) -> np.ndarray:
 
 
 def gth_local_reciprocal_coefficients(
-    pseudopotential: PseudopotentialData,
+    pseudopotential: PseudopotentialData | Sequence[PseudopotentialData],
     basis: PlaneWaveBasis,
     positions: Sequence[Sequence[float]],
 ) -> mx.array:
@@ -55,7 +76,7 @@ def gth_local_reciprocal_coefficients(
     units, including the finite ``G=0`` limit and ionic structure factor.
 
     Args:
-        pseudopotential: Parsed GTH pseudopotential shared with the reference.
+        pseudopotential: One shared or one-per-ion parsed GTH pseudopotential.
         basis: Plane-wave basis supplying reciprocal vectors and volume.
         positions: Ionic Cartesian positions in bohr.
 
@@ -63,48 +84,59 @@ def gth_local_reciprocal_coefficients(
         Complex local-potential coefficients with shape ``basis.grid.shape``.
     """
 
-    _validated_gth(pseudopotential)
     centers = _positions(positions)
+    per_ion = _per_ion_pseudopotentials(pseudopotential, int(centers.shape[0]))
     vectors = np.asarray(basis.reciprocal_vectors, dtype=np.float64)
     g2 = np.sum(vectors * vectors, axis=-1)
-    rloc = float(pseudopotential.gth_rloc)
-    coefficients = list(pseudopotential.gth_coefficients) + [0.0] * 4
-    c1, c2, c3, c4 = coefficients[:4]
-    zion = float(pseudopotential.valence_charge)
-    rq2 = g2 * rloc * rloc
-    gaussian = np.exp(-0.5 * rq2)
-    polynomial = (
-        c1
-        + c2 * (3.0 - rq2)
-        + c3 * (15.0 - 10.0 * rq2 + rq2 * rq2)
-        + c4 * (105.0 - rq2 * (105.0 - rq2 * (21.0 - rq2)))
-    )
-    single = np.empty_like(g2)
-    nonzero = g2 > 1e-14
-    single[nonzero] = (
-        4.0
-        * pi
-        * gaussian[nonzero]
-        * (-zion / g2[nonzero] + sqrt(pi / 2.0) * rloc**3 * polynomial[nonzero])
-        / basis.volume
-    )
-    epsatm = 2.0 * pi * rloc * rloc * zion + (2.0 * pi) ** 1.5 * rloc**3 * (
-        c1 + 3.0 * c2 + 15.0 * c3 + 105.0 * c4
-    )
-    single[~nonzero] = epsatm / basis.volume
-    values = single * _structure_factor(vectors, centers)
+    grouped: dict[str, tuple[PseudopotentialData, list[np.ndarray]]] = {}
+    for pseudo, center in zip(per_ion, centers, strict=True):
+        fingerprint = _pseudopotential_fingerprint(pseudo)
+        if fingerprint not in grouped:
+            grouped[fingerprint] = (pseudo, [])
+        grouped[fingerprint][1].append(center)
+    values = np.zeros(basis.grid.shape, dtype=np.complex128)
+    for pseudo, species_centers in grouped.values():
+        rloc = float(pseudo.gth_rloc)
+        coefficients = list(pseudo.gth_coefficients) + [0.0] * 4
+        c1, c2, c3, c4 = coefficients[:4]
+        zion = float(pseudo.valence_charge)
+        rq2 = g2 * rloc * rloc
+        gaussian = np.exp(-0.5 * rq2)
+        polynomial = (
+            c1
+            + c2 * (3.0 - rq2)
+            + c3 * (15.0 - 10.0 * rq2 + rq2 * rq2)
+            + c4 * (105.0 - rq2 * (105.0 - rq2 * (21.0 - rq2)))
+        )
+        single = np.empty_like(g2)
+        nonzero = g2 > 1e-14
+        single[nonzero] = (
+            4.0
+            * pi
+            * gaussian[nonzero]
+            * (-zion / g2[nonzero] + sqrt(pi / 2.0) * rloc**3 * polynomial[nonzero])
+            / basis.volume
+        )
+        epsatm = 2.0 * pi * rloc * rloc * zion + (2.0 * pi) ** 1.5 * rloc**3 * (
+            c1 + 3.0 * c2 + 15.0 * c3 + 105.0 * c4
+        )
+        single[~nonzero] = epsatm / basis.volume
+        values += single * _structure_factor(
+            vectors,
+            np.asarray(species_centers, dtype=np.float64),
+        )
     return mx.array(values.astype(np.complex64))
 
 
 def gth_local_potential_grid(
-    pseudopotential: PseudopotentialData,
+    pseudopotential: PseudopotentialData | Sequence[PseudopotentialData],
     basis: PlaneWaveBasis,
     positions: Sequence[Sequence[float]],
 ) -> mx.array:
     """Return the real periodic local GTH potential on the FFT grid.
 
     Args:
-        pseudopotential: Parsed GTH pseudopotential.
+        pseudopotential: One shared or one-per-ion parsed GTH pseudopotential.
         basis: Plane-wave basis supplying the FFT grid.
         positions: Ionic Cartesian positions in bohr.
 
@@ -340,13 +372,15 @@ def _pseudopotential_fingerprint(pseudopotential: PseudopotentialData) -> str:
 
 
 def _projector_context_identity(
-    pseudopotential: PseudopotentialData,
+    pseudopotentials: Sequence[PseudopotentialData],
     basis: PlaneWaveBasis,
     positions: np.ndarray,
 ) -> str:
     digest = sha256()
-    digest.update(b"mlx-atomistic.gth-projector-context.v1\0")
-    digest.update(_pseudopotential_fingerprint(pseudopotential).encode("ascii"))
+    digest.update(b"mlx-atomistic.gth-projector-context.v2\0")
+    for pseudopotential in pseudopotentials:
+        digest.update(_pseudopotential_fingerprint(pseudopotential).encode("ascii"))
+        digest.update(b"\0")
     digest.update(basis.reciprocal_grid.fingerprint.encode("ascii"))
     digest.update(np.asarray(positions, dtype=np.float64).tobytes())
     digest.update(b"complex64-float32\0")
@@ -354,14 +388,13 @@ def _projector_context_identity(
 
 
 def _flattened_gth_coupling(
-    pseudopotential: PseudopotentialData,
-    ion_count: int,
+    pseudopotentials: Sequence[PseudopotentialData],
 ) -> tuple[mx.array, int]:
     """Return the block coupling for the canonical flattened projector order."""
 
     blocks = [
         np.asarray(channel.coupling_matrix, dtype=np.float32)
-        for _ion_index in range(ion_count)
+        for pseudopotential in pseudopotentials
         for channel in pseudopotential.gth_channels
         for _harmonic_index in range(2 * channel.angular_momentum + 1)
     ]
@@ -379,7 +412,7 @@ def _flattened_gth_coupling(
 class PeriodicGTHNonlocalOperator:
     """Complete compact separable GTH operator at one Bloch k-point."""
 
-    pseudopotential: PseudopotentialData
+    pseudopotentials: tuple[PseudopotentialData, ...]
     basis: PlaneWaveBasis
     positions: np.ndarray
     _cache: _GTHProjectorCache
@@ -390,30 +423,27 @@ class PeriodicGTHNonlocalOperator:
 
     def __init__(
         self,
-        pseudopotential: PseudopotentialData,
+        pseudopotential: PseudopotentialData | Sequence[PseudopotentialData],
         basis: PlaneWaveBasis,
         positions: Sequence[Sequence[float]],
         *,
         cache: _GTHProjectorCache | None = None,
         cache_budget_bytes: int = _GTHProjectorCache.DEFAULT_BUDGET_BYTES,
     ):
-        _validated_gth(pseudopotential)
-        if not pseudopotential.gth_channels:
-            msg = "GTH pseudopotential has no complete nonlocal channels"
-            raise ValueError(msg)
         centers = _positions(positions)
+        per_ion = _per_ion_pseudopotentials(pseudopotential, int(centers.shape[0]))
+        if any(not value.gth_channels for value in per_ion):
+            msg = "every GTH pseudopotential must have complete nonlocal channels"
+            raise ValueError(msg)
         projector_cache = _GTHProjectorCache(cache_budget_bytes) if cache is None else cache
         context_identity = _projector_context_identity(
-            pseudopotential,
+            per_ion,
             basis,
             centers,
         )
-        flattened_coupling, projector_count = _flattened_gth_coupling(
-            pseudopotential,
-            int(centers.shape[0]),
-        )
+        flattened_coupling, projector_count = _flattened_gth_coupling(per_ion)
         projector_cache.bind(context_identity)
-        object.__setattr__(self, "pseudopotential", pseudopotential)
+        object.__setattr__(self, "pseudopotentials", per_ion)
         object.__setattr__(self, "basis", basis)
         object.__setattr__(self, "positions", centers)
         object.__setattr__(self, "_cache", projector_cache)
@@ -497,7 +527,9 @@ class PeriodicGTHNonlocalOperator:
         harmonic_width = sum(
             2 * angular_momentum + 1
             for angular_momentum in {
-                channel.angular_momentum for channel in reference.pseudopotential.gth_channels
+                channel.angular_momentum
+                for pseudopotential in reference.pseudopotentials
+                for channel in pseudopotential.gth_channels
             }
         )
         estimate = lane_count * bucket_size * (1 + harmonic_width) * 4
@@ -580,9 +612,10 @@ class PeriodicGTHNonlocalOperator:
             )
 
         flattened_projectors = []
-        group_count = int(reference.positions.shape[0]) * sum(
+        group_count = sum(
             2 * channel.angular_momentum + 1
-            for channel in reference.pseudopotential.gth_channels
+            for pseudopotential in reference.pseudopotentials
+            for channel in pseudopotential.gth_channels
         )
         for lane_index, (operator, vectors) in enumerate(lane_data):
             cache, protected_keys = protected_by_cache[id(operator._cache)]
@@ -603,15 +636,20 @@ class PeriodicGTHNonlocalOperator:
                         vectors,
                         q,
                     )
-                    for channel in operator.pseudopotential.gth_channels
+                    for pseudopotential in operator.pseudopotentials
+                    for channel in pseudopotential.gth_channels
                 }
                 rows = []
-                for ion_index in range(operator.positions.shape[0]):
-                    for channel in operator.pseudopotential.gth_channels:
+                for position, pseudopotential in zip(
+                    operator.positions,
+                    operator.pseudopotentials,
+                    strict=True,
+                ):
+                    for channel in pseudopotential.gth_channels:
                         for harmonic in harmonics[channel.angular_momentum]:
                             rows.append(
                                 operator._projector_group(
-                                    operator.positions[ion_index],
+                                    position,
                                     channel,
                                     harmonic,
                                     vectors,
@@ -773,16 +811,37 @@ class PeriodicGTHNonlocalOperator:
             Channel, projector, angular, ion, and k-point metadata.
         """
 
+        fingerprints = [
+            _pseudopotential_fingerprint(value) for value in self.pseudopotentials
+        ]
+        radial_by_ion = [
+            sum(channel.projector_count for channel in value.gth_channels)
+            for value in self.pseudopotentials
+        ]
+        angular_by_ion = [
+            sum(
+                channel.projector_count * (2 * channel.angular_momentum + 1)
+                for channel in value.gth_channels
+            )
+            for value in self.pseudopotentials
+        ]
+        homogeneous = len(set(fingerprints)) == 1
         return {
             "ion_count": int(self.positions.shape[0]),
-            "channel_count": len(self.pseudopotential.gth_channels),
-            "radial_projector_count_per_ion": sum(
-                channel.projector_count for channel in self.pseudopotential.gth_channels
+            "species_count": len(set(fingerprints)),
+            "channel_count": (
+                len(self.pseudopotentials[0].gth_channels) if homogeneous else None
             ),
-            "angular_projector_count_per_ion": sum(
-                channel.projector_count * (2 * channel.angular_momentum + 1)
-                for channel in self.pseudopotential.gth_channels
+            "channel_count_total": sum(
+                len(value.gth_channels) for value in self.pseudopotentials
             ),
+            "radial_projector_count_per_ion": (
+                radial_by_ion[0] if homogeneous else radial_by_ion
+            ),
+            "angular_projector_count_per_ion": (
+                angular_by_ion[0] if homogeneous else angular_by_ion
+            ),
+            "angular_projector_count_total": sum(angular_by_ion),
             "kpoint_cartesian_bohr_inverse": list(self.basis.kpoint_cartesian),
         }
 

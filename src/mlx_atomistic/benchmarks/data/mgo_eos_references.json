@@ -1,0 +1,87 @@
+{
+  "schema_version": "mlx-atomistic.mgo-eos-references.v1",
+  "material": {
+    "cell": "rocksalt-mgo",
+    "functional": "PBE",
+    "spin": "unpolarized"
+  },
+  "protocol": {
+    "central_conventional_lattice_angstrom": 4.254250040100746,
+    "volume_factors": [
+      0.94,
+      0.96,
+      0.98,
+      1.0,
+      1.02,
+      1.04,
+      1.06
+    ],
+    "reference_method": "ACWF verification-PBE-v1",
+    "local_method": "zero-temperature fixed occupations with Mg GTH-PBE-q2 and O GTH-PBE-q6",
+    "method_difference": "The ACWF data use their published verification protocol. The accepted local validation uses the existing fixed-occupation insulating periodic-DFT path with a two-valence-electron Mg GTH pseudopotential and compares equation-of-state shape and fitted properties against all-electron PBE."
+  },
+  "references": {
+    "all_electron_average": {
+      "role": "primary",
+      "source": "Materials Cloud ACWF curated FLEUR/WIEN2k average",
+      "source_url": "https://archive.materialscloud.org/records/yf0rj-w3r97",
+      "source_doi": "10.24435/materialscloud:s4-3h",
+      "source_file": "results-oxides-verification-PBE-v1-AE-average.json",
+      "primitive_cell_atoms": 2,
+      "fit": {
+        "equilibrium_volume_angstrom3": 19.249038606577802,
+        "bulk_modulus_ev_angstrom3": 0.9298661534716726,
+        "bulk_derivative": 4.090925702914065
+      }
+    },
+    "cp2k_gth": {
+      "role": "GTH-family-context",
+      "source": "Materials Cloud ACWF CP2K Quickstep TZV2P/GTH",
+      "source_url": "https://archive.materialscloud.org/records/yf0rj-w3r97",
+      "source_doi": "10.24435/materialscloud:s4-3h",
+      "source_file": "results-oxides-verification-PBE-v1-cp2k_TZV2P.json",
+      "primitive_cell_atoms": 2,
+      "fit": {
+        "equilibrium_volume_angstrom3": 19.333439518757846,
+        "bulk_modulus_ev_angstrom3": 0.9285243935999337,
+        "bulk_derivative": 4.0446997458
+      },
+      "eos_volume_energy_ev": [
+        [18.094715924179447, -2161.8657658925],
+        [18.479709880014852, -2161.8880799839],
+        [18.86470383584919, -2161.9014460213],
+        [19.249697791681527, -2161.9067745205],
+        [19.63469174751382, -2161.9048237774],
+        [20.01968570334806, -2161.8962973995],
+        [20.404679659181102, -2161.8817799458]
+      ]
+    },
+    "qe_sssp": {
+      "role": "context",
+      "source": "Materials Cloud ACWF Quantum ESPRESSO SSSP 1.3 PBE precision",
+      "source_url": "https://archive.materialscloud.org/records/yf0rj-w3r97",
+      "source_doi": "10.24435/materialscloud:s4-3h",
+      "source_file": "results-oxides-verification-PBE-v1-quantum_espresso-SSSP-1.3-PBE-precision.json",
+      "primitive_cell_atoms": 2,
+      "fit": {
+        "equilibrium_volume_angstrom3": 19.249982053611475,
+        "bulk_modulus_ev_angstrom3": 0.9298390505377412,
+        "bulk_derivative": 4.0956653
+      }
+    }
+  },
+  "local_pseudopotentials": {
+    "accepted": [
+      "Mg GTH-PBE-q2",
+      "O GTH-PBE-q6"
+    ],
+    "high_accuracy_feasibility": [
+      "Mg GTH-PBE-q10",
+      "O GTH-PBE-q6"
+    ]
+  },
+  "license": {
+    "identifier": "CC-BY-4.0",
+    "attribution": "Bosoni et al., How to verify the precision of density-functional-theory implementations via reproducible and universal workflows, Nature Reviews Physics 6, 45-58 (2024)."
+  }
+}

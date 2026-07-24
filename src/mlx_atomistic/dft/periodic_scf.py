@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from time import perf_counter
 
 import mlx.core as mx
@@ -41,6 +42,7 @@ from mlx_atomistic.dft.mixing import (
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
+    _pseudopotential_fingerprint,
     gth_local_potential_grid,
     periodic_ewald_energy,
 )
@@ -124,20 +126,22 @@ def _time_reversed_compact_values(
 
 @dataclass(frozen=True)
 class PeriodicDFTSystem:
-    """Orthorhombic periodic DFT system for a shared GTH pseudopotential.
+    """Orthorhombic periodic DFT system with per-ion GTH pseudopotentials.
 
     Args:
         cell_lengths: Orthorhombic cell lengths in bohr.
         grid_shape: FFT grid shape.
         positions: Ionic Cartesian positions in bohr.
-        pseudopotential: Shared GTH pseudopotential for every ion.
+        pseudopotential: Shared GTH pseudopotential for every ion. Mutually
+            exclusive with ``pseudopotentials``.
         electron_count: Total valence electron count. Defaults to the neutral
             pseudopotential charge sum.
+        pseudopotentials: Ordered one-per-ion GTH pseudopotentials.
     """
 
     grid: RealSpaceGrid
     positions: np.ndarray
-    pseudopotential: PseudopotentialData
+    pseudopotentials: tuple[PseudopotentialData, ...]
     electron_count: float
 
     def __init__(
@@ -145,15 +149,33 @@ class PeriodicDFTSystem:
         cell_lengths: Sequence[float],
         grid_shape: Sequence[int],
         positions: Sequence[Sequence[float]],
-        pseudopotential: PseudopotentialData,
+        pseudopotential: PseudopotentialData | None = None,
         electron_count: float | None = None,
+        *,
+        pseudopotentials: Sequence[PseudopotentialData] | None = None,
     ):
         positions_np = np.asarray(positions, dtype=np.float64)
         if positions_np.ndim != 2 or positions_np.shape[1] != 3 or positions_np.shape[0] == 0:
             msg = "positions must have shape (n_ions, 3)"
             raise ValueError(msg)
+        if (pseudopotential is None) == (pseudopotentials is None):
+            msg = "provide exactly one of pseudopotential or pseudopotentials"
+            raise ValueError(msg)
+        if pseudopotentials is None:
+            if not isinstance(pseudopotential, PseudopotentialData):
+                msg = "pseudopotential must be PseudopotentialData"
+                raise TypeError(msg)
+            per_ion = (pseudopotential,) * int(positions_np.shape[0])
+        else:
+            per_ion = tuple(pseudopotentials)
+            if len(per_ion) != int(positions_np.shape[0]):
+                msg = "pseudopotentials length must match the ion count"
+                raise ValueError(msg)
+            if any(not isinstance(value, PseudopotentialData) for value in per_ion):
+                msg = "pseudopotentials must contain PseudopotentialData values"
+                raise TypeError(msg)
         count = (
-            float(pseudopotential.valence_charge * positions_np.shape[0])
+            float(sum(value.valence_charge for value in per_ion))
             if electron_count is None
             else float(electron_count)
         )
@@ -162,8 +184,21 @@ class PeriodicDFTSystem:
             raise ValueError(msg)
         object.__setattr__(self, "grid", RealSpaceGrid(grid_shape, cell_lengths))
         object.__setattr__(self, "positions", positions_np)
-        object.__setattr__(self, "pseudopotential", pseudopotential)
+        object.__setattr__(self, "pseudopotentials", per_ion)
         object.__setattr__(self, "electron_count", count)
+
+    @property
+    def pseudopotential(self) -> PseudopotentialData:
+        """Return the shared pseudopotential of a homogeneous system.
+
+        Raises:
+            ValueError: If the system contains more than one pseudopotential.
+        """
+
+        if not self.is_homogeneous:
+            msg = "multi-element systems do not have one shared pseudopotential"
+            raise ValueError(msg)
+        return self.pseudopotentials[0]
 
     @property
     def ion_count(self) -> int:
@@ -175,7 +210,37 @@ class PeriodicDFTSystem:
     def charges(self) -> tuple[float, ...]:
         """Valence point charges used by the periodic Ewald term."""
 
-        return tuple(float(self.pseudopotential.valence_charge) for _ in range(self.ion_count))
+        return tuple(float(value.valence_charge) for value in self.pseudopotentials)
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        """Element symbol assigned to every ion in position order."""
+
+        return tuple(value.element for value in self.pseudopotentials)
+
+    @property
+    def is_homogeneous(self) -> bool:
+        """Whether every ion uses an identical pseudopotential."""
+
+        fingerprints = {
+            _pseudopotential_fingerprint(value) for value in self.pseudopotentials
+        }
+        return len(fingerprints) == 1
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable identity of the periodic cell and per-ion Hamiltonian."""
+
+        digest = sha256()
+        digest.update(b"mlx-atomistic.periodic-system.v1\0")
+        digest.update(np.asarray(self.grid.cell.matrix, dtype=np.float64).tobytes())
+        digest.update(np.asarray(self.grid.shape, dtype=np.int64).tobytes())
+        digest.update(np.asarray(self.positions, dtype=np.float64).tobytes())
+        digest.update(np.asarray([self.electron_count], dtype=np.float64).tobytes())
+        for value in self.pseudopotentials:
+            digest.update(_pseudopotential_fingerprint(value).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -3690,6 +3755,7 @@ class PeriodicSCFResult:
     resume_integrity_status: str = "fresh"
     timing_admission_status: str = "fresh"
     lineage: tuple[str, ...] = ()
+    system_fingerprint: str | None = None
     _owned_kpoints: tuple[PeriodicKPointResult, ...] | None = field(
         default=None,
         repr=False,
@@ -4371,7 +4437,7 @@ def _run_periodic_scf_with_projector_cache(
         )
         nonlocal_operators = {
             point_index: PeriodicGTHNonlocalOperator(
-                system.pseudopotential,
+                system.pseudopotentials,
                 bases[point_index],
                 system.positions,
                 cache=projector_cache,
@@ -4379,7 +4445,7 @@ def _run_periodic_scf_with_projector_cache(
             for point_index in owned_indices
         }
         local_potential = gth_local_potential_grid(
-            system.pseudopotential,
+            system.pseudopotentials,
             gamma_basis,
             system.positions,
         )
@@ -4874,6 +4940,7 @@ def _run_periodic_scf_with_projector_cache(
         resume_integrity_status="validated" if resume_state is not None else "fresh",
         timing_admission_status=timing_admission_status,
         lineage=lineage,
+        system_fingerprint=system.fingerprint,
         _owned_kpoints=final_owned_results,
         _checkpoint_state=None if converged else final_checkpoint_state,
     )

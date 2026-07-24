@@ -32,7 +32,7 @@ from mlx_atomistic.dft.periodic_scf import (
     _PeriodicSCFContinuationState,
     _run_periodic_scf_controlled,
 )
-from mlx_atomistic.dft.pseudopotentials import PseudopotentialFormat
+from mlx_atomistic.dft.pseudopotentials import PseudopotentialData, PseudopotentialFormat
 from mlx_atomistic.dft.runtime_state import _npy_bytes
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
 
@@ -40,7 +40,8 @@ PERIODIC_SCF_CHECKPOINT_KIND = "periodic-scf-checkpoint"
 PERIODIC_SCF_CHECKPOINT_SCHEMA = "mlx-atomistic.periodic-scf-checkpoint.v1"
 PERIODIC_SCF_CHECKPOINT_PAYLOAD = "checkpoint.json"
 PERIODIC_SCF_COMMAND_KIND = "periodic-scf"
-_CALCULATION_CONTRACT_SCHEMA = "mlx-atomistic.periodic-scf-calculation.v1"
+_CALCULATION_CONTRACT_SCHEMA = "mlx-atomistic.periodic-scf-calculation.v2"
+_LEGACY_CALCULATION_CONTRACT_SCHEMA = "mlx-atomistic.periodic-scf-calculation.v1"
 _SHA256_FIELDS = (
     "workload_fingerprint",
     "protocol_fingerprint",
@@ -430,8 +431,11 @@ def _validate_initialization_binding(
         raise ArtifactIntegrityError(msg)
 
 
-def _pseudopotential_payload(system: PeriodicDFTSystem) -> dict[str, object]:
-    pseudo = system.pseudopotential
+def _single_pseudopotential_payload(
+    pseudo: PseudopotentialData,
+) -> dict[str, object]:
+    """Return one canonical periodic GTH pseudopotential payload."""
+
     if pseudo.format != PseudopotentialFormat.GTH:
         msg = "periodic SCF checkpoints require a GTH pseudopotential"
         raise ValueError(msg)
@@ -450,6 +454,52 @@ def _pseudopotential_payload(system: PeriodicDFTSystem) -> dict[str, object]:
             for channel in pseudo.gth_channels
         ],
     }
+
+
+def _pseudopotential_payload(system: PeriodicDFTSystem) -> dict[str, object]:
+    """Return a deduplicated species table and ordered per-ion assignments."""
+
+    species: list[dict[str, object]] = []
+    species_by_payload: dict[bytes, int] = {}
+    atom_species: list[int] = []
+    for pseudo in system.pseudopotentials:
+        payload = _single_pseudopotential_payload(pseudo)
+        identity = canonical_json_bytes(payload)
+        species_index = species_by_payload.get(identity)
+        if species_index is None:
+            species_index = len(species)
+            species_by_payload[identity] = species_index
+            species.append(payload)
+        atom_species.append(species_index)
+    return {
+        "species": species,
+        "atom_species": atom_species,
+    }
+
+
+def _upgrade_legacy_calculation_contract(
+    calculation: Mapping[str, object],
+) -> dict[str, object]:
+    """Upgrade one homogeneous v1 calculation identity to the v2 species form."""
+
+    upgraded = json.loads(canonical_json_bytes(dict(calculation)))
+    if upgraded.get("schema_version") != _LEGACY_CALCULATION_CONTRACT_SCHEMA:
+        return upgraded
+    system = upgraded.get("system")
+    if not isinstance(system, dict) or not isinstance(system.get("pseudopotential"), dict):
+        msg = "legacy periodic SCF calculation contract is incomplete"
+        raise ArtifactIntegrityError(msg)
+    positions = system.get("positions_bohr")
+    if not isinstance(positions, list) or not positions:
+        msg = "legacy periodic SCF calculation positions are incomplete"
+        raise ArtifactIntegrityError(msg)
+    pseudo = system.pop("pseudopotential")
+    system["pseudopotentials"] = {
+        "species": [pseudo],
+        "atom_species": [0] * len(positions),
+    }
+    upgraded["schema_version"] = _CALCULATION_CONTRACT_SCHEMA
+    return upgraded
 
 
 def periodic_scf_calculation_contract(
@@ -499,7 +549,7 @@ def periodic_scf_calculation_contract(
             "grid_shape": list(system.grid.shape),
             "positions_bohr": np.asarray(system.positions, dtype=np.float64).tolist(),
             "electron_count": system.electron_count,
-            "pseudopotential": _pseudopotential_payload(system),
+            "pseudopotentials": _pseudopotential_payload(system),
         },
         "cutoff_hartree": float(cutoff_hartree),
         "n_bands": int(bands),
@@ -837,18 +887,28 @@ def _validated_checkpoint_metadata(
         metadata.get("calculation_contract"),
         "calculation contract",
     )
-    if calculation.get("schema_version") != _CALCULATION_CONTRACT_SCHEMA:
+    if calculation.get("schema_version") not in {
+        _CALCULATION_CONTRACT_SCHEMA,
+        _LEGACY_CALCULATION_CONTRACT_SCHEMA,
+    }:
         msg = "unsupported periodic SCF calculation contract"
         raise ArtifactIntegrityError(msg)
     observed_calculation = _calculation_fingerprint(calculation)
     if metadata.get("calculation_fingerprint") != observed_calculation:
         msg = "periodic checkpoint calculation fingerprint is inconsistent"
         raise ArtifactIntegrityError(msg)
-    if expected_calculation is not None and calculation != dict(expected_calculation):
+    comparison_calculation = _upgrade_legacy_calculation_contract(calculation)
+    if (
+        expected_calculation is not None
+        and comparison_calculation != dict(expected_calculation)
+    ):
         msg = "periodic checkpoint calculation settings do not match the current run"
         raise ArtifactIntegrityError(msg)
     try:
-        _validate_execution_calculation_binding(stored_execution_identity, calculation)
+        _validate_execution_calculation_binding(
+            stored_execution_identity,
+            comparison_calculation,
+        )
     except ValueError as error:
         raise ArtifactIntegrityError(str(error)) from error
     try:
