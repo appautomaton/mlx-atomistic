@@ -376,7 +376,10 @@ def test_bounded_multi_element_scf_converges_and_binds_system_identity():
     )
 
     assert result.converged
-    assert result.electron_count == 2.0
+    # electron_count is a grid quadrature, not an exact integer: it lands within
+    # float32 summation error of 2 electrons (mlx-cpu vs the Metal build differ
+    # here by ~1e-6), so match with a tolerance rather than bit-exact equality.
+    assert result.electron_count == pytest.approx(2.0, abs=1e-5)
     assert result.system_fingerprint == system.fingerprint
     assert float(mx.sum(result.density) * system.grid.dv) == pytest.approx(
         2.0,

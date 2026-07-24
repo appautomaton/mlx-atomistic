@@ -116,9 +116,12 @@ def test_batched_langevin_matches_per_step(block_size):
     assert np.array_equal(
         np.asarray(batched.sampled_steps), np.asarray(reference.sampled_steps)
     )
+    # Batched and per-step agree to float32 summation precision. Use a relative
+    # band: at total energies ~1e3 a pure absolute tolerance is backend-fragile,
+    # where the mlx-cpu reorder is ~4e-3 absolute but ~3e-6 relative.
     assert np.allclose(
         np.asarray(batched.total_energy), np.asarray(reference.total_energy),
-        rtol=0.0, atol=1e-3,
+        rtol=1e-5, atol=1e-3,
     )
     assert np.allclose(
         np.asarray(batched.sampled_positions), np.asarray(reference.sampled_positions),

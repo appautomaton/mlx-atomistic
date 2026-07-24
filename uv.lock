@@ -1080,12 +1080,17 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/3e/2b/b89364883b98f21c2fe29e52d4ac8bc2fa2fe0d79293b36ec421efc1854a/mlx-0.31.2-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:53c8d57ffa9ce77f8355663be05014c0dd37280e57f19126fb0a24389a30684b", size = 685064, upload-time = "2026-04-22T03:14:52.75Z" },
 ]
 
+[package.optional-dependencies]
+cpu = [
+    { name = "mlx-cpu", marker = "sys_platform == 'linux'" },
+]
+
 [[package]]
 name = "mlx-atomistic"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
-    { name = "mlx" },
+    { name = "mlx", extra = ["cpu"] },
     { name = "numpy" },
     { name = "scipy" },
 ]
@@ -1153,7 +1158,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.9" },
     { name = "mdanalysis", marker = "extra == 'viz'", specifier = ">=2.10.0" },
     { name = "mdtraj", marker = "extra == 'viz'", specifier = ">=1.11.1.post1" },
-    { name = "mlx", specifier = ">=0.31.1" },
+    { name = "mlx", extras = ["cpu"], specifier = ">=0.31.1" },
     { name = "nglview", marker = "extra == 'viz'", specifier = ">=4.0.1" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "pandas", marker = "extra == 'viz'", specifier = ">=2.2" },
@@ -1188,6 +1193,15 @@ test = [
     { name = "pytest-cov", specifier = ">=5" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.8" },
+]
+
+[[package]]
+name = "mlx-cpu"
+version = "0.31.2"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bb/a3/5e62e9d4ebec89f1805b10dad74863815335f3048d5afd4b2640d474d809/mlx_cpu-0.31.2-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:0bfd8292d1d88ff1e5ea0a3202510a2cb61e0f212a69a364cee50aea4a175000", size = 8678191, upload-time = "2026-04-22T01:12:15.982Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/5b/4a0cfe9f7e25bf4a9d7fee9d03be8f56d4aa5949deedda0d8e1437d8b6f2/mlx_cpu-0.31.2-py3-none-manylinux_2_35_x86_64.whl", hash = "sha256:32bd40b8e7351b64b15921db5c24305726f97673e2fc512b1d5dc6727bb2f414", size = 10252297, upload-time = "2026-04-22T01:12:18.478Z" },
 ]
 
 [[package]]

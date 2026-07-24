@@ -520,6 +520,7 @@ def test_timeout_cleanup_leaves_no_completed_checkpoint(tmp_path):
     assert not list(tmp_path.glob(".timeout.tmp-*"))
 
 
+@pytest.mark.slow
 def test_timeout_cleanup_kills_child_and_publishes_no_checkpoint(tmp_path):
     from mlx_atomistic.benchmarks.dft_runtime_core import supervise_full_scf_worker
 

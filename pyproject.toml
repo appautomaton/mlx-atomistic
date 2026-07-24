@@ -34,7 +34,11 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "mlx>=0.31.1",
+  # mlx is a backend-selecting metapackage: macOS resolves mlx-metal, and the
+  # cpu extra resolves mlx-cpu on Linux (its marker is Linux-gated, so it is a
+  # no-op on macOS). This lets headless Linux CI run the CPU backend, which the
+  # Metal build cannot do (ml-explore/mlx#3148).
+  "mlx[cpu]>=0.31.1",
   "numpy>=2.0",
   "scipy>=1.14",
 ]

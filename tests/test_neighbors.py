@@ -455,9 +455,11 @@ def test_unsorted_pairs_are_physics_neutral_and_default_in_md_loop():
     mx.eval(e_sorted, f_sorted, e_unsorted, f_unsorted)
 
     # Identical pair sets => identical physics; residuals are float32 summation
-    # order from MLX's (atomically non-deterministic) scatter-add, same tolerance
-    # band as the cell_pairs-vs-cell_blocks lock above.
-    assert abs(float(e_sorted) - float(e_unsorted)) < 1e-2
+    # order from MLX's (atomically non-deterministic) scatter-add. The band is
+    # relative: at this energy magnitude (~1e4) an absolute tolerance is
+    # backend-fragile, where a few-ULP reorder is ~5e-2 absolute but ~5e-6
+    # relative (mlx-cpu reorders more than the Metal build).
+    assert abs(float(e_sorted) - float(e_unsorted)) < 1e-5 * abs(float(e_sorted))
     assert float(mx.max(mx.abs(f_sorted - f_unsorted))) < 1e-3
 
 
