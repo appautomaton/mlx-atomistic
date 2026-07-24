@@ -271,6 +271,47 @@ def main(argv: list[str] | None = None) -> None:
     validate.add_argument("--summarize-only", action="store_true")
     validate.add_argument("--json", action="store_true")
 
+    force_point = subparsers.add_parser("force-point")
+    force_point.add_argument("--manifest", type=Path, required=True)
+    force_point.add_argument("--eos-report", type=Path, required=True)
+    force_point.add_argument(
+        "--kind",
+        choices=("equilibrium", "displacement"),
+        required=True,
+    )
+    force_point.add_argument("--out", type=Path, required=True)
+    force_point.add_argument("--initial-density", type=Path)
+    force_point.add_argument("--equilibrium-seed", type=Path)
+    force_point.add_argument("--refinement-density", type=Path)
+    force_point.add_argument(
+        "--convergence-tier",
+        choices=("baseline", "refinement"),
+        default="baseline",
+    )
+    force_point.add_argument("--atom-index", type=int)
+    force_point.add_argument("--axis", type=int)
+    force_point.add_argument("--direction", choices=("minus", "plus"))
+    force_point.add_argument("--json", action="store_true")
+
+    validate_forces = subparsers.add_parser("validate-forces")
+    validate_forces.add_argument("--manifest", type=Path, required=True)
+    validate_forces.add_argument("--eos-report", type=Path, required=True)
+    validate_forces.add_argument("--initial-density", type=Path, required=True)
+    validate_forces.add_argument("--out", type=Path, required=True)
+    validate_forces.add_argument("--dry-run", action="store_true")
+    validate_forces.add_argument("--json", action="store_true")
+
+    refine_forces = subparsers.add_parser("refine-forces")
+    refine_forces.add_argument("--manifest", type=Path, required=True)
+    refine_forces.add_argument("--eos-report", type=Path, required=True)
+    refine_forces.add_argument("--base-report", type=Path, required=True)
+    refine_forces.add_argument("--out", type=Path, required=True)
+    refine_forces.add_argument(
+        "--accept-float32-precision-limit",
+        action="store_true",
+    )
+    refine_forces.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "prepare":
         result = prepare_mgo_workload(gth_source=args.gth_source, out=args.out)
@@ -284,7 +325,7 @@ def main(argv: list[str] | None = None) -> None:
             out=args.out,
             initial_density_path=args.initial_density,
         )
-    else:
+    elif args.command == "validate-eos":
         from mlx_atomistic.benchmarks.dft_mgo_eos_runner import (
             run_mgo_eos_validation,
         )
@@ -294,6 +335,48 @@ def main(argv: list[str] | None = None) -> None:
             out=args.out,
             dry_run=args.dry_run,
             summarize_only=args.summarize_only,
+        )
+    elif args.command == "force-point":
+        from mlx_atomistic.benchmarks.dft_mgo_forces import (
+            run_mgo_force_point,
+        )
+
+        result = run_mgo_force_point(
+            manifest_path=args.manifest,
+            eos_report_path=args.eos_report,
+            kind=args.kind,
+            out=args.out,
+            initial_density_path=args.initial_density,
+            equilibrium_seed_path=args.equilibrium_seed,
+            refinement_density_path=args.refinement_density,
+            convergence_tier=args.convergence_tier,
+            atom_index=args.atom_index,
+            axis=args.axis,
+            direction=args.direction,
+        )
+    elif args.command == "validate-forces":
+        from mlx_atomistic.benchmarks.dft_mgo_forces import (
+            run_mgo_force_validation,
+        )
+
+        result = run_mgo_force_validation(
+            manifest_path=args.manifest,
+            eos_report_path=args.eos_report,
+            initial_density_path=args.initial_density,
+            out=args.out,
+            dry_run=args.dry_run,
+        )
+    else:
+        from mlx_atomistic.benchmarks.dft_mgo_forces import (
+            refine_mgo_force_validation,
+        )
+
+        result = refine_mgo_force_validation(
+            manifest_path=args.manifest,
+            eos_report_path=args.eos_report,
+            base_report_path=args.base_report,
+            out=args.out,
+            accept_precision_limit=args.accept_float32_precision_limit,
         )
     _print_payload(result, as_json=args.json)
 

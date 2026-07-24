@@ -112,8 +112,17 @@ analytic Ewald derivative.
 
 At fixed cell, the plane-wave basis does not depend on ionic positions, so
 there is no ionic Pulay-force term. Bounded fixed-state and reconverged
-two-species finite-difference tests cover the implementation. Full MgO
-finite-difference validation remains the next scientific admission gate.
+two-species finite-difference tests cover the implementation.
+
+The full eight-atom MgO validation uses the accepted 70 Ha, 6×6×6 PBE-GTH
+workload and 48 reconverged SCFs at ±0.01 bohr. At the unchanged
+`1e-4 Ha/bohr` gate, 21 of 24 analytic-versus-central-difference components
+pass. The remaining O 6-x and O 7-y/z components are recorded as a known
+float32 total-energy precision limitation, with a maximum deviation of
+`2.246e-4 Ha/bohr`; the threshold is not weakened. Their analytic equilibrium
+forces remain symmetry-correct and near zero, while tighter SCF continuation
+shifts the finite-difference values non-monotonically without a systematic
+atom-axis pattern.
 
 ## Benchmark Evidence
 
