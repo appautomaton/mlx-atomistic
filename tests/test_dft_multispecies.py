@@ -18,6 +18,7 @@ from mlx_atomistic.dft import (
     ReciprocalGrid,
     gth_local_reciprocal_coefficients,
     periodic_scf_calculation_contract,
+    periodic_scf_forces,
     run_periodic_scf,
 )
 from mlx_atomistic.dft._compact import _CompactBatch
@@ -79,6 +80,35 @@ def _bounded_binary_system() -> PeriodicDFTSystem:
         (6, 6, 6),
         ((2.0, 3.0, 3.0), (4.0, 3.0, 3.0)),
         pseudopotentials=(first, second),
+    )
+
+
+def _asymmetric_binary_system(
+    positions=((1.7, 2.8, 3.1), (4.1, 3.5, 2.6)),
+) -> PeriodicDFTSystem:
+    reference = _bounded_binary_system()
+    return PeriodicDFTSystem(
+        reference.grid.lengths,
+        reference.grid.shape,
+        positions,
+        pseudopotentials=reference.pseudopotentials,
+    )
+
+
+def _bounded_force_scf_config() -> PeriodicSCFConfig:
+    return PeriodicSCFConfig(
+        max_iterations=40,
+        min_iterations=3,
+        density_tolerance=3e-5,
+        energy_tolerance=3e-6,
+        orbital_tolerance=2e-5,
+        mixing_beta=0.5,
+        mixer="diis",
+        davidson=PeriodicDavidsonConfig(
+            max_iterations=32,
+            tolerance=2e-5,
+            max_subspace_size=20,
+        ),
     )
 
 
@@ -352,3 +382,55 @@ def test_bounded_multi_element_scf_converges_and_binds_system_identity():
         2.0,
         abs=1e-4,
     )
+    force_result = periodic_scf_forces(system, result)
+    observed = np.asarray(force_result.forces)
+    expected = (
+        np.asarray(force_result.local)
+        + np.asarray(force_result.nonlocal_force)
+        + np.asarray(force_result.ion_ewald)
+    )
+
+    assert observed.shape == (2, 3)
+    assert np.isfinite(observed).all()
+    np.testing.assert_allclose(observed, expected, atol=2e-7)
+    assert force_result.provenance["pulay"] == (
+        "zero_for_fixed_cell_plane_wave_basis"
+    )
+
+
+def test_periodic_scf_force_matches_bounded_total_energy_derivative():
+    mesh = KPointMesh(
+        [KPoint((0.0, 0.0, 0.0), coordinate_system="reduced")]
+    )
+    system = _asymmetric_binary_system()
+    config = _bounded_force_scf_config()
+    reference = run_periodic_scf(
+        system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=mesh,
+        n_bands=1,
+        config=config,
+    )
+    assert reference.converged
+    analytic = float(periodic_scf_forces(system, reference).forces[0, 0])
+
+    displacement = 0.01
+    energies = []
+    for offset in (-displacement, displacement):
+        positions = np.array(system.positions, copy=True)
+        positions[0, 0] += offset
+        displaced = _asymmetric_binary_system(positions)
+        result = run_periodic_scf(
+            displaced,
+            cutoff_hartree=2.5,
+            kpoint_mesh=mesh,
+            n_bands=1,
+            config=config,
+        )
+        assert result.converged
+        energies.append(result.total_energy)
+    finite_difference = -(energies[1] - energies[0]) / (
+        2.0 * displacement
+    )
+
+    assert analytic == pytest.approx(finite_difference, abs=1e-4)

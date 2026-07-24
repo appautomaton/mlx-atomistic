@@ -24,6 +24,7 @@ from mlx_atomistic.dft import (
     gth_local_reciprocal_coefficients,
     periodic_ewald_energy,
     periodic_ewald_forces,
+    periodic_gth_local_forces,
     read_gth,
     run_periodic_scf,
     solve_periodic_eigenproblem,
@@ -229,6 +230,56 @@ def test_gth_local_reciprocal_formula_and_grid_are_real():
     assert np.isfinite(potential).all()
 
 
+def test_periodic_gth_local_forces_match_fixed_density_energy_derivative():
+    grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+    basis = PlaneWaveBasis(grid, 4.0)
+    pseudo = _silicon_gth()
+    positions = np.array(((1.0, 2.0, 3.0), (5.0, 4.0, 2.0)))
+    coordinates = np.asarray(grid.coordinates())
+    density = (
+        0.02
+        + 0.004 * np.cos(2.0 * pi * coordinates[..., 0] / 8.0)
+        + 0.003 * np.sin(2.0 * pi * coordinates[..., 1] / 8.0)
+        + 0.002 * np.cos(4.0 * pi * coordinates[..., 2] / 8.0)
+    ).astype(np.float32)
+
+    observed = np.asarray(
+        periodic_gth_local_forces(
+            mx.array(density),
+            pseudo,
+            basis,
+            positions,
+        )
+    )
+    reference = np.zeros_like(positions)
+    displacement = 1e-2
+    for ion_index in range(positions.shape[0]):
+        for axis in range(3):
+            plus = positions.copy()
+            minus = positions.copy()
+            plus[ion_index, axis] += displacement
+            minus[ion_index, axis] -= displacement
+            energy_plus = float(
+                mx.sum(
+                    mx.array(density)
+                    * gth_local_potential_grid(pseudo, basis, plus)
+                )
+                * grid.dv
+            )
+            energy_minus = float(
+                mx.sum(
+                    mx.array(density)
+                    * gth_local_potential_grid(pseudo, basis, minus)
+                )
+                * grid.dv
+            )
+            reference[ion_index, axis] = -(
+                energy_plus - energy_minus
+            ) / (2.0 * displacement)
+
+    np.testing.assert_allclose(observed, reference, atol=5e-5, rtol=2e-4)
+
+
 def test_periodic_gth_nonlocal_operator_is_hermitian_at_non_gamma_kpoint():
     grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
     basis = PlaneWaveBasis.from_reduced_kpoint(grid, 4.0, (0.25, 0.25, -0.25))
@@ -273,6 +324,60 @@ def test_periodic_gth_nonlocal_operator_is_cell_translation_invariant():
     assert shifted_energy == pytest.approx(first_energy, abs=2e-5)
 
 
+def test_periodic_gth_nonlocal_forces_match_fixed_orbital_energy_derivative():
+    grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(
+        grid,
+        4.0,
+        (0.25, 0.125, -0.25),
+    )
+    positions = np.array(((1.0, 2.0, 3.0), (5.0, 4.0, 2.0)))
+    rng = np.random.default_rng(81)
+    trial = rng.normal(size=(2, *grid.shape)) + 1j * rng.normal(
+        size=(2, *grid.shape)
+    )
+    orbitals = basis.orthonormalize(
+        mx.array(trial.astype(np.complex64))
+    )
+    occupations = [2.0, 0.75]
+
+    operator = PeriodicGTHNonlocalOperator(
+        _silicon_gth(),
+        basis,
+        positions,
+    )
+    observed = np.asarray(
+        operator.forces(orbitals, occupations=occupations)
+    )
+    reference = np.zeros_like(positions)
+    displacement = 2e-3
+    for ion_index in range(positions.shape[0]):
+        for axis in range(3):
+            plus = positions.copy()
+            minus = positions.copy()
+            plus[ion_index, axis] += displacement
+            minus[ion_index, axis] -= displacement
+            energy_plus = float(
+                PeriodicGTHNonlocalOperator(
+                    _silicon_gth(),
+                    basis,
+                    plus,
+                ).energy(orbitals, occupations=occupations)
+            )
+            energy_minus = float(
+                PeriodicGTHNonlocalOperator(
+                    _silicon_gth(),
+                    basis,
+                    minus,
+                ).energy(orbitals, occupations=occupations)
+            )
+            reference[ion_index, axis] = -(
+                energy_plus - energy_minus
+            ) / (2.0 * displacement)
+
+    np.testing.assert_allclose(observed, reference, atol=8e-5, rtol=4e-4)
+
+
 def test_periodic_ewald_energy_translation_scaling_and_force_consistency():
     charges = [1.0, -1.0]
     positions = np.array([[1.0, 1.0, 1.0], [3.0, 3.0, 3.0]])
@@ -294,13 +399,26 @@ def test_periodic_ewald_energy_translation_scaling_and_force_consistency():
         charges,
         positions,
         lengths,
+        tolerance=1e-8,
+    )
+    finite_difference_forces = periodic_ewald_forces(
+        charges,
+        positions,
+        lengths,
         displacement=2e-4,
         tolerance=1e-8,
+        method="finite_difference",
     )
 
     assert np.isfinite(energy)
     assert translated == pytest.approx(energy, abs=2e-9)
     assert scaled == pytest.approx(0.5 * energy, rel=2e-6)
+    np.testing.assert_allclose(
+        forces,
+        finite_difference_forces,
+        atol=2e-8,
+        rtol=2e-7,
+    )
     np.testing.assert_allclose(np.sum(forces, axis=0), 0.0, atol=2e-8)
     assert forces[0, 0] == pytest.approx(forces[0, 1], rel=2e-6)
     assert forces[0, 0] == pytest.approx(forces[0, 2], rel=2e-6)

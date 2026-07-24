@@ -83,12 +83,17 @@ from mlx_atomistic.dft.optimization import (
     optimize_geometry,
     save_geometry_optimization,
 )
+from mlx_atomistic.dft.periodic_forces import (
+    PeriodicForceResult,
+    periodic_scf_forces,
+)
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     gth_local_potential_grid,
     gth_local_reciprocal_coefficients,
     periodic_ewald_energy,
     periodic_ewald_forces,
+    periodic_gth_local_forces,
 )
 from mlx_atomistic.dft.periodic_scf import (
     PeriodicBandPointResult,
@@ -198,6 +203,7 @@ __all__ = [
     "PeriodicBandStructureResult",
     "PeriodicDavidsonConfig",
     "PeriodicEigenResult",
+    "PeriodicForceResult",
     "PeriodicFrozenDensity",
     "PeriodicGTHNonlocalOperator",
     "PeriodicKPointResult",
@@ -265,8 +271,10 @@ __all__ = [
     "orthonormality_error",
     "periodic_ewald_energy",
     "periodic_ewald_forces",
+    "periodic_gth_local_forces",
     "periodic_scf_calculation_contract",
     "periodic_scf_execution_settings",
+    "periodic_scf_forces",
     "periodic_scf_initialization_identity",
     "publish_periodic_scf_checkpoint",
     "real_to_reciprocal",

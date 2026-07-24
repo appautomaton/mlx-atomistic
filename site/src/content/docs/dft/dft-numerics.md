@@ -95,6 +95,26 @@ It does not prove production-grade DFT forces because the nonlocal correction is
 an alpha finite-difference path and production materials validation, cell
 relaxation, and custom kernels remain out of scope.
 
+### Periodic plane-wave forces
+
+The production periodic path has a separate fixed-cell force implementation:
+
+```text
+Fᵢ = Fᵢ(local GTH) + Fᵢ(nonlocal GTH) + Fᵢ(Ewald ions)
+```
+
+`periodic_scf_forces(system, result)` requires a converged
+`PeriodicSCFResult` with an exact system fingerprint. The local term
+differentiates the reciprocal-space ionic phase against the converged density;
+the nonlocal term differentiates each GTH projector phase and sums occupied
+states with their k-point integration weights; and the ion-ion term uses the
+analytic Ewald derivative.
+
+At fixed cell, the plane-wave basis does not depend on ionic positions, so
+there is no ionic Pulay-force term. Bounded fixed-state and reconverged
+two-species finite-difference tests cover the implementation. Full MgO
+finite-difference validation remains the next scientific admission gate.
+
 ## Benchmark Evidence
 
 The DFT benchmark reports SCF timing sections. The new operator benchmark adds:

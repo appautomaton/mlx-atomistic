@@ -148,6 +148,67 @@ def gth_local_potential_grid(
     return mx.real(mx.fft.ifftn(coefficients) * basis.grid.size)
 
 
+def periodic_gth_local_forces(
+    density: mx.array,
+    pseudopotential: PseudopotentialData | Sequence[PseudopotentialData],
+    basis: PlaneWaveBasis,
+    positions: Sequence[Sequence[float]],
+) -> mx.array:
+    """Return analytic local-GTH Hellmann--Feynman forces.
+
+    The derivative is evaluated in reciprocal space from the converged
+    electron density and the phase derivative of each ionic local potential.
+
+    Args:
+        density: Positive electron density on ``basis.grid``.
+        pseudopotential: One shared or one-per-ion parsed GTH pseudopotential.
+        basis: Plane-wave basis supplying the FFT grid and reciprocal vectors.
+        positions: Ionic Cartesian positions in bohr.
+
+    Returns:
+        Local electron-ion forces with shape ``(n_ions, 3)`` in Hartree/bohr.
+    """
+
+    centers = _positions(positions)
+    per_ion = _per_ion_pseudopotentials(pseudopotential, int(centers.shape[0]))
+    density_array = mx.real(mx.array(density)).astype(mx.float32)
+    if density_array.shape != basis.grid.shape:
+        msg = "density shape must match the periodic FFT grid"
+        raise ValueError(msg)
+    density_finite = mx.all(mx.isfinite(density_array))
+    mx.eval(density_finite)
+    if not bool(density_finite):
+        msg = "density must contain only finite values"
+        raise ValueError(msg)
+
+    density_reciprocal = mx.conjugate(mx.fft.fftn(density_array))
+    vectors = mx.array(
+        np.asarray(basis.reciprocal_vectors, dtype=np.float32),
+    )
+    imaginary = mx.array(1j, dtype=mx.complex64)
+    forces = []
+    for pseudo, center in zip(per_ion, centers, strict=True):
+        coefficients = gth_local_reciprocal_coefficients(
+            pseudo,
+            basis,
+            (center,),
+        )
+        force = mx.real(
+            mx.sum(
+                density_reciprocal[..., None]
+                * imaginary
+                * vectors
+                * coefficients[..., None],
+                axis=(0, 1, 2),
+            )
+            * basis.grid.dv
+        )
+        forces.append(force)
+    result = mx.stack(forces, axis=0).astype(mx.float32)
+    mx.eval(result)
+    return result
+
+
 def _gth_radial(
     channel: GTHProjectorChannel,
     projector_index: int,
@@ -782,6 +843,103 @@ class PeriodicGTHNonlocalOperator:
         expectations = mx.real(mx.sum(mx.conjugate(state.values) * applied.values, axis=1))
         return mx.sum(expectations * mx.array(np.asarray(occupations, dtype=np.float32)))
 
+    def _forces_compact(
+        self,
+        coefficients: _CompactLaneState,
+        *,
+        occupations: Sequence[float],
+    ) -> mx.array:
+        """Return analytic per-ion nonlocal forces for compact orbitals."""
+
+        self.basis._validate_state(coefficients)
+        if coefficients.kind != "coefficients":
+            msg = "GTH force input must be coefficient state"
+            raise ValueError(msg)
+        occupation_values = np.asarray(occupations, dtype=np.float32)
+        if occupation_values.shape != (coefficients.vector_count,):
+            msg = "occupations length must match the orbital count"
+            raise ValueError(msg)
+        if not np.all(np.isfinite(occupation_values)):
+            msg = "occupations must contain only finite values"
+            raise ValueError(msg)
+
+        vectors = self.basis._layout._active_shifted_vectors
+        q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
+        coefficient_matrix = mx.transpose(coefficients.values)
+        occupation_array = mx.array(occupation_values)
+        imaginary = mx.array(1j, dtype=mx.complex64)
+        forces = []
+        for position, pseudo in zip(
+            self.positions,
+            self.pseudopotentials,
+            strict=True,
+        ):
+            harmonics = {
+                channel.angular_momentum: _real_spherical_harmonics(
+                    channel.angular_momentum,
+                    vectors,
+                    q,
+                )
+                for channel in pseudo.gth_channels
+            }
+            rows = [
+                self._projector_group(
+                    position,
+                    channel,
+                    harmonic,
+                    vectors,
+                    q,
+                )
+                for channel in pseudo.gth_channels
+                for harmonic in harmonics[channel.angular_momentum]
+            ]
+            beta = mx.concatenate(rows, axis=0)
+            coupling, projector_count = _flattened_gth_coupling((pseudo,))
+            if int(beta.shape[0]) != projector_count:
+                msg = "per-ion GTH projector count is inconsistent"
+                raise RuntimeError(msg)
+            overlaps = mx.matmul(mx.conjugate(beta), coefficient_matrix)
+            mixed = mx.matmul(coupling, overlaps)
+            derivative_bras = (
+                imaginary
+                * mx.transpose(vectors)[:, None, :]
+                * mx.conjugate(beta)[None, :, :]
+            )
+            derivative_overlaps = mx.matmul(
+                derivative_bras,
+                coefficient_matrix,
+            )
+            derivative_energy = 2.0 * mx.real(
+                mx.sum(
+                    mx.conjugate(derivative_overlaps)
+                    * (mixed * occupation_array[None, :])[None, :, :],
+                    axis=(1, 2),
+                )
+            )
+            forces.append(-derivative_energy)
+        result = mx.stack(forces, axis=0).astype(mx.float32)
+        mx.eval(result)
+        return result
+
+    def forces(
+        self,
+        coefficients: mx.array,
+        *,
+        occupations: Sequence[float],
+    ) -> mx.array:
+        """Return analytic nonlocal-GTH Hellmann--Feynman forces.
+
+        Args:
+            coefficients: Orbital stack in the admitted basis.
+            occupations: One occupation per orbital.
+
+        Returns:
+            Nonlocal forces with shape ``(n_ions, 3)`` in Hartree/bohr.
+        """
+
+        state, _ = self.basis._state_from_full(coefficients)
+        return self._forces_compact(state, occupations=occupations)
+
     def cache_info(self) -> dict[str, int]:
         """Return bounded projector-cache accounting.
 
@@ -941,16 +1099,20 @@ def periodic_ewald_forces(
     displacement: float = 1e-4,
     eta: float | None = None,
     tolerance: float = 1e-10,
+    method: str = "analytic",
 ) -> np.ndarray:
-    """Return central-difference forces for the periodic Ewald energy.
+    """Return forces for the periodic Ewald ion-ion energy.
 
     Args:
         charges: Point charges in atomic units.
         positions: Cartesian positions in bohr.
         cell_lengths: Orthorhombic cell lengths in bohr.
-        displacement: Central-difference step in bohr. Defaults to ``1e-4``.
+        displacement: Central-difference step used only when
+            ``method="finite_difference"``. Defaults to ``1e-4``.
         eta: Optional Ewald splitting parameter. Defaults to a cell-scaled value.
         tolerance: Ewald truncation target. Defaults to ``1e-10``.
+        method: ``"analytic"`` or the validation-only
+            ``"finite_difference"``. Defaults to ``"analytic"``.
 
     Returns:
         Force array with shape ``(n_ions, 3)`` in Hartree/bohr.
@@ -959,7 +1121,109 @@ def periodic_ewald_forces(
     if displacement <= 0.0:
         msg = "displacement must be positive"
         raise ValueError(msg)
+    if method not in {"analytic", "finite_difference"}:
+        msg = "method must be 'analytic' or 'finite_difference'"
+        raise ValueError(msg)
     centers = _positions(positions)
+    if method == "analytic":
+        charge = np.asarray(charges, dtype=np.float64)
+        lengths = np.asarray(cell_lengths, dtype=np.float64)
+        if charge.shape != (centers.shape[0],):
+            msg = "charges length must match positions"
+            raise ValueError(msg)
+        if lengths.shape != (3,) or np.any(lengths <= 0.0):
+            msg = "cell_lengths must contain three positive values"
+            raise ValueError(msg)
+        if tolerance <= 0.0 or tolerance >= 1.0:
+            msg = "tolerance must lie in (0, 1)"
+            raise ValueError(msg)
+        eta_value = float(eta) if eta is not None else 5.0 / float(np.min(lengths))
+        if eta_value <= 0.0:
+            msg = "eta must be positive"
+            raise ValueError(msg)
+
+        cutoff_factor = sqrt(-np.log(tolerance))
+        real_cutoff = cutoff_factor / eta_value
+        real_ranges = [
+            range(
+                -int(np.ceil(real_cutoff / length)) - 1,
+                int(np.ceil(real_cutoff / length)) + 2,
+            )
+            for length in lengths
+        ]
+        forces = np.zeros_like(centers)
+        for ion_index, first in enumerate(centers):
+            for other_index, second in enumerate(centers):
+                for image in np.ndindex(
+                    *(len(values) for values in real_ranges)
+                ):
+                    translation = np.array(
+                        [
+                            real_ranges[axis][image[axis]] * lengths[axis]
+                            for axis in range(3)
+                        ]
+                    )
+                    displacement_vector = first - second + translation
+                    distance = float(np.linalg.norm(displacement_vector))
+                    if distance <= 1e-14 or distance > real_cutoff:
+                        continue
+                    coefficient = (
+                        erfc(eta_value * distance) / distance**3
+                        + 2.0
+                        * eta_value
+                        / sqrt(pi)
+                        * np.exp(-(eta_value * distance) ** 2)
+                        / distance**2
+                    )
+                    forces[ion_index] += (
+                        charge[ion_index]
+                        * charge[other_index]
+                        * coefficient
+                        * displacement_vector
+                    )
+
+        reciprocal_cutoff = 2.0 * eta_value * cutoff_factor
+        max_indices = np.ceil(
+            reciprocal_cutoff * lengths / (2.0 * pi)
+        ).astype(int)
+        volume = float(np.prod(lengths))
+        for h in range(-int(max_indices[0]), int(max_indices[0]) + 1):
+            for k in range(-int(max_indices[1]), int(max_indices[1]) + 1):
+                for l_value in range(
+                    -int(max_indices[2]),
+                    int(max_indices[2]) + 1,
+                ):
+                    if h == 0 and k == 0 and l_value == 0:
+                        continue
+                    vector = (
+                        2.0
+                        * pi
+                        * np.array([h, k, l_value], dtype=np.float64)
+                        / lengths
+                    )
+                    g2 = float(np.dot(vector, vector))
+                    if sqrt(g2) > reciprocal_cutoff:
+                        continue
+                    damping = np.exp(
+                        -g2 / (4.0 * eta_value * eta_value)
+                    ) / g2
+                    structure = np.sum(
+                        charge * np.exp(-1j * (centers @ vector))
+                    )
+                    phase_imaginary = np.imag(
+                        np.exp(1j * (centers @ vector)) * structure
+                    )
+                    forces += (
+                        4.0
+                        * pi
+                        / volume
+                        * damping
+                        * charge[:, None]
+                        * phase_imaginary[:, None]
+                        * vector[None, :]
+                    )
+        return forces
+
     forces = np.zeros_like(centers)
     for ion_index in range(centers.shape[0]):
         for axis in range(3):
