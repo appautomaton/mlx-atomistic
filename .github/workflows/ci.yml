@@ -23,7 +23,12 @@ jobs:
   fast:
     name: fast package lane
     if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (g++-11), not ubuntu-latest. mlx-cpu JIT-compiles CPU
+    # kernels by shelling out to a hardcoded `g++`, and g++-13 (the 24.04
+    # default) rejects its generated source: _Float32/64/128 are built-in types
+    # there (ml-explore/mlx#2281). 22.04's g++-11 compiles it cleanly and meets
+    # mlx-cpu's glibc 2.35 floor.
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -50,7 +55,7 @@ jobs:
       # lane fast. The gpu, reference, and data tests skip unless their opt-in
       # flags are passed, so this lane never needs the engines either.
       - name: CPU test suite (not slow)
-        run: uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow" -n auto --dist worksteal --max-worker-restart=200 -rf --tb=line -q
+        run: uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow"
 
   full:
     # Comprehensive scheduled and manual run: the entire CPU suite including slow
@@ -59,7 +64,7 @@ jobs:
     # local validation surfaces that hosted CI does not have.
     name: package suite + coverage
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04  # g++-11, per the fast lane note (ml-explore/mlx#2281)
     timeout-minutes: 60
     steps:
       - name: Check out repository
