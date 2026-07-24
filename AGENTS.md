@@ -60,6 +60,13 @@ The suite runs on the MLX **CPU backend** by default. `tests/conftest.py` sets
 verifiable without a GPU, which is what lets cheap, remote, CPU-only CI carry
 the regression safety net.
 
+That CI runs on Linux, not macOS. GitHub's hosted Linux runners are headless,
+so they install the `mlx-cpu` build through the `cpu` extra in `pyproject.toml`.
+The runner image is pinned to `ubuntu-22.04` because its g++-11 compiles
+mlx-cpu's runtime CPU kernels, whereas 24.04's g++-13 rejects them
+(ml-explore/mlx#2281). Hosted macOS cannot run the suite at all: MLX
+force-initializes Metal and aborts when headless (ml-explore/mlx#3148).
+
 The GPU is a development and optimization instrument, not a test tier. Use
 Apple Silicon Metal when you write or optimize the runtime and when you run real
 workloads. Do not build a routine GPU test gate, and do not assume a GPU is
