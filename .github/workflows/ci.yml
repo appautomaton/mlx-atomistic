@@ -10,14 +10,26 @@ on:
     - cron: "0 9 * * 1"
   workflow_dispatch:
 
+# Least privilege: the workflow only reads the checkout.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same PR. Pushes to main run to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fast:
     name: fast package lane
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -29,20 +41,29 @@ jobs:
         run: uv sync --locked --no-default-groups --extra prep --group test
 
       - name: Lint
-        run: uv run --locked --no-default-groups --group test ruff check src tests scripts
+        run: uv run --locked --no-default-groups --extra prep --group test ruff check src tests scripts
 
-      - name: Hosted package boundary tests
-        run: uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py
+      # CPU-first correctness gate. The suite runs on the MLX CPU backend
+      # (conftest forces CPU), so it needs no GPU. The slow marker is excluded to
+      # keep the lane fast. The gpu, reference, and data tests skip unless their
+      # opt-in flags are passed, so this lane never needs Metal or the engines.
+      - name: CPU test suite (not slow)
+        run: uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow"
 
   full:
-    # Comprehensive scheduled/manual run. Data/reference tests are still opt-in
-    # because their fixtures and engines are local validation surfaces.
+    # Comprehensive scheduled and manual run: the entire CPU suite including slow
+    # tests, with coverage. Reference, data, and GPU tests stay opt-in because
+    # their engines, fixtures, and Metal device are local validation surfaces that
+    # hosted CI does not have.
     name: package suite + coverage
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -53,5 +74,5 @@ jobs:
       - name: Install package test environment
         run: uv sync --locked --no-default-groups --extra prep --group test
 
-      - name: Hosted package boundary tests
-        run: uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py
+      - name: Full CPU suite with coverage
+        run: uv run --locked --no-default-groups --extra prep --group test python -m pytest --cov=mlx_atomistic --cov-report=term-missing

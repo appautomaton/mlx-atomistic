@@ -2787,6 +2787,7 @@ def test_periodic_davidson_observer_counts_single_hpsi_hook_without_numerical_dr
     np.testing.assert_allclose(np.asarray(observed.eigenvalues), np.asarray(plain.eigenvalues))
 
 
+@pytest.mark.slow
 def test_supervised_timeout_kills_worker_group_and_preserves_progress(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -2815,6 +2816,7 @@ def test_supervised_timeout_kills_worker_group_and_preserves_progress(tmp_path):
     assert heartbeat.read_text() == stopped_value
 
 
+@pytest.mark.slow
 def test_supervised_timeout_before_ready_still_kills_process_group(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -2836,6 +2838,7 @@ def test_supervised_timeout_before_ready_still_kills_process_group(tmp_path):
     assert heartbeat.read_text() == stopped_value
 
 
+@pytest.mark.slow
 def test_supervised_result_requires_clean_worker_exit(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -2851,6 +2854,7 @@ def test_supervised_result_requires_clean_worker_exit(tmp_path):
     assert result["status"] == "failed"
 
 
+@pytest.mark.slow
 def test_supervised_progress_callback_failure_still_kills_process_group(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
