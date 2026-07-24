@@ -23,7 +23,7 @@ jobs:
   fast:
     name: fast package lane
     if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -43,21 +43,23 @@ jobs:
       - name: Lint
         run: uv run --locked --no-default-groups --extra prep --group test ruff check src tests scripts
 
-      # CPU-first correctness gate. The suite runs on the MLX CPU backend
-      # (conftest forces CPU), so it needs no GPU. The slow marker is excluded to
-      # keep the lane fast. The gpu, reference, and data tests skip unless their
-      # opt-in flags are passed, so this lane never needs Metal or the engines.
+      # CPU-first correctness gate. Linux runners install mlx-cpu (via the cpu
+      # extra), the headless CPU backend, so the suite runs with no GPU and no
+      # Metal. The macOS Metal build aborts in a GPU-less VM (ml-explore/mlx#3148),
+      # which is why CI runs on Linux. The slow marker is excluded to keep the
+      # lane fast. The gpu, reference, and data tests skip unless their opt-in
+      # flags are passed, so this lane never needs the engines either.
       - name: CPU test suite (not slow)
         run: uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow"
 
   full:
     # Comprehensive scheduled and manual run: the entire CPU suite including slow
-    # tests, with coverage. Reference, data, and GPU tests stay opt-in because
-    # their engines, fixtures, and Metal device are local validation surfaces that
-    # hosted CI does not have.
+    # tests, with coverage, on the Linux CPU backend. Reference, data, and GPU
+    # tests stay opt-in because their engines, fixtures, and Metal device are
+    # local validation surfaces that hosted CI does not have.
     name: package suite + coverage
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Check out repository
