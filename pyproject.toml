@@ -142,6 +142,7 @@ markers = [
   "reference: requires an external reference engine (openmm/lammps); run with --run-reference",
   "data: requires a heavy/gitignored dataset; run with --run-data",
   "gpu: requires a Metal GPU; skipped if unavailable",
+  "perf: exercises DFT performance and formal-evidence governance; run with --run-perf",
 ]
 
 [tool.ruff]
