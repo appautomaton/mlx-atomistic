@@ -34,15 +34,23 @@ def pytest_addoption(parser):
         default=False,
         help="run tests that require a Metal GPU",
     )
+    parser.addoption(
+        "--run-perf",
+        action="store_true",
+        default=False,
+        help="run DFT performance and formal-evidence governance tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
     skip_data = pytest.mark.skip(reason="requires --run-data")
     skip_reference = pytest.mark.skip(reason="requires --run-reference")
     skip_gpu = pytest.mark.skip(reason="requires --run-gpu")
+    skip_perf = pytest.mark.skip(reason="requires --run-perf")
     run_data = config.getoption("--run-data")
     run_reference = config.getoption("--run-reference")
     run_gpu = config.getoption("--run-gpu")
+    run_perf = config.getoption("--run-perf")
     for item in items:
         if not run_data and item.get_closest_marker("data"):
             item.add_marker(skip_data)
@@ -50,3 +58,5 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_reference)
         if not run_gpu and item.get_closest_marker("gpu"):
             item.add_marker(skip_gpu)
+        if not run_perf and item.get_closest_marker("perf"):
+            item.add_marker(skip_perf)

@@ -821,6 +821,7 @@ def test_report_loader_rejects_laundered_raw_host_normalization(
         runtime_core._load_report(destination)
 
 
+@pytest.mark.perf
 def test_baseline_seal_requires_bound_report_and_generation_envelope(tmp_path):
     valid, _fingerprint = _fake_baseline_seal(
         tmp_path / "valid-seal",
@@ -883,6 +884,7 @@ def test_baseline_seal_requires_bound_report_and_generation_envelope(tmp_path):
         inspect_artifact(artifact=wrong_binding, require_admitted=True)
 
 
+@pytest.mark.perf
 @pytest.mark.parametrize("audit", ({"passed": False}, None, "invalid"))
 def test_baseline_seal_rejects_failed_or_malformed_diff_audit(tmp_path, audit):
     artifact, _fingerprint = _fake_baseline_seal(
@@ -896,6 +898,7 @@ def test_baseline_seal_rejects_failed_or_malformed_diff_audit(tmp_path, audit):
         runtime_core._load_seal(artifact)
 
 
+@pytest.mark.perf
 def test_baseline_seal_creation_and_comparison_are_mutually_exclusive(tmp_path):
     with pytest.raises(ValueError, match="cannot also consume"):
         run_fixed_density(
@@ -911,6 +914,7 @@ def test_baseline_seal_creation_and_comparison_are_mutually_exclusive(tmp_path):
         )
 
 
+@pytest.mark.perf
 def test_baseline_diff_audit_fails_closed_for_git_and_structure_drift(
     tmp_path, monkeypatch
 ):
@@ -1664,6 +1668,7 @@ def test_cli_publishes_structured_failure_for_operational_setup_error(
     assert "host inspection unavailable" in capsys.readouterr().err
 
 
+@pytest.mark.perf
 @pytest.mark.parametrize("source", ["AC Power", "Battery Power"])
 @pytest.mark.parametrize("mode_key", ["lowpowermode", "powermode"])
 def test_host_admission_accepts_either_source_at_active_low_power(source, mode_key):
@@ -1693,6 +1698,7 @@ def test_host_admission_accepts_either_source_at_active_low_power(source, mode_k
     assert "SECRET" not in json.dumps(provenance)
 
 
+@pytest.mark.perf
 def test_host_admission_selects_only_current_profile_and_fails_closed():
     calls = []
     battery = collect_host_provenance(
@@ -1725,6 +1731,7 @@ def test_host_admission_selects_only_current_profile_and_fails_closed():
         parse_power_profiles("AC Power:\n powermode nope\n")
 
 
+@pytest.mark.perf
 def test_host_admission_rejects_missing_or_conflicting_power_mode_keys():
     missing = {
         "chip": TARGET_CHIP,
@@ -1748,6 +1755,7 @@ def test_host_admission_rejects_missing_or_conflicting_power_mode_keys():
     )["blockers"]
 
 
+@pytest.mark.perf
 @pytest.mark.parametrize(
     ("field", "forged"),
     (
@@ -1794,6 +1802,7 @@ def test_host_power_mode_declared_normalization_mismatch_blocks_formal_admission
     assert "formal_target_host_low_power_mismatch" in formal["blockers"]
 
 
+@pytest.mark.perf
 def test_host_power_mode_uses_only_active_source_and_alias_is_not_identity():
     legacy_calls = []
     current_calls = []
@@ -1840,6 +1849,7 @@ def test_host_power_mode_uses_only_active_source_and_alias_is_not_identity():
         assert legacy_protocol[field] == value
 
 
+@pytest.mark.perf
 @pytest.mark.parametrize(
     "custom",
     (
@@ -1861,6 +1871,7 @@ def test_host_power_mode_conflict_from_pmset_fails_closed(custom):
     )["admitted"] is False
 
 
+@pytest.mark.perf
 @pytest.mark.parametrize(
     ("custom", "expected_blocker"),
     (
@@ -1881,6 +1892,7 @@ def test_host_power_mode_missing_or_non_low_fails_closed(custom, expected_blocke
     )["blockers"]
 
 
+@pytest.mark.perf
 def test_host_power_mode_equal_dual_aliases_are_unambiguous():
     outputs = _host_outputs()
     outputs[("pmset", "-g", "custom")]["stdout"] = (
@@ -1896,6 +1908,7 @@ def test_host_power_mode_equal_dual_aliases_are_unambiguous():
     )["admitted"] is True
 
 
+@pytest.mark.perf
 def test_host_power_mode_malformed_current_key_is_unparsed():
     outputs = _host_outputs()
     outputs[("pmset", "-g", "custom")]["stdout"] = "AC Power:\n powermode nope\n"
@@ -1909,6 +1922,7 @@ def test_host_power_mode_malformed_current_key_is_unparsed():
     )["admitted"] is False
 
 
+@pytest.mark.perf
 def test_compare_allows_runtime_drift_but_rejects_power_source_mismatch(
     tmp_path, monkeypatch
 ):
@@ -2100,6 +2114,7 @@ def test_compare_allows_runtime_drift_but_rejects_power_source_mismatch(
     assert "power_source_mismatch" in mismatch["admission"]["blockers"]
 
 
+@pytest.mark.perf
 def test_fixed_density_seal_records_dual_sources_and_frozen_work_profile(
     tmp_path, monkeypatch
 ):
@@ -2889,6 +2904,7 @@ def test_supervised_progress_callback_failure_still_kills_process_group(tmp_path
         assert heartbeat.read_text() == stopped_value
 
 
+@pytest.mark.perf
 def test_full_scf_publication_deadline_is_part_of_formal_admission(
     tmp_path, monkeypatch
 ):
