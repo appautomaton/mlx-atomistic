@@ -269,7 +269,16 @@ def test_dft_qm_scope_report_classifies_cp2k_qe_boundaries():
     assert payload["product_runtime"] == "mlx_atomistic"
     assert "cp2k" in payload["reference_policy"]
     assert "quantum_espresso" in payload["reference_policy"]
-    assert entries["plane_wave_scf"]["status"] == "proof-level"
+    assert entries["plane_wave_scf"]["status"] == "verified"
+    # Verified is scoped to the bulk-silicon PBE EOS workload only; the rationale
+    # must say so and must not claim general/production DFT or a closed QE parity.
+    pwscf_rationale = entries["plane_wave_scf"]["rationale"]
+    assert "silicon" in pwscf_rationale.lower()
+    assert "all-electron" in pwscf_rationale
+    assert "diagnostic" in pwscf_rationale
+    # Regression guard: only plane_wave_scf moved off proof-level.
+    assert entries["pseudopotentials"]["status"] == "proof-level"
+    assert entries["geometry_and_stress"]["status"] == "proof-level"
     assert entries["static_reference_comparison"]["status"] == "supported"
     assert entries["qmmm_orchestration"]["status"] == "deferred"
     assert entries["external_runtime_execution"]["status"] == "anti-goal"
@@ -279,7 +288,7 @@ def test_dft_qm_scope_report_classifies_cp2k_qe_boundaries():
 
     ready = dft_qm_scope_readiness_report("pwscf").to_dict()
     assert ready["name"] == "dft_qm_scope"
-    assert ready["status"] == "proof-level"
+    assert ready["status"] == "verified"
     assert ready["blockers"] == []
 
     deferred = dft_qm_scope_readiness_report("qmmm").to_dict()

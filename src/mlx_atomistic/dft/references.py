@@ -132,12 +132,16 @@ def get_dft_qm_scope_report() -> DFTQMScopeReport:
         entries=(
             DFTQMScopeEntry(
                 feature="plane_wave_scf",
-                status="proof-level",
+                status="verified",
                 local_surface=("DFTSystem", "run_scf", "KohnShamOperator", "SCFResult"),
                 reference_families=("CP2K Quickstep", "Quantum ESPRESSO PWscf"),
                 rationale=(
-                    "Local SCF, LDA, Hartree, kinetic, and pseudopotential paths are "
-                    "tested on tiny grids but are not chemically certified production DFT."
+                    "Bulk-silicon PBE plane-wave SCF is scientifically verified against "
+                    "the all-electron (FLEUR/WIEN2k) PBE equation of state at Lejaeghere "
+                    "delta factor 1.942 meV/atom (verified tier). This certifies the "
+                    "silicon EOS workload only; broader chemistry stays proof-level, and "
+                    "the separate MLX-versus-QE PWscf cross-engine parity remains "
+                    "diagnostic, not closed."
                 ),
             ),
             DFTQMScopeEntry(
