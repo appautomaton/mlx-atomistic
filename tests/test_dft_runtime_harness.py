@@ -2804,13 +2804,14 @@ def test_periodic_davidson_observer_counts_single_hpsi_hook_without_numerical_dr
 
 @pytest.mark.slow
 def test_supervised_timeout_kills_worker_group_and_preserves_progress(tmp_path):
+    timeout_seconds = 5.0
     state = tmp_path / "state"
     state.mkdir()
     result = supervise_full_scf_worker(
         manifest_path="unused",
         gth_source="unused",
         state_root=state,
-        timeout_seconds=0.5,
+        timeout_seconds=timeout_seconds,
         worker=_sleeping_process_group_worker,
     )
     assert result["status"] == "timeout"
@@ -2820,7 +2821,7 @@ def test_supervised_timeout_kills_worker_group_and_preserves_progress(tmp_path):
         {
             "event": "full_scf_timeout",
             "status": "failed",
-            "timeout_seconds": 0.5,
+            "timeout_seconds": timeout_seconds,
         },
     ]
     assert (state / "child.pid").is_file()

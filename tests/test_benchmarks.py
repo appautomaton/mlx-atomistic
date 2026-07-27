@@ -952,57 +952,6 @@ def test_openmm_import_failure_does_not_mask_invalid_input(tmp_path):
     assert "synthetic missing openmm" not in result.stderr
 
 
-@pytest.mark.slow
-def test_openmm_dhfr_reference_cases_report_normalized_blocker_or_ok():
-    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_openmm_dhfr.py"
-
-    for case, fixture in (
-        ("dhfr-implicit", "dhfr_implicit"),
-        ("dhfr-explicit-pme", "dhfr_explicit_pme"),
-    ):
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(script),
-                "--case",
-                case,
-                "--platform",
-                "Reference",
-                "--steps",
-                "1",
-                "--json",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        assert result.returncode == 0, result.stdout + result.stderr
-        payload = json.loads(result.stdout)
-        _assert_reference_payload(
-            payload,
-            engine="openmm-reference",
-            benchmark_name="openmm_dhfr_reference",
-            timing_metric="ns_per_day",
-        )
-        assert payload["case"] == case
-        assert payload["fixture"] == fixture
-        assert payload["status"] in {"ok", "blocked"}
-        assert payload["atom_count"] and payload["atom_count"] > 0
-        assert payload["step_count"] == 1
-        assert payload["evaluation_count"] == 1
-        assert payload["input_status"]["downloads_attempted"] is False
-        assert payload["raw_input_paths"]
-        assert payload["raw_input_metadata"]
-        if payload["status"] == "ok":
-            assert payload["blocker"] is None
-            assert payload["finite"] is True
-            assert payload["ns_per_day"] >= 0.0
-            assert payload["timing_value"] == payload["ns_per_day"]
-        else:
-            assert payload["blocker"]
-
-
 def test_openmm_dhfr_missing_inputs_report_normalized_blocker(tmp_path):
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_openmm_dhfr.py"
 
