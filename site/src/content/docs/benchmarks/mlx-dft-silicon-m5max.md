@@ -205,6 +205,14 @@ The persisted report therefore says **scientifically verified baseline,
 cutoff-converged, and 8³ spot-check passed**. Artifacts are under
 `results/mlx-dft-science/eos-admission/`.
 
+The verified claim is an all-electron equation-of-state agreement, not a
+same-code cross-engine parity. A separate MLX-versus-Quantum-ESPRESSO PWscf
+plane-wave parity run exists but remains **diagnostic, not admitted**: its
+comparison is blocked on `case_not_comparable:strain_minus`,
+`case_not_comparable:volume_scan`, and
+`diagnostic_profile_not_admitted_for_qe_parity`. That cross-engine closure is
+deferred and is not part of this verified result.
+
 ## Bounded development evidence
 
 These rows are intentionally not comparable to the complete production result.

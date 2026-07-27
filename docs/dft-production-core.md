@@ -58,13 +58,18 @@ boundary.
 
 | Feature | Local Status | Reference Family |
 | --- | --- | --- |
-| Plane-wave SCF core | proof-level | CP2K Quickstep, QE PWscf |
+| Plane-wave SCF core | verified (bulk-Si EOS) | CP2K Quickstep, QE PWscf |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
 | Geometry relaxation and finite-difference stress | proof-level | CP2K MOTION/GEO_OPT, QE relax |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
 | QM/MM force-environment orchestration | deferred | CP2K FORCE_EVAL/QMMM |
 | PH/EPW/NEB/TDDFT/MPI/offload suite breadth | deferred | QE and CP2K production suites |
 | Importing, wrapping, building, or running CP2K/QE | anti-goal | external executables |
+
+Plane-wave SCF core is `verified` only for the bulk-silicon PBE equation of state
+against an all-electron (FLEUR/WIEN2k) reference (Lejaeghere Δ factor
+1.942 meV/atom); broader chemistry stays proof-level, and the separate
+MLX-versus-QE PWscf cross-engine parity is still diagnostic, not closed.
 
 `dft_qm_scope_readiness_report()` returns a shared readiness payload for these
 features. Deferred, anti-goal, and unknown features report blockers before any
