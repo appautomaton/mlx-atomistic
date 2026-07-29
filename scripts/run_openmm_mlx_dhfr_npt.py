@@ -800,6 +800,7 @@ def _run_mlx_resume_parity(
     seed: int,
     stage_dir: Path,
     continuous,
+    constraint_max_iterations: int = 20,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     total_steps = int(workload["steps"])
     first_steps = total_steps // 2
@@ -820,6 +821,7 @@ def _run_mlx_resume_parity(
         out=first_trajectory,
         checkpoint_out=split_checkpoint,
         steps=first_steps,
+        constraint_max_iterations=constraint_max_iterations,
     )
     first_snapshot = _mlx_resume_snapshot(first)
     del first
@@ -832,6 +834,7 @@ def _run_mlx_resume_parity(
         checkpoint_out=final_checkpoint,
         resume_checkpoint=split_checkpoint,
         steps=second_steps,
+        constraint_max_iterations=constraint_max_iterations,
     )
     resumed_snapshot = _mlx_resume_snapshot(resumed)
     del resumed

@@ -15,8 +15,11 @@ from typing import Any
 
 import mlx.core as mx
 
+from mlx_atomistic.benchmarks import dhfr_npt_v2
 from mlx_atomistic.benchmarks.dhfr_npt import (
-    DEFAULT_CONTRACT_PATH,
+    DEFAULT_CONTRACT_PATH as V1_CONTRACT_PATH,
+)
+from mlx_atomistic.benchmarks.dhfr_npt import (
     DHFRNPTValidationError,
     load_validation_contract,
     payload_fingerprint,
@@ -254,7 +257,7 @@ def _run_diagnostic(
             )
         raise DHFRNPTValidationError("diagnostic seed must be 313")
     calibration_report = load_selected_calibration(calibration_path)
-    v1_contract = load_validation_contract(DEFAULT_CONTRACT_PATH)
+    v1_contract = load_validation_contract(V1_CONTRACT_PATH)
     source_identity = validate_prepared_boundary(prepared_dir, v1_contract)
     if (
         calibration_report["source_manifest_fingerprint"]
@@ -390,6 +393,188 @@ def _run_diagnostic(
     return report
 
 
+def _run_formal_mlx(
+    *,
+    prepared_dir: Path,
+    stage_dir: Path,
+    contract: dict[str, Any],
+    source_manifest_fingerprint: str,
+    seed: int,
+    split_resume: bool,
+) -> dict[str, Any]:
+    workload = contract["workload"]
+    prepared = v1_runner._npt_prepared(load_prepared_system(prepared_dir))
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    trajectory = stage_dir / "mlx_trajectory.npz"
+    checkpoint = stage_dir / "mlx_checkpoint.npz"
+    started = perf_counter()
+    result = v1_runner._run_mlx_npt(
+        prepared,
+        workload=workload,
+        seed=seed,
+        out=trajectory,
+        checkpoint_out=checkpoint,
+        steps=int(workload["steps"]),
+        constraint_max_iterations=int(workload["constraint_max_iterations"]),
+    )
+    mx.eval(
+        result.final_state.positions,
+        result.final_state.velocities,
+        result.final_state.forces,
+    )
+    summary = v1_runner._mlx_npt_summary(
+        result,
+        atom_count=prepared.atom_count,
+    )
+    summary["seed"] = seed
+    summary["elapsed_wall_seconds"] = perf_counter() - started
+    resume_evidence = None
+    resume_artifacts: dict[str, dict[str, Any]] = {}
+    if split_resume:
+        snapshot = v1_runner._mlx_resume_snapshot(result)
+        del result
+        mx.clear_cache()
+        resume_evidence, resume_artifacts = v1_runner._run_mlx_resume_parity(
+            prepared,
+            workload=workload,
+            seed=seed,
+            stage_dir=stage_dir,
+            continuous=snapshot,
+            constraint_max_iterations=int(
+                workload["constraint_max_iterations"]
+            ),
+        )
+    else:
+        del result
+        mx.clear_cache()
+    artifacts = {
+        trajectory.name: _artifact_record(trajectory),
+        checkpoint.name: _artifact_record(checkpoint),
+        **resume_artifacts,
+    }
+    return dhfr_npt_v2.build_engine_report(
+        contract=contract,
+        source_manifest_fingerprint=source_manifest_fingerprint,
+        seed=seed,
+        engine="mlx",
+        summary=summary,
+        checks=dhfr_npt_v2.build_engine_checks(
+            contract=contract,
+            seed=seed,
+            engine="mlx",
+            summary=summary,
+            checkpoint_resume=resume_evidence,
+        ),
+        artifacts=artifacts,
+        checkpoint_resume=resume_evidence,
+    )
+
+
+def _run_formal_openmm(
+    *,
+    prepared_dir: Path,
+    stage_dir: Path,
+    contract: dict[str, Any],
+    source_manifest_fingerprint: str,
+    seed: int,
+) -> dict[str, Any]:
+    api = v1_runner._preparation._common._load_openmm()
+    expected_version = str(contract["engines"]["openmm_version"])
+    if api.openmm.version.version != expected_version:
+        raise DHFRNPTValidationError(
+            "formal OpenMM version does not match the frozen contract"
+        )
+    prepared = v1_runner._npt_prepared(load_prepared_system(prepared_dir))
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    started = perf_counter()
+    result = v1_runner._run_openmm_npt(
+        prepared,
+        contract=contract,
+        platform_name="Reference",
+        seed=seed,
+    )
+    samples = stage_dir / "openmm_samples.npz"
+    v1_runner._atomic_savez(samples, result.pop("arrays"))
+    result["seed"] = seed
+    result["elapsed_wall_seconds"] = perf_counter() - started
+    return dhfr_npt_v2.build_engine_report(
+        contract=contract,
+        source_manifest_fingerprint=source_manifest_fingerprint,
+        seed=seed,
+        engine="openmm",
+        summary=result,
+        checks=dhfr_npt_v2.build_engine_checks(
+            contract=contract,
+            seed=seed,
+            engine="openmm",
+            summary=result,
+            checkpoint_resume=None,
+        ),
+        artifacts={samples.name: _artifact_record(samples)},
+        openmm_version=str(result["openmm_version"]),
+    )
+
+
+def _run_formal(
+    *,
+    prepared_dir: Path,
+    contract_path: Path,
+    out_dir: Path,
+    seed: int,
+    engine: str,
+    split_resume: bool,
+) -> dict[str, Any]:
+    contract = dhfr_npt_v2.load_contract(contract_path)
+    if seed not in dhfr_npt_v2.FORMAL_SEEDS:
+        raise DHFRNPTValidationError("formal seed must be 7 or 19")
+    restart_seed = int(contract["restart_gate"]["seed"])
+    if engine == "mlx" and split_resume != (seed == restart_seed):
+        raise DHFRNPTValidationError(
+            "formal MLX split/resume policy does not match the contract"
+        )
+    if engine == "openmm" and split_resume:
+        raise DHFRNPTValidationError(
+            "formal OpenMM phase cannot use --split-resume"
+        )
+    dhfr_npt_v2.freeze_check(
+        contract_path=contract_path,
+        prepared_dir=prepared_dir,
+        formal_root=out_dir,
+    )
+    source = validate_prepared_boundary(prepared_dir, contract)
+    report_path = dhfr_npt_v2.engine_report_path(
+        out_dir,
+        seed=seed,
+        engine=engine,
+    )
+    if report_path.exists():
+        return dhfr_npt_v2.load_engine_report(
+            report_path,
+            contract=contract,
+            seed=seed,
+            engine=engine,
+        )
+    if engine == "mlx":
+        report = _run_formal_mlx(
+            prepared_dir=prepared_dir,
+            stage_dir=report_path.parent,
+            contract=contract,
+            source_manifest_fingerprint=source["manifest_fingerprint"],
+            seed=seed,
+            split_resume=split_resume,
+        )
+    else:
+        report = _run_formal_openmm(
+            prepared_dir=prepared_dir,
+            stage_dir=report_path.parent,
+            contract=contract,
+            source_manifest_fingerprint=source["manifest_fingerprint"],
+            seed=seed,
+        )
+    dhfr_npt_v2.write_engine_report(report_path, report)
+    return report
+
+
 def _validate_artifact(
     directory: Path,
     *,
@@ -456,10 +641,13 @@ def _is_sha256(value: Any) -> bool:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify-diagnostic", type=Path)
-    parser.add_argument("--stage", choices=("diagnostic",))
+    parser.add_argument("--stage", choices=("diagnostic", "formal"))
+    parser.add_argument("--engine", choices=("mlx", "openmm"))
     parser.add_argument("--seed", type=int)
     parser.add_argument("--prepared", type=Path)
     parser.add_argument("--calibration", type=Path)
+    parser.add_argument("--contract", type=Path)
+    parser.add_argument("--split-resume", action="store_true")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     if args.verify_diagnostic is not None:
@@ -470,9 +658,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 args.seed,
                 args.prepared,
                 args.calibration,
+                args.contract,
                 args.out,
             )
-        ):
+        ) or args.split_resume:
             parser.error("--verify-diagnostic cannot be combined with run arguments")
         return args
     missing = [
@@ -481,13 +670,24 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             ("--stage", args.stage),
             ("--seed", args.seed),
             ("--prepared", args.prepared),
-            ("--calibration", args.calibration),
             ("--out", args.out),
         )
         if value is None
     ]
     if missing:
-        parser.error("missing diagnostic arguments: " + ", ".join(missing))
+        parser.error("missing run arguments: " + ", ".join(missing))
+    if args.stage == "diagnostic":
+        if args.calibration is None:
+            parser.error("--calibration is required for diagnostics")
+        if args.engine is not None or args.contract is not None or args.split_resume:
+            parser.error(
+                "diagnostics cannot use --engine, --contract, or --split-resume"
+            )
+    else:
+        if args.engine is None or args.contract is None:
+            parser.error("--engine and --contract are required for formal runs")
+        if args.calibration is not None:
+            parser.error("--calibration is only valid for diagnostics")
     return args
 
 
@@ -499,21 +699,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = verify_diagnostic_directory(args.verify_diagnostic)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
-    report = _run_diagnostic(
-        prepared_dir=args.prepared,
-        calibration_path=args.calibration,
-        out_dir=args.out,
-        seed=args.seed,
-    )
+    if args.stage == "diagnostic":
+        report = _run_diagnostic(
+            prepared_dir=args.prepared,
+            calibration_path=args.calibration,
+            out_dir=args.out,
+            seed=args.seed,
+        )
+    else:
+        report = _run_formal(
+            prepared_dir=args.prepared,
+            contract_path=args.contract,
+            out_dir=args.out,
+            seed=args.seed,
+            engine=args.engine,
+            split_resume=args.split_resume,
+        )
     print(
         json.dumps(
             {
                 "status": report["status"],
                 "blockers": report["blockers"],
-                "selected_formal_attempts": report[
-                    "selected_formal_attempts"
-                ],
-                "mlx_elapsed_seconds": report["mlx_elapsed_seconds"],
                 "report_fingerprint": report["report_fingerprint"],
             },
             indent=2,

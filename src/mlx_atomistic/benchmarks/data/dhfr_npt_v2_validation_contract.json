@@ -1,0 +1,663 @@
+{
+  "claim": {
+    "limitations": [
+      "short stochastic validation, not thermodynamic convergence",
+      "failed v1 evidence remains historical and unchanged"
+    ],
+    "scope": "bounded repeated orthorhombic anisotropic NPT for OpenMM 5dfr DHFR",
+    "status": "frozen-pre-formal"
+  },
+  "dependency_lock": {
+    "openmm_requirement": "openmm>=8.5.1",
+    "path": "uv.lock",
+    "sha256": "53e0a460c8a286692d03b29dfb492815fbbbf7e916ad95bbbbfbb63dc1fd1e60"
+  },
+  "engines": {
+    "openmm_version": "8.5.1.dev-f7fa0c2",
+    "reference": "OpenMM Reference",
+    "runtime": "MLX/Metal"
+  },
+  "implementation_freeze": {
+    "fingerprint": "600f2514fa8780a5dd4a360fc352d39139fbba4d67ab22d464be8876abf08b6f",
+    "inventory": [
+      {
+        "path": "src/mlx_atomistic/__init__.py",
+        "sha256": "98721d7db67ddc2796cf3e3b6c2f935787eeea16c1a3d174d23ef325faef8cc6"
+      },
+      {
+        "path": "src/mlx_atomistic/_artifact_identity.py",
+        "sha256": "020a876cd7e5316af58ec90bf2815347f40ebc3462ec682b81554bf36aa5ced2"
+      },
+      {
+        "path": "src/mlx_atomistic/artifacts.py",
+        "sha256": "74ee68141ae89327f3e3b190a52b1f70cf30703015686460efe57cb818bcb47c"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/__init__.py",
+        "sha256": "8af722a8f94649f21cac4a5e5b9971c03ca0c6b0c7eaff1c63aa2c4e00f68d13"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/cadence_sensitivity.py",
+        "sha256": "ce59c74ccd93ba0fdbc822fc4a0525eae4e831025641439549b1a00924b2f6a4"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/charged_pme.py",
+        "sha256": "6fe04c3a195077d1a39fe5c9c418f9f3dc8eeafb4f38592f6633066463d87e33"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_artifacts.py",
+        "sha256": "729e53254467d96518d4e38687872ef9fd1025ae793a0a8b9b6b2d315f631933"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_carbon.py",
+        "sha256": "d3ba5e9f1012f3af0ed459112ee07bdfd3aa1ee34c1d9881dad1f6ae247a18ea"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_carbon_eos.py",
+        "sha256": "bb513d50186225b2d9945fc4ea42ae10d46b14e7312a1eb43f0731fda195bb1a"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_carbon_eos_runner.py",
+        "sha256": "307cec51888f0719164eb68fad1564470c7935b0a0baa2472dcc250c08b198cd"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_eos.py",
+        "sha256": "1a090073691583f883e9ca3a44c9b457210b66819e2d5c04e270e98a89257c3d"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_geometry.py",
+        "sha256": "4730f245cf4d8a5a5ba55421675f3bcc00180cb8e566f04cb139070a9fb948a2"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_mgo.py",
+        "sha256": "94b8c3c99cccdc297fc0c6fb93251b8df0655c2e01ab2868f0330fc53e46f609"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_mgo_eos.py",
+        "sha256": "836d2bcd62283b9f09f6cae37fdbf982f3d46b1a403016737622a36ddaae5a28"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_mgo_eos_runner.py",
+        "sha256": "32dd88c4848e72cbea43ddfaf898f555df875b124c40b591f08b7c2299272fc4"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_mgo_forces.py",
+        "sha256": "59e6b7ab3c012d72764b168a25ce41e4b50027d1511736bb7eeb0a203fa96d9e"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_nonlocal.py",
+        "sha256": "896e4839a9659ace37fd5d04fb2ce85f97f3095d9e1874b71d6435644e9e67f1"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_operator.py",
+        "sha256": "45c1307a65b73b957d1f3a1e31f944f1a0030b299da80eed0c0ff28b52b7268a"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_pseudopotential.py",
+        "sha256": "495ec11d541275535a16cc4557ebb45353ffafdc1fb6796cfc6659fff0387520"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_relaxation.py",
+        "sha256": "6ffb6b23bc4a9102bdd4287028297651774d8fbfd2cc7dea8a0a8427add1bab4"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_runtime.py",
+        "sha256": "c33433baede018e750c79e05db98bc381e50019f7a231a95df3dae30bb5f29a2"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_runtime_contract.py",
+        "sha256": "aaac9425927635d2e02fae20073f35d0c37b5ca60541c48b2211e5d87ffc0387"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_runtime_core.py",
+        "sha256": "4c8f38d92830fc342ae5dec59a1f4fae66bfa77af5ef7b0b36e4692122956250"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_scf.py",
+        "sha256": "a6328628232a0a5ff104d176aa10152b01acd42cf0c73db58d9280de01f01b24"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_scf_smell.py",
+        "sha256": "8608cedf3932a197a46d9055f9d2bae7cbf07977dc42655e113e1a085de29cf0"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_silicon.py",
+        "sha256": "05912cbedc182f5f8b1100ddc971f2cabfda61945c31c6a0cbba05e4361dc5a4"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_silicon_bands.py",
+        "sha256": "63bc763f691c3a2346b76d40360519a12585c49480c04dacbc32748f40b8be42"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_silicon_eos.py",
+        "sha256": "6022e2fbbfd633aecbd4bbf094b3760bd5da5c4cfeeac360d1604efede945e87"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_silicon_eos_runner.py",
+        "sha256": "b4e5ce01da94204b5eee27234f4d227d657f944ee62f46a46fe9c70197eeffd0"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_silicon_parity.py",
+        "sha256": "7237f1392c9e6a7949e5db2f07f03b8a82ef978edf6b31d103fb1fe91b1e2bf3"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_solver.py",
+        "sha256": "cc1ed9299e915359cd259d16ee17bec94829dc564706c538602dc359d7a97558"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dft_spin_kpoints.py",
+        "sha256": "6765b01ca4172b2dea2ad2037c3bc99be8e7968879370dd816a1e964b29f029d"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dhfr.py",
+        "sha256": "dc6ce69831877a0571f92b3c32877bbc63dd5a512ebd23067310116ae23c7f0a"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dhfr_npt.py",
+        "sha256": "b5dd2348d50339147c0a4a43409de7e3cc545ac4d6bdeec7722d62e90addcf55"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/dhfr_npt_v2.py",
+        "sha256": "d2a473c40d4c2ce292ac44d3032c7eb191b2b29fd2a42992f507a029c6db4e17"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/ewald_reference.py",
+        "sha256": "d28a8d91b2e41ff0991f2d4c3026dfa9d6f2d444a19066cdedfc2daeeb41ea6b"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/gpcrmd_runtime.py",
+        "sha256": "8bebb291c4463581baead3ccb25bf88ab0b09f8b982fbe37131a85089859bdf4"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/lj_md.py",
+        "sha256": "ef8bb0d8253935a4e72032e52e3e3266a1d21f2608d95243a91acb4f216b5ddd"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/md_acceleration.py",
+        "sha256": "e82e9931cf884a31badc5bc9fa3f4f00471b959f2bcdd8f51e2dd6a94203e054"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/md_performance.py",
+        "sha256": "d2d6b29996ded7813da6732a7c897f0658162033add291fd10df916f52f27626"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/mm_force_terms.py",
+        "sha256": "fdac78bb6cbf1669669651647da67ab08929cc791e6310e9474ca9768ac57781"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/neighbor_nonbonded_parity.py",
+        "sha256": "b827da1d77fca21cb494c1da0a4934abd8bd7687e9a0178836e619a89a3051b2"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/phase3_physics.py",
+        "sha256": "962c18dbcede67f264d0ddcf01badbc301fd83aa1ac27b17d5d5f96e788f6660"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/pme_performance.py",
+        "sha256": "d1f3c54deaf932333fe053f44cd736cb73b3be0b341fddb299f153fd857afe22"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/pme_validation.py",
+        "sha256": "3f8efd60ca06c95c5c02919bd39fa93bff4f8c6bdff7d51a7e5adee5b24ba6df"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/same_workload_compare.py",
+        "sha256": "b53d0bcae1cad704fa6a4d40bf8c1f09e2f6c5b5df66890a675a8803d6b0fdb0"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/schema.py",
+        "sha256": "b0efc638df7af6b47bf6a5f28fc84cc3730f09785efbc0b1b5632a168d279dbb"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/stability.py",
+        "sha256": "0a631eab7842e796aa452f2dd643add68bd88f12068ea7784caf8064bbef3234"
+      },
+      {
+        "path": "src/mlx_atomistic/benchmarks/validation_gauntlet.py",
+        "sha256": "2a880963698625e5d4d7f8ccaf1c86d1f9d8a365ecb42b994966b22429b92086"
+      },
+      {
+        "path": "src/mlx_atomistic/cell_list.py",
+        "sha256": "a56e4127a50ff2d44869162f57dd594ab9e9f11edabaec5426ad31ed7504d920"
+      },
+      {
+        "path": "src/mlx_atomistic/charmm_terms.py",
+        "sha256": "b019e0eddcfd78c61a379c55a811af26efef1c6ea11735b7c65f0441ca360d55"
+      },
+      {
+        "path": "src/mlx_atomistic/compatibility.py",
+        "sha256": "83c5bd69401e57e388ac92d2bde34c96c6d9986a228f8d5fc93d7e2ff67707dc"
+      },
+      {
+        "path": "src/mlx_atomistic/constraints.py",
+        "sha256": "12c2deb7dcc175b6b6efc1f933fa563b93670a13bff21f9c26c70007d85486b9"
+      },
+      {
+        "path": "src/mlx_atomistic/core.py",
+        "sha256": "be7ab484942196df6440dc02e53cc9767f3ba3bb3e68d1ed897f7ca0bc1439cc"
+      },
+      {
+        "path": "src/mlx_atomistic/custom_force.py",
+        "sha256": "fc594781c37bb07dcb6693362d7f77cfcda9dbe395e16fdbb91bfb573f047d44"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/__init__.py",
+        "sha256": "7cc73fe463504c0cd81ef4adc9b0f31f1def95afe322792ebef05a341f506586"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/_compact.py",
+        "sha256": "a339e6e3e3572c45f3843a1a524850abeb9bdcf37579665921dd95eeacea3b9e"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/_memory.py",
+        "sha256": "cd4d39b34e2199528737776b5094b05e44a1bd2f5774dd5172c8390187990a5a"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/_runtime_observer.py",
+        "sha256": "61dbca1b732e0fe2807afd0ee47e30771d3dac08a78cfdc608670b04fba4ee3a"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/artifacts.py",
+        "sha256": "d6a0bff3276b2061475438bc97b5eb0d1f38bbde52e95c67781e1f78d66ee61a"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/band_unfolding.py",
+        "sha256": "3f2a34e81429e35a20d91f415a3fcdee658ac884aad6eea6d9ca25ee1e531e44"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/density.py",
+        "sha256": "f7b607189bb6328e6680867b21c74e0aeb3b7575bab304d406ecba13de5a8dc2"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/fft.py",
+        "sha256": "c6faf178655819d47c62d4f40073562673587867531f102ab7b62031a613963a"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/forces.py",
+        "sha256": "d7a735c940a9d974a0e59b369015e861714bf329117d5e5cde4bb3aa2ceba2ba"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/gga.py",
+        "sha256": "69a022c5f20079be972f1d19f6c61ba0f14737092979b9fbbcc16109252096aa"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/grids.py",
+        "sha256": "d75a7c35467eeaf09a4a32446c0366ce0f96ae0e0264e39c911d649104e297f9"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/kpoints.py",
+        "sha256": "2d6649a410e657d020973f76a39a36c37e56d1fd7085b7b524f43e704b853c95"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/mixing.py",
+        "sha256": "890b043c8d8b349f1659146f87fc6ecc5235f7f4ea41f2ad94987b849a426611"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/nonlocal_pseudopotential.py",
+        "sha256": "555360b86594c60f8827739bd959eb5d9272613fc2bc0851ffed94bc15c1637d"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/occupations.py",
+        "sha256": "99a2b9771556fe4aff036db6d7db9e61649660e91f82ef6d36462dbe5f37d17f"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/operators.py",
+        "sha256": "568581250073c1b048a09a1787022f7cb9747c4fd141fdeccf4074e9fe5997e2"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/optimization.py",
+        "sha256": "735ee81dc3b68ae2cb39580c5335e131697c7aa2b8b3dba16e18ad9fd136f880"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/optimize.py",
+        "sha256": "03ef14e55ba530bfd3d6b0be550cc6d5191ff1f36a56aaa333b9cbe52fbd4a5f"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/periodic_forces.py",
+        "sha256": "edf1e2745480a13d899b0b8a190e6bfce861c59f6b6a0a185daeecd951acc424"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/periodic_gth.py",
+        "sha256": "da6a69c9963462750cdb4e413532a657f8c71b0231f1b5da2054e6d56fd77265"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/periodic_scf.py",
+        "sha256": "f911ef44f6a24fb5eb689e7cf2151e19a3f134499e796d16f51c8ffabcc7dcc5"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/plane_wave.py",
+        "sha256": "46919a9fbcb788b986f898ecd4711dbc679f8bca9a70eef3478809577872cd15"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/potentials.py",
+        "sha256": "64015ca65970b084daa7658ddb8d00cbdfb74ec2ee53bb64dba46f294dc99220"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/pseudopotentials.py",
+        "sha256": "fded5f887d1d382f8dcbd37f6bf01e9bfce4a28fbbe8e77192c69ffc3f593677"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/references.py",
+        "sha256": "5fb26cd8e0c107447d979c3a2e702233f6e50565350fdbba5c572bb28e640b88"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/restart.py",
+        "sha256": "0a9be46b4381b879489be5f27d552ef41504429a6c506cb928077a80a4400e14"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/runtime_state.py",
+        "sha256": "e60501263051c1fe7c7cd4aa8f936dbeced5731bda5cdd24cff8cf7c0fea40bd"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/scf.py",
+        "sha256": "6400a58d135231f2b900da4f2d8fdf1b4fe8352ae0f45bc3b3cc323d71e0bbde"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/stress.py",
+        "sha256": "3f610f9beba1fb57c53930eae1494b3f5d8575d1714a4d33102da9a5ca5915ce"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/system.py",
+        "sha256": "2f57ae025a890e2f20eb3921152486317f12eab696e0d0966017007461a983e6"
+      },
+      {
+        "path": "src/mlx_atomistic/dft/xc.py",
+        "sha256": "1d5c8698dd0eb1cfc0310ad4515198573f507e7284174ac0374df39affa5b166"
+      },
+      {
+        "path": "src/mlx_atomistic/diagnostics.py",
+        "sha256": "54a1c030061a6036317adbb15ea7f97e13833884d9b8147b84a2467507955cd7"
+      },
+      {
+        "path": "src/mlx_atomistic/examples.py",
+        "sha256": "79661e9bd2c973f49fa714cb1027577c8d9c521a12c7a60ad28509289d5a0fae"
+      },
+      {
+        "path": "src/mlx_atomistic/forcefields.py",
+        "sha256": "1d9882fd1b99b1873af125d427da457a81aeb56fdf27ce81911693a5b63b3a29"
+      },
+      {
+        "path": "src/mlx_atomistic/gbsa.py",
+        "sha256": "185d15fcc4861bf80c773fc4ae5c2ea5009af56860bdcc1bc8023c6c867f299a"
+      },
+      {
+        "path": "src/mlx_atomistic/initialize.py",
+        "sha256": "ee254ea9e65c13101b96b90bbaf020c6b180f9d4fd498bbb3a8e3500f70e41bc"
+      },
+      {
+        "path": "src/mlx_atomistic/io.py",
+        "sha256": "fb6557caa1b495b9e3c35c52faec1bc54145ac212c4662aebbef66010288c0ba"
+      },
+      {
+        "path": "src/mlx_atomistic/md.py",
+        "sha256": "f1927a4f6e9f607665ec44d8441e442874347eb66cd9661102bb11ef7eb09d4d"
+      },
+      {
+        "path": "src/mlx_atomistic/metal_kernels.py",
+        "sha256": "52c37541d7cfeca473f51b924d21f903553642ecbb364881e16e0818184604cb"
+      },
+      {
+        "path": "src/mlx_atomistic/minimize.py",
+        "sha256": "429459dcd16c03b23277daf8bd006c79279c4c84dc8ba2b055a478a54c7faa72"
+      },
+      {
+        "path": "src/mlx_atomistic/mm.py",
+        "sha256": "072c74fbe402dc88f4bc3ecf16875c00391884e19f964b81cc03133978faac31"
+      },
+      {
+        "path": "src/mlx_atomistic/neighbors.py",
+        "sha256": "28937efb2c36775491474bc0173f46b9c91f5b559b361439392e8b42388a6170"
+      },
+      {
+        "path": "src/mlx_atomistic/nonbonded.py",
+        "sha256": "7207d355513aaada3d0272b434ebd422bd99d6e6a8481ba01a4d9e122ec22779"
+      },
+      {
+        "path": "src/mlx_atomistic/pme.py",
+        "sha256": "5b7f8aba68dca3d88400762797b9369d8d93d6937ace2166310d2da0791858fb"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/__init__.py",
+        "sha256": "75ca08bb2fbeab8b01c42ac1fe9703e11a0d3a6bbfad1bd2d763a0ec6e9951ec"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/gpcrmd.py",
+        "sha256": "c2ba17915a16a75cad42587759a4a364cd6f9b606dd7a5d12b884b0742c79be3"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/gpcrmd_benchmark.py",
+        "sha256": "0c89f719c4f27443991cb0c4c06243e6c5828424753a9d69d5fa615f712bcef3"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/gromacs.py",
+        "sha256": "868425f747e9eabce993d3f3d604e823c1fb0a18ebf4c69616ecd57d84928f28"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/hmr.py",
+        "sha256": "026ef83fc01fad3e9232fcd6953460dc2805fcc4160972013a7dbdc47b10487e"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/io.py",
+        "sha256": "66c9767af364aea71ada6a222f651ac59de087a168963c3dadd9f46026071f28"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/notebook.py",
+        "sha256": "cb099d3a8353a0a23abf80b8365f1b5ca6e04b1c985a1899617a8f6a95e723c7"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/prepare.py",
+        "sha256": "f792a6c96ae948c4b67653bdf7f959592154166daa42e36aa7d1c3998e6c5ac4"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/production_pocket.py",
+        "sha256": "a60542dfe72c855e19191c91fbad6bae32f41815d24eb12a63989abf9867999e"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/replicas.py",
+        "sha256": "c1913344f6489ed38e658076b4d14c07d2650f2820074b704f6d702a169f5c15"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/runner.py",
+        "sha256": "13faf448b6f93dc35a01df18233389f96bc487733ddb90c0df41bdf65860c2a9"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/schema.py",
+        "sha256": "de6c180170aad3b3a017dd925843c37f3bc185fade26fd383e2e24499eea8e94"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/solvated_example.py",
+        "sha256": "bdf2d8c0c0e1d373f6d5eadb87940e29a5c7d75b1b6b98d658f3848e9c6c23be"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/supercell.py",
+        "sha256": "a19c1f0e1d49e84284c100e977ee173217d650f18fe465a960ca6e3bb67b8f8d"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/t4l_benzene.py",
+        "sha256": "ee88f9a46ea000d48afe6b92387db2cee1110a7eeda844fb4a2830c4f1a67ac3"
+      },
+      {
+        "path": "src/mlx_atomistic/prep/topology_import.py",
+        "sha256": "64d7f79860ed92fc0894affea025d6ca1b16aff78777d5dc59bfabafb8d8a5a7"
+      },
+      {
+        "path": "src/mlx_atomistic/protocols.py",
+        "sha256": "00e68bf5f257ae0374908dceab0591d95b1c8980b212176ff03dd2de7c281162"
+      },
+      {
+        "path": "src/mlx_atomistic/replica_exchange.py",
+        "sha256": "5c5d80b5399d8289969eca3f25f76469b7ab661722b101639061bf6fab9c53ba"
+      },
+      {
+        "path": "src/mlx_atomistic/runtime.py",
+        "sha256": "c3b88149133e1c3fc3646a00d99a360c9fe3a3d861c7f11382447c20d8c1f5f1"
+      },
+      {
+        "path": "src/mlx_atomistic/steering.py",
+        "sha256": "ae9bdb133fbd733c2c14bd51f8626d97dcb7370edc03a078da2d1b5365749017"
+      },
+      {
+        "path": "src/mlx_atomistic/topology.py",
+        "sha256": "91f694fb9e628d73fc1747ee6785243c412d1e9fdd8eb1b07cfdace156cdbbcd"
+      },
+      {
+        "path": "src/mlx_atomistic/trajectory_adapters.py",
+        "sha256": "8023357817c4f269ed9ffd9195214d0042ea1ec5e16187e043db6ecde255eac1"
+      },
+      {
+        "path": "src/mlx_atomistic/units.py",
+        "sha256": "62a70a67302497986fa2b3ef44e5ea45f1ce1c143ef58cc18602a8b77ad1772c"
+      },
+      {
+        "path": "src/mlx_atomistic/validation.py",
+        "sha256": "4e8c6f3e2a3aedf8c2703303122d7375ac36ae1a27b23d20fdb98dfe2a087e58"
+      },
+      {
+        "path": "src/mlx_atomistic/virtual_sites.py",
+        "sha256": "766246fa597c4291c4879831fd8cc6c4063db0ae799a232c619488cde1f5e3b7"
+      },
+      {
+        "path": "src/mlx_atomistic/visualization.py",
+        "sha256": "f923b0d40dff94fdd26e542f62210b6294a4a6a10ebd8417d4893acb0e35acc2"
+      },
+      {
+        "path": "scripts/calibrate_openmm_dhfr_npt.py",
+        "sha256": "7ab9fbf6c0cce35c5525e439ad2d3e7b3c006b39eac7e5ebac51bd2c3d0a700a"
+      },
+      {
+        "path": "scripts/run_bounded_process.py",
+        "sha256": "3e3270339c613c275bacbe1c85ca2845bc348918de5a1b8c32a206ff8c5aced6"
+      },
+      {
+        "path": "scripts/run_openmm_mlx_dhfr_npt.py",
+        "sha256": "d4db87cc95d4067710ca4d58dd8af022d3bc4d633dc327e5ff111ca40d7c5c41"
+      },
+      {
+        "path": "scripts/run_openmm_mlx_dhfr_npt_v2.py",
+        "sha256": "e75c3b24853a36e0fda984e44a83535cb4b9e480b5242a051beeec35ede990be"
+      },
+      {
+        "path": "scripts/run_bounded_dhfr_npt_v2.py",
+        "sha256": "13aa3f98a159bc430b2f616a1bebf515fff1cb27b07c170dbdaf59a032a749f6"
+      }
+    ]
+  },
+  "npt_gates": {
+    "maximum_abs_pressure_bar": 100000.0,
+    "maximum_constraint_error_angstrom": 0.0001,
+    "maximum_energy_excursion_per_atom_kj_mol": 50.0,
+    "maximum_engine_mean_pressure_delta_bar": 10000.0,
+    "maximum_engine_mean_volume_ratio_delta": 0.1,
+    "maximum_temperature_K": 1200.0,
+    "maximum_volume_ratio": 1.25,
+    "minimum_pooled_accepted_moves_per_engine": 1,
+    "minimum_volume_ratio": 0.8,
+    "orthorhombic_off_diagonal_tolerance_angstrom": 1e-06,
+    "required_attempts_per_seed": 30
+  },
+  "provenance": {
+    "calibration_protocol_fingerprint": "ceae3baf6201ecba736b36aa2204789807cee531aa22cf4e97e3f6871dedc303",
+    "calibration_report_fingerprint": "82c4fc52fdab62713d6943124dab0d54c08040fe7cd282fcfc7ae54bf6f5b5d8",
+    "diagnostic_implementation_fingerprint": "5f11f7a7ba81fccd32ed8670a3cb31470b36b008895cd88034732df7dc4a301c",
+    "diagnostic_report_fingerprint": "01bedd18333fa21031503b61fca423fac8b58837edf7ff6698c2671ae7e52e14",
+    "source_manifest_fingerprint": "40a429ec99304f001391704a053e9b4e9f73b3da927f942952607dbd39bb3bff"
+  },
+  "resource_limits": {
+    "mlx_plateau_required": true,
+    "process_tree_max_bytes": 40000000000,
+    "seed_timeout_hard_caps_seconds": {
+      "19": 28800,
+      "7": 43200
+    },
+    "seed_timeout_seconds": {
+      "19": 2700,
+      "7": 3900
+    }
+  },
+  "restart_gate": {
+    "maximum_abs_error": 1e-06,
+    "required": true,
+    "seed": 7
+  },
+  "schema": "mlx-atomistic.dhfr-npt-validation-contract.v2",
+  "target": {
+    "atom_count": 23558,
+    "atom_order_sha256": "a150ae680c9fc7289aae3f86115c26c67b2d351d8da0fb906df7daaed0c40c10",
+    "case_id": "dhfr-5dfr-pme",
+    "constraints_sha256": "37c9c42120f979f5ee55fd683e4b48365806a5b68ad1945d50215731648fd2f6",
+    "force_classes_sha256": "ef70c671aad4f5df1784d5c1ecfea4834e07001fa57b3c2270f1785224057d8c",
+    "forcefield_resources": {
+      "amber99sb.xml": "186f8570413f2ad3efe923578fc53cc895006d50de4b612e9fc58977a914c092",
+      "tip3p.xml": "607f0fc9566c3770db2d9eb579fed68c4157578445eed1ec0aa7dccc23d57a6c"
+    },
+    "molecule_count": 7024,
+    "molecule_identity_sha256": "4d69c0dd46da74ae6199833dfc7079345e0dbfb733f0ace1a42ffa7facdac820",
+    "parameters_sha256": "df02591a48343e6fb9e09be7a6fbf98d8a13f859198b0cef2f0144b6498ac16a",
+    "pdb_path": "vendors/openmm/examples/benchmarks/5dfr_solv-cube_equil.pdb",
+    "pdb_sha256": "fc9759761d9b33c58b09a3d0bf1dbdb76f23dbe0e89a8bd92f43ebcf0f2f2fdf",
+    "source_kind": "openmm_5dfr_solvated_pdb",
+    "vendor_benchmark_path": "vendors/openmm/examples/benchmarks/benchmark.py",
+    "vendor_benchmark_sha256": "cb2dec8f1c61ab0716367ec49561c9e0ad854db4ace5e9d512e7d162959cf25e"
+  },
+  "timeout_derivation": {
+    "formula_version": "dhfr-npt-v2-timeout-v1",
+    "hard_caps_seconds": {
+      "19": 28800,
+      "7": 43200
+    },
+    "mlx_diagnostic_seconds": 962.654772791022,
+    "reference_max_seconds_per_attempt": 5.500452113525535,
+    "rounded_seconds": {
+      "19": 2700,
+      "7": 3900
+    },
+    "rounding_seconds": 300,
+    "selected_attempts": 30,
+    "unrounded_seconds": {
+      "19": 2422.352253865664,
+      "7": 3721.936197133544
+    }
+  },
+  "workload": {
+    "barostat": {
+      "axes": [
+        true,
+        true,
+        true
+      ],
+      "expected_attempts": 30,
+      "family": "monte_carlo",
+      "interval": 25,
+      "max_log_volume_scale": 0.009950330853168083,
+      "mode": "anisotropic"
+    },
+    "center_of_mass_motion_interval": 1,
+    "constraint_max_iterations": 40,
+    "constraints": "HBonds",
+    "diagnostic_interval": 25,
+    "dt_ps": 0.001,
+    "friction_per_ps": 1.0,
+    "hydrogen_mass_amu": 1.5,
+    "pme": {
+      "alpha_per_angstrom": 0.29202898720871845,
+      "assignment_order": 5,
+      "dispersion_correction": true,
+      "ewald_error_tolerance": 0.0005,
+      "mesh_shape": [
+        56,
+        56,
+        56
+      ],
+      "real_cutoff_angstrom": 9.0
+    },
+    "pressure_atm": 0.9869232667160128,
+    "pressure_bar": 1.0,
+    "sample_interval": 25,
+    "seeds": [
+      7,
+      19
+    ],
+    "steps": 750,
+    "temperature_K": 300.0
+  }
+}
