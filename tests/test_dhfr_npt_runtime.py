@@ -89,9 +89,56 @@ def _memory_trace():
     }
 
 
-def _sample(tmp_path, *, engine="openmm", wall=12.0, run_id="run-1"):
-    worker = _worker(tmp_path, engine=engine)
+def _instrumented_profile():
+    return {
+        "profile_steps": runtime.PROFILE_STEPS,
+        "projection_steps": runtime.BASELINE_STEPS,
+        "root_wall_seconds": 8.0,
+        "routes": {
+            "barostat.attempt": {
+                "calls": 3,
+                "root_calls": 3,
+                "first_inclusive_wall_seconds": 4.0,
+                "first_exclusive_wall_seconds": 3.0,
+                "recurring_inclusive_mean_wall_seconds": 2.0,
+                "recurring_exclusive_mean_wall_seconds": 1.0,
+                "total_inclusive_wall_seconds": 8.0,
+                "total_exclusive_wall_seconds": 5.0,
+                "projected_750_calls": 30,
+                "projected_750_exclusive_wall_seconds": 32.0,
+            },
+            "constraints.position_projection": {
+                "calls": 75,
+                "root_calls": 75,
+                "first_inclusive_wall_seconds": 0.05,
+                "first_exclusive_wall_seconds": 0.05,
+                "recurring_inclusive_mean_wall_seconds": 0.04,
+                "recurring_exclusive_mean_wall_seconds": 0.04,
+                "total_inclusive_wall_seconds": 3.01,
+                "total_exclusive_wall_seconds": 3.01,
+                "projected_750_calls": 750,
+                "projected_750_exclusive_wall_seconds": 30.01,
+            },
+        },
+    }
+
+
+def _sample(
+    tmp_path,
+    *,
+    engine="openmm",
+    wall=12.0,
+    run_id="run-1",
+    steps=runtime.BASELINE_STEPS,
+    mode=None,
+    profile=None,
+):
+    worker = _worker(tmp_path, engine=engine, steps=steps)
     worker["process"]["run_id"] = run_id
+    if mode is not None:
+        worker["mode"] = mode
+    if profile is not None:
+        worker["profile"] = profile
     memory = tmp_path / "memory.json"
     memory.write_text(json.dumps(_memory_trace()))
     return runtime.finalize_sample_report(
@@ -281,6 +328,29 @@ def test_bounded_command_starts_fresh_worker_under_supervisor(tmp_path):
     assert worker[worker.index("--precision") + 1] == "single"
 
 
+def test_bounded_command_marks_only_instrumented_worker(tmp_path):
+    command = runner.build_bounded_worker_command(
+        engine="mlx",
+        prepared=tmp_path / "prepared",
+        sample_dir=tmp_path / "sample-001",
+        steps=runtime.PROFILE_STEPS,
+        seed=runtime.RUNTIME_SEED,
+        platform_name="Metal",
+        precision="float32",
+        contract=Path("contract.json"),
+        max_bytes=runtime.PROCESS_TREE_MAX_BYTES,
+        timeout_seconds=runtime.SAMPLE_TIMEOUT_SECONDS,
+        instrumented=True,
+    )
+
+    worker = command[command.index("--") + 1 :]
+    assert "--instrumented" in worker
+
+
+def test_mlx_version_comes_from_installed_distribution():
+    assert runner._package_version("mlx")
+
+
 def test_batch_rerun_skips_completed_valid_sample(tmp_path, monkeypatch):
     expected_workload = _workload()
     sample = _sample(tmp_path / "sample", run_id="finished")
@@ -333,3 +403,122 @@ def test_status_is_read_only_and_reports_not_started(tmp_path):
         "active_sample": None,
     }
     assert not list(tmp_path.iterdir())
+
+
+def test_route_projection_keeps_one_cold_cost_and_scales_recurrence():
+    events = [
+        {
+            "inclusive_wall_seconds": 4.0,
+            "exclusive_wall_seconds": 3.0,
+            "root": True,
+        },
+        {
+            "inclusive_wall_seconds": 2.0,
+            "exclusive_wall_seconds": 1.0,
+            "root": True,
+        },
+        {
+            "inclusive_wall_seconds": 2.0,
+            "exclusive_wall_seconds": 1.0,
+            "root": True,
+        },
+    ]
+
+    summary = runner._summarize_route_events(
+        events,
+        steps=runtime.PROFILE_STEPS,
+    )
+
+    assert summary["projected_750_calls"] == 30
+    assert summary["projected_750_exclusive_wall_seconds"] == 32.0
+    assert summary["first_exclusive_wall_seconds"] == 3.0
+    assert summary["recurring_exclusive_mean_wall_seconds"] == 1.0
+
+
+def test_profile_and_hotspot_reports_preserve_diagnostic_boundary(tmp_path):
+    clean = _sample(
+        tmp_path / "clean",
+        engine="mlx",
+        wall=10.0,
+        steps=runtime.PROFILE_STEPS,
+        mode="clean",
+    )
+    instrumented = _sample(
+        tmp_path / "instrumented",
+        engine="mlx",
+        wall=12.0,
+        steps=runtime.PROFILE_STEPS,
+        mode="instrumented",
+        profile=_instrumented_profile(),
+    )
+
+    profile = runtime.build_profile_report(clean, instrumented)
+    hotspots = runtime.build_hotspot_report(
+        profile,
+        route_audit={
+            "barostat.attempt": {
+                "path": "src/mlx_atomistic/md.py",
+                "line": 3955,
+                "symbol": "_attempt_barostat_move",
+                "hypothesis": "Reuse proposal state.",
+            },
+            "constraints.position_projection": {
+                "path": "src/mlx_atomistic/constraints.py",
+                "line": 74,
+                "symbol": "DistanceConstraints.apply_positions",
+                "hypothesis": "Compile projection.",
+            },
+        },
+    )
+
+    assert profile["role"] == "diagnostic-prefix-only"
+    assert profile["profiling_overhead_wall_seconds"] == 2.0
+    assert profile["reconciliation"]["relative_error"] <= 0.10
+    assert hotspots["selected_route"] == "barostat.attempt"
+    assert hotspots["candidates"][0]["projected_750_calls"] == 30
+    assert hotspots["ranking_resolution"] == "ambiguous-close-low-recurrence"
+    profile_path = tmp_path / "profile.json"
+    hotspots_path = tmp_path / "hotspots.json"
+    runtime.atomic_write_json(profile_path, profile)
+    runtime.atomic_write_json(hotspots_path, hotspots)
+    assert runtime.load_profile_report(profile_path) == profile
+    assert (
+        runtime.load_hotspot_report(
+            hotspots_path,
+            expected_profile_fingerprint=profile["report_fingerprint"],
+        )
+        == hotspots
+    )
+    tampered = copy.deepcopy(hotspots)
+    tampered["selected_route"] = "constraints.position_projection"
+    hotspots_path.write_text(json.dumps(tampered))
+    with pytest.raises(runtime.DHFRNPTRuntimeError, match="fingerprint"):
+        runtime.load_hotspot_report(hotspots_path)
+
+
+def test_profile_report_rejects_unlabeled_instrumented_sample(tmp_path):
+    clean = _sample(
+        tmp_path / "clean",
+        engine="mlx",
+        steps=runtime.PROFILE_STEPS,
+    )
+    instrumented = _sample(
+        tmp_path / "instrumented",
+        engine="mlx",
+        steps=runtime.PROFILE_STEPS,
+        profile=_instrumented_profile(),
+    )
+
+    with pytest.raises(runtime.DHFRNPTRuntimeError, match="not labeled"):
+        runtime.build_profile_report(clean, instrumented)
+
+
+def test_profile_route_source_audit_has_concrete_anchors():
+    audit = runner._route_source_audit()
+
+    assert audit["barostat.attempt"]["path"] == "src/mlx_atomistic/md.py"
+    assert audit["barostat.attempt"]["line"] > 0
+    assert audit["barostat.attempt"]["extracts_scalar"] is True
+    assert audit["pme.reciprocal"]["symbol"] == (
+        "_mesh_reciprocal_energy_forces_mx"
+    )

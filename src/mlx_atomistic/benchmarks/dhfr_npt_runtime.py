@@ -261,6 +261,9 @@ def finalize_sample_report(
             "trace": dict(memory_record),
         },
     }
+    for name in ("mode", "runtime", "profile"):
+        if name in worker:
+            unsigned[name] = worker[name]
     return {
         **unsigned,
         "report_fingerprint": payload_fingerprint(unsigned),
@@ -445,6 +448,437 @@ def load_batch_report(
     return report
 
 
+def build_profile_report(
+    clean_sample: Mapping[str, Any],
+    instrumented_sample: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one diagnostic clean-versus-instrumented MLX profile report."""
+
+    clean = validate_sample_report_payload(clean_sample, engine="mlx")
+    instrumented = validate_sample_report_payload(
+        instrumented_sample,
+        engine="mlx",
+    )
+    clean_workload = _mapping(clean["workload"], name="clean profile workload")
+    instrumented_workload = _mapping(
+        instrumented["workload"],
+        name="instrumented profile workload",
+    )
+    if (
+        clean_workload["workload_fingerprint"]
+        != instrumented_workload["workload_fingerprint"]
+        or clean_workload["steps"] != PROFILE_STEPS
+    ):
+        raise DHFRNPTRuntimeError("profile samples do not share the 75-step workload")
+    if instrumented.get("mode") != "instrumented":
+        raise DHFRNPTRuntimeError("instrumented profile sample is not labeled")
+    profile = _mapping(
+        instrumented.get("profile"),
+        name="instrumented route profile",
+    )
+    if (
+        profile.get("profile_steps") != PROFILE_STEPS
+        or profile.get("projection_steps") != BASELINE_STEPS
+    ):
+        raise DHFRNPTRuntimeError("instrumented route profile schedule drifted")
+    profile = json.loads(json.dumps(profile))
+    routes = _mapping(profile.get("routes"), name="instrumented profile routes")
+    if not routes:
+        raise DHFRNPTRuntimeError("instrumented route profile is empty")
+    for route, details in routes.items():
+        if not isinstance(route, str) or not route:
+            raise DHFRNPTRuntimeError("profile route name is invalid")
+        route_details = _mapping(details, name=f"profile route {route}")
+        calls = route_details.get("calls")
+        projected_calls = route_details.get("projected_750_calls")
+        if (
+            isinstance(calls, bool)
+            or not isinstance(calls, int)
+            or calls < 0
+            or isinstance(projected_calls, bool)
+            or not isinstance(projected_calls, int)
+            or projected_calls < 0
+        ):
+            raise DHFRNPTRuntimeError("profile route call counts are invalid")
+        for name in (
+            "first_inclusive_wall_seconds",
+            "first_exclusive_wall_seconds",
+            "recurring_inclusive_mean_wall_seconds",
+            "recurring_exclusive_mean_wall_seconds",
+            "total_inclusive_wall_seconds",
+            "total_exclusive_wall_seconds",
+            "projected_750_exclusive_wall_seconds",
+            "recurring_exclusive_stddev_wall_seconds",
+            "projected_750_uncertainty_wall_seconds",
+        ):
+            _nonnegative_float(
+                route_details.get(name, 0.0),
+                name=f"{route} {name}",
+            )
+        projected_calls = _projected_route_call_count(
+            calls=calls,
+        )
+        route_details["projected_750_calls"] = projected_calls
+        route_details["projected_750_exclusive_wall_seconds"] = (
+            float(route_details["first_exclusive_wall_seconds"])
+            + max(0, projected_calls - 1)
+            * float(route_details["recurring_exclusive_mean_wall_seconds"])
+        )
+        recurring_samples = int(route_details.get("recurring_sample_count", 0))
+        if recurring_samples >= 2:
+            standard_error = float(
+                route_details.get(
+                    "recurring_exclusive_stddev_wall_seconds",
+                    0.0,
+                )
+            ) / math.sqrt(recurring_samples)
+            route_details["projected_750_uncertainty_wall_seconds"] = (
+                max(0, projected_calls - 1) * standard_error
+            )
+            route_details["uncertainty_status"] = "estimated"
+        else:
+            route_details["projected_750_uncertainty_wall_seconds"] = 0.0
+            route_details["uncertainty_status"] = "insufficient"
+        route_details["first_occurrence_classification"] = (
+            "cold compilation/allocation/cache-population candidate"
+        )
+        route_details["later_occurrences_classification"] = (
+            "recurring route cost"
+        )
+        routes[route] = route_details
+    profile["routes"] = routes
+    profile["timing_semantics"] = {
+        "boundary": "explicit output materialization per selected route",
+        "exclusive_accounting": (
+            "Nested selected-route wall is subtracted from its selected parent."
+        ),
+        "lazy_attribution_caveat": (
+            "Queued upstream MLX work may complete at the next selected output "
+            "boundary; the bounded clean A/B gate, not this profile alone, "
+            "decides whether an optimization is retained."
+        ),
+    }
+
+    clean_timing = _mapping(clean["timing"], name="clean profile timing")
+    instrumented_timing = _mapping(
+        instrumented["timing"],
+        name="instrumented profile timing",
+    )
+    complete = float(instrumented_timing["complete_wall_seconds"])
+    named_outside_profile = sum(
+        float(instrumented_timing[name])
+        for name in (
+            "setup_wall_seconds",
+            "synchronization_diagnostics_wall_seconds",
+            "persistence_wall_seconds",
+        )
+    )
+    root_wall = _nonnegative_float(
+        profile.get("root_wall_seconds"),
+        name="profile root wall seconds",
+    )
+    residual = max(0.0, complete - named_outside_profile - root_wall)
+    reconciled = named_outside_profile + root_wall + residual
+    tolerance = max(1.0e-6, 0.10 * complete)
+    if not math.isclose(complete, reconciled, rel_tol=0.0, abs_tol=tolerance):
+        raise DHFRNPTRuntimeError("instrumented profile does not reconcile")
+    unsigned = {
+        "schema": PROFILE_SCHEMA,
+        "status": "passed",
+        "role": "diagnostic-prefix-only",
+        "workload_fingerprint": clean_workload["workload_fingerprint"],
+        "profile_steps": PROFILE_STEPS,
+        "projection_steps": BASELINE_STEPS,
+        "clean": {
+            "mode": "clean",
+            "sample_fingerprint": clean["report_fingerprint"],
+            "complete_wall_seconds": clean_timing["complete_wall_seconds"],
+            "memory_peak_bytes": clean["memory"]["peak_physical_bytes"],
+            "timing": clean_timing,
+            "runtime": clean.get("runtime"),
+        },
+        "instrumented": {
+            "mode": "instrumented",
+            "sample_fingerprint": instrumented["report_fingerprint"],
+            "complete_wall_seconds": complete,
+            "memory_peak_bytes": instrumented["memory"]["peak_physical_bytes"],
+            "timing": instrumented_timing,
+            "runtime": instrumented.get("runtime"),
+        },
+        "profiling_overhead_wall_seconds": (
+            complete - float(clean_timing["complete_wall_seconds"])
+        ),
+        "reconciliation": {
+            "setup_wall_seconds": instrumented_timing["setup_wall_seconds"],
+            "profiled_root_wall_seconds": root_wall,
+            "synchronization_diagnostics_wall_seconds": instrumented_timing[
+                "synchronization_diagnostics_wall_seconds"
+            ],
+            "persistence_wall_seconds": instrumented_timing[
+                "persistence_wall_seconds"
+            ],
+            "residual_unaccounted_wall_seconds": residual,
+            "reconciled_wall_seconds": reconciled,
+            "relative_error": abs(complete - reconciled) / complete,
+        },
+        "profile": profile,
+    }
+    return {
+        **unsigned,
+        "report_fingerprint": payload_fingerprint(unsigned),
+    }
+
+
+def build_hotspot_report(
+    profile_report: Mapping[str, Any],
+    *,
+    route_audit: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Rank actionable MLX routes from an accepted diagnostic profile."""
+
+    profile = validate_profile_report_payload(profile_report)
+    route_timings = _mapping(
+        _mapping(profile["profile"], name="route profile").get("routes"),
+        name="route timings",
+    )
+    candidates = []
+    for route, details in route_timings.items():
+        timing = _mapping(details, name=f"route timing {route}")
+        if int(timing["calls"]) == 0:
+            continue
+        audit = _mapping(route_audit.get(route), name=f"source audit {route}")
+        hypothesis = audit.get("hypothesis")
+        if not isinstance(hypothesis, str) or not hypothesis:
+            raise DHFRNPTRuntimeError(f"route {route} lacks an optimization hypothesis")
+        candidates.append(
+            {
+                "route": route,
+                "projected_750_exclusive_wall_seconds": float(
+                    timing["projected_750_exclusive_wall_seconds"]
+                ),
+                "projected_750_uncertainty_wall_seconds": float(
+                    timing.get("projected_750_uncertainty_wall_seconds", 0.0)
+                ),
+                "uncertainty_status": timing.get(
+                    "uncertainty_status",
+                    "insufficient",
+                ),
+                "observed_75_exclusive_wall_seconds": float(
+                    timing["total_exclusive_wall_seconds"]
+                ),
+                "observed_calls": int(timing["calls"]),
+                "projected_750_calls": int(timing["projected_750_calls"]),
+                "first_occurrence_wall_seconds": float(
+                    timing["first_exclusive_wall_seconds"]
+                ),
+                "recurring_mean_wall_seconds": float(
+                    timing["recurring_exclusive_mean_wall_seconds"]
+                ),
+                "source": audit,
+                "optimization_hypothesis": hypothesis,
+                "bounded_smell_test": (
+                    "Run the identical 75-step seed-313 prefix with only this "
+                    "route changed; compare complete wall, route work, and outputs."
+                ),
+                "numerical_gates": (
+                    "All existing finite, attempt-schedule, sample-count, "
+                    "constraint, volume, cell, temperature, pressure, and "
+                    "energy-stability checks must pass."
+                ),
+                "memory_gate": "Process-tree peak must remain below 40,000,000,000 bytes.",
+                "rollback_rule": (
+                    "Revert unless clean complete wall improves materially "
+                    "without worse numerical checks or unsafe memory growth."
+                ),
+            }
+        )
+    candidates.sort(
+        key=lambda candidate: candidate[
+            "projected_750_exclusive_wall_seconds"
+        ],
+        reverse=True,
+    )
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = rank
+    if not candidates:
+        raise DHFRNPTRuntimeError("profile contains no observed hotspot routes")
+
+    profile_root = float(
+        _mapping(profile["reconciliation"], name="profile reconciliation")[
+            "profiled_root_wall_seconds"
+        ]
+    )
+    instrumented_complete = float(
+        _mapping(profile["instrumented"], name="instrumented profile")[
+            "complete_wall_seconds"
+        ]
+    )
+    explained_share = profile_root / instrumented_complete
+    top = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+    uncertainty_overlap = second is not None and (
+        top["projected_750_exclusive_wall_seconds"]
+        - top["projected_750_uncertainty_wall_seconds"]
+        <= second["projected_750_exclusive_wall_seconds"]
+        + second["projected_750_uncertainty_wall_seconds"]
+    )
+    close = second is not None and (
+        top["projected_750_exclusive_wall_seconds"]
+        - second["projected_750_exclusive_wall_seconds"]
+    ) <= 0.10 * top["projected_750_exclusive_wall_seconds"]
+    limited_recurrence = second is not None and min(
+        top["observed_calls"],
+        second["observed_calls"],
+    ) <= 3
+    ranking_resolution = (
+        "ambiguous-overlapping-uncertainty"
+        if uncertainty_overlap
+        else "ambiguous-close-low-recurrence"
+        if close and limited_recurrence
+        else "resolved-by-projected-exclusive-time"
+    )
+    reconciliation = _mapping(
+        profile["reconciliation"],
+        name="profile reconciliation",
+    )
+    projected_routes = sum(
+        candidate["projected_750_exclusive_wall_seconds"]
+        for candidate in candidates
+    )
+    residual_75 = float(reconciliation["residual_unaccounted_wall_seconds"])
+    projected_residual = residual_75 * BASELINE_STEPS / PROFILE_STEPS
+    projected_total = (
+        float(reconciliation["setup_wall_seconds"])
+        + float(reconciliation["synchronization_diagnostics_wall_seconds"])
+        + float(reconciliation["persistence_wall_seconds"])
+        + projected_routes
+        + projected_residual
+    )
+    unsigned = {
+        "schema": HOTSPOT_SCHEMA,
+        "status": "passed",
+        "role": "diagnostic-decision-packet",
+        "profile_report_fingerprint": profile["report_fingerprint"],
+        "explained_complete_wall_share": explained_share,
+        "unresolved_remainder": (
+            None
+            if explained_share >= 0.90
+            else {
+                "status": "blocker",
+                "complete_wall_share": 1.0 - explained_share,
+                "reason": (
+                    "Selected route timers explain less than 90% of the "
+                    "instrumented complete wall."
+                ),
+            }
+        ),
+        "ranking_resolution": ranking_resolution,
+        "selected_route": top["route"],
+        "projection_750": {
+            "role": "diagnostic-only-not-a-parity-result",
+            "one_time_setup_wall_seconds": float(
+                reconciliation["setup_wall_seconds"]
+            ),
+            "one_time_final_synchronization_wall_seconds": float(
+                reconciliation["synchronization_diagnostics_wall_seconds"]
+            ),
+            "one_time_persistence_wall_seconds": float(
+                reconciliation["persistence_wall_seconds"]
+            ),
+            "profiled_routes_wall_seconds": projected_routes,
+            "unresolved_residual_wall_seconds": projected_residual,
+            "projected_complete_wall_seconds": projected_total,
+            "residual_assumption": (
+                "The unresolved 75-step residual is scaled linearly; it cannot "
+                "select an optimization candidate."
+            ),
+        },
+        "candidates": candidates,
+    }
+    return {
+        **unsigned,
+        "report_fingerprint": payload_fingerprint(unsigned),
+    }
+
+
+def load_profile_report(path: str | Path) -> dict[str, Any]:
+    """Load and validate one diagnostic MLX profile report."""
+
+    return validate_profile_report_payload(
+        _load_json(path, context="runtime profile report")
+    )
+
+
+def validate_profile_report_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate an in-memory diagnostic MLX profile report."""
+
+    report = dict(payload)
+    if report.get("schema") != PROFILE_SCHEMA or report.get("status") != "passed":
+        raise DHFRNPTRuntimeError("runtime profile is incomplete or unsupported")
+    claimed = report.get("report_fingerprint")
+    unsigned = dict(report)
+    unsigned.pop("report_fingerprint", None)
+    if claimed != payload_fingerprint(unsigned):
+        raise DHFRNPTRuntimeError("runtime profile fingerprint mismatch")
+    if (
+        report.get("role") != "diagnostic-prefix-only"
+        or report.get("profile_steps") != PROFILE_STEPS
+        or report.get("projection_steps") != BASELINE_STEPS
+    ):
+        raise DHFRNPTRuntimeError("runtime profile identity drifted")
+    reconciliation = _mapping(
+        report.get("reconciliation"),
+        name="profile reconciliation",
+    )
+    relative_error = _nonnegative_float(
+        reconciliation.get("relative_error"),
+        name="profile reconciliation error",
+    )
+    if relative_error > 0.10:
+        raise DHFRNPTRuntimeError("runtime profile exceeds reconciliation tolerance")
+    _require_finite_json(report, context="runtime profile report")
+    return report
+
+
+def load_hotspot_report(
+    path: str | Path,
+    *,
+    expected_profile_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Load and validate one diagnostic MLX hotspot packet."""
+
+    report = _load_json(path, context="runtime hotspot report")
+    if report.get("schema") != HOTSPOT_SCHEMA or report.get("status") != "passed":
+        raise DHFRNPTRuntimeError("runtime hotspot packet is incomplete")
+    claimed = report.get("report_fingerprint")
+    unsigned = dict(report)
+    unsigned.pop("report_fingerprint", None)
+    if claimed != payload_fingerprint(unsigned):
+        raise DHFRNPTRuntimeError("runtime hotspot fingerprint mismatch")
+    if (
+        expected_profile_fingerprint is not None
+        and report.get("profile_report_fingerprint")
+        != expected_profile_fingerprint
+    ):
+        raise DHFRNPTRuntimeError("runtime hotspot profile identity mismatch")
+    candidates = _sequence(report.get("candidates"), name="hotspot candidates")
+    if not candidates:
+        raise DHFRNPTRuntimeError("runtime hotspot candidates are missing")
+    first = _mapping(candidates[0], name="first hotspot candidate")
+    if first.get("rank") != 1 or first.get("route") != report.get("selected_route"):
+        raise DHFRNPTRuntimeError("runtime hotspot selection is inconsistent")
+    share = _nonnegative_float(
+        report.get("explained_complete_wall_share"),
+        name="hotspot explained share",
+    )
+    if share > 1.0 + 1.0e-6:
+        raise DHFRNPTRuntimeError("runtime hotspot explained share is invalid")
+    _require_finite_json(report, context="runtime hotspot report")
+    return report
+
+
 def validate_sample_report_payload(
     payload: Mapping[str, Any],
     *,
@@ -528,6 +962,10 @@ def _validate_workload(workload: Mapping[str, Any]) -> None:
         raise DHFRNPTRuntimeError("runtime workload step count mismatch")
     if workload.get("expected_attempts") != int(steps) // 25:
         raise DHFRNPTRuntimeError("runtime workload attempt count mismatch")
+
+
+def _projected_route_call_count(*, calls: int) -> int:
+    return max(0, calls) * BASELINE_STEPS // PROFILE_STEPS
 
 
 def _validate_timing_reconciliation(

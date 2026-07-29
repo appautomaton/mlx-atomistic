@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
+import functools
+import importlib.metadata
+import inspect
 import json
 import math
 import os
@@ -11,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -27,6 +33,393 @@ from mlx_atomistic.benchmarks.dhfr_npt_v2 import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOUNDED_PROCESS_SCRIPT = REPO_ROOT / "scripts" / "run_bounded_process.py"
 
+_PROFILE_ROUTES = (
+    (
+        "constraints.position_projection",
+        "mlx_atomistic.constraints",
+        "DistanceConstraints",
+        "apply_positions",
+    ),
+    (
+        "constraints.velocity_projection",
+        "mlx_atomistic.constraints",
+        "DistanceConstraints",
+        "apply_velocities",
+    ),
+    (
+        "neighbors.update",
+        "mlx_atomistic.neighbors",
+        "NeighborListManager",
+        "update",
+    ),
+    (
+        "neighbors.rebuild",
+        "mlx_atomistic.neighbors",
+        "NeighborListManager",
+        "rebuild",
+    ),
+    (
+        "neighbors.cell_candidate",
+        "mlx_atomistic.neighbors",
+        "NeighborListManager",
+        "build_cell_candidate",
+    ),
+    (
+        "forces.total",
+        "mlx_atomistic.md",
+        None,
+        "_energy_forces_from_terms",
+    ),
+    (
+        "forces.by_term",
+        "mlx_atomistic.md",
+        None,
+        "_energy_forces_by_term",
+    ),
+    (
+        "pme.combined",
+        "mlx_atomistic.forcefields",
+        "NonbondedPotential",
+        "_pme_energy_forces",
+    ),
+    (
+        "pme.combined_components",
+        "mlx_atomistic.forcefields",
+        "NonbondedPotential",
+        "_pme_energy_forces_with_components",
+    ),
+    (
+        "pme.real_space",
+        "mlx_atomistic.pme",
+        None,
+        "_real_space_energy_forces_with_policy_mx",
+    ),
+    (
+        "pme.reciprocal",
+        "mlx_atomistic.pme",
+        None,
+        "_mesh_reciprocal_energy_forces_mx",
+    ),
+    (
+        "pressure.diagnostics",
+        "mlx_atomistic.md",
+        None,
+        "_pressure_diagnostics",
+    ),
+    (
+        "barostat.attempt",
+        "mlx_atomistic.md",
+        None,
+        "_attempt_barostat_move",
+    ),
+    (
+        "materialization.npt_segment",
+        "mlx_atomistic.md",
+        None,
+        "_materialize_npt_segment",
+    ),
+)
+
+_ROUTE_TRAITS = {
+    "constraints.position_projection": {
+        "crosses_python": True,
+        "many_small_metal_launches": True,
+        "avoidable_recomputation": True,
+        "hypothesis": (
+            "Replace the Python-unrolled fixed-iteration projection with a "
+            "compiled/block execution path while preserving the same tolerance."
+        ),
+    },
+    "constraints.velocity_projection": {
+        "crosses_python": True,
+        "many_small_metal_launches": True,
+        "hypothesis": (
+            "Fuse velocity projection with the constrained integration block."
+        ),
+    },
+    "neighbors.update": {
+        "crosses_python": True,
+        "crosses_numpy_or_cpu_state": True,
+        "extracts_scalar": True,
+        "explicit_evaluation": True,
+        "hypothesis": (
+            "Reduce per-step host admission and avoid rebuilding padded "
+            "candidate work that the force path later discards."
+        ),
+    },
+    "neighbors.rebuild": {
+        "crosses_python": True,
+        "crosses_numpy_or_cpu_state": True,
+        "rebuilds_state": True,
+        "repeated_allocation": True,
+        "hypothesis": (
+            "Use the compact-pair production backend or retain reusable cell "
+            "list storage across rebuilds."
+        ),
+    },
+    "neighbors.cell_candidate": {
+        "crosses_python": True,
+        "rebuilds_state": True,
+        "repeated_allocation": True,
+        "hypothesis": (
+            "Reuse candidate neighbor infrastructure during barostat proposals."
+        ),
+    },
+    "forces.total": {
+        "crosses_python": True,
+        "many_small_metal_launches": True,
+        "hypothesis": (
+            "Compile or fuse the recurring force-term graph without changing "
+            "the force-field decomposition."
+        ),
+    },
+    "forces.by_term": {
+        "crosses_python": True,
+        "avoidable_recomputation": True,
+        "many_small_metal_launches": True,
+        "hypothesis": (
+            "Reuse force-term intermediates when pressure diagnostics request "
+            "per-term energy and virial data."
+        ),
+    },
+    "pme.combined": {
+        "crosses_python": True,
+        "many_small_metal_launches": True,
+        "hypothesis": "Fuse recurring PME and Lennard-Jones dispatch.",
+    },
+    "pme.combined_components": {
+        "crosses_python": True,
+        "many_small_metal_launches": True,
+        "avoidable_recomputation": True,
+        "hypothesis": (
+            "Share PME intermediates between force and component diagnostics."
+        ),
+    },
+    "pme.real_space": {
+        "many_small_metal_launches": True,
+        "repeated_allocation": True,
+        "hypothesis": (
+            "Eliminate padded-candidate waste or fuse cutoff filtering into "
+            "the direct-space kernel."
+        ),
+    },
+    "pme.reciprocal": {
+        "crosses_python": True,
+        "explicit_evaluation": True,
+        "many_small_metal_launches": True,
+        "hypothesis": (
+            "Compile/fuse charge assignment, FFT field construction, and "
+            "interpolation while reusing the bound PME plan."
+        ),
+    },
+    "pressure.diagnostics": {
+        "crosses_python": True,
+        "extracts_scalar": True,
+        "avoidable_recomputation": True,
+        "hypothesis": (
+            "Reuse already-computed force and energy intermediates for the "
+            "25-step analytic-pressure sample."
+        ),
+    },
+    "barostat.attempt": {
+        "crosses_python": True,
+        "crosses_numpy_or_cpu_state": True,
+        "extracts_scalar": True,
+        "explicit_evaluation": True,
+        "rebuilds_state": True,
+        "repeated_allocation": True,
+        "avoidable_recomputation": True,
+        "hypothesis": (
+            "Avoid rebuilding PME/neighbor state and recomputing current-cell "
+            "energy for every proposal."
+        ),
+    },
+    "materialization.npt_segment": {
+        "explicit_evaluation": True,
+        "hypothesis": (
+            "Reduce segment-wide synchronization after the dominant compute "
+            "routes are isolated."
+        ),
+    },
+}
+
+_ROUTE_TRAIT_FIELDS = (
+    "crosses_python",
+    "crosses_numpy_or_cpu_state",
+    "extracts_scalar",
+    "explicit_evaluation",
+    "rebuilds_state",
+    "repeated_allocation",
+    "avoidable_recomputation",
+    "many_small_metal_launches",
+)
+
+
+class _MLXRouteProfiler:
+    """Diagnostic-only inclusive/exclusive timer for selected MLX routes."""
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._stack: list[dict[str, Any]] = []
+        self._patches: list[tuple[object, str, Any]] = []
+
+    @contextlib.contextmanager
+    def installed(self):
+        """Patch selected routes for the duration of one worker."""
+
+        import importlib
+
+        try:
+            for route, module_name, class_name, attribute in _PROFILE_ROUTES:
+                module = importlib.import_module(module_name)
+                owner = getattr(module, class_name) if class_name else module
+                original = getattr(owner, attribute)
+                setattr(owner, attribute, self._wrapped(route, original))
+                self._patches.append((owner, attribute, original))
+            yield self
+        finally:
+            for owner, attribute, original in reversed(self._patches):
+                setattr(owner, attribute, original)
+            self._patches.clear()
+
+    def _wrapped(self, route: str, original):
+        @functools.wraps(original)
+        def measured(*args, **kwargs):
+            parent = self._stack[-1]["route"] if self._stack else None
+            frame = {"route": route, "child_seconds": 0.0}
+            self._stack.append(frame)
+            started = time.perf_counter()
+            try:
+                result = original(*args, **kwargs)
+                _materialize_mlx_arrays(result)
+                return result
+            finally:
+                elapsed = time.perf_counter() - started
+                popped = self._stack.pop()
+                exclusive = max(0.0, elapsed - float(popped["child_seconds"]))
+                self._events[route].append(
+                    {
+                        "inclusive_wall_seconds": elapsed,
+                        "exclusive_wall_seconds": exclusive,
+                        "parent": parent,
+                        "root": parent is None,
+                    }
+                )
+                if self._stack:
+                    self._stack[-1]["child_seconds"] += elapsed
+
+        return measured
+
+    def to_report(self, *, steps: int) -> dict[str, Any]:
+        """Return cold, recurring, and projected timing statistics."""
+
+        routes = {}
+        for route, *_ in _PROFILE_ROUTES:
+            events = self._events.get(route, [])
+            routes[route] = _summarize_route_events(
+                events,
+                steps=steps,
+            )
+        root_wall_seconds = sum(
+            float(event["inclusive_wall_seconds"])
+            for events in self._events.values()
+            for event in events
+            if event["root"]
+        )
+        return {
+            "profile_steps": steps,
+            "projection_steps": runtime.BASELINE_STEPS,
+            "root_wall_seconds": root_wall_seconds,
+            "routes": routes,
+        }
+
+
+def _materialize_mlx_arrays(value: Any) -> None:
+    import mlx.core as mx
+
+    arrays: list[Any] = []
+    seen: set[int] = set()
+
+    def collect(current: Any) -> None:
+        if isinstance(current, mx.array):
+            arrays.append(current)
+            return
+        if current is None or isinstance(current, str | bytes | int | float | bool):
+            return
+        identity = id(current)
+        if identity in seen:
+            return
+        seen.add(identity)
+        if isinstance(current, Mapping):
+            for child in current.values():
+                collect(child)
+        elif isinstance(current, Sequence):
+            for child in current:
+                collect(child)
+        elif dataclasses.is_dataclass(current) and not isinstance(current, type):
+            for field in dataclasses.fields(current):
+                collect(getattr(current, field.name))
+
+    collect(value)
+    if arrays:
+        mx.eval(*arrays)
+
+
+def _summarize_route_events(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    steps: int,
+) -> dict[str, Any]:
+    calls = len(events)
+    scale = runtime.BASELINE_STEPS / steps
+    projected_calls = int(round(calls * scale))
+    inclusive = [float(event["inclusive_wall_seconds"]) for event in events]
+    exclusive = [float(event["exclusive_wall_seconds"]) for event in events]
+    recurring_inclusive = inclusive[1:]
+    recurring_exclusive = exclusive[1:]
+    recurring_inclusive_mean = (
+        float(np.mean(recurring_inclusive)) if recurring_inclusive else 0.0
+    )
+    recurring_exclusive_mean = (
+        float(np.mean(recurring_exclusive)) if recurring_exclusive else 0.0
+    )
+    recurring_exclusive_stddev = (
+        float(np.std(recurring_exclusive, ddof=1))
+        if len(recurring_exclusive) >= 2
+        else 0.0
+    )
+    recurring_mean_standard_error = (
+        recurring_exclusive_stddev / math.sqrt(len(recurring_exclusive))
+        if len(recurring_exclusive) >= 2
+        else 0.0
+    )
+    projected_exclusive = 0.0
+    if calls:
+        projected_exclusive = exclusive[0] + max(0, projected_calls - 1) * (
+            recurring_exclusive_mean
+        )
+    projected_uncertainty = max(0, projected_calls - 1) * (
+        recurring_mean_standard_error
+    )
+    return {
+        "calls": calls,
+        "root_calls": sum(bool(event["root"]) for event in events),
+        "first_inclusive_wall_seconds": inclusive[0] if inclusive else 0.0,
+        "first_exclusive_wall_seconds": exclusive[0] if exclusive else 0.0,
+        "recurring_inclusive_mean_wall_seconds": recurring_inclusive_mean,
+        "recurring_exclusive_mean_wall_seconds": recurring_exclusive_mean,
+        "recurring_exclusive_stddev_wall_seconds": recurring_exclusive_stddev,
+        "recurring_sample_count": len(recurring_exclusive),
+        "total_inclusive_wall_seconds": float(sum(inclusive)),
+        "total_exclusive_wall_seconds": float(sum(exclusive)),
+        "projected_750_calls": projected_calls,
+        "projected_750_exclusive_wall_seconds": projected_exclusive,
+        "projected_750_uncertainty_wall_seconds": projected_uncertainty,
+        "uncertainty_status": (
+            "estimated" if len(recurring_exclusive) >= 2 else "insufficient"
+        ),
+    }
+
 
 def build_bounded_worker_command(
     *,
@@ -40,6 +433,7 @@ def build_bounded_worker_command(
     contract: Path,
     max_bytes: int,
     timeout_seconds: float,
+    instrumented: bool = False,
 ) -> list[str]:
     """Build one fresh-process worker command under the macOS supervisor."""
 
@@ -64,6 +458,8 @@ def build_bounded_worker_command(
         "--contract",
         str(contract),
     ]
+    if instrumented:
+        worker.append("--instrumented")
     return [
         sys.executable,
         str(BOUNDED_PROCESS_SCRIPT),
@@ -91,6 +487,7 @@ def run_batch(
     contract_path: Path,
     max_bytes: int,
     sample_timeout_seconds: float,
+    instrumented: bool = False,
 ) -> dict[str, Any]:
     """Run or resume an isolated runtime batch."""
 
@@ -163,6 +560,7 @@ def run_batch(
                 contract=contract_path,
                 max_bytes=max_bytes,
                 timeout_seconds=sample_timeout_seconds,
+                instrumented=instrumented,
             )
             started = time.perf_counter()
             log_path = sample_dir / "worker.log"
@@ -263,6 +661,213 @@ def verify_batch(path: Path, *, engine: str) -> dict[str, Any]:
     return batch
 
 
+def run_profile_batch(
+    *,
+    prepared: Path,
+    out: Path,
+    steps: int,
+    seed: int,
+    contract_path: Path,
+    max_bytes: int,
+    sample_timeout_seconds: float,
+) -> dict[str, Any]:
+    """Run or resume matched clean and instrumented MLX profile prefixes."""
+
+    if steps != runtime.PROFILE_STEPS:
+        raise runtime.DHFRNPTRuntimeError("MLX profiling requires exactly 75 steps")
+    out.mkdir(parents=True, exist_ok=True)
+    status_path = out / "status.json"
+    _write_status(
+        status_path,
+        state="running",
+        engine="mlx",
+        completed=0,
+        requested=2,
+        active_sample=1,
+    )
+    try:
+        run_batch(
+            engine="mlx",
+            prepared=prepared,
+            out=out / "clean",
+            steps=steps,
+            repetitions=1,
+            seed=seed,
+            platform_name="Metal",
+            precision="float32",
+            contract_path=contract_path,
+            max_bytes=max_bytes,
+            sample_timeout_seconds=sample_timeout_seconds,
+        )
+        _refresh_mlx_sample_details(out / "clean", mode="clean")
+        _write_status(
+            status_path,
+            state="running",
+            engine="mlx",
+            completed=1,
+            requested=2,
+            active_sample=2,
+        )
+        run_batch(
+            engine="mlx",
+            prepared=prepared,
+            out=out / "instrumented",
+            steps=steps,
+            repetitions=1,
+            seed=seed,
+            platform_name="Metal",
+            precision="float32",
+            contract_path=contract_path,
+            max_bytes=max_bytes,
+            sample_timeout_seconds=sample_timeout_seconds,
+            instrumented=True,
+        )
+        clean = runtime.load_sample_report(
+            out / "clean" / "sample-001" / "report.json",
+            expected_engine="mlx",
+            artifact_root=out / "clean" / "sample-001",
+        )
+        instrumented = runtime.load_sample_report(
+            out / "instrumented" / "sample-001" / "report.json",
+            expected_engine="mlx",
+            artifact_root=out / "instrumented" / "sample-001",
+        )
+        profile = runtime.build_profile_report(clean, instrumented)
+        hotspots = runtime.build_hotspot_report(
+            profile,
+            route_audit=_route_source_audit(),
+        )
+        runtime.atomic_write_json(out / "report.json", profile)
+        runtime.atomic_write_json(out / "hotspots.json", hotspots)
+        verified = verify_profile(
+            out / "report.json",
+            hotspot_path=out / "hotspots.json",
+        )
+        _write_status(
+            status_path,
+            state="passed",
+            engine="mlx",
+            completed=2,
+            requested=2,
+            active_sample=None,
+        )
+        return verified
+    except BaseException as error:
+        _write_status(
+            status_path,
+            state="failed",
+            engine="mlx",
+            completed=0,
+            requested=2,
+            active_sample=None,
+            error=f"{type(error).__name__}: {error}",
+        )
+        raise
+
+
+def _refresh_mlx_sample_details(batch_dir: Path, *, mode: str) -> None:
+    """Upgrade an accepted pre-profile MLX sample without rerunning it."""
+
+    sample_dir = batch_dir / "sample-001"
+    report_path = sample_dir / "report.json"
+    sample = runtime.load_sample_report(
+        report_path,
+        expected_engine="mlx",
+        artifact_root=sample_dir,
+    )
+    if sample.get("mode") == mode and "runtime" in sample:
+        return
+    worker_path = sample_dir / "worker.json"
+    worker = runtime.load_worker_report(worker_path, expected_engine="mlx")
+    worker["mode"] = mode
+    runtime.atomic_write_json(worker_path, worker)
+    worker = runtime.load_worker_report(worker_path, expected_engine="mlx")
+    worker["artifacts"] = [
+        *worker["artifacts"],
+        runtime.artifact_record(worker_path, relative_to=sample_dir),
+        runtime.artifact_record(sample_dir / "worker.log", relative_to=sample_dir),
+    ]
+    memory_path = sample_dir / "memory.json"
+    refreshed = runtime.finalize_sample_report(
+        worker,
+        complete_wall_seconds=float(sample["timing"]["complete_wall_seconds"]),
+        memory_trace=_load_json(memory_path),
+        memory_record=runtime.artifact_record(
+            memory_path,
+            relative_to=sample_dir,
+        ),
+    )
+    runtime.atomic_write_json(report_path, refreshed)
+    refreshed = runtime.load_sample_report(
+        report_path,
+        expected_engine="mlx",
+        artifact_root=sample_dir,
+    )
+    batch = runtime.build_batch_report([refreshed], engine="mlx")
+    runtime.atomic_write_json(batch_dir / "report.json", batch)
+
+
+def verify_profile(
+    profile_path: Path,
+    *,
+    hotspot_path: Path,
+) -> dict[str, Any]:
+    """Verify a profile packet against both independently saved samples."""
+
+    profile = runtime.load_profile_report(profile_path)
+    root = profile_path.parent
+    clean = runtime.load_sample_report(
+        root / "clean" / "sample-001" / "report.json",
+        expected_engine="mlx",
+        artifact_root=root / "clean" / "sample-001",
+    )
+    instrumented = runtime.load_sample_report(
+        root / "instrumented" / "sample-001" / "report.json",
+        expected_engine="mlx",
+        artifact_root=root / "instrumented" / "sample-001",
+    )
+    if (
+        clean["report_fingerprint"] != profile["clean"]["sample_fingerprint"]
+        or instrumented["report_fingerprint"]
+        != profile["instrumented"]["sample_fingerprint"]
+    ):
+        raise runtime.DHFRNPTRuntimeError(
+            "profile packet does not match its sample reports"
+        )
+    hotspots = runtime.load_hotspot_report(
+        hotspot_path,
+        expected_profile_fingerprint=profile["report_fingerprint"],
+    )
+    return {"profile": profile, "hotspots": hotspots}
+
+
+def _route_source_audit() -> dict[str, dict[str, Any]]:
+    import importlib
+
+    audit = {}
+    for route, module_name, class_name, attribute in _PROFILE_ROUTES:
+        module = importlib.import_module(module_name)
+        owner = getattr(module, class_name) if class_name else module
+        target = getattr(owner, attribute)
+        source_path = inspect.getsourcefile(target)
+        if source_path is None:
+            raise runtime.DHFRNPTRuntimeError(
+                f"profile route {route} has no source file"
+            )
+        _, line = inspect.getsourcelines(target)
+        traits = {field: False for field in _ROUTE_TRAIT_FIELDS}
+        traits.update(_ROUTE_TRAITS[route])
+        audit[route] = {
+            "path": Path(source_path).resolve().relative_to(REPO_ROOT).as_posix(),
+            "line": line,
+            "symbol": (
+                f"{class_name}.{attribute}" if class_name else attribute
+            ),
+            **traits,
+        }
+    return audit
+
+
 def read_status(path: Path) -> dict[str, Any]:
     """Return the current batch status without mutating it."""
 
@@ -302,11 +907,16 @@ def run_worker(
     platform_name: str,
     precision: str,
     contract_path: Path,
+    instrumented: bool = False,
 ) -> dict[str, Any]:
     """Run one engine sample inside a bounded child process."""
 
     out.mkdir(parents=True, exist_ok=True)
     if engine == "openmm":
+        if instrumented:
+            raise runtime.DHFRNPTRuntimeError(
+                "route instrumentation is available only for MLX"
+            )
         report = _run_openmm_worker(
             prepared=prepared,
             out=out,
@@ -323,6 +933,7 @@ def run_worker(
             steps=steps,
             seed=seed,
             contract_path=contract_path,
+            instrumented=instrumented,
         )
     else:
         raise runtime.DHFRNPTRuntimeError(f"unsupported runtime engine: {engine}")
@@ -510,9 +1121,9 @@ def _run_mlx_worker(
     steps: int,
     seed: int,
     contract_path: Path,
+    instrumented: bool,
 ) -> dict[str, Any]:
     worker_started = time.perf_counter()
-    import mlx
     import mlx.core as mx
 
     v1_runner = _load_v1_runner()
@@ -532,18 +1143,24 @@ def _run_mlx_worker(
     trajectory = out / "trajectory.npz"
     checkpoint = out / "checkpoint.npz"
     setup_seconds = time.perf_counter() - setup_started
+    profiler = _MLXRouteProfiler() if instrumented else None
     integration_started = time.perf_counter()
-    result = v1_runner._run_mlx_npt(
-        prepared_system,
-        workload=workload_identity["protocol"],
-        seed=seed,
-        out=trajectory,
-        checkpoint_out=checkpoint,
-        steps=steps,
-        constraint_max_iterations=int(
-            workload_identity["protocol"]["constraint_max_iterations"]
-        ),
-    )
+    with (
+        profiler.installed()
+        if profiler is not None
+        else contextlib.nullcontext()
+    ):
+        result = v1_runner._run_mlx_npt(
+            prepared_system,
+            workload=workload_identity["protocol"],
+            seed=seed,
+            out=trajectory,
+            checkpoint_out=checkpoint,
+            steps=steps,
+            constraint_max_iterations=int(
+                workload_identity["protocol"]["constraint_max_iterations"]
+            ),
+        )
     integration_seconds = time.perf_counter() - integration_started
     barrier_started = time.perf_counter()
     mx.eval(
@@ -570,13 +1187,14 @@ def _run_mlx_worker(
         - integration_seconds
         - synchronization_seconds,
     )
-    return {
+    report = {
         "schema": runtime.WORKER_SCHEMA,
+        "mode": "instrumented" if instrumented else "clean",
         "engine": {
             "name": "mlx",
             "backend": "Metal",
             "device": str(mx.default_device()),
-            "version": mlx.__version__,
+            "version": _package_version("mlx"),
             "role": "product-runtime",
         },
         "host": _host_metadata(),
@@ -614,6 +1232,9 @@ def _run_mlx_worker(
             runtime.artifact_record(checkpoint, relative_to=out),
         ],
     }
+    if profiler is not None:
+        report["profile"] = profiler.to_report(steps=steps)
+    return report
 
 
 def _openmm_numerical_summary(
@@ -739,6 +1360,10 @@ def _read_command(command: Sequence[str]) -> str | None:
     return value if completed.returncode == 0 and value else None
 
 
+def _package_version(distribution: str) -> str:
+    return importlib.metadata.version(distribution)
+
+
 def _load_v1_runner():
     try:
         from scripts import run_openmm_mlx_dhfr_npt as v1_runner
@@ -834,6 +1459,34 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     worker.add_argument("--platform", required=True)
     worker.add_argument("--precision", required=True)
     worker.add_argument("--contract", type=Path, required=True)
+    worker.add_argument("--instrumented", action="store_true")
+
+    profile_batch = subparsers.add_parser("profile-batch")
+    profile_batch.add_argument("--engine", choices=("mlx",), required=True)
+    profile_batch.add_argument("--prepared", type=Path, required=True)
+    profile_batch.add_argument("--out", type=Path, required=True)
+    profile_batch.add_argument(
+        "--steps",
+        type=int,
+        choices=(runtime.PROFILE_STEPS,),
+        required=True,
+    )
+    profile_batch.add_argument("--seed", type=int, default=runtime.RUNTIME_SEED)
+    profile_batch.add_argument(
+        "--contract",
+        type=Path,
+        default=DEFAULT_CONTRACT_PATH,
+    )
+    profile_batch.add_argument(
+        "--max-bytes",
+        type=int,
+        default=runtime.PROCESS_TREE_MAX_BYTES,
+    )
+    profile_batch.add_argument(
+        "--sample-timeout-seconds",
+        type=float,
+        default=runtime.SAMPLE_TIMEOUT_SECONDS,
+    )
 
     status = subparsers.add_parser("status")
     status.add_argument("--input", type=Path, required=True)
@@ -841,6 +1494,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     verify = subparsers.add_parser("verify")
     verify.add_argument("--engine", choices=("openmm", "mlx"), required=True)
     verify.add_argument("--input", type=Path, required=True)
+
+    verify_profile_parser = subparsers.add_parser("verify-profile")
+    verify_profile_parser.add_argument("--input", type=Path, required=True)
+    verify_profile_parser.add_argument("--hotspots", type=Path, required=True)
     return parser.parse_args(argv)
 
 
@@ -862,6 +1519,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_bytes=args.max_bytes,
             sample_timeout_seconds=args.sample_timeout_seconds,
         )
+    elif args.command == "profile-batch":
+        report = run_profile_batch(
+            prepared=args.prepared,
+            out=args.out,
+            steps=args.steps,
+            seed=args.seed,
+            contract_path=args.contract,
+            max_bytes=args.max_bytes,
+            sample_timeout_seconds=args.sample_timeout_seconds,
+        )
     elif args.command == "_worker":
         report = run_worker(
             engine=args.engine,
@@ -872,9 +1539,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             platform_name=args.platform,
             precision=args.precision,
             contract_path=args.contract,
+            instrumented=args.instrumented,
         )
     elif args.command == "status":
         report = read_status(args.input)
+    elif args.command == "verify-profile":
+        report = verify_profile(
+            args.input,
+            hotspot_path=args.hotspots,
+        )
     else:
         report = verify_batch(args.input, engine=args.engine)
     print(json.dumps(report, indent=2, sort_keys=True))
