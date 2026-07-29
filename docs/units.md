@@ -112,6 +112,5 @@ e = 1
 4πε₀ = 1
 ```
 
-The current Γ-point plane-wave prototype keeps examples explicit about units.
-User-facing conversion helpers can be added once the DFT API grows beyond toy
-systems.
+Both the legacy Γ-point reference path and the periodic materials path use
+atomic units. User-facing conversion helpers can be added as the DFT API grows.

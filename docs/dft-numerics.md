@@ -1,10 +1,9 @@
 # DFT Numerics
 
-Milestone 3 makes the DFT layer more numerically inspectable. The primary SCF
-path is still small, Γ-point, and alpha/proof-level, but the code now has
-explicit checks for the Kohn-Sham operator, orbital residuals, energy
-decomposition, nonlocal projector diagnostics, and total-energy force
-consistency.
+The first part of this page documents numerics for the legacy
+`DFTSystem`/`run_scf` Γ-point reference path. The periodic production path is a
+separate implementation with k-point integration, a block-Davidson solver,
+reciprocal-space GTH operators, and analytic fixed-cell forces.
 
 ## Kohn-Sham Operator
 
@@ -91,6 +90,16 @@ This checks consistency between the reported force and the total-energy surface.
 It does not prove production-grade DFT forces because the nonlocal correction is
 an alpha finite-difference path and production materials validation, cell
 relaxation, and custom kernels remain out of scope.
+
+## Periodic Plane-Wave Forces
+
+`periodic_scf_forces(system, result)` evaluates local GTH, nonlocal GTH, and
+Ewald ion contributions from a converged `PeriodicSCFResult`. The accepted
+eight-atom MgO check used 48 reconverged ±0.01 bohr SCFs: 21 of 24 Cartesian
+components passed the unchanged `1e-4 Ha/bohr` gate. The three failures are a
+recorded float32 total-energy precision limit, with a maximum deviation of
+`2.246e-4 Ha/bohr`; symmetry and refinement checks did not indicate an analytic
+force bug.
 
 ## Benchmark Evidence
 

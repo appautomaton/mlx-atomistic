@@ -19,29 +19,28 @@ or dependency-bound tests run on demand.
   Skipped unless the run includes `--run-data`.
 - `gpu` — require a visible Metal GPU. Skipped unless the run includes
   `--run-gpu`.
+- `perf` — exercise DFT performance and formal-evidence governance. Skipped
+  unless the run includes `--run-perf`; performance seals do not gate
+  pre-v0.1 correctness.
 
 Markers are registered with `--strict-markers`, so a typo'd marker fails fast.
 
 ## Commands
 
-Local fast lane — no reference engines, so it never builds LAMMPS:
+Local equivalent of the required pull-request lane:
 
 ```bash
-uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow"
 ```
 
-Hosted CI/package boundary lane — the deterministic subset GitHub Actions runs
-before packaging:
+GitHub Actions runs that command on `ubuntu-22.04` with the `mlx-cpu` extra.
+The opt-in `reference`, `data`, `gpu`, and `perf` tests skip unless their
+matching flag is passed.
+
+The scheduled/manual CPU lane includes `slow` tests and coverage:
 
 ```bash
-uv run --locked --no-default-groups --group test python -m pytest tests/test_runtime_boundaries.py
-```
-
-Package suite + coverage — local Apple Silicon release gate. Reference-engine
-and vendor-data tests remain separate opt-in lanes:
-
-```bash
-uv run --locked --no-default-groups --group test python -m pytest -m "not reference and not data and not gpu" --cov=mlx_atomistic --cov-report=term-missing --cov-fail-under=80
+uv run --locked --no-default-groups --extra prep --group test python -m pytest --cov=mlx_atomistic --cov-report=term-missing
 ```
 
 Run explicit reference or data tiers only after provisioning those local
@@ -51,12 +50,12 @@ surfaces:
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group dev python -m pytest --run-reference -m reference
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group dev python -m pytest --run-data -m data
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test python -m pytest --run-gpu -m gpu
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --extra prep --group test python -m pytest --run-perf -m perf
 ```
 
-MLX runtime tests require a local Apple Silicon host with stable MLX execution.
-Headless, virtualized, or hosted macOS sessions can collect tests and run static
-package-boundary checks, but they are not the runtime validation environment for
-`0.0.1`.
+The Linux CPU result is the routine correctness reference. Metal is a local
+development and optimization instrument: use it for real workloads, Metal-path
+changes, and occasional CPU-versus-GPU parity, not as a routine CI tier.
 
 ## Dependency groups
 

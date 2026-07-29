@@ -3,11 +3,10 @@ title: "DFT Numerics"
 ---
 
 
-Milestone 3 makes the DFT layer more numerically inspectable. The primary SCF
-path is still small, Γ-point, and alpha/proof-level, but the code now has
-explicit checks for the Kohn-Sham operator, orbital residuals, energy
-decomposition, nonlocal projector diagnostics, and total-energy force
-consistency.
+The first part of this page documents numerics for the legacy
+`DFTSystem`/`run_scf` Γ-point reference path. The periodic production path is a
+separate implementation with k-point integration, a block-Davidson solver,
+reciprocal-space GTH operators, and analytic fixed-cell forces.
 
 ## Kohn-Sham Operator
 

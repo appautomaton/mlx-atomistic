@@ -49,10 +49,12 @@ validation surfaces only. They never replace the MLX runtime path.
 
 - **Apple Silicon native:** MLX arrays execute through the Metal backend on
   your machine. No CUDA, no server, no cloud.
-- **Plane-wave DFT building blocks:** Γ-point Kohn–Sham SCF, LDA plus
-  public-alpha PBE-PZ81 GGA diagnostics, non-SCF k-point/band diagnostics,
-  Davidson/preconditioned-residual eigensolver diagnostics, and GTH/UPF
-  pseudopotentials with proof-level local and nonlocal projector diagnostics.
+- **Two explicit DFT surfaces:** the legacy `DFTSystem`/`run_scf` path is a
+  small Γ-point teaching and dense-reference surface. The periodic
+  `PeriodicDFTSystem`/`run_periodic_scf` path uses PBE-PW92, GTH
+  pseudopotentials, Monkhorst-Pack meshes, a block-Davidson/Rayleigh-Ritz
+  eigensolver, frozen-density band paths, and periodic forces. Its verified
+  claims are limited to the published material workloads, not broad chemistry.
 - **Molecular-mechanics building blocks:** Lennard-Jones, Coulomb, harmonic
   bonds and angles, periodic and Ryckaert-Bellemans torsions, NVE/Langevin NVT,
   bounded PME proof surfaces, and proof-level barostat/NPT diagnostics.
@@ -100,6 +102,11 @@ uv run python -m mlx_atomistic.benchmarks.validation_gauntlet --json
 uv run python -m mlx_atomistic.benchmarks.stability --json
 uv run python -m mlx_atomistic.benchmarks.dft_scf --sizes 8,16,24,32 --iterations 5 --mixer both --json
 ```
+
+The committed [DFT material-validation summary](docs/benchmarks/dft-material-validation.md)
+records the admitted silicon and carbon results, the accepted MgO core
+properties, and each remaining limitation. Generated calculation artifacts stay
+under gitignored `results/`.
 
 ## Documentation
 

@@ -86,8 +86,8 @@ Working guidance:
 Test markers (see `pyproject.toml` and `conftest.py`):
 
 - `slow`, `integration`: descriptive markers for long or multi-component tests.
-- `reference`, `data`, `gpu`: opt-in. They are skipped unless you pass
-  `--run-reference`, `--run-data`, or `--run-gpu`.
+- `reference`, `data`, `gpu`, `perf`: opt-in. They are skipped unless you pass
+  `--run-reference`, `--run-data`, `--run-gpu`, or `--run-perf`.
 
 ## Documentation and docstrings
 

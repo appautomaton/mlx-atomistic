@@ -15,10 +15,10 @@ validation surfaces; they do not replace the MLX runtime path.
 
 ## Two scales, one runtime
 
-- **Density Functional Theory** — spin-unpolarized Γ-point plane-wave Kohn-Sham
-  SCF, LDA plus public-alpha PBE-PZ81 GGA diagnostics, non-SCF k-point/band
-  diagnostics, pseudopotentials (GTH / UPF), forces, stress, and geometry
-  optimization prototypes.
+- **Density Functional Theory** — a legacy Γ-point teaching/reference path,
+  plus a separate periodic PBE-GTH path with Monkhorst-Pack SCF,
+  block-Davidson solves, frozen-density bands, and periodic forces. Verified
+  claims stay limited to the published silicon, carbon, and MgO workloads.
 - **Molecular Mechanics** — Lennard-Jones, Coulomb, harmonic bonds/angles,
   periodic + Ryckaert–Bellemans torsions, bounded PME, NVE and Langevin NVT.
 

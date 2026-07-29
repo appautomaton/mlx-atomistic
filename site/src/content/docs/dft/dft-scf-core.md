@@ -3,9 +3,10 @@ title: "DFT SCF Core"
 ---
 
 
-The DFT layer now has a more explicit SCF core while staying intentionally
+This page covers the legacy `DFTSystem`/`run_scf` core. It stays intentionally
 small: spin-unpolarized Γ-point SCF, orthorhombic cells, local Gaussian toy
-pseudopotentials, and ion-backed GTH/UPF pseudopotential prototypes.
+pseudopotentials, and ion-backed GTH/UPF pseudopotential prototypes. It is not
+the periodic `PeriodicDFTSystem`/`run_periodic_scf` materials path.
 
 ## Exchange-Correlation
 

@@ -83,13 +83,15 @@ For normal development:
 
 ```bash
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test ruff check src tests
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test python -m pytest -m "not slow and not integration and not reference and not data and not gpu"
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow"
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.validation_gauntlet --json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.stability --sizes 16 --steps 2 --bonded-steps 2 --dt-values 0.001 --json
 ```
 
 For serious local performance work on Apple Silicon, run the larger benchmark
 matrix outside the fast test loop and keep the JSON/CSV artifacts for comparison.
+Formal DFT performance-governance tests are also opt-in through
+`--run-perf -m perf`; they do not gate pre-v0.1 correctness.
 
 ## OpenMM/OpenCL Reference
 

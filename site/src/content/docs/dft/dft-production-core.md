@@ -3,9 +3,17 @@ title: "DFT Production-Core Milestone"
 ---
 
 
-This milestone consolidates the next DFT phases into one correctness-first release. The library now has working prototype surfaces for nonlocal pseudopotentials, iterative Kohn-Sham solving, spin/occupation diagnostics, k-point and band-path diagnostics, finite-difference stress, dense SCF restart persistence, and reference comparison.
+The DFT package contains two intentionally different surfaces. The legacy
+`DFTSystem`/`run_scf` surface supplies tiny Γ-point teaching, dense-reference,
+spin, occupation, finite-difference stress, and restart diagnostics. The
+periodic `PeriodicDFTSystem`/`run_periodic_scf` surface supplies the
+materials-workload path: PBE-PW92, reciprocal-space GTH operators,
+Monkhorst-Pack integration, block-Davidson/Rayleigh-Ritz solves,
+frozen-density band paths, and periodic forces.
 
-The implementation is still not chemically certified production DFT. It is a production-core infrastructure milestone: the main algorithms exist, have tests, and expose diagnostics, but the numerical models remain intentionally conservative.
+The periodic implementation has verified results for specific workloads, but
+is not broadly chemically certified. Capability claims are tied to the
+[material-validation summary](/mlx-atomistic/benchmarks/dft-material-validation/).
 
 ## Nonlocal Pseudopotentials
 
@@ -21,13 +29,10 @@ SCF applies nonlocal projectors by default when available. `SCFConfig(apply_nonl
 
 ## Solvers
 
-Dense diagonalization remains the tiny-grid reference. Above the dense cutoff,
-`auto` SCF selects a Davidson-style alpha path. The current non-dense
-implementation is a kinetic-preconditioned residual iteration, not a production
-Davidson/Rayleigh-Ritz solver; it still falls back to the dense reference on
-tiny validation grids and reports convergence metadata for callers.
-
-Diagnostics expose residuals, orthonormality error, solver metadata, subspace size, and restart count.
+Dense diagonalization remains the tiny-grid reference for the legacy path.
+Periodic SCF and bands use the MLX-native block-Davidson/Rayleigh-Ritz solver
+without building the full plane-wave Hamiltonian. Diagnostics expose residuals,
+orthonormality error, subspace work, and convergence metadata.
 
 ## Spin, Occupations, k-Points, And Bands
 
@@ -36,12 +41,11 @@ The new spin layer is collinear only:
 - `unpolarized`: one total density `ρ(r)`.
 - `polarized`: separate `ρ↑(r)` and `ρ↓(r)` diagnostics.
 
-Occupation models include fixed occupations and Fermi-Dirac occupations. k-point
-abstractions support Γ-point meshes, reduced-coordinate Monkhorst-Pack diagnostic
-meshes, and Cartesian non-SCF band paths. The kinetic operator supports
-`0.5|G + k|²`; Hamiltonian band evaluation rejects reduced-coordinate paths, and
-nonlocal projector bands are Γ-only until Bloch-phase nonlocal projectors are
-implemented.
+The legacy layer exposes fixed and Fermi-Dirac occupation diagnostics. The
+periodic layer uses reduced-coordinate Monkhorst-Pack meshes and
+`0.5|G + k|²`, including Bloch-phase local and nonlocal GTH evaluation.
+`run_periodic_band_structure` reuses a converged SCF density and solves
+non-self-consistently along a high-symmetry path.
 
 ## Stress, Relaxation, And Restart
 

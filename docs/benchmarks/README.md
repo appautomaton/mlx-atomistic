@@ -33,6 +33,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [dft-material-validation.md](./dft-material-validation.md) | mlx_atomistic | accepted Si, C, and MgO periodic DFT workloads | Metal | Apple M5 Max |
 | [inventory-gap-matrix.md](./inventory-gap-matrix.md) | mlx_atomistic | benchmark inventory and Phase 3 gaps | N/A | N/A |
 | [benchmark-ladder.md](./benchmark-ladder.md) | mlx_atomistic/openmm-reference/lammps-reference | benchmark ladder and row decision value | Metal/OpenCL where available | local |
 | [same-workload-comparison-matrix.md](./same-workload-comparison-matrix.md) | mlx_atomistic/openmm-reference | planned same-workload comparison pairs | Metal/OpenCL where available | local |
@@ -58,7 +59,7 @@ LAMMPS, OpenCL, large downloaded fixtures, or committed raw outputs.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
-| `uv run --locked --no-default-groups --group test python -m pytest tests/test_benchmarks.py -m "not slow and not reference and not data and not gpu"` | mlx_atomistic | fast developer | pytest stdout; temporary test files only |
+| `uv run --locked --no-default-groups --extra prep --group test python -m pytest tests/test_benchmarks.py -m "not slow"` | mlx_atomistic | fast developer | pytest stdout; opt-in reference/data/gpu/perf tests skip |
 | `uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 1 --particles 16 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --sizes 16 --evaluations 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --sizes 32 --steps 1 --sample-interval 1 --diagnostic-interval 1 --evaluation-interval 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |

@@ -18,6 +18,20 @@ benchmark-design context, not as a pass/fail target for `mlx_atomistic`.
 | Fast developer | Smoke-check importable MLX benchmark modules and JSON/CSV shape. | `uv run` environment only; no mandatory OpenMM, LAMMPS, OpenCL, or large fixture. | Temporary pytest paths, stdout JSON, or optional local CSV. |
 | Opt-in performance | Larger Apple Silicon runs, prepared production fixtures, and reference-engine context. | Local accelerator, optional OpenMM/LAMMPS/dev reference setup, and optional gitignored fixtures. | Raw JSON/CSV under gitignored `results/`; committed summaries under `docs/benchmarks/`. |
 
+## Historical Neutral-PME Branch
+
+`feat/neutralized-dhfr-pme-validation` was audited at commit `7584ec5` against
+current `main` and is retired, not merged. Its still-useful evidence is a
+controlled 24,488-atom neutral TIP3P/NaCl PME result: it is explicitly not a
+DHFR protein or GPCRmd simulation. The branch recorded three OpenMM parity
+configurations, bounded NVE/NVT checks, and a `0.06008 s` median MLX LJ+PME
+nonbonded evaluation with no sustained five-evaluation memory growth.
+
+Current main's charged 94,232-atom JAC and source-backed 92,001-atom GPCRmd
+rows supersede that branch for production-path capability claims. No branch
+code or deletion-heavy history was ported; the neutral row remains historical
+context at `7584ec5`, and NPT plus analytic virial remain open.
+
 ## Current MLX Benchmark Modules
 
 | Module | Current coverage | Test/doc evidence | Result/raw-output location | Tier | Phase 3 gap |

@@ -35,6 +35,26 @@ from mlx_atomistic.benchmarks import (
     validation_gauntlet,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_historical_dhfr_branch_disposition_is_documented():
+    root_inventory = (
+        ROOT / "docs/benchmarks/inventory-gap-matrix.md"
+    ).read_text()
+    site_inventory = (
+        ROOT / "site/src/content/docs/benchmarks/inventory-gap-matrix.md"
+    ).read_text()
+
+    for text in (root_inventory, site_inventory):
+        normalized = " ".join(text.split())
+        assert "feat/neutralized-dhfr-pme-validation" in normalized
+        assert "7584ec5" in normalized
+        assert "retired, not merged" in normalized
+        assert "24,488-atom neutral TIP3P/NaCl" in normalized
+        assert "not a DHFR protein" in normalized
+        assert "NPT plus analytic virial remain open" in normalized
+
 
 def _assert_normalized_payload(payload, *, timing_metric, status="ok"):
     for field in NORMALIZED_BENCHMARK_FIELDS:

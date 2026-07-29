@@ -3,9 +3,10 @@ title: "DFT Foundations"
 ---
 
 
-This first DFT slice is a small spin-unpolarized Γ-point plane-wave prototype.
-It is meant to make the numerical building blocks inspectable before we try to
-make them chemically broad or highly optimized.
+This page documents the legacy `DFTSystem`/`run_scf` teaching and
+dense-reference surface: a small spin-unpolarized Γ-point plane-wave prototype.
+It is intentionally separate from the periodic production path built around
+`PeriodicDFTSystem` and `run_periodic_scf`.
 
 ## What It Models
 
@@ -56,12 +57,13 @@ Programmatic toy systems are available as `toy_one_electron_dft_example()` and
 
 ## Current Limits
 
-This is not production DFT. The primary SCF path is still Γ-point and
-spin-unpolarized. K-point support is non-SCF diagnostics, spin/occupation
-support is diagnostic, real pseudopotential formats and nonlocal projectors are
-proof-level, and force, stress, and geometry optimization paths are prototype
-surfaces. Production materials validation, cell relaxation, and custom Metal
-kernels remain out of scope for `0.0.1`.
+This legacy path is not production DFT. It remains Γ-point and
+spin-unpolarized; its spin, occupation, pseudopotential, force, stress, and
+geometry surfaces are diagnostic. The separate periodic path supports
+Monkhorst-Pack integration, reciprocal-space GTH operators, Davidson solves,
+frozen-density band paths, and analytic periodic forces. Its validated
+materials and limits are recorded in the
+[DFT material-validation summary](/mlx-atomistic/benchmarks/dft-material-validation/).
 
 The current value is correctness and observability: density normalization,
 energy decomposition, SCF residuals, FFT behavior, pseudopotential diagnostics,

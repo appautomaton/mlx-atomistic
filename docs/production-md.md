@@ -36,7 +36,9 @@ Drude/polarizable terms, and other terms the MLX engine cannot yet represent
 faithfully. Fixed-cell orthorhombic PME is a bounded production surface:
 accepted artifacts must provide complete configuration/readiness metadata and
 must fit the measured atom/mesh/cutoff/cell envelope. First-path NPT remains a
-proof surface, and unsupported production cases remain blockers.
+proof surface: `simulate_npt()` currently completes its NVT steps and makes one
+terminal cell proposal rather than scheduling repeated proposals inside the MD
+loop. Unsupported production cases remain blockers.
 
 ## Bounded GPCRmd 729 Fixed-Cell Result
 

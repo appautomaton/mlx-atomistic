@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -35,6 +36,8 @@ from mlx_atomistic.dft import (
     save_dense_scf_restart,
     spin_density_from_orbitals,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.data  # needs gitignored vendors/ data; skipped on CI fast lane
@@ -298,3 +301,27 @@ def test_dft_qm_scope_report_classifies_cp2k_qe_boundaries():
     unknown = dft_qm_scope_readiness_report("cp2k-runtime-wrapper").to_dict()
     assert unknown["status"] == "fail-closed"
     assert unknown["blockers"] == ["unknown_dft_qm_feature:cp2k_runtime_wrapper"]
+
+
+def test_dft_material_validation_documentation_preserves_scope_and_limits():
+    root_summary = (
+        ROOT / "docs/benchmarks/dft-material-validation.md"
+    ).read_text()
+    site_summary = (
+        ROOT
+        / "site/src/content/docs/benchmarks/dft-material-validation.md"
+    ).read_text()
+    production_doc = (ROOT / "docs/dft-production-core.md").read_text()
+
+    for text in (root_summary, site_summary):
+        assert "PeriodicDFTSystem" in text
+        assert "0.578 eV" in text
+        assert "0.438 meV/atom" in text
+        assert "16.89%" in text
+        assert "21 of 24" in text
+        assert "2.246e-4 Ha/bohr" in text
+        assert "threshold was not weakened" in text
+        assert "universal periodic DFT accuracy" in text
+    normalized_production = " ".join(production_doc.split())
+    assert "legacy `DFTSystem`/`run_scf`" in normalized_production
+    assert "`PeriodicDFTSystem`/`run_periodic_scf`" in normalized_production
