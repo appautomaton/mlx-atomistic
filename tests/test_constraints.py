@@ -52,6 +52,31 @@ def test_distance_constraints_remain_stable_in_short_long_run():
     assert result.final_state.step == 100
 
 
+def test_periodic_distance_constraints_preserve_continuous_molecules():
+    constraints = DistanceConstraints(
+        [(0, 1)],
+        distances=[1.0],
+        max_iterations=4,
+    )
+    positions = np.asarray(
+        [[7.9, 1.0, 1.0], [8.9, 1.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    projected, error = constraints.apply_positions(
+        positions,
+        masses=np.ones((2,), dtype=np.float32),
+        cell=Cell.cubic(8.0),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(projected)[1] - np.asarray(projected)[0],
+        [1.0, 0.0, 0.0],
+        atol=1.0e-6,
+    )
+    assert float(np.asarray(error)) <= 1.0e-6
+
+
 def test_settle_water_constraints_project_positions_exactly():
     constraints = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
     positions = np.asarray(
@@ -63,6 +88,27 @@ def test_settle_water_constraints_project_positions_exactly():
 
     np.testing.assert_allclose(_distances(np.asarray(projected)), [1.0, 1.0, 1.5], atol=1e-6)
     assert float(np.asarray(error)) <= 1e-6
+
+
+def test_periodic_settle_preserves_continuous_water_coordinates():
+    constraints = SettleWaterConstraints(
+        [(0, 1, 2)],
+        oh_distance=1.0,
+        hh_distance=1.5,
+    )
+    positions = np.asarray(
+        [[7.9, 2.0, 2.0], [8.9, 2.0, 2.0], [7.6, 2.9, 2.0]],
+        dtype=np.float32,
+    )
+
+    projected, error = constraints.apply_positions(
+        positions,
+        masses=np.asarray([16.0, 1.0, 1.0]),
+        cell=Cell.cubic(8.0),
+    )
+
+    assert np.asarray(projected)[1, 0] > 8.0
+    assert float(np.asarray(error)) <= 1.0e-6
 
 
 def test_settle_water_constraints_remove_pair_relative_velocity():

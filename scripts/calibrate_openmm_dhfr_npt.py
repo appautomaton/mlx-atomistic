@@ -167,8 +167,109 @@ def select_calibration_budget(input_dir: str | Path) -> dict[str, Any]:
             "calibration run identity mismatch: " + ", ".join(mismatched)
         )
 
+    candidates = _build_candidates(reports)
+    selected = next(
+        (
+            int(candidate["formal_total_attempts"])
+            for candidate in candidates
+            if candidate["qualifies"]
+        ),
+        None,
+    )
+    unsigned = {
+        "schema": CALIBRATION_REPORT_SCHEMA,
+        "status": "selected" if selected is not None else "no_qualifier",
+        "selected_formal_attempts": selected,
+        "source_manifest_fingerprint": next(
+            iter(identities["source_manifest_fingerprint"])
+        ),
+        "protocol_fingerprint": next(iter(identities["protocol_fingerprint"])),
+        "openmm_version": next(iter(identities["openmm_version"])),
+        "run_fingerprints": sorted(
+            str(report["report_fingerprint"]) for report in reports
+        ),
+        "candidates": candidates,
+        "runs": reports,
+    }
+    return {**unsigned, "report_fingerprint": payload_fingerprint(unsigned)}
+
+
+def validate_calibration_report(
+    report: Mapping[str, Any],
+    *,
+    require_selected: bool = True,
+) -> dict[str, Any]:
+    """Validate a complete six-run calibration report and its selection."""
+
+    payload = dict(report)
+    fingerprint = payload.pop("report_fingerprint", None)
+    if payload.get("schema") != CALIBRATION_REPORT_SCHEMA:
+        raise DHFRNPTValidationError("calibration report schema is unsupported")
+    if fingerprint != payload_fingerprint(payload):
+        raise DHFRNPTValidationError("calibration report fingerprint mismatch")
+    status = payload.get("status")
+    if status not in {"selected", "no_qualifier"}:
+        raise DHFRNPTValidationError("calibration report status is invalid")
+    if require_selected and status != "selected":
+        raise DHFRNPTValidationError("calibration did not select a formal budget")
+    runs = payload.get("runs")
+    if not isinstance(runs, list) or len(runs) != (
+        len(CALIBRATION_SEEDS) * len(CALIBRATION_AXES)
+    ):
+        raise DHFRNPTValidationError("calibration report runs are incomplete")
+    validated = [validate_calibration_run(run) for run in runs]
+    actual_pairs = {(run["seed"], run["axis"]) for run in validated}
+    expected_pairs = {
+        (seed, axis)
+        for seed in CALIBRATION_SEEDS
+        for axis in CALIBRATION_AXES
+    }
+    if actual_pairs != expected_pairs or len(actual_pairs) != len(validated):
+        raise DHFRNPTValidationError("calibration report run inventory mismatch")
+    for name in (
+        "source_manifest_fingerprint",
+        "protocol_fingerprint",
+        "openmm_version",
+    ):
+        values = {str(run[name]) for run in validated}
+        if values != {str(payload.get(name))}:
+            raise DHFRNPTValidationError(
+                f"calibration report {name} does not reconcile"
+            )
+    expected_run_fingerprints = sorted(
+        str(run["report_fingerprint"]) for run in validated
+    )
+    if payload.get("run_fingerprints") != expected_run_fingerprints:
+        raise DHFRNPTValidationError(
+            "calibration report run fingerprints do not reconcile"
+        )
+    expected_candidates = _build_candidates(validated)
+    if payload.get("candidates") != expected_candidates:
+        raise DHFRNPTValidationError(
+            "calibration report candidates do not reconcile"
+        )
+    expected_selected = next(
+        (
+            int(candidate["formal_total_attempts"])
+            for candidate in expected_candidates
+            if candidate["qualifies"]
+        ),
+        None,
+    )
+    if payload.get("selected_formal_attempts") != expected_selected:
+        raise DHFRNPTValidationError(
+            "calibration report selected budget does not reconcile"
+        )
+    expected_status = "selected" if expected_selected is not None else "no_qualifier"
+    if status != expected_status:
+        raise DHFRNPTValidationError(
+            "calibration report status does not reconcile"
+        )
+    return {**payload, "report_fingerprint": str(fingerprint)}
+
+
+def _build_candidates(reports: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     candidates = []
-    selected = None
     for prefix, formal_budget in zip(
         CALIBRATION_PREFIXES,
         FORMAL_BUDGETS,
@@ -217,25 +318,7 @@ def select_calibration_budget(input_dir: str | Path) -> dict[str, Any]:
             "seeds": seed_evidence,
         }
         candidates.append(candidate)
-        if qualifies and selected is None:
-            selected = formal_budget
-
-    unsigned = {
-        "schema": CALIBRATION_REPORT_SCHEMA,
-        "status": "selected" if selected is not None else "no_qualifier",
-        "selected_formal_attempts": selected,
-        "source_manifest_fingerprint": next(
-            iter(identities["source_manifest_fingerprint"])
-        ),
-        "protocol_fingerprint": next(iter(identities["protocol_fingerprint"])),
-        "openmm_version": next(iter(identities["openmm_version"])),
-        "run_fingerprints": sorted(
-            str(report["report_fingerprint"]) for report in reports
-        ),
-        "candidates": candidates,
-        "runs": reports,
-    }
-    return {**unsigned, "report_fingerprint": payload_fingerprint(unsigned)}
+    return candidates
 
 
 def _run_calibration(

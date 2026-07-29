@@ -100,8 +100,6 @@ class DistanceConstraints:
             correction = errors[:, None] * unit
             constrained = constrained.at[i].add(-weight_i[:, None] * correction)
             constrained = constrained.at[j].add(weight_j[:, None] * correction)
-            if cell is not None:
-                constrained = cell.wrap(constrained)
         return constrained, self.max_error(constrained, cell)
 
     def apply_velocities(
@@ -241,8 +239,6 @@ class SettleWaterConstraints:
             constrained_np[hydrogen_a] = origin + along_bisector * bisector + half_hh * difference
             constrained_np[hydrogen_b] = origin + along_bisector * bisector - half_hh * difference
         constrained = as_mx_array(constrained_np)
-        if cell is not None:
-            constrained = cell.wrap(constrained)
         return constrained, self.max_error(constrained, cell)
 
     def apply_velocities(

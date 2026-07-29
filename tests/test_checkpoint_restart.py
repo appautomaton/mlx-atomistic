@@ -670,6 +670,15 @@ def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
     assert resumed.barostat_metadata["axis_accepted"] == continuous.barostat_metadata[
         "axis_accepted"
     ]
+    assert resumed.barostat_metadata["proposal_volume_steps"] == (
+        continuous.barostat_metadata["proposal_volume_steps"]
+    )
+    assert resumed.barostat_metadata["adaptation_attempts"] == (
+        continuous.barostat_metadata["adaptation_attempts"]
+    )
+    assert resumed.barostat_metadata["adaptation_accepted"] == (
+        continuous.barostat_metadata["adaptation_accepted"]
+    )
     assert resumed.barostat_metadata["proposal_history"] == continuous.barostat_metadata[
         "proposal_history"
     ]

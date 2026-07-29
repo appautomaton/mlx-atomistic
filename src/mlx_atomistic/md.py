@@ -421,6 +421,7 @@ class SimulationConfig:
     virtual_sites: VirtualSiteManager | None = None
     block_size: int = 1
     center_of_mass_motion_interval: int | None = None
+    wrap_positions: bool = True
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -694,8 +695,12 @@ class BarostatProposal:
     axis: int | None
     log_reverse_over_forward: float
     kernel: str
+    volume_step: float
     source_pme_plan_fingerprints: tuple[str, ...] = ()
     candidate_pme_plan_fingerprints: tuple[str, ...] = ()
+    delta_energy: float | None = None
+    log_acceptance: float | None = None
+    log_uniform_draw: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2359,7 +2364,7 @@ def simulate_nve(
         acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         velocities_half = state.velocities + 0.5 * config.dt * acceleration
         next_positions = state.positions + config.dt * velocities_half
-        if cell is not None:
+        if cell is not None and config.wrap_positions:
             next_positions = cell.wrap(next_positions)
         constraint_error = _zero_constraint_error(next_positions)
         if constraints is not None:
@@ -2830,14 +2835,14 @@ def simulate_nvt(
             accel = fscale * forces / masses_col
             vel_half = vel + 0.5 * dt * accel
             pos = pos + 0.5 * dt * vel_half
-            if cell is not None:
+            if cell is not None and config.wrap_positions:
                 pos = cell.wrap(pos)
             split_keys = mx.random.split(prng, 2)
             prng = split_keys[0]
             noise = mx.random.normal(vel.shape, key=split_keys[1])
             middle = velocity_decay * vel_half + (noise_scale / sqrt_masses_col) * noise
             pos = pos + 0.5 * dt * middle
-            if cell is not None:
+            if cell is not None and config.wrap_positions:
                 pos = cell.wrap(pos)
             _, next_forces = _energy_forces_from_terms(
                 pos, unnamed_terms, cell=cell, pairs=block_pairs, virtual_sites=None
@@ -3069,7 +3074,7 @@ def simulate_nvt(
         if isinstance(thermostat, LangevinThermostat):
             velocities_half = state.velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + 0.5 * config.dt * velocities_half
-            if cell is not None:
+            if cell is not None and config.wrap_positions:
                 next_positions = cell.wrap(next_positions)
 
             keys = mx.random.split(key, 2)
@@ -3092,7 +3097,7 @@ def simulate_nvt(
             scaled_velocities = state.velocities * thermostat_scale
             velocities_half = scaled_velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + config.dt * velocities_half
-        if cell is not None:
+        if cell is not None and config.wrap_positions:
             next_positions = cell.wrap(next_positions)
         constraint_error = _zero_constraint_error(next_positions)
         if constraints is not None:
@@ -3453,8 +3458,11 @@ def simulate_npt(
         attempts,
         accepted_count,
         proposal_volume_step,
+        proposal_volume_steps,
         axis_attempts,
         axis_accepted,
+        adaptation_attempts,
+        adaptation_accepted,
         proposal_history,
     ) = _restore_barostat_state(
         barostat,
@@ -3473,6 +3481,7 @@ def simulate_npt(
             steps=segment_steps,
             initial_step=current_step,
             initial_time=current_time,
+            wrap_positions=False,
         )
         if isinstance(thermostat, LangevinThermostat):
             active_thermostat = replace(
@@ -3518,6 +3527,7 @@ def simulate_npt(
                 barostat=barostat,
                 rng=barostat_rng,
                 volume_step=proposal_volume_step,
+                axis_volume_steps=proposal_volume_steps,
                 constraints=constraints,
                 boltzmann_constant=config.boltzmann_constant,
                 neighbor_manager=neighbor_manager,
@@ -3539,6 +3549,24 @@ def simulate_npt(
             if axis_name is not None:
                 axis_attempts[axis_name] += 1
                 axis_accepted[axis_name] += int(accepted)
+                adaptation_attempts[axis_name] += 1
+                adaptation_accepted[axis_name] += int(accepted)
+                proposal_volume_steps[axis_name] = (
+                    _adapt_anisotropic_volume_step(
+                        volume_step=proposal_volume_steps[axis_name],
+                        attempted=adaptation_attempts[axis_name],
+                        accepted=adaptation_accepted[axis_name],
+                        current_volume=old_volume,
+                    )
+                )
+                if adaptation_attempts[axis_name] >= 10 and (
+                    adaptation_accepted[axis_name]
+                    < 0.25 * adaptation_attempts[axis_name]
+                    or adaptation_accepted[axis_name]
+                    > 0.75 * adaptation_attempts[axis_name]
+                ):
+                    adaptation_attempts[axis_name] = 0
+                    adaptation_accepted[axis_name] = 0
             proposal_record = {
                 "attempt": attempts,
                 "step": final_state.step,
@@ -3553,6 +3581,10 @@ def simulate_npt(
                 "candidate_pme_plan_fingerprints": list(
                     proposal.candidate_pme_plan_fingerprints
                 ),
+                "delta_energy": proposal.delta_energy,
+                "log_acceptance": proposal.log_acceptance,
+                "log_uniform_draw": proposal.log_uniform_draw,
+                "volume_step": proposal.volume_step,
                 "old_volume": old_volume,
                 "new_volume": float(np.asarray(final_cell.volume)),
             }
@@ -3637,8 +3669,11 @@ def simulate_npt(
             "final_volume": float(np.asarray(current_cell.volume)),
             "molecule_count": molecule_count,
             "proposal_volume_step": proposal_volume_step,
+            "proposal_volume_steps": proposal_volume_steps,
             "axis_attempts": axis_attempts,
             "axis_accepted": axis_accepted,
+            "adaptation_attempts": adaptation_attempts,
+            "adaptation_accepted": adaptation_accepted,
             "proposal_history": proposal_history,
             "rng_state": dict(barostat_rng.bit_generator.state),
             "center_of_mass_motion_interval": config.center_of_mass_motion_interval,
@@ -3925,6 +3960,7 @@ def _attempt_barostat_move(
     barostat: MonteCarloBarostat,
     rng: np.random.Generator,
     volume_step: float,
+    axis_volume_steps: dict[str, float] | None = None,
     constraints: DistanceConstraints | None,
     boltzmann_constant: float,
     neighbor_manager: NeighborListManager | None = None,
@@ -3942,6 +3978,7 @@ def _attempt_barostat_move(
         rng,
         volume=float(np.asarray(cell.volume)),
         volume_step=volume_step,
+        axis_volume_steps=axis_volume_steps,
     )
     proposed_cell = _scaled_cell(cell, np.asarray(proposal.scale_factors))
     proposed_positions = molecularly_strained_positions(
@@ -3954,11 +3991,21 @@ def _attempt_barostat_move(
     proposed_velocities = state.velocities
     constraint_error = _zero_constraint_error(proposed_positions)
     if constraints is not None:
-        proposed_positions, constraint_error = constraints.apply_positions(
-            proposed_positions,
-            state.masses,
-            proposed_cell,
-        )
+        if _barostat_constraint_projection_required(
+            constraints,
+            molecule_ids=molecule_ids,
+            particle_count=state.positions.shape[0],
+        ):
+            proposed_positions, constraint_error = constraints.apply_positions(
+                proposed_positions,
+                state.masses,
+                proposed_cell,
+            )
+        else:
+            constraint_error = constraints.max_error(
+                proposed_positions,
+                proposed_cell,
+            )
 
     proposed_eval_positions = _neighbor_evaluation_positions(proposed_positions, virtual_sites)
     current_force_terms = _cell_bound_force_terms(
@@ -4023,8 +4070,9 @@ def _attempt_barostat_move(
             )
         ).size
     )
+    delta_energy = float(np.asarray(new_energy - old_energy))
     log_acceptance = _barostat_log_acceptance_probability(
-        delta_energy=float(np.asarray(new_energy - old_energy)),
+        delta_energy=delta_energy,
         pressure=barostat.pressure,
         old_volume=old_volume,
         new_volume=new_volume,
@@ -4032,7 +4080,20 @@ def _attempt_barostat_move(
         beta=beta,
         log_reverse_over_forward=proposal.log_reverse_over_forward,
     )
-    accepted = log_acceptance >= 0.0 or float(np.log(rng.random())) < log_acceptance
+    log_uniform_draw = (
+        None if log_acceptance >= 0.0 else float(np.log(rng.random()))
+    )
+    accepted = (
+        log_acceptance >= 0.0
+        or log_uniform_draw is not None
+        and log_uniform_draw < log_acceptance
+    )
+    proposal = replace(
+        proposal,
+        delta_energy=delta_energy,
+        log_acceptance=log_acceptance,
+        log_uniform_draw=log_uniform_draw,
+    )
     if not accepted:
         return state, cell, current_force_terms, False, proposal
     if neighbor_manager is not None and candidate_neighbor_manager is not None:
@@ -4070,6 +4131,22 @@ def _barostat_log_acceptance_probability(
         - molecule_count / beta * float(np.log(new_volume / old_volume))
     )
     return -beta * acceptance_work + log_reverse_over_forward
+
+
+def _barostat_constraint_projection_required(
+    constraints: DistanceConstraints,
+    *,
+    molecule_ids: object | None,
+    particle_count: int,
+) -> bool:
+    pairs = np.asarray(constraints.pairs, dtype=np.int32).reshape((-1, 2))
+    if pairs.shape[0] == 0:
+        return False
+    labels = normalize_molecule_ids(
+        molecule_ids,
+        particle_count=particle_count,
+    )
+    return bool(np.any(labels[pairs[:, 0]] != labels[pairs[:, 1]]))
 
 
 def _cell_bound_force_terms(
@@ -4217,6 +4294,7 @@ def _barostat_proposal(
     *,
     volume: float,
     volume_step: float,
+    axis_volume_steps: dict[str, float] | None = None,
 ) -> BarostatProposal:
     max_scale = barostat.max_log_volume_scale
     if volume_step <= 0.0 or volume <= volume_step:
@@ -4230,11 +4308,19 @@ def _barostat_proposal(
             axis=None,
             log_reverse_over_forward=0.0,
             kernel="symmetric_volume_delta",
+            volume_step=volume_step,
         )
     if barostat.mode == "anisotropic":
         enabled_axes = np.flatnonzero(np.asarray(barostat.axes, dtype=bool))
         axis = int(rng.choice(enabled_axes))
-        relative_volume_change = rng.uniform(-volume_step, volume_step) / volume
+        selected_volume_step = (
+            volume_step
+            if axis_volume_steps is None
+            else float(axis_volume_steps["xyz"[axis]])
+        )
+        relative_volume_change = (
+            rng.uniform(-selected_volume_step, selected_volume_step) / volume
+        )
         scale_factors = np.ones((3,), dtype=np.float64)
         scale_factors[axis] = 1.0 + relative_volume_change
         return BarostatProposal(
@@ -4242,6 +4328,7 @@ def _barostat_proposal(
             axis=axis,
             log_reverse_over_forward=0.0,
             kernel="symmetric_axis_volume_delta",
+            volume_step=selected_volume_step,
         )
 
     plane_axes = _barostat_plane_axes(barostat.membrane_plane)
@@ -4258,6 +4345,7 @@ def _barostat_proposal(
         axis=None,
         log_reverse_over_forward=float(np.sum(log_axis_scale)),
         kernel="symmetric_log_area_and_length",
+        volume_step=volume_step,
     )
 
 
@@ -4265,6 +4353,22 @@ def _scaled_cell(cell: Cell, scale_factors: np.ndarray) -> Cell:
     matrix = np.asarray(cell.matrix, dtype=np.float64).copy()
     matrix *= np.asarray(scale_factors, dtype=np.float64)[:, None]
     return Cell(matrix)
+
+
+def _adapt_anisotropic_volume_step(
+    *,
+    volume_step: float,
+    attempted: int,
+    accepted: int,
+    current_volume: float,
+) -> float:
+    if attempted < 10:
+        return volume_step
+    if accepted < 0.25 * attempted:
+        return volume_step / 1.1
+    if accepted > 0.75 * attempted:
+        return min(volume_step * 1.1, current_volume * 0.3)
+    return volume_step
 
 
 def _restore_barostat_state(
@@ -4279,15 +4383,24 @@ def _restore_barostat_state(
     int,
     int,
     float,
+    dict[str, float],
+    dict[str, int],
+    dict[str, int],
     dict[str, int],
     dict[str, int],
     list[dict[str, Any]],
 ]:
     if state is None:
+        initial_volume_step = current_volume * float(
+            np.expm1(barostat.max_log_volume_scale)
+        )
         return (
             0,
             0,
-            current_volume * float(np.expm1(barostat.max_log_volume_scale)),
+            initial_volume_step,
+            {axis: initial_volume_step for axis in "xyz"},
+            {axis: 0 for axis in "xyz"},
+            {axis: 0 for axis in "xyz"},
             {axis: 0 for axis in "xyz"},
             {axis: 0 for axis in "xyz"},
             [],
@@ -4334,6 +4447,13 @@ def _restore_barostat_state(
     if not np.isfinite(proposal_volume_step) or proposal_volume_step <= 0.0:
         msg = "barostat checkpoint proposal_volume_step must be finite and positive"
         raise ValueError(msg)
+    proposal_volume_steps = _restore_barostat_axis_values(
+        restored.get(
+            "proposal_volume_steps",
+            {axis: proposal_volume_step for axis in "xyz"},
+        ),
+        name="proposal_volume_steps",
+    )
     axis_attempts = _restore_barostat_axis_counts(
         restored.get("axis_attempts"),
         name="axis_attempts",
@@ -4344,6 +4464,20 @@ def _restore_barostat_state(
     )
     if any(axis_accepted[axis] > axis_attempts[axis] for axis in "xyz"):
         msg = "barostat checkpoint per-axis counters are invalid"
+        raise ValueError(msg)
+    adaptation_attempts = _restore_barostat_axis_counts(
+        restored.get("adaptation_attempts", axis_attempts),
+        name="adaptation_attempts",
+    )
+    adaptation_accepted = _restore_barostat_axis_counts(
+        restored.get("adaptation_accepted", axis_accepted),
+        name="adaptation_accepted",
+    )
+    if any(
+        adaptation_accepted[axis] > adaptation_attempts[axis]
+        for axis in "xyz"
+    ):
+        msg = "barostat checkpoint adaptation counters are invalid"
         raise ValueError(msg)
     history = restored.get("proposal_history")
     if not isinstance(history, list) or len(history) != attempts:
@@ -4362,8 +4496,11 @@ def _restore_barostat_state(
         attempts,
         accepted,
         proposal_volume_step,
+        proposal_volume_steps,
         axis_attempts,
         axis_accepted,
+        adaptation_attempts,
+        adaptation_accepted,
         [dict(record) for record in history],
     )
 
@@ -4377,6 +4514,21 @@ def _restore_barostat_axis_counts(value: Any, *, name: str) -> dict[str, int]:
         msg = f"barostat checkpoint {name} must be non-negative"
         raise ValueError(msg)
     return counts
+
+
+def _restore_barostat_axis_values(
+    value: Any,
+    *,
+    name: str,
+) -> dict[str, float]:
+    if not isinstance(value, dict) or set(value) != set("xyz"):
+        msg = f"barostat checkpoint {name} must contain x, y, and z"
+        raise ValueError(msg)
+    values = {axis: float(value[axis]) for axis in "xyz"}
+    if any(not np.isfinite(item) or item <= 0.0 for item in values.values()):
+        msg = f"barostat checkpoint {name} must be finite and positive"
+        raise ValueError(msg)
+    return values
 
 
 def _barostat_metadata(barostat: MonteCarloBarostat) -> dict[str, Any]:

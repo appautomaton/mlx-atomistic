@@ -11,6 +11,8 @@ from mlx_atomistic.md import (
     LennardJonesPotential,
     MonteCarloBarostat,
     SimulationConfig,
+    SimulationState,
+    _attempt_barostat_move,
     _barostat_log_acceptance_probability,
     simulate_npt,
     simulate_nvt,
@@ -64,6 +66,16 @@ class _SourceCellOnlyTerm:
             raise AssertionError("candidate energy evaluated before cell admission")
         self.evaluation_count += 1
         return mx.array(0.0, dtype=positions.dtype), mx.zeros_like(positions)
+
+
+class _ConstraintProjectionTrap:
+    pairs = np.asarray([[0, 1]], dtype=np.int32)
+
+    def apply_positions(self, positions, masses, cell=None):
+        raise AssertionError("rigid molecular strain must not re-project constraints")
+
+    def max_error(self, positions, cell=None):
+        return mx.array(0.0, dtype=positions.dtype)
 
 
 def _small_bound_pme_term(cell, *, real_cutoff=3.0):
@@ -483,6 +495,51 @@ def test_npt_shorter_than_interval_matches_nvt_without_attempt():
     )
 
 
+def test_npt_preserves_continuous_molecule_images_between_cell_moves():
+    positions = np.asarray(
+        [[7.9, 1.0, 1.0], [8.9, 1.0, 1.0]],
+        dtype=np.float32,
+    )
+    constraints = DistanceConstraints(
+        [(0, 1)],
+        distances=[1.0],
+        max_iterations=4,
+    )
+
+    result = simulate_npt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones((2,), dtype=np.float32),
+        molecule_ids=np.asarray([0, 0], dtype=np.int32),
+        cell=Cell.cubic(8.0),
+        force_terms=_ZeroForceTerm(),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=2,
+            seed=4,
+            mode="anisotropic",
+        ),
+        constraints=constraints,
+    )
+
+    final = np.asarray(result.final_state.positions)
+    assert final[1, 0] > 8.0
+    np.testing.assert_allclose(final[1] - final[0], [1.0, 0.0, 0.0], atol=1.0e-6)
+    assert float(np.max(np.asarray(result.constraint_max_error))) <= 1.0e-6
+
+
 def test_npt_schedules_global_steps_and_advances_one_rng_stream():
     positions = np.asarray(
         [[1.0, 1.5, 2.0], [2.0, 2.5, 3.0]],
@@ -531,6 +588,100 @@ def test_npt_schedules_global_steps_and_advances_one_rng_stream():
     assert history[0]["scale_factors"] != history[1]["scale_factors"]
     assert all(item["log_reverse_over_forward"] == 0.0 for item in history)
     assert sum(result.barostat_metadata["axis_attempts"].values()) == 2
+
+
+def test_anisotropic_barostat_adapts_each_axis_proposal_width():
+    cell = Cell.cubic(8.0)
+    positions = np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32)
+    velocities = np.zeros((1, 3), dtype=np.float32)
+    masses = np.ones((1,), dtype=np.float32)
+    thermostat = LangevinThermostat(
+        temperature=0.0,
+        friction=0.0,
+        seed=11,
+    )
+    barostat = MonteCarloBarostat(
+        pressure=0.0,
+        temperature=1.0,
+        interval=1,
+        seed=9,
+        mode="anisotropic",
+        axes=(True, False, False),
+        max_log_volume_scale=float(np.log1p(0.01)),
+    )
+    result = simulate_npt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=_RejectCellChangeTerm(float(np.asarray(cell.volume))),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=11,
+            sample_interval=1,
+            diagnostic_interval=1,
+        ),
+        thermostat=thermostat,
+        barostat=barostat,
+    )
+
+    initial_step = 0.01 * float(np.asarray(cell.volume))
+    history = result.barostat_metadata["proposal_history"]
+    assert result.barostat_attempts == 11
+    assert result.barostat_accepted == 0
+    assert [record["volume_step"] for record in history[:10]] == pytest.approx(
+        [initial_step] * 10
+    )
+    assert history[10]["volume_step"] == pytest.approx(initial_step / 1.1)
+    assert result.barostat_metadata["proposal_volume_steps"]["x"] == (
+        pytest.approx(initial_step / 1.1)
+    )
+    assert result.barostat_metadata["adaptation_attempts"]["x"] == 1
+    assert result.barostat_metadata["adaptation_accepted"]["x"] == 0
+
+    first = simulate_npt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=_RejectCellChangeTerm(float(np.asarray(cell.volume))),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=10,
+            sample_interval=1,
+            diagnostic_interval=1,
+        ),
+        thermostat=thermostat,
+        barostat=barostat,
+    )
+    resumed = simulate_npt(
+        first.final_state.positions,
+        first.final_state.velocities,
+        masses=first.final_state.masses,
+        cell=first.final_cell,
+        force_terms=_RejectCellChangeTerm(float(np.asarray(cell.volume))),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            initial_step=first.final_state.step,
+            initial_time=first.final_state.time,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+            rng_step_offset=first.final_state.step,
+        ),
+        barostat=barostat,
+        barostat_state=first.barostat_metadata,
+    )
+
+    assert resumed.barostat_metadata["proposal_history"] == history
+    assert resumed.barostat_metadata["proposal_volume_steps"] == (
+        result.barostat_metadata["proposal_volume_steps"]
+    )
 
 
 def test_npt_records_selected_center_of_mass_motion_schedule():
@@ -625,6 +776,44 @@ def test_anisotropic_proposal_translates_molecule_centers_without_stretching():
         np.asarray(result.final_state.velocities),
         velocities,
     )
+
+
+def test_barostat_molecular_translation_does_not_reproject_constraints():
+    positions = mx.array(
+        [[1.0, 1.0, 1.0], [2.0, 1.2, 1.1]],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    state = SimulationState(
+        positions=positions,
+        velocities=mx.zeros_like(positions),
+        masses=mx.array([12.0, 1.0], dtype=mx.float32),
+        forces=mx.zeros_like(positions),
+        step=1,
+        time=0.001,
+    )
+
+    _, _, _, accepted, proposal = _attempt_barostat_move(
+        state,
+        (_ZeroForceTerm(),),
+        cell,
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=1,
+            seed=4,
+            mode="anisotropic",
+        ),
+        rng=np.random.default_rng(4),
+        volume_step=0.01 * float(np.asarray(cell.volume)),
+        constraints=_ConstraintProjectionTrap(),
+        boltzmann_constant=1.0,
+        molecule_ids=np.asarray([0, 0], dtype=np.int32),
+    )
+
+    assert accepted
+    assert proposal.delta_energy == pytest.approx(0.0)
+    assert proposal.log_acceptance is not None
 
 
 def test_accepted_move_rebuilds_constraint_free_block_path_for_new_cell():

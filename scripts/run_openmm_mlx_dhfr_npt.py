@@ -763,6 +763,7 @@ def _run_mlx_npt(
     checkpoint_out: Path,
     steps: int,
     resume_checkpoint: Path | None = None,
+    constraint_max_iterations: int = 20,
 ):
     return run_mlx(
         prepared,
@@ -787,7 +788,7 @@ def _run_mlx_npt(
         require_production=True,
         minimize_steps=0,
         equilibration_steps=0,
-        constraint_max_iterations=20,
+        constraint_max_iterations=constraint_max_iterations,
         eager_nonbonded_pair_limit=0,
     )
 
