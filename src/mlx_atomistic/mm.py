@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 
 import mlx.core as mx
 import numpy as np
@@ -17,6 +18,63 @@ from mlx_atomistic.forcefields import (
     PeriodicDihedralPotential,
 )
 from mlx_atomistic.topology import Topology
+
+
+def normalize_molecule_ids(
+    molecule_ids: object,
+    *,
+    atom_count: int,
+    required: bool = False,
+) -> np.ndarray:
+    """Validate contiguous per-atom molecule identifiers.
+
+    Args:
+        molecule_ids: Integer molecule label for every atom, or an empty array.
+        atom_count: Expected number of atoms.
+        required: Whether an empty identifier table is an error.
+
+    Returns:
+        A read-only ``int32`` vector whose labels are ``0..n_molecules-1``.
+    """
+
+    raw = np.asarray(molecule_ids)
+    if raw.size == 0:
+        if required:
+            msg = "exact molecule membership is required"
+            raise ValueError(msg)
+        empty = np.asarray([], dtype=np.int32)
+        empty.setflags(write=False)
+        return empty
+    if raw.shape != (atom_count,):
+        msg = f"molecule_ids must have shape ({atom_count},)"
+        raise ValueError(msg)
+    try:
+        numeric = np.asarray(raw, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        msg = "molecule_ids must contain finite integers"
+        raise ValueError(msg) from exc
+    if not np.all(np.isfinite(numeric)) or not np.all(numeric == np.floor(numeric)):
+        msg = "molecule_ids must contain finite integers"
+        raise ValueError(msg)
+    normalized = numeric.astype(np.int64)
+    labels = np.unique(normalized)
+    if labels.size == 0 or not np.array_equal(labels, np.arange(labels.size)):
+        msg = "molecule_ids labels must be contiguous and start at zero"
+        raise ValueError(msg)
+    result = normalized.astype(np.int32)
+    result.setflags(write=False)
+    return result
+
+
+def molecule_identity_sha256(molecule_ids: object, *, atom_count: int) -> str:
+    """Hash exact molecule membership in atom order."""
+
+    normalized = normalize_molecule_ids(
+        molecule_ids,
+        atom_count=atom_count,
+        required=True,
+    )
+    return sha256(normalized.astype("<i4", copy=False).tobytes()).hexdigest()
 
 
 def _string_tuple(value: Sequence[str], *, count: int, name: str) -> tuple[str, ...]:
@@ -50,6 +108,7 @@ class MMSystem:
     velocities: object | None = None
     cell: Cell | None = None
     virtual_sites: object | None = None
+    molecule_ids: object | None = None
 
     @classmethod
     def from_sequences(
@@ -66,6 +125,7 @@ class MMSystem:
         cell: Cell | None = None,
         atom_type_masses: Mapping[str, float] | None = None,
         virtual_sites: object | None = None,
+        molecule_ids: Sequence[int] | None = None,
     ) -> MMSystem:
         """Create an MM system from Python data."""
 
@@ -96,6 +156,7 @@ class MMSystem:
             velocities=velocities,
             cell=cell,
             virtual_sites=virtual_sites,
+            molecule_ids=molecule_ids,
         )
 
     def __post_init__(self) -> None:
@@ -158,12 +219,27 @@ class MMSystem:
         object.__setattr__(self, "velocities", velocities)
         object.__setattr__(self, "masses", masses)
         object.__setattr__(self, "charges", charges)
+        if self.molecule_ids is not None:
+            object.__setattr__(
+                self,
+                "molecule_ids",
+                normalize_molecule_ids(self.molecule_ids, atom_count=atom_count),
+            )
 
     @property
     def atom_count(self) -> int:
         """Number of atoms."""
 
         return len(self.symbols)
+
+    @property
+    def molecule_count(self) -> int | None:
+        """Number of exact molecules, or ``None`` when membership is absent."""
+
+        if self.molecule_ids is None:
+            return None
+        values = np.asarray(self.molecule_ids, dtype=np.int32)
+        return 0 if values.size == 0 else int(np.max(values)) + 1
 
 
 @dataclass(frozen=True)

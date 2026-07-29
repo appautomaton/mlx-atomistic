@@ -36,6 +36,14 @@ from mlx_atomistic.benchmarks import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+_EXPLICIT_PREP_PATH = ROOT / "scripts" / "prepare_openmm_dhfr_explicit.py"
+_EXPLICIT_PREP_SPEC = importlib.util.spec_from_file_location(
+    "prepare_openmm_dhfr_explicit_under_test",
+    _EXPLICIT_PREP_PATH,
+)
+assert _EXPLICIT_PREP_SPEC is not None and _EXPLICIT_PREP_SPEC.loader is not None
+_EXPLICIT_PREP = importlib.util.module_from_spec(_EXPLICIT_PREP_SPEC)
+_EXPLICIT_PREP_SPEC.loader.exec_module(_EXPLICIT_PREP)
 
 
 def test_historical_dhfr_branch_disposition_is_documented():
@@ -242,6 +250,84 @@ def test_dhfr_explicit_pme_cli_requires_caller_provided_jac_inputs():
     assert explicit_spec.amber_topology_path == topology
     assert explicit_spec.amber_coordinates_path == coordinates
     assert explicit_spec.input_paths == (topology, coordinates)
+
+
+def test_openmm_5dfr_case_is_exact_and_distinct_from_jac():
+    target = dhfr.CASE_SPECS[dhfr.OPENMM_5DFR_CASE]
+    jac = dhfr.CASE_SPECS["dhfr-explicit-pme"]
+
+    assert target.case == _EXPLICIT_PREP.CASE_ID
+    assert target.input_paths == (dhfr.OPENMM_DHFR_SOLVATED,)
+    assert target.force_field_family == "openmm-amber99sb-tip3p"
+    assert target.fixture == "openmm_5dfr_amber99sb_tip3p_pme"
+    assert jac.input_paths == ()
+    assert jac.force_field_family == "caller-provided-amber-pme"
+    assert target.case != jac.case
+    assert target.fixture != jac.fixture
+
+
+def test_openmm_5dfr_cli_rejects_jac_and_source_substitution():
+    default_args = dhfr._parse_args(["--case", dhfr.OPENMM_5DFR_CASE, "--readiness"])
+
+    assert dhfr._case_spec_from_args(default_args) == dhfr.CASE_SPECS[
+        dhfr.OPENMM_5DFR_CASE
+    ]
+
+    substituted = dhfr._parse_args(
+        [
+            "--case",
+            dhfr.OPENMM_5DFR_CASE,
+            "--primary-structure",
+            "synthetic-solvent.pdb",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires exactly"):
+        dhfr._case_spec_from_args(substituted)
+
+    jac = dhfr._parse_args(
+        [
+            "--case",
+            dhfr.OPENMM_5DFR_CASE,
+            "--amber-topology",
+            "JAC.prmtop",
+        ]
+    )
+    with pytest.raises(ValueError, match="does not accept JAC"):
+        dhfr._case_spec_from_args(jac)
+
+
+def test_openmm_5dfr_prep_enforces_source_output_and_molecule_identity(tmp_path):
+    expected = tmp_path / _EXPLICIT_PREP.OPENMM_DHFR_SOLVATED
+    expected.parent.mkdir(parents=True)
+    expected.write_text("CRYST1\n")
+
+    assert (
+        _EXPLICIT_PREP._require_exact_source(
+            tmp_path,
+            _EXPLICIT_PREP.OPENMM_DHFR_SOLVATED,
+        )
+        == expected
+    )
+    with pytest.raises(ValueError, match="cannot be substituted"):
+        _EXPLICIT_PREP._require_exact_source(tmp_path, Path("JAC.prmtop"))
+    assert _EXPLICIT_PREP._results_output_path(
+        tmp_path,
+        Path("results/selected"),
+    ) == tmp_path / "results/selected"
+    with pytest.raises(ValueError, match="results/"):
+        _EXPLICIT_PREP._results_output_path(tmp_path, Path("outputs/selected"))
+
+    molecule_ids = _EXPLICIT_PREP._molecule_ids_from_table(
+        ((0, 1), (2,), (3, 4)),
+        atom_count=5,
+    )
+    assert molecule_ids.tolist() == [0, 0, 1, 2, 2]
+    with pytest.raises(ValueError, match="more than once"):
+        _EXPLICIT_PREP._molecule_ids_from_table(((0, 1), (1, 2)), atom_count=3)
+    assert _EXPLICIT_PREP._inverse_nanometer_to_inverse_angstrom(
+        3.5,
+        unit=object(),
+    ) == pytest.approx(0.35)
 
 
 def test_validation_gauntlet_cli_json_and_csv(tmp_path, capsys):

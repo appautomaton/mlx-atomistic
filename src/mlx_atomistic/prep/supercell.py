@@ -70,6 +70,7 @@ _SPECIAL_FIELDS = {
     "chain_ids",
     "cell_lengths",
     "cell_matrix",
+    "molecule_ids",
     *_TRANSLATED_ATOM_FIELDS,
     *_REPEATED_ATOM_FIELDS,
     *_INDEX_PARAMETER_GROUPS,
@@ -171,6 +172,11 @@ def replicate_prepared_system(
         )
     payload["residue_ids"] = _replicate_residue_ids(prepared.residue_ids, replica_count)
     payload["chain_ids"] = _replicate_chain_ids(prepared.chain_ids, replica_count)
+    payload["molecule_ids"] = _replicate_molecule_ids(
+        prepared.molecule_ids,
+        atom_count=atom_count,
+        replica_count=replica_count,
+    )
 
     for index_name, parameter_names in _INDEX_PARAMETER_GROUPS.items():
         allow_negative = index_name == "virtual_site_parent_atoms"
@@ -491,6 +497,26 @@ def _copy_unclassified_empty_fields(
         raise PreparedSupercellError(msg)
     for name in unknown:
         payload[name] = np.asarray(getattr(prepared, name)).copy()
+
+
+def _replicate_molecule_ids(
+    molecule_ids: np.ndarray,
+    *,
+    atom_count: int,
+    replica_count: int,
+) -> np.ndarray:
+    from mlx_atomistic.mm import normalize_molecule_ids
+
+    source = normalize_molecule_ids(molecule_ids, atom_count=atom_count)
+    if source.size == 0:
+        return source.copy()
+    molecule_count = int(np.max(source)) + 1
+    return np.concatenate(
+        [
+            np.asarray(source, dtype=np.int32) + replica * molecule_count
+            for replica in range(replica_count)
+        ]
+    )
 
 
 def _replicated_metadata(

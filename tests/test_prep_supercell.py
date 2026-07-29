@@ -153,6 +153,7 @@ def _complete_prepared_fixture() -> PreparedSystem:
         virtual_site_parent_atoms=np.asarray([[0, 1, 2, 3]], dtype=np.int32),
         virtual_site_weights=np.asarray([[0.2, 0.3, 0.5, 0.0]], dtype=np.float32),
         virtual_site_types=np.asarray(["three_particle_average"], dtype=str),
+        molecule_ids=np.asarray([0, 0, 1, 1], dtype=np.int32),
     )
 
 
@@ -208,6 +209,10 @@ def test_replicate_prepared_system_offsets_every_supported_index_and_parameter()
     assert replicated.metadata.compatibility_report["array_term_counts"]["harmonic_bond"] == 4
     assert replicated.metadata.compatibility_report["array_term_counts"]["pme"] == 1
     assert replicated.metadata.protocol_metadata["nonbonded"]["cutoff"] == 5.0
+    np.testing.assert_array_equal(
+        replicated.molecule_ids,
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7],
+    )
 
 
 def test_replicate_prepared_system_is_deterministic_and_does_not_mutate_source():
@@ -245,8 +250,23 @@ def test_replicated_prepared_system_round_trips_with_global_arrays_retained(tmp_
     assert loaded.atom_count == 8
     np.testing.assert_array_equal(loaded.charmm_cmap_grids, replicated.charmm_cmap_grids)
     np.testing.assert_array_equal(loaded.nbfix_type_pairs, replicated.nbfix_type_pairs)
+    np.testing.assert_array_equal(loaded.molecule_ids, replicated.molecule_ids)
     assert summary["atom_count"] == 8
     assert summary["indexed_term_counts"]["bonds"] == 2
+
+
+@pytest.mark.parametrize(
+    "molecule_ids",
+    [
+        np.asarray([1, 1, 2, 2], dtype=np.int32),
+        np.asarray([0, 0, 2, 2], dtype=np.int32),
+        np.asarray([0.0, 0.0, 1.5, 1.5], dtype=np.float32),
+        np.asarray([0, 1, 1], dtype=np.int32),
+    ],
+)
+def test_prepared_system_rejects_invalid_molecule_membership(molecule_ids):
+    with pytest.raises(ValueError, match="molecule_ids"):
+        replace(_complete_prepared_fixture(), molecule_ids=molecule_ids).validate()
 
 
 def test_replicate_prepared_system_rejects_triclinic_source():

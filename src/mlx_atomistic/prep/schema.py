@@ -187,6 +187,9 @@ class PreparedSystem:
     virtual_site_types: np.ndarray = field(
         default_factory=lambda: np.asarray([], dtype=str)
     )
+    molecule_ids: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=np.int32)
+    )
 
     @property
     def atom_count(self) -> int:
@@ -234,6 +237,9 @@ class PreparedSystem:
             if array.size != 0 and array.shape != (n_atoms,):
                 msg = f"{name} must be empty or have shape ({n_atoms},)"
                 raise ValueError(msg)
+        from mlx_atomistic.mm import normalize_molecule_ids
+
+        normalize_molecule_ids(self.molecule_ids, atom_count=n_atoms)
         self._validate_gbsa_arrays()
         self._validate_index_array("bonds", 2)
         self._validate_index_array("angles", 3)

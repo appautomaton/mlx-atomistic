@@ -36,6 +36,12 @@ BENCHMARK_NAME = "dhfr"
 COMMAND = default_benchmark_command(BENCHMARK_NAME)
 
 DEFAULT_ARTIFACT_ROOT = Path("outputs/benchmarks/dhfr-artifacts")
+OPENMM_DHFR_SOLVATED = Path(
+    "vendors/openmm/examples/benchmarks/5dfr_solv-cube_equil.pdb"
+)
+OPENMM_5DFR_CASE = "dhfr-5dfr-pme"
+OPENMM_5DFR_ARTIFACT_DIR = Path("results/dhfr-npt-closure/prepared")
+OPENMM_5DFR_PREP_SCRIPT = Path("scripts/prepare_openmm_dhfr_explicit.py")
 GBSA_REQUIRED_ARRAYS = ("gbsa_radius", "gbsa_scale")
 PME_REQUIRED_ARRAYS = (
     "pme_mesh_shape",
@@ -80,6 +86,16 @@ CASE_SPECS = {
         electrostatics_model="pme",
         force_field_family="caller-provided-amber-pme",
         timing_metric="ns_per_day",
+    ),
+    OPENMM_5DFR_CASE: DHFRCaseSpec(
+        case=OPENMM_5DFR_CASE,
+        fixture="openmm_5dfr_amber99sb_tip3p_pme",
+        solvent_model="explicit",
+        electrostatics_model="pme",
+        force_field_family="openmm-amber99sb-tip3p",
+        timing_metric="ns_per_day",
+        input_paths=(OPENMM_DHFR_SOLVATED,),
+        primary_structure_path=OPENMM_DHFR_SOLVATED,
     ),
 }
 
@@ -162,8 +178,7 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
         "atom_count": amber_atom_count if amber_atom_count is not None else atom_count,
         "pdb_atom_count": atom_count,
         "amber_atom_count": amber_atom_count,
-        "cell_metadata_available": case_spec.amber_coordinates_path is not None
-        and (root / case_spec.amber_coordinates_path).exists(),
+        "cell_metadata_available": _cell_metadata_available(case_spec, root),
         "unsupported_terms": [],
         "raw_input_paths": [str(path) for path in case_spec.input_paths],
     }
@@ -215,7 +230,9 @@ def _prepare_payload(
     payload["readiness_only"] = False
     payload["prepare"] = True
     payload["artifact_status"] = "not_attempted"
-    payload["artifact_path"] = str(artifact_root / case_spec.case)
+    payload["artifact_path"] = str(
+        _artifact_relative_path(case_spec, artifact_root=artifact_root)
+    )
     payload["required_arrays"] = list(REQUIRED_ARRAYS)
     payload["force_term_required_arrays"] = _force_term_required_arrays(case_spec)
     payload["unsupported_terms"] = []
@@ -283,7 +300,10 @@ def _prepare_implicit_gbsa(
     artifact_root: Path,
     implicit_prep_script: Path | None,
 ) -> dict[str, Any]:
-    artifact_dir = repo_root / artifact_root / case_spec.case
+    artifact_dir = repo_root / _artifact_relative_path(
+        case_spec,
+        artifact_root=artifact_root,
+    )
     if implicit_prep_script is None:
         blocker = "implicit DHFR preparation requires an explicit prep script path"
         payload.update(
@@ -448,7 +468,10 @@ def _run_prepared_artifact_runtime(
     payload: dict[str, Any],
     artifact_root: Path,
 ) -> dict[str, Any]:
-    artifact_dir = repo_root / artifact_root / case_spec.case
+    artifact_dir = repo_root / _artifact_relative_path(
+        case_spec,
+        artifact_root=artifact_root,
+    )
     setup_start = time.perf_counter()
     try:
         artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
@@ -661,7 +684,14 @@ def _prepare_explicit_pme(
     payload: dict[str, Any],
     artifact_root: Path,
 ) -> dict[str, Any]:
-    if case_spec.amber_topology_path is None or case_spec.amber_coordinates_path is None:
+    is_openmm_5dfr = case_spec.case == OPENMM_5DFR_CASE
+    if (
+        not is_openmm_5dfr
+        and (
+            case_spec.amber_topology_path is None
+            or case_spec.amber_coordinates_path is None
+        )
+    ):
         payload.update(
             {
                 "status": "blocked",
@@ -671,32 +701,57 @@ def _prepare_explicit_pme(
         )
         return payload
 
-    artifact_dir = repo_root / artifact_root / case_spec.case
+    artifact_relative = _artifact_relative_path(
+        case_spec,
+        artifact_root=artifact_root,
+    )
+    artifact_dir = repo_root / artifact_relative
     try:
-        prepared = import_amber_prmtop(
-            prmtop_path=repo_root / case_spec.amber_topology_path,
-            coords_path=repo_root / case_spec.amber_coordinates_path,
-        )
-        prepared = _with_pme_metadata(prepared)
-        save_prepared_system(prepared, artifact_dir)
+        if is_openmm_5dfr:
+            _run_openmm_5dfr_prep(
+                repo_root=repo_root,
+                artifact_dir=artifact_dir,
+            )
+        else:
+            prepared = import_amber_prmtop(
+                prmtop_path=repo_root / case_spec.amber_topology_path,
+                coords_path=repo_root / case_spec.amber_coordinates_path,
+            )
+            prepared = _with_pme_metadata(prepared)
+            save_prepared_system(prepared, artifact_dir)
         artifact = load_prepared_mlx_artifact(artifact_dir, require_production=True)
-    except (TopologyImportError, ValueError, FileNotFoundError) as exc:
+    except (
+        TopologyImportError,
+        subprocess.CalledProcessError,
+        ValueError,
+        FileNotFoundError,
+    ) as exc:
         unsupported_terms = _unsupported_terms_from_error(str(exc))
         payload.update(
             {
                 "status": "blocked",
-                "blocker": f"AMBER explicit PME artifact import blocked: {exc}",
+                "blocker": (
+                    f"OpenMM 5dfr PME artifact preparation blocked: {exc}"
+                    if is_openmm_5dfr
+                    else f"AMBER explicit PME artifact import blocked: {exc}"
+                ),
                 "artifact_status": "blocked",
                 "unsupported_terms": unsupported_terms,
                 "pme": {
                     "config": _pme_config_payload(_default_dhfr_pme_config()),
                     "coordinate_format": _amber_coordinate_format(
                         repo_root / case_spec.amber_coordinates_path
-                    ),
+                    )
+                    if case_spec.amber_coordinates_path is not None
+                    else "openmm_pdb",
                     "required_arrays": list(PME_REQUIRED_ARRAYS),
                     "present_arrays": [],
                     "missing_arrays": list(PME_REQUIRED_ARRAYS),
-                    "blocker": f"AMBER explicit PME artifact import blocked: {exc}",
+                    "blocker": (
+                        f"OpenMM 5dfr PME artifact preparation blocked: {exc}"
+                        if is_openmm_5dfr
+                        else f"AMBER explicit PME artifact import blocked: {exc}"
+                    ),
                 },
             }
         )
@@ -740,11 +795,15 @@ def _prepare_explicit_pme(
             "blocker": blocker,
             "atom_count": artifact.atom_count,
             "artifact_status": "saved",
-            "artifact_path": str(artifact_root / case_spec.case),
+            "artifact_path": str(artifact_relative),
             "artifact_files": [
-                str(artifact_root / case_spec.case / "prepared_system.json"),
-                str(artifact_root / case_spec.case / "prepared_system.npz"),
-                str(artifact_root / case_spec.case / "view.pdb"),
+                str(artifact_relative / name)
+                for name in (
+                    "prepared_system.json",
+                    "prepared_system.npz",
+                    "view.pdb",
+                    *(("source_manifest.json",) if is_openmm_5dfr else ()),
+                )
             ],
             "required_arrays": _array_presence(arrays, REQUIRED_ARRAYS),
             "force_term_required_arrays": _array_presence(arrays, PME_REQUIRED_ARRAYS),
@@ -763,6 +822,36 @@ def _prepare_explicit_pme(
         }
     )
     return payload
+
+
+def _run_openmm_5dfr_prep(*, repo_root: Path, artifact_dir: Path) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / OPENMM_5DFR_PREP_SCRIPT),
+            "--repo-root",
+            str(repo_root),
+            "--pdb",
+            str(OPENMM_DHFR_SOLVATED),
+            "--out",
+            str(artifact_dir.relative_to(repo_root)),
+            "--json",
+        ],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def _artifact_relative_path(
+    case_spec: DHFRCaseSpec,
+    *,
+    artifact_root: Path,
+) -> Path:
+    if case_spec.case == OPENMM_5DFR_CASE:
+        return OPENMM_5DFR_ARTIFACT_DIR
+    return artifact_root / case_spec.case
 
 
 def _with_pme_metadata(prepared: Any) -> Any:
@@ -880,7 +969,7 @@ def _input_status(case_spec: DHFRCaseSpec, repo_root: Path) -> dict[str, Any]:
     missing: list[str] = []
     if not case_spec.input_paths:
         missing.append("caller-provided DHFR input path(s)")
-    if case_spec.electrostatics_model == "pme":
+    if case_spec.case == "dhfr-explicit-pme":
         if case_spec.amber_topology_path is None:
             missing.append("caller-provided AMBER topology path")
         if case_spec.amber_coordinates_path is None:
@@ -908,6 +997,18 @@ def _pdb_atom_count(path: Path) -> int | None:
             if line.startswith(("ATOM  ", "HETATM")):
                 count += 1
     return count
+
+
+def _cell_metadata_available(case_spec: DHFRCaseSpec, repo_root: Path) -> bool:
+    if case_spec.amber_coordinates_path is not None:
+        return (repo_root / case_spec.amber_coordinates_path).exists()
+    if case_spec.primary_structure_path is None:
+        return False
+    path = repo_root / case_spec.primary_structure_path
+    if not path.exists():
+        return False
+    with path.open(errors="replace") as handle:
+        return any(line.startswith("CRYST1") for line in handle)
 
 
 def _amber_prmtop_atom_count(path: Path | None) -> int | None:
@@ -941,6 +1042,20 @@ def _format_human_payload(payload: dict[str, Any]) -> str:
 
 def _case_spec_from_args(args: argparse.Namespace) -> DHFRCaseSpec:
     spec = CASE_SPECS[args.case]
+    if spec.case == OPENMM_5DFR_CASE:
+        if args.amber_topology is not None or args.amber_coordinates is not None:
+            msg = f"{OPENMM_5DFR_CASE} does not accept JAC AMBER inputs"
+            raise ValueError(msg)
+        if (
+            args.primary_structure is not None
+            and args.primary_structure != OPENMM_DHFR_SOLVATED
+        ):
+            msg = (
+                f"{OPENMM_5DFR_CASE} requires exactly "
+                f"{OPENMM_DHFR_SOLVATED}"
+            )
+            raise ValueError(msg)
+        return spec
     amber_topology = args.amber_topology
     amber_coordinates = args.amber_coordinates
     input_paths: list[Path] = []

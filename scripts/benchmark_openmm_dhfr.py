@@ -58,11 +58,22 @@ CASE_SPECS = {
     "dhfr-explicit-pme": CaseSpec(
         case="dhfr-explicit-pme",
         fixture="dhfr_explicit_pme",
-        input_paths=(OPENMM_DHFR_SOLVATED, AMBER20_JAC_PRMTOP, AMBER20_JAC_INPCRD),
+        input_paths=(AMBER20_JAC_PRMTOP, AMBER20_JAC_INPCRD),
         solvent_model="explicit",
         electrostatics_model="pme",
         force_field_family="amber20-jac",
         openmm_test_name="amber20-dhfr",
+        friction_per_ps=1.0,
+        cutoff_nm=0.9,
+    ),
+    "dhfr-5dfr-pme": CaseSpec(
+        case="dhfr-5dfr-pme",
+        fixture="openmm_5dfr_amber99sb_tip3p_pme",
+        input_paths=(OPENMM_DHFR_SOLVATED,),
+        solvent_model="explicit",
+        electrostatics_model="pme",
+        force_field_family="amber99sb-tip3p",
+        openmm_test_name="pme",
         friction_per_ps=1.0,
         cutoff_nm=0.9,
     ),
@@ -228,6 +239,28 @@ def _build_system(
             "nonbonded_method": "CutoffNonPeriodic",
             "constraints": "HBonds",
             "hydrogen_mass_amu": 1.5,
+        }
+
+    if spec.case == "dhfr-5dfr-pme":
+        pdb = app.PDBFile(str(repo_root / OPENMM_DHFR_SOLVATED))
+        force_field = app.ForceField("amber99sb.xml", "tip3p.xml")
+        system = force_field.createSystem(
+            pdb.topology,
+            nonbondedMethod=app.PME,
+            nonbondedCutoff=spec.cutoff_nm * unit.nanometer,
+            constraints=app.HBonds,
+            rigidWater=True,
+            removeCMMotion=True,
+            hydrogenMass=1.5 * unit.amu,
+        )
+        return system, pdb.positions, {
+            "source": "OpenMM examples benchmark 5dfr PME case",
+            "nonbonded_method": "PME",
+            "constraints": "HBonds",
+            "rigid_water": True,
+            "hydrogen_mass_amu": 1.5,
+            "dispersion_correction": True,
+            "center_of_mass_motion": "CMMotionRemover",
         }
 
     prmtop = app.AmberPrmtopFile(str(repo_root / AMBER20_JAC_PRMTOP))

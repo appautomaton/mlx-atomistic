@@ -28,7 +28,11 @@ from mlx_atomistic.forcefields import (
     RBDihedralPotential,
     SoftCoreNonbondedPotential,
 )
-from mlx_atomistic.mm import MMSystem
+from mlx_atomistic.mm import (
+    MMSystem,
+    molecule_identity_sha256,
+    normalize_molecule_ids,
+)
 from mlx_atomistic.nonbonded import normalize_nonbonded_electrostatics
 from mlx_atomistic.pme import (
     PME_SUPPORTED_ASSIGNMENT_ORDERS,
@@ -331,6 +335,26 @@ class PreparedMLXArtifact:
         """Return serialized HMR state without treating it as a force term."""
 
         return hmr_state_from_metadata(self.metadata)
+
+    @property
+    def molecule_ids(self) -> np.ndarray:
+        """Exact per-atom molecule identifiers, or an empty vector."""
+
+        return normalize_molecule_ids(
+            self.arrays.get("molecule_ids", np.asarray([], dtype=np.int32)),
+            atom_count=self.atom_count,
+        )
+
+    @property
+    def molecule_identity_sha256(self) -> str | None:
+        """Stable molecule-membership hash, or ``None`` when absent."""
+
+        if self.molecule_ids.size == 0:
+            return None
+        return molecule_identity_sha256(
+            self.molecule_ids,
+            atom_count=self.atom_count,
+        )
 
 
 def hmr_state_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -965,6 +989,7 @@ def load_prepared_mlx_artifact(
         arrays=arrays,
     )
     _validate_core_shapes(arrays)
+    _validate_molecule_identity_metadata(metadata, arrays)
     _validate_electrostatics_arrays(metadata, arrays)
     _validate_requested_term_arrays(metadata, arrays)
     if require_production or bool(
@@ -1007,6 +1032,59 @@ def _validate_core_shapes(arrays: dict[str, np.ndarray]) -> None:
         ):
             msg = f"{name} must have shape ({n_atoms},)"
             raise ValueError(msg)
+    normalize_molecule_ids(
+        arrays.get("molecule_ids", np.asarray([], dtype=np.int32)),
+        atom_count=n_atoms,
+    )
+
+
+def _validate_molecule_identity_metadata(
+    metadata: dict[str, Any],
+    arrays: dict[str, np.ndarray],
+) -> None:
+    selections = dict(metadata.get("selections", {}))
+    molecules = dict(dict(metadata.get("protocol_metadata", {})).get("molecules", {}))
+    declared_counts = {
+        int(value)
+        for value in (
+            selections.get("molecule_count"),
+            molecules.get("count"),
+        )
+        if value is not None
+    }
+    declared_hashes = {
+        str(value)
+        for value in (
+            selections.get("molecule_identity_sha256"),
+            molecules.get("identity_sha256"),
+        )
+        if value is not None
+    }
+    if not declared_counts and not declared_hashes:
+        return
+    if len(declared_counts) > 1 or len(declared_hashes) > 1:
+        msg = "prepared artifact molecule identity metadata is internally inconsistent"
+        raise ValueError(msg)
+    atom_count = int(np.asarray(arrays["positions"]).shape[0])
+    molecule_ids = normalize_molecule_ids(
+        arrays.get("molecule_ids", np.asarray([], dtype=np.int32)),
+        atom_count=atom_count,
+        required=True,
+    )
+    actual_count = int(np.max(molecule_ids)) + 1
+    actual_hash = molecule_identity_sha256(
+        molecule_ids,
+        atom_count=atom_count,
+    )
+    if declared_counts and actual_count not in declared_counts:
+        msg = "prepared artifact molecule_count metadata does not match molecule_ids"
+        raise ValueError(msg)
+    if declared_hashes and actual_hash not in declared_hashes:
+        msg = (
+            "prepared artifact molecule_identity_sha256 metadata does not match "
+            "molecule_ids"
+        )
+        raise ValueError(msg)
 
 
 def _validate_production_arrays(metadata: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
@@ -1571,6 +1649,11 @@ def build_mlx_system_from_artifact(
         topology=system_topology,
         cell=artifact.cell,
         virtual_sites=virtual_site_manager,
+        molecule_ids=(
+            None
+            if not _array_present(arrays, "molecule_ids")
+            else np.asarray(arrays["molecule_ids"], dtype=np.int32)[:system_atom_count]
+        ),
     )
 
     terms = []
@@ -1968,6 +2051,7 @@ def _reordered_virtual_site_arrays(
         "water_mask",
         "ion_mask",
         "lipid_mask",
+        "molecule_ids",
     ]:
         if name in reordered and np.asarray(reordered[name]).shape[:1] == (len(permutation),):
             reordered[name] = np.asarray(reordered[name])[permutation]

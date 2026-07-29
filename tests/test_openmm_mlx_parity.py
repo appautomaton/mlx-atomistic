@@ -29,6 +29,16 @@ assert _CHARGED_SPEC is not None and _CHARGED_SPEC.loader is not None
 _CHARGED = importlib.util.module_from_spec(_CHARGED_SPEC)
 sys.modules[_CHARGED_SPEC.name] = _CHARGED
 _CHARGED_SPEC.loader.exec_module(_CHARGED)
+_EXPLICIT_PREP_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "prepare_openmm_dhfr_explicit.py"
+)
+_EXPLICIT_PREP_SPEC = importlib.util.spec_from_file_location(
+    "prepare_openmm_dhfr_explicit_reference_under_test",
+    _EXPLICIT_PREP_PATH,
+)
+assert _EXPLICIT_PREP_SPEC is not None and _EXPLICIT_PREP_SPEC.loader is not None
+_EXPLICIT_PREP = importlib.util.module_from_spec(_EXPLICIT_PREP_SPEC)
+_EXPLICIT_PREP_SPEC.loader.exec_module(_EXPLICIT_PREP)
 
 DEFAULT_AMBER_FIXTURE = _HELPER.DEFAULT_AMBER_FIXTURE
 DEFAULT_CHARMM_FIXTURE = _HELPER.DEFAULT_CHARMM_FIXTURE
@@ -136,6 +146,25 @@ def test_openmm_comparable_l_bfgs_minimization_fixture():
 
     assert float(np.asarray(result.energy)) <= openmm_energy + 1e-5
     np.testing.assert_allclose(np.asarray(result.positions), target, atol=1e-4)
+
+
+def test_openmm_5dfr_preparer_rejects_unknown_force_classes():
+    openmm = pytest.importorskip("openmm")
+    system = openmm.System()
+    system.addParticle(1.0)
+    system.addForce(openmm.CustomExternalForce("0"))
+
+    with pytest.raises(ValueError, match="exact supported set"):
+        _EXPLICIT_PREP._validated_force_classes(system)
+
+
+def test_openmm_5dfr_preparer_normalizes_unit_bearing_pme_alpha():
+    unit = pytest.importorskip("openmm.unit")
+
+    assert _EXPLICIT_PREP._inverse_nanometer_to_inverse_angstrom(
+        3.5 / unit.nanometer,
+        unit=unit,
+    ) == pytest.approx(0.35)
 
 
 def test_default_amber_fixture_paths_are_present():

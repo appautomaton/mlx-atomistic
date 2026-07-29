@@ -98,6 +98,7 @@ OPTIONAL_NPZ_ARRAY_DEFAULTS = {
     "virtual_site_parent_atoms": lambda: empty_indices(4),
     "virtual_site_weights": lambda: np.empty((0, 4), dtype=np.float32),
     "virtual_site_types": lambda: np.asarray([], dtype=str),
+    "molecule_ids": lambda: np.asarray([], dtype=np.int32),
 }
 
 

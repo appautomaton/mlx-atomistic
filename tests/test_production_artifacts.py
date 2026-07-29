@@ -15,6 +15,7 @@ from mlx_atomistic.artifacts import (
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.minimize import minimize_energy
+from mlx_atomistic.mm import molecule_identity_sha256
 from mlx_atomistic.neighbors import NeighborBlocks
 from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.prep.io import (
@@ -302,7 +303,23 @@ def test_pair_restricted_demo_term_validates_without_production_requirement(tmp_
 
 
 def test_core_artifact_loader_builds_production_system_terms_and_constraints(tmp_path):
-    prepared = _production_fixture()
+    molecule_ids = np.asarray([0, 0], dtype=np.int32)
+    fixture = _production_fixture()
+    prepared = replace(
+        fixture,
+        metadata=replace(
+            fixture.metadata,
+            selections={
+                **fixture.metadata.selections,
+                "molecule_count": 1,
+                "molecule_identity_sha256": molecule_identity_sha256(
+                    molecule_ids,
+                    atom_count=2,
+                ),
+            },
+        ),
+        molecule_ids=molecule_ids,
+    )
     save_prepared_system(prepared, tmp_path)
 
     artifact = load_prepared_mlx_artifact(tmp_path, require_production=True)
@@ -312,6 +329,10 @@ def test_core_artifact_loader_builds_production_system_terms_and_constraints(tmp
     assert [term.name for term in terms] == ["bond", "nonbonded"]
     assert constraints is not None
     assert constraints.pairs.shape[0] == 1
+    np.testing.assert_array_equal(artifact.molecule_ids, [0, 0])
+    np.testing.assert_array_equal(system.molecule_ids, [0, 0])
+    assert artifact.molecule_identity_sha256 is not None
+    assert system.molecule_count == 1
 
     _, _, tuned_constraints = build_mlx_system_from_artifact(
         artifact,
@@ -319,6 +340,56 @@ def test_core_artifact_loader_builds_production_system_terms_and_constraints(tmp
     )
     assert tuned_constraints is not None
     assert tuned_constraints.max_iterations == 4
+
+
+def test_legacy_artifact_without_molecule_ids_remains_readable(tmp_path):
+    prepared = _production_fixture()
+    save_prepared_system(prepared, tmp_path)
+    npz_path = tmp_path / "prepared_system.npz"
+    with np.load(npz_path, allow_pickle=False) as data:
+        arrays = {
+            name: np.asarray(data[name])
+            for name in data.files
+            if name != "molecule_ids"
+        }
+    np.savez_compressed(npz_path, **arrays)
+
+    artifact = load_prepared_mlx_artifact(tmp_path, require_production=True)
+    system, _, _ = build_mlx_system_from_artifact(artifact)
+
+    assert artifact.molecule_ids.size == 0
+    assert artifact.molecule_identity_sha256 is None
+    assert system.molecule_ids is None
+    assert system.molecule_count is None
+
+
+def test_artifact_rejects_molecule_membership_that_disagrees_with_metadata(tmp_path):
+    molecule_ids = np.asarray([0, 0], dtype=np.int32)
+    fixture = _production_fixture()
+    prepared = replace(
+        fixture,
+        metadata=replace(
+            fixture.metadata,
+            selections={
+                **fixture.metadata.selections,
+                "molecule_count": 1,
+                "molecule_identity_sha256": molecule_identity_sha256(
+                    molecule_ids,
+                    atom_count=2,
+                ),
+            },
+        ),
+        molecule_ids=molecule_ids,
+    )
+    save_prepared_system(prepared, tmp_path)
+    npz_path = tmp_path / "prepared_system.npz"
+    with np.load(npz_path, allow_pickle=False) as data:
+        arrays = {name: np.asarray(data[name]) for name in data.files}
+    arrays["molecule_ids"] = np.asarray([0, 1], dtype=np.int32)
+    np.savez_compressed(npz_path, **arrays)
+
+    with pytest.raises(ValueError, match="molecule_count metadata"):
+        load_prepared_mlx_artifact(tmp_path, require_production=True)
 
 
 def test_rb_artifact_round_trips_and_builds_runtime_term(tmp_path):
