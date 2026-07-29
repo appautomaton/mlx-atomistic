@@ -421,6 +421,85 @@ class NeighborListManager:
         finally:
             self.update_wall_seconds += perf_counter() - start
 
+    def build_cell_candidate(
+        self,
+        positions,
+        cell: Cell,
+    ) -> NeighborListManager:
+        """Build an isolated neighbor state for a proposed periodic cell.
+
+        Args:
+            positions: Candidate particle positions.
+            cell: Candidate periodic cell.
+
+        Returns:
+            A distinct manager with one neighbor list built for the candidate
+                state. This manager does not mutate the current manager.
+        """
+
+        candidate = NeighborListManager(
+            cell,
+            cutoff=self.cutoff,
+            skin=self.skin,
+            check_interval=self.check_interval,
+            sort_pairs=self.sort_pairs,
+            max_workers=self.max_workers,
+            backend=self.backend,
+            max_mlx_dense_atoms=self.max_mlx_dense_atoms,
+            block_size=self.block_size,
+            displacement_check_backend=self.displacement_check_backend,
+            rebuild_count=self.rebuild_count,
+            rebuild_wall_seconds=self.rebuild_wall_seconds,
+            update_wall_seconds=self.update_wall_seconds,
+        )
+        candidate.rebuild(positions)
+        return candidate
+
+    def commit_cell_candidate(
+        self,
+        candidate: NeighborListManager,
+    ) -> None:
+        """Replace the current cell-bound state with a compatible candidate.
+
+        Args:
+            candidate: Isolated candidate returned by
+                `build_cell_candidate`.
+
+        Raises:
+            ValueError: If the candidate uses different neighbor-list policy.
+        """
+
+        policy = (
+            "cutoff",
+            "skin",
+            "check_interval",
+            "sort_pairs",
+            "max_workers",
+            "backend",
+            "max_mlx_dense_atoms",
+            "block_size",
+            "displacement_check_backend",
+        )
+        mismatches = tuple(
+            name
+            for name in policy
+            if getattr(self, name) != getattr(candidate, name)
+        )
+        if mismatches:
+            msg = "neighbor candidate policy mismatch: " + ",".join(mismatches)
+            raise ValueError(msg)
+        if candidate.neighbor_list is None or candidate.reference_positions is None:
+            msg = "neighbor candidate must contain a built neighbor list"
+            raise ValueError(msg)
+        self.cell = candidate.cell
+        self.neighbor_list = candidate.neighbor_list
+        self.reference_positions = candidate.reference_positions
+        self.rebuild_count = candidate.rebuild_count
+        self.last_max_displacement = candidate.last_max_displacement
+        self.updates_since_check = candidate.updates_since_check
+        self.rebuild_wall_seconds = candidate.rebuild_wall_seconds
+        self.update_wall_seconds = candidate.update_wall_seconds
+
 
 def build_neighbor_list(
     positions,

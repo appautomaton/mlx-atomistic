@@ -1001,10 +1001,10 @@ def test_run_mlx_binds_one_fixed_cell_pme_execution_plan(tmp_path):
     assert recorded_plan["reuse_count"] == plan["reuse_count"]
 
 
-def test_production_pme_execution_plan_does_not_promote_npt():
+def test_production_pme_execution_plan_binds_initial_npt_cell():
     from mlx_atomistic.prep.runner import (
         _artifact_from_prepared_system,
-        _bind_fixed_cell_pme_plans,
+        _bind_initial_pme_plans,
     )
 
     artifact = _artifact_from_prepared_system(
@@ -1013,13 +1013,67 @@ def test_production_pme_execution_plan_does_not_promote_npt():
     )
     system, terms, _ = build_mlx_system_from_artifact(artifact)
 
-    with pytest.raises(ValueError, match="fixed-cell NVT only"):
-        _bind_fixed_cell_pme_plans(
-            terms,
-            system.cell,
-            require_production=True,
-            use_npt=True,
-        )
+    bound = _bind_initial_pme_plans(
+        terms,
+        system.cell,
+        require_production=True,
+    )
+
+    pme_terms = tuple(
+        term for term in bound if getattr(term, "electrostatics", None) == "pme"
+    )
+    assert len(pme_terms) == 1
+    assert pme_terms[0].pme_plan is not None
+    assert pme_terms[0].pme_plan.cell is system.cell
+
+
+def test_run_mlx_admits_repeated_npt_with_dynamic_pme_plan():
+    from mlx_atomistic.prep.runner import run_mlx
+
+    prepared = _pme_fixture_with_config_arrays()
+    prepared = replace(
+        prepared,
+        molecule_ids=np.zeros((prepared.positions.shape[0],), dtype=np.int32),
+        metadata=replace(
+            prepared.metadata,
+            protocol_metadata={
+                **prepared.metadata.protocol_metadata,
+                "ensemble": "NPT",
+                "proof_mode": "short_npt",
+                "barostat": "monte_carlo",
+                "npt_barostat": True,
+                "center_of_mass_motion": {
+                    "enabled": True,
+                    "force": "CMMotionRemover",
+                    "frequency_steps": 1,
+                },
+            },
+        ),
+    )
+
+    result = run_mlx(
+        prepared,
+        require_production=True,
+        steps=25,
+        minimize_steps=0,
+        equilibration_steps=0,
+        sample_interval=25,
+        diagnostic_interval=25,
+        restraint_k=0.0,
+        temperature=1.0,
+        friction=0.0,
+    )
+
+    assert result.barostat_attempts == 1
+    assert result.barostat_metadata["molecule_count"] == 1
+    assert result.barostat_metadata["center_of_mass_motion_interval"] == 1
+    assert result.nonbonded_report["pme_execution_plan_count"] == 1
+    plan = result.nonbonded_report["pme_execution_plans"][0]
+    assert plan["fingerprint"] in result.barostat_metadata[
+        "final_pme_plan_fingerprints"
+    ]
+    assert result.nonbonded_report["fixed_cell"] is False
+    assert result.nonbonded_report["pme_force_term_count"] == 1
 
 
 @pytest.mark.parametrize("assignment_order", [2, 4, 5])

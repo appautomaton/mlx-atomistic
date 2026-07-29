@@ -67,6 +67,7 @@ class MinimizeThenNVTProtocol:
     seed: int | None = 7
     diagnostic_interval: int = 1
     compile_force_evaluator: bool = True
+    center_of_mass_motion_interval: int | None = None
     ensemble: str = "NVT"
     proof_mode: str = NVT_PROOF_MODE
     barostat: str | bool | None = None
@@ -328,6 +329,7 @@ def run_minimize_then_nvt(
                 diagnostic_interval=max(1, protocol.equilibration_steps),
                 compile_force_evaluator=protocol.compile_force_evaluator,
                 pressure_diagnostics=pressure_diagnostics,
+                center_of_mass_motion_interval=protocol.center_of_mass_motion_interval,
                 **simulation_units,
             ),
             thermostat=thermostat,
@@ -364,6 +366,7 @@ def run_minimize_then_nvt(
             diagnostic_interval=protocol.diagnostic_interval,
             compile_force_evaluator=protocol.compile_force_evaluator,
             pressure_diagnostics=pressure_diagnostics,
+            center_of_mass_motion_interval=protocol.center_of_mass_motion_interval,
             **simulation_units,
         ),
         thermostat=thermostat,

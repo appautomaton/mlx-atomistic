@@ -52,6 +52,36 @@ def test_neighbor_list_has_unique_expected_pairs():
     assert neighbors.estimated_cell_list_bytes > 0
 
 
+def test_cell_candidate_is_isolated_until_explicit_commit():
+    positions = np.asarray(
+        [[0.2, 0.2, 0.2], [1.0, 0.2, 0.2], [3.5, 0.2, 0.2]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(6.0)
+    manager = NeighborListManager(cell, cutoff=1.5, skin=0.2)
+    original_neighbors = manager.update(positions)
+    original_reference = manager.reference_positions
+    original_rebuild_count = manager.rebuild_count
+    candidate_cell = Cell.orthorhombic([6.1, 6.0, 6.0])
+
+    candidate = manager.build_cell_candidate(positions, candidate_cell)
+
+    assert manager.cell is cell
+    assert manager.neighbor_list is original_neighbors
+    assert manager.reference_positions is original_reference
+    assert manager.rebuild_count == original_rebuild_count
+    assert candidate.cell is candidate_cell
+    assert candidate.neighbor_list is not original_neighbors
+    assert candidate.rebuild_count == original_rebuild_count + 1
+
+    manager.commit_cell_candidate(candidate)
+
+    assert manager.cell is candidate_cell
+    assert manager.neighbor_list is candidate.neighbor_list
+    assert manager.reference_positions is candidate.reference_positions
+    assert manager.rebuild_count == candidate.rebuild_count
+
+
 def test_neighbor_backend_validation_rejects_unknown_backend():
     positions = np.array(
         [

@@ -18,7 +18,6 @@ from mlx_atomistic.neighbors import (
     NeighborBlocks,
     NeighborList,
     NeighborListManager,
-    build_neighbor_list,
 )
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
@@ -695,6 +694,8 @@ class BarostatProposal:
     axis: int | None
     log_reverse_over_forward: float
     kernel: str
+    source_pme_plan_fingerprints: tuple[str, ...] = ()
+    candidate_pme_plan_fingerprints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -704,6 +705,7 @@ class NPTResult:
     production: NVTResult
     final_state: SimulationState
     final_cell: Cell
+    final_force_terms: tuple[ForceTerm, ...]
     cell_lengths: mx.array
     cell_matrix: mx.array
     volume: mx.array
@@ -3360,6 +3362,16 @@ def simulate_npt(
     current_velocities = as_mx_array(velocities)
     current_masses = masses
     current_cell = cell
+    current_terms = _cell_bound_force_terms(
+        terms,
+        current_cell,
+        rebuild_plans=False,
+    )
+    _validate_dynamic_cell_cutoffs(
+        current_terms,
+        current_cell,
+        neighbor_manager=neighbor_manager,
+    )
     base_rng_offset = (
         config.initial_step
         if not isinstance(thermostat, LangevinThermostat)
@@ -3402,7 +3414,7 @@ def simulate_npt(
             current_velocities,
             masses=current_masses,
             cell=current_cell,
-            force_terms=terms,
+            force_terms=current_terms,
             neighbor_manager=neighbor_manager,
             config=segment_config,
             thermostat=active_thermostat,
@@ -3420,9 +3432,15 @@ def simulate_npt(
         old_volume = float(np.asarray(current_cell.volume))
         if should_attempt:
             attempts += 1
-            final_state, final_cell, accepted, proposal = _attempt_barostat_move(
+            (
+                final_state,
+                final_cell,
+                current_terms,
+                accepted,
+                proposal,
+            ) = _attempt_barostat_move(
                 segment.final_state,
-                terms,
+                current_terms,
                 current_cell,
                 barostat=barostat,
                 rng=barostat_rng,
@@ -3436,7 +3454,7 @@ def simulate_npt(
             segment = _npt_production_with_final_barostat_state(
                 segment,
                 final_state,
-                terms,
+                current_terms,
                 final_cell,
                 constraints=constraints,
                 config=segment_config,
@@ -3456,6 +3474,12 @@ def simulate_npt(
                 "kernel": proposal.kernel,
                 "scale_factors": list(proposal.scale_factors),
                 "log_reverse_over_forward": proposal.log_reverse_over_forward,
+                "source_pme_plan_fingerprints": list(
+                    proposal.source_pme_plan_fingerprints
+                ),
+                "candidate_pme_plan_fingerprints": list(
+                    proposal.candidate_pme_plan_fingerprints
+                ),
                 "old_volume": old_volume,
                 "new_volume": float(np.asarray(final_cell.volume)),
             }
@@ -3544,12 +3568,14 @@ def simulate_npt(
             "proposal_history": proposal_history,
             "rng_state": dict(barostat_rng.bit_generator.state),
             "center_of_mass_motion_interval": config.center_of_mass_motion_interval,
+            "final_pme_plan_fingerprints": list(_pme_plan_fingerprints(current_terms)),
         }
     )
     return NPTResult(
         production=production,
         final_state=production.final_state,
         final_cell=current_cell,
+        final_force_terms=current_terms,
         cell_lengths=cell_lengths,
         cell_matrix=cell_matrix,
         volume=volumes,
@@ -3676,11 +3702,14 @@ def _npt_production_with_final_barostat_state(
     virtual_sites = config.virtual_sites
     named_terms = _named_force_terms(force_terms)
     eval_positions = _neighbor_evaluation_positions(final_state.positions, virtual_sites)
-    neighbor_list = (
-        neighbor_manager.update(eval_positions)
-        if neighbor_manager is not None
-        else None
-    )
+    if neighbor_manager is not None:
+        _validate_neighbor_manager_cell(neighbor_manager, final_cell)
+        neighbor_list = neighbor_manager.neighbor_list
+        if neighbor_list is None:
+            msg = "NPT committed state requires an initialized neighbor list"
+            raise RuntimeError(msg)
+    else:
+        neighbor_list = None
     pairs = None if neighbor_list is None else neighbor_list.interactions
     potential_energy, _, energy_by_term = _energy_forces_by_term(
         final_state.positions,
@@ -3796,7 +3825,13 @@ def _attempt_barostat_move(
     neighbor_manager: NeighborListManager | None = None,
     virtual_sites: VirtualSiteManager | None = None,
     molecule_ids: object | None = None,
-) -> tuple[SimulationState, Cell, bool, BarostatProposal]:
+) -> tuple[
+    SimulationState,
+    Cell,
+    tuple[ForceTerm, ...],
+    bool,
+    BarostatProposal,
+]:
     proposal = _barostat_proposal(
         barostat,
         rng,
@@ -3820,28 +3855,54 @@ def _attempt_barostat_move(
             proposed_cell,
         )
 
-    old_eval_positions = _neighbor_evaluation_positions(state.positions, virtual_sites)
     proposed_eval_positions = _neighbor_evaluation_positions(proposed_positions, virtual_sites)
-    old_neighbor_list = (
-        neighbor_manager.update(old_eval_positions) if neighbor_manager is not None else None
+    current_force_terms = _cell_bound_force_terms(
+        force_terms,
+        cell,
+        rebuild_plans=False,
     )
-    old_pairs = None if old_neighbor_list is None else old_neighbor_list.interactions
-    proposed_neighbor_list = _barostat_neighbor_list(
-        proposed_eval_positions,
+    _validate_dynamic_cell_cutoffs(
+        current_force_terms,
         proposed_cell,
-        neighbor_manager,
+        neighbor_manager=neighbor_manager,
     )
+    proposed_force_terms = _cell_bound_force_terms(
+        current_force_terms,
+        proposed_cell,
+        rebuild_plans=True,
+    )
+    proposal = replace(
+        proposal,
+        source_pme_plan_fingerprints=_pme_plan_fingerprints(current_force_terms),
+        candidate_pme_plan_fingerprints=_pme_plan_fingerprints(proposed_force_terms),
+    )
+    candidate_neighbor_manager = None
+    if neighbor_manager is not None:
+        _validate_neighbor_manager_cell(neighbor_manager, cell)
+        old_neighbor_list = neighbor_manager.neighbor_list
+        if old_neighbor_list is None:
+            msg = "barostat requires an initialized current neighbor list"
+            raise RuntimeError(msg)
+        candidate_neighbor_manager = neighbor_manager.build_cell_candidate(
+            proposed_eval_positions,
+            proposed_cell,
+        )
+        proposed_neighbor_list = candidate_neighbor_manager.neighbor_list
+    else:
+        old_neighbor_list = None
+        proposed_neighbor_list = None
+    old_pairs = None if old_neighbor_list is None else old_neighbor_list.interactions
     proposed_pairs = None if proposed_neighbor_list is None else proposed_neighbor_list.interactions
     old_energy, _ = _energy_forces_from_terms(
         state.positions,
-        force_terms,
+        current_force_terms,
         cell=cell,
         pairs=old_pairs,
         virtual_sites=virtual_sites,
     )
     new_energy, new_forces = _energy_forces_from_terms(
         proposed_positions,
-        force_terms,
+        proposed_force_terms,
         cell=proposed_cell,
         pairs=proposed_pairs,
         virtual_sites=virtual_sites,
@@ -3868,10 +3929,9 @@ def _attempt_barostat_move(
     )
     accepted = log_acceptance >= 0.0 or float(np.log(rng.random())) < log_acceptance
     if not accepted:
-        return state, cell, False, proposal
-    if neighbor_manager is not None:
-        neighbor_manager.cell = proposed_cell
-        neighbor_manager.rebuild(proposed_eval_positions)
+        return state, cell, current_force_terms, False, proposal
+    if neighbor_manager is not None and candidate_neighbor_manager is not None:
+        neighbor_manager.commit_cell_candidate(candidate_neighbor_manager)
     mx.eval(proposed_positions, proposed_velocities, new_forces, constraint_error)
     return (
         SimulationState(
@@ -3883,6 +3943,7 @@ def _attempt_barostat_move(
             time=state.time,
         ),
         proposed_cell,
+        proposed_force_terms,
         True,
         proposal,
     )
@@ -3906,24 +3967,87 @@ def _barostat_log_acceptance_probability(
     return -beta * acceptance_work + log_reverse_over_forward
 
 
-def _barostat_neighbor_list(
-    positions: mx.array,
+def _cell_bound_force_terms(
+    force_terms: tuple[ForceTerm, ...],
     cell: Cell,
-    neighbor_manager: NeighborListManager | None,
-) -> NeighborList | None:
-    if neighbor_manager is None:
-        return None
-    return build_neighbor_list(
-        positions,
-        cell,
-        cutoff=neighbor_manager.cutoff,
-        skin=neighbor_manager.skin,
-        sort_pairs=neighbor_manager.sort_pairs,
-        max_workers=neighbor_manager.max_workers,
-        backend=neighbor_manager.backend,
-        max_mlx_dense_atoms=neighbor_manager.max_mlx_dense_atoms,
-        block_size=neighbor_manager.block_size,
+    *,
+    rebuild_plans: bool,
+) -> tuple[ForceTerm, ...]:
+    bound_terms = []
+    for term in force_terms:
+        if getattr(term, "electrostatics", None) != "pme":
+            bound_terms.append(term)
+            continue
+        binder = getattr(term, "bind_pme_plan", None)
+        if not callable(binder):
+            msg = "PME force term does not expose bind_pme_plan"
+            raise TypeError(msg)
+        plan = getattr(term, "pme_plan", None)
+        if plan is None:
+            bound_terms.append(binder(cell))
+            continue
+        if rebuild_plans:
+            rebuild = getattr(plan, "rebuild", None)
+            if not callable(rebuild):
+                msg = "PME execution plan does not expose rebuild"
+                raise TypeError(msg)
+            bound_terms.append(binder(rebuild(cell=cell)))
+            continue
+        plan.validate(
+            cell,
+            config=getattr(term, "pme_config", None),
+            coulomb_constant=float(getattr(term, "coulomb_constant", 1.0)),
+        )
+        bound_terms.append(term)
+    return tuple(bound_terms)
+
+
+def _pme_plan_fingerprints(
+    force_terms: tuple[ForceTerm, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        str(plan.fingerprint)
+        for term in force_terms
+        if (plan := getattr(term, "pme_plan", None)) is not None
     )
+
+
+def _validate_neighbor_manager_cell(
+    neighbor_manager: NeighborListManager,
+    cell: Cell,
+) -> None:
+    if not np.array_equal(
+        np.asarray(neighbor_manager.cell.matrix),
+        np.asarray(cell.matrix),
+    ):
+        msg = "neighbor manager cell does not match authoritative NPT cell"
+        raise ValueError(msg)
+
+
+def _validate_dynamic_cell_cutoffs(
+    force_terms: tuple[ForceTerm, ...],
+    cell: Cell,
+    *,
+    neighbor_manager: NeighborListManager | None,
+) -> None:
+    if neighbor_manager is None:
+        return
+    half_minimum_length = 0.5 * float(
+        np.min(np.asarray(cell.lengths, dtype=np.float64))
+    )
+    for term in force_terms:
+        if getattr(term, "electrostatics", None) != "pme":
+            continue
+        config = getattr(term, "pme_config", None)
+        cutoff = None if config is None else getattr(config, "real_cutoff", None)
+        if cutoff is None:
+            continue
+        if float(cutoff) > half_minimum_length + 1.0e-7:
+            msg = (
+                "dynamic-cell PME real_cutoff must not exceed half the "
+                "minimum box length"
+            )
+            raise ValueError(msg)
 
 
 def _normalize_barostat_mode(mode: str) -> str:

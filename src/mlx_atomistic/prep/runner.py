@@ -205,6 +205,27 @@ def _simulation_config_with_virtual_sites(*, virtual_sites=None, **kwargs) -> Si
     return SimulationConfig(virtual_sites=virtual_sites, **kwargs)
 
 
+def _center_of_mass_motion_interval(
+    protocol_metadata: dict[str, Any],
+) -> int | None:
+    policy = dict(protocol_metadata).get("center_of_mass_motion")
+    if policy is None:
+        return None
+    if not isinstance(policy, dict):
+        msg = "center_of_mass_motion protocol metadata must be a mapping"
+        raise TypeError(msg)
+    if not bool(policy.get("enabled", False)):
+        return None
+    if policy.get("force") != "CMMotionRemover":
+        msg = "unsupported center_of_mass_motion force"
+        raise ValueError(msg)
+    frequency = int(policy.get("frequency_steps", 0))
+    if frequency <= 0:
+        msg = "center_of_mass_motion frequency_steps must be positive"
+        raise ValueError(msg)
+    return frequency
+
+
 class _VirtualSiteForceAdapter:
     name = "virtual_site_force_adapter"
     supports_virial = True
@@ -440,12 +461,11 @@ def _production_neighbor_manager(
     )
 
 
-def _bind_fixed_cell_pme_plans(
+def _bind_initial_pme_plans(
     force_terms,
     cell,
     *,
     require_production: bool,
-    use_npt: bool,
 ):
     terms = tuple(force_terms)
     pme_terms = tuple(
@@ -453,9 +473,6 @@ def _bind_fixed_cell_pme_plans(
     )
     if not require_production or not pme_terms:
         return terms
-    if use_npt:
-        msg = "production PME execution plans currently support fixed-cell NVT only"
-        raise ValueError(msg)
     if cell is None:
         msg = "production PME execution plan requires a periodic cell"
         raise ValueError(msg)
@@ -763,17 +780,19 @@ def run_mlx(
         eager_nonbonded_pair_limit=eager_nonbonded_pair_limit,
     )
     use_npt = protocol_report.metadata["ensemble"] == "NPT"
-    force_terms = _bind_fixed_cell_pme_plans(
+    force_terms = _bind_initial_pme_plans(
         force_terms,
         system.cell,
         require_production=require_production,
-        use_npt=use_npt,
     )
     bound_pme_plan = any(getattr(term, "pme_plan", None) is not None for term in force_terms)
     pressure_diagnostics = (
         artifact.atom_count <= PRESSURE_DIAGNOSTIC_ATOM_LIMIT and not bound_pme_plan
     )
     hmr_state = artifact.hmr_state
+    center_of_mass_motion_interval = _center_of_mass_motion_interval(
+        prepared_system.metadata.protocol_metadata
+    )
     compile_force_evaluator = _compile_force_evaluator_safe(force_terms)
     masses = np.asarray(system.masses, dtype=np.float32)
     unit_system = artifact.unit_system
@@ -864,6 +883,7 @@ def run_mlx(
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
+                center_of_mass_motion_interval=center_of_mass_motion_interval,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
@@ -878,6 +898,7 @@ def run_mlx(
             ),
             constraints=constraints,
             neighbor_manager=neighbor_manager,
+            molecule_ids=system.molecule_ids,
             reporters=reporters,
         )
     elif minimize_steps > 0 or equilibration_steps > 0:
@@ -892,6 +913,7 @@ def run_mlx(
             seed=seed,
             diagnostic_interval=diagnostic_interval,
             compile_force_evaluator=compile_force_evaluator,
+            center_of_mass_motion_interval=center_of_mass_motion_interval,
             ensemble=protocol_report.metadata["ensemble"],
             proof_mode=protocol_report.metadata["proof_mode"],
             barostat=protocol_report.metadata["barostat"],
@@ -947,6 +969,7 @@ def run_mlx(
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
+                center_of_mass_motion_interval=center_of_mass_motion_interval,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
@@ -959,6 +982,8 @@ def run_mlx(
             reporters=reporters,
         )
     elapsed_wall_seconds = time.perf_counter() - run_started
+    if use_npt:
+        force_terms = result.final_force_terms
     pme_execution_plans = _pme_execution_plan_diagnostics(force_terms)
     nonbonded_report = getattr(result, "nonbonded_report", None)
     if nonbonded_report is None:

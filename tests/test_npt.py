@@ -16,6 +16,7 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.neighbors import NeighborListManager
+from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.protocols import validate_gpcrmd_protocol_request
 from mlx_atomistic.topology import Topology
 
@@ -36,6 +37,49 @@ class _CellScaledHarmonicTerm:
         scale = cell.lengths[0]
         energy = 0.5 * mx.sum(positions * positions) / scale
         return energy, -positions / scale
+
+
+class _RejectCellChangeTerm:
+    name = "reject_cell_change"
+    supports_virial = True
+
+    def __init__(self, volume):
+        self.volume = float(volume)
+
+    def energy_forces(self, positions, cell=None, pairs=None):
+        penalty = 1.0e9 * mx.abs(cell.volume - self.volume)
+        return penalty, mx.zeros_like(positions)
+
+
+class _SourceCellOnlyTerm:
+    name = "source_cell_only"
+    supports_virial = True
+
+    def __init__(self, cell):
+        self.cell_matrix = np.asarray(cell.matrix).copy()
+        self.evaluation_count = 0
+
+    def energy_forces(self, positions, cell=None, pairs=None):
+        if not np.array_equal(np.asarray(cell.matrix), self.cell_matrix):
+            raise AssertionError("candidate energy evaluated before cell admission")
+        self.evaluation_count += 1
+        return mx.array(0.0, dtype=positions.dtype), mx.zeros_like(positions)
+
+
+def _small_bound_pme_term(cell, *, real_cutoff=3.0):
+    term = NonbondedPotential(
+        sigma=np.ones((4,), dtype=np.float32),
+        epsilon=np.zeros((4,), dtype=np.float32),
+        charges=np.asarray([0.7, -0.2, -0.3, -0.2], dtype=np.float32),
+        cutoff=real_cutoff,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.35,
+            real_cutoff=real_cutoff,
+        ),
+    )
+    return term.bind_pme_plan(cell)
 
 
 def test_monte_carlo_npt_path_scales_orthorhombic_volume_with_constraints():
@@ -634,6 +678,291 @@ def test_accepted_move_rebuilds_constraint_free_block_path_for_new_cell():
         rtol=1.0e-6,
         atol=1.0e-7,
     )
+
+
+def test_accepted_pme_move_commits_plan_neighbor_energy_and_forces_together():
+    positions = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [4.0, 1.2, 1.1],
+            [2.0, 3.0, 5.0],
+            [6.0, 7.0, 8.0],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(12.0)
+    term = _small_bound_pme_term(cell)
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=0.2,
+        backend="mlx_cell_blocks",
+        block_size=2,
+    )
+
+    result = simulate_npt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones((4,), dtype=np.float32),
+        cell=cell,
+        force_terms=term,
+        neighbor_manager=manager,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0e9,
+            interval=1,
+            seed=4,
+        ),
+    )
+
+    final_term = result.final_force_terms[0]
+    fresh_term = term.bind_pme_plan(result.final_cell)
+    fresh_energy, fresh_forces = fresh_term.energy_forces(
+        result.final_state.positions,
+        cell=result.final_cell,
+        pairs=manager.neighbor_list.interactions,
+    )
+    history = result.barostat_metadata["proposal_history"][0]
+    assert result.barostat_accepted == 1
+    assert manager.cell is result.final_cell
+    assert final_term.pme_plan.cell is result.final_cell
+    assert final_term.pme_plan.config.mesh_shape == term.pme_plan.config.mesh_shape
+    assert final_term.pme_plan.config.alpha == term.pme_plan.config.alpha
+    assert final_term.pme_plan.config.real_cutoff == term.pme_plan.config.real_cutoff
+    assert history["source_pme_plan_fingerprints"] == [term.pme_plan.fingerprint]
+    assert history["candidate_pme_plan_fingerprints"] == [
+        final_term.pme_plan.fingerprint
+    ]
+    assert final_term.pme_plan.fingerprint != term.pme_plan.fingerprint
+    np.testing.assert_allclose(
+        np.asarray(result.potential_energy)[-1],
+        np.asarray(fresh_energy),
+        atol=2.0e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.forces),
+        np.asarray(fresh_forces),
+        atol=2.0e-5,
+    )
+
+
+@pytest.mark.gpu
+def test_dynamic_cell_pme_plan_gpu_matches_cpu(monkeypatch):
+    positions = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [4.0, 1.2, 1.1],
+            [2.0, 3.0, 5.0],
+            [6.0, 7.0, 8.0],
+        ],
+        dtype=np.float32,
+    )
+
+    def run(device):
+        mx.set_default_device(device)
+        mx.set_default_stream(mx.new_stream(device))
+        cell = Cell.cubic(12.0)
+        return simulate_npt(
+            positions,
+            np.zeros_like(positions),
+            masses=np.ones((4,), dtype=np.float32),
+            cell=cell,
+            force_terms=_small_bound_pme_term(cell),
+            neighbor_manager=NeighborListManager(
+                cell,
+                cutoff=3.0,
+                skin=0.2,
+                backend="mlx_cell_blocks",
+                block_size=2,
+            ),
+            config=SimulationConfig(
+                dt=0.001,
+                steps=1,
+                sample_interval=1,
+                diagnostic_interval=1,
+                pressure_diagnostics=False,
+            ),
+            thermostat=LangevinThermostat(
+                temperature=0.0,
+                friction=0.0,
+                seed=11,
+            ),
+            barostat=MonteCarloBarostat(
+                pressure=0.0,
+                temperature=1.0e9,
+                interval=1,
+                seed=4,
+            ),
+        )
+
+    previous = mx.default_device()
+    cpu = mx.Device(mx.cpu, 0)
+    cpu_result = run(cpu)
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    try:
+        gpu = mx.Device(mx.gpu, 0)
+        gpu_result = run(gpu)
+        mx.eval(
+            gpu_result.final_state.positions,
+            gpu_result.final_state.forces,
+            gpu_result.potential_energy,
+        )
+    except Exception:  # noqa: BLE001 - any Metal load failure means skip.
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+        pytest.skip("Metal GPU unavailable")
+    try:
+        np.testing.assert_allclose(
+            np.asarray(gpu_result.final_cell.matrix),
+            np.asarray(cpu_result.final_cell.matrix),
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(gpu_result.potential_energy),
+            np.asarray(cpu_result.potential_energy),
+            atol=2.0e-5,
+        )
+        np.testing.assert_allclose(
+            np.asarray(gpu_result.final_state.forces),
+            np.asarray(cpu_result.final_state.forces),
+            atol=2.0e-5,
+        )
+    finally:
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+
+
+def test_rejected_pme_moves_preserve_complete_plan_and_neighbor_state():
+    positions = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [4.0, 1.2, 1.1],
+            [2.0, 3.0, 5.0],
+            [6.0, 7.0, 8.0],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(12.0)
+    term = _small_bound_pme_term(cell)
+    reject = _RejectCellChangeTerm(cell.volume)
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=0.2,
+        backend="mlx_cell_blocks",
+        block_size=2,
+    )
+    original_neighbors = manager.update(positions)
+    original_reference = manager.reference_positions
+    original_rebuild_count = manager.rebuild_count
+
+    result = simulate_npt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones((4,), dtype=np.float32),
+        cell=cell,
+        force_terms=(term, reject),
+        neighbor_manager=manager,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=1,
+            seed=4,
+        ),
+    )
+
+    assert result.barostat_attempts == 3
+    assert result.barostat_accepted == 0
+    assert result.final_cell is cell
+    assert result.final_force_terms[0] is term
+    assert result.final_force_terms[0].pme_plan is term.pme_plan
+    assert manager.cell is cell
+    assert manager.neighbor_list is original_neighbors
+    assert manager.reference_positions is original_reference
+    assert manager.rebuild_count == original_rebuild_count
+    assert all(
+        record["candidate_pme_plan_fingerprints"]
+        != record["source_pme_plan_fingerprints"]
+        for record in result.barostat_metadata["proposal_history"]
+    )
+
+
+def test_invalid_candidate_pme_cutoff_fails_before_candidate_energy():
+    positions = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [4.0, 1.2, 1.1],
+            [2.0, 3.0, 5.0],
+            [6.0, 7.0, 8.0],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(12.0)
+    guard = _SourceCellOnlyTerm(cell)
+
+    with pytest.raises(ValueError, match="half the minimum box length"):
+        simulate_npt(
+            positions,
+            np.zeros_like(positions),
+            masses=np.ones((4,), dtype=np.float32),
+            cell=cell,
+            force_terms=(
+                _small_bound_pme_term(cell, real_cutoff=5.9),
+                guard,
+            ),
+            neighbor_manager=NeighborListManager(
+                cell,
+                cutoff=5.9,
+                skin=0.0,
+                backend="mlx_cell_blocks",
+                block_size=2,
+            ),
+            config=SimulationConfig(
+                dt=0.001,
+                steps=1,
+                sample_interval=1,
+                diagnostic_interval=1,
+                pressure_diagnostics=False,
+            ),
+            thermostat=LangevinThermostat(
+                temperature=0.0,
+                friction=0.0,
+                seed=11,
+            ),
+            barostat=MonteCarloBarostat(
+                pressure=0.0,
+                temperature=1.0,
+                interval=1,
+                seed=3,
+                max_log_volume_scale=0.1,
+            ),
+        )
+
+    assert guard.evaluation_count > 0
 
 
 def test_barostat_acceptance_uses_molecule_count_and_proposal_ratio():
