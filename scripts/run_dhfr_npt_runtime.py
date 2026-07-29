@@ -165,7 +165,14 @@ def run_batch(
                 timeout_seconds=sample_timeout_seconds,
             )
             started = time.perf_counter()
-            completed = subprocess.run(command, check=False)
+            log_path = sample_dir / "worker.log"
+            with log_path.open("ab") as log_handle:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                )
             complete_wall_seconds = time.perf_counter() - started
             if completed.returncode != 0:
                 raise runtime.DHFRNPTRuntimeError(
@@ -182,6 +189,7 @@ def run_batch(
             worker["artifacts"] = [
                 *worker["artifacts"],
                 runtime.artifact_record(worker_path, relative_to=sample_dir),
+                runtime.artifact_record(log_path, relative_to=sample_dir),
             ]
             memory_payload = _load_json(memory_path)
             sample = runtime.finalize_sample_report(
@@ -334,7 +342,7 @@ def _run_openmm_worker(
     contract_path: Path,
 ) -> dict[str, Any]:
     worker_started = time.perf_counter()
-    from scripts import run_openmm_mlx_dhfr_npt as v1_runner
+    v1_runner = _load_v1_runner()
 
     setup_started = time.perf_counter()
     contract = load_contract(contract_path)
@@ -507,7 +515,7 @@ def _run_mlx_worker(
     import mlx
     import mlx.core as mx
 
-    from scripts import run_openmm_mlx_dhfr_npt as v1_runner
+    v1_runner = _load_v1_runner()
 
     mx.set_default_device(mx.gpu)
     setup_started = time.perf_counter()
@@ -729,6 +737,14 @@ def _read_command(command: Sequence[str]) -> str | None:
         return None
     value = completed.stdout.strip()
     return value if completed.returncode == 0 and value else None
+
+
+def _load_v1_runner():
+    try:
+        from scripts import run_openmm_mlx_dhfr_npt as v1_runner
+    except ImportError:  # pragma: no cover - direct script execution.
+        import run_openmm_mlx_dhfr_npt as v1_runner
+    return v1_runner
 
 
 def _require_workload(
