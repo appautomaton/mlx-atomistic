@@ -111,6 +111,10 @@ class SimulationCheckpoint:
         default_factory=lambda: np.asarray([], dtype=np.int32)
     )
     cell_history_cursor: int = 0
+    neighbor_reference_positions: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    neighbor_state: dict[str, Any] = field(default_factory=dict)
 
     def state(self) -> SimulationState:
         """Rebuild the in-memory simulation state from this checkpoint.
@@ -488,6 +492,8 @@ def save_simulation_checkpoint(
     barostat: dict[str, Any] | None = None,
     molecule_ids: object | None = None,
     neighbor_policy: dict[str, Any] | None = None,
+    neighbor_reference_positions: object | None = None,
+    neighbor_state: dict[str, Any] | None = None,
     force_terms: tuple[str, ...] | list[str] | None = None,
     diagnostic_cursor: int | None = None,
     cell_history_cursor: int | None = None,
@@ -508,6 +514,10 @@ def save_simulation_checkpoint(
         molecule_ids: Optional exact per-particle molecule identifiers.
             Defaults to ``None``.
         neighbor_policy: Optional neighbor-list policy dict. Defaults to ``None``.
+        neighbor_reference_positions: Optional positions at the last neighbor
+            rebuild. Defaults to ``None``.
+        neighbor_state: Optional neighbor-list counters and displacement state.
+            Defaults to ``None``.
         force_terms: Optional names of the force terms in effect. Defaults to ``None``.
         diagnostic_cursor: Optional index into the diagnostic series for exact
             resumption. Defaults to ``None``.
@@ -536,6 +546,14 @@ def save_simulation_checkpoint(
             [] if molecule_ids is None else molecule_ids,
             dtype=np.int32,
         ),
+        "neighbor_reference_positions": np.asarray(
+            (
+                np.empty((0, 3), dtype=np.float32)
+                if neighbor_reference_positions is None
+                else neighbor_reference_positions
+            ),
+            dtype=np.float32,
+        ),
     }
     materialization_elapsed = perf_counter() - materialization_start
     _record_checkpoint_runtime_attribution(
@@ -551,6 +569,7 @@ def save_simulation_checkpoint(
         "thermostat_json": np.asarray(json.dumps(thermostat_payload)),
         "barostat_json": np.asarray(json.dumps(barostat or {})),
         "neighbor_policy_json": np.asarray(json.dumps(neighbor_policy or {})),
+        "neighbor_state_json": np.asarray(json.dumps(neighbor_state or {})),
         "force_terms": np.asarray([] if force_terms is None else list(force_terms), dtype=str),
         "diagnostic_cursor": np.asarray(
             [int(state.step if diagnostic_cursor is None else diagnostic_cursor)],
@@ -649,6 +668,19 @@ def load_simulation_checkpoint(path: str | Path) -> SimulationCheckpoint:
                 0
                 if "cell_history_cursor" not in data.files
                 else int(np.asarray(data["cell_history_cursor"])[0])
+            ),
+            neighbor_reference_positions=(
+                np.empty((0, 3), dtype=np.float32)
+                if "neighbor_reference_positions" not in data.files
+                else np.asarray(
+                    data["neighbor_reference_positions"],
+                    dtype=np.float32,
+                )
+            ),
+            neighbor_state=(
+                {}
+                if "neighbor_state_json" not in data.files
+                else json.loads(str(np.asarray(data["neighbor_state_json"])))
             ),
         )
 

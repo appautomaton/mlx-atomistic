@@ -2812,12 +2812,16 @@ class NonbondedPotential:
             masses=masses,
             molecule_ids=molecule_ids,
         )
-        return local_virial + self._cutoff_finite_strain_correction_virial(
+        mx.eval(local_virial)
+        mx.clear_cache()
+        correction = self._cutoff_finite_strain_correction_virial(
             positions,
             cell=cell,
             masses=masses,
             molecule_ids=molecule_ids,
         )
+        mx.eval(correction)
+        return local_virial + correction
 
     def _cutoff_finite_strain_correction_virial(
         self,
@@ -2984,6 +2988,7 @@ class NonbondedPotential:
                     coulomb_boundary_energies[0]
                     - coulomb_boundary_energies[1]
                 ) / (2.0 * strain_epsilon)
+            mx.eval(correction)
             diagonal.append(correction)
         return mx.diag(mx.stack(diagonal))
 

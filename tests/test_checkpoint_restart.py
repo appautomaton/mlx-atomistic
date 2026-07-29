@@ -508,6 +508,9 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
     )
     assert first_checkpoint.metadata["fixed_cell"] is False
     assert first_checkpoint.cell_history_cursor == 3
+    assert first_checkpoint.neighbor_reference_positions.shape == (3, 3)
+    assert first_checkpoint.neighbor_state["rebuild_count"] >= 1
+    assert first_checkpoint.neighbor_state["updates_since_check"] >= 0
     assert resumed_checkpoint.cell_history_cursor == 6
     np.testing.assert_array_equal(
         first_checkpoint.molecule_ids,

@@ -1,7 +1,9 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from mlx_atomistic.benchmarks.dhfr_npt import (
@@ -266,6 +268,71 @@ def test_staged_runner_cli_requires_declared_stage_seed_pair():
         runner._parse_args(
             ["--stage", "npt", "--prepared", "prepared", "--out", "out"]
         )
+
+
+def test_target_resume_evidence_requires_exact_continuation():
+    from scripts import run_openmm_mlx_dhfr_npt as runner
+
+    def result(values, *, final):
+        scalar = np.asarray(values, dtype=np.float32)
+        vector = scalar[:, None]
+        matrix = scalar[:, None, None]
+        final_vector = np.asarray([final], dtype=np.float32)
+        return SimpleNamespace(
+            final_state=SimpleNamespace(
+                positions=final_vector,
+                velocities=final_vector,
+                forces=final_vector,
+            ),
+            final_cell=SimpleNamespace(matrix=final_vector),
+            sampled_positions=vector,
+            sampled_velocities=vector,
+            sampled_time=scalar,
+            diagnostic_time=scalar,
+            cell_history=matrix,
+            potential_energy=scalar,
+            kinetic_energy=scalar,
+            total_energy=scalar,
+            temperature=scalar,
+            virial_tensor=matrix,
+            pressure_tensor=matrix,
+            pressure=scalar,
+            constraint_max_error=scalar,
+            sampled_steps=scalar.astype(np.int32),
+            diagnostic_steps=scalar.astype(np.int32),
+            pair_count=scalar.astype(np.int32),
+            potential_energy_by_term={"term": scalar},
+            barostat_attempts=2,
+            barostat_accepted=1,
+            barostat_metadata={
+                "proposal_history": [{"attempt": 1}, {"attempt": 2}],
+                "rng_state": {"state": 3},
+            },
+        )
+
+    continuous = runner._mlx_resume_snapshot(
+        result([0.0, 1.0, 2.0], final=2.0)
+    )
+    first = runner._mlx_resume_snapshot(result([0.0, 1.0], final=1.0))
+    resumed = runner._mlx_resume_snapshot(result([1.0, 2.0], final=2.0))
+
+    evidence = runner._mlx_resume_parity_evidence(
+        continuous=continuous,
+        first=first,
+        resumed=resumed,
+        split_step=125,
+    )
+
+    assert evidence["passed"] is True
+    assert evidence["maximum_abs_error"] == 0.0
+    resumed["final_state"]["positions"][0] = 2.1
+    failed = runner._mlx_resume_parity_evidence(
+        continuous=continuous,
+        first=first,
+        resumed=resumed,
+        split_step=125,
+    )
+    assert failed["passed"] is False
 
 
 @pytest.mark.reference

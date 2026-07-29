@@ -742,6 +742,48 @@ def _compile_force_evaluator_safe(force_terms) -> bool:
     )
 
 
+def _restore_checkpoint_neighbor_state(
+    checkpoint,
+    *,
+    neighbor_manager,
+    positions_shape: tuple[int, ...],
+) -> None:
+    reference = np.asarray(
+        checkpoint.neighbor_reference_positions,
+        dtype=np.float32,
+    )
+    state = dict(checkpoint.neighbor_state)
+    if reference.size == 0 and not state:
+        return
+    if neighbor_manager is None:
+        msg = "resume checkpoint carries neighbor state without a neighbor manager"
+        raise ValueError(msg)
+    if reference.shape != positions_shape or not np.all(np.isfinite(reference)):
+        msg = "resume checkpoint neighbor reference positions are invalid"
+        raise ValueError(msg)
+    rebuild_count = int(state.get("rebuild_count", -1))
+    updates_since_check = int(state.get("updates_since_check", -1))
+    last_max_displacement = float(
+        state.get("last_max_displacement", np.nan)
+    )
+    if rebuild_count < 1:
+        msg = "resume checkpoint neighbor rebuild count must be positive"
+        raise ValueError(msg)
+    if not 0 <= updates_since_check < neighbor_manager.check_interval:
+        msg = "resume checkpoint neighbor update cursor is invalid"
+        raise ValueError(msg)
+    if (
+        not np.isfinite(last_max_displacement)
+        or last_max_displacement < 0.0
+    ):
+        msg = "resume checkpoint neighbor displacement is invalid"
+        raise ValueError(msg)
+    neighbor_manager.rebuild(reference)
+    neighbor_manager.rebuild_count = rebuild_count
+    neighbor_manager.updates_since_check = updates_since_check
+    neighbor_manager.last_max_displacement = last_max_displacement
+
+
 def run_mlx(
     prepared: str | Path | PreparedSystem,
     *,
@@ -927,6 +969,12 @@ def run_mlx(
         neighbor_skin=neighbor_skin,
         neighbor_check_interval=neighbor_check_interval,
     )
+    if checkpoint is not None:
+        _restore_checkpoint_neighbor_state(
+            checkpoint,
+            neighbor_manager=neighbor_manager,
+            positions_shape=run_positions.shape,
+        )
 
     run_started = time.perf_counter()
     pressure_internal = (
@@ -1105,6 +1153,20 @@ def run_mlx(
                 "check_interval": neighbor_check_interval,
                 "backend": result.nonbonded_report.get("backend"),
             },
+            neighbor_reference_positions=(
+                None
+                if neighbor_manager is None
+                else neighbor_manager.reference_positions
+            ),
+            neighbor_state=(
+                {}
+                if neighbor_manager is None
+                else {
+                    "rebuild_count": neighbor_manager.rebuild_count,
+                    "last_max_displacement": neighbor_manager.last_max_displacement,
+                    "updates_since_check": neighbor_manager.updates_since_check,
+                }
+            ),
             force_terms=tuple(
                 str(getattr(term, "name", type(term).__name__)) for term in force_terms
             ),

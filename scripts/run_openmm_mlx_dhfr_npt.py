@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -598,34 +599,38 @@ def _run_npt_stage(
     stage_dir.mkdir(parents=True, exist_ok=True)
     mlx_trajectory = stage_dir / "mlx_trajectory.npz"
     mlx_checkpoint = stage_dir / "mlx_checkpoint.npz"
-    mlx_result = run_mlx(
+    mlx_result = _run_mlx_npt(
         prepared,
+        workload=workload,
+        seed=seed,
         out=mlx_trajectory,
         checkpoint_out=mlx_checkpoint,
         steps=int(workload["steps"]),
-        sample_interval=int(workload["sample_interval"]),
-        diagnostic_interval=int(workload["diagnostic_interval"]),
-        dt=float(workload["dt_ps"]),
-        temperature=float(workload["temperature_K"]),
-        friction=float(workload["friction_per_ps"]),
-        seed=seed,
-        pressure_atm=float(workload["pressure_atm"]),
-        barostat_interval=int(workload["barostat"]["interval"]),
-        barostat_mode="anisotropic",
-        barostat_axes=tuple(workload["barostat"]["axes"]),
-        barostat_max_log_volume_scale=float(
-            workload["barostat"]["max_log_volume_scale"]
-        ),
-        restraint_k=0.0,
-        require_production=True,
-        minimize_steps=0,
-        equilibration_steps=0,
-        eager_nonbonded_pair_limit=0,
     )
     mlx_summary = _mlx_npt_summary(
         mlx_result,
         atom_count=prepared.atom_count,
     )
+    mlx_pme_dynamic = bool(
+        mlx_result.barostat_metadata["final_pme_plan_fingerprints"]
+    )
+    resume_evidence = None
+    resume_artifacts: dict[str, dict[str, Any]] = {}
+    declared_seeds = [int(value) for value in workload["seeds"]]
+    if seed == declared_seeds[0]:
+        continuous_snapshot = _mlx_resume_snapshot(mlx_result)
+        del mlx_result
+        mx.clear_cache()
+        resume_evidence, resume_artifacts = _run_mlx_resume_parity(
+            prepared,
+            workload=workload,
+            seed=seed,
+            stage_dir=stage_dir,
+            continuous=continuous_snapshot,
+        )
+    else:
+        del mlx_result
+        mx.clear_cache()
     openmm_result = _run_openmm_npt(
         prepared,
         contract=contract,
@@ -722,10 +727,12 @@ def _run_npt_stage(
             engine_delta["mean_pressure_bar"]
             <= gates["maximum_engine_mean_pressure_delta_bar"]
         ),
-        "mlx_pme_dynamic": bool(
-            mlx_result.barostat_metadata["final_pme_plan_fingerprints"]
-        ),
+        "mlx_pme_dynamic": mlx_pme_dynamic,
     }
+    if resume_evidence is not None:
+        checks["mlx_checkpoint_resume_parity"] = bool(
+            resume_evidence["passed"]
+        )
     evidence = {
         "kind": "bounded_multi_opportunity_anisotropic_npt",
         "seed": seed,
@@ -736,13 +743,270 @@ def _run_npt_stage(
         "mlx": mlx_summary,
         "openmm": openmm_result,
         "engine_delta": engine_delta,
+        "checkpoint_resume": resume_evidence,
         "artifacts": {
             "mlx_trajectory.npz": _artifact_record(mlx_trajectory),
             "mlx_checkpoint.npz": _artifact_record(mlx_checkpoint),
             "openmm_samples.npz": _artifact_record(openmm_arrays),
+            **resume_artifacts,
         },
     }
     return evidence, checks
+
+
+def _run_mlx_npt(
+    prepared,
+    *,
+    workload: dict[str, Any],
+    seed: int,
+    out: Path,
+    checkpoint_out: Path,
+    steps: int,
+    resume_checkpoint: Path | None = None,
+):
+    return run_mlx(
+        prepared,
+        out=out,
+        checkpoint_out=checkpoint_out,
+        resume_checkpoint=resume_checkpoint,
+        steps=steps,
+        sample_interval=int(workload["sample_interval"]),
+        diagnostic_interval=int(workload["diagnostic_interval"]),
+        dt=float(workload["dt_ps"]),
+        temperature=float(workload["temperature_K"]),
+        friction=float(workload["friction_per_ps"]),
+        seed=seed,
+        pressure_atm=float(workload["pressure_atm"]),
+        barostat_interval=int(workload["barostat"]["interval"]),
+        barostat_mode="anisotropic",
+        barostat_axes=tuple(workload["barostat"]["axes"]),
+        barostat_max_log_volume_scale=float(
+            workload["barostat"]["max_log_volume_scale"]
+        ),
+        restraint_k=0.0,
+        require_production=True,
+        minimize_steps=0,
+        equilibration_steps=0,
+        constraint_max_iterations=20,
+        eager_nonbonded_pair_limit=0,
+    )
+
+
+def _run_mlx_resume_parity(
+    prepared,
+    *,
+    workload: dict[str, Any],
+    seed: int,
+    stage_dir: Path,
+    continuous,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    total_steps = int(workload["steps"])
+    first_steps = total_steps // 2
+    second_steps = total_steps - first_steps
+    interval = int(workload["barostat"]["interval"])
+    if first_steps % interval != 0 or second_steps % interval != 0:
+        msg = "target split must preserve complete barostat intervals"
+        raise DHFRNPTValidationError(msg)
+
+    first_trajectory = stage_dir / "mlx_resume_first_trajectory.npz"
+    split_checkpoint = stage_dir / "mlx_resume_split_checkpoint.npz"
+    second_trajectory = stage_dir / "mlx_resume_second_trajectory.npz"
+    final_checkpoint = stage_dir / "mlx_resume_final_checkpoint.npz"
+    first = _run_mlx_npt(
+        prepared,
+        workload=workload,
+        seed=seed,
+        out=first_trajectory,
+        checkpoint_out=split_checkpoint,
+        steps=first_steps,
+    )
+    first_snapshot = _mlx_resume_snapshot(first)
+    del first
+    mx.clear_cache()
+    resumed = _run_mlx_npt(
+        prepared,
+        workload=workload,
+        seed=seed,
+        out=second_trajectory,
+        checkpoint_out=final_checkpoint,
+        resume_checkpoint=split_checkpoint,
+        steps=second_steps,
+    )
+    resumed_snapshot = _mlx_resume_snapshot(resumed)
+    del resumed
+    mx.clear_cache()
+    evidence = _mlx_resume_parity_evidence(
+        continuous=continuous,
+        first=first_snapshot,
+        resumed=resumed_snapshot,
+        split_step=first_steps,
+    )
+    artifacts = {
+        path.name: _artifact_record(path)
+        for path in (
+            first_trajectory,
+            split_checkpoint,
+            second_trajectory,
+            final_checkpoint,
+        )
+    }
+    return evidence, artifacts
+
+
+def _mlx_resume_snapshot(result) -> dict[str, Any]:
+    sampled_fields = (
+        "sampled_positions",
+        "sampled_velocities",
+        "sampled_time",
+        "diagnostic_time",
+        "cell_history",
+        "potential_energy",
+        "kinetic_energy",
+        "total_energy",
+        "temperature",
+        "virial_tensor",
+        "pressure_tensor",
+        "pressure",
+        "constraint_max_error",
+        "sampled_steps",
+        "diagnostic_steps",
+        "pair_count",
+    )
+    return {
+        "final_state": {
+            name: np.asarray(getattr(result.final_state, name)).copy()
+            for name in ("positions", "velocities", "forces")
+        },
+        "final_cell": np.asarray(result.final_cell.matrix).copy(),
+        "sampled": {
+            name: np.asarray(getattr(result, name)).copy()
+            for name in sampled_fields
+        },
+        "potential_energy_by_term": {
+            name: np.asarray(values).copy()
+            for name, values in result.potential_energy_by_term.items()
+        },
+        "barostat_attempts": int(result.barostat_attempts),
+        "barostat_accepted": int(result.barostat_accepted),
+        "proposal_history": copy.deepcopy(
+            result.barostat_metadata["proposal_history"]
+        ),
+        "rng_state": copy.deepcopy(result.barostat_metadata["rng_state"]),
+    }
+
+
+def _mlx_resume_parity_evidence(
+    *,
+    continuous: dict[str, Any],
+    first: dict[str, Any],
+    resumed: dict[str, Any],
+    split_step: int,
+) -> dict[str, Any]:
+    tolerance = 1.0e-6
+
+    def max_abs(left, right) -> float:
+        delta = np.abs(
+            np.asarray(left, dtype=np.float64)
+            - np.asarray(right, dtype=np.float64)
+        )
+        return float(np.max(delta)) if delta.size else 0.0
+
+    final_errors = {
+        name: max_abs(
+            resumed["final_state"][name],
+            continuous["final_state"][name],
+        )
+        for name in ("positions", "velocities", "forces")
+    }
+    final_errors["cell"] = max_abs(
+        resumed["final_cell"],
+        continuous["final_cell"],
+    )
+    sampled_errors = {}
+    for name in (
+        "sampled_positions",
+        "sampled_velocities",
+        "sampled_time",
+        "diagnostic_time",
+        "cell_history",
+        "potential_energy",
+        "kinetic_energy",
+        "total_energy",
+        "temperature",
+        "virial_tensor",
+        "pressure_tensor",
+        "pressure",
+        "constraint_max_error",
+    ):
+        combined = np.concatenate(
+            (
+                np.asarray(first["sampled"][name]),
+                np.asarray(resumed["sampled"][name])[1:],
+            ),
+            axis=0,
+        )
+        sampled_errors[name] = max_abs(
+            combined,
+            continuous["sampled"][name],
+        )
+    index_fields_match = all(
+        np.array_equal(
+            np.concatenate(
+                (
+                    np.asarray(first["sampled"][name]),
+                    np.asarray(resumed["sampled"][name])[1:],
+                ),
+                axis=0,
+            ),
+            np.asarray(continuous["sampled"][name]),
+        )
+        for name in (
+            "sampled_steps",
+            "diagnostic_steps",
+            "pair_count",
+        )
+    )
+    term_errors = {}
+    for name in continuous["potential_energy_by_term"]:
+        combined = np.concatenate(
+            (
+                np.asarray(first["potential_energy_by_term"][name]),
+                np.asarray(resumed["potential_energy_by_term"][name])[1:],
+            ),
+            axis=0,
+        )
+        term_errors[name] = max_abs(
+            combined,
+            continuous["potential_energy_by_term"][name],
+        )
+    metadata_match = (
+        resumed["barostat_attempts"] == continuous["barostat_attempts"]
+        and resumed["barostat_accepted"] == continuous["barostat_accepted"]
+        and resumed["proposal_history"] == continuous["proposal_history"]
+        and resumed["rng_state"] == continuous["rng_state"]
+    )
+    maximum_error = max(
+        (
+            *final_errors.values(),
+            *sampled_errors.values(),
+            *term_errors.values(),
+        )
+    )
+    return {
+        "passed": (
+            maximum_error <= tolerance
+            and index_fields_match
+            and metadata_match
+        ),
+        "split_step": split_step,
+        "tolerance": tolerance,
+        "maximum_abs_error": maximum_error,
+        "final_state_max_abs_errors": final_errors,
+        "sampled_max_abs_errors": sampled_errors,
+        "energy_term_max_abs_errors": term_errors,
+        "index_fields_match": index_fields_match,
+        "barostat_and_rng_state_match": metadata_match,
+    }
 
 
 def _npt_prepared(prepared):
@@ -847,10 +1111,12 @@ def _run_openmm_npt(
     initial_lengths = np.diag(np.asarray(prepared.cell_matrix, dtype=np.float64))
     context.setPeriodicBoxVectors(*_openmm_box(mm, unit, initial_lengths))
     context.setPositions(positions * 0.1 * unit.nanometer)
+    context.applyConstraints(integrator.getConstraintTolerance())
     context.setVelocitiesToTemperature(
         float(workload["temperature_K"]) * unit.kelvin,
         seed,
     )
+    context.applyVelocityConstraints(integrator.getConstraintTolerance())
     sampled = [_openmm_sample(context, prepared, api)]
     for _ in range(int(workload["steps"]) // interval):
         integrator.step(interval)

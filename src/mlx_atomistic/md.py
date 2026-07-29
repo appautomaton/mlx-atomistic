@@ -3492,6 +3492,8 @@ def simulate_npt(
             constraints=constraints,
             reporters=buffered_events.append,
         )
+        _materialize_npt_segment(segment)
+        mx.clear_cache()
         segment_source_cell = current_cell
         should_attempt = (
             segment_steps > 0
@@ -3557,7 +3559,6 @@ def simulate_npt(
             proposal_history.append(proposal_record)
         else:
             final_state = segment.final_state
-
         segment_cells = mx.broadcast_to(
             segment_source_cell.matrix,
             (segment.sampled_positions.shape[0], 3, 3),
@@ -3569,8 +3570,10 @@ def simulate_npt(
             )
         if segments:
             segment_cells = segment_cells[1:]
+        _materialize_npt_segment(segment, segment_cells)
         cell_history_chunks.append(segment_cells)
         segments.append(segment)
+        mx.clear_cache()
 
         _forward_npt_segment_events(
             buffered_events,
@@ -3655,6 +3658,37 @@ def simulate_npt(
         barostat_accepted=accepted_count,
         barostat_metadata=barostat_metadata,
     )
+
+
+def _materialize_npt_segment(
+    segment: NVTResult,
+    cell_history: mx.array | None = None,
+) -> None:
+    arrays = [
+        segment.sampled_positions,
+        segment.sampled_velocities,
+        segment.sampled_steps,
+        segment.sampled_time,
+        segment.diagnostic_steps,
+        segment.diagnostic_time,
+        segment.potential_energy,
+        segment.kinetic_energy,
+        segment.total_energy,
+        segment.temperature,
+        segment.virial_tensor,
+        segment.pressure_tensor,
+        segment.pressure,
+        segment.pair_count,
+        segment.rebuild_count,
+        segment.constraint_max_error,
+        segment.final_state.positions,
+        segment.final_state.velocities,
+        segment.final_state.forces,
+        *segment.potential_energy_by_term.values(),
+    ]
+    if cell_history is not None:
+        arrays.append(cell_history)
+    mx.eval(*arrays)
 
 
 def _concatenate_nvt_segments(segments: list[NVTResult]) -> NVTResult:
