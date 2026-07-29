@@ -30,11 +30,14 @@ from mlx_atomistic.benchmarks.dhfr_npt import (
     validate_prepared_boundary,
     write_stage_report_atomic,
 )
+from mlx_atomistic.core import Cell
 from mlx_atomistic.md import (
     analytic_configurational_virial_tensor,
     configurational_virial_tensor,
 )
 from mlx_atomistic.neighbors import build_neighbor_list
+from mlx_atomistic.nonbonded import molecularly_strained_positions
+from mlx_atomistic.pme import pme_coulomb_strain_components
 from mlx_atomistic.prep.io import load_prepared_system
 from mlx_atomistic.prep.runner import run_mlx
 from mlx_atomistic.units import ATM_TO_KJ_PER_MOL_ANGSTROM3
@@ -274,6 +277,48 @@ def _evaluate_mlx_fixed(prepared_dir: Path) -> dict[str, Any]:
         virial_mode="finite_difference_oracle",
     )
     mx.eval(analytic, finite_difference)
+    analytic_components: dict[str, list[list[float]]] = {}
+    finite_difference_components: dict[str, list[list[float]]] = {}
+    for term in bound_terms:
+        name = str(getattr(term, "name", type(term).__name__))
+        term_analytic = analytic_configurational_virial_tensor(
+            system.positions,
+            total_forces,
+            (term,),
+            cell=system.cell,
+            pairs=neighbors.interactions,
+            masses=system.masses,
+            molecule_ids=system.molecule_ids,
+        )
+        term_finite_difference = configurational_virial_tensor(
+            system.positions,
+            total_forces,
+            (term,),
+            cell=system.cell,
+            pairs=neighbors.interactions,
+            masses=system.masses,
+            molecule_ids=system.molecule_ids,
+            virial_mode="finite_difference_oracle",
+        )
+        mx.eval(term_analytic, term_finite_difference)
+        analytic_components[name] = np.asarray(
+            term_analytic,
+            dtype=np.float64,
+        ).tolist()
+        finite_difference_components[name] = np.asarray(
+            term_finite_difference,
+            dtype=np.float64,
+        ).tolist()
+    nonbonded_local_analytic_components = (
+        _mlx_nonbonded_local_analytic_virial_components(
+            nonbonded,
+            positions=system.positions,
+            cell=system.cell,
+            pairs=neighbors.interactions,
+            masses=system.masses,
+            molecule_ids=system.molecule_ids,
+        )
+    )
     plan = nonbonded.pme_plan
     return {
         "energy_kj_mol": float(np.asarray(total_energy)),
@@ -281,6 +326,11 @@ def _evaluate_mlx_fixed(prepared_dir: Path) -> dict[str, Any]:
         "forces": np.asarray(total_forces, dtype=np.float64) * 10.0,
         "analytic_virial": np.asarray(analytic, dtype=np.float64),
         "fd_virial": np.asarray(finite_difference, dtype=np.float64),
+        "analytic_virial_components": analytic_components,
+        "fd_virial_components": finite_difference_components,
+        "nonbonded_local_analytic_virial_components": (
+            nonbonded_local_analytic_components
+        ),
         "volume_angstrom3": float(np.asarray(system.cell.volume)),
         "pme_plan_fingerprint": None if plan is None else plan.fingerprint,
         "neighbor": {
@@ -350,6 +400,21 @@ def _evaluate_openmm_fixed(
         molecule_ids=np.asarray(prepared.molecule_ids, dtype=np.int32),
         epsilon=1.0e-3,
     )
+    virial_components = {
+        name: np.asarray(
+            _parity._openmm_molecular_strain_virial(
+                context,
+                positions_angstrom=positions,
+                lengths_angstrom=lengths,
+                masses=np.asarray(prepared.masses, dtype=np.float64),
+                molecule_ids=np.asarray(prepared.molecule_ids, dtype=np.int32),
+                epsilon=1.0e-3,
+                groups={index},
+            ),
+            dtype=np.float64,
+        ).tolist()
+        for index, name in force_groups.items()
+    }
     result = {
         "energy_kj_mol": float(
             state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -357,12 +422,95 @@ def _evaluate_openmm_fixed(
         "components": components,
         "forces": forces,
         "virial": np.asarray(virial, dtype=np.float64),
+        "virial_components": virial_components,
         "volume_angstrom3": float(np.prod(lengths)),
         "platform": context.getPlatform().getName(),
         "openmm_version": api.openmm.version.version,
     }
     del context
     return result
+
+
+def _mlx_nonbonded_local_analytic_virial_components(
+    term,
+    *,
+    positions,
+    cell,
+    pairs,
+    masses,
+    molecule_ids,
+) -> dict[str, list[float]]:
+    component_names = (
+        "lj_direct",
+        "coulomb_direct",
+        "coulomb_reciprocal",
+    )
+    source_lengths = cell.lengths
+
+    def component_energies(strain):
+        strained_cell = Cell(source_lengths * (1.0 + strain))
+        strained_positions = molecularly_strained_positions(
+            positions,
+            source_cell=cell,
+            target_cell=strained_cell,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+        regular_lj, _ = term._regular_lj_components(
+            strained_positions,
+            strained_cell,
+            pairs,
+        )
+        exception_lj, _ = term._exception_lj_components(
+            strained_positions,
+            strained_cell,
+        )
+        pme_components = pme_coulomb_strain_components(
+            strained_positions,
+            term.charges,
+            strained_cell,
+            coulomb_constant=term.coulomb_constant,
+            config=term.pme_config,
+            direct_space_pairs=pairs,
+        )
+        _, _, corrections = term._periodic_coulomb_corrections(
+            strained_positions,
+            strained_cell,
+        )
+        return mx.stack(
+            (
+                regular_lj
+                + exception_lj
+                + term._dispersion_correction_energy(strained_cell),
+                pme_components["coulomb_real"] + sum(corrections.values()),
+                pme_components["coulomb_reciprocal"]
+                + pme_components["coulomb_self"]
+                + pme_components["coulomb_background"],
+            )
+        )
+
+    zero = mx.zeros((3,), dtype=positions.dtype)
+    diagonal_by_component = np.zeros((len(component_names), 3), dtype=np.float64)
+    for component_index in range(len(component_names)):
+        cotangent = mx.zeros(
+            (len(component_names),),
+            dtype=positions.dtype,
+        ).at[component_index].add(1.0)
+        _, derivatives = mx.vjp(
+            component_energies,
+            (zero,),
+            (cotangent,),
+        )
+        derivative = derivatives[0]
+        mx.eval(derivative)
+        diagonal_by_component[component_index] = -np.asarray(
+            derivative,
+            dtype=np.float64,
+        )
+    return {
+        name: diagonal_by_component[index].tolist()
+        for index, name in enumerate(component_names)
+    }
 
 
 def _fixed_metrics(

@@ -946,6 +946,36 @@ def finite_difference_configurational_virial_oracle(
         msg = "virial diagnostics require positive cell volume"
         raise ValueError(msg)
 
+    specialized = []
+    remaining_terms = []
+    if virtual_sites is None:
+        for term in force_terms:
+            method = getattr(term, "finite_difference_virial_tensor", None)
+            if (
+                callable(method)
+                and getattr(term, "electrostatics", None) == "pme"
+                and getattr(term, "pme_config", None) is not None
+            ):
+                specialized.append(
+                    method(
+                        positions,
+                        cell=cell,
+                        pairs=pairs,
+                        masses=masses,
+                        molecule_ids=molecule_ids,
+                        strain_epsilon=strain_epsilon,
+                    )
+                )
+            else:
+                remaining_terms.append(term)
+    else:
+        remaining_terms.extend(force_terms)
+    if not remaining_terms:
+        return sum(
+            specialized[1:],
+            start=specialized[0],
+        )
+
     diagonal = []
     for axis in range(3):
         plus_cell = Cell(_strained_cell_matrix(cell.matrix, axis, strain_epsilon))
@@ -958,7 +988,7 @@ def finite_difference_configurational_virial_oracle(
                 masses=masses,
                 molecule_ids=molecule_ids,
             ),
-            force_terms,
+            tuple(remaining_terms),
             cell=plus_cell,
             pairs=pairs,
             virtual_sites=virtual_sites,
@@ -971,13 +1001,14 @@ def finite_difference_configurational_virial_oracle(
                 masses=masses,
                 molecule_ids=molecule_ids,
             ),
-            force_terms,
+            tuple(remaining_terms),
             cell=minus_cell,
             pairs=pairs,
             virtual_sites=virtual_sites,
         )
         diagonal.append(-(plus_energy - minus_energy) / (2.0 * strain_epsilon))
-    return mx.diag(mx.stack(diagonal))
+    generic = mx.diag(mx.stack(diagonal))
+    return sum(specialized, start=generic)
 
 
 def _molecularly_strained_positions(
@@ -1029,11 +1060,41 @@ def _potential_energy_for_virial(
     pairs: object | None,
     virtual_sites: VirtualSiteManager | None = None,
 ) -> mx.array:
+    candidate_terms = force_terms
+    candidate_pairs = pairs
+    if any(getattr(term, "electrostatics", None) == "pme" for term in force_terms):
+        candidate_terms = _cell_bound_force_terms(
+            force_terms,
+            cell,
+            rebuild_plans=True,
+        )
+        if isinstance(pairs, NeighborBlocks):
+            cutoffs = [
+                float(term.cutoff)
+                for term in candidate_terms
+                if getattr(term, "cutoff", None) is not None
+            ]
+            if not cutoffs:
+                msg = "PME virial oracle requires an explicit direct-space cutoff"
+                raise ValueError(msg)
+            evaluation_positions = _neighbor_evaluation_positions(
+                positions,
+                virtual_sites,
+            )
+            candidate_manager = NeighborListManager(
+                cell,
+                cutoff=max(cutoffs),
+                skin=0.0,
+                backend="mlx_cell_blocks",
+            )
+            candidate_pairs = candidate_manager.update(
+                evaluation_positions
+            ).interactions
     energy, _ = _energy_forces_from_terms(
         positions,
-        force_terms,
+        candidate_terms,
         cell=cell,
-        pairs=pairs,
+        pairs=candidate_pairs,
         virtual_sites=virtual_sites,
     )
     return energy

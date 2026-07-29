@@ -24,7 +24,7 @@ from mlx_atomistic.custom_force import (
     CustomForcePotential as CustomForcePotential,
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
-from mlx_atomistic.neighbors import NeighborBlocks
+from mlx_atomistic.neighbors import NeighborBlocks, build_neighbor_list
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
     EwaldReferenceConfig,
@@ -38,6 +38,7 @@ from mlx_atomistic.nonbonded import (
     estimate_dense_nonbonded_bytes,
     ewald_reference_coulomb_energy_forces,
     ewald_reference_coulomb_total_energy_forces,
+    molecularly_strained_positions,
     normalize_force_scope,
     normalize_molecule_ids,
 )
@@ -47,6 +48,7 @@ from mlx_atomistic.pme import (
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
+    pme_coulomb_strain_components,
     pme_coulomb_strain_energy,
     pme_coulomb_total_energy_forces,
     pme_direct_space_policy_report,
@@ -2803,13 +2805,386 @@ class NonbondedPotential:
                     pair_data,
                 )[0]
 
-        return diagonal_strain_virial(
+        local_virial = diagonal_strain_virial(
             positions,
             cell,
             strain_energy,
             masses=masses,
             molecule_ids=molecule_ids,
         )
+        return local_virial + self._cutoff_finite_strain_correction_virial(
+            positions,
+            cell=cell,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+
+    def _cutoff_finite_strain_correction_virial(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+        strain_epsilon: float = 1.0e-3,
+    ) -> mx.array:
+        needs_lj = not (
+            self.cutoff is None
+            or self.lj_shift
+            or self.switch_distance is not None
+            or not bool(np.any(np.asarray(self.epsilon) != 0.0))
+        )
+        needs_coulomb = (
+            self.electrostatics == "pme"
+            and self.pme_config is not None
+            and bool(np.any(np.asarray(self.charges) != 0.0))
+        )
+        if not needs_lj and not needs_coulomb:
+            return mx.zeros((3, 3), dtype=positions.dtype)
+        if self.cutoff is None:
+            msg = "cutoff impulse correction requires a finite cutoff"
+            raise ValueError(msg)
+
+        shell = (
+            float(np.max(np.asarray(cell.lengths, dtype=np.float64)))
+            * strain_epsilon
+            * 1.1
+        )
+        blocks = build_neighbor_list(
+            positions,
+            cell,
+            cutoff=float(self.cutoff),
+            skin=shell,
+            backend="mlx_cell_blocks",
+            sort_pairs=False,
+        ).interactions
+        if not isinstance(blocks, NeighborBlocks):
+            msg = "LJ cutoff impulse correction requires neighbor blocks"
+            raise ValueError(msg)
+
+        left = blocks.left
+        right = blocks.right
+        topology_mask, lj_scales, _ = self._block_masks_and_scales(blocks)
+        base_displacement = cell.minimum_image(
+            positions[left] - positions[right]
+        )
+        base_r2 = mx.sum(base_displacement * base_displacement, axis=-1)
+        base_cutoff_mask = (
+            blocks.valid_mask
+            & (base_r2 > 0.0)
+            & (base_r2 < self.cutoff * self.cutoff)
+        )
+        base_lj_mask = topology_mask & base_cutoff_mask
+        sigma_ij, epsilon_ij = self._mixed_block_parameters(left, right)
+        charge_products = self.charges[left] * self.charges[right]
+        base_safe_r2 = mx.where(base_lj_mask, base_r2, 1.0)
+        base_distance = mx.sqrt(base_safe_r2)
+        base_sigma2_over_r2 = (sigma_ij * sigma_ij) / base_safe_r2
+        base_inv_r6 = (
+            base_sigma2_over_r2
+            * base_sigma2_over_r2
+            * base_sigma2_over_r2
+        )
+        base_d_energy_d_distance = (
+            24.0
+            * epsilon_ij
+            * (base_inv_r6 - 2.0 * base_inv_r6 * base_inv_r6)
+            / base_distance
+        )
+        diagonal = []
+        for axis in range(3):
+            coulomb_boundary_energies = []
+            lj_pair_energies = []
+            strained_displacements = []
+            for signed_epsilon in (strain_epsilon, -strain_epsilon):
+                factors = mx.ones((3,), dtype=positions.dtype).at[axis].add(
+                    signed_epsilon
+                )
+                strained_cell = Cell(cell.lengths * factors)
+                strained_positions = molecularly_strained_positions(
+                    positions,
+                    source_cell=cell,
+                    target_cell=strained_cell,
+                    masses=masses,
+                    molecule_ids=molecule_ids,
+                )
+                displacement = strained_cell.minimum_image(
+                    strained_positions[left] - strained_positions[right]
+                )
+                strained_displacements.append(displacement)
+                r2 = mx.sum(displacement * displacement, axis=-1)
+                strained_cutoff_mask = (
+                    blocks.valid_mask
+                    & (r2 > 0.0)
+                    & (r2 < self.cutoff * self.cutoff)
+                )
+                strained_lj_mask = topology_mask & strained_cutoff_mask
+                safe_r2 = mx.where(
+                    strained_cutoff_mask | base_cutoff_mask,
+                    r2,
+                    1.0,
+                )
+                sigma2_over_r2 = (sigma_ij * sigma_ij) / safe_r2
+                inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+                if needs_lj:
+                    lj_pair_energies.append(
+                        mx.where(
+                            strained_lj_mask,
+                            4.0
+                            * epsilon_ij
+                            * (inv_r6 * inv_r6 - inv_r6)
+                            * lj_scales,
+                            0.0,
+                        )
+                    )
+                if needs_coulomb:
+                    distance = mx.sqrt(safe_r2)
+                    coulomb_mask_delta = strained_cutoff_mask.astype(
+                        positions.dtype
+                    ) - base_cutoff_mask.astype(positions.dtype)
+                    coulomb_boundary_energies.append(
+                        mx.sum(
+                            coulomb_mask_delta
+                            * self.coulomb_constant
+                            * charge_products
+                            * (1.0 - mx.erf(self.pme_config.alpha * distance))
+                            / distance
+                        )
+                    )
+            correction = mx.array(0.0, dtype=positions.dtype)
+            if needs_lj:
+                finite_strain_lj_virial = mx.sum(
+                    -(lj_pair_energies[0] - lj_pair_energies[1])
+                    / (2.0 * strain_epsilon)
+                )
+                displacement_derivative = (
+                    strained_displacements[0] - strained_displacements[1]
+                ) / (2.0 * strain_epsilon)
+                distance_derivative = (
+                    mx.sum(
+                        base_displacement * displacement_derivative,
+                        axis=-1,
+                    )
+                    / base_distance
+                )
+                local_lj_virial = mx.sum(
+                    mx.where(
+                        base_lj_mask,
+                        -base_d_energy_d_distance
+                        * distance_derivative
+                        * lj_scales,
+                        0.0,
+                    )
+                )
+                correction = correction + (
+                    finite_strain_lj_virial - local_lj_virial
+                )
+            if needs_coulomb:
+                correction = correction - (
+                    coulomb_boundary_energies[0]
+                    - coulomb_boundary_energies[1]
+                ) / (2.0 * strain_epsilon)
+            diagonal.append(correction)
+        return mx.diag(mx.stack(diagonal))
+
+    def finite_difference_virial_tensor(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        pairs: object | None,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+        strain_epsilon: float,
+    ) -> mx.array:
+        """Return a component-wise finite-strain virial without total-energy cancellation."""
+
+        del pairs
+        if self.electrostatics != "pme" or self.pme_config is None:
+            msg = "component-wise finite-strain virial currently requires PME"
+            raise ValueError(msg)
+        if self.cutoff is None:
+            msg = "component-wise finite-strain virial requires a cutoff"
+            raise ValueError(msg)
+
+        shell = (
+            float(np.max(np.asarray(cell.lengths, dtype=np.float64)))
+            * strain_epsilon
+            * 1.1
+        )
+        blocks = build_neighbor_list(
+            positions,
+            cell,
+            cutoff=float(self.cutoff),
+            skin=shell,
+            backend="mlx_cell_blocks",
+            sort_pairs=False,
+        ).interactions
+        if not isinstance(blocks, NeighborBlocks):
+            msg = "component-wise finite-strain virial requires neighbor blocks"
+            raise ValueError(msg)
+
+        left = blocks.left
+        right = blocks.right
+        topology_mask, lj_scales, _ = self._block_masks_and_scales(blocks)
+        sigma_ij, epsilon_ij = self._mixed_block_parameters(left, right)
+        charge_products = self.charges[left] * self.charges[right]
+        correction_pairs = (
+            self._ewald_correction_pairs(),
+            self.exception_pairs,
+            self._ewald_one_four_pairs(),
+        )
+        correction_products = (
+            -self.charges[correction_pairs[0][:, 0]]
+            * self.charges[correction_pairs[0][:, 1]],
+            self.exception_charge_products,
+            (
+                (self.coulomb_one_four_scale - 1.0)
+                * self.charges[correction_pairs[2][:, 0]]
+                * self.charges[correction_pairs[2][:, 1]]
+            ),
+        )
+
+        def pair_coulomb_energies(
+            strained_positions: mx.array,
+            strained_cell: Cell,
+            pair_indices: mx.array,
+            products: mx.array,
+        ) -> mx.array:
+            if pair_indices.shape[0] == 0:
+                return mx.zeros((0,), dtype=positions.dtype)
+            displacement = strained_cell.minimum_image(
+                strained_positions[pair_indices[:, 0]]
+                - strained_positions[pair_indices[:, 1]]
+            )
+            distance = mx.sqrt(mx.sum(displacement * displacement, axis=-1))
+            return self.coulomb_constant * products / distance
+
+        def exception_lj_energies(
+            strained_positions: mx.array,
+            strained_cell: Cell,
+        ) -> mx.array:
+            if self.exception_pairs.shape[0] == 0:
+                return mx.zeros((0,), dtype=positions.dtype)
+            displacement = strained_cell.minimum_image(
+                strained_positions[self.exception_pairs[:, 0]]
+                - strained_positions[self.exception_pairs[:, 1]]
+            )
+            r2 = mx.sum(displacement * displacement, axis=-1)
+            sigma2_over_r2 = (
+                self.exception_sigma * self.exception_sigma
+            ) / r2
+            inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+            return 4.0 * self.exception_epsilon * (inv_r6 * inv_r6 - inv_r6)
+
+        diagonal = []
+        for axis in range(3):
+            states = []
+            for signed_epsilon in (strain_epsilon, -strain_epsilon):
+                factors = mx.ones((3,), dtype=positions.dtype).at[axis].add(
+                    signed_epsilon
+                )
+                strained_cell = Cell(cell.lengths * factors)
+                strained_positions = molecularly_strained_positions(
+                    positions,
+                    source_cell=cell,
+                    target_cell=strained_cell,
+                    masses=masses,
+                    molecule_ids=molecule_ids,
+                )
+                displacement = strained_cell.minimum_image(
+                    strained_positions[left] - strained_positions[right]
+                )
+                r2 = mx.sum(displacement * displacement, axis=-1)
+                cutoff_mask = (
+                    blocks.valid_mask
+                    & (r2 > 0.0)
+                    & (r2 < self.cutoff * self.cutoff)
+                )
+                lj_mask = topology_mask & cutoff_mask
+                safe_r2 = mx.where(cutoff_mask, r2, 1.0)
+                distance = mx.sqrt(safe_r2)
+                sigma2_over_r2 = (sigma_ij * sigma_ij) / safe_r2
+                inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+                regular_lj = mx.where(
+                    lj_mask,
+                    4.0
+                    * epsilon_ij
+                    * (inv_r6 * inv_r6 - inv_r6)
+                    * lj_scales,
+                    0.0,
+                )
+                coulomb_real = mx.where(
+                    cutoff_mask,
+                    self.coulomb_constant
+                    * charge_products
+                    * (1.0 - mx.erf(self.pme_config.alpha * distance))
+                    / distance,
+                    0.0,
+                )
+                pme_components = pme_coulomb_strain_components(
+                    strained_positions,
+                    self.charges,
+                    strained_cell,
+                    coulomb_constant=self.coulomb_constant,
+                    config=self.pme_config,
+                    direct_space_pairs=blocks,
+                )
+                states.append(
+                    {
+                        "regular_lj": regular_lj,
+                        "coulomb_real": coulomb_real,
+                        "exception_lj": exception_lj_energies(
+                            strained_positions,
+                            strained_cell,
+                        ),
+                        "corrections": tuple(
+                            pair_coulomb_energies(
+                                strained_positions,
+                                strained_cell,
+                                pair_indices,
+                                products,
+                            )
+                            for pair_indices, products in zip(
+                                correction_pairs,
+                                correction_products,
+                                strict=True,
+                            )
+                        ),
+                        "reciprocal": (
+                            pme_components["coulomb_reciprocal"]
+                            + pme_components["coulomb_background"]
+                        ),
+                        "dispersion": self._dispersion_correction_energy(
+                            strained_cell
+                        ),
+                    }
+                )
+
+            difference = mx.sum(
+                states[0]["regular_lj"] - states[1]["regular_lj"]
+            )
+            difference = difference + mx.sum(
+                states[0]["coulomb_real"] - states[1]["coulomb_real"]
+            )
+            difference = difference + mx.sum(
+                states[0]["exception_lj"] - states[1]["exception_lj"]
+            )
+            difference = (
+                difference
+                + states[0]["reciprocal"]
+                - states[1]["reciprocal"]
+                + states[0]["dispersion"]
+                - states[1]["dispersion"]
+            )
+            for plus, minus in zip(
+                states[0]["corrections"],
+                states[1]["corrections"],
+                strict=True,
+            ):
+                difference = difference + mx.sum(plus - minus)
+            diagonal.append(-difference / (2.0 * strain_epsilon))
+        return mx.diag(mx.stack(diagonal))
 
     def force_scope_report(self, scope: str = "total") -> dict[str, object]:
         """Return support metadata for a force-evaluation scope.

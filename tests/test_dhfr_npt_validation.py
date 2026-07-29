@@ -158,6 +158,28 @@ def test_completed_stage_is_reused_only_with_matching_artifacts(tmp_path):
         )
 
 
+def test_failed_stage_for_same_workload_is_rerunnable(tmp_path):
+    contract = load_validation_contract()
+    identity = _source_identity(contract)
+    path, report = _stage_report(tmp_path, contract, stage="fixed")
+    report["checks"]["another_gate"] = False
+    report["checks"]["scientific_gate"] = False
+    report["status"] = "failed"
+    report["blockers"] = ["scientific_gate", "another_gate"]
+    write_stage_report_atomic(path, report)
+
+    assert (
+        load_completed_stage(
+            path,
+            contract=contract,
+            source_identity=identity,
+            stage="fixed",
+            seed=None,
+        )
+        is None
+    )
+
+
 def test_incomplete_or_cross_contract_stage_fails_closed(tmp_path):
     contract = load_validation_contract()
     identity = _source_identity(contract)

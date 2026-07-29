@@ -328,7 +328,7 @@ def build_stage_report(
     if not check_payload or any(type(value) is not bool for value in check_payload.values()):
         msg = "stage checks must be a non-empty mapping of booleans"
         raise DHFRNPTValidationError(msg)
-    blockers = [name for name, passed in check_payload.items() if not passed]
+    blockers = sorted(name for name, passed in check_payload.items() if not passed)
     report = {
         "schema": STAGE_REPORT_SCHEMA,
         "stage": normalized_stage,
@@ -390,11 +390,12 @@ def load_completed_stage(
         seed: Expected seed.
 
     Returns:
-        Valid passing report, or ``None`` when the path does not exist.
+        Valid passing report, or ``None`` when the path does not exist or contains
+        a structurally valid failed attempt for the same workload.
 
     Raises:
-        DHFRNPTValidationError: If an existing report is unsafe, corrupt, failed,
-            or belongs to another workload.
+        DHFRNPTValidationError: If an existing report is unsafe, corrupt, or
+            belongs to another workload.
     """
 
     report_path = Path(path)
@@ -428,10 +429,9 @@ def load_completed_stage(
     if mismatches:
         msg = "existing stage report identity mismatch: " + ", ".join(mismatches)
         raise DHFRNPTValidationError(msg)
-    if report.get("status") != "passed" or not all(report["checks"].values()):
-        msg = "existing stage report is not a validated completion"
-        raise DHFRNPTValidationError(msg)
     _validate_stage_artifacts(report_path, report)
+    if report.get("status") != "passed" or not all(report["checks"].values()):
+        return None
     return report
 
 
@@ -481,8 +481,8 @@ def validate_stage_report(report: Mapping[str, Any]) -> None:
     if not isinstance(blockers, list):
         msg = "stage report blockers must be a list"
         raise DHFRNPTValidationError(msg)
-    expected_blockers = [name for name, passed in checks.items() if not passed]
-    if blockers != expected_blockers:
+    expected_blockers = sorted(name for name, passed in checks.items() if not passed)
+    if sorted(blockers) != expected_blockers:
         msg = "stage report blockers do not reconcile with checks"
         raise DHFRNPTValidationError(msg)
     expected_status = "passed" if not blockers else "failed"

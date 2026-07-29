@@ -108,13 +108,20 @@ def molecularly_strained_positions(
     masses: mx.array | None,
     molecule_ids: object | None,
 ) -> mx.array:
-    """Map molecular centers into a strained cell without stretching molecules.
+    """Map geometric molecular centers into a strained cell without stretching.
+
+    This follows OpenMM's molecular Monte Carlo barostat convention: each
+    molecule's arithmetic coordinate center is transformed with the cell while
+    every intramolecular displacement is retained exactly. Runtime coordinates
+    are kept continuous and are not independently minimum-image unwrapped,
+    which would corrupt molecules wider than half a box.
 
     Args:
         positions: Particle coordinates, shape ``(n_particles, 3)``.
         source_cell: Authoritative cell before strain.
         target_cell: Candidate strained cell.
-        masses: Optional per-particle masses used for molecular centers.
+        masses: Optional per-particle masses, validated for boundary
+            consistency but not used by the geometric-center convention.
         molecule_ids: Optional contiguous per-particle molecule identifiers.
 
     Returns:
@@ -130,43 +137,30 @@ def molecularly_strained_positions(
         molecule_ids,
         particle_count=particle_count,
     )
-    if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
-        fractional = source_cell.fractional_coordinates(positions)
-        fractional = fractional - mx.floor(fractional)
-        return target_cell.cartesian_coordinates(fractional)
-    particle_masses = (
-        mx.ones((particle_count,), dtype=positions.dtype)
-        if masses is None
-        else as_mx_array(masses)
-    )
-    if particle_masses.shape != (particle_count,):
+    if masses is not None and as_mx_array(masses).shape != (particle_count,):
         msg = "masses must have shape (n_particles,)"
         raise ValueError(msg)
     molecule_count = int(np.max(ids)) + 1
-    _, anchor_indices = np.unique(ids, return_index=True)
     molecule_index = mx.array(ids, dtype=mx.int32)
-    anchors = positions[mx.array(anchor_indices.astype(np.int32), dtype=mx.int32)]
-    particle_anchors = anchors[molecule_index]
-    unwrapped = particle_anchors + source_cell.minimum_image(
-        positions - particle_anchors
-    )
-    mass_by_molecule = mx.zeros(
+    count_by_molecule = mx.zeros(
         (molecule_count,),
         dtype=positions.dtype,
-    ).at[molecule_index].add(particle_masses)
-    weighted_position_by_molecule = mx.zeros(
+    ).at[molecule_index].add(mx.ones((particle_count,), dtype=positions.dtype))
+    position_by_molecule = mx.zeros(
         (molecule_count, 3),
         dtype=positions.dtype,
-    ).at[molecule_index].add(unwrapped * particle_masses[:, None])
-    centers = weighted_position_by_molecule / mass_by_molecule[:, None]
-    fractional_centers = source_cell.fractional_coordinates(centers)
-    fractional_centers = fractional_centers - mx.floor(fractional_centers)
-    target_centers = target_cell.cartesian_coordinates(fractional_centers)
-    return (
-        unwrapped
-        - centers[molecule_index]
-        + target_centers[molecule_index]
-    )
+    ).at[molecule_index].add(positions)
+    centers = position_by_molecule / count_by_molecule[:, None]
+    if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
+        fractional_centers = source_cell.fractional_coordinates(centers)
+        fractional_centers = fractional_centers - mx.floor(fractional_centers)
+        target_centers = target_cell.cartesian_coordinates(fractional_centers)
+    elif source_cell.is_orthorhombic and target_cell.is_orthorhombic:
+        target_centers = centers * (target_cell.lengths / source_cell.lengths)
+    else:
+        fractional_centers = source_cell.fractional_coordinates(centers)
+        target_centers = target_cell.cartesian_coordinates(fractional_centers)
+    return positions + (target_centers - centers)[molecule_index]
 
 
 def diagonal_strain_virial(

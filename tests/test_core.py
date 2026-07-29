@@ -30,6 +30,23 @@ def test_minimum_image_orthorhombic_cell():
     np.testing.assert_allclose(np.array(displacement), [[-4.0, 9.0, 14.0]], atol=1e-6)
 
 
+def test_orthorhombic_fractional_round_trip_is_stable_for_large_batches():
+    cell = Cell.orthorhombic([62.23, 62.23, 62.23])
+    rng = np.random.default_rng(7)
+    positions = rng.uniform(-8.0, 74.0, size=(7_024, 3)).astype(np.float32)
+
+    reconstructed = cell.cartesian_coordinates(
+        cell.fractional_coordinates(positions)
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(reconstructed),
+        positions,
+        rtol=0.0,
+        atol=4.0e-6,
+    )
+
+
 def test_cell_wrap():
     cell = Cell.cubic(5.0)
     wrapped = cell.wrap(np.array([[5.5, -0.5, 2.0]], dtype=np.float32))

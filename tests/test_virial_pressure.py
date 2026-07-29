@@ -35,6 +35,7 @@ from mlx_atomistic.md import (
     virial_readiness_report,
 )
 from mlx_atomistic.neighbors import NeighborListManager
+from mlx_atomistic.nonbonded import molecularly_strained_positions
 from mlx_atomistic.pme import PMEConfig
 
 
@@ -375,6 +376,34 @@ def test_molecular_kinetic_pressure_uses_center_of_mass_motion():
     )
 
 
+def test_molecular_strain_uses_openmm_geometric_center_for_large_molecule():
+    positions = mx.array(
+        [[-2.0, 1.0, 1.0], [4.0, 1.0, 1.0], [10.0, 1.0, 1.0]],
+        dtype=mx.float32,
+    )
+    source = Cell.cubic(8.0)
+    target = Cell(np.diag([8.8, 8.0, 8.0]).astype(np.float32))
+
+    strained = molecularly_strained_positions(
+        positions,
+        source_cell=source,
+        target_cell=target,
+        masses=mx.array([100.0, 1.0, 1.0], dtype=mx.float32),
+        molecule_ids=np.zeros((3,), dtype=np.int32),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(strained),
+        np.asarray(positions) + np.asarray([0.4, 0.0, 0.0]),
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.diff(np.asarray(strained), axis=0),
+        np.diff(np.asarray(positions), axis=0),
+        atol=1.0e-6,
+    )
+
+
 def test_intramolecular_term_reports_explicit_zero_molecular_virial():
     class IntramolecularBond:
         name = "intramolecular_bond"
@@ -563,6 +592,175 @@ def test_selected_pme_nonbonded_analytic_virial_matches_oracle():
         rtol=7.0e-3,
         atol=3.0e-4,
     )
+
+
+def test_unswitched_lj_analytic_virial_includes_cutoff_finite_strain_correction():
+    positions = mx.array(
+        [[1.0, 1.0, 1.0], [3.999, 1.0, 1.0]],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0],
+        epsilon=[0.2, 0.2],
+        charges=[0.0, 0.0],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.4,
+            real_cutoff=3.0,
+            assignment_order=4,
+        ),
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+    )
+    pairs = manager.update(positions).interactions
+    molecule_ids = np.asarray([0, 1], dtype=np.int32)
+    masses = mx.ones((2,), dtype=mx.float32)
+    _, forces = term.energy_forces(positions, cell, pairs)
+
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        strain_epsilon=1.0e-3,
+    )
+
+    np.testing.assert_allclose(
+        np.diag(np.asarray(analytic)),
+        np.diag(np.asarray(oracle)),
+        rtol=2.0e-3,
+        atol=2.0e-4,
+    )
+
+
+def test_pme_real_space_analytic_virial_includes_cutoff_impulse():
+    positions = mx.array(
+        [[1.0, 1.0, 1.0], [3.999, 1.0, 1.0]],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0],
+        epsilon=[0.0, 0.0],
+        charges=[0.5, -0.5],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.4,
+            real_cutoff=3.0,
+            assignment_order=4,
+        ),
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+    )
+    pairs = manager.update(positions).interactions
+    molecule_ids = np.asarray([0, 1], dtype=np.int32)
+    masses = mx.ones((2,), dtype=mx.float32)
+    _, forces = term.energy_forces(positions, cell, pairs)
+
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        strain_epsilon=1.0e-3,
+    )
+
+    np.testing.assert_allclose(
+        np.diag(np.asarray(analytic)),
+        np.diag(np.asarray(oracle)),
+        rtol=2.0e-3,
+        atol=3.0e-3,
+    )
+
+
+def test_bound_pme_virial_oracle_rebuilds_candidate_plan_and_neighbors():
+    positions = mx.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.9, 1.1, 1.0],
+            [4.2, 4.0, 4.0],
+            [5.0, 4.2, 4.1],
+        ],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    term = NonbondedPotential(
+        sigma=[0.9, 1.0, 1.1, 0.95],
+        epsilon=[0.15, 0.2, 0.18, 0.12],
+        charges=[0.4, -0.4, 0.25, -0.25],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.4,
+            real_cutoff=3.0,
+            assignment_order=4,
+        ),
+    ).bind_pme_plan(cell)
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+    )
+    pairs = manager.update(positions).interactions
+    _, forces = term.energy_forces(positions, cell, pairs)
+    source_fingerprint = term.pme_plan.fingerprint
+
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=mx.ones((4,), dtype=mx.float32),
+        molecule_ids=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        strain_epsilon=2.0e-3,
+    )
+
+    assert np.all(np.isfinite(np.asarray(oracle)))
+    assert term.pme_plan.fingerprint == source_fingerprint
+    np.testing.assert_allclose(np.asarray(manager.cell.matrix), np.asarray(cell.matrix))
 
 
 def test_analytic_pair_virial_matches_molecular_cell_strain_oracle():

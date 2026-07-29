@@ -619,6 +619,7 @@ def _openmm_molecular_strain_virial(
     masses,
     molecule_ids,
     epsilon,
+    groups=None,
 ):
     from openmm import unit
 
@@ -635,11 +636,7 @@ def _openmm_molecular_strain_virial(
             target_positions = positions.copy()
             for molecule_index in np.unique(molecule_ids):
                 indices = np.flatnonzero(molecule_ids == molecule_index)
-                weights = masses[indices]
-                center = np.sum(
-                    positions[indices] * weights[:, None],
-                    axis=0,
-                ) / np.sum(weights)
+                center = np.mean(positions[indices], axis=0)
                 target_center = center.copy()
                 target_center[axis] *= 1.0 + signed_epsilon
                 target_positions[indices] += target_center - center
@@ -648,7 +645,10 @@ def _openmm_molecular_strain_virial(
             vectors = _orthorhombic_openmm_box(target_lengths, mm, unit)
             context.setPeriodicBoxVectors(*vectors)
             context.setPositions(target_positions * 0.1 * unit.nanometer)
-            energy = context.getState(getEnergy=True).getPotentialEnergy()
+            state_kwargs = {"getEnergy": True}
+            if groups is not None:
+                state_kwargs["groups"] = groups
+            energy = context.getState(**state_kwargs).getPotentialEnergy()
             energies.append(float(energy.value_in_unit(unit.kilojoule_per_mole)))
         diagonal[axis] = -(energies[0] - energies[1]) / (2.0 * epsilon)
     return np.diag(diagonal)

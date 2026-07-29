@@ -205,7 +205,10 @@ class Cell:
             Cartesian coordinates, with the same shape as ``fractional``.
         """
 
-        return as_mx_array(fractional) @ self.matrix
+        fractional = as_mx_array(fractional)
+        if self.is_orthorhombic:
+            return fractional * mx.diag(self.matrix)
+        return fractional @ self.matrix
 
     def wrap(self, positions: mx.array) -> mx.array:
         """Wrap positions back into the primary periodic cell.
