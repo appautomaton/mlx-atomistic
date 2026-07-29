@@ -1862,6 +1862,9 @@ def build_mlx_system_from_artifact(
         "exception_sigma": exception_sigma,
         "exception_epsilon": exception_epsilon,
         "pme_config": pme_config,
+        "use_dispersion_correction": bool(
+            nonbonded_metadata.get("dispersion_correction", False)
+        ),
         "atom_types": np.asarray(arrays["atom_types"], dtype=str),
         "nbfix_pairs": nbfix_pairs,
         "nbfix_sigma": nbfix_sigma,

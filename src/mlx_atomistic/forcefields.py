@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import mlx.core as mx
 import numpy as np
@@ -34,10 +34,12 @@ from mlx_atomistic.nonbonded import (
     NonbondedExecutionConfig,
     choose_nonbonded_backend,
     dense_combined_energy_forces,
+    diagonal_strain_virial,
     estimate_dense_nonbonded_bytes,
     ewald_reference_coulomb_energy_forces,
     ewald_reference_coulomb_total_energy_forces,
     normalize_force_scope,
+    normalize_molecule_ids,
 )
 from mlx_atomistic.pme import (
     PMEConfig,
@@ -45,6 +47,7 @@ from mlx_atomistic.pme import (
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
+    pme_coulomb_strain_energy,
     pme_coulomb_total_energy_forces,
     pme_direct_space_policy_report,
 )
@@ -63,6 +66,27 @@ def _parameter_array(value, *, count: int, name: str) -> mx.array:
 
 def _zero_energy(positions: mx.array) -> mx.array:
     return mx.sum(positions[:, 0] * 0.0)
+
+
+def _explicit_intramolecular_zero_virial(
+    term_indices: mx.array,
+    positions: mx.array,
+    molecule_ids: object | None,
+) -> mx.array | None:
+    """Return an explicit zero when every indexed term stays in one molecule."""
+
+    if molecule_ids is None:
+        return None
+    ids = normalize_molecule_ids(
+        molecule_ids,
+        particle_count=positions.shape[0],
+    )
+    indices = np.asarray(term_indices, dtype=np.int32)
+    if indices.shape[0] == 0 or np.all(
+        ids[indices] == ids[indices[:, :1]],
+    ):
+        return mx.zeros((3, 3), dtype=positions.dtype)
+    return None
 
 
 def _unit_pair_scale() -> mx.array:
@@ -137,7 +161,7 @@ class HarmonicBondPotential:
     length: object
     name: str = "bond"
     supports_virial: bool = True
-    analytic_virial_supported: bool = False
+    analytic_virial_supported: bool = True
 
     def __post_init__(self) -> None:
         bonds = np.asarray(self.bonds, dtype=np.int32)
@@ -215,6 +239,34 @@ class HarmonicBondPotential:
         forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
         return energy, forces
 
+    def analytic_virial_tensor(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        pairs: object | None,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+    ) -> mx.array:
+        """Return the analytic molecular diagonal cell-strain virial."""
+
+        del pairs
+        positions = as_mx_array(positions)
+        zero = _explicit_intramolecular_zero_virial(
+            self.bonds,
+            positions,
+            molecule_ids,
+        )
+        if zero is not None:
+            return zero
+        return diagonal_strain_virial(
+            positions,
+            cell,
+            self.potential_energy,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+
 
 @dataclass(frozen=True)
 class HarmonicAnglePotential:
@@ -225,7 +277,7 @@ class HarmonicAnglePotential:
     angle: object
     name: str = "angle"
     supports_virial: bool = True
-    analytic_virial_supported: bool = False
+    analytic_virial_supported: bool = True
 
     def __post_init__(self) -> None:
         angles = np.asarray(self.angles, dtype=np.int32)
@@ -329,6 +381,34 @@ class HarmonicAnglePotential:
         )
         return energy, forces
 
+    def analytic_virial_tensor(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        pairs: object | None,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+    ) -> mx.array:
+        """Return the analytic molecular diagonal cell-strain virial."""
+
+        del pairs
+        positions = as_mx_array(positions)
+        zero = _explicit_intramolecular_zero_virial(
+            self.angles,
+            positions,
+            molecule_ids,
+        )
+        if zero is not None:
+            return zero
+        return diagonal_strain_virial(
+            positions,
+            cell,
+            self.potential_energy,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+
 
 @dataclass(frozen=True)
 class PositionalRestraintPotential:
@@ -411,7 +491,7 @@ class PeriodicDihedralPotential:
     phase: object = 0.0
     name: str = "dihedral"
     supports_virial: bool = True
-    analytic_virial_supported: bool = False
+    analytic_virial_supported: bool = True
 
     def __post_init__(self) -> None:
         dihedrals = np.asarray(self.dihedrals, dtype=np.int32)
@@ -540,6 +620,34 @@ class PeriodicDihedralPotential:
             .add(force_m)
         )
         return energy, forces
+
+    def analytic_virial_tensor(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        pairs: object | None,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+    ) -> mx.array:
+        """Return the analytic molecular diagonal cell-strain virial."""
+
+        del pairs
+        positions = as_mx_array(positions)
+        zero = _explicit_intramolecular_zero_virial(
+            self.dihedrals,
+            positions,
+            molecule_ids,
+        )
+        if zero is not None:
+            return zero
+        return diagonal_strain_virial(
+            positions,
+            cell,
+            self.potential_energy,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
 
 
 @dataclass(frozen=True)
@@ -969,9 +1077,11 @@ class NonbondedPotential:
     memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
     lambda_lj: float = 1.0
     lambda_electrostatics: float = 1.0
+    use_dispersion_correction: bool = False
     name: str = "nonbonded"
     supports_virial: bool = True
-    analytic_virial_supported: bool = False
+    analytic_virial_supported: bool = field(init=False, default=False)
+    _dispersion_coefficient: float = field(init=False, default=0.0, repr=False)
 
     def __post_init__(self) -> None:
         sigma = as_mx_array(self.sigma)
@@ -1279,8 +1389,94 @@ class NonbondedPotential:
         object.__setattr__(self, "memory_budget_bytes", config.memory_budget_bytes)
         object.__setattr__(self, "lambda_lj", float(self.lambda_lj))
         object.__setattr__(self, "lambda_electrostatics", float(self.lambda_electrostatics))
+        if self.use_dispersion_correction and config.electrostatics != "pme":
+            msg = "LJ dispersion correction currently requires PME electrostatics"
+            raise ValueError(msg)
+        if self.use_dispersion_correction and self.switch_distance is not None:
+            msg = "analytic LJ dispersion correction does not support switching"
+            raise ValueError(msg)
+        object.__setattr__(
+            self,
+            "_dispersion_coefficient",
+            self._openmm_dispersion_coefficient(),
+        )
+        analytic_supported = (
+            config.electrostatics in {"cutoff", "pme"}
+            and float(self.lambda_lj) == 1.0
+            and float(self.lambda_electrostatics) == 1.0
+            and nbfix_pairs.shape[0] == 0
+            and nbfix_type_pairs.shape[0] == 0
+            and (
+                config.electrostatics != "pme"
+                or (
+                    self.pme_config is not None
+                    and self.pme_config.real_cutoff is not None
+                )
+            )
+        )
+        object.__setattr__(self, "analytic_virial_supported", analytic_supported)
         object.__setattr__(self, "_pair_scale_cache", None)
         object.__setattr__(self, "_block_scale_cache", None)
+
+    def _openmm_dispersion_coefficient(self) -> float:
+        """Return OpenMM's unswitched long-range LJ correction coefficient."""
+
+        if not self.use_dispersion_correction:
+            return 0.0
+        if self.cutoff is None:
+            msg = "LJ dispersion correction requires a finite cutoff"
+            raise ValueError(msg)
+        sigma = np.asarray(self.sigma, dtype=np.float64)
+        epsilon = np.asarray(self.epsilon, dtype=np.float64)
+        classes, counts = np.unique(
+            np.stack([sigma, epsilon], axis=1),
+            axis=0,
+            return_counts=True,
+        )
+        sum_sigma12 = 0.0
+        sum_sigma6 = 0.0
+        for first_index, ((sigma_i, epsilon_i), count_i) in enumerate(
+            zip(classes, counts, strict=True)
+        ):
+            same_count = float(count_i * (count_i + 1) // 2)
+            sigma6 = float(sigma_i) ** 6
+            sum_sigma12 += same_count * float(epsilon_i) * sigma6 * sigma6
+            sum_sigma6 += same_count * float(epsilon_i) * sigma6
+            for (sigma_j, epsilon_j), count_j in zip(
+                classes[:first_index],
+                counts[:first_index],
+                strict=True,
+            ):
+                mixed_sigma = 0.5 * (float(sigma_i) + float(sigma_j))
+                mixed_epsilon = float(np.sqrt(float(epsilon_i) * float(epsilon_j)))
+                mixed_count = float(count_i * count_j)
+                mixed_sigma6 = mixed_sigma**6
+                sum_sigma12 += (
+                    mixed_count * mixed_epsilon * mixed_sigma6 * mixed_sigma6
+                )
+                sum_sigma6 += mixed_count * mixed_epsilon * mixed_sigma6
+        particle_count = float(sigma.shape[0])
+        interaction_count = particle_count * (particle_count + 1.0) / 2.0
+        mean_sigma12 = sum_sigma12 / interaction_count
+        mean_sigma6 = sum_sigma6 / interaction_count
+        cutoff = float(self.cutoff)
+        return (
+            8.0
+            * particle_count
+            * particle_count
+            * float(np.pi)
+            * (
+                mean_sigma12 / (9.0 * cutoff**9)
+                - mean_sigma6 / (3.0 * cutoff**3)
+            )
+        )
+
+    def _dispersion_correction_energy(self, cell: Cell) -> mx.array:
+        """Return the selected OpenMM LJ tail energy at the current volume."""
+
+        if not self.use_dispersion_correction:
+            return mx.sum(cell.matrix * 0.0)
+        return self._dispersion_coefficient / cell.volume
 
     def build_pme_plan(self, cell: Cell) -> PMEExecutionPlan:
         """Build a compatible fixed-cell PME execution plan for this potential.
@@ -2353,7 +2549,8 @@ class NonbondedPotential:
             direct_space_pairs,
         )
         exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
-        lj_energy = lj_energy + exception_lj
+        dispersion_energy = self._dispersion_correction_energy(cell)
+        lj_energy = lj_energy + exception_lj + dispersion_energy
         lj_forces = lj_forces + exception_lj_forces
 
         pme_energy, pme_forces, pme_components = pme_coulomb_energy_forces(
@@ -2372,6 +2569,7 @@ class NonbondedPotential:
         coulomb_forces = pme_forces + correction_forces
         components = {
             "lj": lj_energy,
+            "lj_dispersion_correction": dispersion_energy,
             "coulomb": coulomb_energy,
             "coulomb_real": pme_components["coulomb_real"],
             "coulomb_reciprocal": pme_components["coulomb_reciprocal"],
@@ -2402,6 +2600,7 @@ class NonbondedPotential:
             direct_space_pairs,
         )
         exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        dispersion_energy = self._dispersion_correction_energy(cell)
         pme_energy, pme_forces = pme_coulomb_total_energy_forces(
             positions,
             self.charges,
@@ -2418,7 +2617,7 @@ class NonbondedPotential:
         coulomb_energy = pme_energy + correction_energy
         coulomb_forces = pme_forces + correction_forces
         return (
-            lj_energy + exception_lj + coulomb_energy,
+            lj_energy + exception_lj + dispersion_energy + coulomb_energy,
             lj_forces + exception_lj_forces + coulomb_forces,
         )
 
@@ -2442,6 +2641,7 @@ class NonbondedPotential:
             direct_space_pairs,
         )
         exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
+        dispersion_energy = self._dispersion_correction_energy(cell)
         direct_energy, direct_forces = pme_coulomb_direct_space_energy_forces(
             positions,
             self.charges,
@@ -2456,7 +2656,11 @@ class NonbondedPotential:
             cell,
         )
         return (
-            lj_energy + exception_lj + direct_energy + correction_energy,
+            lj_energy
+            + exception_lj
+            + dispersion_energy
+            + direct_energy
+            + correction_energy,
             lj_forces + exception_lj_forces + direct_forces + correction_forces,
         )
 
@@ -2511,6 +2715,101 @@ class NonbondedPotential:
         reason = report.get("fallback_reason") or "pme_direct_space_shared_policy_unsupported"
         msg = f"PME production direct-space shared pair policy unsupported: {reason}"
         raise ValueError(msg)
+
+    def analytic_virial_tensor(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        pairs: object | None,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+    ) -> mx.array:
+        """Return the analytic molecular diagonal cell-strain virial.
+
+        Args:
+            positions: Particle coordinates, shape ``(n_atoms, 3)``.
+            cell: Source orthorhombic periodic cell.
+            pairs: Neighbor blocks or compact pairs held fixed during the local
+                cell derivative.
+            masses: Optional per-particle masses for molecular centers.
+            molecule_ids: Optional contiguous per-particle molecule identifiers.
+
+        Returns:
+            The diagonal ``(3, 3)`` configurational virial tensor.
+
+        Raises:
+            ValueError: If this configuration is outside the admitted analytic
+                virial envelope.
+        """
+
+        if not self.analytic_virial_supported:
+            msg = "nonbonded configuration lacks analytic virial support"
+            raise ValueError(msg)
+        pair_data = pairs
+        if pair_data is not None and not isinstance(pair_data, NeighborBlocks):
+            pair_data = mx.array(pair_data, dtype=mx.int32)
+
+        if self.electrostatics == "pme":
+            if self.pme_config is None:
+                msg = "analytic PME virial requires pme_config"
+                raise ValueError(msg)
+            if pair_data is None:
+                msg = "analytic PME virial requires direct-space pairs or blocks"
+                raise ValueError(msg)
+
+            def strain_energy(
+                strained_positions: mx.array,
+                strained_cell: Cell,
+            ) -> mx.array:
+                lj_energy, _ = self._regular_lj_components(
+                    strained_positions,
+                    strained_cell,
+                    pair_data,
+                )
+                exception_lj, _ = self._exception_lj_components(
+                    strained_positions,
+                    strained_cell,
+                )
+                pme_energy = pme_coulomb_strain_energy(
+                    strained_positions,
+                    self.charges,
+                    strained_cell,
+                    coulomb_constant=self.coulomb_constant,
+                    config=self.pme_config,
+                    direct_space_pairs=pair_data,
+                )
+                correction_energy, _, _ = self._periodic_coulomb_corrections(
+                    strained_positions,
+                    strained_cell,
+                )
+                return (
+                    lj_energy
+                    + exception_lj
+                    + self._dispersion_correction_energy(strained_cell)
+                    + pme_energy
+                    + correction_energy
+                )
+
+        else:
+
+            def strain_energy(
+                strained_positions: mx.array,
+                strained_cell: Cell,
+            ) -> mx.array:
+                return self.energy_forces(
+                    strained_positions,
+                    strained_cell,
+                    pair_data,
+                )[0]
+
+        return diagonal_strain_virial(
+            positions,
+            cell,
+            strain_energy,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
 
     def force_scope_report(self, scope: str = "total") -> dict[str, object]:
         """Return support metadata for a force-evaluation scope.

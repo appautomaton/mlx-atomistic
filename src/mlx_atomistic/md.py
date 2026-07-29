@@ -27,6 +27,8 @@ from mlx_atomistic.nonbonded import (
     choose_nonbonded_backend,
     dense_lj_energy_forces,
     estimate_dense_nonbonded_bytes,
+    molecularly_strained_positions,
+    normalize_molecule_ids,
 )
 from mlx_atomistic.runtime import (
     VIRIAL_SUPPORT_ANALYTIC,
@@ -955,41 +957,13 @@ def _molecularly_strained_positions(
     masses: mx.array | None,
     molecule_ids: object | None,
 ) -> mx.array:
-    positions = as_mx_array(positions)
-    particle_count = positions.shape[0]
-    if molecule_ids is None:
-        fractional = source_cell.fractional_coordinates(positions)
-        fractional = fractional - mx.floor(fractional)
-        return target_cell.cartesian_coordinates(fractional)
-    ids = _normalize_pressure_molecule_ids(
-        molecule_ids,
-        particle_count=particle_count,
+    return molecularly_strained_positions(
+        positions,
+        source_cell=source_cell,
+        target_cell=target_cell,
+        masses=masses,
+        molecule_ids=molecule_ids,
     )
-    if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
-        fractional = source_cell.fractional_coordinates(positions)
-        fractional = fractional - mx.floor(fractional)
-        return target_cell.cartesian_coordinates(fractional)
-    particle_masses = (
-        mx.ones((particle_count,), dtype=positions.dtype)
-        if masses is None
-        else as_mx_array(masses)
-    )
-    if particle_masses.shape != (particle_count,):
-        msg = "masses must have shape (n_particles,)"
-        raise ValueError(msg)
-    strained = mx.zeros_like(positions)
-    for molecule_index in range(int(np.max(ids)) + 1):
-        atom_indices = np.flatnonzero(ids == molecule_index).astype(np.int32)
-        indices = mx.array(atom_indices, dtype=mx.int32)
-        anchor = positions[indices[0]]
-        unwrapped = anchor + source_cell.minimum_image(positions[indices] - anchor)
-        weights = particle_masses[indices]
-        center = mx.sum(unwrapped * weights[:, None], axis=0) / mx.sum(weights)
-        fractional_center = source_cell.fractional_coordinates(center)
-        fractional_center = fractional_center - mx.floor(fractional_center)
-        target_center = target_cell.cartesian_coordinates(fractional_center)
-        strained = strained.at[indices].add(unwrapped - center + target_center)
-    return strained
 
 
 def _normalize_pressure_molecule_ids(
@@ -997,22 +971,10 @@ def _normalize_pressure_molecule_ids(
     *,
     particle_count: int,
 ) -> np.ndarray:
-    if molecule_ids is None:
-        return np.arange(particle_count, dtype=np.int32)
-    raw = np.asarray(molecule_ids)
-    if raw.shape != (particle_count,):
-        msg = "molecule_ids must have shape (n_particles,)"
-        raise ValueError(msg)
-    numeric = np.asarray(raw, dtype=np.float64)
-    if not np.all(np.isfinite(numeric)) or not np.all(numeric == np.floor(numeric)):
-        msg = "molecule_ids must contain finite integers"
-        raise ValueError(msg)
-    normalized = numeric.astype(np.int32)
-    labels = np.unique(normalized)
-    if not np.array_equal(labels, np.arange(labels.size)):
-        msg = "molecule_ids labels must be contiguous and start at zero"
-        raise ValueError(msg)
-    return normalized
+    return normalize_molecule_ids(
+        molecule_ids,
+        particle_count=particle_count,
+    )
 
 
 def _validate_orthorhombic_pressure_cell(cell: Cell) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import ceil
 from typing import Literal
@@ -9,7 +10,7 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from mlx_atomistic.core import Cell
+from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.neighbors import DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND
 from mlx_atomistic.topology import Topology
 
@@ -59,6 +60,161 @@ _FORCE_SCOPE_ALIASES = {
     "fft": "reciprocal_space",
     "reciprocal_space": "reciprocal_space",
 }
+
+
+def normalize_molecule_ids(
+    molecule_ids: object | None,
+    *,
+    particle_count: int,
+) -> np.ndarray:
+    """Return contiguous zero-based molecule identifiers.
+
+    Args:
+        molecule_ids: Optional per-particle molecule labels. When omitted, each
+            particle is treated as a separate molecule.
+        particle_count: Number of particles represented by the labels.
+
+    Returns:
+        An integer array of shape ``(particle_count,)``.
+
+    Raises:
+        ValueError: If labels have the wrong shape or are not finite,
+            contiguous, zero-based integers.
+    """
+
+    if molecule_ids is None:
+        return np.arange(particle_count, dtype=np.int32)
+    raw = np.asarray(molecule_ids)
+    if raw.shape != (particle_count,):
+        msg = "molecule_ids must have shape (n_particles,)"
+        raise ValueError(msg)
+    numeric = np.asarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(numeric)) or not np.all(numeric == np.floor(numeric)):
+        msg = "molecule_ids must contain finite integers"
+        raise ValueError(msg)
+    normalized = numeric.astype(np.int32)
+    labels = np.unique(normalized)
+    if not np.array_equal(labels, np.arange(labels.size)):
+        msg = "molecule_ids labels must be contiguous and start at zero"
+        raise ValueError(msg)
+    return normalized
+
+
+def molecularly_strained_positions(
+    positions: mx.array,
+    *,
+    source_cell: Cell,
+    target_cell: Cell,
+    masses: mx.array | None,
+    molecule_ids: object | None,
+) -> mx.array:
+    """Map molecular centers into a strained cell without stretching molecules.
+
+    Args:
+        positions: Particle coordinates, shape ``(n_particles, 3)``.
+        source_cell: Authoritative cell before strain.
+        target_cell: Candidate strained cell.
+        masses: Optional per-particle masses used for molecular centers.
+        molecule_ids: Optional contiguous per-particle molecule identifiers.
+
+    Returns:
+        Coordinates in the target cell with each molecule translated rigidly.
+
+    Raises:
+        ValueError: If masses or molecule identifiers are invalid.
+    """
+
+    positions = as_mx_array(positions)
+    particle_count = positions.shape[0]
+    ids = normalize_molecule_ids(
+        molecule_ids,
+        particle_count=particle_count,
+    )
+    if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
+        fractional = source_cell.fractional_coordinates(positions)
+        fractional = fractional - mx.floor(fractional)
+        return target_cell.cartesian_coordinates(fractional)
+    particle_masses = (
+        mx.ones((particle_count,), dtype=positions.dtype)
+        if masses is None
+        else as_mx_array(masses)
+    )
+    if particle_masses.shape != (particle_count,):
+        msg = "masses must have shape (n_particles,)"
+        raise ValueError(msg)
+    molecule_count = int(np.max(ids)) + 1
+    _, anchor_indices = np.unique(ids, return_index=True)
+    molecule_index = mx.array(ids, dtype=mx.int32)
+    anchors = positions[mx.array(anchor_indices.astype(np.int32), dtype=mx.int32)]
+    particle_anchors = anchors[molecule_index]
+    unwrapped = particle_anchors + source_cell.minimum_image(
+        positions - particle_anchors
+    )
+    mass_by_molecule = mx.zeros(
+        (molecule_count,),
+        dtype=positions.dtype,
+    ).at[molecule_index].add(particle_masses)
+    weighted_position_by_molecule = mx.zeros(
+        (molecule_count, 3),
+        dtype=positions.dtype,
+    ).at[molecule_index].add(unwrapped * particle_masses[:, None])
+    centers = weighted_position_by_molecule / mass_by_molecule[:, None]
+    fractional_centers = source_cell.fractional_coordinates(centers)
+    fractional_centers = fractional_centers - mx.floor(fractional_centers)
+    target_centers = target_cell.cartesian_coordinates(fractional_centers)
+    return (
+        unwrapped
+        - centers[molecule_index]
+        + target_centers[molecule_index]
+    )
+
+
+def diagonal_strain_virial(
+    positions: mx.array,
+    cell: Cell,
+    energy_function: Callable[[mx.array, Cell], mx.array],
+    *,
+    masses: mx.array | None,
+    molecule_ids: object | None,
+) -> mx.array:
+    """Differentiate one MLX energy graph with respect to diagonal cell strain.
+
+    Args:
+        positions: Particle coordinates, shape ``(n_particles, 3)``.
+        cell: Source orthorhombic cell.
+        energy_function: Scalar energy callable accepting strained coordinates
+            and the corresponding strained cell.
+        masses: Optional per-particle masses for molecular centers.
+        molecule_ids: Optional contiguous per-particle molecule identifiers.
+
+    Returns:
+        The diagonal configurational virial tensor, ``-dU/d(strain)``.
+
+    Raises:
+        ValueError: If the cell is not orthorhombic.
+    """
+
+    if not cell.is_orthorhombic:
+        msg = "analytic diagonal strain virial requires an orthorhombic cell"
+        raise ValueError(msg)
+    positions = as_mx_array(positions)
+    source_lengths = cell.lengths
+
+    def strained_energy(strain: mx.array) -> mx.array:
+        target_cell = Cell(source_lengths * (1.0 + strain))
+        target_positions = molecularly_strained_positions(
+            positions,
+            source_cell=cell,
+            target_cell=target_cell,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+        return energy_function(target_positions, target_cell)
+
+    gradient = mx.grad(strained_energy)(
+        mx.zeros((3,), dtype=positions.dtype),
+    )
+    return mx.diag(-gradient)
 
 
 @dataclass(frozen=True)

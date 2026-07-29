@@ -62,7 +62,7 @@ def reference_periodic_dihedral_angle(points):
     return angle * sign
 
 
-def test_forcefield_analytic_support_defaults_fail_closed():
+def test_forcefield_analytic_support_matches_closed_envelope():
     terms = (
         LennardJonesPotential(),
         HarmonicBondPotential([(0, 1)], k=1.0, length=1.0),
@@ -81,7 +81,14 @@ def test_forcefield_analytic_support_defaults_fail_closed():
     )
 
     assert all(term.supports_virial for term in terms)
-    assert all(term.analytic_virial_supported is False for term in terms)
+    assert [term.analytic_virial_supported for term in terms] == [
+        False,
+        True,
+        True,
+        True,
+        False,
+        True,
+    ]
 
 
 def test_harmonic_bond_force_matches_finite_difference():

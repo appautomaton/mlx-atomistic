@@ -919,7 +919,10 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
         },
         protocol_metadata={
             **prepared.metadata.protocol_metadata,
-            "nonbonded": {"cutoff": 5.0},
+            "nonbonded": {
+                "cutoff": 5.0,
+                "dispersion_correction": True,
+            },
         },
         compatibility_report={
             **prepared.metadata.compatibility_report,
@@ -957,10 +960,12 @@ def test_pme_artifact_builds_nonbonded_pme_with_config_arrays(tmp_path):
     )
 
     assert nonbonded.electrostatics == "pme"
+    assert nonbonded.use_dispersion_correction is True
     assert nonbonded.pme_config.mesh_shape == (8, 8, 8)
     assert nonbonded.pme_config.background_policy == "reject_non_neutral"
     assert np.isfinite(float(np.asarray(energy)))
     assert np.all(np.isfinite(np.asarray(forces)))
+    assert "lj_dispersion_correction" in components
     assert "pme_diagnostics" in components
 
 

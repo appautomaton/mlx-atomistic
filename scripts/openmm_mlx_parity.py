@@ -18,6 +18,10 @@ from mlx_atomistic.artifacts import (
     build_mlx_system_from_artifact,
     load_prepared_mlx_artifact,
 )
+from mlx_atomistic.core import Cell
+from mlx_atomistic.forcefields import NonbondedPotential
+from mlx_atomistic.md import analytic_configurational_virial_tensor
+from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import PMEConfig, pme_readiness_report
 from mlx_atomistic.prep.io import save_prepared_system
 from mlx_atomistic.prep.schema import (
@@ -383,6 +387,271 @@ def evaluate_tip4p_ew_openmm_mlx_parity(*, platform_name: str = "Reference") -> 
         "runtime_atom_count": mlx_system.atom_count,
         "runtime_virtual_site_count": mlx_system.virtual_sites.n_virtual_sites,
     }
+
+
+def evaluate_periodic_nonbonded_virial_parity(
+    *,
+    platform_name: str = "Reference",
+) -> dict[str, Any]:
+    """Compare a small periodic PME system's energy, force, virial, and pressure.
+
+    Args:
+        platform_name: OpenMM platform used only for reference evaluation.
+
+    Returns:
+        Numerical OpenMM-versus-MLX errors for the fixed two-molecule fixture.
+    """
+
+    import openmm as mm
+    from openmm import unit
+
+    positions_angstrom = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [1.9, 1.1, 1.0],
+            [4.2, 4.0, 4.0],
+            [5.0, 4.2, 4.1],
+        ],
+        dtype=np.float32,
+    )
+    masses = np.asarray([12.0, 1.0, 16.0, 1.0], dtype=np.float32)
+    molecule_ids = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    sigma_angstrom = np.asarray([1.0, 0.9, 1.1, 0.95], dtype=np.float32)
+    epsilon_kj_mol = np.asarray([0.2, 0.1, 0.18, 0.12], dtype=np.float32)
+    charges = np.asarray([0.4, -0.4, 0.25, -0.25], dtype=np.float32)
+    lengths_angstrom = np.asarray([8.0, 8.0, 8.0], dtype=np.float32)
+    cutoff_angstrom = 3.0
+    alpha_per_angstrom = 0.4
+    mesh_shape = (16, 16, 16)
+    coulomb_constant = 1389.35457644382
+    exception = {
+        "pair": (0, 1),
+        "charge_product": -0.08,
+        "sigma_angstrom": 0.95,
+        "epsilon_kj_mol": 0.1,
+    }
+
+    cell = Cell(lengths_angstrom)
+    pme_config = PMEConfig(
+        mesh_shape=mesh_shape,
+        alpha=alpha_per_angstrom,
+        real_cutoff=cutoff_angstrom,
+        assignment_order=5,
+    )
+    mlx_term = NonbondedPotential(
+        sigma=sigma_angstrom,
+        epsilon=epsilon_kj_mol,
+        charges=charges,
+        coulomb_constant=coulomb_constant,
+        cutoff=cutoff_angstrom,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=pme_config,
+        exception_pairs=[exception["pair"]],
+        exception_charge_products=[exception["charge_product"]],
+        exception_sigma=[exception["sigma_angstrom"]],
+        exception_epsilon=[exception["epsilon_kj_mol"]],
+        use_dispersion_correction=True,
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=cutoff_angstrom,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+    )
+    positions_mx = mx.array(positions_angstrom, dtype=mx.float32)
+    interactions = manager.update(positions_mx).interactions
+    mlx_energy, mlx_forces, mlx_components = mlx_term.energy_forces_with_components(
+        positions_mx,
+        cell,
+        interactions,
+    )
+    mlx_virial = analytic_configurational_virial_tensor(
+        positions_mx,
+        mlx_forces,
+        (mlx_term,),
+        cell=cell,
+        pairs=interactions,
+        masses=mx.array(masses, dtype=mx.float32),
+        molecule_ids=molecule_ids,
+    )
+
+    system = mm.System()
+    for mass in masses:
+        system.addParticle(float(mass) * unit.dalton)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.PME)
+    nonbonded.setCutoffDistance(cutoff_angstrom * 0.1 * unit.nanometer)
+    nonbonded.setPMEParameters(
+        alpha_per_angstrom * 10.0 / unit.nanometer,
+        *mesh_shape,
+    )
+    nonbonded.setUseDispersionCorrection(True)
+    for charge, sigma, epsilon in zip(
+        charges,
+        sigma_angstrom,
+        epsilon_kj_mol,
+        strict=True,
+    ):
+        nonbonded.addParticle(
+            float(charge) * unit.elementary_charge,
+            float(sigma) * 0.1 * unit.nanometer,
+            float(epsilon) * unit.kilojoule_per_mole,
+        )
+    nonbonded.addException(
+        *exception["pair"],
+        exception["charge_product"] * unit.elementary_charge**2,
+        exception["sigma_angstrom"] * 0.1 * unit.nanometer,
+        exception["epsilon_kj_mol"] * unit.kilojoule_per_mole,
+    )
+    system.addForce(nonbonded)
+    box_vectors = _orthorhombic_openmm_box(lengths_angstrom, mm, unit)
+    system.setDefaultPeriodicBoxVectors(*box_vectors)
+    context = mm.Context(
+        system,
+        mm.VerletIntegrator(0.001 * unit.picoseconds),
+        mm.Platform.getPlatformByName(platform_name),
+    )
+    context.setPeriodicBoxVectors(*box_vectors)
+    context.setPositions(positions_angstrom * 0.1 * unit.nanometer)
+    state = context.getState(getEnergy=True, getForces=True)
+    openmm_energy = float(
+        state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    )
+    openmm_forces = np.asarray(
+        state.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer
+        ),
+        dtype=np.float64,
+    )
+    openmm_virial = _openmm_molecular_strain_virial(
+        context,
+        positions_angstrom=positions_angstrom,
+        lengths_angstrom=lengths_angstrom,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        epsilon=2.0e-3,
+    )
+    mlx_virial_np = np.asarray(mlx_virial, dtype=np.float64)
+    mlx_forces_nm = np.asarray(mlx_forces, dtype=np.float64) * 10.0
+    volume = float(np.prod(lengths_angstrom, dtype=np.float64))
+    require_analytic_virial_components(
+        mlx_components,
+        required=(
+            "lj",
+            "lj_dispersion_correction",
+            "coulomb_real",
+            "coulomb_reciprocal",
+            "coulomb_self",
+            "coulomb_background",
+            "coulomb_exclusion_correction",
+            "coulomb_exception",
+            "coulomb_one_four_correction",
+        ),
+    )
+    return {
+        "reference_engine": "openmm",
+        "reference_engine_role": OPENMM_REFERENCE_ROLE,
+        "total_energy_openmm_kj_mol": openmm_energy,
+        "total_energy_mlx_kj_mol": float(np.asarray(mlx_energy)),
+        "total_energy_abs_error_kj_mol": abs(
+            float(np.asarray(mlx_energy)) - openmm_energy
+        ),
+        "force_max_abs_error_kj_mol_nm": float(
+            np.max(np.abs(mlx_forces_nm - openmm_forces))
+        ),
+        "force_rms_abs_error_kj_mol_nm": float(
+            np.sqrt(np.mean((mlx_forces_nm - openmm_forces) ** 2))
+        ),
+        "virial_diagonal_openmm_kj_mol": np.diag(openmm_virial).tolist(),
+        "virial_diagonal_mlx_kj_mol": np.diag(mlx_virial_np).tolist(),
+        "virial_max_abs_error_kj_mol": float(
+            np.max(np.abs(np.diag(mlx_virial_np - openmm_virial)))
+        ),
+        "pressure_diagonal_openmm_kj_mol_a3": (
+            np.diag(openmm_virial) / volume
+        ).tolist(),
+        "pressure_diagonal_mlx_kj_mol_a3": (
+            np.diag(mlx_virial_np) / volume
+        ).tolist(),
+        "pressure_max_abs_error_kj_mol_a3": float(
+            np.max(np.abs(np.diag(mlx_virial_np - openmm_virial))) / volume
+        ),
+        "mlx_component_keys": sorted(mlx_components),
+    }
+
+
+def require_analytic_virial_components(
+    components: dict[str, Any],
+    *,
+    required: Sequence[str],
+) -> None:
+    """Fail closed when an analytic-virial component map is incomplete.
+
+    Args:
+        components: Named component values available to the parity gate.
+        required: Exact component names required by the selected workload.
+
+    Raises:
+        ValueError: If any required component is absent.
+    """
+
+    missing = sorted(set(required) - set(components))
+    if missing:
+        msg = "missing analytic virial components: " + ", ".join(missing)
+        raise ValueError(msg)
+
+
+def _orthorhombic_openmm_box(lengths_angstrom, mm, unit):
+    lengths_nm = np.asarray(lengths_angstrom, dtype=np.float64) * 0.1
+    return (
+        mm.Vec3(lengths_nm[0], 0.0, 0.0),
+        mm.Vec3(0.0, lengths_nm[1], 0.0),
+        mm.Vec3(0.0, 0.0, lengths_nm[2]),
+    ) * unit.nanometer
+
+
+def _openmm_molecular_strain_virial(
+    context,
+    *,
+    positions_angstrom,
+    lengths_angstrom,
+    masses,
+    molecule_ids,
+    epsilon,
+):
+    from openmm import unit
+
+    positions = np.asarray(positions_angstrom, dtype=np.float64)
+    lengths = np.asarray(lengths_angstrom, dtype=np.float64)
+    masses = np.asarray(masses, dtype=np.float64)
+    molecule_ids = np.asarray(molecule_ids, dtype=np.int32)
+    diagonal = np.zeros((3,), dtype=np.float64)
+    for axis in range(3):
+        energies = []
+        for signed_epsilon in (epsilon, -epsilon):
+            target_lengths = lengths.copy()
+            target_lengths[axis] *= 1.0 + signed_epsilon
+            target_positions = positions.copy()
+            for molecule_index in np.unique(molecule_ids):
+                indices = np.flatnonzero(molecule_ids == molecule_index)
+                weights = masses[indices]
+                center = np.sum(
+                    positions[indices] * weights[:, None],
+                    axis=0,
+                ) / np.sum(weights)
+                target_center = center.copy()
+                target_center[axis] *= 1.0 + signed_epsilon
+                target_positions[indices] += target_center - center
+            import openmm as mm
+
+            vectors = _orthorhombic_openmm_box(target_lengths, mm, unit)
+            context.setPeriodicBoxVectors(*vectors)
+            context.setPositions(target_positions * 0.1 * unit.nanometer)
+            energy = context.getState(getEnergy=True).getPotentialEnergy()
+            energies.append(float(energy.value_in_unit(unit.kilojoule_per_mole)))
+        diagonal[axis] = -(energies[0] - energies[1]) / (2.0 * epsilon)
+    return np.diag(diagonal)
 
 
 def _tip4p_ew_prepared_artifact(pme_config: PMEParityConfig) -> PreparedSystem:

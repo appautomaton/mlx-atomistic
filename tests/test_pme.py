@@ -1,3 +1,4 @@
+import mlx.core as mx
 import numpy as np
 import pytest
 
@@ -20,6 +21,7 @@ from mlx_atomistic.pme import (
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
+    pme_coulomb_strain_components,
     pme_coulomb_total_energy_forces,
     pme_direct_space_policy_report,
     pme_force_scope_report,
@@ -673,7 +675,12 @@ def test_pme_readiness_report_accepts_mlx_fft_backend_for_production():
     assert report["checks"]["one_four_corrections"] is True
     assert report["checks"]["explicit_exceptions"] is True
     assert report["blockers"] == ()
-    assert report["virial"]["status"] == "finite_difference_cell_strain"
+    assert report["virial"] == {
+        "status": "analytic_diagonal_cell_strain",
+        "support_level": "analytic",
+        "analytic_supported": True,
+        "production_pressure_ready": True,
+    }
     assert report["force_scopes"]["total"]["production_total_only"] is True
     assert report["force_scopes"]["components"]["diagnostic_components"] is True
     assert report["force_scopes"]["direct_space"]["direct_space"] is True
@@ -704,6 +711,118 @@ def test_pme_readiness_accepts_charged_uniform_background_policy():
     assert report["checks"]["charge_policy"] is True
     assert report["background_policy"] == "uniform_neutralizing_plasma"
     assert report["blockers"] == ()
+
+
+@pytest.mark.parametrize(
+    ("charges", "background_policy"),
+    [
+        ([0.7, -0.2, -0.3, -0.2], "reject_non_neutral"),
+        ([0.7, -0.2, -0.3, -0.1], "uniform_neutralizing_plasma"),
+    ],
+)
+def test_pme_analytic_strain_components_match_independent_central_difference(
+    charges,
+    background_policy,
+):
+    positions = _positions()
+    charges_mx = as_mx_array(charges)
+    lengths = as_mx_array([12.0, 12.0, 12.0])
+    pairs = mx.array(
+        [(i, j) for i in range(4) for j in range(i + 1, 4)],
+        dtype=mx.int32,
+    )
+    config = PMEConfig(
+        mesh_shape=(8, 8, 8),
+        alpha=0.35,
+        real_cutoff=5.0,
+        assignment_order=4,
+        background_policy=background_policy,
+    )
+
+    def component_energy(strain, name):
+        target_lengths = lengths * (1.0 + strain)
+        target_positions = positions * (1.0 + strain)
+        return pme_coulomb_strain_components(
+            target_positions,
+            charges_mx,
+            Cell(target_lengths),
+            config=config,
+            direct_space_pairs=pairs,
+        )[name]
+
+    zero = mx.zeros((3,), dtype=mx.float32)
+    epsilon = 2.0e-3
+    for name in (
+        "coulomb_real",
+        "coulomb_reciprocal",
+        "coulomb_self",
+        "coulomb_background",
+    ):
+        analytic = np.asarray(
+            mx.grad(
+                lambda strain, component_name=name: component_energy(
+                    strain,
+                    component_name,
+                )
+            )(zero)
+        )
+        central = np.zeros((3,), dtype=np.float32)
+        for axis in range(3):
+            displacement = np.zeros((3,), dtype=np.float32)
+            displacement[axis] = epsilon
+            plus = float(np.asarray(component_energy(mx.array(displacement), name)))
+            minus = float(np.asarray(component_energy(mx.array(-displacement), name)))
+            central[axis] = (plus - minus) / (2.0 * epsilon)
+        np.testing.assert_allclose(analytic, central, rtol=5.0e-3, atol=2.0e-5)
+
+
+@pytest.mark.gpu
+def test_pme_analytic_strain_gpu_memory_is_bounded(monkeypatch):
+    previous = mx.default_device()
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    try:
+        device = mx.Device(mx.gpu, 0)
+        mx.set_default_device(device)
+        mx.set_default_stream(mx.new_stream(device))
+        mx.eval(mx.array([1.0], dtype=mx.float32))
+    except Exception:  # noqa: BLE001 - any Metal load failure means skip.
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+        pytest.skip("Metal GPU unavailable")
+    try:
+        positions = mx.array(np.asarray(_positions()), dtype=mx.float32)
+        charges = mx.array(np.asarray(_charges()), dtype=mx.float32)
+        lengths = mx.array([12.0, 12.0, 12.0], dtype=mx.float32)
+        pairs = mx.array(
+            [(i, j) for i in range(4) for j in range(i + 1, 4)],
+            dtype=mx.int32,
+        )
+        config = PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=5.0,
+            assignment_order=5,
+        )
+
+        def total_energy(strain):
+            components = pme_coulomb_strain_components(
+                positions * (1.0 + strain),
+                charges,
+                Cell(lengths * (1.0 + strain)),
+                config=config,
+                direct_space_pairs=pairs,
+            )
+            return sum(components.values())
+
+        mx.reset_peak_memory()
+        gradient = mx.grad(total_energy)(mx.zeros((3,), dtype=mx.float32))
+        mx.eval(gradient)
+
+        assert np.all(np.isfinite(np.asarray(gradient)))
+        assert mx.get_peak_memory() < 256 * 1024**2
+    finally:
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
 
 
 def test_pme_readiness_admits_94k_atoms_and_maximum_validated_mesh():

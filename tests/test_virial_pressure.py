@@ -34,6 +34,7 @@ from mlx_atomistic.md import (
     validate_virial_support,
     virial_readiness_report,
 )
+from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import PMEConfig
 
 
@@ -329,23 +330,20 @@ def test_explicitly_supported_built_in_terms_pass_virial_gate():
     validate_virial_support(terms)
 
 
-def test_built_in_virial_support_defaults_to_oracle_only():
+def test_selected_bond_virial_support_is_analytic():
     term = HarmonicBondPotential([(0, 1)], k=10.0, length=1.0)
 
     report = virial_readiness_report([term])
     production = virial_readiness_report([term], require_analytic=True)
 
-    assert term.analytic_virial_supported is False
-    assert report.status == "oracle_only"
+    assert term.analytic_virial_supported is True
+    assert report.status == "ready"
     assert report.blockers == ()
-    assert report.metadata["term_support"] == {
-        "bond": "finite_difference_oracle"
-    }
-    assert production.status == "blocked"
-    assert production.blockers == ("analytic_required:bond",)
-    assert missing_analytic_virial_support([term]) == ("bond",)
-    with pytest.raises(ValueError, match="missing analytic virial support.*bond"):
-        validate_analytic_virial_support([term])
+    assert report.metadata["term_support"] == {"bond": "analytic"}
+    assert production.status == "ready"
+    assert production.blockers == ()
+    assert missing_analytic_virial_support([term]) == ()
+    validate_analytic_virial_support([term])
 
 
 def test_molecular_kinetic_pressure_uses_center_of_mass_motion():
@@ -435,6 +433,136 @@ def test_intramolecular_term_reports_explicit_zero_molecular_virial():
 
     np.testing.assert_array_equal(np.asarray(analytic), np.zeros((3, 3)))
     np.testing.assert_allclose(np.asarray(oracle), np.zeros((3, 3)), atol=2.0e-5)
+
+
+@pytest.mark.parametrize(
+    ("term", "positions"),
+    [
+        (
+            HarmonicBondPotential([(0, 1)], k=4.0, length=1.0),
+            [[1.0, 1.0, 1.0], [2.2, 1.0, 1.0]],
+        ),
+        (
+            HarmonicAnglePotential([(0, 1, 2)], k=3.0, angle=1.4),
+            [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [2.1, 2.0, 1.0]],
+        ),
+        (
+            PeriodicDihedralPotential(
+                [(0, 1, 2, 3)],
+                k=0.4,
+                periodicity=3.0,
+                phase=0.2,
+            ),
+            [
+                [1.0, 1.0, 1.0],
+                [2.0, 1.0, 1.0],
+                [2.2, 2.0, 1.0],
+                [3.0, 2.2, 1.8],
+            ],
+        ),
+    ],
+)
+def test_selected_intramolecular_terms_have_zero_analytic_cell_virial(
+    term,
+    positions,
+):
+    positions = mx.array(positions, dtype=mx.float32)
+    atom_count = positions.shape[0]
+    cell = Cell.cubic(8.0)
+    masses = mx.ones((atom_count,), dtype=mx.float32)
+    molecule_ids = np.zeros((atom_count,), dtype=np.int32)
+    _, forces = term.energy_forces(positions, cell)
+
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=None,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=None,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+
+    np.testing.assert_allclose(np.asarray(analytic), 0.0, atol=2.0e-6)
+    np.testing.assert_allclose(np.asarray(analytic), np.asarray(oracle), atol=2.0e-5)
+
+
+def test_selected_pme_nonbonded_analytic_virial_matches_oracle():
+    positions = mx.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.9, 1.1, 1.0],
+            [4.2, 4.0, 4.0],
+            [5.0, 4.2, 4.1],
+        ],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    config = PMEConfig(
+        mesh_shape=(8, 8, 8),
+        alpha=0.4,
+        real_cutoff=3.0,
+        assignment_order=4,
+    )
+    term = NonbondedPotential(
+        sigma=[0.9, 1.0, 1.1, 0.95],
+        epsilon=[0.15, 0.2, 0.18, 0.12],
+        charges=[0.4, -0.4, 0.25, -0.25],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=config,
+        exception_pairs=[(0, 1)],
+        exception_charge_products=[-0.08],
+        exception_sigma=[0.95],
+        exception_epsilon=[0.1],
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=0.0,
+        backend="mlx_cell_blocks",
+    )
+    pairs = manager.update(positions).interactions
+    molecule_ids = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    masses = mx.ones((4,), dtype=mx.float32)
+    _, forces = term.energy_forces(positions, cell, pairs)
+
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        strain_epsilon=2.0e-3,
+    )
+
+    np.testing.assert_allclose(
+        np.diag(np.asarray(analytic)),
+        np.diag(np.asarray(oracle)),
+        rtol=7.0e-3,
+        atol=3.0e-4,
+    )
 
 
 def test_analytic_pair_virial_matches_molecular_cell_strain_oracle():

@@ -50,6 +50,10 @@ default_amber_fixture_paths = _HELPER.default_amber_fixture_paths
 default_charmm_fixture_paths = _HELPER.default_charmm_fixture_paths
 default_gromacs_fixture_paths = _HELPER.default_gromacs_fixture_paths
 evaluate_tip4p_ew_openmm_mlx_parity = _HELPER.evaluate_tip4p_ew_openmm_mlx_parity
+evaluate_periodic_nonbonded_virial_parity = (
+    _HELPER.evaluate_periodic_nonbonded_virial_parity
+)
+require_analytic_virial_components = _HELPER.require_analytic_virial_components
 run_amber_openmm_mlx_parity = _HELPER.run_amber_openmm_mlx_parity
 run_charmm_openmm_mlx_parity = _HELPER.run_charmm_openmm_mlx_parity
 run_gromacs_openmm_mlx_parity = _HELPER.run_gromacs_openmm_mlx_parity
@@ -73,6 +77,28 @@ def _require_default_fixture() -> tuple[Path, Path]:
     assert prmtop.exists(), f"tracked AMBER parity prmtop is missing: {prmtop}"
     assert coords.exists(), f"tracked AMBER parity coordinates are missing: {coords}"
     return prmtop, coords
+
+
+def test_analytic_virial_component_map_fails_closed():
+    with pytest.raises(
+        ValueError,
+        match="missing analytic virial components: coulomb_background",
+    ):
+        require_analytic_virial_components(
+            {"coulomb_real": 1.0},
+            required=("coulomb_real", "coulomb_background"),
+        )
+
+
+def test_small_periodic_pme_energy_force_virial_and_pressure_match_openmm():
+    report = evaluate_periodic_nonbonded_virial_parity()
+
+    assert report["reference_engine"] == "openmm"
+    assert report["total_energy_abs_error_kj_mol"] < 2.0e-3
+    assert report["force_max_abs_error_kj_mol_nm"] < 2.0e-2
+    assert report["force_rms_abs_error_kj_mol_nm"] < 1.0e-2
+    assert report["virial_max_abs_error_kj_mol"] < 5.0e-3
+    assert report["pressure_max_abs_error_kj_mol_a3"] < 1.0e-5
 
 
 def _require_charmm_fixture() -> tuple[Path, Path, Path, Path]:

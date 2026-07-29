@@ -20,7 +20,7 @@ from mlx_atomistic.nonbonded import (
     normalize_force_scope,
 )
 from mlx_atomistic.runtime import (
-    VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
+    VIRIAL_SUPPORT_ANALYTIC,
     ReadinessReport,
 )
 
@@ -215,7 +215,6 @@ class PMEExecutionPlan:
         self.reuse_validation_seconds = 0.0
         self.last_reuse_validation_seconds = 0.0
         self._signature = signature
-
     @classmethod
     def build(
         cls,
@@ -373,6 +372,16 @@ class PMEExecutionPlan:
         self.reuse_count += 1
         self.last_reuse_validation_seconds = float(validation_seconds)
         self.reuse_validation_seconds += float(validation_seconds)
+
+
+@dataclass(frozen=True)
+class _PMEStrainPlan:
+    """Cell-differentiable reciprocal arrays used by the analytic virial."""
+
+    influence: mx.array
+    wavevectors: tuple[mx.array, mx.array, mx.array]
+    grid_size: int
+    reciprocal_modes: int
 
 
 @dataclass(frozen=True)
@@ -747,10 +756,10 @@ def pme_readiness_report(
             "supported_assignment_orders": PME_SUPPORTED_ASSIGNMENT_ORDERS,
         },
         "virial": {
-            "status": "finite_difference_cell_strain",
-            "support_level": VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
-            "analytic_supported": False,
-            "production_pressure_ready": False,
+            "status": "analytic_diagonal_cell_strain",
+            "support_level": VIRIAL_SUPPORT_ANALYTIC,
+            "analytic_supported": True,
+            "production_pressure_ready": True,
         },
         "force_scopes": {
             scope: pme_force_scope_report(scope) for scope in FORCE_EVALUATION_SCOPES
@@ -901,6 +910,174 @@ def pme_coulomb_total_energy_forces(
         plan=plan,
     )
     return total_energy, forces
+
+
+def pme_coulomb_strain_components(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float = 1.0,
+    config: PMEConfig | None = None,
+    direct_space_pairs: mx.array | NeighborBlocks | None = None,
+) -> dict[str, mx.array]:
+    """Return cell-differentiable PME components for analytic virials.
+
+    This path rebuilds the cell-dependent reciprocal arrays from MLX values so
+    automatic differentiation sees the complete diagonal cell derivative. It
+    is intentionally separate from the reusable fixed-cell execution plan.
+
+    Args:
+        positions: Molecularly strained coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``.
+        cell: Strained orthorhombic periodic cell.
+        coulomb_constant: Coulomb prefactor in the configured unit system.
+        config: PME parameters with an explicit real-space cutoff.
+        direct_space_pairs: Compact pairs or neighbor blocks held fixed during
+            the infinitesimal strain derivative.
+
+    Returns:
+        Differentiable real, reciprocal, self, and background energies.
+
+    Raises:
+        ValueError: If the cell, shapes, cutoff, charge policy, or direct-space
+            pair representation is outside the analytic-virial envelope.
+    """
+
+    config = _resolve_plan_config(config)
+    if not isinstance(cell, Cell) or not cell.is_orthorhombic:
+        msg = "analytic PME virial requires an orthorhombic Cell"
+        raise ValueError(msg)
+    if config.real_cutoff is None:
+        msg = "analytic PME virial requires an explicit real-space cutoff"
+        raise ValueError(msg)
+    if direct_space_pairs is None:
+        msg = "analytic PME virial requires compact direct-space pairs or blocks"
+        raise ValueError(msg)
+    positions_mx = mx.array(positions, dtype=mx.float32)
+    charges_mx = mx.array(charges, dtype=mx.float32)
+    if positions_mx.ndim != 2 or positions_mx.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if charges_mx.shape != (positions_mx.shape[0],):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    net_charge = float(np.asarray(mx.sum(charges_mx)))
+    if (
+        abs(net_charge) > config.charge_tolerance
+        and config.background_policy != "uniform_neutralizing_plasma"
+    ):
+        msg = (
+            "analytic PME virial requires a neutral system unless "
+            "background_policy='uniform_neutralizing_plasma'"
+        )
+        raise ValueError(msg)
+
+    cell_lengths = cell.lengths.astype(mx.float32)
+    wrapped = positions_mx - mx.floor(positions_mx / cell_lengths) * cell_lengths
+    if isinstance(direct_space_pairs, NeighborBlocks):
+        real_energy, _ = _real_space_block_energy_forces_mx(
+            wrapped,
+            charges_mx,
+            cell_lengths,
+            direct_space_pairs,
+            alpha=config.alpha,
+            cutoff=config.real_cutoff,
+            coulomb_constant=coulomb_constant,
+        )
+    else:
+        pair_array = _validate_compact_pairs(
+            mx.array(direct_space_pairs, dtype=mx.int32),
+            positions_mx.shape[0],
+        )
+        real_energy, _ = _real_space_pair_energy_forces_mx(
+            wrapped,
+            charges_mx,
+            cell_lengths,
+            pair_array,
+            alpha=config.alpha,
+            cutoff=config.real_cutoff,
+            coulomb_constant=coulomb_constant,
+        )
+
+    influence, wavevectors, reciprocal_modes = _differentiable_influence_function_mx(
+        cell_lengths,
+        config.mesh_shape,
+        alpha=config.alpha,
+        coulomb_constant=coulomb_constant,
+        deconvolve_assignment=config.deconvolve_assignment,
+        assignment_order=config.assignment_order,
+    )
+    strain_plan = _PMEStrainPlan(
+        influence=influence,
+        wavevectors=wavevectors,
+        grid_size=int(np.prod(config.mesh_shape)),
+        reciprocal_modes=reciprocal_modes,
+    )
+    reciprocal_energy, _, _ = _mesh_reciprocal_energy_forces_mx(
+        wrapped,
+        charges_mx,
+        cell_lengths,
+        np.empty((0,), dtype=np.float64),
+        config=config,
+        coulomb_constant=coulomb_constant,
+        plan=strain_plan,
+        return_mesh_info=False,
+    )
+    self_energy = (
+        -float(coulomb_constant)
+        * config.alpha
+        / float(np.sqrt(np.pi))
+        * mx.sum(charges_mx * charges_mx)
+    )
+    background_energy = _neutralizing_plasma_energy_mx(
+        charges_mx,
+        volume=mx.prod(cell_lengths),
+        alpha=config.alpha,
+        coulomb_constant=coulomb_constant,
+        background_policy=config.background_policy,
+    )
+    return {
+        "coulomb_real": real_energy,
+        "coulomb_reciprocal": reciprocal_energy,
+        "coulomb_self": self_energy,
+        "coulomb_background": background_energy,
+    }
+
+
+def pme_coulomb_strain_energy(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float = 1.0,
+    config: PMEConfig | None = None,
+    direct_space_pairs: mx.array | NeighborBlocks | None = None,
+) -> mx.array:
+    """Return the complete cell-differentiable PME energy for analytic virials.
+
+    Args:
+        positions: Molecularly strained coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``.
+        cell: Strained orthorhombic periodic cell.
+        coulomb_constant: Coulomb prefactor in the configured unit system.
+        config: PME parameters with an explicit real-space cutoff.
+        direct_space_pairs: Compact pairs or neighbor blocks held fixed during
+            the infinitesimal strain derivative.
+
+    Returns:
+        The sum of real, reciprocal, self, and background PME energies.
+    """
+
+    components = pme_coulomb_strain_components(
+        positions,
+        charges,
+        cell,
+        coulomb_constant=coulomb_constant,
+        config=config,
+        direct_space_pairs=direct_space_pairs,
+    )
+    return sum(components.values())
 
 
 def pme_direct_space_policy_report(
@@ -1482,7 +1659,7 @@ def _validate_inputs_mx(
 def _neutralizing_plasma_energy_mx(
     charges: mx.array,
     *,
-    volume: float,
+    volume: float | mx.array,
     alpha: float,
     coulomb_constant: float,
     background_policy: PMEBackgroundPolicy,
@@ -1491,7 +1668,7 @@ def _neutralizing_plasma_energy_mx(
         return mx.sum(charges * 0.0)
     net_charge = mx.sum(charges)
     scale = -float(coulomb_constant) * float(np.pi) / (
-        2.0 * float(volume) * float(alpha) * float(alpha)
+        2.0 * volume * float(alpha) * float(alpha)
     )
     return scale * net_charge * net_charge
 
@@ -1931,6 +2108,53 @@ def _influence_function_mx(
     return influence, (kx, ky, kz), int(np.prod(mesh_shape) - 1)
 
 
+def _differentiable_influence_function_mx(
+    cell_lengths: mx.array,
+    mesh_shape: tuple[int, int, int],
+    *,
+    alpha: float,
+    coulomb_constant: float,
+    deconvolve_assignment: bool,
+    assignment_order: int = 2,
+) -> tuple[mx.array, tuple[mx.array, mx.array, mx.array], int]:
+    """Build reciprocal arrays without detaching cell lengths from MLX."""
+
+    assignment_order = _validate_assignment_order(assignment_order)
+    k_components = []
+    window = mx.ones(mesh_shape, dtype=mx.float32)
+    for axis, size in enumerate(mesh_shape):
+        modes = mx.fft.fftfreq(size) * float(size)
+        k_axis = 2.0 * float(np.pi) * modes / cell_lengths[axis]
+        shape = [1, 1, 1]
+        shape[axis] = int(size)
+        k_grid = mx.reshape(k_axis, tuple(shape))
+        k_components.append(mx.broadcast_to(k_grid, mesh_shape))
+        if deconvolve_assignment:
+            window_axis = _sinc_mx(modes / float(size)) ** assignment_order
+            window = window * mx.broadcast_to(
+                mx.reshape(window_axis, tuple(shape)),
+                mesh_shape,
+            )
+
+    kx, ky, kz = k_components
+    k2 = kx * kx + ky * ky + kz * kz
+    mask = k2 > 0.0
+    denominator = k2
+    if deconvolve_assignment:
+        denominator = denominator * mx.maximum(window * window, mx.array(1e-12))
+    safe_denominator = mx.where(mask, denominator, 1.0)
+    influence = (
+        float(coulomb_constant)
+        * 4.0
+        * float(np.pi)
+        / mx.prod(cell_lengths)
+        * mx.exp(-k2 / (4.0 * float(alpha) * float(alpha)))
+        / safe_denominator
+    )
+    influence = mx.where(mask, influence, 0.0)
+    return influence, (kx, ky, kz), int(np.prod(mesh_shape) - 1)
+
+
 def _sinc_mx(values: mx.array) -> mx.array:
     argument = float(np.pi) * values
     near_zero = mx.abs(argument) < 1e-7
@@ -1964,7 +2188,9 @@ def _assign_charges_bspline_mx(
     assignment_order = _validate_assignment_order(assignment_order)
     mesh = mx.array(mesh_shape, dtype=mx.float32)
     scaled = (positions - mx.floor(positions / cell_lengths) * cell_lengths) / cell_lengths * mesh
-    base = mx.floor(scaled).astype(mx.int32) - ((assignment_order - 1) // 2)
+    base = mx.stop_gradient(
+        mx.floor(scaled).astype(mx.int32)
+    ) - ((assignment_order - 1) // 2)
     fractions = [scaled[:, axis] - mx.floor(scaled[:, axis]) for axis in range(3)]
     nx, ny, nz = mesh_shape
     grid = mx.zeros((nx * ny * nz,), dtype=mx.float32)
@@ -2015,7 +2241,9 @@ def _interpolate_bspline_mx(
     n_atoms = int(positions.shape[0])
     mesh = mx.array(mesh_shape, dtype=mx.float32)
     scaled = (positions - mx.floor(positions / cell_lengths) * cell_lengths) / cell_lengths * mesh
-    base = mx.floor(scaled).astype(mx.int32) - ((assignment_order - 1) // 2)
+    base = mx.stop_gradient(
+        mx.floor(scaled).astype(mx.int32)
+    ) - ((assignment_order - 1) // 2)
     fractions = [scaled[:, axis] - mx.floor(scaled[:, axis]) for axis in range(3)]
     values = mx.zeros((n_atoms, *trailing_shape), dtype=grid.dtype)
     nx, ny, nz = mesh_shape
