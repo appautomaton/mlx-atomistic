@@ -1,0 +1,108 @@
+{
+  "schema": "mlx-atomistic.dhfr-npt-validation-contract.v1",
+  "claim": {
+    "scope": "bounded repeated anisotropic orthorhombic NPT closure on OpenMM 5dfr",
+    "excludes": [
+      "production-length ensemble convergence",
+      "general NPT certification",
+      "stepwise stochastic trajectory identity",
+      "triclinic or membrane pressure coupling",
+      "performance or speedup claims"
+    ]
+  },
+  "target": {
+    "case_id": "dhfr-5dfr-pme",
+    "source_kind": "openmm_5dfr_solvated_pdb",
+    "pdb_path": "vendors/openmm/examples/benchmarks/5dfr_solv-cube_equil.pdb",
+    "pdb_sha256": "fc9759761d9b33c58b09a3d0bf1dbdb76f23dbe0e89a8bd92f43ebcf0f2f2fdf",
+    "vendor_benchmark_path": "vendors/openmm/examples/benchmarks/benchmark.py",
+    "vendor_benchmark_sha256": "cb2dec8f1c61ab0716367ec49561c9e0ad854db4ace5e9d512e7d162959cf25e",
+    "forcefield_resources": {
+      "amber99sb.xml": "186f8570413f2ad3efe923578fc53cc895006d50de4b612e9fc58977a914c092",
+      "tip3p.xml": "607f0fc9566c3770db2d9eb579fed68c4157578445eed1ec0aa7dccc23d57a6c"
+    },
+    "atom_count": 23558,
+    "molecule_count": 7024,
+    "molecule_identity_sha256": "4d69c0dd46da74ae6199833dfc7079345e0dbfb733f0ace1a42ffa7facdac820",
+    "atom_order_sha256": "a150ae680c9fc7289aae3f86115c26c67b2d351d8da0fb906df7daaed0c40c10",
+    "force_classes_sha256": "ef70c671aad4f5df1784d5c1ecfea4834e07001fa57b3c2270f1785224057d8c",
+    "parameters_sha256": "df02591a48343e6fb9e09be7a6fbf98d8a13f859198b0cef2f0144b6498ac16a",
+    "constraints_sha256": "37c9c42120f979f5ee55fd683e4b48365806a5b68ad1945d50215731648fd2f6"
+  },
+  "workload": {
+    "temperature_K": 300.0,
+    "pressure_bar": 1.0,
+    "pressure_atm": 0.9869232667160128,
+    "dt_ps": 0.001,
+    "steps": 250,
+    "sample_interval": 25,
+    "diagnostic_interval": 25,
+    "friction_per_ps": 1.0,
+    "seeds": [
+      7,
+      19
+    ],
+    "barostat": {
+      "family": "monte_carlo",
+      "mode": "anisotropic",
+      "interval": 25,
+      "axes": [
+        true,
+        true,
+        true
+      ],
+      "max_log_volume_scale": 0.02,
+      "expected_attempts": 10
+    },
+    "center_of_mass_motion_interval": 1,
+    "hydrogen_mass_amu": 1.5,
+    "constraints": "HBonds",
+    "pme": {
+      "mesh_shape": [
+        56,
+        56,
+        56
+      ],
+      "alpha_per_angstrom": 0.29202898720871845,
+      "real_cutoff_angstrom": 9.0,
+      "assignment_order": 5,
+      "ewald_error_tolerance": 0.0005,
+      "dispersion_correction": true
+    }
+  },
+  "resource_limits": {
+    "process_tree_max_bytes": 40000000000,
+    "fixed_timeout_seconds": 7200,
+    "npt_seed_timeout_seconds": 7200
+  },
+  "fixed_state_gates": {
+    "energy_error_per_atom_kj_mol": 0.005,
+    "relative_energy_error": 0.00005,
+    "force_rms_error_kj_mol_nm": 3.0,
+    "force_max_error_kj_mol_nm": 12.0,
+    "virial_error_per_atom_kj_mol": 0.005,
+    "relative_virial_error": 0.0005,
+    "pressure_diagonal_max_error_kj_mol_a3": 0.0001,
+    "finite_difference_virial_error_per_atom_kj_mol": 0.005
+  },
+  "npt_gates": {
+    "required_attempts_per_seed": 10,
+    "minimum_accepted_moves_per_seed": 1,
+    "maximum_constraint_error_angstrom": 0.0001,
+    "minimum_volume_ratio": 0.8,
+    "maximum_volume_ratio": 1.25,
+    "orthorhombic_off_diagonal_tolerance_angstrom": 0.000001,
+    "maximum_temperature_K": 1200.0,
+    "maximum_abs_pressure_bar": 100000.0,
+    "maximum_energy_excursion_per_atom_kj_mol": 50.0,
+    "maximum_engine_mean_volume_ratio_delta": 0.1,
+    "maximum_engine_mean_pressure_delta_bar": 10000.0
+  },
+  "gate_basis": {
+    "energy_and_force": "Existing same-workload charged-PME parity policy: 0.005 kJ/mol/atom, 5e-5 relative energy, 3 RMS and 12 max kJ/mol/nm force error.",
+    "virial_and_pressure": "Small order-five periodic PME OpenMM oracle passes below 0.005 kJ/mol diagonal virial and 1e-5 kJ/mol/A^3 pressure error; target gates add size-aware per-atom and relative bounds.",
+    "constraints": "Existing constrained production fixtures remain below 1e-4 A.",
+    "volume_and_stability": "Short non-target anisotropic fixtures remain within 0.95-1.10 volume ratio; the target bound is widened before target inspection for ten stochastic proposals.",
+    "aggregate": "Short stochastic trajectories are compared only through finite bounded pressure/volume summaries, never stepwise identity."
+  }
+}

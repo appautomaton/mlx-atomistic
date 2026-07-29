@@ -518,6 +518,7 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
     for result in (continuous, first, resumed):
         assert result.nonbonded_report["fixed_cell"] is False
         assert result.nonbonded_report["pme_execution_plan_count"] == 1
+        assert np.all(np.isfinite(np.asarray(result.pressure)))
 
 
 def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):

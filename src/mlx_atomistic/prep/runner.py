@@ -843,8 +843,13 @@ def run_mlx(
         require_production=require_production,
     )
     bound_pme_plan = any(getattr(term, "pme_plan", None) is not None for term in force_terms)
-    pressure_diagnostics = (
-        artifact.atom_count <= PRESSURE_DIAGNOSTIC_ATOM_LIMIT and not bound_pme_plan
+    lazy_nonbonded = any(
+        getattr(getattr(term, "topology", None), "nonbonded_pair_policy", None)
+        == "lazy"
+        for term in force_terms
+    )
+    pressure_diagnostics = artifact.atom_count <= PRESSURE_DIAGNOSTIC_ATOM_LIMIT and (
+        not bound_pme_plan or (use_npt and lazy_nonbonded)
     )
     hmr_state = artifact.hmr_state
     center_of_mass_motion_interval = _center_of_mass_motion_interval(
@@ -946,6 +951,7 @@ def run_mlx(
                 diagnostic_interval=diagnostic_interval,
                 compile_force_evaluator=compile_force_evaluator,
                 pressure_diagnostics=pressure_diagnostics,
+                pressure_virial_mode="analytic",
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
