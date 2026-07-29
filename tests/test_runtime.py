@@ -3,7 +3,12 @@ import numpy as np
 import mlx_atomistic.md as md
 from mlx_atomistic.core import Cell
 from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate_nve
-from mlx_atomistic.runtime import RuntimeInfo, get_platform_boundary_report
+from mlx_atomistic.runtime import (
+    VIRIAL_SUPPORT_LEVELS,
+    RuntimeInfo,
+    get_platform_boundary_report,
+    normalize_virial_support,
+)
 
 
 def test_platform_boundary_report_names_local_engine_concepts():
@@ -32,6 +37,20 @@ def test_platform_boundary_report_names_local_engine_concepts():
     assert "PreparedMLXArtifact" in sections["system_artifact"]["local_concepts"]
     assert "pme_readiness_report" in sections["readiness"]["local_concepts"]
     assert "ReferenceDFTCase" in sections["dft_qm_scope"]["local_concepts"]
+
+
+def test_virial_support_labels_are_closed_and_normalized():
+    assert VIRIAL_SUPPORT_LEVELS == (
+        "analytic",
+        "finite_difference_oracle",
+        "unsupported",
+    )
+    assert normalize_virial_support("finite-difference-oracle") == (
+        "finite_difference_oracle"
+    )
+
+    with np.testing.assert_raises_regex(ValueError, "virial support"):
+        normalize_virial_support("implicit_fallback")
 
 
 def test_non_output_failure_checks_do_not_host_materialize_positions_or_velocities(monkeypatch):

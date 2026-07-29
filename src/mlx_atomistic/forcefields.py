@@ -137,6 +137,7 @@ class HarmonicBondPotential:
     length: object
     name: str = "bond"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         bonds = np.asarray(self.bonds, dtype=np.int32)
@@ -224,6 +225,7 @@ class HarmonicAnglePotential:
     angle: object
     name: str = "angle"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         angles = np.asarray(self.angles, dtype=np.int32)
@@ -337,6 +339,7 @@ class PositionalRestraintPotential:
     k: float
     name: str = "positional_restraint"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         reference = as_mx_array(self.reference_positions)
@@ -408,6 +411,7 @@ class PeriodicDihedralPotential:
     phase: object = 0.0
     name: str = "dihedral"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         dihedrals = np.asarray(self.dihedrals, dtype=np.int32)
@@ -555,6 +559,7 @@ class RBDihedralPotential:
     c5: object
     name: str = "rb_dihedral"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         dihedrals = np.asarray(self.dihedrals, dtype=np.int32)
@@ -782,6 +787,7 @@ class CoulombPotential:
     one_four_scale: float = 1.0
     name: str = "coulomb"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         if self.topology is not None and self.charges is None:
@@ -965,6 +971,7 @@ class NonbondedPotential:
     lambda_electrostatics: float = 1.0
     name: str = "nonbonded"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         sigma = as_mx_array(self.sigma)
@@ -2796,6 +2803,7 @@ class PairRestrictedNonbondedPotential:
     pairs: object
     name: str = "pair_restricted_nonbonded"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         pairs = np.asarray(self.pairs, dtype=np.int32)
@@ -2989,6 +2997,7 @@ class SoftCoreNonbondedPotential:
     lambda_electrostatics: float = 1.0
     name: str = "soft_core_nonbonded"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(

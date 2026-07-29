@@ -28,6 +28,13 @@ from mlx_atomistic.nonbonded import (
     dense_lj_energy_forces,
     estimate_dense_nonbonded_bytes,
 )
+from mlx_atomistic.runtime import (
+    VIRIAL_SUPPORT_ANALYTIC,
+    VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
+    VIRIAL_SUPPORT_UNSUPPORTED,
+    ReadinessReport,
+    normalize_virial_support,
+)
 from mlx_atomistic.topology import Topology, _isin_sorted_codes
 from mlx_atomistic.virtual_sites import VirtualSiteManager
 
@@ -78,6 +85,7 @@ class LennardJonesPotential:
     memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
     name: str = "lj"
     supports_virial: bool = True
+    analytic_virial_supported: bool = False
     use_fused_kernel: bool = False
 
     def __post_init__(self) -> None:
@@ -406,6 +414,7 @@ class SimulationConfig:
     diagnostic_interval: int = 1
     compile_force_evaluator: bool = False
     pressure_diagnostics: bool = True
+    pressure_virial_mode: str = VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE
     initial_step: int = 0
     initial_time: float = 0.0
     virtual_sites: VirtualSiteManager | None = None
@@ -430,6 +439,11 @@ class SimulationConfig:
         if self.boltzmann_constant <= 0.0:
             msg = "boltzmann_constant must be positive"
             raise ValueError(msg)
+        pressure_virial_mode = normalize_virial_support(self.pressure_virial_mode)
+        if pressure_virial_mode == VIRIAL_SUPPORT_UNSUPPORTED:
+            msg = "pressure_virial_mode cannot be unsupported"
+            raise ValueError(msg)
+        object.__setattr__(self, "pressure_virial_mode", pressure_virial_mode)
         if self.evaluation_interval <= 0:
             msg = "evaluation_interval must be positive"
             raise ValueError(msg)
@@ -778,35 +792,115 @@ def configurational_virial_tensor(
     pairs: object | None,
     virtual_sites: VirtualSiteManager | None = None,
     strain_epsilon: float = 1e-3,
+    masses: mx.array | None = None,
+    molecule_ids: object | None = None,
+    virial_mode: str = VIRIAL_SUPPORT_ANALYTIC,
 ) -> mx.array:
-    """Return a configurational virial diagnostic after explicit support validation.
-
-    Periodic orthorhombic cells use diagonal finite differences in cell strain
-    with fractional coordinates held fixed. Off-diagonal strain is not part of
-    this Slice 8 diagnostic convention and is reported as zero.
+    """Return an analytic production virial or the named validation oracle.
 
     Args:
         positions: Particle coordinates, shape ``(n_particles, 3)``.
-        forces: Forces used for the non-periodic fallback, shape ``(n_particles, 3)``.
-        force_terms: Force terms whose energy is finite-differenced under cell
-            strain; each must support virial diagnostics.
-        cell: Periodic cell; ``None`` returns the non-periodic
-            `virial_tensor`.
-        pairs: Optional neighbor/pair structure forwarded to the force terms;
-            ``None`` lets each term build its own.
+        forces: Forces used for the non-periodic fallback.
+        force_terms: Force terms contributing to the configurational virial.
+        cell: Periodic cell; ``None`` uses the non-periodic force virial.
+        pairs: Optional neighbor/pair structure forwarded to analytic terms.
         virtual_sites: Optional virtual-site manager applied before energy
             evaluation. Defaults to ``None``.
-        strain_epsilon: Half-width of the symmetric cell-strain finite
-            difference. Defaults to ``1e-3``.
+        strain_epsilon: Half-width used only by the finite-difference oracle.
+        masses: Optional particle masses for molecular center construction.
+        molecule_ids: Optional contiguous per-particle molecule identifiers;
+            absent identifiers treat every particle as its own molecule.
+        virial_mode: ``analytic`` for production or
+            ``finite_difference_oracle`` for validation.
 
     Returns:
-        The ``(3, 3)`` diagonal virial tensor (off-diagonal entries are zero
-            by this diagnostic's convention).
+        The diagonal ``(3, 3)`` configurational virial tensor.
 
     Raises:
-        ValueError: If a force term lacks virial support, ``strain_epsilon``
-            is non-positive, or the cell volume is non-positive.
+        ValueError: If the requested support level or cell is invalid.
     """
+
+    mode = normalize_virial_support(virial_mode)
+    if mode == VIRIAL_SUPPORT_ANALYTIC:
+        return analytic_configurational_virial_tensor(
+            positions,
+            forces,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+    if mode == VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE:
+        return finite_difference_configurational_virial_oracle(
+            positions,
+            forces,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+            strain_epsilon=strain_epsilon,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+    msg = "unsupported virial mode cannot produce pressure"
+    raise ValueError(msg)
+
+
+def analytic_configurational_virial_tensor(
+    positions: mx.array,
+    forces: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    masses: mx.array | None = None,
+    molecule_ids: object | None = None,
+) -> mx.array:
+    """Return the production analytic diagonal configurational virial."""
+
+    validate_analytic_virial_support(force_terms)
+    positions = as_mx_array(positions)
+    if cell is None:
+        return virial_tensor(positions, forces)
+    _validate_orthorhombic_pressure_cell(cell)
+    contributions = []
+    for _, term in _named_force_terms(force_terms):
+        method = getattr(term, "analytic_virial_tensor", None)
+        if not callable(method):
+            msg = "analytic virial support requires analytic_virial_tensor"
+            raise ValueError(msg)
+        contribution = as_mx_array(
+            method(
+                positions,
+                cell=cell,
+                pairs=pairs,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            )
+        )
+        if contribution.shape != (3, 3):
+            msg = "analytic virial contributions must have shape (3, 3)"
+            raise ValueError(msg)
+        contributions.append(mx.diag(mx.diag(contribution)))
+    if not contributions:
+        return mx.zeros((3, 3), dtype=positions.dtype)
+    return sum(contributions[1:], start=contributions[0])
+
+
+def finite_difference_configurational_virial_oracle(
+    positions: mx.array,
+    forces: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None = None,
+    strain_epsilon: float = 1e-3,
+    masses: mx.array | None = None,
+    molecule_ids: object | None = None,
+) -> mx.array:
+    """Return the validation-only molecular cell-strain virial oracle."""
 
     validate_virial_support(force_terms)
     positions = as_mx_array(positions)
@@ -819,21 +913,31 @@ def configurational_virial_tensor(
         msg = "virial diagnostics require positive cell volume"
         raise ValueError(msg)
 
-    fractional = cell.fractional_coordinates(positions)
-    fractional = fractional - mx.floor(fractional)
     diagonal = []
     for axis in range(3):
         plus_cell = Cell(_strained_cell_matrix(cell.matrix, axis, strain_epsilon))
         minus_cell = Cell(_strained_cell_matrix(cell.matrix, axis, -strain_epsilon))
         plus_energy = _potential_energy_for_virial(
-            plus_cell.cartesian_coordinates(fractional),
+            _molecularly_strained_positions(
+                positions,
+                source_cell=cell,
+                target_cell=plus_cell,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            ),
             force_terms,
             cell=plus_cell,
             pairs=pairs,
             virtual_sites=virtual_sites,
         )
         minus_energy = _potential_energy_for_virial(
-            minus_cell.cartesian_coordinates(fractional),
+            _molecularly_strained_positions(
+                positions,
+                source_cell=cell,
+                target_cell=minus_cell,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            ),
             force_terms,
             cell=minus_cell,
             pairs=pairs,
@@ -841,6 +945,82 @@ def configurational_virial_tensor(
         )
         diagonal.append(-(plus_energy - minus_energy) / (2.0 * strain_epsilon))
     return mx.diag(mx.stack(diagonal))
+
+
+def _molecularly_strained_positions(
+    positions: mx.array,
+    *,
+    source_cell: Cell,
+    target_cell: Cell,
+    masses: mx.array | None,
+    molecule_ids: object | None,
+) -> mx.array:
+    positions = as_mx_array(positions)
+    particle_count = positions.shape[0]
+    if molecule_ids is None:
+        fractional = source_cell.fractional_coordinates(positions)
+        fractional = fractional - mx.floor(fractional)
+        return target_cell.cartesian_coordinates(fractional)
+    ids = _normalize_pressure_molecule_ids(
+        molecule_ids,
+        particle_count=particle_count,
+    )
+    if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
+        fractional = source_cell.fractional_coordinates(positions)
+        fractional = fractional - mx.floor(fractional)
+        return target_cell.cartesian_coordinates(fractional)
+    particle_masses = (
+        mx.ones((particle_count,), dtype=positions.dtype)
+        if masses is None
+        else as_mx_array(masses)
+    )
+    if particle_masses.shape != (particle_count,):
+        msg = "masses must have shape (n_particles,)"
+        raise ValueError(msg)
+    strained = mx.zeros_like(positions)
+    for molecule_index in range(int(np.max(ids)) + 1):
+        atom_indices = np.flatnonzero(ids == molecule_index).astype(np.int32)
+        indices = mx.array(atom_indices, dtype=mx.int32)
+        anchor = positions[indices[0]]
+        unwrapped = anchor + source_cell.minimum_image(positions[indices] - anchor)
+        weights = particle_masses[indices]
+        center = mx.sum(unwrapped * weights[:, None], axis=0) / mx.sum(weights)
+        fractional_center = source_cell.fractional_coordinates(center)
+        fractional_center = fractional_center - mx.floor(fractional_center)
+        target_center = target_cell.cartesian_coordinates(fractional_center)
+        strained = strained.at[indices].add(unwrapped - center + target_center)
+    return strained
+
+
+def _normalize_pressure_molecule_ids(
+    molecule_ids: object | None,
+    *,
+    particle_count: int,
+) -> np.ndarray:
+    if molecule_ids is None:
+        return np.arange(particle_count, dtype=np.int32)
+    raw = np.asarray(molecule_ids)
+    if raw.shape != (particle_count,):
+        msg = "molecule_ids must have shape (n_particles,)"
+        raise ValueError(msg)
+    numeric = np.asarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(numeric)) or not np.all(numeric == np.floor(numeric)):
+        msg = "molecule_ids must contain finite integers"
+        raise ValueError(msg)
+    normalized = numeric.astype(np.int32)
+    labels = np.unique(normalized)
+    if not np.array_equal(labels, np.arange(labels.size)):
+        msg = "molecule_ids labels must be contiguous and start at zero"
+        raise ValueError(msg)
+    return normalized
+
+
+def _validate_orthorhombic_pressure_cell(cell: Cell) -> None:
+    matrix = np.asarray(cell.matrix, dtype=np.float64)
+    off_diagonal = matrix - np.diag(np.diag(matrix))
+    if not np.allclose(off_diagonal, 0.0, rtol=0.0, atol=1.0e-7):
+        msg = "analytic pressure currently requires an orthorhombic cell"
+        raise ValueError(msg)
 
 
 def _strained_cell_matrix(matrix: mx.array, axis: int, strain: float) -> mx.array:
@@ -871,6 +1051,7 @@ def kinetic_pressure_tensor(
     masses: mx.array,
     *,
     kinetic_energy_scale: float = 1.0,
+    molecule_ids: object | None = None,
 ) -> mx.array:
     """Return the kinetic (momentum-flux) tensor in the configured units.
 
@@ -879,6 +1060,8 @@ def kinetic_pressure_tensor(
         masses: Per-particle masses, shape ``(n_particles,)``.
         kinetic_energy_scale: Multiplicative factor converting the raw kinetic
             quantity into the configured energy unit. Defaults to ``1.0``.
+        molecule_ids: Optional contiguous per-particle molecule identifiers.
+            When present, the tensor uses molecular center-of-mass momenta.
 
     Returns:
         The ``(3, 3)`` tensor ``scale · Σ_i m_i v_i ⊗ v_i``.
@@ -896,6 +1079,29 @@ def kinetic_pressure_tensor(
     if masses.shape != (velocities.shape[0],):
         msg = "masses must have shape (n_particles,)"
         raise ValueError(msg)
+    if molecule_ids is not None:
+        ids = _normalize_pressure_molecule_ids(
+            molecule_ids,
+            particle_count=velocities.shape[0],
+        )
+        molecule_count = int(np.max(ids)) + 1
+        indices = mx.array(ids, dtype=mx.int32)
+        molecule_masses = mx.zeros(
+            (molecule_count,),
+            dtype=masses.dtype,
+        ).at[indices].add(masses)
+        momenta = masses[:, None] * velocities
+        molecule_momenta = mx.zeros(
+            (molecule_count, 3),
+            dtype=velocities.dtype,
+        ).at[indices].add(momenta)
+        molecule_velocities = molecule_momenta / molecule_masses[:, None]
+        weighted_velocities = molecule_masses[:, None] * molecule_velocities
+        return (
+            kinetic_energy_scale
+            * mx.transpose(molecule_velocities)
+            @ weighted_velocities
+        )
     weighted_velocities = masses[:, None] * velocities
     return kinetic_energy_scale * mx.transpose(velocities) @ weighted_velocities
 
@@ -911,6 +1117,8 @@ def pressure_tensor(
     pairs: object | None,
     kinetic_energy_scale: float = 1.0,
     virtual_sites: VirtualSiteManager | None = None,
+    molecule_ids: object | None = None,
+    virial_mode: str = VIRIAL_SUPPORT_ANALYTIC,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Return virial tensor, pressure tensor, and scalar pressure diagnostics.
 
@@ -932,6 +1140,10 @@ def pressure_tensor(
             Defaults to ``1.0``.
         virtual_sites: Optional virtual-site manager applied before energy
             evaluation. Defaults to ``None``.
+        molecule_ids: Optional exact molecule membership for molecular
+            configurational and kinetic pressure.
+        virial_mode: ``analytic`` for production or
+            ``finite_difference_oracle`` for validation.
 
     Returns:
         A ``(virial, pressure, scalar)`` tuple: the ``(3, 3)`` configurational
@@ -949,6 +1161,9 @@ def pressure_tensor(
         cell=cell,
         pairs=pairs,
         virtual_sites=virtual_sites,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        virial_mode=virial_mode,
     )
     if cell is None:
         zeros = mx.zeros((3, 3), dtype=virial.dtype)
@@ -961,6 +1176,7 @@ def pressure_tensor(
         velocities,
         masses,
         kinetic_energy_scale=kinetic_energy_scale,
+        molecule_ids=molecule_ids,
     )
     tensor = (kinetic_tensor + virial) / volume
     scalar = mx.trace(tensor) / 3.0
@@ -979,6 +1195,8 @@ def _pressure_diagnostics(
     kinetic_energy_scale: float,
     enabled: bool,
     virtual_sites: VirtualSiteManager | None = None,
+    virial_mode: str = VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
+    molecule_ids: object | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
     if enabled:
         return pressure_tensor(
@@ -991,6 +1209,8 @@ def _pressure_diagnostics(
             pairs=pairs,
             kinetic_energy_scale=kinetic_energy_scale,
             virtual_sites=virtual_sites,
+            molecule_ids=molecule_ids,
+            virial_mode=virial_mode,
         )
     zeros = mx.zeros((3, 3), dtype=positions.dtype)
     return zeros, zeros, mx.sum(positions[:, 0] * 0.0)
@@ -1029,6 +1249,62 @@ def _named_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTer
     return tuple(named_terms)
 
 
+def virial_support_state(term: ForceTerm) -> str:
+    """Return one force term's truthful virial capability."""
+
+    if bool(getattr(term, "analytic_virial_supported", False)) and callable(
+        getattr(term, "analytic_virial_tensor", None)
+    ):
+        return VIRIAL_SUPPORT_ANALYTIC
+    if _term_supports_virial(term):
+        return VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE
+    return VIRIAL_SUPPORT_UNSUPPORTED
+
+
+def virial_readiness_report(
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
+    *,
+    require_analytic: bool = False,
+) -> ReadinessReport:
+    """Return per-term analytic, oracle-only, or unsupported virial readiness."""
+
+    states = {
+        name: virial_support_state(term)
+        for name, term in _named_force_terms(force_terms)
+    }
+    unsupported = tuple(
+        name for name, state in states.items() if state == VIRIAL_SUPPORT_UNSUPPORTED
+    )
+    oracle_only = tuple(
+        name
+        for name, state in states.items()
+        if state == VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE
+    )
+    blockers = tuple(f"unsupported:{name}" for name in unsupported)
+    if require_analytic:
+        blockers += tuple(f"analytic_required:{name}" for name in oracle_only)
+    if blockers:
+        status = "blocked"
+    elif oracle_only:
+        status = "oracle_only"
+    else:
+        status = "ready"
+    return ReadinessReport(
+        name="virial",
+        status=status,
+        blockers=blockers,
+        warnings=(
+            tuple(f"finite_difference_oracle_only:{name}" for name in oracle_only)
+            if not require_analytic
+            else ()
+        ),
+        metadata={
+            "require_analytic": require_analytic,
+            "term_support": states,
+        },
+    )
+
+
 def missing_virial_support(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
 ) -> tuple[str, ...]:
@@ -1049,6 +1325,18 @@ def missing_virial_support(
     return tuple(missing)
 
 
+def missing_analytic_virial_support(
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
+) -> tuple[str, ...]:
+    """Return exact force-term names lacking production analytic virial support."""
+
+    return tuple(
+        name
+        for name, term in _named_force_terms(force_terms)
+        if virial_support_state(term) != VIRIAL_SUPPORT_ANALYTIC
+    )
+
+
 def validate_virial_support(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
 ) -> None:
@@ -1065,6 +1353,33 @@ def validate_virial_support(
     if missing:
         msg = "missing virial support for force terms: " + ", ".join(missing)
         raise ValueError(msg)
+
+
+def validate_analytic_virial_support(
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
+) -> None:
+    """Fail closed when production pressure sees an oracle-only force term."""
+
+    missing = missing_analytic_virial_support(force_terms)
+    if missing:
+        msg = "missing analytic virial support for force terms: " + ", ".join(missing)
+        raise ValueError(msg)
+
+
+def _validate_pressure_virial_support(
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...],
+    *,
+    virial_mode: str,
+) -> None:
+    mode = normalize_virial_support(virial_mode)
+    if mode == VIRIAL_SUPPORT_ANALYTIC:
+        validate_analytic_virial_support(force_terms)
+        return
+    if mode == VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE:
+        validate_virial_support(force_terms)
+        return
+    msg = "unsupported virial mode cannot produce pressure"
+    raise ValueError(msg)
 
 
 def _term_supports_virial(term: ForceTerm) -> bool:
@@ -1846,7 +2161,11 @@ def simulate_nve(
         force_terms = LennardJonesPotential()
     terms = _named_force_terms(force_terms)
     unnamed_terms = tuple(term for _, term in terms)
-    validate_virial_support(unnamed_terms)
+    if config.pressure_diagnostics:
+        _validate_pressure_virial_support(
+            unnamed_terms,
+            virial_mode=config.pressure_virial_mode,
+        )
     _validate_compact_nonbonded_backend(
         unnamed_terms,
         neighbor_manager=neighbor_manager,
@@ -1937,6 +2256,7 @@ def simulate_nve(
         kinetic_energy_scale=config.kinetic_energy_scale,
         enabled=config.pressure_diagnostics,
         virtual_sites=virtual_sites,
+        virial_mode=config.pressure_virial_mode,
     )
     virials = [virial]
     pressure_tensors = [pressure_tensor_value]
@@ -2108,6 +2428,7 @@ def simulate_nve(
                 kinetic_energy_scale=config.kinetic_energy_scale,
                 enabled=config.pressure_diagnostics,
                 virtual_sites=virtual_sites,
+                virial_mode=config.pressure_virial_mode,
             )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)
@@ -2246,7 +2567,11 @@ def simulate_nvt(
         force_terms = LennardJonesPotential()
     terms = _named_force_terms(force_terms)
     unnamed_terms = tuple(term for _, term in terms)
-    validate_virial_support(unnamed_terms)
+    if config.pressure_diagnostics:
+        _validate_pressure_virial_support(
+            unnamed_terms,
+            virial_mode=config.pressure_virial_mode,
+        )
     _validate_compact_nonbonded_backend(
         unnamed_terms,
         neighbor_manager=neighbor_manager,
@@ -2386,6 +2711,7 @@ def simulate_nvt(
         kinetic_energy_scale=config.kinetic_energy_scale,
         enabled=config.pressure_diagnostics,
         virtual_sites=virtual_sites,
+        virial_mode=config.pressure_virial_mode,
     )
     virials = [virial]
     pressure_tensors = [pressure_tensor_value]
@@ -2597,6 +2923,7 @@ def simulate_nvt(
                         kinetic_energy_scale=config.kinetic_energy_scale,
                         enabled=config.pressure_diagnostics,
                         virtual_sites=virtual_sites,
+                        virial_mode=config.pressure_virial_mode,
                     )
                     virials.append(virial)
                     pressure_tensors.append(pressure_tensor_value)
@@ -2861,6 +3188,7 @@ def simulate_nvt(
                 kinetic_energy_scale=config.kinetic_energy_scale,
                 enabled=config.pressure_diagnostics,
                 virtual_sites=virtual_sites,
+                virial_mode=config.pressure_virial_mode,
             )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)
@@ -3008,7 +3336,11 @@ def simulate_npt(
     if force_terms is None:
         force_terms = LennardJonesPotential()
     terms = tuple(force_terms) if isinstance(force_terms, (list, tuple)) else (force_terms,)
-    validate_virial_support(terms)
+    if config.pressure_diagnostics:
+        _validate_pressure_virial_support(
+            terms,
+            virial_mode=config.pressure_virial_mode,
+        )
     _validate_barostat_cell_support(cell, barostat)
 
     production = simulate_nvt(
@@ -3127,6 +3459,7 @@ def _npt_production_with_final_barostat_state(
         kinetic_energy_scale=config.kinetic_energy_scale,
         enabled=config.pressure_diagnostics,
         virtual_sites=virtual_sites,
+        virial_mode=config.pressure_virial_mode,
     )
     constraint_error = (
         _zero_constraint_error(final_state.positions)

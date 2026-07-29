@@ -62,6 +62,28 @@ def reference_periodic_dihedral_angle(points):
     return angle * sign
 
 
+def test_forcefield_analytic_support_defaults_fail_closed():
+    terms = (
+        LennardJonesPotential(),
+        HarmonicBondPotential([(0, 1)], k=1.0, length=1.0),
+        HarmonicAnglePotential([(0, 1, 2)], k=1.0, angle=1.0),
+        PeriodicDihedralPotential(
+            [(0, 1, 2, 3)],
+            k=1.0,
+            periodicity=1.0,
+        ),
+        CoulombPotential(charges=[1.0, -1.0]),
+        NonbondedPotential(
+            sigma=[1.0, 1.0],
+            epsilon=[0.1, 0.1],
+            charges=[1.0, -1.0],
+        ),
+    )
+
+    assert all(term.supports_virial for term in terms)
+    assert all(term.analytic_virial_supported is False for term in terms)
+
+
 def test_harmonic_bond_force_matches_finite_difference():
     positions = np.array([[0.0, 0.0, 0.0], [1.2, 0.1, 0.0]], dtype=np.float32)
     term = HarmonicBondPotential([(0, 1)], k=5.0, length=1.0)

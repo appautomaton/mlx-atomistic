@@ -4,7 +4,42 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.metadata import version
-from typing import Any
+from typing import Any, Literal, cast
+
+VIRIAL_SUPPORT_ANALYTIC = "analytic"
+VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE = "finite_difference_oracle"
+VIRIAL_SUPPORT_UNSUPPORTED = "unsupported"
+VIRIAL_SUPPORT_LEVELS = (
+    VIRIAL_SUPPORT_ANALYTIC,
+    VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
+    VIRIAL_SUPPORT_UNSUPPORTED,
+)
+VirialSupport = Literal[
+    "analytic",
+    "finite_difference_oracle",
+    "unsupported",
+]
+
+
+def normalize_virial_support(value: object) -> VirialSupport:
+    """Return a supported virial-capability label.
+
+    Args:
+        value: Capability label to normalize.
+
+    Returns:
+        One of ``analytic``, ``finite_difference_oracle``, or ``unsupported``.
+
+    Raises:
+        ValueError: If the label is not part of the virial capability contract.
+    """
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized not in VIRIAL_SUPPORT_LEVELS:
+        choices = ", ".join(VIRIAL_SUPPORT_LEVELS)
+        msg = f"virial support must be one of: {choices}"
+        raise ValueError(msg)
+    return cast(VirialSupport, normalized)
 
 
 @dataclass(frozen=True)
@@ -193,6 +228,12 @@ __all__ = [
     "PlatformBoundarySection",
     "ReadinessReport",
     "RuntimeInfo",
+    "VIRIAL_SUPPORT_ANALYTIC",
+    "VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE",
+    "VIRIAL_SUPPORT_LEVELS",
+    "VIRIAL_SUPPORT_UNSUPPORTED",
+    "VirialSupport",
     "get_platform_boundary_report",
     "get_runtime_info",
+    "normalize_virial_support",
 ]

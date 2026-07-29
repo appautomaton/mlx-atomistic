@@ -19,7 +19,10 @@ from mlx_atomistic.nonbonded import (
     ForceScopeReport,
     normalize_force_scope,
 )
-from mlx_atomistic.runtime import ReadinessReport
+from mlx_atomistic.runtime import (
+    VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
+    ReadinessReport,
+)
 
 PME_EXECUTION_BACKEND = "mlx_fft_cic"
 PME_PRODUCTION_EXECUTABLE = True
@@ -745,7 +748,9 @@ def pme_readiness_report(
         },
         "virial": {
             "status": "finite_difference_cell_strain",
+            "support_level": VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE,
             "analytic_supported": False,
+            "production_pressure_ready": False,
         },
         "force_scopes": {
             scope: pme_force_scope_report(scope) for scope in FORCE_EVALUATION_SCOPES

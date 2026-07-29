@@ -1,3 +1,4 @@
+import mlx.core as mx
 import numpy as np
 import pytest
 
@@ -21,11 +22,17 @@ from mlx_atomistic.io import load_npz_trajectory, save_npz_trajectory
 from mlx_atomistic.md import (
     LennardJonesPotential,
     SimulationConfig,
+    analytic_configurational_virial_tensor,
+    finite_difference_configurational_virial_oracle,
+    kinetic_pressure_tensor,
+    missing_analytic_virial_support,
     missing_virial_support,
     pressure_tensor,
     simulate_nve,
     simulate_nvt,
+    validate_analytic_virial_support,
     validate_virial_support,
+    virial_readiness_report,
 )
 from mlx_atomistic.pme import PMEConfig
 
@@ -196,6 +203,7 @@ def test_triclinic_pressure_uses_matrix_volume():
         (ZeroVirialTerm(),),
         cell=cell,
         pairs=None,
+        virial_mode="finite_difference_oracle",
     )
 
     kinetic = np.asarray([[2.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 0.0]])
@@ -319,3 +327,220 @@ def test_explicitly_supported_built_in_terms_pass_virial_gate():
 
     assert missing_virial_support(terms) == ()
     validate_virial_support(terms)
+
+
+def test_built_in_virial_support_defaults_to_oracle_only():
+    term = HarmonicBondPotential([(0, 1)], k=10.0, length=1.0)
+
+    report = virial_readiness_report([term])
+    production = virial_readiness_report([term], require_analytic=True)
+
+    assert term.analytic_virial_supported is False
+    assert report.status == "oracle_only"
+    assert report.blockers == ()
+    assert report.metadata["term_support"] == {
+        "bond": "finite_difference_oracle"
+    }
+    assert production.status == "blocked"
+    assert production.blockers == ("analytic_required:bond",)
+    assert missing_analytic_virial_support([term]) == ("bond",)
+    with pytest.raises(ValueError, match="missing analytic virial support.*bond"):
+        validate_analytic_virial_support([term])
+
+
+def test_molecular_kinetic_pressure_uses_center_of_mass_motion():
+    velocities = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.0, -2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    masses = np.ones((4,), dtype=np.float32)
+
+    atom_tensor = kinetic_pressure_tensor(velocities, masses)
+    molecular_tensor = kinetic_pressure_tensor(
+        velocities,
+        masses,
+        molecule_ids=np.asarray([0, 0, 1, 1], dtype=np.int32),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(atom_tensor),
+        np.diag([10.0, 8.0, 0.0]),
+    )
+    np.testing.assert_allclose(
+        np.asarray(molecular_tensor),
+        np.diag([8.0, 0.0, 0.0]),
+    )
+
+
+def test_intramolecular_term_reports_explicit_zero_molecular_virial():
+    class IntramolecularBond:
+        name = "intramolecular_bond"
+        supports_virial = True
+        analytic_virial_supported = True
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            del pairs
+            displacement = positions[0] - positions[1]
+            if cell is not None:
+                displacement = cell.minimum_image(displacement)
+            distance = np.sqrt(np.sum(np.asarray(displacement) ** 2))
+            energy = 0.5 * (distance - 1.0) ** 2
+            direction = displacement / distance
+            force = -(distance - 1.0) * direction
+            forces = mx.zeros_like(positions).at[0].add(force).at[1].add(-force)
+            return mx.array(energy, dtype=positions.dtype), forces
+
+        def analytic_virial_tensor(
+            self,
+            positions,
+            *,
+            cell,
+            pairs,
+            masses,
+            molecule_ids,
+        ):
+            del cell, pairs, masses, molecule_ids
+            return mx.zeros((3, 3), dtype=positions.dtype)
+
+    positions = mx.array([[1.0, 1.0, 1.0], [2.2, 1.0, 1.0]])
+    masses = mx.array([1.0, 1.0])
+    molecule_ids = np.asarray([0, 0], dtype=np.int32)
+    cell = Cell.cubic(6.0)
+    term = IntramolecularBond()
+    _, forces = term.energy_forces(positions, cell)
+
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=None,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=None,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+
+    np.testing.assert_array_equal(np.asarray(analytic), np.zeros((3, 3)))
+    np.testing.assert_allclose(np.asarray(oracle), np.zeros((3, 3)), atol=2.0e-5)
+
+
+def test_analytic_pair_virial_matches_molecular_cell_strain_oracle():
+    class IntermolecularHarmonicPair:
+        name = "intermolecular_pair"
+        supports_virial = True
+        analytic_virial_supported = True
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            del pairs
+            displacement = positions[0] - positions[1]
+            if cell is not None:
+                displacement = cell.minimum_image(displacement)
+            distance = mx.sqrt(mx.sum(displacement * displacement))
+            extension = distance - 1.0
+            force = -extension * displacement / distance
+            forces = mx.zeros_like(positions).at[0].add(force).at[1].add(-force)
+            return 0.5 * extension * extension, forces
+
+        def analytic_virial_tensor(
+            self,
+            positions,
+            *,
+            cell,
+            pairs,
+            masses,
+            molecule_ids,
+        ):
+            del pairs, masses, molecule_ids
+            displacement = cell.minimum_image(positions[0] - positions[1])
+            _, forces = self.energy_forces(positions, cell)
+            return mx.outer(displacement, forces[0])
+
+    positions = mx.array([[1.0, 1.0, 1.0], [2.3, 1.4, 1.2]])
+    masses = mx.array([1.0, 2.0])
+    molecule_ids = np.asarray([0, 1], dtype=np.int32)
+    cell = Cell.cubic(6.0)
+    term = IntermolecularHarmonicPair()
+    _, forces = term.energy_forces(positions, cell)
+
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=None,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=None,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        strain_epsilon=2.0e-3,
+    )
+
+    np.testing.assert_allclose(
+        np.diag(np.asarray(analytic)),
+        np.diag(np.asarray(oracle)),
+        rtol=2.0e-3,
+        atol=3.0e-4,
+    )
+    assert virial_readiness_report([term], require_analytic=True).status == "ready"
+
+
+def test_analytic_pressure_never_calls_finite_difference_energy_path():
+    class AnalyticOnlyTerm:
+        name = "analytic_only"
+        supports_virial = False
+        analytic_virial_supported = True
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            raise AssertionError("analytic pressure must not evaluate energy")
+
+        def analytic_virial_tensor(
+            self,
+            positions,
+            *,
+            cell,
+            pairs,
+            masses,
+            molecule_ids,
+        ):
+            del cell, pairs, masses, molecule_ids
+            return mx.diag(mx.array([1.0, 2.0, 3.0], dtype=positions.dtype))
+
+    positions = np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32)
+    velocities = np.zeros_like(positions)
+    masses = np.ones((1,), dtype=np.float32)
+    forces = np.zeros_like(positions)
+
+    virial, tensor, scalar = pressure_tensor(
+        positions,
+        velocities,
+        masses,
+        forces,
+        (AnalyticOnlyTerm(),),
+        cell=Cell.cubic(2.0),
+        pairs=None,
+        molecule_ids=np.asarray([0], dtype=np.int32),
+    )
+
+    np.testing.assert_allclose(np.asarray(virial), np.diag([1.0, 2.0, 3.0]))
+    np.testing.assert_allclose(np.asarray(tensor), np.diag([0.125, 0.25, 0.375]))
+    assert float(np.asarray(scalar)) == pytest.approx(0.25)

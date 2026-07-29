@@ -312,6 +312,34 @@ def test_npt_fails_closed_before_unsupported_virial_pressure_claim():
         )
 
 
+def test_npt_analytic_pressure_fails_before_oracle_only_term_is_evaluated():
+    class OracleOnlyForceTerm:
+        name = "oracle_only_bias"
+        supports_virial = True
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            raise AssertionError("integration must not start")
+
+    positions = np.array([[1.0, 1.5, 2.0], [2.0, 2.5, 3.0]], dtype=np.float32)
+    velocities = np.zeros_like(positions)
+
+    with pytest.raises(ValueError, match="missing analytic virial.*oracle_only_bias"):
+        simulate_npt(
+            positions,
+            velocities,
+            masses=np.asarray([1.0, 1.0], dtype=np.float32),
+            cell=Cell.cubic(8.0),
+            force_terms=OracleOnlyForceTerm(),
+            config=SimulationConfig(
+                dt=0.001,
+                steps=1,
+                pressure_virial_mode="analytic",
+            ),
+            thermostat=LangevinThermostat(temperature=0.0, friction=0.0, seed=11),
+            barostat=MonteCarloBarostat(mode="anisotropic"),
+        )
+
+
 def test_monte_carlo_barostat_validates_interval_state():
     with pytest.raises(ValueError, match="barostat interval must be positive"):
         MonteCarloBarostat(interval=0)
