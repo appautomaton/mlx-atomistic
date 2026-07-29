@@ -1585,8 +1585,8 @@ def test_gpcrmd_source_protocol_benchmark_writes_restart_evidence(tmp_path: Path
         assert row["fixed_cell"] is True
         assert row["hmr_status"] == "represented_by_masses"
         assert row["hmr_preserved"] is True
-        assert row["neighbor_backend"] == "mlx_cell_blocks"
-        assert row["neighbor_representation"] == "NeighborBlocks"
+        assert row["neighbor_backend"] == "mlx_cell_pairs"
+        assert row["neighbor_representation"] == "pairs"
         assert row["topology_pair_policy"] == "lazy"
         assert row["eager_nonbonded_pair_limit"] == 0
         assert row["shared_direct_space_neighbors"] is True

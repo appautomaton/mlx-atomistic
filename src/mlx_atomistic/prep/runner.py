@@ -458,7 +458,7 @@ def _production_neighbor_manager(
         check_interval=neighbor_check_interval,
         sort_pairs=False,
         max_workers=GPCRMD_NEIGHBOR_WORKERS,
-        backend="mlx_cell_blocks" if uses_pme else "auto",
+        backend="mlx_cell_pairs" if uses_pme else "auto",
     )
 
 
@@ -588,7 +588,7 @@ def _runtime_execution_contract(
         "shared_direct_space_neighbors": bool(
             pme_term_count
             and neighbor_manager is not None
-            and representation_kind == "blocks"
+            and representation_kind in {"blocks", "pairs"}
         ),
         "dense_or_tiled_fallback_used": bool(
             backend in {"dense_all_pairs", "tiled_all_pairs"} or fallback_reason

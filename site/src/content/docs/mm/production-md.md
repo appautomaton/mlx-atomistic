@@ -70,6 +70,13 @@ The regenerated blocker matrix marks the bounded fixture passed; the stale
 This remains one bounded four-step fixed-cell result, not broad production MD
 certification.
 
+That validation records the backend used when it was produced. The current
+production runner uses shared compact `mlx_cell_pairs` for the same LJ and
+direct-PME contract. A matched 75-step DHFR NPT prefix passed the same numerical
+gates while reducing complete wall time from 142.87 to 27.30 seconds and peak
+process-tree memory from 27.33 to 6.64 GB. No production-length claim is made
+from that bounded performance prefix.
+
 ## Validated Charged Fixed-Cell PME Envelope
 
 The product runtime now has a measured charged-PME validation workload:

@@ -3,6 +3,7 @@ from math import pi
 import numpy as np
 import pytest
 
+import mlx_atomistic.forcefields as forcefields_module
 from mlx_atomistic import PMEConfig as ExportedPMEConfig
 from mlx_atomistic import PMEExecutionPlan as ExportedPMEExecutionPlan
 from mlx_atomistic import RBDihedralPotential as ExportedRBDihedralPotential
@@ -674,10 +675,6 @@ def test_nonbonded_pme_requires_mesh_config_cell_and_full_system():
     )
     for kwargs, expected in [
         ({}, "periodic cell"),
-        (
-            {"cell": Cell.cubic(12.0), "pairs": np.array([[0, 1]], dtype=np.int32)},
-            "pme_production_direct_space_requires_neighbor_blocks",
-        ),
     ]:
         try:
             term.energy_forces(positions, **kwargs)
@@ -938,6 +935,115 @@ def test_nonbonded_pme_uses_shared_direct_space_blocks_for_production_total():
     assert diagnostics.direct_space_candidate_count == neighbors.candidate_count
     np.testing.assert_allclose(np.asarray(block_energy), np.asarray(dense_energy), atol=1e-6)
     np.testing.assert_allclose(np.asarray(block_forces), np.asarray(dense_forces), atol=1e-6)
+
+
+def test_nonbonded_pme_uses_shared_compact_pairs_for_production_total():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0], [6.0, 7.0, 8.0]],
+        dtype=np.float32,
+    )
+    charges = np.array([0.7, -0.2, -0.3, -0.2], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(24, 24, 24), alpha=0.35, real_cutoff=5.0)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=5.0,
+        skin=0.0,
+        backend="mlx_cell_pairs",
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0, 1.0],
+        epsilon=[0.0, 0.0, 0.0, 0.0],
+        charges=charges,
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=config,
+    )
+
+    dense_energy, dense_forces, _ = term.energy_forces_with_components(
+        positions,
+        cell,
+    )
+    pair_energy, pair_forces, components = term.energy_forces_with_components(
+        positions,
+        cell,
+        pairs=neighbors.interactions,
+    )
+
+    diagnostics = components["pme_diagnostics"]
+    assert diagnostics.direct_space_policy == "compact_pair"
+    assert diagnostics.direct_space_representation == "pairs"
+    assert diagnostics.direct_space_candidate_count == neighbors.pair_count
+    np.testing.assert_allclose(np.asarray(pair_energy), np.asarray(dense_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(pair_forces), np.asarray(dense_forces), atol=1e-6)
+
+
+@pytest.mark.parametrize("backend", ["mlx_cell_pairs", "mlx_cell_blocks"])
+def test_nonbonded_pair_scale_cache_keeps_provider_identity(
+    monkeypatch,
+    backend,
+):
+    positions = np.array(
+        [[0.1, 0.1, 0.1], [1.1, 0.1, 0.1], [0.1, 1.1, 0.1], [2.2, 2.2, 2.2]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(4.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        eager_nonbonded_pair_limit=0,
+    )
+
+    def make_term():
+        return NonbondedPotential(
+            sigma=[1.0, 1.1, 1.2, 1.0],
+            epsilon=[0.2, 0.25, 0.3, 0.2],
+            charges=[0.25, -0.25, 0.1, -0.1],
+            topology=topology,
+            cutoff=2.0,
+        )
+
+    first = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.2,
+        skin=0.0,
+        backend=backend,
+        block_size=2,
+    ).interactions
+    second = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.0,
+        skin=0.0,
+        backend=backend,
+        block_size=3,
+    ).interactions
+    monkeypatch.setattr(forcefields_module, "id", lambda _value: 1, raising=False)
+    cached = make_term()
+    cached.energy_forces(positions, cell, first)
+    cached_energy, cached_forces = cached.energy_forces(
+        positions,
+        cell,
+        second,
+    )
+    expected_energy, expected_forces = make_term().energy_forces(
+        positions,
+        cell,
+        second,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(cached_energy),
+        np.asarray(expected_energy),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(cached_forces),
+        np.asarray(expected_forces),
+        atol=1e-6,
+    )
 
 
 def test_nonbonded_pme_fails_closed_for_unsafe_shared_direct_space_policy():

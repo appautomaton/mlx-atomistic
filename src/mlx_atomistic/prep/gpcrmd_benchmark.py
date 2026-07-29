@@ -541,8 +541,8 @@ def _source_protocol_settings(manifest: Mapping[str, Any]) -> dict[str, Any]:
     expected_runtime = {
         "topology_pair_policy": "lazy",
         "eager_nonbonded_pair_limit": 0,
-        "neighbor_backend": "mlx_cell_blocks",
-        "neighbor_representation": "NeighborBlocks",
+        "neighbor_backend": "mlx_cell_pairs",
+        "neighbor_representation": "pairs",
         "fixed_cell_pme_plan_reuse": True,
         "dense_or_tiled_fallback_allowed": False,
     }
@@ -797,8 +797,8 @@ def _source_protocol_completed_row(
         runtime_contract.get("fixed_cell") is True
         and runtime_contract.get("topology_pair_policy") == "lazy"
         and runtime_contract.get("eager_nonbonded_pair_limit") == 0
-        and runtime_contract.get("neighbor_backend") == "mlx_cell_blocks"
-        and runtime_contract.get("neighbor_representation") == "NeighborBlocks"
+        and runtime_contract.get("neighbor_backend") == "mlx_cell_pairs"
+        and runtime_contract.get("neighbor_representation") == "pairs"
         and runtime_contract.get("shared_direct_space_neighbors") is True
         and runtime_contract.get("dense_or_tiled_fallback_used") is False
     )

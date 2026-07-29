@@ -23,7 +23,7 @@ from mlx_atomistic.benchmarks import (
 from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.benchmarks.pme_validation import manifest_hash
 from mlx_atomistic.forcefields import NonbondedPotential
-from mlx_atomistic.neighbors import NeighborBlocks, build_neighbor_list
+from mlx_atomistic.neighbors import build_neighbor_list
 from mlx_atomistic.pme import (
     _assign_charges_bspline_mx,
     _influence_function_mx,
@@ -376,8 +376,8 @@ def _gpcrmd_manifest_admission(
     expected_runtime_contract = {
         "topology_pair_policy": "lazy",
         "eager_nonbonded_pair_limit": 0,
-        "neighbor_backend": "mlx_cell_blocks",
-        "neighbor_representation": "NeighborBlocks",
+        "neighbor_backend": "mlx_cell_pairs",
+        "neighbor_representation": "pairs",
         "fixed_cell_pme_plan_reuse": True,
         "dense_or_tiled_fallback_allowed": False,
     }
@@ -907,7 +907,7 @@ def build_payload(
             system.cell,
             cutoff=real_cutoff,
             skin=0.0,
-            backend="mlx_cell_blocks",
+            backend="mlx_cell_pairs",
         )
         direct_space_interactions = direct_space_neighbors.interactions
         direct_space_neighbor_report = {
@@ -939,17 +939,14 @@ def build_payload(
             },
         )
     neighbor_blockers = []
-    if direct_space_neighbors.backend != "mlx_cell_blocks":
+    if direct_space_neighbors.backend != "mlx_cell_pairs":
         neighbor_blockers.append(
-            f"backend={direct_space_neighbors.backend}:expected=mlx_cell_blocks"
+            f"backend={direct_space_neighbors.backend}:expected=mlx_cell_pairs"
         )
-    if direct_space_neighbors.representation_kind != "blocks" or not isinstance(
-        direct_space_interactions,
-        NeighborBlocks,
-    ):
+    if direct_space_neighbors.representation_kind != "pairs":
         neighbor_blockers.append(
             "representation="
-            f"{direct_space_neighbors.representation_kind}:expected=NeighborBlocks"
+            f"{direct_space_neighbors.representation_kind}:expected=pairs"
         )
     if direct_space_neighbors.fallback_reason is not None:
         neighbor_blockers.append(
@@ -1348,14 +1345,13 @@ def build_payload(
     stage_timings = _stage_timings(timing_rows)
     checks = {
         "parity_passed": bool(parity["passed"]),
-        "shared_neighbor_blocks": (
-            direct_space_neighbor_report["backend"] == "mlx_cell_blocks"
-            and direct_space_neighbor_report["representation_kind"] == "blocks"
-            and isinstance(direct_space_interactions, NeighborBlocks)
+        "shared_neighbor_pairs": (
+            direct_space_neighbor_report["backend"] == "mlx_cell_pairs"
+            and direct_space_neighbor_report["representation_kind"] == "pairs"
         ),
         "no_direct_space_fallback": (
-            direct_space_policy.get("policy") == "block_candidate"
-            and direct_space_policy.get("representation") == "blocks"
+            direct_space_policy.get("policy") == "compact_pair"
+            and direct_space_policy.get("representation") == "pairs"
             and direct_space_policy.get("fallback_reason") is None
         ),
         "admission_passed": not admission_blockers,

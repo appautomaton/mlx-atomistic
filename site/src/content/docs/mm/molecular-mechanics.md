@@ -75,8 +75,10 @@ process-global PME cache is used.
 Production fixed-cell PME is currently admitted only for supported
 orthorhombic configurations within the measured 100,000-atom and 1,048,576
 mesh-point checks. Large lazy-topology PME uses shared
-`mlx_cell_blocks`/`NeighborBlocks` for LJ and direct-space Coulomb and refuses a
-dense fallback. Two measured workloads now anchor this boundary:
+`mlx_cell_pairs` compact neighbors for LJ and direct-space Coulomb and refuses
+a dense fallback. Historical validation reports may record the earlier
+`mlx_cell_blocks` representation; the physical PME contract is unchanged. Two
+measured workloads now anchor this boundary:
 
 - the 94,232-atom charged AMBER20 JAC envelope with explicit
   `uniform_neutralizing_plasma`, documented in

@@ -805,7 +805,7 @@ def test_gpcrmd_short_range_prototype_report_is_explicitly_non_production(tmp_pa
     assert "not production GPCRmd PME" in report["warnings"][0]
 
 
-def test_gpcrmd_production_neighbor_manager_accepts_scalable_pme_blocks():
+def test_gpcrmd_production_neighbor_manager_uses_compact_pme_pairs():
     from mlx_atomistic.prep.runner import GPCRMD_NEIGHBOR_SKIN, _production_neighbor_manager
 
     system = SimpleNamespace(cell=Cell.cubic(4.0))
@@ -837,9 +837,10 @@ def test_gpcrmd_production_neighbor_manager_accepts_scalable_pme_blocks():
             dtype=np.float32,
         )
     )
-    assert pme_manager.backend == "mlx_cell_blocks"
-    assert pme_neighbors.backend == "mlx_cell_blocks"
-    assert isinstance(pme_neighbors.interactions, NeighborBlocks)
+    assert pme_manager.backend == "mlx_cell_pairs"
+    assert pme_neighbors.backend == "mlx_cell_pairs"
+    assert not isinstance(pme_neighbors.interactions, NeighborBlocks)
+    assert pme_neighbors.compaction_backend == "cpu_argwhere"
     assert topology._nonbonded_pairs is None
 
     no_cell_system = SimpleNamespace(cell=None)

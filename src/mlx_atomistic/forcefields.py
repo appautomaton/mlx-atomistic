@@ -1565,10 +1565,14 @@ class NonbondedPotential:
                 )
                 raise ValueError(msg)
             if pairs is not None:
-                cache_key = (id(pairs), self.lj_one_four_scale, self.coulomb_one_four_scale)
+                cache_key = (self.lj_one_four_scale, self.coulomb_one_four_scale)
                 cache = self._pair_scale_cache
-                if cache is not None and cache[0] == cache_key:
-                    return cache[1]
+                if (
+                    cache is not None
+                    and cache[0] is pairs
+                    and cache[1] == cache_key
+                ):
+                    return cache[2]
             filtered = self.topology.nonbonded_pairs(pairs)
             if not self._exceptions_excluded_by_topology:
                 filtered = self._remove_exception_pairs(filtered)
@@ -1596,7 +1600,11 @@ class NonbondedPotential:
                 object.__setattr__(
                     self,
                     "_pair_scale_cache",
-                    (cache_key, (filtered, lj_scales, coulomb_scales)),
+                    (
+                        pairs,
+                        cache_key,
+                        (filtered, lj_scales, coulomb_scales),
+                    ),
                 )
             return filtered, lj_scales, coulomb_scales
 
@@ -1719,14 +1727,16 @@ class NonbondedPotential:
         blocks: NeighborBlocks,
     ) -> tuple[mx.array, mx.array, mx.array]:
         cache_key = (
-            id(blocks),
             self.lj_one_four_scale,
             self.coulomb_one_four_scale,
-            id(self.topology),
         )
         cache = self._block_scale_cache
-        if cache is not None and cache[0] == cache_key:
-            return cache[1]
+        if (
+            cache is not None
+            and cache[0] is blocks
+            and cache[1] == cache_key
+        ):
+            return cache[2]
 
         left = np.asarray(blocks.left, dtype=np.int32).reshape(-1)
         right = np.asarray(blocks.right, dtype=np.int32).reshape(-1)
@@ -1775,8 +1785,69 @@ class NonbondedPotential:
                 dtype=mx.float32,
             )
         result = (mask, lj_scales, coulomb_scales)
-        object.__setattr__(self, "_block_scale_cache", (cache_key, result))
+        object.__setattr__(
+            self,
+            "_block_scale_cache",
+            (blocks, cache_key, result),
+        )
         return result
+
+    def _compact_pair_masks_and_scales(
+        self,
+        pairs: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        pair_array = np.asarray(pairs, dtype=np.int32)
+        if pair_array.ndim != 2 or pair_array.shape[1] != 2:
+            msg = "pairs must have shape (n, 2)"
+            raise ValueError(msg)
+        n_atoms = int(self.sigma.shape[0])
+        if np.any(pair_array < 0) or np.any(pair_array >= n_atoms):
+            msg = "pairs contain atom indices outside [0, n_atoms)"
+            raise ValueError(msg)
+
+        left = np.minimum(pair_array[:, 0], pair_array[:, 1]).astype(
+            np.int64,
+            copy=False,
+        )
+        right = np.maximum(pair_array[:, 0], pair_array[:, 1]).astype(
+            np.int64,
+            copy=False,
+        )
+        codes = left * np.int64(n_atoms) + right
+        keep = np.ones((pair_array.shape[0],), dtype=bool)
+        one_four_codes = np.empty((0,), dtype=np.int64)
+        if self.topology is not None:
+            keep &= ~_isin_sorted_codes(codes, self.topology._exclusion_codes)
+            one_four_codes = self.topology._one_four_codes
+        if self.has_exceptions and (
+            self.topology is None or not self._exceptions_excluded_by_topology
+        ):
+            keep &= ~_isin_sorted_codes(codes, self._exception_pair_codes)
+
+        mask = mx.array(keep)
+        if float(self.lj_one_four_scale) == 1.0 or one_four_codes.size == 0:
+            lj_scales = _unit_pair_scale()
+        else:
+            one_four = _isin_sorted_codes(codes, one_four_codes)
+            lj_scales = mx.array(
+                np.where(one_four, float(self.lj_one_four_scale), 1.0).astype(
+                    np.float32
+                ),
+                dtype=mx.float32,
+            )
+        if float(self.coulomb_one_four_scale) == 1.0 or one_four_codes.size == 0:
+            coulomb_scales = _unit_pair_scale()
+        else:
+            one_four = _isin_sorted_codes(codes, one_four_codes)
+            coulomb_scales = mx.array(
+                np.where(
+                    one_four,
+                    float(self.coulomb_one_four_scale),
+                    1.0,
+                ).astype(np.float32),
+                dtype=mx.float32,
+            )
+        return mask, lj_scales, coulomb_scales
 
     def _block_components(
         self,
@@ -2700,12 +2771,6 @@ class NonbondedPotential:
         if self.pme_config is None:
             msg = "PME electrostatics requires pme_config"
             raise ValueError(msg)
-        if not isinstance(pairs, NeighborBlocks):
-            msg = (
-                "PME production direct-space shared pair policy unsupported: "
-                "pme_production_direct_space_requires_neighbor_blocks"
-            )
-            raise ValueError(msg)
         report = pme_direct_space_policy_report(
             cell,
             config=self.pme_config,
@@ -2854,28 +2919,27 @@ class NonbondedPotential:
             * strain_epsilon
             * 1.1
         )
-        blocks = build_neighbor_list(
+        pairs = build_neighbor_list(
             positions,
             cell,
             cutoff=float(self.cutoff),
             skin=shell,
-            backend="mlx_cell_blocks",
+            backend="mlx_cell_pairs",
             sort_pairs=False,
         ).interactions
-        if not isinstance(blocks, NeighborBlocks):
-            msg = "LJ cutoff impulse correction requires neighbor blocks"
+        if isinstance(pairs, NeighborBlocks):
+            msg = "cutoff impulse correction requires compact pairs"
             raise ValueError(msg)
 
-        left = blocks.left
-        right = blocks.right
-        topology_mask, lj_scales, _ = self._block_masks_and_scales(blocks)
+        left = pairs[:, 0]
+        right = pairs[:, 1]
+        topology_mask, lj_scales, _ = self._compact_pair_masks_and_scales(pairs)
         base_displacement = cell.minimum_image(
             positions[left] - positions[right]
         )
         base_r2 = mx.sum(base_displacement * base_displacement, axis=-1)
         base_cutoff_mask = (
-            blocks.valid_mask
-            & (base_r2 > 0.0)
+            (base_r2 > 0.0)
             & (base_r2 < self.cutoff * self.cutoff)
         )
         base_lj_mask = topology_mask & base_cutoff_mask
@@ -2918,8 +2982,7 @@ class NonbondedPotential:
                 strained_displacements.append(displacement)
                 r2 = mx.sum(displacement * displacement, axis=-1)
                 strained_cutoff_mask = (
-                    blocks.valid_mask
-                    & (r2 > 0.0)
+                    (r2 > 0.0)
                     & (r2 < self.cutoff * self.cutoff)
                 )
                 strained_lj_mask = topology_mask & strained_cutoff_mask

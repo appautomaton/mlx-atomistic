@@ -26,16 +26,15 @@ custom Metal kernels.
   into MLX distance-filter chunks, and emits compact pairs through CPU
   compaction.
 - `mlx_cell_blocks` keeps the periodic cell/bin candidate search in a
-  fixed-shape block representation. Production PME selects this backend so LJ
-  and direct-space Coulomb share `NeighborBlocks` without materializing a dense
-  topology pair cache.
+  fixed-shape block representation. It remains available for fixed-shape
+  consumers and historical benchmark reproduction.
 - `python_neighbor` means the Python/NumPy cell-list builder is included in the
   benchmark before MLX pair evaluation.
 - `auto` uses dense MLX when no pair list is supplied and the dense memory
   estimate fits the configured budget; otherwise it falls back to tiled MLX.
   For neighbor-list managers, `auto` selects `mlx_dense_pairs` for supported
   small systems and `mlx_cell_pairs` above the small-system limit. The
-  production PME runner explicitly selects `mlx_cell_blocks`.
+  production PME runner explicitly selects `mlx_cell_pairs`.
 
 ## Current Hot-Path Recommendation
 
@@ -91,8 +90,12 @@ delta was `4.56e-7` and maximum absolute force delta was `8.49e-7`. This
 unavailable for that measurement. A later source-backed GPCRmd 729 run now
 passes a separate bounded fixed-cell parity/NVT/restart gate using
 `mlx_cell_blocks`/`NeighborBlocks`; it does not change the classification of the
-synthetic neighbor row. Charged fixed-cell PME also has a separate 94,232-atom
-JAC validation. See
+synthetic neighbor row. The production runner has since moved to compact
+`mlx_cell_pairs` after a matched 75-step DHFR NPT prefix reduced complete wall
+time from 142.87 to 27.30 seconds and process-tree peak memory from 27.33 to
+6.64 GB while passing the same numerical gates. This is bounded optimization
+evidence, not a new production-length validation. Charged fixed-cell PME also
+has a separate 94,232-atom JAC validation. See
 [`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](../benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md)
 and
 [`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](../benchmarks/scalable-charged-pme-runtime-m5max.md),

@@ -235,8 +235,8 @@ def _build_gpcrmd_closure_matrix(
     required_cases = [cases_by_phase.get(name) for name in sorted(required_phase_names)]
     runtime_contract_ok = all(case is not None for case in required_cases) and all(
         case.get("topology_pair_policy") == "lazy"
-        and case.get("neighbor_backend") == "mlx_cell_blocks"
-        and case.get("neighbor_representation") == "NeighborBlocks"
+        and case.get("neighbor_backend") == "mlx_cell_pairs"
+        and case.get("neighbor_representation") == "pairs"
         and case.get("dense_or_tiled_fallback_used") is False
         and case.get("checks", {}).get("runtime_contract_matches") is True
         for case in required_cases
@@ -255,7 +255,7 @@ def _build_gpcrmd_closure_matrix(
         passed=topology_ok,
         command=runtime_command,
         observed=(
-            "lazy topology used shared mlx_cell_blocks/NeighborBlocks in parity, "
+            "lazy topology used shared mlx_cell_pairs/compact pairs in parity, "
             "warmup, measured, and restart phases with no dense/tiled fallback"
         ),
         context="parity/gpcrmd_pme_parity_report.json and runtime/gpcrmd_performance.json",

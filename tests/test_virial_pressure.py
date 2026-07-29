@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.forcefields as forcefields_module
 from mlx_atomistic.charmm_terms import (
     CHARMMCMAPPotential,
     CHARMMForceSwitchNonbondedPotential,
@@ -710,6 +711,49 @@ def test_pme_real_space_analytic_virial_includes_cutoff_impulse():
         rtol=2.0e-3,
         atol=3.0e-3,
     )
+
+
+def test_cutoff_impulse_correction_uses_compact_neighbor_pairs(monkeypatch):
+    positions = mx.array(
+        [[1.0, 1.0, 1.0], [3.999, 1.0, 1.0]],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0],
+        epsilon=[0.2, 0.2],
+        charges=[0.5, -0.5],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.4,
+            real_cutoff=3.0,
+            assignment_order=4,
+        ),
+    )
+    observed_backends = []
+    build_neighbor_list = forcefields_module.build_neighbor_list
+
+    def recording_build_neighbor_list(*args, **kwargs):
+        observed_backends.append(kwargs.get("backend"))
+        return build_neighbor_list(*args, **kwargs)
+
+    monkeypatch.setattr(
+        forcefields_module,
+        "build_neighbor_list",
+        recording_build_neighbor_list,
+    )
+    correction = term._cutoff_finite_strain_correction_virial(
+        positions,
+        cell=cell,
+        masses=mx.ones((2,), dtype=mx.float32),
+        molecule_ids=np.asarray([0, 1], dtype=np.int32),
+    )
+
+    assert observed_backends == ["mlx_cell_pairs"]
+    assert np.all(np.isfinite(np.asarray(correction)))
 
 
 def test_bound_pme_virial_oracle_rebuilds_candidate_plan_and_neighbors():

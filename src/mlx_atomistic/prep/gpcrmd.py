@@ -1085,8 +1085,8 @@ def build_gpcrmd_mlx_workload_manifest(
         "runtime_contract": {
             "topology_pair_policy": "lazy",
             "eager_nonbonded_pair_limit": 0,
-            "neighbor_backend": "mlx_cell_blocks",
-            "neighbor_representation": "NeighborBlocks",
+            "neighbor_backend": "mlx_cell_pairs",
+            "neighbor_representation": "pairs",
             "fixed_cell_pme_plan_reuse": True,
             "dense_or_tiled_fallback_allowed": False,
         },
