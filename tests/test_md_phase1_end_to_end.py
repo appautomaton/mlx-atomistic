@@ -120,6 +120,7 @@ def test_phase1_minimize_nose_hoover_nvt_anisotropic_npt_records_finite_state():
             pressure=0.0,
             temperature=1.0,
             seed=4,
+            interval=4,
             max_log_volume_scale=0.01,
             mode="anisotropic",
             axes=(True, False, True),

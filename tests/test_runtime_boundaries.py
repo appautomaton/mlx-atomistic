@@ -272,6 +272,7 @@ def test_external_engine_imports_stay_in_documented_reference_scripts():
         Path("scripts/benchmark_m5max_reference.py"),
         Path("scripts/benchmark_openmm_dhfr.py"),
         Path("scripts/benchmark_openmm_opencl.py"),
+        Path("scripts/calibrate_openmm_dhfr_npt.py"),
         Path("scripts/openmm_mlx_parity.py"),
         Path("scripts/prepare_openmm_dhfr_implicit.py"),
         Path("scripts/run_charged_pme_parity.py"),
