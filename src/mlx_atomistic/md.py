@@ -421,6 +421,7 @@ class SimulationConfig:
     initial_time: float = 0.0
     virtual_sites: VirtualSiteManager | None = None
     block_size: int = 1
+    center_of_mass_motion_interval: int | None = None
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -460,6 +461,12 @@ class SimulationConfig:
             raise ValueError(msg)
         if self.block_size < 1:
             msg = "block_size must be a positive integer (1 = per-step execution)"
+            raise ValueError(msg)
+        if (
+            self.center_of_mass_motion_interval is not None
+            and self.center_of_mass_motion_interval <= 0
+        ):
+            msg = "center_of_mass_motion_interval must be positive or None"
             raise ValueError(msg)
 
 
@@ -658,6 +665,9 @@ class MonteCarloBarostat:
         if self.max_log_volume_scale <= 0.0:
             msg = "max_log_volume_scale must be positive"
             raise ValueError(msg)
+        if self.max_log_volume_scale >= float(np.log(2.0)):
+            msg = "max_log_volume_scale must be smaller than log(2)"
+            raise ValueError(msg)
         mode = _normalize_barostat_mode(self.mode)
         object.__setattr__(self, "mode", mode)
         axes = tuple(bool(axis) for axis in self.axes)
@@ -675,6 +685,16 @@ class MonteCarloBarostat:
             raise ValueError(msg)
         object.__setattr__(self, "membrane_plane", "".join("xyz"[axis] for axis in plane_axes))
         object.__setattr__(self, "normal_axis", "xyz"[normal_axis])
+
+
+@dataclass(frozen=True)
+class BarostatProposal:
+    """One explicit Monte Carlo cell proposal and its proposal-density ratio."""
+
+    scale_factors: tuple[float, float, float]
+    axis: int | None
+    log_reverse_over_forward: float
+    kernel: str
 
 
 @dataclass(frozen=True)
@@ -723,6 +743,15 @@ def kinetic_energy(
     velocities = as_mx_array(velocities)
     masses = as_mx_array(masses)
     return kinetic_energy_scale * 0.5 * mx.sum(masses[:, None] * velocities * velocities)
+
+
+def _remove_center_of_mass_velocity(
+    velocities: mx.array,
+    masses: mx.array,
+) -> mx.array:
+    total_mass = mx.sum(masses)
+    center_velocity = mx.sum(masses[:, None] * velocities, axis=0) / total_mass
+    return velocities - center_velocity
 
 
 def instantaneous_temperature(
@@ -1818,6 +1847,7 @@ def _langevin_block_execution_enabled(
         and neighbor_manager is not None
         and constraints is None
         and virtual_sites is None
+        and config.center_of_mass_motion_interval is None
     )
 
 
@@ -2490,7 +2520,7 @@ def simulate_nvt(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...] | None = None,
     neighbor_manager: NeighborListManager | None = None,
     config: SimulationConfig | None = None,
-    thermostat: LangevinThermostat | None = None,
+    thermostat: Thermostat | None = None,
     constraints: DistanceConstraints | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> NVTResult:
@@ -3057,6 +3087,14 @@ def simulate_nvt(
                 masses,
                 cell,
             )
+        if (
+            config.center_of_mass_motion_interval is not None
+            and current_step % config.center_of_mass_motion_interval == 0
+        ):
+            next_velocities = _remove_center_of_mass_velocity(
+                next_velocities,
+                masses,
+            )
         if isinstance(thermostat, NoseHooverThermostat):
             next_velocities = next_velocities * mx.exp(-0.5 * config.dt * nh_chain_velocity)
             next_kinetic = kinetic_energy(
@@ -3253,12 +3291,13 @@ def simulate_npt(
     force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...] | None = None,
     neighbor_manager: NeighborListManager | None = None,
     config: SimulationConfig | None = None,
-    thermostat: LangevinThermostat | None = None,
+    thermostat: Thermostat | None = None,
     barostat: MonteCarloBarostat | None = None,
     constraints: DistanceConstraints | None = None,
+    molecule_ids: object | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
 ) -> NPTResult:
-    """Run NVT dynamics followed by a Monte Carlo pressure-coupling attempt.
+    """Run molecular Monte Carlo pressure coupling at exact in-loop intervals.
 
     Args:
         positions: Initial coordinates, shape ``(n_particles, 3)``.
@@ -3276,11 +3315,13 @@ def simulate_npt(
             thermostat temperature. Defaults to ``None``.
         constraints: Optional distance constraints applied each step.
             Defaults to ``None``.
+        molecule_ids: Optional contiguous per-particle molecule identifiers.
+            When omitted, each particle is treated as a separate molecule.
         reporters: Optional runtime reporter(s). Defaults to ``None``.
 
     Returns:
-        An `NPTResult` with the NVT trajectory plus cell-volume history
-            from the pressure-coupling attempts.
+        An `NPTResult` with the integrated trajectory, sampled cell history,
+            and persistent barostat counters.
 
     Raises:
         ValueError: If ``cell`` is ``None`` (NPT requires a periodic cell).
@@ -3304,71 +3345,322 @@ def simulate_npt(
             virial_mode=config.pressure_virial_mode,
         )
     _validate_barostat_cell_support(cell, barostat)
+    initial_positions = as_mx_array(positions)
+    molecule_labels = normalize_molecule_ids(
+        molecule_ids,
+        particle_count=initial_positions.shape[0],
+    )
+    molecule_count = int(np.max(molecule_labels)) + 1
+    reporters_tuple = _normalize_reporters(reporters)
+    barostat_rng = np.random.default_rng(barostat.seed)
+    end_step = config.initial_step + config.steps
+    current_step = config.initial_step
+    current_time = config.initial_time
+    current_positions = initial_positions
+    current_velocities = as_mx_array(velocities)
+    current_masses = masses
+    current_cell = cell
+    base_rng_offset = (
+        config.initial_step
+        if not isinstance(thermostat, LangevinThermostat)
+        or thermostat.rng_step_offset is None
+        else thermostat.rng_step_offset
+    )
+    active_thermostat: Thermostat = thermostat
+    next_barostat_step = (
+        (current_step // barostat.interval) + 1
+    ) * barostat.interval
+    segments: list[NVTResult] = []
+    cell_history_chunks: list[mx.array] = []
+    seen_reporter_events: set[tuple[str, int]] = set()
+    attempts = 0
+    accepted_count = 0
+    proposal_volume_step = float(np.asarray(cell.volume)) * float(
+        np.expm1(barostat.max_log_volume_scale)
+    )
+    axis_attempts = {axis: 0 for axis in "xyz"}
+    axis_accepted = {axis: 0 for axis in "xyz"}
+    proposal_history: list[dict[str, Any]] = []
 
-    production = simulate_nvt(
-        positions,
-        velocities,
-        masses=masses,
-        cell=cell,
-        force_terms=terms,
-        neighbor_manager=neighbor_manager,
-        config=config,
-        thermostat=thermostat,
-        constraints=constraints,
-        reporters=reporters,
+    while not segments or current_step < end_step:
+        segment_end = min(end_step, next_barostat_step)
+        segment_steps = segment_end - current_step
+        segment_config = replace(
+            config,
+            steps=segment_steps,
+            initial_step=current_step,
+            initial_time=current_time,
+        )
+        if isinstance(thermostat, LangevinThermostat):
+            active_thermostat = replace(
+                thermostat,
+                rng_step_offset=base_rng_offset + (current_step - config.initial_step),
+            )
+        buffered_events: list[ReporterEvent] = []
+        segment = simulate_nvt(
+            current_positions,
+            current_velocities,
+            masses=current_masses,
+            cell=current_cell,
+            force_terms=terms,
+            neighbor_manager=neighbor_manager,
+            config=segment_config,
+            thermostat=active_thermostat,
+            constraints=constraints,
+            reporters=buffered_events.append,
+        )
+        segment_source_cell = current_cell
+        should_attempt = (
+            segment_steps > 0
+            and segment_end == next_barostat_step
+            and segment_end <= end_step
+        )
+        proposal: BarostatProposal | None = None
+        accepted = False
+        old_volume = float(np.asarray(current_cell.volume))
+        if should_attempt:
+            attempts += 1
+            final_state, final_cell, accepted, proposal = _attempt_barostat_move(
+                segment.final_state,
+                terms,
+                current_cell,
+                barostat=barostat,
+                rng=barostat_rng,
+                volume_step=proposal_volume_step,
+                constraints=constraints,
+                boltzmann_constant=config.boltzmann_constant,
+                neighbor_manager=neighbor_manager,
+                virtual_sites=config.virtual_sites,
+                molecule_ids=molecule_labels,
+            )
+            segment = _npt_production_with_final_barostat_state(
+                segment,
+                final_state,
+                terms,
+                final_cell,
+                constraints=constraints,
+                config=segment_config,
+                neighbor_manager=neighbor_manager,
+            )
+            current_cell = final_cell
+            accepted_count += int(accepted)
+            axis_name = None if proposal.axis is None else "xyz"[proposal.axis]
+            if axis_name is not None:
+                axis_attempts[axis_name] += 1
+                axis_accepted[axis_name] += int(accepted)
+            proposal_record = {
+                "attempt": attempts,
+                "step": final_state.step,
+                "axis": axis_name,
+                "accepted": int(accepted),
+                "kernel": proposal.kernel,
+                "scale_factors": list(proposal.scale_factors),
+                "log_reverse_over_forward": proposal.log_reverse_over_forward,
+                "old_volume": old_volume,
+                "new_volume": float(np.asarray(final_cell.volume)),
+            }
+            proposal_history.append(proposal_record)
+        else:
+            final_state = segment.final_state
+
+        segment_cells = mx.broadcast_to(
+            segment_source_cell.matrix,
+            (segment.sampled_positions.shape[0], 3, 3),
+        )
+        if should_attempt:
+            segment_cells = _replace_last_frame(
+                segment_cells,
+                current_cell.matrix,
+            )
+        if segments:
+            segment_cells = segment_cells[1:]
+        cell_history_chunks.append(segment_cells)
+        segments.append(segment)
+
+        _forward_npt_segment_events(
+            buffered_events,
+            reporters_tuple,
+            segment=segment,
+            seen=seen_reporter_events,
+        )
+        if should_attempt and proposal is not None:
+            _notify_barostat_reporters(
+                reporters_tuple,
+                final_state=final_state,
+                final_cell=current_cell,
+                metadata={
+                    **_barostat_metadata(barostat),
+                    **proposal_history[-1],
+                },
+            )
+            next_barostat_step += barostat.interval
+
+        current_positions = final_state.positions
+        current_velocities = final_state.velocities
+        current_masses = final_state.masses
+        current_step = final_state.step
+        current_time = final_state.time
+        if isinstance(active_thermostat, NoseHooverThermostat):
+            active_thermostat = replace(
+                active_thermostat,
+                chain_position=float(segment.thermostat_metadata["chain_position"]),
+                chain_velocity=float(segment.thermostat_metadata["chain_velocity"]),
+            )
+        if current_step >= end_step:
+            break
+
+    production = _concatenate_nvt_segments(segments)
+    cell_matrix = mx.concatenate(cell_history_chunks, axis=0)
+    cell_lengths = mx.sqrt(mx.sum(cell_matrix * cell_matrix, axis=2))
+    volumes = (
+        cell_matrix[:, 0, 0]
+        * (
+            cell_matrix[:, 1, 1] * cell_matrix[:, 2, 2]
+            - cell_matrix[:, 1, 2] * cell_matrix[:, 2, 1]
+        )
+        - cell_matrix[:, 0, 1]
+        * (
+            cell_matrix[:, 1, 0] * cell_matrix[:, 2, 2]
+            - cell_matrix[:, 1, 2] * cell_matrix[:, 2, 0]
+        )
+        + cell_matrix[:, 0, 2]
+        * (
+            cell_matrix[:, 1, 0] * cell_matrix[:, 2, 1]
+            - cell_matrix[:, 1, 1] * cell_matrix[:, 2, 0]
+        )
     )
-    final_state, final_cell, accepted = _attempt_barostat_move(
-        production.final_state,
-        terms,
-        cell,
-        barostat=barostat,
-        constraints=constraints,
-        boltzmann_constant=config.boltzmann_constant,
-        neighbor_manager=neighbor_manager,
-        virtual_sites=config.virtual_sites,
-    )
-    production = _npt_production_with_final_barostat_state(
-        production,
-        final_state,
-        terms,
-        final_cell,
-        constraints=constraints,
-        config=config,
-        neighbor_manager=neighbor_manager,
-    )
-    volumes = mx.array(
-        [float(np.asarray(cell.volume)), float(np.asarray(final_cell.volume))],
-        dtype=mx.float32,
-    )
-    cell_matrix = mx.stack([cell.matrix, final_cell.matrix])
     barostat_metadata = _barostat_metadata(barostat)
     barostat_metadata.update(
         {
-            "attempts": 1,
-            "accepted": int(accepted),
+            "attempts": attempts,
+            "accepted": accepted_count,
             "target_pressure": barostat.pressure,
             "initial_volume": float(np.asarray(cell.volume)),
-            "final_volume": float(np.asarray(final_cell.volume)),
+            "final_volume": float(np.asarray(current_cell.volume)),
+            "molecule_count": molecule_count,
+            "proposal_volume_step": proposal_volume_step,
+            "axis_attempts": axis_attempts,
+            "axis_accepted": axis_accepted,
+            "proposal_history": proposal_history,
+            "rng_state": dict(barostat_rng.bit_generator.state),
+            "center_of_mass_motion_interval": config.center_of_mass_motion_interval,
         }
-    )
-    _notify_barostat_reporters(
-        reporters,
-        final_state=final_state,
-        final_cell=final_cell,
-        metadata=barostat_metadata,
     )
     return NPTResult(
         production=production,
-        final_state=final_state,
-        final_cell=final_cell,
-        cell_lengths=mx.stack([cell.lengths, final_cell.lengths]),
+        final_state=production.final_state,
+        final_cell=current_cell,
+        cell_lengths=cell_lengths,
         cell_matrix=cell_matrix,
         volume=volumes,
         target_pressure=barostat.pressure,
-        barostat_attempts=1,
-        barostat_accepted=int(accepted),
+        barostat_attempts=attempts,
+        barostat_accepted=accepted_count,
         barostat_metadata=barostat_metadata,
     )
+
+
+def _concatenate_nvt_segments(segments: list[NVTResult]) -> NVTResult:
+    if not segments:
+        msg = "NPT integration requires at least one NVT segment"
+        raise ValueError(msg)
+
+    def concatenate(field_name: str) -> mx.array:
+        chunks = []
+        for index, segment in enumerate(segments):
+            values = getattr(segment, field_name)
+            chunks.append(values if index == 0 else values[1:])
+        return mx.concatenate(chunks, axis=0)
+
+    final = segments[-1]
+    runtime_sync_report: dict[str, int | float] = {}
+    for key in final.runtime_sync_report:
+        runtime_sync_report[key] = sum(
+            float(segment.runtime_sync_report.get(key, 0.0))
+            if "seconds" in key
+            else int(segment.runtime_sync_report.get(key, 0))
+            for segment in segments
+        )
+    nonbonded_report = dict(final.nonbonded_report)
+    nonbonded_report["force_evaluation_wall_seconds"] = sum(
+        float(segment.nonbonded_report.get("force_evaluation_wall_seconds", 0.0))
+        for segment in segments
+    )
+    potential_energy = concatenate("potential_energy")
+    kinetic_energy_values = concatenate("kinetic_energy")
+    return replace(
+        final,
+        sampled_positions=concatenate("sampled_positions"),
+        sampled_velocities=concatenate("sampled_velocities"),
+        sampled_steps=concatenate("sampled_steps"),
+        sampled_time=concatenate("sampled_time"),
+        diagnostic_steps=concatenate("diagnostic_steps"),
+        diagnostic_time=concatenate("diagnostic_time"),
+        potential_energy=potential_energy,
+        kinetic_energy=kinetic_energy_values,
+        total_energy=potential_energy + kinetic_energy_values,
+        potential_energy_by_term={
+            name: mx.concatenate(
+                [
+                    segment.potential_energy_by_term[name]
+                    if index == 0
+                    else segment.potential_energy_by_term[name][1:]
+                    for index, segment in enumerate(segments)
+                ],
+                axis=0,
+            )
+            for name in final.potential_energy_by_term
+        },
+        temperature=concatenate("temperature"),
+        virial_tensor=concatenate("virial_tensor"),
+        pressure_tensor=concatenate("pressure_tensor"),
+        pressure=concatenate("pressure"),
+        pair_count=concatenate("pair_count"),
+        rebuild_count=concatenate("rebuild_count"),
+        constraint_max_error=concatenate("constraint_max_error"),
+        nonbonded_report=nonbonded_report,
+        runtime_sync_report=runtime_sync_report,
+    )
+
+
+def _forward_npt_segment_events(
+    events: list[ReporterEvent],
+    reporters: tuple[RuntimeReporter, ...],
+    *,
+    segment: NVTResult,
+    seen: set[tuple[str, int]],
+) -> None:
+    for event in events:
+        key = (event.event_type, event.step)
+        if key in seen:
+            continue
+        seen.add(key)
+        forwarded = replace(event, ensemble="npt")
+        if event.step == segment.final_state.step:
+            if event.event_type == "sample":
+                forwarded = replace(forwarded, state=segment.final_state)
+            elif event.event_type == "diagnostic":
+                forwarded = replace(
+                    forwarded,
+                    state=segment.final_state,
+                    potential_energy=segment.potential_energy[-1],
+                    kinetic_energy=segment.kinetic_energy[-1],
+                    total_energy=segment.total_energy[-1],
+                    temperature=segment.temperature[-1],
+                    energy_by_term={
+                        name: values[-1]
+                        for name, values in segment.potential_energy_by_term.items()
+                    },
+                    virial_tensor=segment.virial_tensor[-1],
+                    pressure_tensor=segment.pressure_tensor[-1],
+                    pressure=segment.pressure[-1],
+                    pair_count=segment.pair_count[-1],
+                    rebuild_count=segment.rebuild_count[-1],
+                    constraint_max_error=segment.constraint_max_error[-1],
+                    thermostat=segment.thermostat_metadata,
+                )
+        for reporter in reporters:
+            reporter(forwarded)
 
 
 def _npt_production_with_final_barostat_state(
@@ -3497,27 +3789,33 @@ def _attempt_barostat_move(
     cell: Cell,
     *,
     barostat: MonteCarloBarostat,
+    rng: np.random.Generator,
+    volume_step: float,
     constraints: DistanceConstraints | None,
     boltzmann_constant: float,
     neighbor_manager: NeighborListManager | None = None,
     virtual_sites: VirtualSiteManager | None = None,
-) -> tuple[SimulationState, Cell, bool]:
-    rng = np.random.default_rng(barostat.seed)
-    scale_factors = _barostat_scale_factors(barostat, rng)
-    proposed_cell = _scaled_cell(cell, scale_factors)
-    fractional = cell.fractional_coordinates(state.positions)
-    proposed_positions = proposed_cell.cartesian_coordinates(fractional)
+    molecule_ids: object | None = None,
+) -> tuple[SimulationState, Cell, bool, BarostatProposal]:
+    proposal = _barostat_proposal(
+        barostat,
+        rng,
+        volume=float(np.asarray(cell.volume)),
+        volume_step=volume_step,
+    )
+    proposed_cell = _scaled_cell(cell, np.asarray(proposal.scale_factors))
+    proposed_positions = molecularly_strained_positions(
+        state.positions,
+        source_cell=cell,
+        target_cell=proposed_cell,
+        masses=state.masses,
+        molecule_ids=molecule_ids,
+    )
     proposed_velocities = state.velocities
     constraint_error = _zero_constraint_error(proposed_positions)
     if constraints is not None:
         proposed_positions, constraint_error = constraints.apply_positions(
             proposed_positions,
-            state.masses,
-            proposed_cell,
-        )
-        proposed_velocities = constraints.apply_velocities(
-            proposed_positions,
-            proposed_velocities,
             state.masses,
             proposed_cell,
         )
@@ -3551,15 +3849,26 @@ def _attempt_barostat_move(
     old_volume = float(np.asarray(cell.volume))
     new_volume = float(np.asarray(proposed_cell.volume))
     beta = 1.0 / (boltzmann_constant * barostat.temperature)
-    atom_count = int(state.positions.shape[0])
-    delta = (
-        float(np.asarray(new_energy - old_energy))
-        + barostat.pressure * (new_volume - old_volume)
-        - atom_count / beta * float(np.log(new_volume / old_volume))
+    molecule_count = int(
+        np.unique(
+            normalize_molecule_ids(
+                molecule_ids,
+                particle_count=state.positions.shape[0],
+            )
+        ).size
     )
-    accepted = delta <= 0.0 or rng.random() < float(np.exp(-beta * delta))
+    log_acceptance = _barostat_log_acceptance_probability(
+        delta_energy=float(np.asarray(new_energy - old_energy)),
+        pressure=barostat.pressure,
+        old_volume=old_volume,
+        new_volume=new_volume,
+        molecule_count=molecule_count,
+        beta=beta,
+        log_reverse_over_forward=proposal.log_reverse_over_forward,
+    )
+    accepted = log_acceptance >= 0.0 or float(np.log(rng.random())) < log_acceptance
     if not accepted:
-        return state, cell, False
+        return state, cell, False, proposal
     if neighbor_manager is not None:
         neighbor_manager.cell = proposed_cell
         neighbor_manager.rebuild(proposed_eval_positions)
@@ -3575,7 +3884,26 @@ def _attempt_barostat_move(
         ),
         proposed_cell,
         True,
+        proposal,
     )
+
+
+def _barostat_log_acceptance_probability(
+    *,
+    delta_energy: float,
+    pressure: float,
+    old_volume: float,
+    new_volume: float,
+    molecule_count: int,
+    beta: float,
+    log_reverse_over_forward: float,
+) -> float:
+    acceptance_work = (
+        delta_energy
+        + pressure * (new_volume - old_volume)
+        - molecule_count / beta * float(np.log(new_volume / old_volume))
+    )
+    return -beta * acceptance_work + log_reverse_over_forward
 
 
 def _barostat_neighbor_list(
@@ -3654,19 +3982,38 @@ def _validate_barostat_cell_support(cell: Cell, barostat: MonteCarloBarostat) ->
         raise ValueError(msg)
 
 
-def _barostat_scale_factors(
+def _barostat_proposal(
     barostat: MonteCarloBarostat,
     rng: np.random.Generator,
-) -> np.ndarray:
+    *,
+    volume: float,
+    volume_step: float,
+) -> BarostatProposal:
     max_scale = barostat.max_log_volume_scale
+    if volume_step <= 0.0 or volume <= volume_step:
+        msg = "barostat volume proposal step must be positive and smaller than volume"
+        raise ValueError(msg)
     if barostat.mode == "isotropic":
-        log_volume_scale = rng.uniform(-max_scale, max_scale)
-        return np.full(3, np.exp(log_volume_scale / 3.0), dtype=np.float64)
+        relative_volume_change = rng.uniform(-volume_step, volume_step) / volume
+        length_scale = (1.0 + relative_volume_change) ** (1.0 / 3.0)
+        return BarostatProposal(
+            scale_factors=(length_scale, length_scale, length_scale),
+            axis=None,
+            log_reverse_over_forward=0.0,
+            kernel="symmetric_volume_delta",
+        )
     if barostat.mode == "anisotropic":
-        log_axis_scale = np.zeros(3, dtype=np.float64)
-        enabled = np.asarray(barostat.axes, dtype=bool)
-        log_axis_scale[enabled] = rng.uniform(-max_scale, max_scale, size=int(enabled.sum()))
-        return np.exp(log_axis_scale)
+        enabled_axes = np.flatnonzero(np.asarray(barostat.axes, dtype=bool))
+        axis = int(rng.choice(enabled_axes))
+        relative_volume_change = rng.uniform(-volume_step, volume_step) / volume
+        scale_factors = np.ones((3,), dtype=np.float64)
+        scale_factors[axis] = 1.0 + relative_volume_change
+        return BarostatProposal(
+            scale_factors=tuple(float(value) for value in scale_factors),
+            axis=axis,
+            log_reverse_over_forward=0.0,
+            kernel="symmetric_axis_volume_delta",
+        )
 
     plane_axes = _barostat_plane_axes(barostat.membrane_plane)
     normal_axis = _barostat_axis_index(barostat.normal_axis)
@@ -3676,7 +4023,13 @@ def _barostat_scale_factors(
     for axis in plane_axes:
         log_axis_scale[axis] = log_area_scale / 2.0
     log_axis_scale[normal_axis] = log_normal_scale
-    return np.exp(log_axis_scale)
+    scale_factors = np.exp(log_axis_scale)
+    return BarostatProposal(
+        scale_factors=tuple(float(value) for value in scale_factors),
+        axis=None,
+        log_reverse_over_forward=float(np.sum(log_axis_scale)),
+        kernel="symmetric_log_area_and_length",
+    )
 
 
 def _scaled_cell(cell: Cell, scale_factors: np.ndarray) -> Cell:
@@ -3718,7 +4071,7 @@ def _notify_barostat_reporters(
     event_metadata = dict(metadata)
     event_metadata["final_cell"] = np.asarray(final_cell.matrix, dtype=np.float32).tolist()
     event = ReporterEvent(
-        ensemble="NPT",
+        ensemble="npt",
         event_type="barostat",
         step=final_state.step,
         time=final_state.time,

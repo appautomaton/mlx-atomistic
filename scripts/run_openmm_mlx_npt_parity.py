@@ -31,6 +31,7 @@ from mlx_atomistic.prep.topology_import import import_amber_prmtop
 from mlx_atomistic.units import ATM_TO_KJ_PER_MOL_ANGSTROM3
 
 REPORT_NAME = "openmm_mlx_npt_parity_report.json"
+CENTER_OF_MASS_MOTION_INTERVAL = 1
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class NPTParityReport:
     dt_ps: float
     temperature_K: float
     pressure_atm: float
+    center_of_mass_motion_interval: int
     openmm_platform: str | None
     pme_config: dict[str, Any]
     pme_readiness: dict[str, Any] | None
@@ -206,6 +208,7 @@ def run_npt_parity(
             boltzmann_constant=boltzmann_constant,
             pressure_diagnostics=False,
             compile_force_evaluator=False,
+            center_of_mass_motion_interval=CENTER_OF_MASS_MOTION_INTERVAL,
         ),
         thermostat=LangevinThermostat(
             temperature=temperature_K,
@@ -253,6 +256,7 @@ def run_npt_parity(
         dt_ps=float(dt_ps),
         temperature_K=float(temperature_K),
         pressure_atm=float(pressure_atm),
+        center_of_mass_motion_interval=CENTER_OF_MASS_MOTION_INTERVAL,
         openmm_platform=str(openmm_result["platform"]),
         pme_config=_pme_config_payload(pme_config),
         pme_readiness=readiness,
@@ -301,9 +305,13 @@ def _run_openmm_npt(
         nonbondedMethod=app.PME,
         nonbondedCutoff=pme_config.real_cutoff_angstrom * 0.1 * unit.nanometer,
         constraints=None,
-        removeCMMotion=False,
+        removeCMMotion=True,
     )
     system.setDefaultPeriodicBoxVectors(*box_vectors)
+    for force_index in range(system.getNumForces()):
+        force = system.getForce(force_index)
+        if isinstance(force, mm.CMMotionRemover):
+            force.setFrequency(CENTER_OF_MASS_MOTION_INTERVAL)
     for force_index in range(system.getNumForces()):
         force = system.getForce(force_index)
         if isinstance(force, mm.NonbondedForce):
@@ -375,6 +383,7 @@ def _blocked_report(
         dt_ps=float(dt_ps),
         temperature_K=float(temperature_K),
         pressure_atm=float(pressure_atm),
+        center_of_mass_motion_interval=CENTER_OF_MASS_MOTION_INTERVAL,
         openmm_platform=None,
         pme_config=_pme_config_payload(pme_config),
         pme_readiness=pme_readiness,

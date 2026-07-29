@@ -715,6 +715,7 @@ def test_openmm_anisotropic_barostat_cell_trend_is_bounded_like_mlx():
         barostat=MonteCarloBarostat(
             pressure=0.0,
             temperature=1.0,
+            interval=1,
             seed=4,
             max_log_volume_scale=0.02,
             mode="anisotropic",

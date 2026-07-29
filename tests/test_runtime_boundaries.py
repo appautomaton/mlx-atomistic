@@ -35,6 +35,7 @@ FORBIDDEN_UNIGNORED_OUTPUT_ROOTS = (
 )
 IGNORED_GENERATED_OUTPUT_PREFIX = "outputs/benchmarks/"
 REFERENCE_POLICY_TEXT_FILES = {
+    Path("src/mlx_atomistic/benchmarks/dhfr.py"),
     Path("src/mlx_atomistic/runtime.py"),
     Path("src/mlx_atomistic/dft/references.py"),
 }

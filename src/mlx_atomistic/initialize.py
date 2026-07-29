@@ -8,7 +8,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.md import instantaneous_temperature
+from mlx_atomistic.md import _remove_center_of_mass_velocity, instantaneous_temperature
 
 
 def simple_cubic_lattice(n_particles: int, *, density: float = 0.8) -> tuple[mx.array, Cell]:
@@ -107,10 +107,7 @@ def remove_center_of_mass_velocity(velocities, masses=None) -> mx.array:
 
     velocities = as_mx_array(velocities)
     masses = as_mx_array([1.0] * velocities.shape[0]) if masses is None else as_mx_array(masses)
-
-    total_mass = mx.sum(masses)
-    center_velocity = mx.sum(masses[:, None] * velocities, axis=0) / total_mass
-    return velocities - center_velocity
+    return _remove_center_of_mass_velocity(velocities, masses)
 
 
 def rescale_temperature(velocities, masses=None, *, temperature: float = 1.0) -> mx.array:

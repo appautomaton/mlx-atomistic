@@ -78,6 +78,52 @@ def test_block_execution_gate_requires_supported_langevin_config():
         config, thermostat=NoseHooverThermostat(temperature=1.0),
         neighbor_manager=manager, constraints=None, virtual_sites=None,
     )
+    # A scheduled center-of-mass operation requires the per-step path.
+    assert not _langevin_block_execution_enabled(
+        SimulationConfig(
+            steps=10,
+            block_size=8,
+            center_of_mass_motion_interval=1,
+        ),
+        thermostat=langevin,
+        neighbor_manager=manager,
+        constraints=None,
+        virtual_sites=None,
+    )
+
+
+def test_nvt_center_of_mass_motion_uses_global_step_schedule():
+    positions = np.asarray([[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]], dtype=np.float32)
+    velocities = np.asarray([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+    masses = np.asarray([1.0, 2.0], dtype=np.float32)
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        force_terms=LennardJonesPotential(epsilon=0.0, cutoff=None),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            initial_step=1,
+            initial_time=0.001,
+            sample_interval=1,
+            diagnostic_interval=1,
+            center_of_mass_motion_interval=3,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+    )
+
+    sampled = np.asarray(result.sampled_velocities)
+    np.testing.assert_allclose(sampled[1], velocities, atol=1.0e-7)
+    momentum_at_step_3 = np.sum(sampled[2] * masses[:, None], axis=0)
+    momentum_at_step_4 = np.sum(sampled[3] * masses[:, None], axis=0)
+    np.testing.assert_allclose(momentum_at_step_3, np.zeros(3), atol=1.0e-7)
+    np.testing.assert_allclose(momentum_at_step_4, np.zeros(3), atol=1.0e-7)
 
 
 @pytest.mark.parametrize("block_size", [4, 16])

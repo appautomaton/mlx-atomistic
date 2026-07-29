@@ -11,7 +11,9 @@ from mlx_atomistic.md import (
     LennardJonesPotential,
     MonteCarloBarostat,
     SimulationConfig,
+    _barostat_log_acceptance_probability,
     simulate_npt,
+    simulate_nvt,
 )
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.protocols import validate_gpcrmd_protocol_request
@@ -24,6 +26,16 @@ class _ZeroForceTerm:
 
     def energy_forces(self, positions, cell=None, pairs=None):
         return mx.array(0.0, dtype=positions.dtype), mx.zeros_like(positions)
+
+
+class _CellScaledHarmonicTerm:
+    name = "cell_scaled_harmonic"
+    supports_virial = True
+
+    def energy_forces(self, positions, cell=None, pairs=None):
+        scale = cell.lengths[0]
+        energy = 0.5 * mx.sum(positions * positions) / scale
+        return energy, -positions / scale
 
 
 def test_monte_carlo_npt_path_scales_orthorhombic_volume_with_constraints():
@@ -55,11 +67,11 @@ def test_monte_carlo_npt_path_scales_orthorhombic_volume_with_constraints():
     )
 
     assert result.final_state.step == 4
-    assert result.barostat_attempts == 1
-    assert result.barostat_accepted in {0, 1}
+    assert result.barostat_attempts == 2
+    assert result.barostat_accepted in {0, 1, 2}
     assert result.target_pressure == 0.0
-    assert result.cell_lengths.shape == (2, 3)
-    assert result.volume.shape == (2,)
+    assert result.cell_lengths.shape == (3, 3)
+    assert result.volume.shape == (3,)
     np.testing.assert_allclose(np.asarray(result.cell_lengths)[0], np.asarray(cell.lengths))
     assert np.isfinite(np.asarray(result.volume)).all()
     assert np.isfinite(np.asarray(result.cell_lengths)).all()
@@ -93,7 +105,7 @@ def test_monte_carlo_npt_accepts_isotropic_orthorhombic_box_update(tmp_path):
         barostat=MonteCarloBarostat(
             pressure=0.0,
             temperature=1.0,
-            interval=5,
+            interval=1,
             seed=4,
             max_log_volume_scale=0.02,
         ),
@@ -173,6 +185,7 @@ def test_npt_barostat_rebuilds_neighbor_pairs_for_lazy_topology():
         barostat=MonteCarloBarostat(
             pressure=0.0,
             temperature=1.0,
+            interval=1,
             seed=4,
             max_log_volume_scale=0.02,
         ),
@@ -218,6 +231,7 @@ def test_anisotropic_barostat_scales_enabled_matrix_axes_independently():
         barostat=MonteCarloBarostat(
             pressure=0.0,
             temperature=1.0,
+            interval=1,
             seed=4,
             max_log_volume_scale=0.02,
             mode="anisotropic",
@@ -264,6 +278,7 @@ def test_membrane_barostat_reports_explicit_plane_and_normal_policy():
         barostat=MonteCarloBarostat(
             pressure=0.0,
             temperature=1.0,
+            interval=1,
             seed=4,
             max_log_volume_scale=0.02,
             mode="semi_isotropic",
@@ -343,6 +358,307 @@ def test_npt_analytic_pressure_fails_before_oracle_only_term_is_evaluated():
 def test_monte_carlo_barostat_validates_interval_state():
     with pytest.raises(ValueError, match="barostat interval must be positive"):
         MonteCarloBarostat(interval=0)
+
+
+def test_center_of_mass_motion_interval_must_be_positive():
+    with pytest.raises(ValueError, match="center_of_mass_motion_interval"):
+        SimulationConfig(center_of_mass_motion_interval=0)
+
+
+def test_npt_shorter_than_interval_matches_nvt_without_attempt():
+    positions = np.asarray(
+        [[1.0, 1.5, 2.0], [2.0, 2.5, 3.0]],
+        dtype=np.float32,
+    )
+    velocities = np.zeros_like(positions)
+    masses = np.asarray([1.0, 2.0], dtype=np.float32)
+    cell = Cell.cubic(8.0)
+    config = SimulationConfig(
+        dt=0.001,
+        steps=4,
+        sample_interval=2,
+        diagnostic_interval=2,
+    )
+    thermostat = LangevinThermostat(
+        temperature=1.0,
+        friction=1.0,
+        seed=17,
+    )
+
+    nvt = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=_ZeroForceTerm(),
+        config=config,
+        thermostat=thermostat,
+    )
+    npt = simulate_npt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=_ZeroForceTerm(),
+        config=config,
+        thermostat=thermostat,
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=5,
+            seed=3,
+        ),
+    )
+
+    assert npt.barostat_attempts == 0
+    assert npt.barostat_accepted == 0
+    np.testing.assert_array_equal(
+        np.asarray(npt.sampled_positions),
+        np.asarray(nvt.sampled_positions),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(npt.sampled_velocities),
+        np.asarray(nvt.sampled_velocities),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(npt.final_state.forces),
+        np.asarray(nvt.final_state.forces),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(npt.cell_matrix),
+        np.broadcast_to(
+            np.asarray(cell.matrix),
+            npt.cell_matrix.shape,
+        ),
+    )
+
+
+def test_npt_schedules_global_steps_and_advances_one_rng_stream():
+    positions = np.asarray(
+        [[1.0, 1.5, 2.0], [2.0, 2.5, 3.0]],
+        dtype=np.float32,
+    )
+    reporter = RuntimeTraceReporter()
+    result = simulate_npt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones((2,), dtype=np.float32),
+        cell=Cell.cubic(8.0),
+        force_terms=_ZeroForceTerm(),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=8,
+            initial_step=7,
+            initial_time=0.007,
+            sample_interval=5,
+            diagnostic_interval=5,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=5,
+            seed=9,
+            mode="anisotropic",
+        ),
+        reporters=reporter,
+    )
+
+    events = [
+        event
+        for event in reporter.events
+        if event["event_type"] == "barostat"
+    ]
+    history = result.barostat_metadata["proposal_history"]
+    assert result.final_state.step == 15
+    assert result.barostat_attempts == 2
+    assert [event["step"] for event in events] == [10, 15]
+    assert len(history) == 2
+    assert history[0]["scale_factors"] != history[1]["scale_factors"]
+    assert all(item["log_reverse_over_forward"] == 0.0 for item in history)
+    assert sum(result.barostat_metadata["axis_attempts"].values()) == 2
+
+
+def test_npt_records_selected_center_of_mass_motion_schedule():
+    result = simulate_npt(
+        np.asarray([[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        masses=np.asarray([1.0, 2.0], dtype=np.float32),
+        molecule_ids=np.asarray([0, 1], dtype=np.int32),
+        cell=Cell.cubic(8.0),
+        force_terms=_ZeroForceTerm(),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=2,
+            sample_interval=1,
+            diagnostic_interval=1,
+            center_of_mass_motion_interval=1,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=5,
+            seed=9,
+        ),
+    )
+
+    final_momentum = np.sum(
+        np.asarray(result.final_state.velocities)
+        * np.asarray(result.final_state.masses)[:, None],
+        axis=0,
+    )
+    np.testing.assert_allclose(final_momentum, np.zeros(3), atol=1.0e-7)
+    assert result.barostat_metadata["center_of_mass_motion_interval"] == 1
+
+
+def test_anisotropic_proposal_translates_molecule_centers_without_stretching():
+    positions = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [2.0, 1.2, 1.1],
+            [4.0, 4.0, 4.0],
+            [4.8, 4.1, 4.3],
+        ],
+        dtype=np.float32,
+    )
+    velocities = np.zeros_like(positions)
+    result = simulate_npt(
+        positions,
+        velocities,
+        masses=np.asarray([12.0, 1.0, 16.0, 1.0], dtype=np.float32),
+        molecule_ids=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        cell=Cell.cubic(8.0),
+        force_terms=_ZeroForceTerm(),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=1,
+            seed=4,
+            mode="anisotropic",
+        ),
+    )
+
+    final = np.asarray(result.final_state.positions)
+    assert result.barostat_accepted == 1
+    assert result.barostat_metadata["molecule_count"] == 2
+    np.testing.assert_allclose(
+        final[1] - final[0],
+        positions[1] - positions[0],
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        final[3] - final[2],
+        positions[3] - positions[2],
+        atol=1.0e-6,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(result.final_state.velocities),
+        velocities,
+    )
+
+
+def test_accepted_move_rebuilds_constraint_free_block_path_for_new_cell():
+    positions = np.asarray(
+        [[1.0, 1.0, 1.0], [2.0, 1.5, 1.25], [3.0, 2.0, 1.5]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(8.0)
+    term = _CellScaledHarmonicTerm()
+    result = simulate_npt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones((3,), dtype=np.float32),
+        cell=cell,
+        force_terms=term,
+        neighbor_manager=NeighborListManager(
+            cell,
+            cutoff=2.0,
+            skin=0.5,
+        ),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=5,
+            sample_interval=5,
+            diagnostic_interval=5,
+            pressure_diagnostics=False,
+            block_size=3,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0e9,
+            interval=3,
+            seed=4,
+            mode="anisotropic",
+        ),
+    )
+
+    fresh_energy, fresh_forces = term.energy_forces(
+        result.final_state.positions,
+        cell=result.final_cell,
+    )
+    assert result.barostat_attempts == 1
+    assert result.barostat_accepted == 1
+    np.testing.assert_allclose(
+        np.asarray(result.potential_energy)[-1],
+        np.asarray(fresh_energy),
+        rtol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.forces),
+        np.asarray(fresh_forces),
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+
+
+def test_barostat_acceptance_uses_molecule_count_and_proposal_ratio():
+    two_molecules = _barostat_log_acceptance_probability(
+        delta_energy=0.5,
+        pressure=0.2,
+        old_volume=10.0,
+        new_volume=11.0,
+        molecule_count=2,
+        beta=3.0,
+        log_reverse_over_forward=0.25,
+    )
+    four_molecules = _barostat_log_acceptance_probability(
+        delta_energy=0.5,
+        pressure=0.2,
+        old_volume=10.0,
+        new_volume=11.0,
+        molecule_count=4,
+        beta=3.0,
+        log_reverse_over_forward=0.25,
+    )
+
+    assert four_molecules - two_molecules == pytest.approx(
+        2.0 * np.log(1.1)
+    )
 
 
 def test_protocol_gate_accepts_first_monte_carlo_npt_path():
