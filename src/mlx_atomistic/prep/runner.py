@@ -21,6 +21,7 @@ from mlx_atomistic.artifacts import (
     load_prepared_mlx_artifact,
     validate_mlx_compatibility,
 )
+from mlx_atomistic.core import Cell
 from mlx_atomistic.io import (
     TrajectoryRecord,
     load_npz_trajectory,
@@ -514,6 +515,33 @@ def _pme_execution_plan_diagnostics(force_terms) -> list[dict[str, object]]:
     return diagnostics
 
 
+def _rebind_pme_plans_for_cell(force_terms, cell):
+    rebound = []
+    for term in force_terms:
+        if getattr(term, "electrostatics", None) != "pme":
+            rebound.append(term)
+            continue
+        binder = getattr(term, "bind_pme_plan", None)
+        if not callable(binder):
+            msg = "production PME force term does not expose bind_pme_plan"
+            raise TypeError(msg)
+        rebound.append(binder(cell))
+    return tuple(rebound)
+
+
+def _checkpoint_cell(cell_payload: np.ndarray | None) -> Cell:
+    if cell_payload is None:
+        msg = "NPT resume checkpoint requires a periodic cell"
+        raise ValueError(msg)
+    values = np.asarray(cell_payload, dtype=np.float32)
+    if values.shape == (3,):
+        return Cell.orthorhombic(values.tolist())
+    if values.shape == (3, 3):
+        return Cell(values)
+    msg = "NPT resume checkpoint cell must have shape (3,) or (3, 3)"
+    raise ValueError(msg)
+
+
 def _runtime_execution_contract(
     force_terms,
     *,
@@ -628,6 +656,25 @@ def _validate_resume_checkpoint(
     elif fixed_cell and checkpoint.cell is not None:
         msg = "resume checkpoint cell does not match the non-periodic prepared artifact"
         raise ValueError(msg)
+    elif not fixed_cell:
+        _checkpoint_cell(checkpoint.cell)
+        if checkpoint.cell_history_cursor < 0:
+            msg = "NPT resume checkpoint cell-history cursor must be non-negative"
+            raise ValueError(msg)
+        expected_molecule_ids = (
+            np.asarray([], dtype=np.int32)
+            if system.molecule_ids is None
+            else np.asarray(system.molecule_ids, dtype=np.int32)
+        )
+        if checkpoint.molecule_ids.shape != expected_molecule_ids.shape or not np.array_equal(
+            checkpoint.molecule_ids,
+            expected_molecule_ids,
+        ):
+            msg = "resume checkpoint molecule identity does not match the prepared artifact"
+            raise ValueError(msg)
+        if not checkpoint.barostat:
+            msg = "NPT resume checkpoint requires persistent barostat state"
+            raise ValueError(msg)
     thermostat = checkpoint.thermostat
     for name, requested in (
         ("temperature", temperature),
@@ -705,6 +752,11 @@ def run_mlx(
     temperature: float = 300.0,
     friction: float = 1.0,
     seed: int | None = 7,
+    pressure_atm: float = 1.0,
+    barostat_interval: int = 25,
+    barostat_mode: str | None = None,
+    barostat_axes: tuple[bool, bool, bool] = (True, True, True),
+    barostat_max_log_volume_scale: float = 0.02,
     nonbonded_cutoff: float | None = None,
     coulomb_constant: float | None = None,
     restraint_k: float = 5.0,
@@ -727,7 +779,7 @@ def run_mlx(
     xtc_out: str | Path | None = None,
     topology_out: str | Path | None = None,
 ):
-    """Run an MLX NVT trajectory and optionally save `trajectory.npz`."""
+    """Run an MLX NVT or admitted NPT trajectory and optionally save it."""
 
     del nonbonded_cutoff, coulomb_constant
     if receptor_mass_scale != 1.0:
@@ -750,6 +802,11 @@ def run_mlx(
     protocol_report = validate_gpcrmd_protocol_request(
         prepared_system.metadata.protocol_metadata,
         raise_on_blockers=True,
+    )
+    selected_barostat_mode = (
+        str(protocol_report.metadata["barostat_mode"])
+        if barostat_mode is None
+        else str(barostat_mode)
     )
     if not np.isfinite(neighbor_skin) or neighbor_skin < 0.0:
         msg = "neighbor_skin must be finite and non-negative"
@@ -803,6 +860,9 @@ def run_mlx(
     boltzmann_constant = 1.0 if unit_system is None else unit_system.boltzmann_constant
     checkpoint = None
     run_positions = np.asarray(system.positions, dtype=np.float32)
+    run_cell = system.cell
+    barostat_state = None
+    cell_history_cursor = 0
     initial_step = 0
     initial_time = 0.0
     rng_step_offset = None
@@ -827,6 +887,11 @@ def run_mlx(
         initial_step = checkpoint.step
         initial_time = checkpoint.time
         rng_step_offset = int(checkpoint.thermostat.get("rng_step_offset", checkpoint.step))
+        if use_npt:
+            run_cell = _checkpoint_cell(checkpoint.cell)
+            force_terms = _rebind_pme_plans_for_cell(force_terms, run_cell)
+            barostat_state = checkpoint.barostat
+            cell_history_cursor = checkpoint.cell_history_cursor
         minimize_steps = 0
         equilibration_steps = 0
     else:
@@ -843,14 +908,15 @@ def run_mlx(
             positions=run_positions,
             masses=masses,
             constraints=constraints,
-            cell=system.cell,
+            cell=run_cell,
             temperature=temperature,
             kinetic_energy_scale=kinetic_energy_scale,
             boltzmann_constant=boltzmann_constant,
             rescale=rescale_initial_velocities,
         )
+    runtime_system = replace(system, cell=run_cell)
     neighbor_manager = _production_neighbor_manager(
-        system,
+        runtime_system,
         force_terms,
         require_production=require_production,
         neighbor_skin=neighbor_skin,
@@ -859,16 +925,16 @@ def run_mlx(
 
     run_started = time.perf_counter()
     pressure_internal = (
-        ATM_TO_KJ_PER_MOL_ANGSTROM3
+        pressure_atm * ATM_TO_KJ_PER_MOL_ANGSTROM3
         if unit_system is not None and unit_system.coordinates == "angstrom"
-        else 1.0
+        else pressure_atm
     )
     if use_npt:
         result = simulate_npt(
             run_positions,
             velocities,
             masses=masses,
-            cell=system.cell,
+            cell=run_cell,
             force_terms=force_terms,
             config=_simulation_config_with_virtual_sites(
                 dt=dt,
@@ -894,8 +960,13 @@ def run_mlx(
             barostat=MonteCarloBarostat(
                 pressure=pressure_internal,
                 temperature=temperature,
+                interval=barostat_interval,
+                max_log_volume_scale=barostat_max_log_volume_scale,
                 seed=seed,
+                mode=selected_barostat_mode,
+                axes=barostat_axes,
             ),
+            barostat_state=barostat_state,
             constraints=constraints,
             neighbor_manager=neighbor_manager,
             molecule_ids=system.molecule_ids,
@@ -942,7 +1013,7 @@ def run_mlx(
                 force_terms=force_terms,
                 protocol=protocol,
                 virtual_sites=system.virtual_sites,
-                cell=system.cell,
+                cell=run_cell,
                 constraints=constraints,
                 unit_system=unit_system,
                 pressure_diagnostics=pressure_diagnostics,
@@ -954,7 +1025,7 @@ def run_mlx(
             run_positions,
             velocities,
             masses=masses,
-            cell=system.cell,
+            cell=run_cell,
             force_terms=force_terms,
             config=_simulation_config_with_virtual_sites(
                 dt=dt,
@@ -1005,16 +1076,24 @@ def run_mlx(
     if out is None and prepared_dir is not None:
         out = prepared_dir / TRAJECTORY_NAME
     if checkpoint_out is not None:
+        result_cell_history_cursor = cell_history_cursor
+        if use_npt:
+            result_cell_history_cursor += max(
+                int(np.asarray(result.cell_history).shape[0]) - 1,
+                0,
+            )
         save_simulation_checkpoint(
             checkpoint_out,
             result.final_state,
-            cell=result.final_cell if use_npt else system.cell,
+            cell=result.final_cell if use_npt else run_cell,
             thermostat={
                 "temperature": temperature,
                 "friction": friction,
                 "seed": seed,
                 "rng_step_offset": int(result.final_state.step),
             },
+            barostat=result.barostat_metadata if use_npt else None,
+            molecule_ids=system.molecule_ids if use_npt else None,
             neighbor_policy={
                 "skin": neighbor_skin,
                 "check_interval": neighbor_check_interval,
@@ -1024,6 +1103,7 @@ def run_mlx(
                 str(getattr(term, "name", type(term).__name__)) for term in force_terms
             ),
             diagnostic_cursor=int(np.asarray(result.diagnostic_steps)[-1]),
+            cell_history_cursor=result_cell_history_cursor,
             metadata={
                 "kind": "mlx_atomistic.checkpoint",
                 "source": "prep.run_mlx",
@@ -1048,6 +1128,9 @@ def run_mlx(
                 "final_step": int(result.final_state.step),
                 "final_time_ps": float(result.final_state.time),
                 "fixed_cell": not use_npt,
+                "molecule_identity_sha256": (
+                    artifact.molecule_identity_sha256 if use_npt else None
+                ),
                 "resumed_from": None if checkpoint is None else str(resume_checkpoint),
                 "run_metadata": dict(metadata_overrides or {}),
                 "platform_readiness": {
@@ -1140,15 +1223,26 @@ def run_mlx(
             "hydrogen_mass_repartitioning": hmr_state,
             "runtime_execution_contract": runtime_execution_contract,
         }
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
+        metadata.update(protocol_report.metadata)
         if use_npt:
             metadata["kind"] = "mlx_atomistic.prep_npt"
             metadata["barostat_attempts"] = result.barostat_attempts
             metadata["barostat_accepted"] = result.barostat_accepted
-            metadata["pressure_atm"] = 1.0
+            metadata["pressure_atm"] = pressure_atm
             metadata["barostat_pressure_internal"] = pressure_internal
-        if metadata_overrides:
-            metadata.update(metadata_overrides)
-        metadata.update(protocol_report.metadata)
+            metadata["barostat_interval"] = barostat_interval
+            metadata["barostat_mode"] = selected_barostat_mode
+            metadata["barostat_axes"] = list(barostat_axes)
+            metadata["barostat_max_log_volume_scale"] = (
+                barostat_max_log_volume_scale
+            )
+            metadata["cell_history_cursor_start"] = cell_history_cursor
+            metadata["cell_history_cursor_end"] = cell_history_cursor + max(
+                int(np.asarray(result.cell_history).shape[0]) - 1,
+                0,
+            )
         metadata["platform_readiness"] = {
             "artifact": artifact_readiness.to_dict(),
             "protocol": protocol_readiness.to_dict(),

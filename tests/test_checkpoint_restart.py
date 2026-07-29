@@ -399,52 +399,211 @@ def test_production_pme_checkpoint_split_matches_uninterrupted_run(tmp_path):
         assert plan["reuse_count"] > 0
 
 
-def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
-    positions = np.array([[1.0, 1.0, 1.0], [2.1, 1.0, 1.0]], dtype=np.float32)
-    velocities = np.zeros_like(positions)
+def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path):
+    from mlx_atomistic.prep.runner import run_mlx
 
-    result = simulate_npt(
+    fixture = _production_pme_checkpoint_fixture()
+    prepared = replace(
+        fixture,
+        molecule_ids=np.zeros((fixture.atom_count,), dtype=np.int32),
+        metadata=replace(
+            fixture.metadata,
+            protocol_metadata={
+                **fixture.metadata.protocol_metadata,
+                "ensemble": "NPT",
+                "proof_mode": "short_npt",
+                "barostat": "anisotropic",
+                "npt_barostat": True,
+                "center_of_mass_motion": {
+                    "enabled": True,
+                    "force": "CMMotionRemover",
+                    "frequency_steps": 1,
+                },
+            },
+        ),
+    )
+    common = {
+        "require_production": True,
+        "sample_interval": 1,
+        "diagnostic_interval": 1,
+        "dt": 0.001,
+        "temperature": 1.0,
+        "friction": 0.1,
+        "seed": 29,
+        "pressure_atm": 1.0,
+        "barostat_interval": 2,
+        "barostat_mode": "anisotropic",
+        "barostat_axes": (True, True, True),
+        "barostat_max_log_volume_scale": 0.001,
+        "restraint_k": 0.0,
+        "minimize_steps": 0,
+        "equilibration_steps": 0,
+        "eager_nonbonded_pair_limit": 0,
+    }
+    continuous = run_mlx(
+        prepared,
+        out=tmp_path / "npt-continuous.npz",
+        checkpoint_out=tmp_path / "npt-continuous-checkpoint.npz",
+        steps=6,
+        **common,
+    )
+    split_checkpoint = tmp_path / "npt-split-checkpoint.npz"
+    first = run_mlx(
+        prepared,
+        out=tmp_path / "npt-split-first.npz",
+        checkpoint_out=split_checkpoint,
+        steps=3,
+        **common,
+    )
+    resumed = run_mlx(
+        prepared,
+        out=tmp_path / "npt-split-resumed.npz",
+        checkpoint_out=tmp_path / "npt-resumed-checkpoint.npz",
+        resume_checkpoint=split_checkpoint,
+        steps=3,
+        **common,
+    )
+
+    for name in ("positions", "velocities", "forces"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(resumed.final_state, name)),
+            np.asarray(getattr(continuous.final_state, name)),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+    np.testing.assert_allclose(
+        np.asarray(resumed.final_cell.matrix),
+        np.asarray(continuous.final_cell.matrix),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert resumed.barostat_metadata["proposal_history"] == continuous.barostat_metadata[
+        "proposal_history"
+    ]
+    assert resumed.barostat_metadata["rng_state"] == continuous.barostat_metadata["rng_state"]
+    first_record = load_npz_trajectory(tmp_path / "npt-split-first.npz")
+    resumed_record = load_npz_trajectory(tmp_path / "npt-split-resumed.npz")
+    continuous_record = load_npz_trajectory(tmp_path / "npt-continuous.npz")
+    assert continuous_record.metadata["pressure_atm"] == 1.0
+    assert continuous_record.metadata["barostat_interval"] == 2
+    assert continuous_record.metadata["barostat_mode"] == "anisotropic"
+    assert continuous_record.metadata["barostat_axes"] == [True, True, True]
+    for name in ("sampled_positions", "sampled_velocities", "cell_history"):
+        combined = np.concatenate(
+            (
+                np.asarray(getattr(first_record, name)),
+                np.asarray(getattr(resumed_record, name))[1:],
+            ),
+            axis=0,
+        )
+        np.testing.assert_allclose(
+            combined,
+            np.asarray(getattr(continuous_record, name)),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+    first_checkpoint = load_simulation_checkpoint(split_checkpoint)
+    resumed_checkpoint = load_simulation_checkpoint(
+        tmp_path / "npt-resumed-checkpoint.npz"
+    )
+    assert first_checkpoint.metadata["fixed_cell"] is False
+    assert first_checkpoint.cell_history_cursor == 3
+    assert resumed_checkpoint.cell_history_cursor == 6
+    np.testing.assert_array_equal(
+        first_checkpoint.molecule_ids,
+        np.zeros((fixture.atom_count,), dtype=np.int32),
+    )
+    assert resumed_checkpoint.barostat["attempts"] == continuous.barostat_attempts
+    assert resumed_checkpoint.barostat["final_pme_plan_fingerprints"]
+    for result in (continuous, first, resumed):
+        assert result.nonbonded_report["fixed_cell"] is False
+        assert result.nonbonded_report["pme_execution_plan_count"] == 1
+
+
+def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [2.1, 1.0, 1.0], [1.0, 2.2, 1.0]],
+        dtype=np.float32,
+    )
+    velocities = np.zeros_like(positions)
+    masses = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
+    molecule_ids = np.asarray([0, 0, 1], dtype=np.int32)
+    thermostat = LangevinThermostat(temperature=0.5, friction=1.0, seed=23)
+    barostat = MonteCarloBarostat(
+        pressure=0.0,
+        temperature=0.5,
+        interval=2,
+        seed=4,
+        max_log_volume_scale=0.01,
+        mode="anisotropic",
+        axes=(True, True, True),
+    )
+
+    continuous = simulate_npt(
         positions,
         velocities,
-        masses=np.asarray([1.0, 1.0], dtype=np.float32),
+        masses=masses,
         cell=Cell.cubic(7.0),
         force_terms=LennardJonesPotential(cutoff=3.0),
-        config=SimulationConfig(dt=0.001, steps=2, sample_interval=1, diagnostic_interval=1),
-        thermostat=LangevinThermostat(temperature=0.5, friction=1.0, seed=23),
-        barostat=MonteCarloBarostat(
-            pressure=0.0,
-            temperature=0.5,
-            interval=2,
-            seed=4,
-            max_log_volume_scale=0.01,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=10,
+            sample_interval=1,
+            diagnostic_interval=1,
         ),
+        thermostat=thermostat,
+        barostat=barostat,
+        molecule_ids=molecule_ids,
+    )
+    first = simulate_npt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=Cell.cubic(7.0),
+        force_terms=LennardJonesPotential(cutoff=3.0),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=1,
+            diagnostic_interval=1,
+        ),
+        thermostat=thermostat,
+        barostat=barostat,
+        molecule_ids=molecule_ids,
     )
 
     checkpoint_path = tmp_path / "npt-checkpoint.npz"
     save_simulation_checkpoint(
         checkpoint_path,
-        result.final_state,
-        cell=result.final_cell,
+        first.final_state,
+        cell=first.final_cell,
         thermostat={
             "temperature": 0.5,
             "friction": 1.0,
             "seed": 23,
-            "rng_step_offset": result.final_state.step,
+            "rng_step_offset": first.final_state.step,
         },
+        barostat=first.barostat_metadata,
+        molecule_ids=molecule_ids,
         neighbor_policy={"ensemble": "NPT", "barostat": "monte_carlo"},
         force_terms=("lj",),
-        diagnostic_cursor=result.final_state.step,
+        diagnostic_cursor=first.final_state.step,
+        cell_history_cursor=3,
         metadata={
             "ensemble": "NPT",
             "barostat": "monte_carlo",
-            "barostat_attempts": result.barostat_attempts,
-            "barostat_accepted": result.barostat_accepted,
+            "barostat_attempts": first.barostat_attempts,
+            "barostat_accepted": first.barostat_accepted,
         },
     )
 
     checkpoint = load_simulation_checkpoint(checkpoint_path)
-    restart_cell = Cell.orthorhombic(checkpoint.cell.tolist())
-    resumed = simulate_nvt(
+    restart_cell = (
+        Cell.orthorhombic(checkpoint.cell.tolist())
+        if checkpoint.cell.shape == (3,)
+        else Cell(checkpoint.cell)
+    )
+    resumed = simulate_npt(
         checkpoint.positions,
         checkpoint.velocities,
         masses=checkpoint.masses,
@@ -452,7 +611,7 @@ def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
         force_terms=LennardJonesPotential(cutoff=3.0),
         config=SimulationConfig(
             dt=0.001,
-            steps=2,
+            steps=7,
             sample_interval=1,
             diagnostic_interval=1,
             initial_step=checkpoint.step,
@@ -464,18 +623,90 @@ def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
             seed=23,
             rng_step_offset=checkpoint.step,
         ),
+        barostat=barostat,
+        barostat_state=checkpoint.barostat,
+        molecule_ids=checkpoint.molecule_ids,
     )
+    with pytest.raises(
+        ValueError,
+        match="barostat checkpoint pressure does not match requested configuration",
+    ):
+        simulate_npt(
+            checkpoint.positions,
+            checkpoint.velocities,
+            masses=checkpoint.masses,
+            cell=restart_cell,
+            force_terms=LennardJonesPotential(cutoff=3.0),
+            config=SimulationConfig(
+                dt=0.001,
+                steps=1,
+                sample_interval=1,
+                diagnostic_interval=1,
+                initial_step=checkpoint.step,
+                initial_time=checkpoint.time,
+            ),
+            thermostat=replace(thermostat, rng_step_offset=checkpoint.step),
+            barostat=replace(barostat, pressure=1.0),
+            barostat_state=checkpoint.barostat,
+            molecule_ids=checkpoint.molecule_ids,
+        )
 
-    assert checkpoint.step == result.final_state.step
-    assert checkpoint.thermostat["rng_step_offset"] == result.final_state.step
+    assert checkpoint.step == first.final_state.step
+    assert checkpoint.thermostat["rng_step_offset"] == first.final_state.step
     assert checkpoint.neighbor_policy == {"ensemble": "NPT", "barostat": "monte_carlo"}
+    assert checkpoint.cell_history_cursor == 3
+    np.testing.assert_array_equal(checkpoint.molecule_ids, molecule_ids)
     assert checkpoint.metadata["ensemble"] == "NPT"
     assert checkpoint.metadata["barostat_attempts"] == 1
-    np.testing.assert_allclose(checkpoint.cell, np.asarray(result.final_cell.lengths))
-    assert np.isfinite(checkpoint.positions).all()
-    assert np.isfinite(checkpoint.velocities).all()
-    assert resumed.final_state.step == result.final_state.step + 2
-    assert np.isfinite(np.asarray(resumed.final_state.positions)).all()
+    assert resumed.barostat_attempts == continuous.barostat_attempts
+    assert resumed.barostat_accepted == continuous.barostat_accepted
+    assert resumed.barostat_metadata["axis_attempts"] == continuous.barostat_metadata[
+        "axis_attempts"
+    ]
+    assert resumed.barostat_metadata["axis_accepted"] == continuous.barostat_metadata[
+        "axis_accepted"
+    ]
+    assert resumed.barostat_metadata["proposal_history"] == continuous.barostat_metadata[
+        "proposal_history"
+    ]
+    assert resumed.barostat_metadata["rng_state"] == continuous.barostat_metadata["rng_state"]
+    for name in ("positions", "velocities", "forces"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(resumed.final_state, name)),
+            np.asarray(getattr(continuous.final_state, name)),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+    np.testing.assert_allclose(
+        np.asarray(resumed.final_cell.matrix),
+        np.asarray(continuous.final_cell.matrix),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    for name in (
+        "sampled_positions",
+        "sampled_velocities",
+        "sampled_steps",
+        "sampled_time",
+        "potential_energy",
+        "kinetic_energy",
+        "total_energy",
+        "temperature",
+        "cell_history",
+    ):
+        combined = np.concatenate(
+            (
+                np.asarray(getattr(first, name)),
+                np.asarray(getattr(resumed, name))[1:],
+            ),
+            axis=0,
+        )
+        np.testing.assert_allclose(
+            combined,
+            np.asarray(getattr(continuous, name)),
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
 
 def test_triclinic_checkpoint_and_trajectory_preserve_cell_matrix(tmp_path):
@@ -517,6 +748,67 @@ def test_triclinic_checkpoint_and_trajectory_preserve_cell_matrix(tmp_path):
     record = load_npz_trajectory(trajectory_path)
     np.testing.assert_allclose(checkpoint.cell, matrix)
     np.testing.assert_allclose(record.cell, matrix)
+    np.testing.assert_allclose(
+        record.cell_history,
+        np.broadcast_to(matrix, (result.sampled_positions.shape[0], 3, 3)),
+    )
+    assert checkpoint.barostat == {}
+    assert checkpoint.molecule_ids.size == 0
+    assert checkpoint.cell_history_cursor == 0
+
+
+def test_legacy_single_cell_trajectory_loads_cell_history_compatibly(tmp_path):
+    matrix = np.diag(np.asarray([4.0, 5.0, 6.0], dtype=np.float32))
+    source = tmp_path / "current.npz"
+    legacy = tmp_path / "legacy.npz"
+    result = _run_nvt(
+        np.asarray([[1.0, 1.0, 1.0], [2.2, 1.0, 1.0]], dtype=np.float32),
+        np.zeros((2, 3), dtype=np.float32),
+        steps=2,
+    )
+    save_npz_trajectory(source, result, cell=Cell.orthorhombic([4.0, 5.0, 6.0]))
+    with np.load(source, allow_pickle=False) as data:
+        payload = {
+            name: np.asarray(data[name])
+            for name in data.files
+            if name != "cell_history"
+        }
+    np.savez_compressed(legacy, **payload)
+
+    record = load_npz_trajectory(legacy)
+
+    np.testing.assert_allclose(
+        record.cell_history,
+        np.broadcast_to(matrix, (result.sampled_positions.shape[0], 3, 3)),
+    )
+
+
+def test_atomic_trajectory_write_preserves_prior_complete_file(tmp_path, monkeypatch):
+    trajectory = tmp_path / "trajectory.npz"
+    result = _run_nvt(
+        np.asarray([[1.0, 1.0, 1.0], [2.2, 1.0, 1.0]], dtype=np.float32),
+        np.zeros((2, 3), dtype=np.float32),
+        steps=2,
+    )
+    save_npz_trajectory(trajectory, result, cell=Cell.cubic(6.0))
+    original_steps = load_npz_trajectory(trajectory).sampled_steps.copy()
+
+    def _fail_after_partial_write(handle, **_payload):
+        handle.write(b"incomplete")
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(
+        "mlx_atomistic.io.np.savez_compressed",
+        _fail_after_partial_write,
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        save_npz_trajectory(trajectory, result, cell=Cell.cubic(6.0))
+
+    np.testing.assert_array_equal(
+        load_npz_trajectory(trajectory).sampled_steps,
+        original_steps,
+    )
+    assert not (tmp_path / ".trajectory.npz.tmp").exists()
 
 
 def test_checkpoint_reports_hmr_state_from_metadata(tmp_path):

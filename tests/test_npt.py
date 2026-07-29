@@ -193,6 +193,12 @@ def test_monte_carlo_npt_accepts_isotropic_orthorhombic_box_update(tmp_path):
         atol=1e-6,
     )
     np.testing.assert_allclose(record.cell, np.asarray(result.final_cell.lengths), rtol=1e-6)
+    np.testing.assert_allclose(
+        record.cell_history,
+        np.asarray(result.cell_history),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_npt_barostat_rebuilds_neighbor_pairs_for_lazy_topology():

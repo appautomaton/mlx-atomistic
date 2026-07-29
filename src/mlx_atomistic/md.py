@@ -3295,6 +3295,7 @@ def simulate_npt(
     config: SimulationConfig | None = None,
     thermostat: Thermostat | None = None,
     barostat: MonteCarloBarostat | None = None,
+    barostat_state: dict[str, Any] | None = None,
     constraints: DistanceConstraints | None = None,
     molecule_ids: object | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
@@ -3315,6 +3316,8 @@ def simulate_npt(
             `LangevinThermostat`. Defaults to ``None``.
         barostat: Monte Carlo barostat; ``None`` uses one matched to the
             thermostat temperature. Defaults to ``None``.
+        barostat_state: Optional serialized persistent barostat state from a
+            prior committed NPT boundary. Defaults to ``None``.
         constraints: Optional distance constraints applied each step.
             Defaults to ``None``.
         molecule_ids: Optional contiguous per-particle molecule identifiers.
@@ -3385,14 +3388,21 @@ def simulate_npt(
     segments: list[NVTResult] = []
     cell_history_chunks: list[mx.array] = []
     seen_reporter_events: set[tuple[str, int]] = set()
-    attempts = 0
-    accepted_count = 0
-    proposal_volume_step = float(np.asarray(cell.volume)) * float(
-        np.expm1(barostat.max_log_volume_scale)
+    (
+        attempts,
+        accepted_count,
+        proposal_volume_step,
+        axis_attempts,
+        axis_accepted,
+        proposal_history,
+    ) = _restore_barostat_state(
+        barostat,
+        barostat_rng,
+        barostat_state,
+        current_volume=float(np.asarray(cell.volume)),
+        molecule_count=molecule_count,
+        center_of_mass_motion_interval=config.center_of_mass_motion_interval,
     )
-    axis_attempts = {axis: 0 for axis in "xyz"}
-    axis_accepted = {axis: 0 for axis in "xyz"}
-    proposal_history: list[dict[str, Any]] = []
 
     while not segments or current_step < end_step:
         segment_end = min(end_step, next_barostat_step)
@@ -4160,6 +4170,118 @@ def _scaled_cell(cell: Cell, scale_factors: np.ndarray) -> Cell:
     matrix = np.asarray(cell.matrix, dtype=np.float64).copy()
     matrix *= np.asarray(scale_factors, dtype=np.float64)[:, None]
     return Cell(matrix)
+
+
+def _restore_barostat_state(
+    barostat: MonteCarloBarostat,
+    rng: np.random.Generator,
+    state: dict[str, Any] | None,
+    *,
+    current_volume: float,
+    molecule_count: int,
+    center_of_mass_motion_interval: int | None,
+) -> tuple[
+    int,
+    int,
+    float,
+    dict[str, int],
+    dict[str, int],
+    list[dict[str, Any]],
+]:
+    if state is None:
+        return (
+            0,
+            0,
+            current_volume * float(np.expm1(barostat.max_log_volume_scale)),
+            {axis: 0 for axis in "xyz"},
+            {axis: 0 for axis in "xyz"},
+            [],
+        )
+    restored = dict(state)
+    expected = _barostat_metadata(barostat)
+    for name in ("family", "mode", "interval"):
+        if restored.get(name) != expected[name]:
+            msg = f"barostat checkpoint {name} does not match requested configuration"
+            raise ValueError(msg)
+    for name in ("pressure", "temperature", "max_log_volume_scale"):
+        if not np.isclose(
+            float(restored.get(name, np.nan)),
+            float(expected[name]),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            msg = f"barostat checkpoint {name} does not match requested configuration"
+            raise ValueError(msg)
+    if barostat.mode == "anisotropic" and restored.get("axes") != expected["axes"]:
+        msg = "barostat checkpoint axes do not match requested configuration"
+        raise ValueError(msg)
+    if barostat.mode == "membrane":
+        for name in ("membrane_plane", "normal_axis"):
+            if restored.get(name) != expected[name]:
+                msg = f"barostat checkpoint {name} does not match requested configuration"
+                raise ValueError(msg)
+    if int(restored.get("molecule_count", -1)) != molecule_count:
+        msg = "barostat checkpoint molecule count does not match runtime topology"
+        raise ValueError(msg)
+    if (
+        restored.get("center_of_mass_motion_interval")
+        != center_of_mass_motion_interval
+    ):
+        msg = "barostat checkpoint center-of-mass cadence does not match runtime"
+        raise ValueError(msg)
+
+    attempts = int(restored.get("attempts", -1))
+    accepted = int(restored.get("accepted", -1))
+    if attempts < 0 or accepted < 0 or accepted > attempts:
+        msg = "barostat checkpoint counters are invalid"
+        raise ValueError(msg)
+    proposal_volume_step = float(restored.get("proposal_volume_step", np.nan))
+    if not np.isfinite(proposal_volume_step) or proposal_volume_step <= 0.0:
+        msg = "barostat checkpoint proposal_volume_step must be finite and positive"
+        raise ValueError(msg)
+    axis_attempts = _restore_barostat_axis_counts(
+        restored.get("axis_attempts"),
+        name="axis_attempts",
+    )
+    axis_accepted = _restore_barostat_axis_counts(
+        restored.get("axis_accepted"),
+        name="axis_accepted",
+    )
+    if any(axis_accepted[axis] > axis_attempts[axis] for axis in "xyz"):
+        msg = "barostat checkpoint per-axis counters are invalid"
+        raise ValueError(msg)
+    history = restored.get("proposal_history")
+    if not isinstance(history, list) or len(history) != attempts:
+        msg = "barostat checkpoint proposal history does not match attempts"
+        raise ValueError(msg)
+    rng_state = restored.get("rng_state")
+    if not isinstance(rng_state, dict):
+        msg = "barostat checkpoint RNG state is missing"
+        raise ValueError(msg)
+    try:
+        rng.bit_generator.state = rng_state
+    except (TypeError, ValueError) as error:
+        msg = "barostat checkpoint RNG state is invalid"
+        raise ValueError(msg) from error
+    return (
+        attempts,
+        accepted,
+        proposal_volume_step,
+        axis_attempts,
+        axis_accepted,
+        [dict(record) for record in history],
+    )
+
+
+def _restore_barostat_axis_counts(value: Any, *, name: str) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set("xyz"):
+        msg = f"barostat checkpoint {name} must contain x, y, and z"
+        raise ValueError(msg)
+    counts = {axis: int(value[axis]) for axis in "xyz"}
+    if any(count < 0 for count in counts.values()):
+        msg = f"barostat checkpoint {name} must be non-negative"
+        raise ValueError(msg)
+    return counts
 
 
 def _barostat_metadata(barostat: MonteCarloBarostat) -> dict[str, Any]:

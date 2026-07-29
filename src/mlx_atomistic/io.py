@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -38,6 +39,7 @@ class TrajectoryRecord:
     virial_tensor: np.ndarray | None = None
     pressure_tensor: np.ndarray | None = None
     pressure: np.ndarray | None = None
+    cell_history: np.ndarray | None = None
 
 
 @dataclass
@@ -104,6 +106,11 @@ class SimulationCheckpoint:
     force_terms: tuple[str, ...]
     diagnostic_cursor: int
     metadata: dict[str, Any]
+    barostat: dict[str, Any] = field(default_factory=dict)
+    molecule_ids: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=np.int32)
+    )
+    cell_history_cursor: int = 0
 
     def state(self) -> SimulationState:
         """Rebuild the in-memory simulation state from this checkpoint.
@@ -163,6 +170,54 @@ def _cell_payload(cell: Cell | None) -> np.ndarray:
     if cell.is_orthorhombic:
         return np.asarray(cell.lengths, dtype=np.float32)
     return np.asarray(cell.matrix, dtype=np.float32)
+
+
+def _cell_matrix_payload(cell: Cell | None) -> np.ndarray | None:
+    if cell is None:
+        return None
+    return np.asarray(cell.matrix, dtype=np.float32)
+
+
+def _cell_history_payload(result, cell: Cell | None) -> np.ndarray:
+    sampled_count = int(np.asarray(result.sampled_positions).shape[0])
+    history = getattr(result, "cell_history", None)
+    if history is not None:
+        values = np.asarray(history, dtype=np.float32)
+        if values.shape != (sampled_count, 3, 3):
+            msg = "cell_history must align one-for-one with sampled positions"
+            raise ValueError(msg)
+        return values
+    matrix = _cell_matrix_payload(cell)
+    if matrix is None:
+        return np.asarray([], dtype=np.float32)
+    return np.broadcast_to(matrix, (sampled_count, 3, 3)).copy()
+
+
+def _load_cell_history(
+    data,
+    *,
+    cell_data: np.ndarray,
+    sampled_count: int,
+) -> np.ndarray | None:
+    if "cell_history" in data.files:
+        history = np.asarray(data["cell_history"], dtype=np.float32)
+        if history.size == 0:
+            return None
+        if history.shape != (sampled_count, 3, 3):
+            msg = "stored cell_history does not align with sampled positions"
+            raise ValueError(msg)
+        return history
+    if cell_data.size == 0:
+        return None
+    matrix = (
+        np.diag(cell_data)
+        if cell_data.shape == (3,)
+        else np.asarray(cell_data, dtype=np.float32)
+    )
+    if matrix.shape != (3, 3):
+        msg = "stored trajectory cell must have shape (3,) or (3, 3)"
+        raise ValueError(msg)
+    return np.broadcast_to(matrix, (sampled_count, 3, 3)).copy()
 
 
 def read_xyz(path: str | Path) -> tuple[tuple[str, ...], np.ndarray, str]:
@@ -289,6 +344,7 @@ def save_npz_trajectory(
         ),
         "symbols": np.asarray([] if symbols is None else list(symbols), dtype=str),
         "cell": _cell_payload(cell),
+        "cell_history": _cell_history_payload(result, cell),
         "metadata_json": np.asarray(json.dumps(metadata or {})),
         "energy_term_names": np.asarray(
             list(getattr(result, "potential_energy_by_term", {}).keys()),
@@ -309,7 +365,7 @@ def save_npz_trajectory(
     ]:
         if hasattr(result, name):
             payload[name] = np.asarray(getattr(result, name))
-    np.savez_compressed(path, **payload)
+    _atomic_savez_compressed(Path(path), payload)
 
 
 def trajectory_record_from_result(
@@ -372,6 +428,7 @@ def trajectory_record_from_result(
             getattr(result, "pressure_tensor", _zero_diagnostic_tensor(result))
         ),
         pressure=np.asarray(getattr(result, "pressure", _zero_diagnostic_scalar(result))),
+        cell_history=_cell_history_payload(result, cell),
     )
 
 
@@ -389,11 +446,12 @@ def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
         term_names = tuple(str(item) for item in data["energy_term_names"].tolist())
         terms = {name: np.asarray(data[f"energy_term::{name}"]) for name in term_names}
         cell_data = np.asarray(data["cell"], dtype=np.float32)
+        sampled_positions = np.asarray(data["sampled_positions"])
         symbols = tuple(str(item) for item in data["symbols"].tolist())
         metadata = json.loads(str(np.asarray(data["metadata_json"])))
         diagnostic_steps, diagnostic_time = _load_diagnostic_axis(data, metadata)
         return TrajectoryRecord(
-            sampled_positions=np.asarray(data["sampled_positions"]),
+            sampled_positions=sampled_positions,
             sampled_velocities=np.asarray(data["sampled_velocities"]),
             sampled_steps=np.asarray(data["sampled_steps"]),
             sampled_time=np.asarray(data["sampled_time"]),
@@ -413,6 +471,11 @@ def load_npz_trajectory(path: str | Path) -> TrajectoryRecord:
             virial_tensor=_load_diagnostic_tensor(data, "virial_tensor"),
             pressure_tensor=_load_diagnostic_tensor(data, "pressure_tensor"),
             pressure=_load_diagnostic_scalar(data, "pressure"),
+            cell_history=_load_cell_history(
+                data,
+                cell_data=cell_data,
+                sampled_count=int(sampled_positions.shape[0]),
+            ),
         )
 
 
@@ -422,9 +485,12 @@ def save_simulation_checkpoint(
     *,
     cell: Cell | None = None,
     thermostat: dict[str, Any] | None = None,
+    barostat: dict[str, Any] | None = None,
+    molecule_ids: object | None = None,
     neighbor_policy: dict[str, Any] | None = None,
     force_terms: tuple[str, ...] | list[str] | None = None,
     diagnostic_cursor: int | None = None,
+    cell_history_cursor: int | None = None,
     metadata: dict[str, Any] | None = None,
     runtime_sync_report: dict[str, int | float] | None = None,
     runtime_nonbonded_report: dict[str, int | float | str | None] | None = None,
@@ -437,10 +503,16 @@ def save_simulation_checkpoint(
         cell: Optional periodic cell. Defaults to ``None``.
         thermostat: Optional thermostat state (RNG offset or Nose-Hoover state).
             Defaults to ``None``.
+        barostat: Optional persistent barostat configuration, RNG, counters,
+            and proposal state. Defaults to ``None``.
+        molecule_ids: Optional exact per-particle molecule identifiers.
+            Defaults to ``None``.
         neighbor_policy: Optional neighbor-list policy dict. Defaults to ``None``.
         force_terms: Optional names of the force terms in effect. Defaults to ``None``.
         diagnostic_cursor: Optional index into the diagnostic series for exact
             resumption. Defaults to ``None``.
+        cell_history_cursor: Optional count of committed sampled-cell
+            transitions. Defaults to ``None``.
         metadata: Optional JSON-serializable metadata dict. Defaults to ``None``.
         runtime_sync_report: Optional runtime-sync counters to persist. Defaults to ``None``.
         runtime_nonbonded_report: Optional nonbonded-runtime report to persist.
@@ -460,6 +532,10 @@ def save_simulation_checkpoint(
         "velocities": np.asarray(state.velocities),
         "masses": np.asarray(state.masses),
         "forces": np.asarray(state.forces),
+        "molecule_ids": np.asarray(
+            [] if molecule_ids is None else molecule_ids,
+            dtype=np.int32,
+        ),
     }
     materialization_elapsed = perf_counter() - materialization_start
     _record_checkpoint_runtime_attribution(
@@ -473,15 +549,20 @@ def save_simulation_checkpoint(
         "time": np.asarray([float(state.time)], dtype=np.float64),
         "cell": _cell_payload(cell),
         "thermostat_json": np.asarray(json.dumps(thermostat_payload)),
+        "barostat_json": np.asarray(json.dumps(barostat or {})),
         "neighbor_policy_json": np.asarray(json.dumps(neighbor_policy or {})),
         "force_terms": np.asarray([] if force_terms is None else list(force_terms), dtype=str),
         "diagnostic_cursor": np.asarray(
             [int(state.step if diagnostic_cursor is None else diagnostic_cursor)],
             dtype=np.int64,
         ),
+        "cell_history_cursor": np.asarray(
+            [int(0 if cell_history_cursor is None else cell_history_cursor)],
+            dtype=np.int64,
+        ),
         "metadata_json": np.asarray(json.dumps(metadata or {})),
     }
-    np.savez_compressed(path, **payload)
+    _atomic_savez_compressed(path, payload)
 
 
 def _record_checkpoint_runtime_attribution(
@@ -554,7 +635,35 @@ def load_simulation_checkpoint(path: str | Path) -> SimulationCheckpoint:
             force_terms=tuple(str(item) for item in data["force_terms"].tolist()),
             diagnostic_cursor=int(np.asarray(data["diagnostic_cursor"])[0]),
             metadata=json.loads(str(np.asarray(data["metadata_json"]))),
+            barostat=(
+                {}
+                if "barostat_json" not in data.files
+                else json.loads(str(np.asarray(data["barostat_json"])))
+            ),
+            molecule_ids=(
+                np.asarray([], dtype=np.int32)
+                if "molecule_ids" not in data.files
+                else np.asarray(data["molecule_ids"], dtype=np.int32)
+            ),
+            cell_history_cursor=(
+                0
+                if "cell_history_cursor" not in data.files
+                else int(np.asarray(data["cell_history_cursor"])[0])
+            ),
         )
+
+
+def _atomic_savez_compressed(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _load_diagnostic_axis(data, metadata: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
