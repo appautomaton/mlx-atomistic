@@ -22,7 +22,11 @@ from mlx_atomistic.md import (
     SimulationConfig,
     simulate_nvt,
 )
-from mlx_atomistic.metal_kernels import fused_lj_forces
+from mlx_atomistic.metal_kernels import (
+    fused_lj_forces,
+    fused_parameterized_pme_direct_components,
+    fused_parameterized_pme_direct_force_only,
+)
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.topology import Topology
@@ -243,6 +247,41 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
             pairs,
         )
     )
+    aligned_lj_scales = potential._compact_aligned_lj_scales(pairs)
+    _, direct_reference_forces, _, _ = fused_parameterized_pme_direct_components(
+        positions,
+        pairs,
+        mx.diag(cell.matrix),
+        potential.sigma,
+        potential.epsilon,
+        potential.charges,
+        aligned_lj_scales,
+        cutoff=potential.cutoff,
+        shift=potential.lj_shift,
+        switch_distance=potential.switch_distance,
+        coulomb_constant=potential.coulomb_constant,
+        alpha=config.alpha,
+    )
+    direct_force_only = fused_parameterized_pme_direct_force_only(
+        positions,
+        pairs,
+        mx.diag(cell.matrix),
+        potential.sigma,
+        potential.epsilon,
+        potential.charges,
+        aligned_lj_scales,
+        cutoff=potential.cutoff,
+        shift=potential.lj_shift,
+        switch_distance=potential.switch_distance,
+        coulomb_constant=potential.coulomb_constant,
+        alpha=config.alpha,
+    )
+    runtime_force_only = potential._runtime_forces(
+        positions,
+        cell=cell,
+        pairs=pairs,
+    )
+    assert runtime_force_only is not NotImplemented
 
     mx.eval(
         reference_energy,
@@ -251,6 +290,9 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
         fused_forces,
         runtime_energy,
         runtime_forces,
+        direct_reference_forces,
+        direct_force_only,
+        runtime_force_only,
         *runtime_components.values(),
     )
     assert potential._aligned_lj_scale_cache is not None
@@ -274,6 +316,18 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
     )
     np.testing.assert_allclose(
         np.asarray(runtime_forces),
+        np.asarray(reference_forces),
+        rtol=1e-5,
+        atol=2e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(direct_force_only),
+        np.asarray(direct_reference_forces),
+        rtol=1e-5,
+        atol=2e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(runtime_force_only),
         np.asarray(reference_forces),
         rtol=1e-5,
         atol=2e-4,

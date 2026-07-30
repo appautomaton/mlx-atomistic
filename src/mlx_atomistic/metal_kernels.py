@@ -1,10 +1,9 @@
 """Fused Metal kernels for recurring Lennard-Jones force paths.
 
 Collapses the per-step pairwise LJ force op-chain (gather -> minimum image -> r^2 ->
-LJ scalar -> scatter-add) into a single ``mx.fast.metal_kernel`` dispatch. Forces use an
-atomic scatter into a half neighbor list; per-pair energy is written to its own slot
-(no contention) and summed by the caller -- this keeps the energy accurate (needed by the
-periodic-virial finite-difference path) without a single-cell energy-atomic hot spot.
+LJ scalar -> scatter-add) into a single ``mx.fast.metal_kernel`` dispatch. Diagnostic
+kernels write per-pair energy without contention, while force-only kernels omit those
+outputs and reductions entirely.
 
 The simple kernel covers scalar reduced-unit LJ. The parameterized kernel covers
 per-atom Lorentz-Berthelot parameters, topology scales, shifts, and smooth switching
@@ -77,6 +76,7 @@ _LJ_FORCE_SOURCE = r"""
 _kernel_singleton = None
 _parameterized_kernel_singleton = None
 _pme_direct_kernel_singleton = None
+_pme_direct_force_only_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
 
@@ -316,8 +316,10 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
     dz -= lz * floor(dz / lz + 0.5f);
 
     float r2 = dx * dx + dy * dy + dz * dz;
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
     float lj_energy_value = 0.0f;
     float coulomb_energy_value = 0.0f;
+#endif
     if (r2 > 0.0f && r2 < params[0]) {
         float distance = sqrt(r2);
         float scalar = 0.0f;
@@ -363,8 +365,10 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
                     ) / params[4];
                 }
             }
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
             lj_energy_value =
                 unswitched_energy * switch_value * lj_scale;
+#endif
             scalar += (
                 24.0f
                 * epsilon_ij
@@ -378,8 +382,10 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         float qij = charges[i] * charges[j];
         float erfc_term =
             1.0f - mlx_atomistic_erf(params[7] * distance);
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
         coulomb_energy_value =
             params[6] * qij * erfc_term / distance;
+#endif
         scalar += params[6] * qij * (
             erfc_term / (r2 * distance)
             + params[8] * exp(-params[7] * params[7] * r2) / r2
@@ -407,6 +413,7 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
             &forces[3 * j + 2], -fz, memory_order_relaxed
         );
     }
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
     atomic_store_explicit(
         &pair_lj_energy[t], lj_energy_value, memory_order_relaxed
     );
@@ -415,7 +422,12 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         coulomb_energy_value,
         memory_order_relaxed
     );
+#endif
 """
+
+_PARAMETERIZED_PME_DIRECT_FORCE_ONLY_SOURCE = (
+    "#define MLX_ATOMISTIC_FORCE_ONLY 1\n" + _PARAMETERIZED_PME_DIRECT_SOURCE
+)
 
 _PME_ORDER5_HEADER = r"""
 inline void mlx_atomistic_pme_order5_weights(
@@ -655,6 +667,33 @@ def _parameterized_pme_direct_kernel():
             atomic_outputs=True,
         )
     return _pme_direct_kernel_singleton
+
+
+def _parameterized_pme_direct_force_only_kernel():
+    """Return the cached force-only fused LJ/PME-direct Metal kernel."""
+
+    global _pme_direct_force_only_kernel_singleton
+    if _pme_direct_force_only_kernel_singleton is None:
+        _pme_direct_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="fused_parameterized_pme_direct_force_only",
+            input_names=[
+                "positions",
+                "pairs_i",
+                "pairs_j",
+                "box",
+                "sigma",
+                "epsilon",
+                "charges",
+                "lj_scales",
+                "params",
+                "npair",
+            ],
+            output_names=["forces"],
+            source=_PARAMETERIZED_PME_DIRECT_FORCE_ONLY_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _pme_direct_force_only_kernel_singleton
 
 
 def _pme_order5_spread_kernel():
@@ -1120,3 +1159,107 @@ def fused_parameterized_pme_direct_forces(
         alpha=alpha,
     )
     return energy, forces
+
+
+def fused_parameterized_pme_direct_force_only(
+    positions: mx.array,
+    pairs: mx.array,
+    box_lengths: mx.array,
+    sigma: mx.array,
+    epsilon: mx.array,
+    charges: mx.array,
+    lj_scales: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    coulomb_constant: float,
+    alpha: float,
+) -> mx.array:
+    """Evaluate combined LJ plus PME direct-space forces without energy outputs.
+
+    Args:
+        positions: Atomic coordinates with shape ``(n_atoms, 3)``.
+        pairs: Shared half-neighbor candidates with shape ``(n_pairs, 2)``.
+        box_lengths: Orthorhombic cell lengths with shape ``(3,)``.
+        sigma: Per-atom LJ sigma values.
+        epsilon: Per-atom LJ epsilon values.
+        charges: Per-atom partial charges.
+        lj_scales: One aligned LJ scale per candidate; zero excludes LJ only.
+        cutoff: Shared finite LJ and PME real-space cutoff.
+        shift: Whether to subtract each LJ pair's cutoff energy.
+        switch_distance: Optional start of the smooth LJ potential switch.
+        coulomb_constant: Coulomb prefactor in the configured units.
+        alpha: Ewald splitting parameter.
+
+    Returns:
+        An ``(n_atoms, 3)`` force array. The kernel allocates no per-pair
+        energy outputs.
+
+    Raises:
+        ValueError: If the cutoff, alpha, or aligned scale count is invalid.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    pairs = as_mx_array(pairs, dtype=mx.int32)
+    sigma = as_mx_array(sigma, dtype=mx.float32)
+    epsilon = as_mx_array(epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    lj_scales = as_mx_array(lj_scales, dtype=mx.float32)
+    n_atoms = positions.shape[0]
+    n_pairs = pairs.shape[0]
+    if n_pairs == 0:
+        return mx.zeros_like(positions)
+    if cutoff is None or cutoff <= 0.0:
+        msg = "fused_parameterized_pme_direct_force_only requires a positive cutoff"
+        raise ValueError(msg)
+    if alpha <= 0.0:
+        msg = "fused_parameterized_pme_direct_force_only requires positive alpha"
+        raise ValueError(msg)
+    if int(lj_scales.size) != n_pairs:
+        msg = "lj_scales must contain one aligned value per pair"
+        raise ValueError(msg)
+    lj_scales = mx.reshape(lj_scales, (n_pairs,))
+
+    cutoff_value = float(cutoff)
+    has_switch = switch_distance is not None
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - float(switch_distance)
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(has_switch),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+        ],
+        dtype=mx.float32,
+    )
+    npair = mx.array([n_pairs], dtype=mx.int32)
+    box = as_mx_array(box_lengths, dtype=mx.float32)
+    threads = 256 if n_pairs >= 256 else n_pairs
+    (forces,) = _parameterized_pme_direct_force_only_kernel()(
+        inputs=[
+            positions,
+            pairs[:, 0],
+            pairs[:, 1],
+            box,
+            sigma,
+            epsilon,
+            charges,
+            lj_scales,
+            params,
+            npair,
+        ],
+        output_shapes=[(n_atoms, 3)],
+        output_dtypes=[mx.float32],
+        grid=(n_pairs, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces

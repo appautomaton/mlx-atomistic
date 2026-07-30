@@ -847,6 +847,35 @@ def test_nonbonded_pme_binds_and_reuses_one_execution_plan():
     np.testing.assert_allclose(np.asarray(third_forces), np.asarray(first_forces), atol=1e-6)
 
 
+def test_nonbonded_runtime_force_only_declines_without_supported_metal_path():
+    positions = np.array(
+        [[1.0, 1.0, 1.0], [4.0, 1.2, 1.1], [2.0, 3.0, 5.0]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(12.0)
+    term = NonbondedPotential(
+        sigma=[1.0, 1.0, 1.0],
+        epsilon=[0.1, 0.2, 0.3],
+        charges=[1.0, -0.5, -0.5],
+        cutoff=5.0,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=5.0,
+        ),
+    )
+    pairs = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=5.0,
+        skin=0.2,
+        backend="mlx_cell_pairs",
+    ).interactions
+
+    assert term._runtime_forces(positions, cell=cell, pairs=pairs) is NotImplemented
+
+
 def test_nonbonded_pme_rejects_incompatible_bound_plan():
     cell = Cell.cubic(12.0)
     config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)

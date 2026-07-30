@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from types import NotImplementedType
 
 import mlx.core as mx
 import numpy as np
@@ -27,6 +28,7 @@ from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
     fused_parameterized_lj_forces,
     fused_parameterized_pme_direct_components,
+    fused_parameterized_pme_direct_force_only,
     fused_parameterized_pme_direct_forces,
 )
 from mlx_atomistic.neighbors import NeighborBlocks, build_neighbor_list
@@ -1843,6 +1845,27 @@ class NonbondedPotential:
         )
         return aligned
 
+    def _supports_fused_pme_direct(
+        self,
+        cell: Cell,
+        pairs: mx.array | NeighborBlocks,
+    ) -> bool:
+        return (
+            isinstance(pairs, mx.array)
+            and "gpu" in str(mx.default_device()).lower()
+            and cell.is_orthorhombic
+            and self.cutoff is not None
+            and self.pme_config is not None
+            and self.pme_config.real_cutoff is not None
+            and np.isclose(
+                float(self.cutoff),
+                float(self.pme_config.real_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            and not self.has_nbfix
+        )
+
     def _block_components(
         self,
         positions: mx.array,
@@ -2446,6 +2469,30 @@ class NonbondedPotential:
         forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
         return mx.sum(lj_pair_energy), forces
 
+    def _exception_lj_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+    ) -> mx.array:
+        if not self.has_exceptions:
+            return mx.zeros_like(positions)
+        pairs = self.exception_pairs
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        mask = r2 > 0.0
+        safe_r2 = mx.where(mask, r2, 1.0)
+        sigma2_over_r2 = (self.exception_sigma * self.exception_sigma) / safe_r2
+        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
+        inv_r12 = inv_r6 * inv_r6
+        scalar = 24.0 * self.exception_epsilon * (2.0 * inv_r12 - inv_r6) / safe_r2
+        scalar = mx.where(mask, scalar, 0.0)
+        pair_forces = scalar[:, None] * displacement
+        return mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
+
     def _bare_coulomb_components(
         self,
         positions: mx.array,
@@ -2472,6 +2519,29 @@ class NonbondedPotential:
         pair_forces = scalar[:, None] * displacement
         forces = mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
         return mx.sum(pair_energy), forces
+
+    def _bare_coulomb_forces(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array,
+        charge_products: mx.array,
+    ) -> mx.array:
+        if pairs.shape[0] == 0:
+            return mx.zeros_like(positions)
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        displacement = positions[i] - positions[j]
+        if cell is not None:
+            displacement = cell.minimum_image(displacement)
+        r2 = mx.sum(displacement * displacement, axis=-1)
+        mask = r2 > 0.0
+        safe_r2 = mx.where(mask, r2, 1.0)
+        distance = mx.sqrt(safe_r2)
+        scalar = self.coulomb_constant * charge_products / (safe_r2 * distance)
+        scalar = mx.where(mask, scalar, 0.0)
+        pair_forces = scalar[:, None] * displacement
+        return mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
 
     def _ewald_correction_pairs(self) -> mx.array:
         pairs = set(self._exception_pair_set)
@@ -2541,6 +2611,44 @@ class NonbondedPotential:
             "coulomb_one_four_correction": one_four_energy,
         }
         return energy, forces, components
+
+    def _periodic_coulomb_correction_forces(
+        self,
+        positions: mx.array,
+        cell: Cell,
+    ) -> mx.array:
+        correction_pairs = self._ewald_correction_pairs()
+        if correction_pairs.shape[0] == 0:
+            correction_forces = mx.zeros_like(positions)
+        else:
+            i = correction_pairs[:, 0]
+            j = correction_pairs[:, 1]
+            correction_forces = self._bare_coulomb_forces(
+                positions,
+                cell,
+                correction_pairs,
+                -(self.charges[i] * self.charges[j]),
+            )
+
+        exception_forces = self._bare_coulomb_forces(
+            positions,
+            cell,
+            self.exception_pairs,
+            self.exception_charge_products,
+        )
+        one_four_pairs = self._ewald_one_four_pairs()
+        if one_four_pairs.shape[0] == 0:
+            one_four_forces = mx.zeros_like(positions)
+        else:
+            i = one_four_pairs[:, 0]
+            j = one_four_pairs[:, 1]
+            one_four_forces = self._bare_coulomb_forces(
+                positions,
+                cell,
+                one_four_pairs,
+                (self.coulomb_one_four_scale - 1.0) * self.charges[i] * self.charges[j],
+            )
+        return correction_forces + exception_forces + one_four_forces
 
     def _ewald_energy_forces_with_components(
         self,
@@ -2691,19 +2799,9 @@ class NonbondedPotential:
             cell,
             pairs,
         )
-        fused_direct = (
-            isinstance(direct_space_pairs, mx.array)
-            and "gpu" in str(mx.default_device()).lower()
-            and cell.is_orthorhombic
-            and self.cutoff is not None
-            and self.pme_config.real_cutoff is not None
-            and np.isclose(
-                float(self.cutoff),
-                float(self.pme_config.real_cutoff),
-                rtol=1e-6,
-                atol=1e-7,
-            )
-            and not self.has_nbfix
+        fused_direct = self._supports_fused_pme_direct(
+            cell,
+            direct_space_pairs,
         )
         if not fused_direct:
             return self._pme_energy_forces_with_components(
@@ -2790,6 +2888,54 @@ class NonbondedPotential:
         forces = direct_forces + exception_lj_forces + reciprocal_forces + correction_forces
         return lj_energy + coulomb_energy, forces, components
 
+    def _runtime_forces(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell | None = None,
+        pairs: mx.array | NeighborBlocks | None = None,
+    ) -> mx.array | NotImplementedType:
+        """Return the optimized recurring PME forces or decline safely."""
+
+        if self.electrostatics != "pme" or cell is None or self.pme_config is None:
+            return NotImplemented
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+        direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
+        if not self._supports_fused_pme_direct(cell, direct_space_pairs):
+            return NotImplemented
+
+        direct_forces = fused_parameterized_pme_direct_force_only(
+            positions,
+            direct_space_pairs,
+            mx.diag(cell.matrix),
+            self.sigma,
+            self.epsilon,
+            self.charges,
+            self._compact_aligned_lj_scales(direct_space_pairs),
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+        )
+        _, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            plan=self.pme_plan,
+        )
+        return (
+            direct_forces
+            + self._exception_lj_forces(positions, cell)
+            + reciprocal_forces
+            + self._periodic_coulomb_correction_forces(positions, cell)
+        )
+
     def _pme_energy_forces(
         self,
         positions: mx.array,
@@ -2804,19 +2950,9 @@ class NonbondedPotential:
             raise ValueError(msg)
 
         direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
-        fused_direct = (
-            isinstance(direct_space_pairs, mx.array)
-            and "gpu" in str(mx.default_device()).lower()
-            and cell.is_orthorhombic
-            and self.cutoff is not None
-            and self.pme_config.real_cutoff is not None
-            and np.isclose(
-                float(self.cutoff),
-                float(self.pme_config.real_cutoff),
-                rtol=1e-6,
-                atol=1e-7,
-            )
-            and not self.has_nbfix
+        fused_direct = self._supports_fused_pme_direct(
+            cell,
+            direct_space_pairs,
         )
         if fused_direct:
             direct_energy, direct_forces = fused_parameterized_pme_direct_forces(
