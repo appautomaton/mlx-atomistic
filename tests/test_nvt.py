@@ -110,6 +110,45 @@ def test_internal_force_evaluation_dispatches_exact_requested_mode(
     assert (result.virial is not None) == (evaluation_request.mode == "diagnostic")
 
 
+def test_internal_analytic_diagnostic_uses_one_combined_owner():
+    class CombinedDiagnosticTerm(_DemandCountingTerm):
+        def _runtime_energy_forces_with_components_virial(
+            self,
+            positions,
+            cell=None,
+            pairs=None,
+            *,
+            masses=None,
+            molecule_ids=None,
+        ):
+            del cell, pairs, masses, molecule_ids
+            self.calls.append("combined_diagnostic")
+            energy = mx.sum(positions * 0.0)
+            return (
+                energy,
+                mx.zeros_like(positions),
+                {"zero": energy},
+                mx.zeros((3, 3), dtype=positions.dtype),
+            )
+
+    term = CombinedDiagnosticTerm()
+    result = _evaluate_force_terms(
+        mx.zeros((2, 3), dtype=mx.float32),
+        (term,),
+        request=_ForceEvaluationRequest(
+            "diagnostic",
+            virial_mode="analytic",
+        ),
+        cell=Cell.cubic(6.0),
+        pairs=mx.array([[0, 1]], dtype=mx.int32),
+    )
+
+    assert term.calls == ["combined_diagnostic"]
+    assert result.optimized_terms == 1
+    assert result.fallback_terms == 0
+    assert result.virial is not None
+
+
 @pytest.mark.parametrize("mode", ["forces", "energy"])
 def test_internal_force_evaluation_falls_back_when_private_hook_declines(mode):
     class DecliningTerm:

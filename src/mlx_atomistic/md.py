@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field, replace
 from math import exp, sqrt
 from time import perf_counter
+from types import NotImplementedType
 from typing import Any, Literal, Protocol
 
 import mlx.core as mx
@@ -1566,6 +1567,33 @@ def _evaluate_force_terms(
             if named_force_terms is None
             else named_force_terms
         )
+        if request.virial_mode == VIRIAL_SUPPORT_ANALYTIC:
+            combined = _analytic_diagnostic_by_term(
+                positions,
+                named_terms,
+                cell=cell,
+                pairs=pairs,
+                virtual_sites=virtual_sites,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            )
+            if combined is not NotImplemented:
+                (
+                    energy,
+                    forces,
+                    components,
+                    virial,
+                    optimized_terms,
+                    fallback_terms,
+                ) = combined
+                return _ForceEvaluationResult(
+                    energy=energy,
+                    forces=forces,
+                    components=components,
+                    virial=virial,
+                    optimized_terms=optimized_terms,
+                    fallback_terms=fallback_terms,
+                )
         energy, forces, components = _energy_forces_by_term(
             positions,
             named_terms,
@@ -1833,6 +1861,160 @@ def _energy_forces_by_term(
         total_energy,
         _redistribute_virtual_site_forces(total_forces, eval_positions, virtual_sites),
         energy_by_term,
+    )
+
+
+def _analytic_diagnostic_by_term(
+    positions: mx.array,
+    force_terms: tuple[tuple[str, ForceTerm], ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None,
+    masses: mx.array | None,
+    molecule_ids: object | None,
+) -> (
+    tuple[
+        mx.array,
+        mx.array,
+        dict[str, mx.array],
+        mx.array,
+        int,
+        int,
+    ]
+    | NotImplementedType
+):
+    """Evaluate analytic diagnostics through one owning term pass."""
+
+    unnamed_terms = tuple(term for _, term in force_terms)
+    if (
+        cell is None
+        or (
+            virtual_sites is not None
+            and virtual_sites.n_virtual_sites > 0
+        )
+        or _groupable_potential_terms(unnamed_terms, pairs)
+    ):
+        return NotImplemented
+    validate_analytic_virial_support(unnamed_terms)
+    _validate_orthorhombic_pressure_cell(cell)
+    eval_positions = as_mx_array(positions)
+    total_energy = None
+    total_forces = mx.zeros_like(eval_positions)
+    total_virial = mx.zeros((3, 3), dtype=eval_positions.dtype)
+    energy_by_term: dict[str, mx.array] = {}
+    optimized_terms = 0
+    fallback_terms = 0
+
+    for name, term in force_terms:
+        combined_diagnostic = getattr(
+            term,
+            "_runtime_energy_forces_with_components_virial",
+            None,
+        )
+        result = (
+            combined_diagnostic(
+                eval_positions,
+                cell,
+                pairs,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            )
+            if callable(combined_diagnostic)
+            else NotImplemented
+        )
+        if result is NotImplemented:
+            combined_components = getattr(
+                term,
+                "_runtime_energy_forces_with_components",
+                None,
+            )
+            if not callable(combined_components):
+                combined_components = getattr(
+                    term,
+                    "energy_forces_with_components",
+                    None,
+                )
+            if callable(combined_components):
+                energy, forces, components = combined_components(
+                    eval_positions,
+                    cell,
+                    pairs=pairs,
+                )
+            else:
+                energy, forces = term.energy_forces(
+                    eval_positions,
+                    cell,
+                    pairs=pairs,
+                )
+                component_energies = getattr(
+                    term,
+                    "component_energies",
+                    None,
+                )
+                components = (
+                    component_energies(
+                        eval_positions,
+                        cell=cell,
+                        pairs=pairs,
+                    )
+                    if callable(component_energies)
+                    else {}
+                )
+            virial_method = getattr(
+                term,
+                "analytic_virial_tensor",
+                None,
+            )
+            if not callable(virial_method):
+                msg = (
+                    "analytic virial support requires "
+                    "analytic_virial_tensor"
+                )
+                raise ValueError(msg)
+            term_virial = virial_method(
+                eval_positions,
+                cell=cell,
+                pairs=pairs,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            )
+            fallback_terms += 1
+        else:
+            energy, forces, components, term_virial = result
+            optimized_terms += 1
+
+        component_count = 0
+        for component_name, component_energy in components.items():
+            if _is_energy_component(component_energy):
+                energy_by_term[f"{name}.{component_name}"] = (
+                    component_energy
+                )
+                component_count += 1
+        if component_count == 0:
+            energy_by_term[name] = energy
+        term_virial = as_mx_array(term_virial)
+        if term_virial.shape != (3, 3):
+            msg = "analytic virial contributions must have shape (3, 3)"
+            raise ValueError(msg)
+        total_energy = (
+            energy
+            if total_energy is None
+            else total_energy + energy
+        )
+        total_forces = total_forces + forces
+        total_virial = total_virial + mx.diag(mx.diag(term_virial))
+
+    if total_energy is None:
+        msg = "force_terms must not be empty"
+        raise ValueError(msg)
+    return (
+        total_energy,
+        total_forces,
+        energy_by_term,
+        total_virial,
+        optimized_terms,
+        fallback_terms,
     )
 
 

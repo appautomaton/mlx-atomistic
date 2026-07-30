@@ -343,6 +343,114 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
 
 
 @pytest.mark.gpu
+def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
+    """The fused diagnostic preserves energy, forces, components, and virial."""
+
+    positions = mx.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.2, 1.0, 1.0],
+            [3.999, 1.0, 1.0],
+            [4.2, 1.0, 1.0],
+        ],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1), (2, 3)],
+        partial_charges=[0.4, -0.4, 0.25, -0.25],
+        nonbonded_cutoff=3.0,
+        eager_nonbonded_pair_limit=0,
+    )
+    potential = NonbondedPotential(
+        sigma=[0.9, 1.0, 1.1, 0.95],
+        epsilon=[0.15, 0.2, 0.18, 0.12],
+        charges=[0.4, -0.4, 0.25, -0.25],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.4,
+            real_cutoff=3.0,
+            assignment_order=5,
+        ),
+        topology=topology,
+    ).bind_pme_plan(cell)
+    pairs = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=3.0,
+        skin=0.3,
+        backend="mlx_cell_pairs",
+    ).interactions
+    masses = mx.ones((4,), dtype=mx.float32)
+    molecule_ids = np.asarray([0, 0, 1, 1], dtype=np.int32)
+
+    reference_energy, reference_forces, reference_components = (
+        potential._runtime_energy_forces_with_components(
+            positions,
+            cell,
+            pairs,
+        )
+    )
+    reference_virial = potential.analytic_virial_tensor(
+        positions,
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    fused = potential._runtime_energy_forces_with_components_virial(
+        positions,
+        cell,
+        pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    assert fused is not NotImplemented
+    energy, forces, components, virial = fused
+    mx.eval(
+        reference_energy,
+        reference_forces,
+        reference_virial,
+        energy,
+        forces,
+        virial,
+        *reference_components.values(),
+        *components.values(),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(energy),
+        np.asarray(reference_energy),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(forces),
+        np.asarray(reference_forces),
+        rtol=1e-5,
+        atol=3e-4,
+    )
+    assert set(components) == set(reference_components)
+    for name, value in components.items():
+        np.testing.assert_allclose(
+            np.asarray(value),
+            np.asarray(reference_components[name]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+    np.testing.assert_allclose(
+        np.diag(np.asarray(virial)),
+        np.diag(np.asarray(reference_virial)),
+        rtol=3e-3,
+        atol=5e-2,
+    )
+
+
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_fused_nvt_matches_op_chain_end_to_end():
     """A batched-block NVT run with the fused kernel tracks the op-chain trajectory.

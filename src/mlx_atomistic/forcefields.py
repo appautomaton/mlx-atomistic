@@ -28,8 +28,10 @@ from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
     fused_parameterized_lj_forces,
     fused_parameterized_pme_direct_components,
+    fused_parameterized_pme_direct_components_virial,
     fused_parameterized_pme_direct_force_only,
     fused_parameterized_pme_direct_forces,
+    fused_pme_cutoff_correction_virial,
 )
 from mlx_atomistic.neighbors import NeighborBlocks, build_neighbor_list
 from mlx_atomistic.nonbonded import (
@@ -53,6 +55,7 @@ from mlx_atomistic.pme import (
     PMEConfig,
     PMEExecutionPlan,
     _pme_coulomb_nonreciprocal_strain_energy,
+    _pme_coulomb_reciprocal_energy_forces_virial,
     _pme_coulomb_reciprocal_virial,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
@@ -2887,6 +2890,267 @@ class NonbondedPotential:
         }
         forces = direct_forces + exception_lj_forces + reciprocal_forces + correction_forces
         return lj_energy + coulomb_energy, forces, components
+
+    def _runtime_energy_forces_with_components_virial(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+        *,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+    ) -> (
+        tuple[
+            mx.array,
+            mx.array,
+            dict[str, mx.array | object],
+            mx.array,
+        ]
+        | NotImplementedType
+    ):
+        """Return one fused recurring PME diagnostic evaluation or decline."""
+
+        if (
+            self.electrostatics != "pme"
+            or cell is None
+            or self.pme_config is None
+            or not self.analytic_virial_supported
+        ):
+            return NotImplemented
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+        particle_count = int(positions.shape[0])
+        if masses is not None and as_mx_array(masses).shape != (particle_count,):
+            msg = "masses must have shape (n_particles,)"
+            raise ValueError(msg)
+        direct_space_pairs = self._validated_pme_direct_space_pairs(
+            cell,
+            pairs,
+        )
+        if not self._supports_fused_pme_direct(
+            cell,
+            direct_space_pairs,
+        ):
+            return NotImplemented
+
+        (
+            _,
+            direct_forces,
+            lj_energy,
+            coulomb_real_energy,
+            direct_atomic_diagonal,
+        ) = fused_parameterized_pme_direct_components_virial(
+            positions,
+            direct_space_pairs,
+            mx.diag(cell.matrix),
+            self.sigma,
+            self.epsilon,
+            self.charges,
+            self._compact_aligned_lj_scales(direct_space_pairs),
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+        )
+        exception_lj, exception_lj_forces = self._exception_lj_components(
+            positions,
+            cell,
+        )
+        dispersion_energy = self._dispersion_correction_energy(cell)
+        lj_energy = lj_energy + exception_lj + dispersion_energy
+        (
+            reciprocal_energy,
+            reciprocal_forces,
+            reciprocal_virial,
+        ) = _pme_coulomb_reciprocal_energy_forces_virial(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            plan=self.pme_plan,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+        self_energy = (
+            -float(self.coulomb_constant)
+            * self.pme_config.alpha
+            / float(np.sqrt(np.pi))
+            * mx.sum(self.charges * self.charges)
+        )
+        if self.pme_config.background_policy == "uniform_neutralizing_plasma":
+            net_charge = mx.sum(self.charges)
+            background_energy = (
+                -float(self.coulomb_constant)
+                * float(np.pi)
+                / (
+                    2.0
+                    * cell.volume
+                    * self.pme_config.alpha
+                    * self.pme_config.alpha
+                )
+                * net_charge
+                * net_charge
+            )
+        else:
+            background_energy = mx.sum(self.charges * 0.0)
+        correction_energy, correction_forces, correction_components = (
+            self._periodic_coulomb_corrections(
+                positions,
+                cell,
+            )
+        )
+        coulomb_energy = (
+            coulomb_real_energy
+            + reciprocal_energy
+            + self_energy
+            + background_energy
+            + correction_energy
+        )
+        components = {
+            "lj": lj_energy,
+            "lj_dispersion_correction": dispersion_energy,
+            "coulomb": coulomb_energy,
+            "coulomb_real": coulomb_real_energy,
+            "coulomb_reciprocal": reciprocal_energy,
+            "coulomb_self": self_energy,
+            "coulomb_background": background_energy,
+            **correction_components,
+        }
+        forces = (
+            direct_forces
+            + exception_lj_forces
+            + reciprocal_forces
+            + correction_forces
+        )
+
+        ids = normalize_molecule_ids(
+            molecule_ids,
+            particle_count=particle_count,
+        )
+        molecule_index = mx.array(ids, dtype=mx.int32)
+        if np.array_equal(
+            ids,
+            np.arange(particle_count, dtype=np.int32),
+        ):
+            strain_centers = cell.cartesian_coordinates(
+                cell.fractional_coordinates(positions)
+                - mx.floor(cell.fractional_coordinates(positions))
+            )
+            molecular_correction = mx.zeros((3,), dtype=positions.dtype)
+        else:
+            molecule_count = int(np.max(ids)) + 1
+            counts = (
+                mx.zeros((molecule_count,), dtype=positions.dtype)
+                .at[molecule_index]
+                .add(mx.ones((particle_count,), dtype=positions.dtype))
+            )
+            centers = (
+                mx.zeros((molecule_count, 3), dtype=positions.dtype)
+                .at[molecule_index]
+                .add(positions)
+                / counts[:, None]
+            )
+            strain_centers = centers[molecule_index]
+            molecular_correction = mx.sum(
+                direct_forces * (strain_centers - positions),
+                axis=0,
+            )
+
+        def small_strain_energy(
+            strained_positions: mx.array,
+            strained_cell: Cell,
+        ) -> mx.array:
+            strained_exception_lj, _ = self._exception_lj_components(
+                strained_positions,
+                strained_cell,
+            )
+            strained_correction, _, _ = self._periodic_coulomb_corrections(
+                strained_positions,
+                strained_cell,
+            )
+            if (
+                self.pme_config.background_policy
+                == "uniform_neutralizing_plasma"
+            ):
+                strained_background = (
+                    -float(self.coulomb_constant)
+                    * float(np.pi)
+                    / (
+                        2.0
+                        * strained_cell.volume
+                        * self.pme_config.alpha
+                        * self.pme_config.alpha
+                    )
+                    * net_charge
+                    * net_charge
+                )
+            else:
+                strained_background = mx.sum(self.charges * 0.0)
+            return (
+                strained_exception_lj
+                + self._dispersion_correction_energy(strained_cell)
+                + strained_correction
+                + strained_background
+            )
+
+        small_virial = diagonal_strain_virial(
+            positions,
+            cell,
+            small_strain_energy,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
+        local_virial = (
+            mx.diag(direct_atomic_diagonal + molecular_correction)
+            + small_virial
+        )
+        strain_pairs = self._compact_cutoff_strain_pairs(
+            positions,
+            cell=cell,
+            strain_epsilon=1.0e-3,
+        )
+        topology_mask, strain_lj_scales, _ = (
+            self._compact_pair_masks_and_scales(strain_pairs)
+        )
+        aligned_strain_lj_scales = mx.where(
+            topology_mask,
+            strain_lj_scales,
+            0.0,
+        ).astype(mx.float32)
+        needs_lj = not (
+            self.lj_shift
+            or self.switch_distance is not None
+            or not bool(np.any(np.asarray(self.epsilon) != 0.0))
+        )
+        needs_coulomb = bool(
+            np.any(np.asarray(self.charges) != 0.0)
+        )
+        cutoff_correction = fused_pme_cutoff_correction_virial(
+            positions,
+            strain_centers,
+            strain_pairs,
+            mx.diag(cell.matrix),
+            self.sigma,
+            self.epsilon,
+            self.charges,
+            aligned_strain_lj_scales,
+            cutoff=float(self.cutoff),
+            strain_epsilon=1.0e-3,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+            include_lj=needs_lj,
+            include_coulomb=needs_coulomb,
+        )
+        virial = (
+            local_virial
+            + reciprocal_virial
+            + cutoff_correction
+        )
+        return lj_energy + coulomb_energy, forces, components, virial
 
     def _runtime_forces(
         self,

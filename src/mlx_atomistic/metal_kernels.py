@@ -76,7 +76,9 @@ _LJ_FORCE_SOURCE = r"""
 _kernel_singleton = None
 _parameterized_kernel_singleton = None
 _pme_direct_kernel_singleton = None
+_pme_direct_virial_kernel_singleton = None
 _pme_direct_force_only_kernel_singleton = None
+_pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
 
@@ -320,6 +322,11 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
     float lj_energy_value = 0.0f;
     float coulomb_energy_value = 0.0f;
 #endif
+#ifdef MLX_ATOMISTIC_VIRIAL
+    float virial_x = 0.0f;
+    float virial_y = 0.0f;
+    float virial_z = 0.0f;
+#endif
     if (r2 > 0.0f && r2 < params[0]) {
         float distance = sqrt(r2);
         float scalar = 0.0f;
@@ -394,6 +401,11 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         float fx = scalar * dx;
         float fy = scalar * dy;
         float fz = scalar * dz;
+#ifdef MLX_ATOMISTIC_VIRIAL
+        virial_x = dx * fx;
+        virial_y = dy * fy;
+        virial_z = dz * fz;
+#endif
         atomic_fetch_add_explicit(
             &forces[3 * i + 0], fx, memory_order_relaxed
         );
@@ -423,11 +435,159 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         memory_order_relaxed
     );
 #endif
+#ifdef MLX_ATOMISTIC_VIRIAL
+    atomic_store_explicit(
+        &pair_virial[3 * t + 0], virial_x, memory_order_relaxed
+    );
+    atomic_store_explicit(
+        &pair_virial[3 * t + 1], virial_y, memory_order_relaxed
+    );
+    atomic_store_explicit(
+        &pair_virial[3 * t + 2], virial_z, memory_order_relaxed
+    );
+#endif
 """
 
+_PARAMETERIZED_PME_DIRECT_VIRIAL_SOURCE = (
+    "#define MLX_ATOMISTIC_VIRIAL 1\n" + _PARAMETERIZED_PME_DIRECT_SOURCE
+)
 _PARAMETERIZED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     "#define MLX_ATOMISTIC_FORCE_ONLY 1\n" + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
+
+_PME_CUTOFF_CORRECTION_VIRIAL_SOURCE = r"""
+    uint t = thread_position_in_grid.x;
+    if (t >= (uint)npair[0]) {
+        return;
+    }
+    int i = pairs_i[t];
+    int j = pairs_j[t];
+
+    float raw_dx = positions[3 * i + 0] - positions[3 * j + 0];
+    float raw_dy = positions[3 * i + 1] - positions[3 * j + 1];
+    float raw_dz = positions[3 * i + 2] - positions[3 * j + 2];
+    float center_dx = centers[3 * i + 0] - centers[3 * j + 0];
+    float center_dy = centers[3 * i + 1] - centers[3 * j + 1];
+    float center_dz = centers[3 * i + 2] - centers[3 * j + 2];
+    float lx = box[0];
+    float ly = box[1];
+    float lz = box[2];
+    float dx = raw_dx - lx * rint(raw_dx / lx);
+    float dy = raw_dy - ly * rint(raw_dy / ly);
+    float dz = raw_dz - lz * rint(raw_dz / lz);
+    float base_r2 = dx * dx + dy * dy + dz * dz;
+    bool base_cutoff =
+        base_r2 > 0.0f && base_r2 < params[0];
+    float lj_scale = lj_scales[t];
+    bool base_lj = base_cutoff && lj_scale != 0.0f;
+    float base_safe_r2 = base_lj ? base_r2 : 1.0f;
+    float base_distance = sqrt(base_safe_r2);
+    float sigma_ij = 0.5f * (sigma[i] + sigma[j]);
+    float epsilon_ij = sqrt(epsilon[i] * epsilon[j]);
+    float base_sigma2_over_r2 =
+        sigma_ij * sigma_ij / base_safe_r2;
+    float base_inv_r6 =
+        base_sigma2_over_r2
+        * base_sigma2_over_r2
+        * base_sigma2_over_r2;
+    float base_d_energy_d_distance = (
+        24.0f
+        * epsilon_ij
+        * (base_inv_r6 - 2.0f * base_inv_r6 * base_inv_r6)
+        / base_distance
+    );
+    float qij = charges[i] * charges[j];
+    float strain_epsilon = params[2];
+
+    for (int axis = 0; axis < 3; axis++) {
+        float3 strained_displacement[2];
+        float lj_pair_energy[2] = {0.0f, 0.0f};
+        float coulomb_boundary_energy[2] = {0.0f, 0.0f};
+        for (int sign_index = 0; sign_index < 2; sign_index++) {
+            float signed_epsilon = (
+                sign_index == 0 ? strain_epsilon : -strain_epsilon
+            );
+            float slx = lx * (axis == 0 ? 1.0f + signed_epsilon : 1.0f);
+            float sly = ly * (axis == 1 ? 1.0f + signed_epsilon : 1.0f);
+            float slz = lz * (axis == 2 ? 1.0f + signed_epsilon : 1.0f);
+            float sdx = raw_dx + (
+                axis == 0 ? signed_epsilon * center_dx : 0.0f
+            );
+            float sdy = raw_dy + (
+                axis == 1 ? signed_epsilon * center_dy : 0.0f
+            );
+            float sdz = raw_dz + (
+                axis == 2 ? signed_epsilon * center_dz : 0.0f
+            );
+            sdx -= slx * rint(sdx / slx);
+            sdy -= sly * rint(sdy / sly);
+            sdz -= slz * rint(sdz / slz);
+            strained_displacement[sign_index] = float3(sdx, sdy, sdz);
+            float r2 = sdx * sdx + sdy * sdy + sdz * sdz;
+            bool strained_cutoff = r2 > 0.0f && r2 < params[0];
+            float safe_r2 = (
+                strained_cutoff || base_cutoff ? r2 : 1.0f
+            );
+            if (params[5] > 0.5f && strained_cutoff && lj_scale != 0.0f) {
+                float sigma2_over_r2 =
+                    sigma_ij * sigma_ij / safe_r2;
+                float inv_r6 =
+                    sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
+                lj_pair_energy[sign_index] = (
+                    4.0f
+                    * epsilon_ij
+                    * (inv_r6 * inv_r6 - inv_r6)
+                    * lj_scale
+                );
+            }
+            if (params[6] > 0.5f) {
+                float distance = sqrt(safe_r2);
+                float mask_delta = (
+                    (strained_cutoff ? 1.0f : 0.0f)
+                    - (base_cutoff ? 1.0f : 0.0f)
+                );
+                coulomb_boundary_energy[sign_index] = (
+                    mask_delta
+                    * params[3]
+                    * qij
+                    * (1.0f - mlx_atomistic_erf(params[4] * distance))
+                    / distance
+                );
+            }
+        }
+        float correction = 0.0f;
+        if (params[5] > 0.5f) {
+            float finite_strain_lj_virial = -(
+                lj_pair_energy[0] - lj_pair_energy[1]
+            ) / (2.0f * strain_epsilon);
+            float3 displacement_derivative = (
+                strained_displacement[0] - strained_displacement[1]
+            ) / (2.0f * strain_epsilon);
+            float distance_derivative = (
+                dx * displacement_derivative.x
+                + dy * displacement_derivative.y
+                + dz * displacement_derivative.z
+            ) / base_distance;
+            float local_lj_virial = base_lj ? (
+                -base_d_energy_d_distance
+                * distance_derivative
+                * lj_scale
+            ) : 0.0f;
+            correction += finite_strain_lj_virial - local_lj_virial;
+        }
+        if (params[6] > 0.5f) {
+            correction -= (
+                coulomb_boundary_energy[0]
+                - coulomb_boundary_energy[1]
+            ) / (2.0f * strain_epsilon);
+        }
+        atomic_store_explicit(
+            &pair_correction[3 * t + axis],
+            correction,
+            memory_order_relaxed
+        );
+    }
+"""
 
 _PME_ORDER5_HEADER = r"""
 inline void mlx_atomistic_pme_order5_weights(
@@ -694,6 +854,66 @@ def _parameterized_pme_direct_force_only_kernel():
             atomic_outputs=True,
         )
     return _pme_direct_force_only_kernel_singleton
+
+
+def _parameterized_pme_direct_virial_kernel():
+    """Return the cached diagnostic fused LJ/PME-direct virial kernel."""
+
+    global _pme_direct_virial_kernel_singleton
+    if _pme_direct_virial_kernel_singleton is None:
+        _pme_direct_virial_kernel_singleton = mx.fast.metal_kernel(
+            name="fused_parameterized_pme_direct_virial",
+            input_names=[
+                "positions",
+                "pairs_i",
+                "pairs_j",
+                "box",
+                "sigma",
+                "epsilon",
+                "charges",
+                "lj_scales",
+                "params",
+                "npair",
+            ],
+            output_names=[
+                "forces",
+                "pair_lj_energy",
+                "pair_coulomb_energy",
+                "pair_virial",
+            ],
+            source=_PARAMETERIZED_PME_DIRECT_VIRIAL_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _pme_direct_virial_kernel_singleton
+
+
+def _pme_cutoff_correction_virial_kernel():
+    """Return the cached fused PME cutoff-correction virial kernel."""
+
+    global _pme_cutoff_correction_virial_kernel_singleton
+    if _pme_cutoff_correction_virial_kernel_singleton is None:
+        _pme_cutoff_correction_virial_kernel_singleton = mx.fast.metal_kernel(
+            name="fused_pme_cutoff_correction_virial",
+            input_names=[
+                "positions",
+                "centers",
+                "pairs_i",
+                "pairs_j",
+                "box",
+                "sigma",
+                "epsilon",
+                "charges",
+                "lj_scales",
+                "params",
+                "npair",
+            ],
+            output_names=["pair_correction"],
+            source=_PME_CUTOFF_CORRECTION_VIRIAL_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _pme_cutoff_correction_virial_kernel_singleton
 
 
 def _pme_order5_spread_kernel():
@@ -1107,6 +1327,250 @@ def fused_parameterized_pme_direct_components(
     lj_energy = mx.sum(pair_lj_energy)
     coulomb_energy = mx.sum(pair_coulomb_energy)
     return lj_energy + coulomb_energy, forces, lj_energy, coulomb_energy
+
+
+def fused_parameterized_pme_direct_components_virial(
+    positions: mx.array,
+    pairs: mx.array,
+    box_lengths: mx.array,
+    sigma: mx.array,
+    epsilon: mx.array,
+    charges: mx.array,
+    lj_scales: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    coulomb_constant: float,
+    alpha: float,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Evaluate direct components, forces, and atomic diagonal virial.
+
+    Args:
+        positions: Atomic coordinates with shape ``(n_atoms, 3)``.
+        pairs: Shared half-neighbor candidates with shape ``(n_pairs, 2)``.
+        box_lengths: Orthorhombic cell lengths with shape ``(3,)``.
+        sigma: Per-atom LJ sigma values.
+        epsilon: Per-atom LJ epsilon values.
+        charges: Per-atom partial charges.
+        lj_scales: One aligned LJ scale per candidate; zero excludes LJ only.
+        cutoff: Shared finite LJ and PME real-space cutoff.
+        shift: Whether to subtract each LJ pair's cutoff energy.
+        switch_distance: Optional start of the smooth LJ potential switch.
+        coulomb_constant: Coulomb prefactor in the configured units.
+        alpha: Ewald splitting parameter.
+
+    Returns:
+        Combined energy, forces, LJ energy, direct Coulomb energy, and the
+        three diagonal atomic-virial components.
+
+    Raises:
+        ValueError: If the cutoff, alpha, or aligned scale count is invalid.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    pairs = as_mx_array(pairs, dtype=mx.int32)
+    sigma = as_mx_array(sigma, dtype=mx.float32)
+    epsilon = as_mx_array(epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    lj_scales = as_mx_array(lj_scales, dtype=mx.float32)
+    n_atoms = positions.shape[0]
+    n_pairs = pairs.shape[0]
+    if n_pairs == 0:
+        zero = mx.sum(positions[:, 0] * 0.0)
+        return (
+            zero,
+            mx.zeros_like(positions),
+            zero,
+            zero,
+            mx.zeros((3,), dtype=mx.float32),
+        )
+    if cutoff is None or cutoff <= 0.0:
+        msg = "fused_parameterized_pme_direct_components_virial requires a positive cutoff"
+        raise ValueError(msg)
+    if alpha <= 0.0:
+        msg = "fused_parameterized_pme_direct_components_virial requires positive alpha"
+        raise ValueError(msg)
+    if int(lj_scales.size) != n_pairs:
+        msg = "lj_scales must contain one aligned value per pair"
+        raise ValueError(msg)
+    lj_scales = mx.reshape(lj_scales, (n_pairs,))
+
+    cutoff_value = float(cutoff)
+    has_switch = switch_distance is not None
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - float(switch_distance)
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(has_switch),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+        ],
+        dtype=mx.float32,
+    )
+    npair = mx.array([n_pairs], dtype=mx.int32)
+    box = as_mx_array(box_lengths, dtype=mx.float32)
+    threads = 256 if n_pairs >= 256 else n_pairs
+    forces, pair_lj_energy, pair_coulomb_energy, pair_virial = (
+        _parameterized_pme_direct_virial_kernel()(
+            inputs=[
+                positions,
+                pairs[:, 0],
+                pairs[:, 1],
+                box,
+                sigma,
+                epsilon,
+                charges,
+                lj_scales,
+                params,
+                npair,
+            ],
+            output_shapes=[
+                (n_atoms, 3),
+                (n_pairs,),
+                (n_pairs,),
+                (n_pairs, 3),
+            ],
+            output_dtypes=[
+                mx.float32,
+                mx.float32,
+                mx.float32,
+                mx.float32,
+            ],
+            grid=(n_pairs, 1, 1),
+            threadgroup=(threads, 1, 1),
+            init_value=0.0,
+        )
+    )
+    lj_energy = mx.sum(pair_lj_energy)
+    coulomb_energy = mx.sum(pair_coulomb_energy)
+    return (
+        lj_energy + coulomb_energy,
+        forces,
+        lj_energy,
+        coulomb_energy,
+        mx.sum(pair_virial, axis=0),
+    )
+
+
+def fused_pme_cutoff_correction_virial(
+    positions: mx.array,
+    molecule_centers: mx.array,
+    pairs: mx.array,
+    box_lengths: mx.array,
+    sigma: mx.array,
+    epsilon: mx.array,
+    charges: mx.array,
+    lj_scales: mx.array,
+    *,
+    cutoff: float,
+    strain_epsilon: float,
+    coulomb_constant: float,
+    alpha: float,
+    include_lj: bool,
+    include_coulomb: bool,
+) -> mx.array:
+    """Evaluate the finite-strain cutoff correction in one Metal dispatch.
+
+    Args:
+        positions: Atomic coordinates with shape ``(n_atoms, 3)``.
+        molecule_centers: Per-atom geometric molecule centers, shape
+            ``(n_atoms, 3)``.
+        pairs: Compact cutoff-shell pairs with shape ``(n_pairs, 2)``.
+        box_lengths: Orthorhombic cell lengths with shape ``(3,)``.
+        sigma: Per-atom LJ sigma values.
+        epsilon: Per-atom LJ epsilon values.
+        charges: Per-atom partial charges.
+        lj_scales: One aligned LJ scale per candidate; zero excludes LJ.
+        cutoff: Shared finite LJ and PME real-space cutoff.
+        strain_epsilon: Positive central finite-strain displacement.
+        coulomb_constant: Coulomb prefactor in the configured units.
+        alpha: Ewald splitting parameter.
+        include_lj: Whether to include the unswitched LJ correction.
+        include_coulomb: Whether to include the PME real-space boundary term.
+
+    Returns:
+        A diagonal ``(3, 3)`` cutoff-correction virial tensor.
+
+    Raises:
+        ValueError: If shapes or positive scalar parameters are invalid.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    molecule_centers = as_mx_array(molecule_centers, dtype=mx.float32)
+    pairs = as_mx_array(pairs, dtype=mx.int32)
+    sigma = as_mx_array(sigma, dtype=mx.float32)
+    epsilon = as_mx_array(epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    lj_scales = as_mx_array(lj_scales, dtype=mx.float32)
+    atom_count = int(positions.shape[0])
+    pair_count = int(pairs.shape[0])
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if molecule_centers.shape != positions.shape:
+        msg = "molecule_centers must match positions"
+        raise ValueError(msg)
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        msg = "pairs must have shape (n_pairs, 2)"
+        raise ValueError(msg)
+    if sigma.shape != (atom_count,) or epsilon.shape != (atom_count,):
+        msg = "sigma and epsilon must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if charges.shape != (atom_count,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if int(lj_scales.size) != pair_count:
+        msg = "lj_scales must contain one aligned value per pair"
+        raise ValueError(msg)
+    if cutoff <= 0.0 or strain_epsilon <= 0.0 or alpha <= 0.0:
+        msg = "cutoff, strain_epsilon, and alpha must be positive"
+        raise ValueError(msg)
+    if pair_count == 0 or not (include_lj or include_coulomb):
+        return mx.zeros((3, 3), dtype=mx.float32)
+
+    params = mx.array(
+        [
+            float(cutoff) * float(cutoff),
+            float(cutoff),
+            float(strain_epsilon),
+            float(coulomb_constant),
+            float(alpha),
+            float(include_lj),
+            float(include_coulomb),
+        ],
+        dtype=mx.float32,
+    )
+    npair = mx.array([pair_count], dtype=mx.int32)
+    threads = min(256, pair_count)
+    (pair_correction,) = _pme_cutoff_correction_virial_kernel()(
+        inputs=[
+            positions,
+            molecule_centers,
+            pairs[:, 0],
+            pairs[:, 1],
+            as_mx_array(box_lengths, dtype=mx.float32),
+            sigma,
+            epsilon,
+            charges,
+            mx.reshape(lj_scales, (pair_count,)),
+            params,
+            npair,
+        ],
+        output_shapes=[(pair_count, 3)],
+        output_dtypes=[mx.float32],
+        grid=(pair_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return mx.diag(mx.sum(pair_correction, axis=0))
 
 
 def fused_parameterized_pme_direct_forces(

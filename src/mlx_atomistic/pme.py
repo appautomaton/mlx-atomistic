@@ -1151,7 +1151,7 @@ def pme_coulomb_strain_energy(
     return sum(components.values())
 
 
-def _pme_coulomb_reciprocal_virial(
+def _pme_coulomb_reciprocal_energy_forces_virial(
     positions: mx.array,
     charges: mx.array,
     cell: Cell,
@@ -1161,8 +1161,8 @@ def _pme_coulomb_reciprocal_virial(
     plan: PMEExecutionPlan | None,
     masses: mx.array | None,
     molecule_ids: object | None,
-) -> mx.array:
-    """Return molecular reciprocal PME virial without full mesh backpropagation.
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Return reciprocal energy, forces, and molecular virial from one mesh.
 
     Homogeneous atomic strain leaves the fractional charge grid fixed, so its
     cell derivative only needs the reciprocal influence function.  Molecular
@@ -1191,18 +1191,19 @@ def _pme_coulomb_reciprocal_virial(
         coulomb_constant=coulomb_constant,
         plan=plan,
     )
-    _, reciprocal_forces, charge_grid = _mesh_reciprocal_energy_forces_core_mx(
-        wrapped_positions,
-        charges_mx,
-        cell_lengths,
-        influence=execution_plan.influence,
-        wavevectors=execution_plan.wavevectors,
-        mesh_shape=config.mesh_shape,
-        assignment_order=config.assignment_order,
-        grid_size=execution_plan.grid_size,
-        allow_order5_metal=True,
+    reciprocal_energy, reciprocal_forces, charge_grid, rho_hat = (
+        _mesh_reciprocal_energy_forces_core_mx(
+            wrapped_positions,
+            charges_mx,
+            cell_lengths,
+            influence=execution_plan.influence,
+            wavevectors=execution_plan.wavevectors,
+            mesh_shape=config.mesh_shape,
+            assignment_order=config.assignment_order,
+            grid_size=execution_plan.grid_size,
+            allow_order5_metal=True,
+        )
     )
-    rho_hat = mx.fft.fftn(charge_grid)
 
     def atomically_strained_energy(strain: mx.array) -> mx.array:
         strained_lengths = cell_lengths * (1.0 + strain)
@@ -1228,26 +1229,62 @@ def _pme_coulomb_reciprocal_virial(
         particle_count=particle_count,
     )
     if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
-        return mx.diag(atomic_diagonal)
+        reciprocal_virial = mx.diag(atomic_diagonal)
+    else:
+        molecule_count = int(np.max(ids)) + 1
+        molecule_index = mx.array(ids, dtype=mx.int32)
+        counts = (
+            mx.zeros((molecule_count,), dtype=original_positions.dtype)
+            .at[molecule_index]
+            .add(mx.ones((particle_count,), dtype=original_positions.dtype))
+        )
+        centers = (
+            mx.zeros((molecule_count, 3), dtype=original_positions.dtype)
+            .at[molecule_index]
+            .add(original_positions)
+            / counts[:, None]
+        )
+        molecular_correction = mx.sum(
+            reciprocal_forces
+            * (centers[molecule_index] - original_positions),
+            axis=0,
+        )
+        reciprocal_virial = mx.diag(
+            atomic_diagonal + molecular_correction
+        )
+    return (
+        reciprocal_energy.astype(mx.float32),
+        reciprocal_forces.astype(mx.float32),
+        reciprocal_virial,
+    )
 
-    molecule_count = int(np.max(ids)) + 1
-    molecule_index = mx.array(ids, dtype=mx.int32)
-    counts = (
-        mx.zeros((molecule_count,), dtype=original_positions.dtype)
-        .at[molecule_index]
-        .add(mx.ones((particle_count,), dtype=original_positions.dtype))
+
+def _pme_coulomb_reciprocal_virial(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float,
+    config: PMEConfig,
+    plan: PMEExecutionPlan | None,
+    masses: mx.array | None,
+    molecule_ids: object | None,
+) -> mx.array:
+    """Return molecular reciprocal PME virial without full mesh backpropagation."""
+
+    _, _, reciprocal_virial = (
+        _pme_coulomb_reciprocal_energy_forces_virial(
+            positions,
+            charges,
+            cell,
+            coulomb_constant=coulomb_constant,
+            config=config,
+            plan=plan,
+            masses=masses,
+            molecule_ids=molecule_ids,
+        )
     )
-    centers = (
-        mx.zeros((molecule_count, 3), dtype=original_positions.dtype)
-        .at[molecule_index]
-        .add(original_positions)
-        / counts[:, None]
-    )
-    molecular_correction = mx.sum(
-        reciprocal_forces * (centers[molecule_index] - original_positions),
-        axis=0,
-    )
-    return mx.diag(atomic_diagonal + molecular_correction)
+    return reciprocal_virial
 
 
 def pme_direct_space_policy_report(
@@ -2215,7 +2252,7 @@ def _mesh_reciprocal_energy_forces_mx(
         )
         return energy, forces, None
 
-    energy, forces, charge_grid = _mesh_reciprocal_energy_forces_core_mx(
+    energy, forces, charge_grid, _ = _mesh_reciprocal_energy_forces_core_mx(
         positions,
         charges,
         cell_lengths,
@@ -2253,7 +2290,7 @@ def _mesh_reciprocal_energy_forces_core_mx(
     assignment_order: int,
     grid_size: int,
     allow_order5_metal: bool,
-) -> tuple[mx.array, mx.array, mx.array]:
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     use_order5_metal = (
         allow_order5_metal
         and
@@ -2285,7 +2322,7 @@ def _mesh_reciprocal_energy_forces_core_mx(
             potential_grid,
             cell_lengths,
         )
-        return energy, forces, charge_grid
+        return energy, forces, charge_grid, rho_hat
     field_grids = [
         mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
         for k_axis in wavevectors
@@ -2305,7 +2342,7 @@ def _mesh_reciprocal_energy_forces_core_mx(
     )
     energy = 0.5 * mx.sum(charges * potential_at_atoms)
     forces = charges[:, None] * field_at_atoms
-    return energy, forces, charge_grid
+    return energy, forces, charge_grid, rho_hat
 
 
 def _compiled_reciprocal_evaluator(
@@ -2332,7 +2369,7 @@ def _compiled_reciprocal_evaluator(
         ky: mx.array,
         kz: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        energy, forces, _ = _mesh_reciprocal_energy_forces_core_mx(
+        energy, forces, _, _ = _mesh_reciprocal_energy_forces_core_mx(
             positions,
             charges,
             cell_lengths,
