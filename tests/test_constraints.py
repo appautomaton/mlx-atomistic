@@ -83,10 +83,14 @@ def test_settle_water_constraints_project_positions_exactly():
         [[0.0, 0.0, 0.0], [1.1, 0.1, 0.0], [-0.1, 0.9, 0.0]],
         dtype=np.float32,
     )
+    masses = np.asarray([16.0, 1.0, 1.0])
+    center_before = np.sum(positions * masses[:, None], axis=0) / np.sum(masses)
 
-    projected, error = constraints.apply_positions(positions, masses=np.asarray([16.0, 1.0, 1.0]))
+    projected, error = constraints.apply_positions(positions, masses=masses)
 
     np.testing.assert_allclose(_distances(np.asarray(projected)), [1.0, 1.0, 1.5], atol=1e-6)
+    center_after = np.sum(np.asarray(projected) * masses[:, None], axis=0) / np.sum(masses)
+    np.testing.assert_allclose(center_after, center_before, atol=1e-6)
     assert float(np.asarray(error)) <= 1e-6
 
 
@@ -113,16 +117,18 @@ def test_periodic_settle_preserves_continuous_water_coordinates():
 
 def test_settle_water_constraints_remove_pair_relative_velocity():
     constraints = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
+    masses = np.asarray([16.0, 1.0, 1.0])
     projected, _ = constraints.apply_positions(
         np.asarray([[0.0, 0.0, 0.0], [1.1, 0.1, 0.0], [-0.1, 0.9, 0.0]], dtype=np.float32),
-        masses=np.asarray([16.0, 1.0, 1.0]),
+        masses=masses,
     )
     velocities = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.2, 0.0], [-0.4, 0.3, 0.0]])
+    momentum_before = np.sum(velocities * masses[:, None], axis=0)
 
     constrained = constraints.apply_velocities(
         projected,
         velocities,
-        masses=np.asarray([16.0, 1.0, 1.0]),
+        masses=masses,
     )
 
     for left, right in np.asarray(constraints.pairs):
@@ -130,6 +136,8 @@ def test_settle_water_constraints_remove_pair_relative_velocity():
         unit = displacement / np.linalg.norm(displacement)
         relative = np.asarray(constrained)[left] - np.asarray(constrained)[right]
         assert abs(float(np.dot(relative, unit))) < 1e-6
+    momentum_after = np.sum(np.asarray(constrained) * masses[:, None], axis=0)
+    np.testing.assert_allclose(momentum_after, momentum_before, atol=1e-6)
 
 
 def test_settle_interoperates_with_generic_distance_constraints_in_nve():
@@ -154,6 +162,47 @@ def test_settle_interoperates_with_generic_distance_constraints_in_nve():
 
     assert constraints.pairs.shape[0] == 4
     assert float(np.max(np.asarray(result.constraint_max_error))) < 1e-5
+
+
+def test_overlapping_composite_constraints_project_all_relative_velocities():
+    settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
+    tether = DistanceConstraints([(0, 3)], distances=[2.0], max_iterations=4)
+    constraints = CompositeConstraints((tether, settle))
+    masses = np.asarray([16.0, 1.0, 1.0, 12.0], dtype=np.float32)
+    positions, _ = constraints.apply_positions(
+        np.asarray(
+            [
+                [2.0, 2.0, 2.0],
+                [3.1, 2.1, 2.0],
+                [1.9, 2.9, 2.0],
+                [4.1, 2.0, 2.0],
+            ],
+            dtype=np.float32,
+        ),
+        masses,
+        Cell.cubic(8.0),
+    )
+    velocities = np.asarray(
+        [
+            [0.3, -0.1, 0.2],
+            [-0.2, 0.4, 0.0],
+            [0.1, -0.3, 0.2],
+            [-0.4, 0.2, -0.1],
+        ],
+        dtype=np.float32,
+    )
+
+    projected = constraints.apply_velocities(
+        positions,
+        velocities,
+        masses,
+        Cell.cubic(8.0),
+    )
+
+    for left, right in np.asarray(constraints.pairs):
+        displacement = np.asarray(positions)[left] - np.asarray(positions)[right]
+        relative = np.asarray(projected)[left] - np.asarray(projected)[right]
+        assert abs(float(np.dot(relative, displacement))) < 1e-5
 
 
 def test_settle_rejects_malformed_water_topology():

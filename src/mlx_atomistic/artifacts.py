@@ -12,7 +12,11 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.compatibility import normalize_compatibility_report
-from mlx_atomistic.constraints import DistanceConstraints
+from mlx_atomistic.constraints import (
+    CompositeConstraints,
+    DistanceConstraints,
+    SettleWaterConstraints,
+)
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.forcefields import (
     CHARMMCMAPPotential,
@@ -1545,7 +1549,11 @@ def build_mlx_system_from_artifact(
     restraint_k: float = 0.0,
     constraint_max_iterations: int = 20,
     eager_nonbonded_pair_limit: int | None = DEFAULT_EAGER_NONBONDED_PAIR_LIMIT,
-) -> tuple[MMSystem, list, DistanceConstraints | None]:
+) -> tuple[
+    MMSystem,
+    list,
+    DistanceConstraints | SettleWaterConstraints | CompositeConstraints | None,
+]:
     """Convert a prepared artifact into `MMSystem`, force terms, and constraints."""
 
     arrays = dict(artifact.arrays)
@@ -1941,12 +1949,169 @@ def build_mlx_system_from_artifact(
         )
     distance_constraints = None
     if constraints.shape[0] > 0:
-        distance_constraints = DistanceConstraints(
+        distance_constraints = _runtime_constraints_from_artifact(
+            arrays,
             constraints,
-            distances=constraint_distances,
+            constraint_distances,
+            system_atom_count=system_atom_count,
             max_iterations=constraint_max_iterations,
         )
     return system, terms, distance_constraints
+
+
+def _runtime_constraints_from_artifact(
+    arrays: dict[str, np.ndarray],
+    pairs: np.ndarray,
+    distances: np.ndarray,
+    *,
+    system_atom_count: int,
+    max_iterations: int,
+) -> DistanceConstraints | SettleWaterConstraints | CompositeConstraints:
+    partition = _rigid_water_constraint_partition(
+        arrays,
+        pairs,
+        distances,
+        system_atom_count=system_atom_count,
+    )
+    if partition is None:
+        return DistanceConstraints(
+            pairs,
+            distances=distances,
+            max_iterations=max_iterations,
+        )
+
+    waters, water_rows, oh_distance, hh_distance = partition
+    settle = SettleWaterConstraints(
+        waters,
+        oh_distance=oh_distance,
+        hh_distance=hh_distance,
+    )
+    remaining_mask = np.ones((pairs.shape[0],), dtype=bool)
+    remaining_mask[water_rows] = False
+    if not np.any(remaining_mask):
+        return settle
+    remaining = DistanceConstraints(
+        pairs[remaining_mask],
+        distances=distances[remaining_mask],
+        max_iterations=min(max_iterations, 8),
+    )
+    return CompositeConstraints((settle, remaining))
+
+
+def _rigid_water_constraint_partition(
+    arrays: dict[str, np.ndarray],
+    pairs: np.ndarray,
+    distances: np.ndarray,
+    *,
+    system_atom_count: int,
+) -> tuple[np.ndarray, np.ndarray, float, float] | None:
+    water_mask = np.asarray(
+        arrays.get("water_mask", np.asarray([], dtype=bool)),
+        dtype=bool,
+    )
+    molecule_ids = np.asarray(
+        arrays.get("molecule_ids", np.asarray([], dtype=np.int32)),
+        dtype=np.int32,
+    )
+    symbols = np.char.upper(
+        np.asarray(
+            arrays.get("symbols", np.asarray([], dtype=str)),
+            dtype=str,
+        )
+    )
+    if (
+        water_mask.shape[0] < system_atom_count
+        or molecule_ids.shape[0] < system_atom_count
+        or symbols.shape[0] < system_atom_count
+    ):
+        return None
+    water_mask = water_mask[:system_atom_count]
+    molecule_ids = molecule_ids[:system_atom_count]
+    symbols = symbols[:system_atom_count]
+    water_atoms = np.flatnonzero(water_mask)
+    if water_atoms.size == 0:
+        return None
+
+    edge_rows: dict[tuple[int, int], int] = {}
+    for row, (left, right) in enumerate(
+        np.asarray(pairs, dtype=np.int32)
+    ):
+        edge = tuple(sorted((int(left), int(right))))
+        if edge in edge_rows:
+            return None
+        edge_rows[edge] = row
+
+    waters: list[tuple[int, int, int]] = []
+    water_rows: list[int] = []
+    oh_distances: list[float] = []
+    hh_distances: list[float] = []
+    for molecule_id in np.unique(molecule_ids[water_mask]):
+        members = np.flatnonzero(molecule_ids == molecule_id)
+        if (
+            members.shape != (3,)
+            or not np.all(water_mask[members])
+        ):
+            return None
+        member_symbols = symbols[members]
+        oxygen_candidates = members[member_symbols == "O"]
+        hydrogen_candidates = np.sort(members[member_symbols == "H"])
+        if (
+            oxygen_candidates.shape != (1,)
+            or hydrogen_candidates.shape != (2,)
+        ):
+            return None
+        oxygen = int(oxygen_candidates[0])
+        hydrogen_a = int(hydrogen_candidates[0])
+        hydrogen_b = int(hydrogen_candidates[1])
+        edges = (
+            tuple(sorted((oxygen, hydrogen_a))),
+            tuple(sorted((oxygen, hydrogen_b))),
+            tuple(sorted((hydrogen_a, hydrogen_b))),
+        )
+        if any(edge not in edge_rows for edge in edges):
+            return None
+        rows = [edge_rows[edge] for edge in edges]
+        local_oh = [
+            float(distances[rows[0]]),
+            float(distances[rows[1]]),
+        ]
+        if not np.isclose(
+            local_oh[0],
+            local_oh[1],
+            rtol=1.0e-5,
+            atol=1.0e-6,
+        ):
+            return None
+        local_hh = float(distances[rows[2]])
+        if local_hh >= 2.0 * local_oh[0]:
+            return None
+        waters.append((oxygen, hydrogen_a, hydrogen_b))
+        water_rows.extend(rows)
+        oh_distances.append(local_oh[0])
+        hh_distances.append(local_hh)
+
+    if not waters:
+        return None
+    if not np.allclose(
+        oh_distances,
+        oh_distances[0],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    ):
+        return None
+    if not np.allclose(
+        hh_distances,
+        hh_distances[0],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    ):
+        return None
+    return (
+        np.asarray(waters, dtype=np.int32),
+        np.asarray(water_rows, dtype=np.int32),
+        oh_distances[0],
+        hh_distances[0],
+    )
 
 
 def _virtual_sites_from_arrays(

@@ -77,8 +77,12 @@ median of 13.77 seconds and peak process-tree memory from 27.33 GB to
 separate 2,269-atom alanine 50-step gate measured the reciprocal-kernel change:
 0.853 to 0.537 seconds without pressure diagnostics and 1.313 to 0.987 seconds
 with analytic pressure diagnostics, with fixed-coordinate OpenMM parity still
-passing. No production-length claim is made from these bounded performance
-prefixes.
+passing. Batched MLX rigid-water projection then reduced those medians to 0.419
+and 0.863 seconds, respectively. A complete 100-step NVT plus 1,000-step NPT
+check passed all 16 unchanged science gates in 15.899 seconds versus the prior
+23.110 seconds, with `3.34e-6` A maximum constraint error and a 0.94 GB
+process-tree peak. This is one-picosecond stability evidence; no
+production-length claim is made.
 
 ## Validated Charged Fixed-Cell PME Envelope
 

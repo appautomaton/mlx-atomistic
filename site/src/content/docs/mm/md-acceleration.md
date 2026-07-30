@@ -100,10 +100,18 @@ reciprocal PME now also uses dedicated Metal charge-spread and
 potential-derivative interpolation kernels, reducing the 2,269-atom alanine
 50-step fixed-cell median from 0.853 to 0.537 seconds without pressure
 diagnostics and from 1.313 to 0.987 seconds with analytic pressure diagnostics.
-Fixed-coordinate OpenMM parity remained within the accepted energy and force
-gates. These measurements were made on an M5 Max in low-power mode. This is
-bounded optimization evidence, not a new production-length validation. Charged
-fixed-cell PME also has a separate 94,232-atom JAC validation. See
+The artifact loader now also routes complete three-site water constraint
+triangles to a batched MLX rigid-water projector while preserving a fail-closed
+generic path for incomplete or mixed geometries. That reduced the same
+fixed-cell median from 0.537 to 0.419 seconds and the analytic-pressure median
+from 0.987 to 0.863 seconds. The complete 100-step NVT plus 1,000-step NPT
+alanine check then passed all 16 unchanged science gates in 15.899 seconds,
+down from 23.110 seconds, with a `3.34e-6` A maximum constraint error and a
+0.94 GB process-tree peak. Fixed-coordinate OpenMM parity remained within the
+accepted energy and force gates. These measurements were made on an M5 Max in
+low-power mode. This is bounded optimization and one-picosecond stability
+evidence, not a production-length validation. Charged fixed-cell PME also has
+a separate 94,232-atom JAC validation. See
 [`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](../benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md)
 and
 [`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](../benchmarks/scalable-charged-pme-runtime-m5max.md),

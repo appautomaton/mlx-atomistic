@@ -8,10 +8,16 @@ import pytest
 from mlx_atomistic.artifacts import (
     MLXCompatibilityError,
     PreparedMLXArtifact,
+    _runtime_constraints_from_artifact,
     artifact_readiness_report,
     build_mlx_system_from_artifact,
     load_prepared_mlx_artifact,
     validate_mlx_compatibility,
+)
+from mlx_atomistic.constraints import (
+    CompositeConstraints,
+    DistanceConstraints,
+    SettleWaterConstraints,
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.minimize import minimize_energy
@@ -340,6 +346,57 @@ def test_core_artifact_loader_builds_production_system_terms_and_constraints(tmp
     )
     assert tuned_constraints is not None
     assert tuned_constraints.max_iterations == 4
+
+
+def test_artifact_constraints_partition_rigid_waters_from_residual_bonds():
+    arrays = {
+        "symbols": np.asarray(["O", "H", "H", "C", "H"], dtype=str),
+        "water_mask": np.asarray([True, True, True, False, False]),
+        "molecule_ids": np.asarray([0, 0, 0, 1, 1], dtype=np.int32),
+    }
+    pairs = np.asarray(
+        [[0, 1], [0, 2], [1, 2], [3, 4]],
+        dtype=np.int32,
+    )
+    distances = np.asarray([0.9572, 0.9572, 1.5139, 1.09], dtype=np.float32)
+
+    constraints = _runtime_constraints_from_artifact(
+        arrays,
+        pairs,
+        distances,
+        system_atom_count=5,
+        max_iterations=40,
+    )
+
+    assert isinstance(constraints, CompositeConstraints)
+    settle, remaining = constraints.constraints
+    assert isinstance(settle, SettleWaterConstraints)
+    assert isinstance(remaining, DistanceConstraints)
+    np.testing.assert_array_equal(np.asarray(settle.waters), [[0, 1, 2]])
+    np.testing.assert_array_equal(np.asarray(remaining.pairs), [[3, 4]])
+    assert remaining.max_iterations == 8
+
+
+def test_artifact_constraints_fail_closed_when_water_topology_is_incomplete():
+    arrays = {
+        "symbols": np.asarray(["O", "H", "H", "C", "H"], dtype=str),
+        "water_mask": np.asarray([True, True, True, False, False]),
+        "molecule_ids": np.asarray([0, 0, 0, 1, 1], dtype=np.int32),
+    }
+    pairs = np.asarray([[0, 1], [0, 2], [3, 4]], dtype=np.int32)
+    distances = np.asarray([0.9572, 0.9572, 1.09], dtype=np.float32)
+
+    constraints = _runtime_constraints_from_artifact(
+        arrays,
+        pairs,
+        distances,
+        system_atom_count=5,
+        max_iterations=40,
+    )
+
+    assert isinstance(constraints, DistanceConstraints)
+    assert constraints.max_iterations == 40
+    np.testing.assert_array_equal(np.asarray(constraints.pairs), pairs)
 
 
 def test_legacy_artifact_without_molecule_ids_remains_readable(tmp_path):
