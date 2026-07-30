@@ -2899,6 +2899,7 @@ class NonbondedPotential:
         *,
         masses: mx.array | None,
         molecule_ids: object | None,
+        cutoff_strain_pairs: mx.array | None = None,
     ) -> (
         tuple[
             mx.array,
@@ -3108,19 +3109,23 @@ class NonbondedPotential:
             mx.diag(direct_atomic_diagonal + molecular_correction)
             + small_virial
         )
-        strain_pairs = self._compact_cutoff_strain_pairs(
-            positions,
-            cell=cell,
-            strain_epsilon=1.0e-3,
+        strain_pairs = cutoff_strain_pairs
+        if strain_pairs is None:
+            strain_pairs = self._compact_cutoff_strain_pairs(
+                positions,
+                cell=cell,
+                strain_epsilon=1.0e-3,
+            )
+        elif (
+            not isinstance(strain_pairs, mx.array)
+            or strain_pairs.ndim != 2
+            or strain_pairs.shape[1] != 2
+        ):
+            msg = "cutoff strain pairs must have shape (n_pairs, 2)"
+            raise ValueError(msg)
+        aligned_strain_lj_scales = (
+            self._compact_aligned_lj_scales(strain_pairs)
         )
-        topology_mask, strain_lj_scales, _ = (
-            self._compact_pair_masks_and_scales(strain_pairs)
-        )
-        aligned_strain_lj_scales = mx.where(
-            topology_mask,
-            strain_lj_scales,
-            0.0,
-        ).astype(mx.float32)
         needs_lj = not (
             self.lj_shift
             or self.switch_distance is not None
@@ -3151,6 +3156,35 @@ class NonbondedPotential:
             + cutoff_correction
         )
         return lj_energy + coulomb_energy, forces, components, virial
+
+    def _runtime_energy_forces_with_components_virial_reusing_pairs(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+        *,
+        masses: mx.array | None,
+        molecule_ids: object | None,
+        cutoff_strain_pairs: mx.array,
+    ) -> (
+        tuple[
+            mx.array,
+            mx.array,
+            dict[str, mx.array | object],
+            mx.array,
+        ]
+        | NotImplementedType
+    ):
+        """Evaluate diagnostics using a scheduler-proven complete pair set."""
+
+        return self._runtime_energy_forces_with_components_virial(
+            positions,
+            cell,
+            pairs,
+            masses=masses,
+            molecule_ids=molecule_ids,
+            cutoff_strain_pairs=cutoff_strain_pairs,
+        )
 
     def _runtime_forces(
         self,

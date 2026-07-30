@@ -9,6 +9,7 @@ from mlx_atomistic.md import (
     LennardJonesPotential,
     NoseHooverThermostat,
     SimulationConfig,
+    _diagnostic_cutoff_strain_pairs,
     _evaluate_force_terms,
     _ForceEvaluationRequest,
     _langevin_block_execution_enabled,
@@ -110,6 +111,48 @@ def test_internal_force_evaluation_dispatches_exact_requested_mode(
     assert (result.virial is not None) == (evaluation_request.mode == "diagnostic")
 
 
+def test_diagnostic_cutoff_strain_pairs_require_complete_verlet_margin():
+    positions, _, cell, _ = _small_system()
+    manager = NeighborListManager(
+        cell,
+        cutoff=2.5,
+        skin=0.4,
+        backend="mlx_cell_pairs",
+    )
+    neighbor_list = manager.update(positions)
+
+    assert (
+        _diagnostic_cutoff_strain_pairs(
+            manager,
+            neighbor_list,
+            cell,
+        )
+        is neighbor_list.interactions
+    )
+
+    manager.updates_since_check = 1
+    assert _diagnostic_cutoff_strain_pairs(manager, neighbor_list, cell) is None
+    manager.updates_since_check = 0
+    assert (
+        _diagnostic_cutoff_strain_pairs(
+            manager,
+            neighbor_list,
+            Cell.cubic(7.0),
+        )
+        is None
+    )
+
+    manager.last_max_displacement = 0.2
+    assert (
+        _diagnostic_cutoff_strain_pairs(
+            manager,
+            neighbor_list,
+            cell,
+        )
+        is None
+    )
+
+
 def test_internal_analytic_diagnostic_uses_one_combined_owner():
     class CombinedDiagnosticTerm(_DemandCountingTerm):
         def _runtime_energy_forces_with_components_virial(
@@ -147,6 +190,49 @@ def test_internal_analytic_diagnostic_uses_one_combined_owner():
     assert result.optimized_terms == 1
     assert result.fallback_terms == 0
     assert result.virial is not None
+
+
+def test_internal_analytic_diagnostic_uses_proven_cutoff_strain_pairs():
+    class ReusedPairDiagnosticTerm(_DemandCountingTerm):
+        def _runtime_energy_forces_with_components_virial_reusing_pairs(
+            self,
+            positions,
+            cell=None,
+            pairs=None,
+            *,
+            masses=None,
+            molecule_ids=None,
+            cutoff_strain_pairs=None,
+        ):
+            del cell, pairs, masses, molecule_ids
+            self.calls.append(("reused_diagnostic", cutoff_strain_pairs))
+            energy = mx.sum(positions * 0.0)
+            return (
+                energy,
+                mx.zeros_like(positions),
+                {"zero": energy},
+                mx.zeros((3, 3), dtype=positions.dtype),
+            )
+
+    term = ReusedPairDiagnosticTerm()
+    strain_pairs = mx.array([[0, 1]], dtype=mx.int32)
+    result = _evaluate_force_terms(
+        mx.zeros((2, 3), dtype=mx.float32),
+        (term,),
+        request=_ForceEvaluationRequest(
+            "diagnostic",
+            virial_mode="analytic",
+        ),
+        cell=Cell.cubic(6.0),
+        pairs=strain_pairs,
+        cutoff_strain_pairs=strain_pairs,
+    )
+
+    assert len(term.calls) == 1
+    assert term.calls[0][0] == "reused_diagnostic"
+    assert term.calls[0][1] is strain_pairs
+    assert result.optimized_terms == 1
+    assert result.fallback_terms == 0
 
 
 @pytest.mark.parametrize("mode", ["forces", "energy"])

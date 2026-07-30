@@ -1558,6 +1558,7 @@ def _evaluate_force_terms(
     masses: mx.array | None = None,
     molecule_ids: object | None = None,
     named_force_terms: tuple[tuple[str, ForceTerm], ...] | None = None,
+    cutoff_strain_pairs: mx.array | None = None,
 ) -> _ForceEvaluationResult:
     """Evaluate force terms for one exact internal output demand."""
 
@@ -1576,6 +1577,7 @@ def _evaluate_force_terms(
                 virtual_sites=virtual_sites,
                 masses=masses,
                 molecule_ids=molecule_ids,
+                cutoff_strain_pairs=cutoff_strain_pairs,
             )
             if combined is not NotImplemented:
                 (
@@ -1873,6 +1875,7 @@ def _analytic_diagnostic_by_term(
     virtual_sites: VirtualSiteManager | None,
     masses: mx.array | None,
     molecule_ids: object | None,
+    cutoff_strain_pairs: mx.array | None = None,
 ) -> (
     tuple[
         mx.array,
@@ -1912,6 +1915,17 @@ def _analytic_diagnostic_by_term(
             "_runtime_energy_forces_with_components_virial",
             None,
         )
+        reuse_diagnostic = None
+        reuses_cutoff_strain_pairs = False
+        if cutoff_strain_pairs is not None:
+            reuse_diagnostic = getattr(
+                term,
+                "_runtime_energy_forces_with_components_virial_reusing_pairs",
+                None,
+            )
+            if callable(reuse_diagnostic):
+                combined_diagnostic = reuse_diagnostic
+                reuses_cutoff_strain_pairs = True
         result = (
             combined_diagnostic(
                 eval_positions,
@@ -1919,6 +1933,11 @@ def _analytic_diagnostic_by_term(
                 pairs,
                 masses=masses,
                 molecule_ids=molecule_ids,
+                **(
+                    {"cutoff_strain_pairs": cutoff_strain_pairs}
+                    if reuses_cutoff_strain_pairs
+                    else {}
+                ),
             )
             if callable(combined_diagnostic)
             else NotImplemented
@@ -2047,6 +2066,56 @@ def _neighbor_evaluation_positions(
     return _virtual_site_evaluation_positions(positions, virtual_sites)
 
 
+def _diagnostic_cutoff_strain_pairs(
+    neighbor_manager: NeighborListManager | None,
+    neighbor_list: NeighborList | None,
+    cell: Cell | None,
+    *,
+    strain_epsilon: float = 1.0e-3,
+) -> mx.array | None:
+    """Return current Verlet pairs when they safely cover cell-strain work."""
+
+    if (
+        neighbor_manager is None
+        or neighbor_list is None
+        or cell is None
+        or not cell.is_orthorhombic
+        or neighbor_list is not neighbor_manager.neighbor_list
+        or neighbor_manager.updates_since_check != 0
+        or strain_epsilon <= 0.0
+        or not np.isclose(
+            float(neighbor_list.cutoff),
+            float(neighbor_manager.cutoff),
+            rtol=1.0e-7,
+            atol=1.0e-8,
+        )
+        or not np.isclose(
+            float(neighbor_list.skin),
+            float(neighbor_manager.skin),
+            rtol=1.0e-7,
+            atol=1.0e-8,
+        )
+        or not isinstance(neighbor_list.interactions, mx.array)
+        or not np.array_equal(
+            np.asarray(neighbor_manager.cell.matrix),
+            np.asarray(cell.matrix),
+        )
+    ):
+        return None
+    required_shell = (
+        float(np.max(np.asarray(cell.lengths, dtype=np.float64)))
+        * strain_epsilon
+        * 1.1
+    )
+    remaining_pair_margin = (
+        float(neighbor_list.skin)
+        - 2.0 * float(neighbor_manager.last_max_displacement)
+    )
+    if remaining_pair_margin + 1.0e-7 < required_shell:
+        return None
+    return neighbor_list.interactions
+
+
 def _forces_from_terms(
     positions: mx.array,
     force_terms: tuple[ForceTerm, ...],
@@ -2120,6 +2189,7 @@ def _diagnostic_from_terms(
     virtual_sites: VirtualSiteManager | None = None,
     virial_mode: str | None = None,
     masses: mx.array | None = None,
+    cutoff_strain_pairs: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, dict[str, mx.array], mx.array | None]:
     request = (
         _DIAGNOSTIC_REQUEST
@@ -2135,6 +2205,7 @@ def _diagnostic_from_terms(
         virtual_sites=virtual_sites,
         masses=masses,
         named_force_terms=force_terms,
+        cutoff_strain_pairs=cutoff_strain_pairs,
     )
     if result.energy is None or result.forces is None:
         msg = "diagnostic evaluation did not return energy and forces"
@@ -2151,6 +2222,7 @@ def _make_energy_forces_by_term_evaluator(
     virtual_sites: VirtualSiteManager | None = None,
     virial_mode: str | None = None,
     masses: mx.array | None = None,
+    cutoff_strain_pairs: mx.array | None = None,
 ):
     unnamed_terms = tuple(term for _, term in force_terms)
     request = (
@@ -2169,6 +2241,7 @@ def _make_energy_forces_by_term_evaluator(
             virtual_sites=virtual_sites,
             masses=masses,
             named_force_terms=force_terms,
+            cutoff_strain_pairs=cutoff_strain_pairs,
         )
         if result.energy is None or result.forces is None:
             msg = "diagnostic evaluation did not return energy and forces"
@@ -2881,6 +2954,11 @@ def simulate_nve(
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
+    cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
+        neighbor_manager,
+        neighbor_list,
+        cell,
+    )
     force_evaluation_wall_seconds = 0.0
     energy_forces_by_term = _make_energy_forces_by_term_evaluator(
         terms,
@@ -2892,6 +2970,7 @@ def simulate_nve(
             config.pressure_virial_mode if config.pressure_diagnostics else None
         ),
         masses=masses,
+        cutoff_strain_pairs=cutoff_strain_pairs,
     )
     forces_evaluator = _make_forces_evaluator(
         unnamed_terms,
@@ -3037,6 +3116,11 @@ def simulate_nve(
             next_forces = forces_evaluator(next_positions)
             energy_by_term = None
         elif diagnostic_step:
+            cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
+                neighbor_manager,
+                neighbor_list,
+                cell,
+            )
             (
                 potential_energy,
                 next_forces,
@@ -3054,6 +3138,7 @@ def simulate_nve(
                     else None
                 ),
                 masses=masses,
+                cutoff_strain_pairs=cutoff_strain_pairs,
             )
         else:
             potential_energy = None
@@ -3337,6 +3422,11 @@ def _simulate_nvt(
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
+    cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
+        neighbor_manager,
+        neighbor_list,
+        cell,
+    )
     force_evaluation_wall_seconds = 0.0
     energy_forces_by_term = _make_energy_forces_by_term_evaluator(
         terms,
@@ -3348,6 +3438,7 @@ def _simulate_nvt(
             config.pressure_virial_mode if config.pressure_diagnostics else None
         ),
         masses=masses,
+        cutoff_strain_pairs=cutoff_strain_pairs,
     )
     energy_forces = _make_energy_forces_evaluator(
         unnamed_terms,
@@ -3635,6 +3726,13 @@ def _simulate_nvt(
                             for name, energies in potential_energy_by_term.items()
                         }
                     else:
+                        cutoff_strain_pairs = (
+                            _diagnostic_cutoff_strain_pairs(
+                                neighbor_manager,
+                                neighbor_list,
+                                cell,
+                            )
+                        )
                         (
                             potential_energy,
                             _,
@@ -3652,6 +3750,7 @@ def _simulate_nvt(
                                 else None
                             ),
                             masses=masses,
+                            cutoff_strain_pairs=cutoff_strain_pairs,
                         )
                     fe_wall += perf_counter() - force_start
 
@@ -3875,6 +3974,11 @@ def _simulate_nvt(
             next_forces = forces_evaluator(next_positions)
             energy_by_term = None
         elif full_diagnostic_step:
+            cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
+                neighbor_manager,
+                neighbor_list,
+                cell,
+            )
             (
                 potential_energy,
                 next_forces,
@@ -3892,6 +3996,7 @@ def _simulate_nvt(
                     else None
                 ),
                 masses=masses,
+                cutoff_strain_pairs=cutoff_strain_pairs,
             )
         elif deferred_final:
             potential_energy, next_forces = _energy_forces_from_terms(

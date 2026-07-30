@@ -411,6 +411,21 @@ def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
     )
     assert fused is not NotImplemented
     energy, forces, components, virial = fused
+    reused = (
+        potential
+        ._runtime_energy_forces_with_components_virial_reusing_pairs(
+            positions,
+            cell,
+            pairs,
+            masses=masses,
+            molecule_ids=molecule_ids,
+            cutoff_strain_pairs=pairs,
+        )
+    )
+    assert reused is not NotImplemented
+    reused_energy, reused_forces, reused_components, reused_virial = (
+        reused
+    )
     mx.eval(
         reference_energy,
         reference_forces,
@@ -418,8 +433,12 @@ def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
         energy,
         forces,
         virial,
+        reused_energy,
+        reused_forces,
+        reused_virial,
         *reference_components.values(),
         *components.values(),
+        *reused_components.values(),
     )
 
     np.testing.assert_allclose(
@@ -445,6 +464,25 @@ def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
     np.testing.assert_allclose(
         np.diag(np.asarray(virial)),
         np.diag(np.asarray(reference_virial)),
+        rtol=3e-3,
+        atol=5e-2,
+    )
+    np.testing.assert_allclose(
+        np.asarray(reused_energy),
+        np.asarray(energy),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(reused_forces),
+        np.asarray(forces),
+        rtol=1e-5,
+        atol=3e-4,
+    )
+    assert set(reused_components) == set(components)
+    np.testing.assert_allclose(
+        np.diag(np.asarray(reused_virial)),
+        np.diag(np.asarray(virial)),
         rtol=3e-3,
         atol=5e-2,
     )
