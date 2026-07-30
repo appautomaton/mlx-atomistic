@@ -639,6 +639,16 @@ class NVTResult:
 
 
 @dataclass(frozen=True)
+class _NVTBoundaryDiagnostics:
+    """Diagnostics already committed at an NPT segment boundary."""
+
+    energy_by_term: dict[str, mx.array]
+    virial_tensor: mx.array
+    pressure_tensor: mx.array
+    pressure: mx.array
+
+
+@dataclass(frozen=True)
 class MonteCarloBarostat:
     """Monte Carlo barostat parameters for isotropic, anisotropic, and membrane NPT."""
 
@@ -1092,9 +1102,7 @@ def _potential_energy_for_virial(
                 skin=0.0,
                 backend="mlx_cell_blocks",
             )
-            candidate_pairs = candidate_manager.update(
-                evaluation_positions
-            ).interactions
+            candidate_pairs = candidate_manager.update(evaluation_positions).interactions
     energy, _ = _energy_forces_from_terms(
         positions,
         candidate_terms,
@@ -1145,22 +1153,26 @@ def kinetic_pressure_tensor(
         )
         molecule_count = int(np.max(ids)) + 1
         indices = mx.array(ids, dtype=mx.int32)
-        molecule_masses = mx.zeros(
-            (molecule_count,),
-            dtype=masses.dtype,
-        ).at[indices].add(masses)
+        molecule_masses = (
+            mx.zeros(
+                (molecule_count,),
+                dtype=masses.dtype,
+            )
+            .at[indices]
+            .add(masses)
+        )
         momenta = masses[:, None] * velocities
-        molecule_momenta = mx.zeros(
-            (molecule_count, 3),
-            dtype=velocities.dtype,
-        ).at[indices].add(momenta)
+        molecule_momenta = (
+            mx.zeros(
+                (molecule_count, 3),
+                dtype=velocities.dtype,
+            )
+            .at[indices]
+            .add(momenta)
+        )
         molecule_velocities = molecule_momenta / molecule_masses[:, None]
         weighted_velocities = molecule_masses[:, None] * molecule_velocities
-        return (
-            kinetic_energy_scale
-            * mx.transpose(molecule_velocities)
-            @ weighted_velocities
-        )
+        return kinetic_energy_scale * mx.transpose(molecule_velocities) @ weighted_velocities
     weighted_velocities = masses[:, None] * velocities
     return kinetic_energy_scale * mx.transpose(velocities) @ weighted_velocities
 
@@ -1327,17 +1339,12 @@ def virial_readiness_report(
 ) -> ReadinessReport:
     """Return per-term analytic, oracle-only, or unsupported virial readiness."""
 
-    states = {
-        name: virial_support_state(term)
-        for name, term in _named_force_terms(force_terms)
-    }
+    states = {name: virial_support_state(term) for name, term in _named_force_terms(force_terms)}
     unsupported = tuple(
         name for name, state in states.items() if state == VIRIAL_SUPPORT_UNSUPPORTED
     )
     oracle_only = tuple(
-        name
-        for name, state in states.items()
-        if state == VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE
+        name for name, state in states.items() if state == VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE
     )
     blockers = tuple(f"unsupported:{name}" for name in unsupported)
     if require_analytic:
@@ -1518,7 +1525,17 @@ def _energy_forces_by_term(
             energy_by_term[name] = term.potential_energy(eval_positions, cell)
             continue
 
-        combined_components = getattr(term, "energy_forces_with_components", None)
+        combined_components = getattr(
+            term,
+            "_runtime_energy_forces_with_components",
+            None,
+        )
+        if not callable(combined_components):
+            combined_components = getattr(
+                term,
+                "energy_forces_with_components",
+                None,
+            )
         if callable(combined_components):
             energy, forces, components = combined_components(eval_positions, cell, pairs=pairs)
             for component_name, component_energy in components.items():
@@ -1716,9 +1733,7 @@ class _RuntimeSyncRecorder:
         for reason in RUNTIME_SYNC_REASONS:
             report[f"runtime_sync_{reason}_count"] = self.sync_counts[reason]
             report[f"runtime_sync_{reason}_wall_seconds"] = self.sync_wall_seconds[reason]
-            report[f"runtime_materialization_{reason}_count"] = (
-                self.materialization_counts[reason]
-            )
+            report[f"runtime_materialization_{reason}_count"] = self.materialization_counts[reason]
             report[f"runtime_materialization_{reason}_wall_seconds"] = (
                 self.materialization_wall_seconds[reason]
             )
@@ -1834,11 +1849,7 @@ def _eval_step_state(
     runtime_sync: _RuntimeSyncRecorder | None = None,
     sync_reason: str = "diagnostic",
 ) -> float:
-    state_values = (
-        (state.positions, state.velocities)
-        if evaluate_sampled_state
-        else ()
-    )
+    state_values = (state.positions, state.velocities) if evaluate_sampled_state else ()
     values = (
         *state_values,
         state.forces,
@@ -1867,11 +1878,7 @@ def _eval_runtime_state(
     runtime_sync: _RuntimeSyncRecorder | None = None,
     sync_reason: str = "failure_check",
 ) -> float:
-    state_values = (
-        (state.positions, state.velocities)
-        if evaluate_sampled_state
-        else ()
-    )
+    state_values = (state.positions, state.velocities) if evaluate_sampled_state else ()
     values = (
         *state_values,
         state.forces,
@@ -2616,6 +2623,37 @@ def simulate_nvt(
             temperature-control metrics.
     """
 
+    return _simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=force_terms,
+        neighbor_manager=neighbor_manager,
+        config=config,
+        thermostat=thermostat,
+        constraints=constraints,
+        reporters=reporters,
+    )
+
+
+def _simulate_nvt(
+    positions,
+    velocities,
+    *,
+    masses=None,
+    cell: Cell | None = None,
+    force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...] | None = None,
+    neighbor_manager: NeighborListManager | None = None,
+    config: SimulationConfig | None = None,
+    thermostat: Thermostat | None = None,
+    constraints: DistanceConstraints | None = None,
+    reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
+    initial_diagnostics: _NVTBoundaryDiagnostics | None = None,
+    defer_final_diagnostics: bool = False,
+) -> NVTResult:
+    """Run the NVT core with optional NPT boundary-diagnostic reuse."""
+
     if config is None:
         config = SimulationConfig()
     virtual_sites = config.virtual_sites
@@ -2671,7 +2709,11 @@ def simulate_nvt(
         virtual_sites=virtual_sites,
     )
     force_start = perf_counter()
-    potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
+    if initial_diagnostics is None:
+        potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
+    else:
+        potential_energy, forces = energy_forces(positions)
+        energy_by_term = dict(initial_diagnostics.energy_by_term)
     force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
@@ -2760,19 +2802,24 @@ def simulate_nvt(
             chain_position=float(np.asarray(nh_chain_position)),
             chain_velocity=float(np.asarray(nh_chain_velocity)),
         )
-    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-        state.positions,
-        state.velocities,
-        masses,
-        state.forces,
-        unnamed_terms,
-        cell=cell,
-        pairs=pairs,
-        kinetic_energy_scale=config.kinetic_energy_scale,
-        enabled=config.pressure_diagnostics,
-        virtual_sites=virtual_sites,
-        virial_mode=config.pressure_virial_mode,
-    )
+    if initial_diagnostics is None:
+        virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+            state.positions,
+            state.velocities,
+            masses,
+            state.forces,
+            unnamed_terms,
+            cell=cell,
+            pairs=pairs,
+            kinetic_energy_scale=config.kinetic_energy_scale,
+            enabled=config.pressure_diagnostics,
+            virtual_sites=virtual_sites,
+            virial_mode=config.pressure_virial_mode,
+        )
+    else:
+        virial = initial_diagnostics.virial_tensor
+        pressure_tensor_value = initial_diagnostics.pressure_tensor
+        pressure_value = initial_diagnostics.pressure
     virials = [virial]
     pressure_tensors = [pressure_tensor_value]
     pressures = [pressure_value]
@@ -2860,9 +2907,7 @@ def simulate_nvt(
 
             def block(pos, vel, forces, prng, block_pairs):
                 for _ in range(n_substeps):
-                    pos, vel, forces, prng = _langevin_substep(
-                        pos, vel, forces, prng, block_pairs
-                    )
+                    pos, vel, forces, prng = _langevin_substep(pos, vel, forces, prng, block_pairs)
                 return pos, vel, forces, prng
 
             compiled = mx.compile(block)
@@ -2915,13 +2960,31 @@ def simulate_nvt(
                 diagnostic_step = _is_diagnostic_step(
                     current_step, config, final=local_step == config.steps
                 )
+                deferred_final = defer_final_diagnostics and local_step == config.steps
                 energy_by_term = None
                 potential_energy = None
                 if diagnostic_step:
                     force_start = perf_counter()
-                    potential_energy, _, energy_by_term = _energy_forces_by_term(
-                        pos, terms, cell=cell, pairs=pairs, virtual_sites=None
-                    )
+                    if deferred_final:
+                        potential_energy, _ = _energy_forces_from_terms(
+                            pos,
+                            unnamed_terms,
+                            cell=cell,
+                            pairs=pairs,
+                            virtual_sites=None,
+                        )
+                        energy_by_term = {
+                            name: energies[-1]
+                            for name, energies in potential_energy_by_term.items()
+                        }
+                    else:
+                        potential_energy, _, energy_by_term = _energy_forces_by_term(
+                            pos,
+                            terms,
+                            cell=cell,
+                            pairs=pairs,
+                            virtual_sites=None,
+                        )
                     fe_wall += perf_counter() - force_start
 
                 sampled_state_evaluated = False
@@ -2972,19 +3035,24 @@ def simulate_nvt(
                             boltzmann_constant=config.boltzmann_constant,
                         )
                     )
-                    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-                        state.positions,
-                        state.velocities,
-                        masses,
-                        state.forces,
-                        unnamed_terms,
-                        cell=cell,
-                        pairs=pairs,
-                        kinetic_energy_scale=config.kinetic_energy_scale,
-                        enabled=config.pressure_diagnostics,
-                        virtual_sites=virtual_sites,
-                        virial_mode=config.pressure_virial_mode,
-                    )
+                    if deferred_final:
+                        virial = virials[-1]
+                        pressure_tensor_value = pressure_tensors[-1]
+                        pressure_value = pressures[-1]
+                    else:
+                        virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+                            state.positions,
+                            state.velocities,
+                            masses,
+                            state.forces,
+                            unnamed_terms,
+                            cell=cell,
+                            pairs=pairs,
+                            kinetic_energy_scale=config.kinetic_energy_scale,
+                            enabled=config.pressure_diagnostics,
+                            virtual_sites=virtual_sites,
+                            virial_mode=config.pressure_virial_mode,
+                        )
                     virials.append(virial)
                     pressure_tensors.append(pressure_tensor_value)
                     pressures.append(pressure_value)
@@ -3122,13 +3190,15 @@ def simulate_nvt(
             config,
             final=local_step == config.steps,
         )
+        deferred_final = defer_final_diagnostics and local_step == config.steps
+        full_diagnostic_step = diagnostic_step and not deferred_final
         force_start = perf_counter()
-        if neighbor_manager is None and diagnostic_step:
+        if neighbor_manager is None and full_diagnostic_step:
             potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
         elif neighbor_manager is None:
             potential_energy, next_forces = energy_forces(next_positions)
             energy_by_term = None
-        elif diagnostic_step:
+        elif full_diagnostic_step:
             potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
                 next_positions,
                 terms,
@@ -3145,6 +3215,10 @@ def simulate_nvt(
                 virtual_sites=virtual_sites,
             )
             energy_by_term = None
+        if deferred_final:
+            energy_by_term = {
+                name: energies[-1] for name, energies in potential_energy_by_term.items()
+            }
         force_evaluation_wall_seconds += perf_counter() - force_start
         next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = velocities_half + 0.5 * config.dt * next_acceleration
@@ -3245,19 +3319,24 @@ def simulate_nvt(
                     boltzmann_constant=config.boltzmann_constant,
                 )
             )
-            virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-                state.positions,
-                state.velocities,
-                masses,
-                state.forces,
-                unnamed_terms,
-                cell=cell,
-                pairs=pairs,
-                kinetic_energy_scale=config.kinetic_energy_scale,
-                enabled=config.pressure_diagnostics,
-                virtual_sites=virtual_sites,
-                virial_mode=config.pressure_virial_mode,
-            )
+            if deferred_final:
+                virial = virials[-1]
+                pressure_tensor_value = pressure_tensors[-1]
+                pressure_value = pressures[-1]
+            else:
+                virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+                    state.positions,
+                    state.velocities,
+                    masses,
+                    state.forces,
+                    unnamed_terms,
+                    cell=cell,
+                    pairs=pairs,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                    enabled=config.pressure_diagnostics,
+                    virtual_sites=virtual_sites,
+                    virial_mode=config.pressure_virial_mode,
+                )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)
             pressures.append(pressure_value)
@@ -3443,14 +3522,11 @@ def simulate_npt(
     )
     base_rng_offset = (
         config.initial_step
-        if not isinstance(thermostat, LangevinThermostat)
-        or thermostat.rng_step_offset is None
+        if not isinstance(thermostat, LangevinThermostat) or thermostat.rng_step_offset is None
         else thermostat.rng_step_offset
     )
     active_thermostat: Thermostat = thermostat
-    next_barostat_step = (
-        (current_step // barostat.interval) + 1
-    ) * barostat.interval
+    next_barostat_step = ((current_step // barostat.interval) + 1) * barostat.interval
     segments: list[NVTResult] = []
     cell_history_chunks: list[mx.array] = []
     seen_reporter_events: set[tuple[str, int]] = set()
@@ -3472,10 +3548,14 @@ def simulate_npt(
         molecule_count=molecule_count,
         center_of_mass_motion_interval=config.center_of_mass_motion_interval,
     )
+    boundary_diagnostics: _NVTBoundaryDiagnostics | None = None
 
     while not segments or current_step < end_step:
         segment_end = min(end_step, next_barostat_step)
         segment_steps = segment_end - current_step
+        should_attempt = (
+            segment_steps > 0 and segment_end == next_barostat_step and segment_end <= end_step
+        )
         segment_config = replace(
             config,
             steps=segment_steps,
@@ -3489,7 +3569,7 @@ def simulate_npt(
                 rng_step_offset=base_rng_offset + (current_step - config.initial_step),
             )
         buffered_events: list[ReporterEvent] = []
-        segment = simulate_nvt(
+        segment = _simulate_nvt(
             current_positions,
             current_velocities,
             masses=current_masses,
@@ -3500,15 +3580,12 @@ def simulate_npt(
             thermostat=active_thermostat,
             constraints=constraints,
             reporters=buffered_events.append,
+            initial_diagnostics=boundary_diagnostics,
+            defer_final_diagnostics=should_attempt,
         )
         _materialize_npt_segment(segment)
         mx.clear_cache()
         segment_source_cell = current_cell
-        should_attempt = (
-            segment_steps > 0
-            and segment_end == next_barostat_step
-            and segment_end <= end_step
-        )
         proposal: BarostatProposal | None = None
         accepted = False
         old_volume = float(np.asarray(current_cell.volume))
@@ -3524,6 +3601,7 @@ def simulate_npt(
                 segment.final_state,
                 current_terms,
                 current_cell,
+                current_energy=segment.potential_energy[-1],
                 barostat=barostat,
                 rng=barostat_rng,
                 volume_step=proposal_volume_step,
@@ -3551,19 +3629,15 @@ def simulate_npt(
                 axis_accepted[axis_name] += int(accepted)
                 adaptation_attempts[axis_name] += 1
                 adaptation_accepted[axis_name] += int(accepted)
-                proposal_volume_steps[axis_name] = (
-                    _adapt_anisotropic_volume_step(
-                        volume_step=proposal_volume_steps[axis_name],
-                        attempted=adaptation_attempts[axis_name],
-                        accepted=adaptation_accepted[axis_name],
-                        current_volume=old_volume,
-                    )
+                proposal_volume_steps[axis_name] = _adapt_anisotropic_volume_step(
+                    volume_step=proposal_volume_steps[axis_name],
+                    attempted=adaptation_attempts[axis_name],
+                    accepted=adaptation_accepted[axis_name],
+                    current_volume=old_volume,
                 )
                 if adaptation_attempts[axis_name] >= 10 and (
-                    adaptation_accepted[axis_name]
-                    < 0.25 * adaptation_attempts[axis_name]
-                    or adaptation_accepted[axis_name]
-                    > 0.75 * adaptation_attempts[axis_name]
+                    adaptation_accepted[axis_name] < 0.25 * adaptation_attempts[axis_name]
+                    or adaptation_accepted[axis_name] > 0.75 * adaptation_attempts[axis_name]
                 ):
                     adaptation_attempts[axis_name] = 0
                     adaptation_accepted[axis_name] = 0
@@ -3575,12 +3649,8 @@ def simulate_npt(
                 "kernel": proposal.kernel,
                 "scale_factors": list(proposal.scale_factors),
                 "log_reverse_over_forward": proposal.log_reverse_over_forward,
-                "source_pme_plan_fingerprints": list(
-                    proposal.source_pme_plan_fingerprints
-                ),
-                "candidate_pme_plan_fingerprints": list(
-                    proposal.candidate_pme_plan_fingerprints
-                ),
+                "source_pme_plan_fingerprints": list(proposal.source_pme_plan_fingerprints),
+                "candidate_pme_plan_fingerprints": list(proposal.candidate_pme_plan_fingerprints),
                 "delta_energy": proposal.delta_energy,
                 "log_acceptance": proposal.log_acceptance,
                 "log_uniform_draw": proposal.log_uniform_draw,
@@ -3605,6 +3675,7 @@ def simulate_npt(
         _materialize_npt_segment(segment, segment_cells)
         cell_history_chunks.append(segment_cells)
         segments.append(segment)
+        boundary_diagnostics = _nvt_boundary_diagnostics(segment)
         mx.clear_cache()
 
         _forward_npt_segment_events(
@@ -3724,6 +3795,19 @@ def _materialize_npt_segment(
     if cell_history is not None:
         arrays.append(cell_history)
     mx.eval(*arrays)
+
+
+def _nvt_boundary_diagnostics(
+    segment: NVTResult,
+) -> _NVTBoundaryDiagnostics:
+    return _NVTBoundaryDiagnostics(
+        energy_by_term={
+            name: values[-1] for name, values in segment.potential_energy_by_term.items()
+        },
+        virial_tensor=segment.virial_tensor[-1],
+        pressure_tensor=segment.pressure_tensor[-1],
+        pressure=segment.pressure[-1],
+    )
 
 
 def _concatenate_nvt_segments(segments: list[NVTResult]) -> NVTResult:
@@ -3895,9 +3979,7 @@ def _npt_production_with_final_barostat_state(
         if name in energy_by_term
     }
     pair_count = (
-        _dense_pair_count(eval_positions)
-        if neighbor_list is None
-        else neighbor_list.pair_count
+        _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
     force_evaluation_wall_seconds = float(
@@ -3957,6 +4039,7 @@ def _attempt_barostat_move(
     force_terms: tuple[ForceTerm, ...],
     cell: Cell,
     *,
+    current_energy: mx.array | None = None,
     barostat: MonteCarloBarostat,
     rng: np.random.Generator,
     volume_step: float,
@@ -4045,12 +4128,16 @@ def _attempt_barostat_move(
         proposed_neighbor_list = None
     old_pairs = None if old_neighbor_list is None else old_neighbor_list.interactions
     proposed_pairs = None if proposed_neighbor_list is None else proposed_neighbor_list.interactions
-    old_energy, _ = _energy_forces_from_terms(
-        state.positions,
-        current_force_terms,
-        cell=cell,
-        pairs=old_pairs,
-        virtual_sites=virtual_sites,
+    old_energy = (
+        _energy_forces_from_terms(
+            state.positions,
+            current_force_terms,
+            cell=cell,
+            pairs=old_pairs,
+            virtual_sites=virtual_sites,
+        )[0]
+        if current_energy is None
+        else as_mx_array(current_energy)
     )
     new_energy, new_forces = _energy_forces_from_terms(
         proposed_positions,
@@ -4080,13 +4167,9 @@ def _attempt_barostat_move(
         beta=beta,
         log_reverse_over_forward=proposal.log_reverse_over_forward,
     )
-    log_uniform_draw = (
-        None if log_acceptance >= 0.0 else float(np.log(rng.random()))
-    )
+    log_uniform_draw = None if log_acceptance >= 0.0 else float(np.log(rng.random()))
     accepted = (
-        log_acceptance >= 0.0
-        or log_uniform_draw is not None
-        and log_uniform_draw < log_acceptance
+        log_acceptance >= 0.0 or log_uniform_draw is not None and log_uniform_draw < log_acceptance
     )
     proposal = replace(
         proposal,
@@ -4214,9 +4297,7 @@ def _validate_dynamic_cell_cutoffs(
 ) -> None:
     if neighbor_manager is None:
         return
-    half_minimum_length = 0.5 * float(
-        np.min(np.asarray(cell.lengths, dtype=np.float64))
-    )
+    half_minimum_length = 0.5 * float(np.min(np.asarray(cell.lengths, dtype=np.float64)))
     for term in force_terms:
         if getattr(term, "electrostatics", None) != "pme":
             continue
@@ -4225,10 +4306,7 @@ def _validate_dynamic_cell_cutoffs(
         if cutoff is None:
             continue
         if float(cutoff) > half_minimum_length + 1.0e-7:
-            msg = (
-                "dynamic-cell PME real_cutoff must not exceed half the "
-                "minimum box length"
-            )
+            msg = "dynamic-cell PME real_cutoff must not exceed half the minimum box length"
             raise ValueError(msg)
 
 
@@ -4314,13 +4392,9 @@ def _barostat_proposal(
         enabled_axes = np.flatnonzero(np.asarray(barostat.axes, dtype=bool))
         axis = int(rng.choice(enabled_axes))
         selected_volume_step = (
-            volume_step
-            if axis_volume_steps is None
-            else float(axis_volume_steps["xyz"[axis]])
+            volume_step if axis_volume_steps is None else float(axis_volume_steps["xyz"[axis]])
         )
-        relative_volume_change = (
-            rng.uniform(-selected_volume_step, selected_volume_step) / volume
-        )
+        relative_volume_change = rng.uniform(-selected_volume_step, selected_volume_step) / volume
         scale_factors = np.ones((3,), dtype=np.float64)
         scale_factors[axis] = 1.0 + relative_volume_change
         return BarostatProposal(
@@ -4391,9 +4465,7 @@ def _restore_barostat_state(
     list[dict[str, Any]],
 ]:
     if state is None:
-        initial_volume_step = current_volume * float(
-            np.expm1(barostat.max_log_volume_scale)
-        )
+        initial_volume_step = current_volume * float(np.expm1(barostat.max_log_volume_scale))
         return (
             0,
             0,
@@ -4431,10 +4503,7 @@ def _restore_barostat_state(
     if int(restored.get("molecule_count", -1)) != molecule_count:
         msg = "barostat checkpoint molecule count does not match runtime topology"
         raise ValueError(msg)
-    if (
-        restored.get("center_of_mass_motion_interval")
-        != center_of_mass_motion_interval
-    ):
+    if restored.get("center_of_mass_motion_interval") != center_of_mass_motion_interval:
         msg = "barostat checkpoint center-of-mass cadence does not match runtime"
         raise ValueError(msg)
 
@@ -4473,10 +4542,7 @@ def _restore_barostat_state(
         restored.get("adaptation_accepted", axis_accepted),
         name="adaptation_accepted",
     )
-    if any(
-        adaptation_accepted[axis] > adaptation_attempts[axis]
-        for axis in "xyz"
-    ):
+    if any(adaptation_accepted[axis] > adaptation_attempts[axis] for axis in "xyz"):
         msg = "barostat checkpoint adaptation counters are invalid"
         raise ValueError(msg)
     history = restored.get("proposal_history")

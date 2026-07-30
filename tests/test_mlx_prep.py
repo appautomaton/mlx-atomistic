@@ -951,6 +951,7 @@ LIG
     )
 
     assert artifact.atom_count == 2
+    np.testing.assert_array_equal(artifact.molecule_ids, [0, 0])
     assert artifact.metadata["compatibility_report"]["hydrogen_count"] == 1
     assert np.asarray(result.sampled_positions).shape == (3, 2, 3)
 
@@ -973,11 +974,14 @@ def test_import_amber_parity_fixture_preserves_phase2_terms():
     assert prepared.impropers.shape == (4, 4)
     assert prepared.constraints.shape == (12, 2)
     assert prepared.nonbonded_exception_pairs.shape == (98, 2)
+    np.testing.assert_array_equal(prepared.molecule_ids, np.zeros(22, dtype=np.int32))
     assert prepared.charges.shape == (22,)
     assert prepared.sigma.shape == (22,)
     assert prepared.epsilon.shape == (22,)
     assert report["unsupported_terms"] == []
     assert report["periodic_box_present"] is False
+    assert prepared.metadata.selections["molecule_count"] == 1
+    assert report["molecule_count"] == 1
     assert term_counts["amber_14_exceptions"] == 41
     assert term_counts["amber_excluded_pairs"] == 57
     assert scaling["source"] == "standard_amber_fallback"

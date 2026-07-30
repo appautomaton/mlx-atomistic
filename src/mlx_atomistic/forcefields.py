@@ -24,6 +24,11 @@ from mlx_atomistic.custom_force import (
     CustomForcePotential as CustomForcePotential,
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
+from mlx_atomistic.metal_kernels import (
+    fused_parameterized_lj_forces,
+    fused_parameterized_pme_direct_components,
+    fused_parameterized_pme_direct_forces,
+)
 from mlx_atomistic.neighbors import NeighborBlocks, build_neighbor_list
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
@@ -1170,9 +1175,7 @@ class NonbondedPotential:
         if nbfix_pairs.ndim != 2 or nbfix_pairs.shape[1] != 2:
             msg = "nbfix_pairs must have shape (n, 2)"
             raise ValueError(msg)
-        if nbfix_pairs.size and (
-            np.any(nbfix_pairs < 0) or np.any(nbfix_pairs >= sigma.shape[0])
-        ):
+        if nbfix_pairs.size and (np.any(nbfix_pairs < 0) or np.any(nbfix_pairs >= sigma.shape[0])):
             msg = "nbfix_pairs contain atom indices outside [0, n_atoms)"
             raise ValueError(msg)
         nbfix_pair_set: set[tuple[int, int]] = set()
@@ -1276,9 +1279,8 @@ class NonbondedPotential:
                 }
             )
             if missing_type_names:
-                msg = (
-                    "nbfix_type_pairs reference atom types absent from atom_types: "
-                    + ", ".join(missing_type_names)
+                msg = "nbfix_type_pairs reference atom types absent from atom_types: " + ", ".join(
+                    missing_type_names
                 )
                 raise ValueError(msg)
             atom_type_ids = np.asarray(
@@ -1295,8 +1297,8 @@ class NonbondedPotential:
         exception_pair_set = {
             (min(int(i), int(j)), max(int(i), int(j))) for i, j in exception_pairs.tolist()
         }
-        exceptions_excluded_by_topology = (
-            self.topology is not None and exception_pair_set.issubset(self.topology.exclusion_set)
+        exceptions_excluded_by_topology = self.topology is not None and exception_pair_set.issubset(
+            self.topology.exclusion_set
         )
         config = NonbondedExecutionConfig(
             backend=self.backend,
@@ -1305,9 +1307,8 @@ class NonbondedPotential:
             memory_budget_bytes=self.memory_budget_bytes,
         )
         if (
-            (float(self.lambda_lj) < 1.0 or float(self.lambda_electrostatics) < 1.0)
-            and config.electrostatics != "cutoff"
-        ):
+            float(self.lambda_lj) < 1.0 or float(self.lambda_electrostatics) < 1.0
+        ) and config.electrostatics != "cutoff":
             msg = "soft-core lambda scaling currently supports cutoff electrostatics only"
             raise ValueError(msg)
         if config.electrostatics == "pme":
@@ -1410,15 +1411,13 @@ class NonbondedPotential:
             and nbfix_type_pairs.shape[0] == 0
             and (
                 config.electrostatics != "pme"
-                or (
-                    self.pme_config is not None
-                    and self.pme_config.real_cutoff is not None
-                )
+                or (self.pme_config is not None and self.pme_config.real_cutoff is not None)
             )
         )
         object.__setattr__(self, "analytic_virial_supported", analytic_supported)
         object.__setattr__(self, "_pair_scale_cache", None)
         object.__setattr__(self, "_block_scale_cache", None)
+        object.__setattr__(self, "_aligned_lj_scale_cache", None)
 
     def _openmm_dispersion_coefficient(self) -> float:
         """Return OpenMM's unswitched long-range LJ correction coefficient."""
@@ -1453,9 +1452,7 @@ class NonbondedPotential:
                 mixed_epsilon = float(np.sqrt(float(epsilon_i) * float(epsilon_j)))
                 mixed_count = float(count_i * count_j)
                 mixed_sigma6 = mixed_sigma**6
-                sum_sigma12 += (
-                    mixed_count * mixed_epsilon * mixed_sigma6 * mixed_sigma6
-                )
+                sum_sigma12 += mixed_count * mixed_epsilon * mixed_sigma6 * mixed_sigma6
                 sum_sigma6 += mixed_count * mixed_epsilon * mixed_sigma6
         particle_count = float(sigma.shape[0])
         interaction_count = particle_count * (particle_count + 1.0) / 2.0
@@ -1467,10 +1464,7 @@ class NonbondedPotential:
             * particle_count
             * particle_count
             * float(np.pi)
-            * (
-                mean_sigma12 / (9.0 * cutoff**9)
-                - mean_sigma6 / (3.0 * cutoff**3)
-            )
+            * (mean_sigma12 / (9.0 * cutoff**9) - mean_sigma6 / (3.0 * cutoff**3))
         )
 
     def _dispersion_correction_energy(self, cell: Cell) -> mx.array:
@@ -1567,11 +1561,7 @@ class NonbondedPotential:
             if pairs is not None:
                 cache_key = (self.lj_one_four_scale, self.coulomb_one_four_scale)
                 cache = self._pair_scale_cache
-                if (
-                    cache is not None
-                    and cache[0] is pairs
-                    and cache[1] == cache_key
-                ):
+                if cache is not None and cache[0] is pairs and cache[1] == cache_key:
                     return cache[2]
             filtered = self.topology.nonbonded_pairs(pairs)
             if not self._exceptions_excluded_by_topology:
@@ -1674,8 +1664,7 @@ class NonbondedPotential:
                 right = self._nbfix_type_pair_ids[index, 1]
                 known_types = (left >= 0) & (right >= 0)
                 matched = known_types & (
-                    ((type_i == left) & (type_j == right))
-                    | ((type_i == right) & (type_j == left))
+                    ((type_i == left) & (type_j == right)) | ((type_i == right) & (type_j == left))
                 )
                 sigma_ij = mx.where(matched, self.nbfix_type_sigma[index], sigma_ij)
                 epsilon_ij = mx.where(matched, self.nbfix_type_epsilon[index], epsilon_ij)
@@ -1714,9 +1703,8 @@ class NonbondedPotential:
             for index in range(int(self.nbfix_pairs.shape[0])):
                 nbfix_left = self.nbfix_pairs[index, 0]
                 nbfix_right = self.nbfix_pairs[index, 1]
-                matched = (
-                    ((left == nbfix_left) & (right == nbfix_right))
-                    | ((left == nbfix_right) & (right == nbfix_left))
+                matched = ((left == nbfix_left) & (right == nbfix_right)) | (
+                    (left == nbfix_right) & (right == nbfix_left)
                 )
                 sigma_ij = mx.where(matched, self.nbfix_sigma[index], sigma_ij)
                 epsilon_ij = mx.where(matched, self.nbfix_epsilon[index], epsilon_ij)
@@ -1731,11 +1719,7 @@ class NonbondedPotential:
             self.coulomb_one_four_scale,
         )
         cache = self._block_scale_cache
-        if (
-            cache is not None
-            and cache[0] is blocks
-            and cache[1] == cache_key
-        ):
+        if cache is not None and cache[0] is blocks and cache[1] == cache_key:
             return cache[2]
 
         left = np.asarray(blocks.left, dtype=np.int32).reshape(-1)
@@ -1767,9 +1751,7 @@ class NonbondedPotential:
             lj_scales = _unit_pair_scale()
         else:
             one_four = _isin_sorted_codes(codes, one_four_codes)
-            lj_scales_np = np.where(one_four, float(self.lj_one_four_scale), 1.0).astype(
-                np.float32
-            )
+            lj_scales_np = np.where(one_four, float(self.lj_one_four_scale), 1.0).astype(np.float32)
             lj_scales = mx.array(lj_scales_np.reshape(blocks.left.shape), dtype=mx.float32)
         if float(self.coulomb_one_four_scale) == 1.0 or one_four_codes.size == 0:
             coulomb_scales = _unit_pair_scale()
@@ -1830,9 +1812,7 @@ class NonbondedPotential:
         else:
             one_four = _isin_sorted_codes(codes, one_four_codes)
             lj_scales = mx.array(
-                np.where(one_four, float(self.lj_one_four_scale), 1.0).astype(
-                    np.float32
-                ),
+                np.where(one_four, float(self.lj_one_four_scale), 1.0).astype(np.float32),
                 dtype=mx.float32,
             )
         if float(self.coulomb_one_four_scale) == 1.0 or one_four_codes.size == 0:
@@ -1848,6 +1828,19 @@ class NonbondedPotential:
                 dtype=mx.float32,
             )
         return mask, lj_scales, coulomb_scales
+
+    def _compact_aligned_lj_scales(self, pairs: mx.array) -> mx.array:
+        cache = self._aligned_lj_scale_cache
+        if cache is not None and cache[0] is pairs:
+            return cache[1]
+        mask, lj_scales, _ = self._compact_pair_masks_and_scales(pairs)
+        aligned = mx.where(mask, lj_scales, 0.0).astype(mx.float32)
+        object.__setattr__(
+            self,
+            "_aligned_lj_scale_cache",
+            (pairs, aligned),
+        )
+        return aligned
 
     def _block_components(
         self,
@@ -1920,9 +1913,7 @@ class NonbondedPotential:
         flat_i = mx.reshape(i, (-1,))
         flat_j = mx.reshape(j, (-1,))
         flat_forces = mx.reshape(pair_forces, (-1, 3))
-        forces = mx.zeros_like(positions).at[flat_i].add(flat_forces).at[flat_j].add(
-            -flat_forces
-        )
+        forces = mx.zeros_like(positions).at[flat_i].add(flat_forces).at[flat_j].add(-flat_forces)
         return (
             empty_pairs,
             mx.sum(lj_pair_energy),
@@ -1962,9 +1953,7 @@ class NonbondedPotential:
         lj_pair_energy = lambda_lj * 4.0 * epsilon_ij * lj_shape
         lj_dshape_dx = -2.0 * inv_x * inv_x * inv_x + inv_x * inv_x
         dlj_x_dlambda = -2.0 * lj_alpha * (1.0 - lambda_lj)
-        dlj_dlambda = 4.0 * epsilon_ij * (
-            lj_shape + lambda_lj * lj_dshape_dx * dlj_x_dlambda
-        )
+        dlj_dlambda = 4.0 * epsilon_ij * (lj_shape + lambda_lj * lj_dshape_dx * dlj_x_dlambda)
         lj_scalar = (
             lambda_lj
             * 24.0
@@ -1997,9 +1986,13 @@ class NonbondedPotential:
         soft_r = mx.sqrt(soft_r2)
         coulomb_base = self.coulomb_constant * qij / soft_r
         coulomb_pair_energy = lambda_coulomb * coulomb_base
-        dcoulomb_dlambda = self.coulomb_constant * qij * (
-            1.0 / soft_r
-            + lambda_coulomb * coulomb_alpha * (1.0 - lambda_coulomb) / (soft_r2 * soft_r)
+        dcoulomb_dlambda = (
+            self.coulomb_constant
+            * qij
+            * (
+                1.0 / soft_r
+                + lambda_coulomb * coulomb_alpha * (1.0 - lambda_coulomb) / (soft_r2 * soft_r)
+            )
         )
         coulomb_scalar = lambda_coulomb * self.coulomb_constant * qij / (soft_r2 * soft_r)
         if self.coulomb_shift and self.cutoff is not None:
@@ -2253,6 +2246,8 @@ class NonbondedPotential:
         positions: mx.array,
         cell: Cell | None,
         pairs: mx.array | NeighborBlocks | None = None,
+        *,
+        allow_fused_metal: bool = True,
     ) -> tuple[mx.array, mx.array]:
         if isinstance(pairs, NeighborBlocks):
             return self._regular_lj_block_components(positions, cell, pairs)
@@ -2260,6 +2255,25 @@ class NonbondedPotential:
         pairs, lj_scales, _ = self._pairs_and_scales(positions, pairs)
         if pairs.shape[0] == 0:
             return _zero_energy(positions), mx.zeros_like(positions)
+        if (
+            allow_fused_metal
+            and "gpu" in str(mx.default_device()).lower()
+            and cell is not None
+            and cell.is_orthorhombic
+            and self.cutoff is not None
+            and not self.has_nbfix
+        ):
+            return fused_parameterized_lj_forces(
+                positions,
+                pairs,
+                mx.diag(cell.matrix),
+                self.sigma,
+                self.epsilon,
+                lj_scales,
+                cutoff=self.cutoff,
+                shift=self.lj_shift,
+                switch_distance=self.switch_distance,
+            )
 
         i = pairs[:, 0]
         j = pairs[:, 1]
@@ -2345,9 +2359,7 @@ class NonbondedPotential:
         flat_i = mx.reshape(i, (-1,))
         flat_j = mx.reshape(j, (-1,))
         flat_forces = mx.reshape(pair_forces, (-1, 3))
-        forces = mx.zeros_like(positions).at[flat_i].add(flat_forces).at[flat_j].add(
-            -flat_forces
-        )
+        forces = mx.zeros_like(positions).at[flat_i].add(flat_forces).at[flat_j].add(-flat_forces)
         return mx.sum(pair_energy), forces
 
     def _exception_components(
@@ -2396,8 +2408,8 @@ class NonbondedPotential:
         coulomb_pair_energy = mx.where(mask, coulomb_pair_energy, 0.0)
 
         lj_scalar = 24.0 * self.exception_epsilon * (2.0 * inv_r12 - inv_r6) / safe_r2
-        coulomb_scalar = self.coulomb_constant * self.exception_charge_products / (
-            safe_r2 * distance
+        coulomb_scalar = (
+            self.coulomb_constant * self.exception_charge_products / (safe_r2 * distance)
         )
         scalar = mx.where(mask, lj_scalar + coulomb_scalar, 0.0)
         pair_forces = scalar[:, None] * displacement
@@ -2653,6 +2665,130 @@ class NonbondedPotential:
         }
         return lj_energy + coulomb_energy, lj_forces + coulomb_forces, components
 
+    def _runtime_energy_forces_with_components(
+        self,
+        positions: mx.array,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
+        """Return recurring energy components without mesh-inspection metadata."""
+
+        if self.electrostatics != "pme":
+            return self.energy_forces_with_components(
+                positions,
+                cell,
+                pairs,
+            )
+        if cell is None:
+            msg = "PME electrostatics requires a periodic cell"
+            raise ValueError(msg)
+        if self.pme_config is None:
+            msg = "PME electrostatics requires pme_config"
+            raise ValueError(msg)
+
+        direct_space_pairs = self._validated_pme_direct_space_pairs(
+            cell,
+            pairs,
+        )
+        fused_direct = (
+            isinstance(direct_space_pairs, mx.array)
+            and "gpu" in str(mx.default_device()).lower()
+            and cell.is_orthorhombic
+            and self.cutoff is not None
+            and self.pme_config.real_cutoff is not None
+            and np.isclose(
+                float(self.cutoff),
+                float(self.pme_config.real_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            and not self.has_nbfix
+        )
+        if not fused_direct:
+            return self._pme_energy_forces_with_components(
+                positions,
+                cell,
+                direct_space_pairs,
+            )
+
+        (
+            direct_energy,
+            direct_forces,
+            lj_energy,
+            coulomb_real_energy,
+        ) = fused_parameterized_pme_direct_components(
+            positions,
+            direct_space_pairs,
+            mx.diag(cell.matrix),
+            self.sigma,
+            self.epsilon,
+            self.charges,
+            self._compact_aligned_lj_scales(direct_space_pairs),
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+        )
+        del direct_energy
+        exception_lj, exception_lj_forces = self._exception_lj_components(
+            positions,
+            cell,
+        )
+        dispersion_energy = self._dispersion_correction_energy(cell)
+        lj_energy = lj_energy + exception_lj + dispersion_energy
+        reciprocal_energy, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            include_self_correction=False,
+            plan=self.pme_plan,
+        )
+        self_energy = (
+            -float(self.coulomb_constant)
+            * self.pme_config.alpha
+            / float(np.sqrt(np.pi))
+            * mx.sum(self.charges * self.charges)
+        )
+        if self.pme_config.background_policy == "uniform_neutralizing_plasma":
+            net_charge = mx.sum(self.charges)
+            background_energy = (
+                -float(self.coulomb_constant)
+                * float(np.pi)
+                / (2.0 * cell.volume * self.pme_config.alpha * self.pme_config.alpha)
+                * net_charge
+                * net_charge
+            )
+        else:
+            background_energy = mx.sum(self.charges * 0.0)
+        correction_energy, correction_forces, correction_components = (
+            self._periodic_coulomb_corrections(
+                positions,
+                cell,
+            )
+        )
+        coulomb_energy = (
+            coulomb_real_energy
+            + reciprocal_energy
+            + self_energy
+            + background_energy
+            + correction_energy
+        )
+        components = {
+            "lj": lj_energy,
+            "lj_dispersion_correction": dispersion_energy,
+            "coulomb": coulomb_energy,
+            "coulomb_real": coulomb_real_energy,
+            "coulomb_reciprocal": reciprocal_energy,
+            "coulomb_self": self_energy,
+            "coulomb_background": background_energy,
+            **correction_components,
+        }
+        forces = direct_forces + exception_lj_forces + reciprocal_forces + correction_forces
+        return lj_energy + coulomb_energy, forces, components
+
     def _pme_energy_forces(
         self,
         positions: mx.array,
@@ -2667,31 +2803,71 @@ class NonbondedPotential:
             raise ValueError(msg)
 
         direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
-        lj_energy, lj_forces = self._regular_lj_components(
-            positions,
-            cell,
-            direct_space_pairs,
+        fused_direct = (
+            isinstance(direct_space_pairs, mx.array)
+            and "gpu" in str(mx.default_device()).lower()
+            and cell.is_orthorhombic
+            and self.cutoff is not None
+            and self.pme_config.real_cutoff is not None
+            and np.isclose(
+                float(self.cutoff),
+                float(self.pme_config.real_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            and not self.has_nbfix
         )
+        if fused_direct:
+            direct_energy, direct_forces = fused_parameterized_pme_direct_forces(
+                positions,
+                direct_space_pairs,
+                mx.diag(cell.matrix),
+                self.sigma,
+                self.epsilon,
+                self.charges,
+                self._compact_aligned_lj_scales(direct_space_pairs),
+                cutoff=self.cutoff,
+                shift=self.lj_shift,
+                switch_distance=self.switch_distance,
+                coulomb_constant=self.coulomb_constant,
+                alpha=self.pme_config.alpha,
+            )
+            reciprocal_energy, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
+                positions,
+                self.charges,
+                cell,
+                coulomb_constant=self.coulomb_constant,
+                config=self.pme_config,
+                plan=self.pme_plan,
+            )
+            regular_energy = direct_energy + reciprocal_energy
+            regular_forces = direct_forces + reciprocal_forces
+        else:
+            lj_energy, lj_forces = self._regular_lj_components(
+                positions,
+                cell,
+                direct_space_pairs,
+            )
+            pme_energy, pme_forces = pme_coulomb_total_energy_forces(
+                positions,
+                self.charges,
+                cell,
+                coulomb_constant=self.coulomb_constant,
+                config=self.pme_config,
+                direct_space_pairs=direct_space_pairs,
+                plan=self.pme_plan,
+            )
+            regular_energy = lj_energy + pme_energy
+            regular_forces = lj_forces + pme_forces
         exception_lj, exception_lj_forces = self._exception_lj_components(positions, cell)
         dispersion_energy = self._dispersion_correction_energy(cell)
-        pme_energy, pme_forces = pme_coulomb_total_energy_forces(
-            positions,
-            self.charges,
-            cell,
-            coulomb_constant=self.coulomb_constant,
-            config=self.pme_config,
-            direct_space_pairs=direct_space_pairs,
-            plan=self.pme_plan,
-        )
         correction_energy, correction_forces, _ = self._periodic_coulomb_corrections(
             positions,
             cell,
         )
-        coulomb_energy = pme_energy + correction_energy
-        coulomb_forces = pme_forces + correction_forces
         return (
-            lj_energy + exception_lj + dispersion_energy + coulomb_energy,
-            lj_forces + exception_lj_forces + coulomb_forces,
+            regular_energy + exception_lj + dispersion_energy + correction_energy,
+            regular_forces + exception_lj_forces + correction_forces,
         )
 
     def _pme_direct_space_energy_forces(
@@ -2729,11 +2905,7 @@ class NonbondedPotential:
             cell,
         )
         return (
-            lj_energy
-            + exception_lj
-            + dispersion_energy
-            + direct_energy
-            + correction_energy,
+            lj_energy + exception_lj + dispersion_energy + direct_energy + correction_energy,
             lj_forces + exception_lj_forces + direct_forces + correction_forces,
         )
 
@@ -2816,6 +2988,19 @@ class NonbondedPotential:
         pair_data = pairs
         if pair_data is not None and not isinstance(pair_data, NeighborBlocks):
             pair_data = mx.array(pair_data, dtype=mx.int32)
+        strain_pairs = None
+        if (
+            self.electrostatics == "pme"
+            and self.cutoff is not None
+            and self.topology is not None
+            and self.topology.nonbonded_pair_policy == "lazy"
+        ):
+            strain_pairs = self._compact_cutoff_strain_pairs(
+                positions,
+                cell=cell,
+                strain_epsilon=1.0e-3,
+            )
+            pair_data = strain_pairs
 
         if self.electrostatics == "pme":
             if self.pme_config is None:
@@ -2833,6 +3018,7 @@ class NonbondedPotential:
                     strained_positions,
                     strained_cell,
                     pair_data,
+                    allow_fused_metal=False,
                 )
                 exception_lj, _ = self._exception_lj_components(
                     strained_positions,
@@ -2884,9 +3070,34 @@ class NonbondedPotential:
             cell=cell,
             masses=masses,
             molecule_ids=molecule_ids,
+            strain_pairs=strain_pairs,
         )
         mx.eval(correction)
         return local_virial + correction
+
+    def _compact_cutoff_strain_pairs(
+        self,
+        positions: mx.array,
+        *,
+        cell: Cell,
+        strain_epsilon: float,
+    ) -> mx.array:
+        if self.cutoff is None:
+            msg = "cutoff strain pairs require a finite cutoff"
+            raise ValueError(msg)
+        shell = float(np.max(np.asarray(cell.lengths, dtype=np.float64))) * strain_epsilon * 1.1
+        pairs = build_neighbor_list(
+            positions,
+            cell,
+            cutoff=float(self.cutoff),
+            skin=shell,
+            backend="mlx_cell_pairs",
+            sort_pairs=False,
+        ).interactions
+        if isinstance(pairs, NeighborBlocks):
+            msg = "cutoff strain pairs require compact pairs"
+            raise ValueError(msg)
+        return pairs
 
     def _cutoff_finite_strain_correction_virial(
         self,
@@ -2896,6 +3107,7 @@ class NonbondedPotential:
         masses: mx.array | None,
         molecule_ids: object | None,
         strain_epsilon: float = 1.0e-3,
+        strain_pairs: mx.array | None = None,
     ) -> mx.array:
         needs_lj = not (
             self.cutoff is None
@@ -2914,50 +3126,31 @@ class NonbondedPotential:
             msg = "cutoff impulse correction requires a finite cutoff"
             raise ValueError(msg)
 
-        shell = (
-            float(np.max(np.asarray(cell.lengths, dtype=np.float64)))
-            * strain_epsilon
-            * 1.1
+        pairs = (
+            self._compact_cutoff_strain_pairs(
+                positions,
+                cell=cell,
+                strain_epsilon=strain_epsilon,
+            )
+            if strain_pairs is None
+            else mx.array(strain_pairs, dtype=mx.int32)
         )
-        pairs = build_neighbor_list(
-            positions,
-            cell,
-            cutoff=float(self.cutoff),
-            skin=shell,
-            backend="mlx_cell_pairs",
-            sort_pairs=False,
-        ).interactions
-        if isinstance(pairs, NeighborBlocks):
-            msg = "cutoff impulse correction requires compact pairs"
-            raise ValueError(msg)
 
         left = pairs[:, 0]
         right = pairs[:, 1]
         topology_mask, lj_scales, _ = self._compact_pair_masks_and_scales(pairs)
-        base_displacement = cell.minimum_image(
-            positions[left] - positions[right]
-        )
+        base_displacement = cell.minimum_image(positions[left] - positions[right])
         base_r2 = mx.sum(base_displacement * base_displacement, axis=-1)
-        base_cutoff_mask = (
-            (base_r2 > 0.0)
-            & (base_r2 < self.cutoff * self.cutoff)
-        )
+        base_cutoff_mask = (base_r2 > 0.0) & (base_r2 < self.cutoff * self.cutoff)
         base_lj_mask = topology_mask & base_cutoff_mask
         sigma_ij, epsilon_ij = self._mixed_block_parameters(left, right)
         charge_products = self.charges[left] * self.charges[right]
         base_safe_r2 = mx.where(base_lj_mask, base_r2, 1.0)
         base_distance = mx.sqrt(base_safe_r2)
         base_sigma2_over_r2 = (sigma_ij * sigma_ij) / base_safe_r2
-        base_inv_r6 = (
-            base_sigma2_over_r2
-            * base_sigma2_over_r2
-            * base_sigma2_over_r2
-        )
+        base_inv_r6 = base_sigma2_over_r2 * base_sigma2_over_r2 * base_sigma2_over_r2
         base_d_energy_d_distance = (
-            24.0
-            * epsilon_ij
-            * (base_inv_r6 - 2.0 * base_inv_r6 * base_inv_r6)
-            / base_distance
+            24.0 * epsilon_ij * (base_inv_r6 - 2.0 * base_inv_r6 * base_inv_r6) / base_distance
         )
         diagonal = []
         for axis in range(3):
@@ -2965,9 +3158,7 @@ class NonbondedPotential:
             lj_pair_energies = []
             strained_displacements = []
             for signed_epsilon in (strain_epsilon, -strain_epsilon):
-                factors = mx.ones((3,), dtype=positions.dtype).at[axis].add(
-                    signed_epsilon
-                )
+                factors = mx.ones((3,), dtype=positions.dtype).at[axis].add(signed_epsilon)
                 strained_cell = Cell(cell.lengths * factors)
                 strained_positions = molecularly_strained_positions(
                     positions,
@@ -2981,10 +3172,7 @@ class NonbondedPotential:
                 )
                 strained_displacements.append(displacement)
                 r2 = mx.sum(displacement * displacement, axis=-1)
-                strained_cutoff_mask = (
-                    (r2 > 0.0)
-                    & (r2 < self.cutoff * self.cutoff)
-                )
+                strained_cutoff_mask = (r2 > 0.0) & (r2 < self.cutoff * self.cutoff)
                 strained_lj_mask = topology_mask & strained_cutoff_mask
                 safe_r2 = mx.where(
                     strained_cutoff_mask | base_cutoff_mask,
@@ -2997,10 +3185,7 @@ class NonbondedPotential:
                     lj_pair_energies.append(
                         mx.where(
                             strained_lj_mask,
-                            4.0
-                            * epsilon_ij
-                            * (inv_r6 * inv_r6 - inv_r6)
-                            * lj_scales,
+                            4.0 * epsilon_ij * (inv_r6 * inv_r6 - inv_r6) * lj_scales,
                             0.0,
                         )
                     )
@@ -3021,8 +3206,7 @@ class NonbondedPotential:
             correction = mx.array(0.0, dtype=positions.dtype)
             if needs_lj:
                 finite_strain_lj_virial = mx.sum(
-                    -(lj_pair_energies[0] - lj_pair_energies[1])
-                    / (2.0 * strain_epsilon)
+                    -(lj_pair_energies[0] - lj_pair_energies[1]) / (2.0 * strain_epsilon)
                 )
                 displacement_derivative = (
                     strained_displacements[0] - strained_displacements[1]
@@ -3037,19 +3221,14 @@ class NonbondedPotential:
                 local_lj_virial = mx.sum(
                     mx.where(
                         base_lj_mask,
-                        -base_d_energy_d_distance
-                        * distance_derivative
-                        * lj_scales,
+                        -base_d_energy_d_distance * distance_derivative * lj_scales,
                         0.0,
                     )
                 )
-                correction = correction + (
-                    finite_strain_lj_virial - local_lj_virial
-                )
+                correction = correction + (finite_strain_lj_virial - local_lj_virial)
             if needs_coulomb:
                 correction = correction - (
-                    coulomb_boundary_energies[0]
-                    - coulomb_boundary_energies[1]
+                    coulomb_boundary_energies[0] - coulomb_boundary_energies[1]
                 ) / (2.0 * strain_epsilon)
             mx.eval(correction)
             diagonal.append(correction)
@@ -3075,11 +3254,7 @@ class NonbondedPotential:
             msg = "component-wise finite-strain virial requires a cutoff"
             raise ValueError(msg)
 
-        shell = (
-            float(np.max(np.asarray(cell.lengths, dtype=np.float64)))
-            * strain_epsilon
-            * 1.1
-        )
+        shell = float(np.max(np.asarray(cell.lengths, dtype=np.float64))) * strain_epsilon * 1.1
         blocks = build_neighbor_list(
             positions,
             cell,
@@ -3103,8 +3278,7 @@ class NonbondedPotential:
             self._ewald_one_four_pairs(),
         )
         correction_products = (
-            -self.charges[correction_pairs[0][:, 0]]
-            * self.charges[correction_pairs[0][:, 1]],
+            -self.charges[correction_pairs[0][:, 0]] * self.charges[correction_pairs[0][:, 1]],
             self.exception_charge_products,
             (
                 (self.coulomb_one_four_scale - 1.0)
@@ -3122,8 +3296,7 @@ class NonbondedPotential:
             if pair_indices.shape[0] == 0:
                 return mx.zeros((0,), dtype=positions.dtype)
             displacement = strained_cell.minimum_image(
-                strained_positions[pair_indices[:, 0]]
-                - strained_positions[pair_indices[:, 1]]
+                strained_positions[pair_indices[:, 0]] - strained_positions[pair_indices[:, 1]]
             )
             distance = mx.sqrt(mx.sum(displacement * displacement, axis=-1))
             return self.coulomb_constant * products / distance
@@ -3139,9 +3312,7 @@ class NonbondedPotential:
                 - strained_positions[self.exception_pairs[:, 1]]
             )
             r2 = mx.sum(displacement * displacement, axis=-1)
-            sigma2_over_r2 = (
-                self.exception_sigma * self.exception_sigma
-            ) / r2
+            sigma2_over_r2 = (self.exception_sigma * self.exception_sigma) / r2
             inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
             return 4.0 * self.exception_epsilon * (inv_r6 * inv_r6 - inv_r6)
 
@@ -3149,9 +3320,7 @@ class NonbondedPotential:
         for axis in range(3):
             states = []
             for signed_epsilon in (strain_epsilon, -strain_epsilon):
-                factors = mx.ones((3,), dtype=positions.dtype).at[axis].add(
-                    signed_epsilon
-                )
+                factors = mx.ones((3,), dtype=positions.dtype).at[axis].add(signed_epsilon)
                 strained_cell = Cell(cell.lengths * factors)
                 strained_positions = molecularly_strained_positions(
                     positions,
@@ -3164,11 +3333,7 @@ class NonbondedPotential:
                     strained_positions[left] - strained_positions[right]
                 )
                 r2 = mx.sum(displacement * displacement, axis=-1)
-                cutoff_mask = (
-                    blocks.valid_mask
-                    & (r2 > 0.0)
-                    & (r2 < self.cutoff * self.cutoff)
-                )
+                cutoff_mask = blocks.valid_mask & (r2 > 0.0) & (r2 < self.cutoff * self.cutoff)
                 lj_mask = topology_mask & cutoff_mask
                 safe_r2 = mx.where(cutoff_mask, r2, 1.0)
                 distance = mx.sqrt(safe_r2)
@@ -3176,10 +3341,7 @@ class NonbondedPotential:
                 inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
                 regular_lj = mx.where(
                     lj_mask,
-                    4.0
-                    * epsilon_ij
-                    * (inv_r6 * inv_r6 - inv_r6)
-                    * lj_scales,
+                    4.0 * epsilon_ij * (inv_r6 * inv_r6 - inv_r6) * lj_scales,
                     0.0,
                 )
                 coulomb_real = mx.where(
@@ -3223,21 +3385,13 @@ class NonbondedPotential:
                             pme_components["coulomb_reciprocal"]
                             + pme_components["coulomb_background"]
                         ),
-                        "dispersion": self._dispersion_correction_energy(
-                            strained_cell
-                        ),
+                        "dispersion": self._dispersion_correction_energy(strained_cell),
                     }
                 )
 
-            difference = mx.sum(
-                states[0]["regular_lj"] - states[1]["regular_lj"]
-            )
-            difference = difference + mx.sum(
-                states[0]["coulomb_real"] - states[1]["coulomb_real"]
-            )
-            difference = difference + mx.sum(
-                states[0]["exception_lj"] - states[1]["exception_lj"]
-            )
+            difference = mx.sum(states[0]["regular_lj"] - states[1]["regular_lj"])
+            difference = difference + mx.sum(states[0]["coulomb_real"] - states[1]["coulomb_real"])
+            difference = difference + mx.sum(states[0]["exception_lj"] - states[1]["exception_lj"])
             difference = (
                 difference
                 + states[0]["reciprocal"]
@@ -3485,10 +3639,14 @@ class NonbondedPotential:
             cell,
             pairs,
         )
-        return energy, forces, {
-            "lambda_lj": dlj_dlambda,
-            "lambda_electrostatics": dcoulomb_dlambda,
-        }
+        return (
+            energy,
+            forces,
+            {
+                "lambda_lj": dlj_dlambda,
+                "lambda_electrostatics": dcoulomb_dlambda,
+            },
+        )
 
     def energy_forces(
         self,

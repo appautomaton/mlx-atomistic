@@ -38,6 +38,7 @@ from mlx_atomistic.md import (
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.nonbonded import molecularly_strained_positions
 from mlx_atomistic.pme import PMEConfig
+from mlx_atomistic.topology import Topology
 
 
 def _periodic_fixture():
@@ -754,6 +755,89 @@ def test_cutoff_impulse_correction_uses_compact_neighbor_pairs(monkeypatch):
 
     assert observed_backends == ["mlx_cell_pairs"]
     assert np.all(np.isfinite(np.asarray(correction)))
+
+
+def test_lazy_pme_analytic_virial_reuses_one_compact_strain_shell(monkeypatch):
+    positions = mx.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.9, 1.1, 1.0],
+            [4.2, 4.0, 4.0],
+            [5.0, 4.2, 4.1],
+        ],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(8.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        partial_charges=[0.4, -0.4, 0.25, -0.25],
+        nonbonded_cutoff=3.0,
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[0.9, 1.0, 1.1, 0.95],
+        epsilon=[0.15, 0.2, 0.18, 0.12],
+        charges=[0.4, -0.4, 0.25, -0.25],
+        cutoff=3.0,
+        lj_shift=False,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(8, 8, 8),
+            alpha=0.4,
+            real_cutoff=3.0,
+            assignment_order=4,
+        ),
+        topology=topology,
+    )
+    manager = NeighborListManager(
+        cell,
+        cutoff=3.0,
+        skin=2.0,
+        backend="mlx_cell_pairs",
+    )
+    pairs = manager.update(positions).interactions
+    molecule_ids = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    masses = mx.ones((4,), dtype=mx.float32)
+    _, forces = term.energy_forces(positions, cell, pairs)
+    observed_backends = []
+    build_neighbor_list = forcefields_module.build_neighbor_list
+
+    def recording_build_neighbor_list(*args, **kwargs):
+        observed_backends.append(kwargs.get("backend"))
+        return build_neighbor_list(*args, **kwargs)
+
+    monkeypatch.setattr(
+        forcefields_module,
+        "build_neighbor_list",
+        recording_build_neighbor_list,
+    )
+    analytic = analytic_configurational_virial_tensor(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    assert observed_backends == ["mlx_cell_pairs"]
+    oracle = finite_difference_configurational_virial_oracle(
+        positions,
+        forces,
+        (term,),
+        cell=cell,
+        pairs=pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        strain_epsilon=2.0e-3,
+    )
+
+    np.testing.assert_allclose(
+        np.diag(np.asarray(analytic)),
+        np.diag(np.asarray(oracle)),
+        rtol=7.0e-3,
+        atol=3.0e-4,
+    )
 
 
 def test_bound_pme_virial_oracle_rebuilds_candidate_plan_and_neighbors():

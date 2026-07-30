@@ -34,6 +34,10 @@ PME_BACKGROUND_POLICIES = (
     "uniform_neutralizing_plasma",
 )
 PME_EXECUTION_PLAN_SCHEMA_VERSION = 1
+_COMPILED_RECIPROCAL_EVALUATORS: dict[
+    tuple[tuple[int, int, int], int, str],
+    object,
+] = {}
 PMEBackgroundPolicy = Literal[
     "reject_non_neutral",
     "uniform_neutralizing_plasma",
@@ -2016,37 +2020,45 @@ def _mesh_reciprocal_energy_forces_mx(
     plan: PMEExecutionPlan,
     return_mesh_info: bool = True,
 ) -> tuple[mx.array, mx.array, dict[str, float | int] | None]:
-    charge_grid = _assign_charges_bspline_mx(
+    # Validation already folded these host values into ``plan``.
+    del cell_lengths_np, coulomb_constant
+    cache_key = (
+        config.mesh_shape,
+        config.assignment_order,
+        str(mx.default_device()),
+    )
+    if (
+        not return_mesh_info
+        and "gpu" in str(mx.default_device()).lower()
+        and isinstance(plan, PMEExecutionPlan)
+        and (
+            cache_key in _COMPILED_RECIPROCAL_EVALUATORS
+            or plan.reuse_count > 1
+        )
+    ):
+        evaluator = _compiled_reciprocal_evaluator(
+            config.mesh_shape,
+            assignment_order=config.assignment_order,
+        )
+        energy, forces = evaluator(
+            positions,
+            charges,
+            cell_lengths,
+            plan.influence,
+            *plan.wavevectors,
+        )
+        return energy, forces, None
+
+    energy, forces, charge_grid = _mesh_reciprocal_energy_forces_core_mx(
         positions,
         charges,
         cell_lengths,
-        config.mesh_shape,
+        influence=plan.influence,
+        wavevectors=plan.wavevectors,
+        mesh_shape=config.mesh_shape,
         assignment_order=config.assignment_order,
+        grid_size=plan.grid_size,
     )
-    rho_hat = mx.fft.fftn(charge_grid)
-    del cell_lengths_np, coulomb_constant
-    phi_hat = plan.influence * rho_hat
-    grid_size = plan.grid_size
-    potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
-    field_grids = [
-        mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
-        for k_axis in plan.wavevectors
-    ]
-    field_grid = mx.stack(field_grids, axis=-1)
-    potential_at_atoms = _interpolate_bspline_mx(
-        positions,
-        potential_grid,
-        cell_lengths,
-        assignment_order=config.assignment_order,
-    )
-    field_at_atoms = _interpolate_bspline_mx(
-        positions,
-        field_grid,
-        cell_lengths,
-        assignment_order=config.assignment_order,
-    )
-    energy = 0.5 * mx.sum(charges * potential_at_atoms)
-    forces = charges[:, None] * field_at_atoms
     if not return_mesh_info:
         return energy, forces, None
     mx.eval(energy, forces, charge_grid)
@@ -2061,6 +2073,90 @@ def _mesh_reciprocal_energy_forces_mx(
             "reciprocal_modes": plan.reciprocal_modes,
         },
     )
+
+
+def _mesh_reciprocal_energy_forces_core_mx(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
+    *,
+    influence: mx.array,
+    wavevectors: tuple[mx.array, mx.array, mx.array],
+    mesh_shape: tuple[int, int, int],
+    assignment_order: int,
+    grid_size: int,
+) -> tuple[mx.array, mx.array, mx.array]:
+    charge_grid = _assign_charges_bspline_mx(
+        positions,
+        charges,
+        cell_lengths,
+        mesh_shape,
+        assignment_order=assignment_order,
+    )
+    rho_hat = mx.fft.fftn(charge_grid)
+    phi_hat = influence * rho_hat
+    potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
+    field_grids = [
+        mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
+        for k_axis in wavevectors
+    ]
+    field_grid = mx.stack(field_grids, axis=-1)
+    potential_at_atoms = _interpolate_bspline_mx(
+        positions,
+        potential_grid,
+        cell_lengths,
+        assignment_order=assignment_order,
+    )
+    field_at_atoms = _interpolate_bspline_mx(
+        positions,
+        field_grid,
+        cell_lengths,
+        assignment_order=assignment_order,
+    )
+    energy = 0.5 * mx.sum(charges * potential_at_atoms)
+    forces = charges[:, None] * field_at_atoms
+    return energy, forces, charge_grid
+
+
+def _compiled_reciprocal_evaluator(
+    mesh_shape: tuple[int, int, int],
+    *,
+    assignment_order: int,
+):
+    cache_key = (
+        mesh_shape,
+        assignment_order,
+        str(mx.default_device()),
+    )
+    cached = _COMPILED_RECIPROCAL_EVALUATORS.get(cache_key)
+    if cached is not None:
+        return cached
+    grid_size = int(np.prod(mesh_shape, dtype=np.int64))
+
+    def evaluate(
+        positions: mx.array,
+        charges: mx.array,
+        cell_lengths: mx.array,
+        influence: mx.array,
+        kx: mx.array,
+        ky: mx.array,
+        kz: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        energy, forces, _ = _mesh_reciprocal_energy_forces_core_mx(
+            positions,
+            charges,
+            cell_lengths,
+            influence=influence,
+            wavevectors=(kx, ky, kz),
+            mesh_shape=mesh_shape,
+            assignment_order=assignment_order,
+            grid_size=grid_size,
+        )
+        return energy, forces
+
+    compiled = mx.compile(evaluate)
+    _COMPILED_RECIPROCAL_EVALUATORS[cache_key] = compiled
+    return compiled
 
 
 def _influence_function_mx(

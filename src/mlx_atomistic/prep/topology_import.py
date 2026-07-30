@@ -243,6 +243,12 @@ def import_amber_prmtop(
         symbols=symbols,
         bond_lengths=bond_length,
     )
+    molecule_ids = _molecule_ids_from_connectivity(
+        atom_count,
+        bonds=bonds,
+        virtual_site_parent_atoms=virtual_site_parent_atoms,
+    )
+    molecule_count = int(np.max(molecule_ids)) + 1
     hydrogen_count = int(np.count_nonzero(np.char.upper(symbols.astype(str)) == "H"))
     if hydrogen_count == 0:
         msg = (
@@ -306,6 +312,7 @@ def import_amber_prmtop(
             "ion_atom_count": int(np.count_nonzero(ion_mask)),
             "lipid_atom_count": int(np.count_nonzero(lipid_mask)),
             "system_charge": float(np.sum(charges)),
+            "molecule_count": molecule_count,
         },
         units={
             "coordinates": "angstrom",
@@ -330,6 +337,7 @@ def import_amber_prmtop(
             "unsupported_terms": [],
             "rejected_terms": [],
             "parameter_counts_match_topology": True,
+            "molecule_count": molecule_count,
             "term_counts": term_counts,
             "term_details": term_details,
             "force_field_provenance": "AMBER prmtop/inpcrd import",
@@ -393,6 +401,7 @@ def import_amber_prmtop(
         virtual_site_parent_atoms=virtual_site_parent_atoms,
         virtual_site_weights=virtual_site_weights,
         virtual_site_types=virtual_site_types,
+        molecule_ids=molecule_ids,
     )
     try:
         prepared.validate()
@@ -3604,6 +3613,51 @@ def _hydrogen_bond_constraints(
     constraints = np.asarray(pairs, dtype=np.int32).reshape((-1, 2))
     distances = np.asarray([distances_by_pair[pair] for pair in pairs], dtype=np.float32)
     return constraints, distances
+
+
+def _molecule_ids_from_connectivity(
+    atom_count: int,
+    *,
+    bonds: np.ndarray,
+    virtual_site_parent_atoms: np.ndarray,
+) -> np.ndarray:
+    """Return contiguous molecule labels from bonds and virtual-site parents."""
+
+    parents = np.arange(atom_count, dtype=np.int32)
+
+    def find(atom: int) -> int:
+        root = atom
+        while int(parents[root]) != root:
+            root = int(parents[root])
+        while atom != root:
+            next_atom = int(parents[atom])
+            parents[atom] = root
+            atom = next_atom
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+
+    for left, right in np.asarray(bonds, dtype=np.int32).reshape((-1, 2)):
+        union(int(left), int(right))
+    for row in np.asarray(
+        virtual_site_parent_atoms,
+        dtype=np.int32,
+    ).reshape((-1, 4)):
+        site = int(row[3])
+        for parent in row[:3]:
+            union(site, int(parent))
+
+    labels_by_root: dict[int, int] = {}
+    molecule_ids = np.empty((atom_count,), dtype=np.int32)
+    for atom in range(atom_count):
+        root = find(atom)
+        label = labels_by_root.setdefault(root, len(labels_by_root))
+        molecule_ids[atom] = label
+    return molecule_ids
 
 
 def _term_counts(

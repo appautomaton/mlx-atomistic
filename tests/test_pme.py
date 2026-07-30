@@ -825,6 +825,73 @@ def test_pme_analytic_strain_gpu_memory_is_bounded(monkeypatch):
         mx.set_default_stream(mx.new_stream(previous))
 
 
+@pytest.mark.gpu
+def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
+    previous = mx.default_device()
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    device = mx.Device(mx.gpu, 0)
+    cache_key = ((16, 16, 16), 5, str(device))
+    try:
+        mx.set_default_device(device)
+        mx.set_default_stream(mx.new_stream(device))
+        mx.eval(mx.array([1.0], dtype=mx.float32))
+    except Exception:  # noqa: BLE001 - any Metal load failure means skip.
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+        pytest.skip("Metal GPU unavailable")
+    try:
+        pme_module._COMPILED_RECIPROCAL_EVALUATORS.pop(cache_key, None)
+        positions = mx.array(np.asarray(_positions()), dtype=mx.float32)
+        charges = mx.array(np.asarray(_charges()), dtype=mx.float32)
+        cell = Cell.cubic(12.0)
+        config = PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=5.0,
+            assignment_order=5,
+        )
+        plan = PMEExecutionPlan(cell, config=config)
+
+        reference_energy, reference_forces = (
+            pme_coulomb_reciprocal_space_energy_forces(
+                positions,
+                charges,
+                cell,
+                config=config,
+                plan=plan,
+            )
+        )
+        mx.eval(reference_energy, reference_forces)
+        compiled_energy, compiled_forces = (
+            pme_coulomb_reciprocal_space_energy_forces(
+                positions,
+                charges,
+                cell,
+                config=config,
+                plan=plan,
+            )
+        )
+        mx.eval(compiled_energy, compiled_forces)
+
+        assert cache_key in pme_module._COMPILED_RECIPROCAL_EVALUATORS
+        np.testing.assert_allclose(
+            np.asarray(compiled_energy),
+            np.asarray(reference_energy),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(compiled_forces),
+            np.asarray(reference_forces),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+    finally:
+        pme_module._COMPILED_RECIPROCAL_EVALUATORS.pop(cache_key, None)
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+
+
 def test_pme_readiness_admits_94k_atoms_and_maximum_validated_mesh():
     atom_count = 94_232
     charges = np.zeros((atom_count,), dtype=np.float32)

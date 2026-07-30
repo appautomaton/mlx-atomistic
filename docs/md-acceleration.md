@@ -88,9 +88,12 @@ unavailable for that measurement. A later source-backed GPCRmd 729 run now
 passes a separate bounded fixed-cell parity/NVT/restart gate using
 `mlx_cell_blocks`/`NeighborBlocks`; it does not change the classification of the
 synthetic neighbor row. The production runner has since moved to compact
-`mlx_cell_pairs` after a matched 75-step DHFR NPT prefix reduced complete wall
-time from 142.87 to 27.30 seconds and process-tree peak memory from 27.33 to
-6.64 GB while passing the same numerical gates. This is bounded optimization
+`mlx_cell_pairs`. Retained NPT diagnostic reuse, reciprocal-PME graph
+compilation, and fused parameterized LJ/direct-PME Metal kernels then reduced a
+matched 75-step DHFR NPT prefix from 142.87 to a repeated median of 13.77
+seconds. Process-tree peak memory fell from 27.33 GB to 5.18--6.11 GB across
+the retained samples, and the same numerical gates passed. These measurements
+were made on an M5 Max in low-power mode. This is bounded optimization
 evidence, not a new production-length validation. Charged fixed-cell PME also
 has a separate 94,232-atom JAC validation. See
 [`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](./benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md)

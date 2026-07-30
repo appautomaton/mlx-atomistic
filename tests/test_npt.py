@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.md as md_module
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import NonbondedPotential
@@ -1104,6 +1105,141 @@ def test_rejected_pme_moves_preserve_complete_plan_and_neighbor_state():
         != record["source_pme_plan_fingerprints"]
         for record in result.barostat_metadata["proposal_history"]
     )
+
+
+def test_rejected_move_computes_the_committed_diagnostic_once(monkeypatch):
+    positions = np.asarray(
+        [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(8.0)
+    recompute_count = 0
+    committed_diagnostic = md_module._npt_production_with_final_barostat_state
+
+    def recording_recompute(*args, **kwargs):
+        nonlocal recompute_count
+        recompute_count += 1
+        return committed_diagnostic(*args, **kwargs)
+
+    monkeypatch.setattr(
+        md_module,
+        "_npt_production_with_final_barostat_state",
+        recording_recompute,
+    )
+    result = simulate_npt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones((2,), dtype=np.float32),
+        cell=cell,
+        force_terms=_RejectCellChangeTerm(cell.volume),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=1,
+            seed=4,
+        ),
+    )
+
+    assert result.barostat_attempts == 1
+    assert result.barostat_accepted == 0
+    assert recompute_count == 1
+
+
+def test_npt_computes_one_pressure_frame_per_committed_boundary(monkeypatch):
+    pressure_call_count = 0
+    pressure_diagnostics = md_module._pressure_diagnostics
+
+    def recording_pressure(*args, **kwargs):
+        nonlocal pressure_call_count
+        pressure_call_count += 1
+        return pressure_diagnostics(*args, **kwargs)
+
+    monkeypatch.setattr(
+        md_module,
+        "_pressure_diagnostics",
+        recording_pressure,
+    )
+    result = simulate_npt(
+        np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+        np.zeros((1, 3), dtype=np.float32),
+        masses=np.ones((1,), dtype=np.float32),
+        cell=Cell.cubic(8.0),
+        force_terms=_ZeroForceTerm(),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=4,
+            sample_interval=2,
+            diagnostic_interval=2,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=2,
+            seed=4,
+        ),
+    )
+
+    assert pressure_call_count == 3
+    assert np.asarray(result.pressure).shape == (3,)
+
+
+def test_barostat_uses_supplied_current_energy_without_recomputing_it():
+    class CountingTerm:
+        name = "counting"
+
+        def __init__(self):
+            self.calls = 0
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            del cell, pairs
+            self.calls += 1
+            return mx.sum(positions * 0.0), mx.zeros_like(positions)
+
+    term = CountingTerm()
+    positions = mx.array([[1.0, 1.0, 1.0]], dtype=mx.float32)
+    state = SimulationState(
+        positions=positions,
+        velocities=mx.zeros_like(positions),
+        masses=mx.ones((1,), dtype=mx.float32),
+        forces=mx.zeros_like(positions),
+        step=0,
+        time=0.0,
+    )
+    _attempt_barostat_move(
+        state,
+        (term,),
+        Cell.cubic(8.0),
+        current_energy=mx.array(0.0, dtype=mx.float32),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=1,
+            seed=4,
+        ),
+        rng=np.random.default_rng(4),
+        volume_step=0.01,
+        constraints=None,
+        boltzmann_constant=1.0,
+    )
+
+    assert term.calls == 1
 
 
 def test_invalid_candidate_pme_cutoff_fails_before_candidate_energy():
