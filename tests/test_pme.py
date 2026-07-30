@@ -10,7 +10,11 @@ from mlx_atomistic.metal_kernels import (
     pme_order5_energy_forces,
 )
 from mlx_atomistic.neighbors import build_neighbor_list
-from mlx_atomistic.nonbonded import EwaldReferenceConfig, ewald_reference_coulomb_energy_forces
+from mlx_atomistic.nonbonded import (
+    EwaldReferenceConfig,
+    diagonal_strain_virial,
+    ewald_reference_coulomb_energy_forces,
+)
 from mlx_atomistic.pme import (
     PMEConfig,
     PMEExecutionPlan,
@@ -20,6 +24,7 @@ from mlx_atomistic.pme import (
     _influence_function_mx,
     _interpolate_bspline_mx,
     _interpolate_cic_mx,
+    _pme_coulomb_reciprocal_virial,
     assign_charges_bspline,
     assign_charges_cic,
     pme_coulomb_direct_space_energy_forces,
@@ -778,6 +783,64 @@ def test_pme_analytic_strain_components_match_independent_central_difference(
             minus = float(np.asarray(component_energy(mx.array(-displacement), name)))
             central[axis] = (plus - minus) / (2.0 * epsilon)
         np.testing.assert_allclose(analytic, central, rtol=5.0e-3, atol=2.0e-5)
+
+
+def test_pme_reciprocal_virial_matches_full_molecular_strain_gradient():
+    positions = mx.array(
+        [
+            [-0.1, 1.0, 1.0],
+            [0.2, 1.1, 1.0],
+            [4.2, 4.0, 4.0],
+            [5.0, 4.2, 4.1],
+        ],
+        dtype=mx.float32,
+    )
+    charges = _charges()
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(
+        mesh_shape=(8, 8, 8),
+        alpha=0.35,
+        real_cutoff=5.0,
+        assignment_order=4,
+    )
+    pairs = mx.array(
+        [(i, j) for i in range(4) for j in range(i + 1, 4)],
+        dtype=mx.int32,
+    )
+    molecule_ids = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    masses = mx.ones((4,), dtype=mx.float32)
+    plan = PMEExecutionPlan(cell, config=config)
+
+    virial = _pme_coulomb_reciprocal_virial(
+        positions,
+        charges,
+        cell,
+        coulomb_constant=1.0,
+        config=config,
+        plan=plan,
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+    oracle = diagonal_strain_virial(
+        positions,
+        cell,
+        lambda strained_positions, strained_cell: pme_coulomb_strain_components(
+            strained_positions,
+            charges,
+            strained_cell,
+            config=config,
+            direct_space_pairs=pairs,
+        )["coulomb_reciprocal"],
+        masses=masses,
+        molecule_ids=molecule_ids,
+    )
+
+    np.testing.assert_allclose(
+        np.diag(np.asarray(virial)),
+        np.diag(np.asarray(oracle)),
+        rtol=2.0e-3,
+        atol=3.0e-4,
+    )
 
 
 @pytest.mark.gpu

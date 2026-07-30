@@ -50,11 +50,12 @@ from mlx_atomistic.nonbonded import (
 from mlx_atomistic.pme import (
     PMEConfig,
     PMEExecutionPlan,
+    _pme_coulomb_nonreciprocal_strain_energy,
+    _pme_coulomb_reciprocal_virial,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
     pme_coulomb_strain_components,
-    pme_coulomb_strain_energy,
     pme_coulomb_total_energy_forces,
     pme_direct_space_policy_report,
 )
@@ -3009,6 +3010,16 @@ class NonbondedPotential:
             if pair_data is None:
                 msg = "analytic PME virial requires direct-space pairs or blocks"
                 raise ValueError(msg)
+            reciprocal_virial = _pme_coulomb_reciprocal_virial(
+                positions,
+                self.charges,
+                cell,
+                coulomb_constant=self.coulomb_constant,
+                config=self.pme_config,
+                plan=self.pme_plan,
+                masses=masses,
+                molecule_ids=molecule_ids,
+            )
 
             def strain_energy(
                 strained_positions: mx.array,
@@ -3024,7 +3035,7 @@ class NonbondedPotential:
                     strained_positions,
                     strained_cell,
                 )
-                pme_energy = pme_coulomb_strain_energy(
+                pme_energy = _pme_coulomb_nonreciprocal_strain_energy(
                     strained_positions,
                     self.charges,
                     strained_cell,
@@ -3073,6 +3084,8 @@ class NonbondedPotential:
             strain_pairs=strain_pairs,
         )
         mx.eval(correction)
+        if self.electrostatics == "pme":
+            return local_virial + reciprocal_virial + correction
         return local_virial + correction
 
     def _compact_cutoff_strain_pairs(

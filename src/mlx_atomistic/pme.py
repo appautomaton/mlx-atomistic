@@ -22,6 +22,7 @@ from mlx_atomistic.nonbonded import (
     FORCE_EVALUATION_SCOPES,
     ForceScopeReport,
     normalize_force_scope,
+    normalize_molecule_ids,
 )
 from mlx_atomistic.runtime import (
     VIRIAL_SUPPORT_ANALYTIC,
@@ -920,37 +921,16 @@ def pme_coulomb_total_energy_forces(
     return total_energy, forces
 
 
-def pme_coulomb_strain_components(
+def _pme_coulomb_nonreciprocal_strain_components(
     positions: mx.array,
     charges: mx.array,
     cell: Cell,
     *,
-    coulomb_constant: float = 1.0,
-    config: PMEConfig | None = None,
-    direct_space_pairs: mx.array | NeighborBlocks | None = None,
-) -> dict[str, mx.array]:
-    """Return cell-differentiable PME components for analytic virials.
-
-    This path rebuilds the cell-dependent reciprocal arrays from MLX values so
-    automatic differentiation sees the complete diagonal cell derivative. It
-    is intentionally separate from the reusable fixed-cell execution plan.
-
-    Args:
-        positions: Molecularly strained coordinates, shape ``(n_atoms, 3)``.
-        charges: Per-atom partial charges, shape ``(n_atoms,)``.
-        cell: Strained orthorhombic periodic cell.
-        coulomb_constant: Coulomb prefactor in the configured unit system.
-        config: PME parameters with an explicit real-space cutoff.
-        direct_space_pairs: Compact pairs or neighbor blocks held fixed during
-            the infinitesimal strain derivative.
-
-    Returns:
-        Differentiable real, reciprocal, self, and background energies.
-
-    Raises:
-        ValueError: If the cell, shapes, cutoff, charge policy, or direct-space
-            pair representation is outside the analytic-virial envelope.
-    """
+    coulomb_constant: float,
+    config: PMEConfig | None,
+    direct_space_pairs: mx.array | NeighborBlocks | None,
+) -> tuple[PMEConfig, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Build the differentiable non-reciprocal PME strain components."""
 
     config = _resolve_plan_config(config)
     if not isinstance(cell, Cell) or not cell.is_orthorhombic:
@@ -1008,6 +988,102 @@ def pme_coulomb_strain_components(
             coulomb_constant=coulomb_constant,
         )
 
+    self_energy = (
+        -float(coulomb_constant)
+        * config.alpha
+        / float(np.sqrt(np.pi))
+        * mx.sum(charges_mx * charges_mx)
+    )
+    background_energy = _neutralizing_plasma_energy_mx(
+        charges_mx,
+        volume=mx.prod(cell_lengths),
+        alpha=config.alpha,
+        coulomb_constant=coulomb_constant,
+        background_policy=config.background_policy,
+    )
+    return (
+        config,
+        wrapped,
+        charges_mx,
+        cell_lengths,
+        real_energy,
+        self_energy,
+        background_energy,
+    )
+
+
+def _pme_coulomb_nonreciprocal_strain_energy(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float,
+    config: PMEConfig,
+    direct_space_pairs: mx.array | NeighborBlocks,
+) -> mx.array:
+    """Return direct, self, and background energy for strain differentiation."""
+
+    _, _, _, _, real_energy, self_energy, background_energy = (
+        _pme_coulomb_nonreciprocal_strain_components(
+            positions,
+            charges,
+            cell,
+            coulomb_constant=coulomb_constant,
+            config=config,
+            direct_space_pairs=direct_space_pairs,
+        )
+    )
+    return real_energy + self_energy + background_energy
+
+
+def pme_coulomb_strain_components(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float = 1.0,
+    config: PMEConfig | None = None,
+    direct_space_pairs: mx.array | NeighborBlocks | None = None,
+) -> dict[str, mx.array]:
+    """Return cell-differentiable PME components for analytic virials.
+
+    This path rebuilds the cell-dependent reciprocal arrays from MLX values so
+    automatic differentiation sees the complete diagonal cell derivative. It
+    is intentionally separate from the reusable fixed-cell execution plan.
+
+    Args:
+        positions: Molecularly strained coordinates, shape ``(n_atoms, 3)``.
+        charges: Per-atom partial charges, shape ``(n_atoms,)``.
+        cell: Strained orthorhombic periodic cell.
+        coulomb_constant: Coulomb prefactor in the configured unit system.
+        config: PME parameters with an explicit real-space cutoff.
+        direct_space_pairs: Compact pairs or neighbor blocks held fixed during
+            the infinitesimal strain derivative.
+
+    Returns:
+        Differentiable real, reciprocal, self, and background energies.
+
+    Raises:
+        ValueError: If the cell, shapes, cutoff, charge policy, or direct-space
+            pair representation is outside the analytic-virial envelope.
+    """
+
+    (
+        config,
+        wrapped,
+        charges_mx,
+        cell_lengths,
+        real_energy,
+        self_energy,
+        background_energy,
+    ) = _pme_coulomb_nonreciprocal_strain_components(
+        positions,
+        charges,
+        cell,
+        coulomb_constant=coulomb_constant,
+        config=config,
+        direct_space_pairs=direct_space_pairs,
+    )
     influence, wavevectors, reciprocal_modes = _differentiable_influence_function_mx(
         cell_lengths,
         config.mesh_shape,
@@ -1031,19 +1107,6 @@ def pme_coulomb_strain_components(
         coulomb_constant=coulomb_constant,
         plan=strain_plan,
         return_mesh_info=False,
-    )
-    self_energy = (
-        -float(coulomb_constant)
-        * config.alpha
-        / float(np.sqrt(np.pi))
-        * mx.sum(charges_mx * charges_mx)
-    )
-    background_energy = _neutralizing_plasma_energy_mx(
-        charges_mx,
-        volume=mx.prod(cell_lengths),
-        alpha=config.alpha,
-        coulomb_constant=coulomb_constant,
-        background_policy=config.background_policy,
     )
     return {
         "coulomb_real": real_energy,
@@ -1086,6 +1149,105 @@ def pme_coulomb_strain_energy(
         direct_space_pairs=direct_space_pairs,
     )
     return sum(components.values())
+
+
+def _pme_coulomb_reciprocal_virial(
+    positions: mx.array,
+    charges: mx.array,
+    cell: Cell,
+    *,
+    coulomb_constant: float,
+    config: PMEConfig,
+    plan: PMEExecutionPlan | None,
+    masses: mx.array | None,
+    molecule_ids: object | None,
+) -> mx.array:
+    """Return molecular reciprocal PME virial without full mesh backpropagation.
+
+    Homogeneous atomic strain leaves the fractional charge grid fixed, so its
+    cell derivative only needs the reciprocal influence function.  Molecular
+    strain then differs by ``Σ Fᵢ · (Rₘ - rᵢ)`` along each diagonal, where
+    ``Rₘ`` is the unwrapped center of atom ``i``'s molecule.  This reuses the
+    production reciprocal forces instead of differentiating through charge
+    assignment, interpolation, and both FFTs.
+    """
+
+    original_positions = mx.array(positions, dtype=mx.float32)
+    config = _resolve_evaluation_config(config, plan)
+    wrapped_positions, charges_mx, cell_lengths, _ = _validate_inputs_mx(
+        original_positions,
+        charges,
+        cell,
+        charge_tolerance=config.charge_tolerance,
+        background_policy=config.background_policy,
+    )
+    particle_count = original_positions.shape[0]
+    if masses is not None and mx.array(masses).shape != (particle_count,):
+        msg = "masses must have shape (n_particles,)"
+        raise ValueError(msg)
+    execution_plan = _acquire_execution_plan(
+        cell,
+        config=config,
+        coulomb_constant=coulomb_constant,
+        plan=plan,
+    )
+    _, reciprocal_forces, charge_grid = _mesh_reciprocal_energy_forces_core_mx(
+        wrapped_positions,
+        charges_mx,
+        cell_lengths,
+        influence=execution_plan.influence,
+        wavevectors=execution_plan.wavevectors,
+        mesh_shape=config.mesh_shape,
+        assignment_order=config.assignment_order,
+        grid_size=execution_plan.grid_size,
+        allow_order5_metal=True,
+    )
+    rho_hat = mx.fft.fftn(charge_grid)
+
+    def atomically_strained_energy(strain: mx.array) -> mx.array:
+        strained_lengths = cell_lengths * (1.0 + strain)
+        influence, _, _ = _differentiable_influence_function_mx(
+            strained_lengths,
+            config.mesh_shape,
+            alpha=config.alpha,
+            coulomb_constant=coulomb_constant,
+            deconvolve_assignment=config.deconvolve_assignment,
+            assignment_order=config.assignment_order,
+        )
+        potential_grid = (
+            mx.real(mx.fft.ifftn(influence * rho_hat))
+            * float(execution_plan.grid_size)
+        )
+        return 0.5 * mx.sum(charge_grid * potential_grid)
+
+    atomic_diagonal = -mx.grad(atomically_strained_energy)(
+        mx.zeros((3,), dtype=original_positions.dtype)
+    )
+    ids = normalize_molecule_ids(
+        molecule_ids,
+        particle_count=particle_count,
+    )
+    if np.array_equal(ids, np.arange(particle_count, dtype=np.int32)):
+        return mx.diag(atomic_diagonal)
+
+    molecule_count = int(np.max(ids)) + 1
+    molecule_index = mx.array(ids, dtype=mx.int32)
+    counts = (
+        mx.zeros((molecule_count,), dtype=original_positions.dtype)
+        .at[molecule_index]
+        .add(mx.ones((particle_count,), dtype=original_positions.dtype))
+    )
+    centers = (
+        mx.zeros((molecule_count, 3), dtype=original_positions.dtype)
+        .at[molecule_index]
+        .add(original_positions)
+        / counts[:, None]
+    )
+    molecular_correction = mx.sum(
+        reciprocal_forces * (centers[molecule_index] - original_positions),
+        axis=0,
+    )
+    return mx.diag(atomic_diagonal + molecular_correction)
 
 
 def pme_direct_space_policy_report(
