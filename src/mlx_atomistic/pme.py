@@ -13,6 +13,10 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell
+from mlx_atomistic.metal_kernels import (
+    pme_order5_charge_grid,
+    pme_order5_energy_forces,
+)
 from mlx_atomistic.neighbors import NeighborBlocks
 from mlx_atomistic.nonbonded import (
     FORCE_EVALUATION_SCOPES,
@@ -2058,6 +2062,7 @@ def _mesh_reciprocal_energy_forces_mx(
         mesh_shape=config.mesh_shape,
         assignment_order=config.assignment_order,
         grid_size=plan.grid_size,
+        allow_order5_metal=isinstance(plan, PMEExecutionPlan),
     )
     if not return_mesh_info:
         return energy, forces, None
@@ -2085,17 +2090,40 @@ def _mesh_reciprocal_energy_forces_core_mx(
     mesh_shape: tuple[int, int, int],
     assignment_order: int,
     grid_size: int,
+    allow_order5_metal: bool,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    charge_grid = _assign_charges_bspline_mx(
-        positions,
-        charges,
-        cell_lengths,
-        mesh_shape,
-        assignment_order=assignment_order,
+    use_order5_metal = (
+        allow_order5_metal
+        and
+        assignment_order == 5
+        and "gpu" in str(mx.default_device()).lower()
     )
+    if use_order5_metal:
+        charge_grid = pme_order5_charge_grid(
+            positions,
+            charges,
+            cell_lengths,
+            mesh_shape,
+        )
+    else:
+        charge_grid = _assign_charges_bspline_mx(
+            positions,
+            charges,
+            cell_lengths,
+            mesh_shape,
+            assignment_order=assignment_order,
+        )
     rho_hat = mx.fft.fftn(charge_grid)
     phi_hat = influence * rho_hat
     potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
+    if use_order5_metal:
+        energy, forces = pme_order5_energy_forces(
+            positions,
+            charges,
+            potential_grid,
+            cell_lengths,
+        )
+        return energy, forces, charge_grid
     field_grids = [
         mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
         for k_axis in wavevectors
@@ -2151,6 +2179,7 @@ def _compiled_reciprocal_evaluator(
             mesh_shape=mesh_shape,
             assignment_order=assignment_order,
             grid_size=grid_size,
+            allow_order5_metal=True,
         )
         return energy, forces
 

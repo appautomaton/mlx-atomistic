@@ -77,6 +77,8 @@ _LJ_FORCE_SOURCE = r"""
 _kernel_singleton = None
 _parameterized_kernel_singleton = None
 _pme_direct_kernel_singleton = None
+_pme_order5_spread_kernel_singleton = None
+_pme_order5_interpolate_kernel_singleton = None
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -415,6 +417,174 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
     );
 """
 
+_PME_ORDER5_HEADER = r"""
+inline void mlx_atomistic_pme_order5_weights(
+    float3 fraction,
+    thread float3* weights,
+    thread float3* derivatives
+) {
+    weights[4] = float3(0.0f);
+    weights[1] = fraction;
+    weights[0] = float3(1.0f) - fraction;
+    for (int j = 3; j < 5; j++) {
+        float divisor = 1.0f / (float)(j - 1);
+        weights[j - 1] = divisor * fraction * weights[j - 2];
+        for (int k = 1; k < (j - 1); k++) {
+            weights[j - k - 1] = divisor * (
+                (fraction + float3((float)k)) * weights[j - k - 2]
+                + (float3((float)(j - k)) - fraction)
+                * weights[j - k - 1]
+            );
+        }
+        weights[0] =
+            divisor * (float3(1.0f) - fraction) * weights[0];
+    }
+
+    derivatives[0] = -weights[0];
+    for (int j = 1; j < 5; j++) {
+        derivatives[j] = weights[j - 1] - weights[j];
+    }
+
+    const float scale = 0.25f;
+    weights[4] = scale * fraction * weights[3];
+    for (int j = 1; j < 4; j++) {
+        weights[4 - j] = scale * (
+            (fraction + float3((float)j)) * weights[3 - j]
+            + (float3((float)(5 - j)) - fraction) * weights[4 - j]
+        );
+    }
+    weights[0] =
+        scale * (float3(1.0f) - fraction) * weights[0];
+}
+"""
+
+_PME_ORDER5_SPREAD_SOURCE = r"""
+    uint lane = thread_position_in_grid.x;
+    uint atom_count = (uint)counts[0];
+    if (lane >= atom_count * 5u) {
+        return;
+    }
+    uint atom = lane / 5u;
+    int z_offset = (int)(lane - atom * 5u);
+
+    float3 scaled;
+    scaled.x = (
+        positions[3 * atom + 0]
+        - floor(positions[3 * atom + 0] / cell[0]) * cell[0]
+    ) / cell[0] * (float)mesh[0];
+    scaled.y = (
+        positions[3 * atom + 1]
+        - floor(positions[3 * atom + 1] / cell[1]) * cell[1]
+    ) / cell[1] * (float)mesh[1];
+    scaled.z = (
+        positions[3 * atom + 2]
+        - floor(positions[3 * atom + 2] / cell[2]) * cell[2]
+    ) / cell[2] * (float)mesh[2];
+    int3 anchor = int3(
+        (int)floor(scaled.x) - 2,
+        (int)floor(scaled.y) - 2,
+        (int)floor(scaled.z) - 2
+    );
+    float3 fraction = scaled - floor(scaled);
+    float3 weights[5];
+    float3 derivatives[5];
+    mlx_atomistic_pme_order5_weights(
+        fraction,
+        weights,
+        derivatives
+    );
+
+    int nz = mesh[2];
+    int ny = mesh[1];
+    int z = (anchor.z + z_offset + nz) % nz;
+    float qz = charges[atom] * weights[z_offset].z;
+    for (int x_offset = 0; x_offset < 5; x_offset++) {
+        int x = (anchor.x + x_offset + mesh[0]) % mesh[0];
+        float qzx = qz * weights[x_offset].x;
+        for (int y_offset = 0; y_offset < 5; y_offset++) {
+            int y = (anchor.y + y_offset + ny) % ny;
+            int index = (x * ny + y) * nz + z;
+            float value = qzx * weights[y_offset].y;
+            atomic_fetch_add_explicit(
+                &charge_grid[index],
+                value,
+                memory_order_relaxed
+            );
+        }
+    }
+"""
+
+_PME_ORDER5_INTERPOLATE_SOURCE = r"""
+    uint atom = thread_position_in_grid.x;
+    if (atom >= (uint)counts[0]) {
+        return;
+    }
+
+    float3 scaled;
+    scaled.x = (
+        positions[3 * atom + 0]
+        - floor(positions[3 * atom + 0] / cell[0]) * cell[0]
+    ) / cell[0] * (float)mesh[0];
+    scaled.y = (
+        positions[3 * atom + 1]
+        - floor(positions[3 * atom + 1] / cell[1]) * cell[1]
+    ) / cell[1] * (float)mesh[1];
+    scaled.z = (
+        positions[3 * atom + 2]
+        - floor(positions[3 * atom + 2] / cell[2]) * cell[2]
+    ) / cell[2] * (float)mesh[2];
+    int3 anchor = int3(
+        (int)floor(scaled.x) - 2,
+        (int)floor(scaled.y) - 2,
+        (int)floor(scaled.z) - 2
+    );
+    float3 fraction = scaled - floor(scaled);
+    float3 weights[5];
+    float3 derivatives[5];
+    mlx_atomistic_pme_order5_weights(
+        fraction,
+        weights,
+        derivatives
+    );
+
+    int ny = mesh[1];
+    int nz = mesh[2];
+    float potential = 0.0f;
+    float3 gradient = float3(0.0f);
+    for (int x_offset = 0; x_offset < 5; x_offset++) {
+        int x = (anchor.x + x_offset + mesh[0]) % mesh[0];
+        for (int y_offset = 0; y_offset < 5; y_offset++) {
+            int y = (anchor.y + y_offset + ny) % ny;
+            for (int z_offset = 0; z_offset < 5; z_offset++) {
+                int z = (anchor.z + z_offset + nz) % nz;
+                float grid_value = potential_grid[(x * ny + y) * nz + z];
+                float wx = weights[x_offset].x;
+                float wy = weights[y_offset].y;
+                float wz = weights[z_offset].z;
+                potential += wx * wy * wz * grid_value;
+                gradient.x += (
+                    derivatives[x_offset].x * wy * wz * grid_value
+                );
+                gradient.y += (
+                    wx * derivatives[y_offset].y * wz * grid_value
+                );
+                gradient.z += (
+                    wx * wy * derivatives[z_offset].z * grid_value
+                );
+            }
+        }
+    }
+
+    float charge = charges[atom];
+    atom_energy[atom] = 0.5f * charge * potential;
+    forces[3 * atom + 0] =
+        -charge * gradient.x * (float)mesh[0] / cell[0];
+    forces[3 * atom + 1] =
+        -charge * gradient.y * (float)mesh[1] / cell[1];
+    forces[3 * atom + 2] =
+        -charge * gradient.z * (float)mesh[2] / cell[2];
+"""
+
 
 def _lj_force_kernel():
     """Return the cached fused-LJ Metal kernel, building it on first call."""
@@ -485,6 +655,161 @@ def _parameterized_pme_direct_kernel():
             atomic_outputs=True,
         )
     return _pme_direct_kernel_singleton
+
+
+def _pme_order5_spread_kernel():
+    """Return the cached order-five PME charge-spread Metal kernel."""
+
+    global _pme_order5_spread_kernel_singleton
+    if _pme_order5_spread_kernel_singleton is None:
+        _pme_order5_spread_kernel_singleton = mx.fast.metal_kernel(
+            name="pme_order5_spread",
+            input_names=["positions", "charges", "cell", "mesh", "counts"],
+            output_names=["charge_grid"],
+            source=_PME_ORDER5_SPREAD_SOURCE,
+            header=_PME_ORDER5_HEADER,
+            atomic_outputs=True,
+        )
+    return _pme_order5_spread_kernel_singleton
+
+
+def _pme_order5_interpolate_kernel():
+    """Return the cached order-five PME interpolation Metal kernel."""
+
+    global _pme_order5_interpolate_kernel_singleton
+    if _pme_order5_interpolate_kernel_singleton is None:
+        _pme_order5_interpolate_kernel_singleton = mx.fast.metal_kernel(
+            name="pme_order5_interpolate",
+            input_names=[
+                "positions",
+                "charges",
+                "potential_grid",
+                "cell",
+                "mesh",
+                "counts",
+            ],
+            output_names=["atom_energy", "forces"],
+            source=_PME_ORDER5_INTERPOLATE_SOURCE,
+            header=_PME_ORDER5_HEADER,
+        )
+    return _pme_order5_interpolate_kernel_singleton
+
+
+def pme_order5_charge_grid(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
+    mesh_shape: tuple[int, int, int],
+) -> mx.array:
+    """Spread particle charges onto a PME mesh with one Metal dispatch.
+
+    Args:
+        positions: Atomic coordinates with shape ``(n_atoms, 3)``.
+        charges: Per-atom charges with shape ``(n_atoms,)``.
+        cell_lengths: Orthorhombic cell lengths with shape ``(3,)``.
+        mesh_shape: Three positive PME mesh dimensions.
+
+    Returns:
+        The float32 order-five B-spline charge grid.
+
+    Raises:
+        ValueError: If input shapes or mesh dimensions are invalid.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    cell_lengths = as_mx_array(cell_lengths, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    atom_count = int(positions.shape[0])
+    if charges.shape != (atom_count,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if cell_lengths.shape != (3,):
+        msg = "cell_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if len(mesh_shape) != 3 or any(int(size) <= 0 for size in mesh_shape):
+        msg = "mesh_shape must contain three positive dimensions"
+        raise ValueError(msg)
+    normalized_mesh = tuple(int(size) for size in mesh_shape)
+    grid_size = normalized_mesh[0] * normalized_mesh[1] * normalized_mesh[2]
+    mesh = mx.array(normalized_mesh, dtype=mx.int32)
+    counts = mx.array([atom_count], dtype=mx.int32)
+    work_items = atom_count * 5
+    if work_items == 0:
+        return mx.zeros(normalized_mesh, dtype=mx.float32)
+    threads = min(256, work_items)
+    (charge_grid,) = _pme_order5_spread_kernel()(
+        inputs=[positions, charges, cell_lengths, mesh, counts],
+        output_shapes=[(grid_size,)],
+        output_dtypes=[mx.float32],
+        grid=(work_items, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return mx.reshape(charge_grid, normalized_mesh)
+
+
+def pme_order5_energy_forces(
+    positions: mx.array,
+    charges: mx.array,
+    potential_grid: mx.array,
+    cell_lengths: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Interpolate order-five PME energy and forces with one Metal dispatch.
+
+    Args:
+        positions: Atomic coordinates with shape ``(n_atoms, 3)``.
+        charges: Per-atom charges with shape ``(n_atoms,)``.
+        potential_grid: Scalar three-dimensional reciprocal potential mesh.
+        cell_lengths: Orthorhombic cell lengths with shape ``(3,)``.
+
+    Returns:
+        Scalar reciprocal energy and ``(n_atoms, 3)`` forces.
+
+    Raises:
+        ValueError: If input shapes are invalid.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    potential_grid = as_mx_array(potential_grid, dtype=mx.float32)
+    cell_lengths = as_mx_array(cell_lengths, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    atom_count = int(positions.shape[0])
+    if charges.shape != (atom_count,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if potential_grid.ndim != 3:
+        msg = "potential_grid must be three-dimensional"
+        raise ValueError(msg)
+    if cell_lengths.shape != (3,):
+        msg = "cell_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if atom_count == 0:
+        return mx.array(0.0, dtype=mx.float32), mx.zeros_like(positions)
+    mesh = mx.array(potential_grid.shape, dtype=mx.int32)
+    counts = mx.array([atom_count], dtype=mx.int32)
+    threads = min(256, atom_count)
+    atom_energy, forces = _pme_order5_interpolate_kernel()(
+        inputs=[
+            positions,
+            charges,
+            potential_grid,
+            cell_lengths,
+            mesh,
+            counts,
+        ],
+        output_shapes=[(atom_count,), (atom_count, 3)],
+        output_dtypes=[mx.float32, mx.float32],
+        grid=(atom_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return mx.sum(atom_energy), forces
 
 
 def fused_lj_forces(

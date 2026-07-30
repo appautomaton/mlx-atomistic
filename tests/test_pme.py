@@ -5,6 +5,10 @@ import pytest
 import mlx_atomistic.pme as pme_module
 from mlx_atomistic.benchmarks import ewald_reference
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.metal_kernels import (
+    pme_order5_charge_grid,
+    pme_order5_energy_forces,
+)
 from mlx_atomistic.neighbors import build_neighbor_list
 from mlx_atomistic.nonbonded import EwaldReferenceConfig, ewald_reference_coulomb_energy_forces
 from mlx_atomistic.pme import (
@@ -820,6 +824,99 @@ def test_pme_analytic_strain_gpu_memory_is_bounded(monkeypatch):
 
         assert np.all(np.isfinite(np.asarray(gradient)))
         assert mx.get_peak_memory() < 256 * 1024**2
+    finally:
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+
+
+@pytest.mark.gpu
+def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
+    previous = mx.default_device()
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    try:
+        device = mx.Device(mx.gpu, 0)
+        mx.set_default_device(device)
+        mx.set_default_stream(mx.new_stream(device))
+        mx.eval(mx.array([1.0], dtype=mx.float32))
+    except Exception:  # noqa: BLE001 - any Metal load failure means skip.
+        mx.set_default_device(previous)
+        mx.set_default_stream(mx.new_stream(previous))
+        pytest.skip("Metal GPU unavailable")
+    try:
+        positions = mx.array(
+            [
+                [-0.25, 0.1, 12.1],
+                [12.0, 4.2, -0.3],
+                [2.4, 11.8, 5.1],
+                [6.7, 7.3, 8.9],
+            ],
+            dtype=mx.float32,
+        )
+        charges = mx.array([0.7, -0.2, 0.4, -0.1], dtype=mx.float32)
+        lengths = mx.array([12.0, 12.0, 12.0], dtype=mx.float32)
+        mesh_shape = (12, 14, 16)
+        reference_grid = _assign_charges_bspline_mx(
+            positions,
+            charges,
+            lengths,
+            mesh_shape,
+            assignment_order=5,
+        )
+        metal_grid = pme_order5_charge_grid(
+            positions,
+            charges,
+            lengths,
+            mesh_shape,
+        )
+        potential_grid = mx.sin(
+            mx.arange(int(np.prod(mesh_shape)), dtype=mx.float32) * 0.013
+        ).reshape(mesh_shape)
+        metal_energy, metal_forces = pme_order5_energy_forces(
+            positions,
+            charges,
+            potential_grid,
+            lengths,
+        )
+
+        def fixed_grid_energy(coordinates):
+            values = _interpolate_bspline_mx(
+                coordinates,
+                potential_grid,
+                lengths,
+                assignment_order=5,
+            )
+            return 0.5 * mx.sum(charges * values)
+
+        reference_energy, energy_gradient = mx.value_and_grad(
+            fixed_grid_energy
+        )(positions)
+        mx.eval(
+            reference_grid,
+            metal_grid,
+            reference_energy,
+            energy_gradient,
+            metal_energy,
+            metal_forces,
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(metal_grid),
+            np.asarray(reference_grid),
+            rtol=2e-6,
+            atol=2e-7,
+        )
+        np.testing.assert_allclose(
+            np.asarray(metal_energy),
+            np.asarray(reference_energy),
+            rtol=2e-6,
+            atol=2e-7,
+        )
+        np.testing.assert_allclose(
+            np.asarray(metal_forces),
+            -2.0 * np.asarray(energy_gradient),
+            rtol=2e-5,
+            atol=2e-6,
+        )
     finally:
         mx.set_default_device(previous)
         mx.set_default_stream(mx.new_stream(previous))

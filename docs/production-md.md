@@ -68,12 +68,17 @@ This remains one bounded four-step fixed-cell result, not broad production MD
 certification.
 
 That validation records the backend used when it was produced. The current
-production runner uses shared compact `mlx_cell_pairs`, compiled reciprocal PME,
-and a fused parameterized LJ/direct-PME Metal path. A matched 75-step DHFR NPT
-prefix passed the same numerical gates while reducing complete wall time from
-142.87 to a repeated median of 13.77 seconds and peak process-tree memory from
-27.33 GB to 5.18--6.11 GB across retained samples on an M5 Max in low-power
-mode. No production-length claim is made from that bounded performance prefix.
+production runner uses shared compact `mlx_cell_pairs`, dedicated order-five
+reciprocal-PME Metal spreading/interpolation, and a fused parameterized
+LJ/direct-PME Metal path. A matched 75-step DHFR NPT prefix passed the same
+numerical gates while reducing complete wall time from 142.87 to a repeated
+median of 13.77 seconds and peak process-tree memory from 27.33 GB to
+5.18--6.11 GB across retained samples on an M5 Max in low-power mode. A
+separate 2,269-atom alanine 50-step gate measured the reciprocal-kernel change:
+0.853 to 0.537 seconds without pressure diagnostics and 1.313 to 0.987 seconds
+with analytic pressure diagnostics, with fixed-coordinate OpenMM parity still
+passing. No production-length claim is made from these bounded performance
+prefixes.
 
 ## Validated Charged Fixed-Cell PME Envelope
 

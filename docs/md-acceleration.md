@@ -92,10 +92,15 @@ synthetic neighbor row. The production runner has since moved to compact
 compilation, and fused parameterized LJ/direct-PME Metal kernels then reduced a
 matched 75-step DHFR NPT prefix from 142.87 to a repeated median of 13.77
 seconds. Process-tree peak memory fell from 27.33 GB to 5.18--6.11 GB across
-the retained samples, and the same numerical gates passed. These measurements
-were made on an M5 Max in low-power mode. This is bounded optimization
-evidence, not a new production-length validation. Charged fixed-cell PME also
-has a separate 94,232-atom JAC validation. See
+the retained samples, and the same numerical gates passed. Order-five
+reciprocal PME now also uses dedicated Metal charge-spread and
+potential-derivative interpolation kernels, reducing the 2,269-atom alanine
+50-step fixed-cell median from 0.853 to 0.537 seconds without pressure
+diagnostics and from 1.313 to 0.987 seconds with analytic pressure diagnostics.
+Fixed-coordinate OpenMM parity remained within the accepted energy and force
+gates. These measurements were made on an M5 Max in low-power mode. This is
+bounded optimization evidence, not a new production-length validation. Charged
+fixed-cell PME also has a separate 94,232-atom JAC validation. See
 [`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](./benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md)
 and
 [`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md),
