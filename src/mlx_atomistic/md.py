@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field, replace
 from math import exp, sqrt
 from time import perf_counter
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import mlx.core as mx
 import numpy as np
@@ -69,6 +69,59 @@ class ForceTerm(Protocol):
             An ``(energy, forces)`` tuple: scalar potential energy and forces of
                 shape ``(n_particles, 3)``.
         """
+
+
+_ForceEvaluationMode = Literal[
+    "forces",
+    "energy_forces",
+    "energy",
+    "diagnostic",
+]
+
+
+@dataclass(frozen=True)
+class _ForceEvaluationRequest:
+    """Describe one exact internal force-evaluation demand."""
+
+    mode: _ForceEvaluationMode
+    virial_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {
+            "forces",
+            "energy_forces",
+            "energy",
+            "diagnostic",
+        }:
+            msg = f"unsupported force-evaluation mode: {self.mode!r}"
+            raise ValueError(msg)
+        if self.virial_mode is not None:
+            if self.mode != "diagnostic":
+                msg = "virial output is available only in diagnostic mode"
+                raise ValueError(msg)
+            object.__setattr__(
+                self,
+                "virial_mode",
+                normalize_virial_support(self.virial_mode),
+            )
+
+
+@dataclass(frozen=True)
+class _ForceEvaluationResult:
+    """Hold only the outputs requested by an internal force evaluation."""
+
+    energy: mx.array | None = None
+    forces: mx.array | None = None
+    components: dict[str, mx.array] = field(default_factory=dict)
+    virial: mx.array | None = None
+    optimized_terms: int = 0
+    fallback_terms: int = 0
+
+
+_FORCES_REQUEST = _ForceEvaluationRequest("forces")
+_ENERGY_FORCES_REQUEST = _ForceEvaluationRequest("energy_forces")
+_ENERGY_REQUEST = _ForceEvaluationRequest("energy")
+_DIAGNOSTIC_REQUEST = _ForceEvaluationRequest("diagnostic")
 
 
 @dataclass(frozen=True)
@@ -1287,6 +1340,42 @@ def _pressure_diagnostics(
     return zeros, zeros, mx.sum(positions[:, 0] * 0.0)
 
 
+def _pressure_diagnostics_from_virial(
+    virial: mx.array | None,
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    *,
+    cell: Cell | None,
+    kinetic_energy_scale: float,
+    enabled: bool,
+    molecule_ids: object | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Assemble pressure from a virial produced by the owning diagnostic evaluation."""
+
+    if not enabled:
+        zeros = mx.zeros((3, 3), dtype=positions.dtype)
+        return zeros, zeros, mx.sum(positions[:, 0] * 0.0)
+    if virial is None:
+        msg = "enabled pressure diagnostics require a configurational virial"
+        raise RuntimeError(msg)
+    if cell is None:
+        zeros = mx.zeros((3, 3), dtype=virial.dtype)
+        return virial, zeros, mx.sum(virial * 0.0)
+    volume = cell.volume
+    if float(np.asarray(volume)) <= 0.0:
+        msg = "pressure diagnostics require positive cell volume"
+        raise ValueError(msg)
+    kinetic_tensor = kinetic_pressure_tensor(
+        velocities,
+        masses,
+        kinetic_energy_scale=kinetic_energy_scale,
+        molecule_ids=molecule_ids,
+    )
+    tensor = (kinetic_tensor + virial) / volume
+    return virial, tensor, mx.trace(tensor) / 3.0
+
+
 def _temperature_degrees_of_freedom(
     positions: mx.array,
     constraints: DistanceConstraints | None,
@@ -1457,6 +1546,186 @@ def _term_supports_virial(term: ForceTerm) -> bool:
     )
 
 
+def _evaluate_force_terms(
+    positions: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    request: _ForceEvaluationRequest,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None = None,
+    masses: mx.array | None = None,
+    molecule_ids: object | None = None,
+    named_force_terms: tuple[tuple[str, ForceTerm], ...] | None = None,
+) -> _ForceEvaluationResult:
+    """Evaluate force terms for one exact internal output demand."""
+
+    if request.mode == "diagnostic":
+        named_terms = (
+            _named_force_terms(force_terms)
+            if named_force_terms is None
+            else named_force_terms
+        )
+        energy, forces, components = _energy_forces_by_term(
+            positions,
+            named_terms,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+        )
+        virial = None
+        if request.virial_mode is not None:
+            virial = configurational_virial_tensor(
+                positions,
+                forces,
+                force_terms,
+                cell=cell,
+                pairs=pairs,
+                virtual_sites=virtual_sites,
+                masses=masses,
+                molecule_ids=molecule_ids,
+                virial_mode=request.virial_mode,
+            )
+        return _ForceEvaluationResult(
+            energy=energy,
+            forces=forces,
+            components=components,
+            virial=virial,
+            fallback_terms=len(force_terms),
+        )
+    if request.mode == "energy_forces":
+        energy, forces = _energy_forces_from_terms(
+            positions,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+        )
+        return _ForceEvaluationResult(
+            energy=energy,
+            forces=forces,
+            fallback_terms=len(force_terms),
+        )
+    if request.mode == "forces":
+        forces, optimized_terms, fallback_terms = _forces_from_term_demands(
+            positions,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+        )
+        return _ForceEvaluationResult(
+            forces=forces,
+            optimized_terms=optimized_terms,
+            fallback_terms=fallback_terms,
+        )
+    energy, optimized_terms, fallback_terms = _energy_from_term_demands(
+        positions,
+        force_terms,
+        cell=cell,
+        pairs=pairs,
+        virtual_sites=virtual_sites,
+    )
+    return _ForceEvaluationResult(
+        energy=energy,
+        optimized_terms=optimized_terms,
+        fallback_terms=fallback_terms,
+    )
+
+
+def _forces_from_term_demands(
+    positions: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None,
+) -> tuple[mx.array, int, int]:
+    real_positions = as_mx_array(positions)
+    eval_positions = _virtual_site_evaluation_positions(real_positions, virtual_sites)
+    grouped_terms = _groupable_potential_terms(force_terms, pairs)
+    grouped_ids = {id(term) for term in grouped_terms}
+    total_forces = mx.zeros_like(eval_positions)
+    optimized_terms = len(grouped_terms)
+    fallback_terms = 0
+    if grouped_terms:
+        total_forces = total_forces + _grouped_potential_forces(
+            eval_positions,
+            grouped_terms,
+            cell=cell,
+        )
+    for term in force_terms:
+        if id(term) in grouped_ids:
+            continue
+        force_method = getattr(term, "_runtime_forces", None)
+        forces = (
+            force_method(eval_positions, cell=cell, pairs=pairs)
+            if callable(force_method)
+            else NotImplemented
+        )
+        if forces is NotImplemented:
+            _, forces = term.energy_forces(eval_positions, cell, pairs=pairs)
+            fallback_terms += 1
+        else:
+            optimized_terms += 1
+        total_forces = total_forces + as_mx_array(forces)
+    if optimized_terms + fallback_terms == 0:
+        msg = "force_terms must not be empty"
+        raise ValueError(msg)
+    return (
+        _redistribute_virtual_site_forces(
+            total_forces,
+            eval_positions,
+            virtual_sites,
+        ),
+        optimized_terms,
+        fallback_terms,
+    )
+
+
+def _energy_from_term_demands(
+    positions: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None,
+) -> tuple[mx.array, int, int]:
+    real_positions = as_mx_array(positions)
+    eval_positions = _virtual_site_evaluation_positions(real_positions, virtual_sites)
+    grouped_terms = _groupable_potential_terms(force_terms, pairs)
+    grouped_ids = {id(term) for term in grouped_terms}
+    total_energy = None
+    optimized_terms = 0
+    fallback_terms = 0
+    for term in force_terms:
+        if id(term) in grouped_ids:
+            energy = term.potential_energy(eval_positions, cell)
+            optimized_terms += 1
+        else:
+            energy_method = getattr(term, "_runtime_energy", None)
+            energy = (
+                energy_method(eval_positions, cell=cell, pairs=pairs)
+                if callable(energy_method)
+                else NotImplemented
+            )
+            if energy is NotImplemented:
+                potential_energy = getattr(term, "potential_energy", None)
+                if pairs is None and callable(potential_energy):
+                    energy = potential_energy(eval_positions, cell)
+                    optimized_terms += 1
+                else:
+                    energy, _ = term.energy_forces(eval_positions, cell, pairs=pairs)
+                    fallback_terms += 1
+            else:
+                optimized_terms += 1
+        total_energy = energy if total_energy is None else total_energy + energy
+    if total_energy is None:
+        msg = "force_terms must not be empty"
+        raise ValueError(msg)
+    return total_energy, optimized_terms, fallback_terms
+
+
 def _energy_forces_from_terms(
     positions: mx.array,
     force_terms: tuple[ForceTerm, ...],
@@ -1596,6 +1865,101 @@ def _neighbor_evaluation_positions(
     return _virtual_site_evaluation_positions(positions, virtual_sites)
 
 
+def _forces_from_terms(
+    positions: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None = None,
+) -> mx.array:
+    if not any(callable(getattr(term, "_runtime_forces", None)) for term in force_terms):
+        _, forces = _energy_forces_from_terms(
+            positions,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+        )
+        return forces
+    result = _evaluate_force_terms(
+        positions,
+        force_terms,
+        request=_FORCES_REQUEST,
+        cell=cell,
+        pairs=pairs,
+        virtual_sites=virtual_sites,
+    )
+    if result.forces is None:
+        msg = "forces evaluation did not return forces"
+        raise RuntimeError(msg)
+    return result.forces
+
+
+def _energy_from_terms(
+    positions: mx.array,
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None = None,
+) -> mx.array:
+    if pairs is not None and not any(
+        callable(getattr(term, "_runtime_energy", None)) for term in force_terms
+    ):
+        energy, _ = _energy_forces_from_terms(
+            positions,
+            force_terms,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+        )
+        return energy
+    result = _evaluate_force_terms(
+        positions,
+        force_terms,
+        request=_ENERGY_REQUEST,
+        cell=cell,
+        pairs=pairs,
+        virtual_sites=virtual_sites,
+    )
+    if result.energy is None:
+        msg = "energy evaluation did not return energy"
+        raise RuntimeError(msg)
+    return result.energy
+
+
+def _diagnostic_from_terms(
+    positions: mx.array,
+    force_terms: tuple[tuple[str, ForceTerm], ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    virtual_sites: VirtualSiteManager | None = None,
+    virial_mode: str | None = None,
+    masses: mx.array | None = None,
+) -> tuple[mx.array, mx.array, dict[str, mx.array], mx.array | None]:
+    request = (
+        _DIAGNOSTIC_REQUEST
+        if virial_mode is None
+        else _ForceEvaluationRequest("diagnostic", virial_mode=virial_mode)
+    )
+    result = _evaluate_force_terms(
+        positions,
+        tuple(term for _, term in force_terms),
+        request=request,
+        cell=cell,
+        pairs=pairs,
+        virtual_sites=virtual_sites,
+        masses=masses,
+        named_force_terms=force_terms,
+    )
+    if result.energy is None or result.forces is None:
+        msg = "diagnostic evaluation did not return energy and forces"
+        raise RuntimeError(msg)
+    return result.energy, result.forces, result.components, result.virial
+
+
 def _make_energy_forces_by_term_evaluator(
     force_terms: tuple[tuple[str, ForceTerm], ...],
     *,
@@ -1603,15 +1967,71 @@ def _make_energy_forces_by_term_evaluator(
     pairs: object | None,
     compile_evaluator: bool,
     virtual_sites: VirtualSiteManager | None = None,
+    virial_mode: str | None = None,
+    masses: mx.array | None = None,
 ):
+    unnamed_terms = tuple(term for _, term in force_terms)
+    request = (
+        _DIAGNOSTIC_REQUEST
+        if virial_mode is None
+        else _ForceEvaluationRequest("diagnostic", virial_mode=virial_mode)
+    )
+
     def evaluate(pos: mx.array):
-        return _energy_forces_by_term(
+        result = _evaluate_force_terms(
+            pos,
+            unnamed_terms,
+            request=request,
+            cell=cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+            masses=masses,
+            named_force_terms=force_terms,
+        )
+        if result.energy is None or result.forces is None:
+            msg = "diagnostic evaluation did not return energy and forces"
+            raise RuntimeError(msg)
+        return result.energy, result.forces, result.components, result.virial
+
+    if compile_evaluator and pairs is None and virtual_sites is None:
+        return mx.compile(evaluate)
+    return evaluate
+
+
+def _make_forces_evaluator(
+    force_terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+    pairs: object | None,
+    compile_evaluator: bool,
+    virtual_sites: VirtualSiteManager | None = None,
+):
+    runtime_force_hooks = any(
+        callable(getattr(term, "_runtime_forces", None)) for term in force_terms
+    )
+
+    def evaluate(pos: mx.array):
+        if not runtime_force_hooks:
+            _, forces = _energy_forces_from_terms(
+                pos,
+                force_terms,
+                cell=cell,
+                pairs=pairs,
+                virtual_sites=virtual_sites,
+            )
+            return forces
+        result = _evaluate_force_terms(
             pos,
             force_terms,
+            request=_FORCES_REQUEST,
             cell=cell,
             pairs=pairs,
             virtual_sites=virtual_sites,
         )
+        if result.forces is None:
+            msg = "forces evaluation did not return forces"
+            raise RuntimeError(msg)
+        return result.forces
 
     if compile_evaluator and pairs is None and virtual_sites is None:
         return mx.compile(evaluate)
@@ -1631,13 +2051,18 @@ def _make_energy_forces_evaluator(
     virtual_sites: VirtualSiteManager | None = None,
 ):
     def evaluate(pos: mx.array):
-        return _energy_forces_from_terms(
+        result = _evaluate_force_terms(
             pos,
             force_terms,
+            request=_ENERGY_FORCES_REQUEST,
             cell=cell,
             pairs=pairs,
             virtual_sites=virtual_sites,
         )
+        if result.energy is None or result.forces is None:
+            msg = "energy-forces evaluation did not return energy and forces"
+            raise RuntimeError(msg)
+        return result.energy, result.forces
 
     if compile_evaluator and pairs is None and virtual_sites is None:
         return mx.compile(evaluate)
@@ -1679,6 +2104,24 @@ def _grouped_potential_energy_forces(
 
     energy, gradient = mx.value_and_grad(total_potential_energy)(positions)
     return energy, -gradient
+
+
+def _grouped_potential_forces(
+    positions: mx.array,
+    terms: tuple[ForceTerm, ...],
+    *,
+    cell: Cell | None,
+) -> mx.array:
+    def total_potential_energy(pos: mx.array) -> mx.array:
+        total = None
+        for term in terms:
+            energy = term.potential_energy(pos, cell)
+            total = energy if total is None else total + energy
+        if total is None:
+            return _zero_constraint_error(pos)
+        return total
+
+    return -mx.grad(total_potential_energy)(positions)
 
 
 def _dense_pair_count(positions: mx.array) -> int:
@@ -2263,8 +2706,12 @@ def simulate_nve(
         pairs=pairs,
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
         virtual_sites=virtual_sites,
+        virial_mode=(
+            config.pressure_virial_mode if config.pressure_diagnostics else None
+        ),
+        masses=masses,
     )
-    energy_forces = _make_energy_forces_evaluator(
+    forces_evaluator = _make_forces_evaluator(
         unnamed_terms,
         cell=cell,
         pairs=pairs,
@@ -2272,7 +2719,9 @@ def simulate_nve(
         virtual_sites=virtual_sites,
     )
     force_start = perf_counter()
-    potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
+    potential_energy, forces, energy_by_term, diagnostic_virial = (
+        energy_forces_by_term(positions)
+    )
     force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
@@ -2312,18 +2761,14 @@ def simulate_nve(
             boltzmann_constant=config.boltzmann_constant,
         )
     ]
-    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics_from_virial(
+        diagnostic_virial,
         state.positions,
         state.velocities,
         masses,
-        state.forces,
-        unnamed_terms,
         cell=cell,
-        pairs=pairs,
         kinetic_energy_scale=config.kinetic_energy_scale,
         enabled=config.pressure_diagnostics,
-        virtual_sites=virtual_sites,
-        virial_mode=config.pressure_virial_mode,
     )
     virials = [virial]
     pressure_tensors = [pressure_tensor_value]
@@ -2397,21 +2842,40 @@ def simulate_nve(
             final=local_step == config.steps,
         )
         force_start = perf_counter()
+        diagnostic_virial = None
         if neighbor_manager is None and diagnostic_step:
-            potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
+            (
+                potential_energy,
+                next_forces,
+                energy_by_term,
+                diagnostic_virial,
+            ) = energy_forces_by_term(next_positions)
         elif neighbor_manager is None:
-            potential_energy, next_forces = energy_forces(next_positions)
+            potential_energy = None
+            next_forces = forces_evaluator(next_positions)
             energy_by_term = None
         elif diagnostic_step:
-            potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
+            (
+                potential_energy,
+                next_forces,
+                energy_by_term,
+                diagnostic_virial,
+            ) = _diagnostic_from_terms(
                 next_positions,
                 terms,
                 cell=cell,
                 pairs=pairs,
                 virtual_sites=virtual_sites,
+                virial_mode=(
+                    config.pressure_virial_mode
+                    if config.pressure_diagnostics
+                    else None
+                ),
+                masses=masses,
             )
         else:
-            potential_energy, next_forces = _energy_forces_from_terms(
+            potential_energy = None
+            next_forces = _forces_from_terms(
                 next_positions,
                 unnamed_terms,
                 cell=cell,
@@ -2484,18 +2948,16 @@ def simulate_nve(
                     boltzmann_constant=config.boltzmann_constant,
                 )
             )
-            virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-                state.positions,
-                state.velocities,
-                masses,
-                state.forces,
-                unnamed_terms,
-                cell=cell,
-                pairs=pairs,
-                kinetic_energy_scale=config.kinetic_energy_scale,
-                enabled=config.pressure_diagnostics,
-                virtual_sites=virtual_sites,
-                virial_mode=config.pressure_virial_mode,
+            virial, pressure_tensor_value, pressure_value = (
+                _pressure_diagnostics_from_virial(
+                    diagnostic_virial,
+                    state.positions,
+                    state.velocities,
+                    masses,
+                    cell=cell,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                    enabled=config.pressure_diagnostics,
+                )
             )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)
@@ -2700,6 +3162,10 @@ def _simulate_nvt(
         pairs=pairs,
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
         virtual_sites=virtual_sites,
+        virial_mode=(
+            config.pressure_virial_mode if config.pressure_diagnostics else None
+        ),
+        masses=masses,
     )
     energy_forces = _make_energy_forces_evaluator(
         unnamed_terms,
@@ -2708,12 +3174,22 @@ def _simulate_nvt(
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
         virtual_sites=virtual_sites,
     )
+    forces_evaluator = _make_forces_evaluator(
+        unnamed_terms,
+        cell=cell,
+        pairs=pairs,
+        compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
+        virtual_sites=virtual_sites,
+    )
     force_start = perf_counter()
     if initial_diagnostics is None:
-        potential_energy, forces, energy_by_term = energy_forces_by_term(positions)
+        potential_energy, forces, energy_by_term, diagnostic_virial = (
+            energy_forces_by_term(positions)
+        )
     else:
         potential_energy, forces = energy_forces(positions)
         energy_by_term = dict(initial_diagnostics.energy_by_term)
+        diagnostic_virial = initial_diagnostics.virial_tensor
     force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
@@ -2803,18 +3279,16 @@ def _simulate_nvt(
             chain_velocity=float(np.asarray(nh_chain_velocity)),
         )
     if initial_diagnostics is None:
-        virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-            state.positions,
-            state.velocities,
-            masses,
-            state.forces,
-            unnamed_terms,
-            cell=cell,
-            pairs=pairs,
-            kinetic_energy_scale=config.kinetic_energy_scale,
-            enabled=config.pressure_diagnostics,
-            virtual_sites=virtual_sites,
-            virial_mode=config.pressure_virial_mode,
+        virial, pressure_tensor_value, pressure_value = (
+            _pressure_diagnostics_from_virial(
+                diagnostic_virial,
+                state.positions,
+                state.velocities,
+                masses,
+                cell=cell,
+                kinetic_energy_scale=config.kinetic_energy_scale,
+                enabled=config.pressure_diagnostics,
+            )
         )
     else:
         virial = initial_diagnostics.virial_tensor
@@ -2891,7 +3365,7 @@ def _simulate_nvt(
             pos = pos + 0.5 * dt * middle
             if cell is not None and config.wrap_positions:
                 pos = cell.wrap(pos)
-            _, next_forces = _energy_forces_from_terms(
+            next_forces = _forces_from_terms(
                 pos, unnamed_terms, cell=cell, pairs=block_pairs, virtual_sites=None
             )
             next_accel = fscale * next_forces / masses_col
@@ -2963,10 +3437,11 @@ def _simulate_nvt(
                 deferred_final = defer_final_diagnostics and local_step == config.steps
                 energy_by_term = None
                 potential_energy = None
+                diagnostic_virial = None
                 if diagnostic_step:
                     force_start = perf_counter()
                     if deferred_final:
-                        potential_energy, _ = _energy_forces_from_terms(
+                        potential_energy = _energy_from_terms(
                             pos,
                             unnamed_terms,
                             cell=cell,
@@ -2978,12 +3453,23 @@ def _simulate_nvt(
                             for name, energies in potential_energy_by_term.items()
                         }
                     else:
-                        potential_energy, _, energy_by_term = _energy_forces_by_term(
+                        (
+                            potential_energy,
+                            _,
+                            energy_by_term,
+                            diagnostic_virial,
+                        ) = _diagnostic_from_terms(
                             pos,
                             terms,
                             cell=cell,
                             pairs=pairs,
                             virtual_sites=None,
+                            virial_mode=(
+                                config.pressure_virial_mode
+                                if config.pressure_diagnostics
+                                else None
+                            ),
+                            masses=masses,
                         )
                     fe_wall += perf_counter() - force_start
 
@@ -3040,18 +3526,16 @@ def _simulate_nvt(
                         pressure_tensor_value = pressure_tensors[-1]
                         pressure_value = pressures[-1]
                     else:
-                        virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-                            state.positions,
-                            state.velocities,
-                            masses,
-                            state.forces,
-                            unnamed_terms,
-                            cell=cell,
-                            pairs=pairs,
-                            kinetic_energy_scale=config.kinetic_energy_scale,
-                            enabled=config.pressure_diagnostics,
-                            virtual_sites=virtual_sites,
-                            virial_mode=config.pressure_virial_mode,
+                        virial, pressure_tensor_value, pressure_value = (
+                            _pressure_diagnostics_from_virial(
+                                diagnostic_virial,
+                                state.positions,
+                                state.velocities,
+                                masses,
+                                cell=cell,
+                                kinetic_energy_scale=config.kinetic_energy_scale,
+                                enabled=config.pressure_diagnostics,
+                            )
                         )
                     virials.append(virial)
                     pressure_tensors.append(pressure_tensor_value)
@@ -3193,21 +3677,52 @@ def _simulate_nvt(
         deferred_final = defer_final_diagnostics and local_step == config.steps
         full_diagnostic_step = diagnostic_step and not deferred_final
         force_start = perf_counter()
+        diagnostic_virial = None
         if neighbor_manager is None and full_diagnostic_step:
-            potential_energy, next_forces, energy_by_term = energy_forces_by_term(next_positions)
-        elif neighbor_manager is None:
+            (
+                potential_energy,
+                next_forces,
+                energy_by_term,
+                diagnostic_virial,
+            ) = energy_forces_by_term(next_positions)
+        elif neighbor_manager is None and deferred_final:
             potential_energy, next_forces = energy_forces(next_positions)
             energy_by_term = None
+        elif neighbor_manager is None:
+            potential_energy = None
+            next_forces = forces_evaluator(next_positions)
+            energy_by_term = None
         elif full_diagnostic_step:
-            potential_energy, next_forces, energy_by_term = _energy_forces_by_term(
+            (
+                potential_energy,
+                next_forces,
+                energy_by_term,
+                diagnostic_virial,
+            ) = _diagnostic_from_terms(
                 next_positions,
                 terms,
                 cell=cell,
                 pairs=pairs,
                 virtual_sites=virtual_sites,
+                virial_mode=(
+                    config.pressure_virial_mode
+                    if config.pressure_diagnostics
+                    else None
+                ),
+                masses=masses,
             )
-        else:
+        elif deferred_final:
             potential_energy, next_forces = _energy_forces_from_terms(
+                next_positions,
+                unnamed_terms,
+                cell=cell,
+                pairs=pairs,
+                virtual_sites=virtual_sites,
+            )
+            energy_by_term = None
+        else:
+            potential_energy = None
+            next_forces = _forces_from_terms(
                 next_positions,
                 unnamed_terms,
                 cell=cell,
@@ -3324,18 +3839,16 @@ def _simulate_nvt(
                 pressure_tensor_value = pressure_tensors[-1]
                 pressure_value = pressures[-1]
             else:
-                virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
-                    state.positions,
-                    state.velocities,
-                    masses,
-                    state.forces,
-                    unnamed_terms,
-                    cell=cell,
-                    pairs=pairs,
-                    kinetic_energy_scale=config.kinetic_energy_scale,
-                    enabled=config.pressure_diagnostics,
-                    virtual_sites=virtual_sites,
-                    virial_mode=config.pressure_virial_mode,
+                virial, pressure_tensor_value, pressure_value = (
+                    _pressure_diagnostics_from_virial(
+                        diagnostic_virial,
+                        state.positions,
+                        state.velocities,
+                        masses,
+                        cell=cell,
+                        kinetic_energy_scale=config.kinetic_energy_scale,
+                        enabled=config.pressure_diagnostics,
+                    )
                 )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)

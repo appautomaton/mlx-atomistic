@@ -1,3 +1,4 @@
+import mlx.core as mx
 import numpy as np
 import pytest
 
@@ -8,6 +9,8 @@ from mlx_atomistic.md import (
     LennardJonesPotential,
     NoseHooverThermostat,
     SimulationConfig,
+    _evaluate_force_terms,
+    _ForceEvaluationRequest,
     _langevin_block_execution_enabled,
     simulate_nve,
     simulate_nvt,
@@ -25,6 +28,149 @@ def _small_system():
         dtype=np.float32,
     )
     return positions, velocities, Cell.cubic(6.0), LennardJonesPotential(cutoff=2.5)
+
+
+class _DemandCountingTerm:
+    name = "demand_counting"
+    supports_virial = True
+    analytic_virial_supported = True
+
+    def __init__(self):
+        self.calls = []
+
+    def _runtime_forces(self, positions, *, cell=None, pairs=None):
+        del cell, pairs
+        self.calls.append("forces")
+        return mx.zeros_like(positions)
+
+    def _runtime_energy(self, positions, *, cell=None, pairs=None):
+        del cell, pairs
+        self.calls.append("energy")
+        return mx.sum(positions * 0.0)
+
+    def energy_forces(self, positions, cell=None, pairs=None):
+        del cell, pairs
+        self.calls.append("energy_forces")
+        return mx.sum(positions * 0.0), mx.zeros_like(positions)
+
+    def energy_forces_with_components(self, positions, cell=None, pairs=None):
+        del cell, pairs
+        self.calls.append("diagnostic")
+        energy = mx.sum(positions * 0.0)
+        return energy, mx.zeros_like(positions), {"zero": energy}
+
+    def analytic_virial_tensor(
+        self,
+        positions,
+        *,
+        cell=None,
+        pairs=None,
+        masses=None,
+        molecule_ids=None,
+    ):
+        del cell, pairs, masses, molecule_ids
+        self.calls.append("virial")
+        return mx.zeros((3, 3), dtype=positions.dtype)
+
+
+@pytest.mark.parametrize(
+    ("evaluation_request", "expected_calls"),
+    [
+        (_ForceEvaluationRequest("forces"), ["forces"]),
+        (_ForceEvaluationRequest("energy_forces"), ["energy_forces"]),
+        (_ForceEvaluationRequest("energy"), ["energy"]),
+        (
+            _ForceEvaluationRequest("diagnostic", virial_mode="analytic"),
+            ["diagnostic", "virial"],
+        ),
+    ],
+)
+def test_internal_force_evaluation_dispatches_exact_requested_mode(
+    evaluation_request,
+    expected_calls,
+):
+    term = _DemandCountingTerm()
+    positions = mx.zeros((2, 3), dtype=mx.float32)
+
+    result = _evaluate_force_terms(
+        positions,
+        (term,),
+        request=evaluation_request,
+        cell=Cell.cubic(6.0),
+        pairs=None,
+    )
+
+    assert term.calls == expected_calls
+    assert (result.energy is not None) == (
+        evaluation_request.mode in {"energy_forces", "energy", "diagnostic"}
+    )
+    assert (result.forces is not None) == (
+        evaluation_request.mode in {"forces", "energy_forces", "diagnostic"}
+    )
+    assert (result.virial is not None) == (evaluation_request.mode == "diagnostic")
+
+
+@pytest.mark.parametrize("mode", ["forces", "energy"])
+def test_internal_force_evaluation_falls_back_when_private_hook_declines(mode):
+    class DecliningTerm:
+        name = "declining"
+
+        def __init__(self):
+            self.calls = []
+
+        def _runtime_forces(self, positions, *, cell=None, pairs=None):
+            del positions, cell, pairs
+            self.calls.append("private_forces")
+            return NotImplemented
+
+        def _runtime_energy(self, positions, *, cell=None, pairs=None):
+            del positions, cell, pairs
+            self.calls.append("private_energy")
+            return NotImplemented
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            del cell, pairs
+            self.calls.append("energy_forces")
+            return mx.sum(positions * 0.0), mx.zeros_like(positions)
+
+    term = DecliningTerm()
+    result = _evaluate_force_terms(
+        mx.zeros((2, 3), dtype=mx.float32),
+        (term,),
+        request=_ForceEvaluationRequest(mode),
+        cell=None,
+        pairs=mx.array([[0, 1]], dtype=mx.int32),
+    )
+
+    assert term.calls == [f"private_{mode}", "energy_forces"]
+    assert result.optimized_terms == 0
+    assert result.fallback_terms == 1
+
+
+def test_nvt_ordinary_steps_request_forces_and_boundaries_request_diagnostics():
+    term = _DemandCountingTerm()
+    positions = np.zeros((2, 3), dtype=np.float32)
+
+    simulate_nvt(
+        positions,
+        np.zeros_like(positions),
+        cell=Cell.cubic(6.0),
+        force_terms=term,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=3,
+        ),
+    )
+
+    assert term.calls == ["diagnostic", "forces", "forces", "diagnostic"]
 
 
 def test_langevin_thermostat_validation():
