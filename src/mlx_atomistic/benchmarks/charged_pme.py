@@ -27,7 +27,7 @@ from mlx_atomistic.prep.supercell import (
 from mlx_atomistic.runtime import get_runtime_info
 
 SUPERCELL_SUMMARY_NAME = "supercell_summary.json"
-RUNTIME_SCHEMA = "mlx_atomistic.charged_pme_runtime.v1"
+RUNTIME_SCHEMA = "mlx_atomistic.charged_pme_runtime.v2"
 
 
 def prepare_payload(
@@ -126,6 +126,10 @@ def runtime_payload(
     dt_ps: float = 0.004,
     temperature_k: float = 300.0,
     seed: int = 17,
+    neighbor_skin: float = 5.5,
+    neighbor_check_interval: int = 1,
+    sample_interval: int | None = None,
+    diagnostic_interval: int | None = None,
 ) -> dict[str, Any]:
     """Run bounded fixed-cell charged-PME NVT with one reusable plan.
 
@@ -137,6 +141,13 @@ def runtime_payload(
         dt_ps: Timestep in picoseconds. Defaults to ``0.004``.
         temperature_k: Langevin target temperature. Defaults to ``300``.
         seed: Deterministic thermostat seed. Defaults to ``17``.
+        neighbor_skin: Verlet-list skin in angstrom. Defaults to ``5.5``.
+        neighbor_check_interval: Steps between displacement admissions.
+            Defaults to ``1``.
+        sample_interval: Measured trajectory sampling cadence. ``None`` records
+            only the final step. Defaults to ``None``.
+        diagnostic_interval: Measured diagnostic cadence. ``None`` evaluates
+            only the final step. Defaults to ``None``.
 
     Returns:
         JSON-serializable passing, failed, blocked, or resource-ceiling payload.
@@ -144,6 +155,10 @@ def runtime_payload(
 
     prepared_path = Path(prepared)
     out_path = Path(out)
+    sample_interval = steps if sample_interval is None else int(sample_interval)
+    diagnostic_interval = (
+        steps if diagnostic_interval is None else int(diagnostic_interval)
+    )
     base = {
         "kind": RUNTIME_SCHEMA,
         "prepared": str(prepared_path),
@@ -153,6 +168,10 @@ def runtime_payload(
         "dt_ps": float(dt_ps),
         "temperature_target_k": float(temperature_k),
         "seed": int(seed),
+        "neighbor_skin": float(neighbor_skin),
+        "neighbor_check_interval": int(neighbor_check_interval),
+        "sample_interval": sample_interval,
+        "diagnostic_interval": diagnostic_interval,
         "status": "blocked",
         "passed": False,
         "blockers": [],
@@ -168,6 +187,14 @@ def runtime_payload(
         validation_blockers.append("dt_ps_must_be_finite_positive")
     if not np.isfinite(temperature_k) or temperature_k <= 0.0:
         validation_blockers.append("temperature_k_must_be_finite_positive")
+    if not np.isfinite(neighbor_skin) or neighbor_skin < 0.0:
+        validation_blockers.append("neighbor_skin_must_be_finite_nonnegative")
+    if neighbor_check_interval <= 0:
+        validation_blockers.append("neighbor_check_interval_must_be_positive")
+    if sample_interval <= 0:
+        validation_blockers.append("sample_interval_must_be_positive")
+    if diagnostic_interval <= 0:
+        validation_blockers.append("diagnostic_interval_must_be_positive")
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
     validation_blockers.extend(
         f"missing_prepared_input:{path}" for path in required if not path.is_file()
@@ -196,10 +223,11 @@ def runtime_payload(
         neighbor_manager = NeighborListManager(
             system.cell,
             cutoff=cutoff,
-            skin=0.3,
-            check_interval=1,
+            skin=neighbor_skin,
+            check_interval=neighbor_check_interval,
             sort_pairs=False,
-            backend="mlx_cell_blocks",
+            backend="mlx_cell_pairs",
+            displacement_check_backend="mlx_scalar",
         )
         setup_seconds = time.perf_counter() - setup_started
         unit_system = artifact.unit_system
@@ -230,6 +258,8 @@ def runtime_payload(
                 steps=warmups,
                 dt_ps=dt_ps,
                 simulation_units=simulation_units,
+                sample_interval=warmups,
+                diagnostic_interval=warmups,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -255,6 +285,8 @@ def runtime_payload(
                 steps=steps,
                 dt_ps=dt_ps,
                 simulation_units=simulation_units,
+                sample_interval=sample_interval,
+                diagnostic_interval=diagnostic_interval,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -330,9 +362,9 @@ def runtime_payload(
             "plan_reused_in_measurement": final_plan["reuse_count"] > reuse_after_warmup,
             "lazy_topology": topology_report["pair_policy"] == "lazy",
             "pair_cache_unmaterialized": not topology_report["pair_cache_materialized"],
-            "neighbor_blocks": (
-                neighbor_report["manager_backend"] == "mlx_cell_blocks"
-                and neighbor_report["representation"] == "blocks"
+            "compact_neighbor_pairs": (
+                neighbor_report["manager_backend"] == "mlx_cell_pairs"
+                and neighbor_report["representation"] == "pairs"
             ),
             "no_neighbor_fallback": neighbor_report["fallback_reason"] is None,
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
@@ -442,12 +474,14 @@ def _simulation_config(
     steps: int,
     dt_ps: float,
     simulation_units: dict[str, float],
+    sample_interval: int,
+    diagnostic_interval: int,
 ) -> SimulationConfig:
     return SimulationConfig(
         dt=dt_ps,
         steps=steps,
-        sample_interval=1,
-        diagnostic_interval=1,
+        sample_interval=sample_interval,
+        diagnostic_interval=diagnostic_interval,
         pressure_diagnostics=False,
         compile_force_evaluator=False,
         **simulation_units,
@@ -560,6 +594,10 @@ def main(argv: list[str] | None = None) -> None:
     runtime_parser.add_argument("--dt-ps", type=float, default=0.004)
     runtime_parser.add_argument("--temperature-k", type=float, default=300.0)
     runtime_parser.add_argument("--seed", type=int, default=17)
+    runtime_parser.add_argument("--neighbor-skin", type=float, default=5.5)
+    runtime_parser.add_argument("--neighbor-check-interval", type=int, default=1)
+    runtime_parser.add_argument("--sample-interval", type=int, default=None)
+    runtime_parser.add_argument("--diagnostic-interval", type=int, default=None)
     runtime_parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -582,6 +620,10 @@ def main(argv: list[str] | None = None) -> None:
             dt_ps=args.dt_ps,
             temperature_k=args.temperature_k,
             seed=args.seed,
+            neighbor_skin=args.neighbor_skin,
+            neighbor_check_interval=args.neighbor_check_interval,
+            sample_interval=args.sample_interval,
+            diagnostic_interval=args.diagnostic_interval,
             out=args.out,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
