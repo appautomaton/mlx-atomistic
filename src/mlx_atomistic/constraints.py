@@ -102,6 +102,53 @@ class DistanceConstraints:
             constrained = constrained.at[j].add(weight_j[:, None] * correction)
         return constrained, self.max_error(constrained, cell)
 
+    def apply_position_step(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply a SHAKE position step from a constrained reference geometry."""
+
+        reference = as_mx_array(reference_positions)
+        constrained = as_mx_array(predicted_positions)
+        masses = as_mx_array(masses)
+        if self.pairs.shape[0] == 0:
+            return constrained, self.max_error(constrained, cell)
+        if reference.shape != constrained.shape:
+            msg = "reference_positions and predicted_positions must have matching shapes"
+            raise ValueError(msg)
+        if self._max_pair_index >= constrained.shape[0]:
+            msg = "constraint pair index outside positions"
+            raise ValueError(msg)
+
+        i = self.pairs[:, 0]
+        j = self.pairs[:, 1]
+        inverse_masses = 1.0 / masses
+        reference_displacement = reference[i] - reference[j]
+        if cell is not None:
+            reference_displacement = cell.minimum_image(reference_displacement)
+        inverse_mass_sum = inverse_masses[i] + inverse_masses[j]
+        target_squared = self.distances * self.distances
+        for _ in range(self.max_iterations):
+            displacement = self._displacements(constrained, cell)
+            error_squared = target_squared - mx.sum(displacement * displacement, axis=-1)
+            denominator = 2.0 * inverse_mass_sum * mx.sum(
+                displacement * reference_displacement,
+                axis=-1,
+            )
+            safe_denominator = mx.where(
+                mx.abs(denominator) > 1.0e-20,
+                denominator,
+                mx.where(denominator < 0.0, -1.0e-20, 1.0e-20),
+            )
+            multiplier = error_squared / safe_denominator
+            correction = multiplier[:, None] * reference_displacement
+            constrained = constrained.at[i].add(inverse_masses[i, None] * correction)
+            constrained = constrained.at[j].add(-inverse_masses[j, None] * correction)
+        return constrained, self.max_error(constrained, cell)
+
     def apply_velocities(
         self,
         positions,
@@ -126,13 +173,14 @@ class DistanceConstraints:
         displacement = self._displacements(positions, cell)
         distances = mx.sqrt(mx.maximum(mx.sum(displacement * displacement, axis=-1), 1e-12))
         unit = displacement / distances[:, None]
-        relative_velocity = constrained[i] - constrained[j]
-        relative_along_bond = mx.sum(relative_velocity * unit, axis=-1)
         weight_i = inverse_masses[i] / (inverse_masses[i] + inverse_masses[j])
         weight_j = inverse_masses[j] / (inverse_masses[i] + inverse_masses[j])
-        correction = relative_along_bond[:, None] * unit
-        constrained = constrained.at[i].add(-weight_i[:, None] * correction)
-        constrained = constrained.at[j].add(weight_j[:, None] * correction)
+        for _ in range(self.max_iterations):
+            relative_velocity = constrained[i] - constrained[j]
+            relative_along_bond = mx.sum(relative_velocity * unit, axis=-1)
+            correction = relative_along_bond[:, None] * unit
+            constrained = constrained.at[i].add(-weight_i[:, None] * correction)
+            constrained = constrained.at[j].add(weight_j[:, None] * correction)
         return constrained
 
 
@@ -284,6 +332,184 @@ class SettleWaterConstraints:
             .add(projected_a - constrained[hydrogen_a])
             .at[hydrogen_b]
             .add(projected_b - constrained[hydrogen_b])
+        )
+        return constrained, self.max_error(constrained, cell)
+
+    def apply_position_step(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply the SETTLE dynamics projection from a constrained reference state."""
+
+        reference = as_mx_array(reference_positions)
+        predicted = as_mx_array(predicted_positions)
+        masses = as_mx_array(masses)
+        if self.pairs.shape[0] == 0:
+            return predicted, self.max_error(predicted, cell)
+        if reference.shape != predicted.shape:
+            msg = "reference_positions and predicted_positions must have matching shapes"
+            raise ValueError(msg)
+        if self._max_pair_index >= predicted.shape[0]:
+            msg = "SETTLE water atom index outside positions"
+            raise ValueError(msg)
+        if masses.shape != (predicted.shape[0],):
+            msg = "masses must have shape (n_particles,)"
+            raise ValueError(msg)
+
+        oxygen = self.waters[:, 0]
+        hydrogen_a = self.waters[:, 1]
+        hydrogen_b = self.waters[:, 2]
+
+        def displacement(first: mx.array, second: mx.array) -> mx.array:
+            value = first - second
+            return cell.minimum_image(value) if cell is not None else value
+
+        old_b = displacement(reference[hydrogen_a], reference[oxygen])
+        old_c = displacement(reference[hydrogen_b], reference[oxygen])
+        step_o = displacement(predicted[oxygen], reference[oxygen])
+        step_a = displacement(predicted[hydrogen_a], reference[hydrogen_a])
+        step_b = displacement(predicted[hydrogen_b], reference[hydrogen_b])
+
+        # Vectorized transcription of OpenMM's ReferenceSETTLEAlgorithm::apply:
+        # preserve the predicted center of mass, solve the rigid geometry in a
+        # frame defined by the prior constrained water, then rotate it back.
+        mass_o = masses[oxygen]
+        mass_a = masses[hydrogen_a]
+        mass_b = masses[hydrogen_b]
+        total_mass = mass_o + mass_a + mass_b
+        center = (
+            mass_o[:, None] * step_o
+            + mass_a[:, None] * (old_b + step_a)
+            + mass_b[:, None] * (old_c + step_b)
+        ) / total_mass[:, None]
+        centered_o = step_o - center
+        centered_a = old_b + step_a - center
+        centered_b = old_c + step_b - center
+
+        axis_z = _cross_vectors_mx(old_b, old_c)
+        axis_z = axis_z / mx.sqrt(
+            mx.maximum(mx.sum(axis_z * axis_z, axis=-1), 1.0e-20)
+        )[:, None]
+        axis_x = _cross_vectors_mx(centered_o, axis_z)
+        axis_x = axis_x / mx.sqrt(
+            mx.maximum(mx.sum(axis_x * axis_x, axis=-1), 1.0e-20)
+        )[:, None]
+        axis_y = _cross_vectors_mx(axis_z, axis_x)
+        axis_y = axis_y / mx.sqrt(
+            mx.maximum(mx.sum(axis_y * axis_y, axis=-1), 1.0e-20)
+        )[:, None]
+
+        def component(values: mx.array, axis: mx.array) -> mx.array:
+            return mx.sum(values * axis, axis=-1)
+
+        old_b_x = component(old_b, axis_x)
+        old_b_y = component(old_b, axis_y)
+        old_c_x = component(old_c, axis_x)
+        old_c_y = component(old_c, axis_y)
+        centered_o_z = component(centered_o, axis_z)
+        centered_a_x = component(centered_a, axis_x)
+        centered_a_y = component(centered_a, axis_y)
+        centered_a_z = component(centered_a, axis_z)
+        centered_b_x = component(centered_b, axis_x)
+        centered_b_y = component(centered_b, axis_y)
+        centered_b_z = component(centered_b, axis_z)
+
+        half_hh = 0.5 * float(self.hh_distance)
+        oxygen_to_h_axis = float(
+            np.sqrt(float(self.oh_distance) ** 2 - half_hh * half_hh)
+        )
+        oxygen_radius = oxygen_to_h_axis * (mass_a + mass_b) / total_mass
+        hydrogen_radius = oxygen_to_h_axis - oxygen_radius
+        sin_phi = mx.clip(centered_o_z / oxygen_radius, -1.0, 1.0)
+        cos_phi = mx.sqrt(mx.maximum(1.0 - sin_phi * sin_phi, 0.0))
+        sin_psi = mx.clip(
+            (centered_a_z - centered_b_z)
+            / mx.maximum(2.0 * half_hh * cos_phi, 1.0e-20),
+            -1.0,
+            1.0,
+        )
+        cos_psi = mx.sqrt(mx.maximum(1.0 - sin_psi * sin_psi, 0.0))
+
+        oxygen_y = oxygen_radius * cos_phi
+        hydrogen_x = -half_hh * cos_psi
+        hydrogen_a_y = -hydrogen_radius * cos_phi - half_hh * sin_psi * sin_phi
+        hydrogen_b_y = -hydrogen_radius * cos_phi + half_hh * sin_psi * sin_phi
+        hydrogen_x_squared = hydrogen_x * hydrogen_x
+        current_hh_squared = (
+            4.0 * hydrogen_x_squared
+            + (hydrogen_a_y - hydrogen_b_y) ** 2
+            + (centered_a_z - centered_b_z) ** 2
+        )
+        delta_x = 2.0 * hydrogen_x + mx.sqrt(
+            mx.maximum(
+                4.0 * hydrogen_x_squared
+                - current_hh_squared
+                + float(self.hh_distance) ** 2,
+                0.0,
+            )
+        )
+        hydrogen_x = hydrogen_x - 0.5 * delta_x
+
+        alpha = (
+            hydrogen_x * (old_b_x - old_c_x)
+            + old_b_y * hydrogen_a_y
+            + old_c_y * hydrogen_b_y
+        )
+        beta = (
+            hydrogen_x * (old_c_y - old_b_y)
+            + old_b_x * hydrogen_a_y
+            + old_c_x * hydrogen_b_y
+        )
+        gamma = (
+            old_b_x * centered_a_y
+            - centered_a_x * old_b_y
+            + old_c_x * centered_b_y
+            - centered_b_x * old_c_y
+        )
+        alpha_beta_squared = alpha * alpha + beta * beta
+        sin_theta = (
+            alpha * gamma
+            - beta
+            * mx.sqrt(mx.maximum(alpha_beta_squared - gamma * gamma, 0.0))
+        ) / mx.maximum(alpha_beta_squared, 1.0e-20)
+        sin_theta = mx.clip(sin_theta, -1.0, 1.0)
+        cos_theta = mx.sqrt(mx.maximum(1.0 - sin_theta * sin_theta, 0.0))
+
+        oxygen_x = -oxygen_y * sin_theta
+        oxygen_y = oxygen_y * cos_theta
+        hydrogen_a_x = hydrogen_x * cos_theta - hydrogen_a_y * sin_theta
+        hydrogen_a_y = hydrogen_x * sin_theta + hydrogen_a_y * cos_theta
+        hydrogen_b_x = -hydrogen_x * cos_theta - hydrogen_b_y * sin_theta
+        hydrogen_b_y = -hydrogen_x * sin_theta + hydrogen_b_y * cos_theta
+
+        def from_frame(x, y, z) -> mx.array:
+            return x[:, None] * axis_x + y[:, None] * axis_y + z[:, None] * axis_z
+
+        projected_o = reference[oxygen] + center + from_frame(
+            oxygen_x,
+            oxygen_y,
+            centered_o_z,
+        )
+        projected_a = reference[oxygen] + center + from_frame(
+            hydrogen_a_x,
+            hydrogen_a_y,
+            centered_a_z,
+        )
+        projected_b = reference[oxygen] + center + from_frame(
+            hydrogen_b_x,
+            hydrogen_b_y,
+            centered_b_z,
+        )
+        constrained = (
+            predicted.at[oxygen]
+            .add(projected_o - predicted[oxygen])
+            .at[hydrogen_a]
+            .add(projected_a - predicted[hydrogen_a])
+            .at[hydrogen_b]
+            .add(projected_b - predicted[hydrogen_b])
         )
         return constrained, self.max_error(constrained, cell)
 
@@ -481,6 +707,35 @@ class CompositeConstraints:
                     masses,
                     cell,
                 )
+        return constrained, self.max_error(constrained, cell)
+
+    def apply_position_step(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply dynamics-aware child position constraints in sequence."""
+
+        constrained = as_mx_array(predicted_positions)
+        cycles = 8 if self._requires_iteration else 1
+        for _ in range(cycles):
+            for constraint in self.constraints:
+                step_projector = getattr(constraint, "apply_position_step", None)
+                if step_projector is None:
+                    constrained, _ = constraint.apply_positions(
+                        constrained,
+                        masses,
+                        cell,
+                    )
+                else:
+                    constrained, _ = step_projector(
+                        reference_positions,
+                        constrained,
+                        masses,
+                        cell,
+                    )
         return constrained, self.max_error(constrained, cell)
 
     def apply_velocities(

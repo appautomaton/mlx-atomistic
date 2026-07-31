@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import (
@@ -305,6 +306,114 @@ def test_langevin_thermostat_validation():
         LangevinThermostat(friction=-1.0)
 
 
+def test_langevin_zero_force_carries_thermostatted_velocity():
+    """A zero-force Langevin step must retain its stochastic velocity kick."""
+
+    positions = np.zeros((8, 3), dtype=np.float32)
+    result = simulate_nvt(
+        positions,
+        np.zeros_like(positions),
+        masses=np.ones(8, dtype=np.float32),
+        force_terms=_DemandCountingTerm(),
+        config=SimulationConfig(
+            dt=0.01,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=1.0,
+            friction=1.0,
+            seed=13,
+        ),
+    )
+
+    final_positions = np.asarray(result.final_state.positions)
+    final_velocities = np.asarray(result.final_state.velocities)
+    assert float(np.asarray(result.temperature)[-1]) > 0.0
+    np.testing.assert_allclose(
+        final_velocities,
+        2.0 * (final_positions - positions) / 0.01,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+
+
+def test_constrained_langevin_matches_rattle_baoab_ordering():
+    """A forced constrained step follows the complete RATTLE BAOAB sequence."""
+
+    class ConstantForce:
+        def __init__(self, forces):
+            self.forces = mx.array(forces, dtype=mx.float32)
+
+        def energy_forces(self, positions, cell=None, pairs=None):
+            del cell, pairs
+            return -mx.sum(positions * self.forces), self.forces
+
+    dt = 0.1
+    positions = mx.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=mx.float32)
+    velocities = mx.array([[0.0, 0.1, 0.0], [0.0, -0.1, 0.0]], dtype=mx.float32)
+    masses = mx.ones((2,), dtype=mx.float32)
+    forces = mx.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=mx.float32)
+    constraints = DistanceConstraints([(0, 1)], distances=[1.0], max_iterations=8)
+
+    velocity_half = velocities + 0.5 * dt * forces / masses[:, None]
+    predicted_positions = positions + dt * velocity_half
+    expected_positions, _ = constraints.apply_position_step(
+        positions,
+        predicted_positions,
+        masses,
+    )
+    velocity_after_drift = velocity_half + (
+        expected_positions - predicted_positions
+    ) / dt
+    velocity_after_drift = constraints.apply_velocities(
+        expected_positions,
+        velocity_after_drift,
+        masses,
+    )
+    expected_velocities = velocity_after_drift + 0.5 * dt * forces / masses[:, None]
+    expected_velocities = constraints.apply_velocities(
+        expected_positions,
+        expected_velocities,
+        masses,
+    )
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        force_terms=ConstantForce(forces),
+        constraints=constraints,
+        config=SimulationConfig(
+            dt=dt,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=19,
+        ),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.positions),
+        np.asarray(expected_positions),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.velocities),
+        np.asarray(expected_velocities),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+
+
 def test_nose_hoover_thermostat_validation():
     with pytest.raises(ValueError, match="temperature"):
         NoseHooverThermostat(temperature=0.0)
@@ -445,6 +554,60 @@ def test_batched_langevin_matches_per_step(block_size):
         rtol=0.0, atol=1e-3,
     )
     assert bool(np.isfinite(np.asarray(batched.total_energy)).all())
+
+
+def test_batched_langevin_zero_force_retains_thermal_noise():
+    """Compiled Langevin blocks must carry the random velocity between steps."""
+
+    positions, cell = fcc_lattice(32, density=0.8)
+    positions = np.asarray(positions, dtype=np.float32)
+    velocities = np.zeros_like(positions)
+    potential = LennardJonesPotential(epsilon=0.0, cutoff=2.5)
+
+    def run(block_size):
+        manager = NeighborListManager(
+            cell,
+            cutoff=2.5,
+            skin=1.2,
+            check_interval=1,
+            backend="mlx_cell_pairs",
+        )
+        return simulate_nvt(
+            positions,
+            velocities,
+            cell=cell,
+            force_terms=potential,
+            neighbor_manager=manager,
+            config=SimulationConfig(
+                dt=0.002,
+                steps=4,
+                sample_interval=4,
+                diagnostic_interval=4,
+                block_size=block_size,
+            ),
+            thermostat=LangevinThermostat(
+                temperature=1.0,
+                friction=1.0,
+                seed=17,
+            ),
+        )
+
+    reference = run(1)
+    batched = run(4)
+
+    assert float(np.asarray(batched.temperature)[-1]) > 0.0
+    np.testing.assert_allclose(
+        np.asarray(batched.final_state.positions),
+        np.asarray(reference.final_state.positions),
+        rtol=0.0,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(batched.final_state.velocities),
+        np.asarray(reference.final_state.velocities),
+        rtol=2.0e-4,
+        atol=1.0e-5,
+    )
 
 
 def test_batched_block_size_falls_back_without_neighbor_manager():
