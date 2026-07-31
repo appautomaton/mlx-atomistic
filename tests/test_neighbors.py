@@ -5,7 +5,7 @@ import pytest
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import LennardJonesPotential, simulate
-from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
+from mlx_atomistic.neighbors import NeighborListManager, NeighborTiles, build_neighbor_list
 from mlx_atomistic.nonbonded import estimate_dense_nonbonded_bytes
 
 
@@ -19,9 +19,154 @@ def _block_pair_set(neighbors):
 
 
 def _neighbor_pair_set(neighbors):
+    if neighbors.tiles is not None:
+        return {
+            tuple(pair)
+            for pair in np.asarray(neighbors.tiles.materialize_pairs()).tolist()
+        }
     if neighbors.blocks is not None:
         return _block_pair_set(neighbors)
     return {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()}
+
+
+def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():
+    rng = np.random.default_rng(21)
+    positions = rng.uniform(0.0, 6.0, size=(24, 3)).astype(np.float32)
+    cell = Cell.cubic(6.0)
+    oracle = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.0,
+        skin=0.4,
+        backend="periodic_cell_list",
+    )
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.0,
+        skin=0.4,
+        backend="mlx_cell_tiles",
+    )
+
+    tiles = neighbors.tiles
+    assert isinstance(tiles, NeighborTiles)
+    np.testing.assert_array_equal(
+        np.asarray(tiles.materialize_pairs()),
+        np.asarray(oracle.pairs),
+    )
+    materialized = np.asarray(tiles.materialize_pairs())
+    assert np.all(materialized[:, 0] < materialized[:, 1])
+    assert np.unique(materialized, axis=0).shape[0] == materialized.shape[0]
+    assert neighbors.pairs.shape == (0, 2)
+    assert neighbors.interactions is tiles
+    assert neighbors.backend == "mlx_cell_tiles"
+    assert neighbors.representation_kind == "tiles"
+    assert neighbors.pair_count == oracle.pair_count
+    assert neighbors.compact_pair_count == oracle.pair_count
+    assert neighbors.candidate_count == tiles.raw_candidate_count
+    assert neighbors.candidate_count >= neighbors.compact_pair_count
+    assert neighbors.estimated_pair_bytes == tiles.estimated_bytes
+    assert neighbors.compaction_backend == "cpu_tile_membership_mask"
+    assert tiles.block_size == 8
+    assert tiles.exact_pair_count == oracle.pair_count
+    assert tiles.padded_lane_count == tiles.tile_count * 64
+    assert tiles.padding_waste_count == tiles.padded_lane_count - oracle.pair_count
+    assert 0.0 <= tiles.padding_waste_fraction < 1.0
+    assert tiles.generation == 0
+    assert np.all(np.any(np.asarray(tiles.member_mask) != 0, axis=1))
+
+
+def test_neighbor_tiles_same_cell_blocks_use_exact_unique_upper_triangle():
+    positions = np.stack(
+        (
+            np.linspace(0.10, 0.46, 10, dtype=np.float32),
+            np.full((10,), 0.1, dtype=np.float32),
+            np.full((10,), 0.1, dtype=np.float32),
+        ),
+        axis=1,
+    )
+    neighbors = build_neighbor_list(
+        positions,
+        Cell.cubic(16.0),
+        cutoff=2.0,
+        skin=0.0,
+        backend="mlx_cell_tiles",
+    )
+
+    tiles = neighbors.tiles
+    assert tiles is not None
+    expected = np.asarray(
+        [(left, right) for left in range(10) for right in range(left + 1, 10)],
+        dtype=np.int32,
+    )
+    np.testing.assert_array_equal(np.asarray(tiles.materialize_pairs()), expected)
+    np.testing.assert_array_equal(
+        np.asarray(tiles.tile_blocks),
+        np.asarray([[0, 0], [0, 1], [1, 1]], dtype=np.int32),
+    )
+    assert tiles.atom_blocks.shape == (2, 8)
+    assert tiles.tile_count == 3
+    assert tiles.exact_pair_count == 45
+    assert tiles.raw_candidate_count == 45
+    assert tiles.padded_lane_count == 192
+
+
+def test_neighbor_tiles_membership_uses_cutoff_plus_skin_not_force_cutoff():
+    positions = np.asarray(
+        [
+            [0.1, 0.1, 0.1],
+            [1.3, 0.1, 0.1],
+            [1.8, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(8.0)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.0,
+        skin=0.3,
+        backend="mlx_cell_tiles",
+    )
+    force_cutoff = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.0,
+        skin=0.0,
+        backend="periodic_cell_list",
+    )
+
+    assert _neighbor_pair_set(neighbors) == {(0, 1), (1, 2)}
+    assert _neighbor_pair_set(force_cutoff) == {(1, 2)}
+
+
+def test_neighbor_tile_manager_assigns_monotonic_rebuild_generations():
+    positions = np.asarray(
+        [[0.2, 0.2, 0.2], [0.9, 0.2, 0.2], [3.0, 0.2, 0.2]],
+        dtype=np.float32,
+    )
+    manager = NeighborListManager(
+        Cell.cubic(6.0),
+        cutoff=1.0,
+        skin=0.4,
+        backend="mlx_cell_tiles",
+    )
+
+    first = manager.update(positions)
+    small_move = positions.copy()
+    small_move[0, 0] += 0.1
+    current = manager.update(small_move)
+    large_move = positions.copy()
+    large_move[0, 0] += 0.25
+    second = manager.update(large_move)
+
+    assert first.tiles is not None
+    assert second.tiles is not None
+    assert current is first
+    assert first.tiles.generation == 1
+    assert second.tiles.generation == 2
+    assert second is not first
+    assert manager.rebuild_count == 2
 
 
 def test_neighbor_list_has_unique_expected_pairs():
@@ -315,7 +460,12 @@ def test_triclinic_dense_neighbor_pairs_use_minimum_image():
 
 @pytest.mark.parametrize(
     "backend",
-    ["periodic_cell_list", "mlx_cell_pairs", "mlx_cell_blocks"],
+    [
+        "periodic_cell_list",
+        "mlx_cell_pairs",
+        "mlx_cell_blocks",
+        "mlx_cell_tiles",
+    ],
 )
 def test_triclinic_compact_neighbor_backends_fail_closed(backend):
     cell = Cell.triclinic(
