@@ -17,7 +17,10 @@ from mlx_atomistic.cell_list import (
     estimate_pair_list_bytes,
 )
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.metal_kernels import neighbor_pair_cutoff_mask
+from mlx_atomistic.metal_kernels import (
+    neighbor_pair_cutoff_mask,
+    neighbor_pair_ordered_scatter,
+)
 
 NeighborBackend = Literal[
     "auto",
@@ -42,9 +45,9 @@ DEFAULT_MLX_CELL_BLOCK_SIZE = 256
 # M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
 # ("mlx_cell_pairs") beats the fixed-shape padded-block path ("mlx_cell_blocks")
 # by 5.9-7.1x in a managed loop (incl. rebuild) at identical physics (dE=0).
-# Host compaction scales near-linearly (50k build ~0.34s) and does not OOM, so
-# there is no scaling reason to prefer padded blocks. Blocks remain available as
-# an explicit backend for the future on-device fused path.
+# Compact real-pair lists avoid evaluating the much larger padded candidate
+# inventory. Metal uses deterministic prefix-scan compaction while CPU retains
+# the NumPy fallback. Blocks remain available as an explicit backend.
 DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND: NeighborBackend = "mlx_cell_pairs"
 _BOOL_BYTES = np.dtype(np.bool_).itemsize
 _FLOAT_BYTES = np.dtype(np.float32).itemsize
@@ -951,7 +954,11 @@ def _build_mlx_cell_pair_list(
         representation_kind="pairs",
         candidate_count=candidate_count,
         estimated_candidate_bytes=peak_candidate_count * (3 * _FLOAT_BYTES + _BOOL_BYTES),
-        compaction_backend="cpu_argwhere",
+        compaction_backend=(
+            "metal_prefix_scan"
+            if "gpu" in str(mx.default_device()).lower()
+            else "cpu_argwhere"
+        ),
         fallback_reason=None,
     )
     return NeighborList(
@@ -1001,6 +1008,26 @@ def _mlx_filter_index_pairs_within_radius(
             cell.lengths,
             search_radius=search_radius,
         )
+        prefix = mx.cumsum(close.astype(mx.int32))
+        mx.eval(prefix)
+        selected_count = int(np.asarray(prefix[-1]))
+        if selected_count == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        accepted_i, accepted_j = neighbor_pair_ordered_scatter(
+            left_mx,
+            right_mx,
+            close,
+            prefix,
+        )
+        compact = mx.stack(
+            (
+                accepted_i[:selected_count],
+                accepted_j[:selected_count],
+            ),
+            axis=1,
+        )
+        mx.eval(compact)
+        return np.asarray(compact).astype(np.int32, copy=False)
     else:
         displacement = positions_mx[left_mx] - positions_mx[right_mx]
         displacement = cell.minimum_image(displacement)

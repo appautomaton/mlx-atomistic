@@ -83,6 +83,7 @@ _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
 _aligned_topology_lj_scales_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
+_neighbor_pair_ordered_scatter_kernel_singleton = None
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -842,6 +843,18 @@ _NEIGHBOR_PAIR_CUTOFF_MASK_SOURCE = r"""
     close[t] = dx * dx + dy * dy + dz * dz < params[0];
 """
 
+_NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE = r"""
+    uint t = thread_position_in_grid.x;
+    if (t >= (uint)counts[0] || !close[t]) {
+        return;
+    }
+    uint out = (uint)(prefix[t] - 1);
+    int i = pairs_i[t];
+    int j = pairs_j[t];
+    accepted_i[out] = min(i, j);
+    accepted_j[out] = max(i, j);
+"""
+
 
 def _lj_force_kernel():
     """Return the cached fused-LJ Metal kernel, building it on first call."""
@@ -1083,6 +1096,26 @@ def _neighbor_pair_cutoff_mask_kernel():
     return _neighbor_pair_cutoff_mask_kernel_singleton
 
 
+def _neighbor_pair_ordered_scatter_kernel():
+    """Return the cached deterministic neighbor-compaction Metal kernel."""
+
+    global _neighbor_pair_ordered_scatter_kernel_singleton
+    if _neighbor_pair_ordered_scatter_kernel_singleton is None:
+        _neighbor_pair_ordered_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_pair_ordered_scatter",
+            input_names=[
+                "pairs_i",
+                "pairs_j",
+                "close",
+                "prefix",
+                "counts",
+            ],
+            output_names=["accepted_i", "accepted_j"],
+            source=_NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE,
+        )
+    return _neighbor_pair_ordered_scatter_kernel_singleton
+
+
 def neighbor_pair_cutoff_mask(
     positions: mx.array,
     pairs_i: mx.array,
@@ -1145,6 +1178,64 @@ def neighbor_pair_cutoff_mask(
         threadgroup=(threads, 1, 1),
     )
     return close
+
+
+def neighbor_pair_ordered_scatter(
+    pairs_i: mx.array,
+    pairs_j: mx.array,
+    close: mx.array,
+    prefix: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Scatter accepted neighbor candidates by their stable prefix positions.
+
+    Args:
+        pairs_i: Left atom indices with shape ``(n_pairs,)``.
+        pairs_j: Right atom indices with shape ``(n_pairs,)``.
+        close: Boolean cutoff mask with shape ``(n_pairs,)``.
+        prefix: Inclusive integer prefix sum of ``close``.
+
+    Returns:
+        Candidate-sized left and right output buffers whose leading accepted
+        entries preserve the input candidate order.
+
+    Raises:
+        ValueError: If the inputs are not matching one-dimensional arrays.
+    """
+
+    pairs_i = as_mx_array(pairs_i, dtype=mx.int32)
+    pairs_j = as_mx_array(pairs_j, dtype=mx.int32)
+    close = as_mx_array(close, dtype=mx.bool_)
+    prefix = as_mx_array(prefix, dtype=mx.int32)
+    if pairs_i.ndim != 1:
+        msg = "pairs_i must be one-dimensional"
+        raise ValueError(msg)
+    if pairs_j.shape != pairs_i.shape or close.shape != pairs_i.shape:
+        msg = "pairs_i, pairs_j, and close must have matching shapes"
+        raise ValueError(msg)
+    if prefix.shape != pairs_i.shape:
+        msg = "prefix must match the candidate-pair shape"
+        raise ValueError(msg)
+
+    pair_count = int(pairs_i.shape[0])
+    if pair_count == 0:
+        empty = mx.zeros((0,), dtype=mx.int32)
+        return empty, empty
+    threads = min(256, pair_count)
+    accepted_i, accepted_j = _neighbor_pair_ordered_scatter_kernel()(
+        inputs=[
+            pairs_i,
+            pairs_j,
+            close,
+            prefix,
+            mx.array([pair_count], dtype=mx.int32),
+        ],
+        output_shapes=[(pair_count,), (pair_count,)],
+        output_dtypes=[mx.int32, mx.int32],
+        grid=(pair_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0,
+    )
+    return accepted_i, accepted_j
 
 
 def aligned_topology_lj_scales(
