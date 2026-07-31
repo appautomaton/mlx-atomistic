@@ -153,6 +153,40 @@ class PMEExecutionPlan:
         ValueError: If the cell, Coulomb constant, dtype, or backend is unsupported.
     """
 
+    _IMMUTABLE_DEFINITION_FIELDS = frozenset(
+        {
+            "cell",
+            "cell_matrix",
+            "cell_lengths",
+            "config",
+            "real_cutoff",
+            "coulomb_constant",
+            "dtype",
+            "backend",
+            "device",
+            "influence",
+            "wavevectors",
+            "grid_size",
+            "reciprocal_modes",
+            "fingerprint",
+            "_signature",
+            "_cell_lengths_np",
+            "_cell_lengths_mx",
+        }
+    )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if (
+            getattr(self, "_definition_frozen", False)
+            and name in self._IMMUTABLE_DEFINITION_FIELDS
+        ):
+            msg = (
+                f"PMEExecutionPlan.{name} is immutable; "
+                "use rebuild() for defining-input changes"
+            )
+            raise AttributeError(msg)
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         cell: Cell,
@@ -203,6 +237,8 @@ class PMEExecutionPlan:
         self.cell = cell
         self.cell_matrix = tuple(tuple(float(value) for value in row) for row in cell_matrix)
         self.cell_lengths = tuple(float(value) for value in cell_lengths)
+        self._cell_lengths_np = np.asarray(cell_lengths, dtype=np.float64)
+        self._cell_lengths_mx = mx.array(cell_lengths, dtype=mx.float32)
         self.config = config
         self.real_cutoff = float(real_cutoff)
         self.coulomb_constant = coulomb_constant
@@ -224,6 +260,8 @@ class PMEExecutionPlan:
         self.reuse_validation_seconds = 0.0
         self.last_reuse_validation_seconds = 0.0
         self._signature = signature
+        self._definition_frozen = True
+
     @classmethod
     def build(
         cls,
@@ -1460,6 +1498,63 @@ def pme_coulomb_reciprocal_space_energy_forces(
             volume=float(np.prod(cell_lengths_np, dtype=np.float64)),
             alpha=config.alpha,
             coulomb_constant=coulomb_constant,
+            background_policy=config.background_policy,
+        )
+    return energy.astype(mx.float32), forces.astype(mx.float32)
+
+
+def _prepared_pme_reciprocal_space_energy_forces(
+    positions: mx.array,
+    charges: mx.array,
+    plan: PMEExecutionPlan,
+    *,
+    include_self_correction: bool = True,
+) -> tuple[mx.array, mx.array]:
+    """Evaluate reciprocal PME from setup-validated, plan-bound inputs.
+
+    This private production path deliberately omits the public wrapper's
+    recurring host-side finite, charge-policy, cell, and plan admission.  Its
+    caller must own a ``PMEExecutionPlan`` already validated against immutable
+    charges and the current cell, and must perform dynamic position health
+    checks before force evaluation.
+    """
+
+    positions_mx = mx.array(positions, dtype=mx.float32)
+    charges_mx = mx.array(charges, dtype=mx.float32)
+    if positions_mx.ndim != 2 or positions_mx.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if charges_mx.shape != (positions_mx.shape[0],):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+
+    config = plan.config
+    cell_lengths_np = plan._cell_lengths_np
+    cell_lengths_mx = plan._cell_lengths_mx
+    wrapped_positions = (
+        positions_mx
+        - mx.floor(positions_mx / cell_lengths_mx) * cell_lengths_mx
+    )
+    plan._record_reuse(0.0)
+    energy, forces, _ = _mesh_reciprocal_energy_forces_mx(
+        wrapped_positions,
+        charges_mx,
+        cell_lengths_mx,
+        cell_lengths_np,
+        config=config,
+        coulomb_constant=plan.coulomb_constant,
+        plan=plan,
+        return_mesh_info=False,
+    )
+    if include_self_correction:
+        energy = energy - float(plan.coulomb_constant) * config.alpha / float(
+            np.sqrt(np.pi)
+        ) * mx.sum(charges_mx * charges_mx)
+        energy = energy + _neutralizing_plasma_energy_mx(
+            charges_mx,
+            volume=float(np.prod(cell_lengths_np, dtype=np.float64)),
+            alpha=config.alpha,
+            coulomb_constant=plan.coulomb_constant,
             background_policy=config.background_policy,
         )
     return energy.astype(mx.float32), forces.astype(mx.float32)

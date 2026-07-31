@@ -758,6 +758,16 @@ def test_nonbonded_pme_refuses_non_finite_coulomb_constant_and_config_fields():
     else:
         raise AssertionError("PME nonbonded accepted invalid pme_config.charge_tolerance")
 
+    with pytest.raises(ValueError, match="charges must be finite"):
+        NonbondedPotential(
+            **{**valid_kwargs, "charges": [1.0, np.nan]},
+            pme_config=PMEConfig(
+                mesh_shape=(16, 16, 16),
+                alpha=0.35,
+                real_cutoff=5.0,
+            ),
+        )
+
 
 def test_nonbonded_pme_matches_standalone_pme_without_lj():
     positions = np.array(

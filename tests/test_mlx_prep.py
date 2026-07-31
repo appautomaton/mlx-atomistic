@@ -781,6 +781,7 @@ def test_gpcrmd_production_neighbor_manager_uses_auto_backend_policy():
     assert manager is not None
     assert manager.backend == "auto"
     assert manager.skin == GPCRMD_NEIGHBOR_SKIN
+    assert manager.displacement_check_backend == "mlx_scalar"
 
     tuned_manager = _production_neighbor_manager(
         system,
@@ -792,6 +793,7 @@ def test_gpcrmd_production_neighbor_manager_uses_auto_backend_policy():
     assert tuned_manager is not None
     assert tuned_manager.skin == 1.25
     assert tuned_manager.check_interval == 4
+    assert tuned_manager.displacement_check_backend == "mlx_scalar"
 
     large_system = SimpleNamespace(cell=Cell.cubic(80.0))
     large_topology = Topology.from_sequences(

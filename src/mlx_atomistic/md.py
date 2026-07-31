@@ -14,6 +14,7 @@ import numpy as np
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.force_runtime import _PreparedForcePipeline
 from mlx_atomistic.metal_kernels import fused_lj_forces
 from mlx_atomistic.neighbors import (
     NeighborBlocks,
@@ -2952,6 +2953,20 @@ def simulate_nve(
     neighbor_list = (
         neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
     )
+    prepared_force_pipeline = (
+        None
+        if neighbor_manager is None or neighbor_manager.check_interval != 1
+        else _PreparedForcePipeline.prepare(
+            unnamed_terms,
+            cell=cell,
+            virtual_sites=virtual_sites,
+        )
+    )
+    force_binding = (
+        None
+        if prepared_force_pipeline is None
+        else prepared_force_pipeline.bind(neighbor_list)
+    )
     pairs = None if neighbor_list is None else neighbor_list.interactions
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -3094,6 +3109,8 @@ def simulate_nve(
         neighbor_list = (
             neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
         )
+        if prepared_force_pipeline is not None:
+            force_binding = prepared_force_pipeline.bind(neighbor_list)
         pairs = None if neighbor_list is None else neighbor_list.interactions
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -3145,12 +3162,19 @@ def simulate_nve(
             )
         else:
             potential_energy = None
-            next_forces = _forces_from_terms(
-                next_positions,
-                unnamed_terms,
-                cell=cell,
-                pairs=pairs,
-                virtual_sites=virtual_sites,
+            next_forces = (
+                _forces_from_terms(
+                    next_positions,
+                    unnamed_terms,
+                    cell=cell,
+                    pairs=pairs,
+                    virtual_sites=virtual_sites,
+                )
+                if force_binding is None
+                else force_binding.forces(
+                    next_positions,
+                    evaluation_positions=eval_positions,
+                )
             )
             energy_by_term = None
         force_evaluation_wall_seconds += perf_counter() - force_start
@@ -3431,6 +3455,20 @@ def _simulate_nvt(
         if neighbor_list is None:
             msg = "NPT boundary reuse requires an initialized neighbor list"
             raise RuntimeError(msg)
+    prepared_force_pipeline = (
+        None
+        if neighbor_manager is None or neighbor_manager.check_interval != 1
+        else _PreparedForcePipeline.prepare(
+            unnamed_terms,
+            cell=cell,
+            virtual_sites=virtual_sites,
+        )
+    )
+    force_binding = (
+        None
+        if prepared_force_pipeline is None
+        else prepared_force_pipeline.bind(neighbor_list)
+    )
     pairs = None if neighbor_list is None else neighbor_list.interactions
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -3667,14 +3705,104 @@ def _simulate_nvt(
             if cached is not None:
                 return cached
 
-            def block(pos, vel, forces, prng, block_pairs):
+            def block(pos, vel, forces, prng, block_pairs, reference_positions):
+                block_max_displacement = mx.array(0.0, dtype=pos.dtype)
+                block_admissible = mx.array(True)
                 for _ in range(n_substeps):
-                    pos, vel, forces, prng = _langevin_substep(pos, vel, forces, prng, block_pairs)
-                return pos, vel, forces, prng
+                    pos, vel, forces, prng = _langevin_substep(
+                        pos,
+                        vel,
+                        forces,
+                        prng,
+                        block_pairs,
+                    )
+                    displacement = cell.minimum_image(pos - reference_positions)
+                    distance2 = mx.sum(displacement * displacement, axis=1)
+                    step_max_displacement = (
+                        mx.array(0.0, dtype=pos.dtype)
+                        if pos.shape[0] == 0
+                        else mx.sqrt(mx.max(distance2))
+                    )
+                    block_max_displacement = mx.maximum(
+                        block_max_displacement,
+                        step_max_displacement,
+                    )
+                    block_admissible = (
+                        block_admissible
+                        & mx.all(mx.isfinite(pos))
+                        & (step_max_displacement <= neighbor_manager.rebuild_threshold)
+                    )
+                return (
+                    pos,
+                    vel,
+                    forces,
+                    prng,
+                    block_max_displacement,
+                    block_admissible,
+                )
 
             compiled = mx.compile(block)
             _block_cache[n_substeps] = compiled
             return compiled
+
+        def _replay_langevin_block(
+            pos,
+            vel,
+            forces,
+            prng,
+            n_substeps: int,
+        ):
+            replay_pairs = pairs
+            replay_pair_count = pair_count
+            replay_rebuild_count = rebuild_count
+            for _ in range(n_substeps):
+                accel = fscale * forces / masses_col
+                vel_half = vel + 0.5 * dt * accel
+                pos = pos + 0.5 * dt * vel_half
+                if cell is not None and config.wrap_positions:
+                    pos = cell.wrap(pos)
+                split_keys = mx.random.split(prng, 2)
+                prng = split_keys[0]
+                noise = mx.random.normal(vel.shape, key=split_keys[1])
+                middle = (
+                    velocity_decay * vel_half
+                    + (noise_scale / sqrt_masses_col) * noise
+                )
+                pos = pos + 0.5 * dt * middle
+                if cell is not None and config.wrap_positions:
+                    pos = cell.wrap(pos)
+
+                replay_neighbor_list = neighbor_manager.rebuild(pos)
+                replay_pairs = replay_neighbor_list.interactions
+                replay_pair_count = replay_neighbor_list.pair_count
+                replay_rebuild_count = neighbor_manager.rebuild_count
+                if prepared_force_pipeline is None:
+                    forces = _forces_from_terms(
+                        pos,
+                        unnamed_terms,
+                        cell=cell,
+                        pairs=replay_pairs,
+                        virtual_sites=None,
+                    )
+                else:
+                    replay_binding = prepared_force_pipeline.bind(
+                        replay_neighbor_list
+                    )
+                    forces = replay_binding.forces(
+                        pos,
+                        evaluation_positions=pos,
+                    )
+                next_accel = fscale * forces / masses_col
+                vel = middle + 0.5 * dt * next_accel
+            return (
+                pos,
+                vel,
+                forces,
+                prng,
+                replay_pairs,
+                replay_pair_count,
+                replay_rebuild_count,
+            )
 
         def _next_recording_local_step(local_step: int) -> int:
             """Smallest local step > `local_step` that is a sampling, diagnostic,
@@ -3692,17 +3820,59 @@ def _simulate_nvt(
             local_step = 0
             while local_step < config.steps:
                 n = min(config.block_size, _next_recording_local_step(local_step) - local_step)
-                pos, vel, forces, key = _compiled_block(n)(pos, vel, forces, key, pairs)
+                block_start = (pos, vel, forces, key)
+                reference_positions = neighbor_manager.reference_positions
+                if reference_positions is None:
+                    msg = "compiled block execution requires neighbor reference positions"
+                    raise RuntimeError(msg)
+                (
+                    proposed_pos,
+                    proposed_vel,
+                    proposed_forces,
+                    proposed_key,
+                    block_max_displacement,
+                    block_admissible,
+                ) = _compiled_block(n)(
+                    pos,
+                    vel,
+                    forces,
+                    key,
+                    pairs,
+                    reference_positions,
+                )
+                if neighbor_manager._admit_block(
+                    block_max_displacement,
+                    block_admissible,
+                ):
+                    pos = proposed_pos
+                    vel = proposed_vel
+                    forces = proposed_forces
+                    key = proposed_key
+                    neighbor_list = neighbor_manager.neighbor_list
+                    if neighbor_list is None:
+                        msg = "admitted block lost its current neighbor list"
+                        raise RuntimeError(msg)
+                else:
+                    (
+                        pos,
+                        vel,
+                        forces,
+                        key,
+                        pairs,
+                        pair_count,
+                        rebuild_count,
+                    ) = _replay_langevin_block(*block_start, n)
+                    neighbor_list = neighbor_manager.neighbor_list
+                    if neighbor_list is None:
+                        msg = "replayed block lost its current neighbor list"
+                        raise RuntimeError(msg)
                 local_step += n
                 current_step = config.initial_step + local_step
                 current_time = config.initial_time + local_step * config.dt
 
-                force_start = perf_counter()
-                neighbor_list = neighbor_manager.update(pos)
                 pairs = neighbor_list.interactions
                 pair_count = neighbor_list.pair_count
                 rebuild_count = neighbor_manager.rebuild_count
-                fe_wall += perf_counter() - force_start
 
                 state = SimulationState(
                     positions=pos,
@@ -3986,6 +4156,8 @@ def _simulate_nvt(
         neighbor_list = (
             neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
         )
+        if prepared_force_pipeline is not None:
+            force_binding = prepared_force_pipeline.bind(neighbor_list)
         pairs = None if neighbor_list is None else neighbor_list.interactions
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -4051,12 +4223,19 @@ def _simulate_nvt(
             energy_by_term = None
         else:
             potential_energy = None
-            next_forces = _forces_from_terms(
-                next_positions,
-                unnamed_terms,
-                cell=cell,
-                pairs=pairs,
-                virtual_sites=virtual_sites,
+            next_forces = (
+                _forces_from_terms(
+                    next_positions,
+                    unnamed_terms,
+                    cell=cell,
+                    pairs=pairs,
+                    virtual_sites=virtual_sites,
+                )
+                if force_binding is None
+                else force_binding.forces(
+                    next_positions,
+                    evaluation_positions=eval_positions,
+                )
             )
             energy_by_term = None
         if deferred_final:

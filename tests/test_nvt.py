@@ -610,6 +610,71 @@ def test_batched_langevin_zero_force_retains_thermal_noise():
     )
 
 
+@pytest.mark.parametrize("check_interval", [1, 4])
+def test_batched_langevin_replays_when_skin_is_crossed_mid_block(check_interval):
+    """A block that invalidates its Verlet list must replay before using new pairs."""
+
+    positions = np.asarray(
+        [[2.0, 5.0, 5.0], [3.8, 5.0, 5.0]],
+        dtype=np.float32,
+    )
+    velocities = np.asarray(
+        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(10.0)
+    potential = LennardJonesPotential(cutoff=1.5)
+
+    def run(block_size, interval):
+        manager = NeighborListManager(
+            cell,
+            cutoff=1.5,
+            skin=0.2,
+            check_interval=interval,
+            backend="mlx_cell_pairs",
+            displacement_check_backend="mlx_scalar",
+        )
+        result = simulate_nvt(
+            positions,
+            velocities,
+            cell=cell,
+            force_terms=potential,
+            neighbor_manager=manager,
+            config=SimulationConfig(
+                dt=0.05,
+                steps=4,
+                sample_interval=4,
+                diagnostic_interval=4,
+                pressure_diagnostics=False,
+                block_size=block_size,
+            ),
+            thermostat=LangevinThermostat(
+                temperature=0.0,
+                friction=0.0,
+                seed=29,
+            ),
+        )
+        return result, manager
+
+    reference, reference_manager = run(1, 1)
+    batched, batched_manager = run(4, check_interval)
+
+    assert reference_manager.rebuild_count >= 2
+    assert batched_manager.rebuild_count >= reference_manager.rebuild_count
+    np.testing.assert_allclose(
+        np.asarray(batched.final_state.positions),
+        np.asarray(reference.final_state.positions),
+        rtol=0.0,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(batched.final_state.velocities),
+        np.asarray(reference.final_state.velocities),
+        rtol=2.0e-5,
+        atol=2.0e-6,
+    )
+
+
 def test_batched_block_size_falls_back_without_neighbor_manager():
     """block_size > 1 on the dense path (no manager) must still run correctly."""
     positions, velocities, cell, potential = _batched_fcc_system(n=108)

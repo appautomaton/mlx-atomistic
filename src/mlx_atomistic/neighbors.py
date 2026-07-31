@@ -49,6 +49,7 @@ DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION = 3
 DEFAULT_MLX_SPATIAL_MAX_CELLS_PER_ATOM = 4
 DEFAULT_MLX_CELL_BLOCK_SIZE = 256
 DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 8
+DEFAULT_MLX_CELL_TILE_BATCH = 65_536
 # Default neighbor backend for systems above the dense-pair limit. Measured on
 # M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
 # ("mlx_cell_pairs") beats the fixed-shape padded-block path ("mlx_cell_blocks")
@@ -607,6 +608,43 @@ class NeighborListManager:
         finally:
             self.update_wall_seconds += perf_counter() - start
 
+    def _admit_block(
+        self,
+        max_displacement: mx.array,
+        admissible: mx.array,
+    ) -> bool:
+        """Commit one device-measured integration block when its list stayed valid.
+
+        Args:
+            max_displacement: Maximum minimum-image displacement reached anywhere
+                in the proposed block.
+            admissible: Scalar boolean that is true only when every proposed
+                position was finite and stayed within the rebuild threshold.
+
+        Returns:
+            ``True`` when the current neighbor list safely covers the whole
+            block. ``False`` requests exact per-step replay from the block start.
+        """
+
+        start = perf_counter()
+        try:
+            mx.eval(max_displacement, admissible)
+            if not bool(np.asarray(admissible)):
+                return False
+            displacement = float(np.asarray(max_displacement))
+            if not np.isfinite(displacement):
+                return False
+            if displacement > self.rebuild_threshold:
+                return False
+            if self.neighbor_list is None or self.reference_positions is None:
+                msg = "neighbor list manager has no current neighbor list"
+                raise RuntimeError(msg)
+            self.last_max_displacement = displacement
+            self.updates_since_check = 0
+            return True
+        finally:
+            self.update_wall_seconds += perf_counter() - start
+
     def _release_pending_metal_cache(self) -> None:
         """Release inactive rebuild temporaries at the next safe call boundary."""
 
@@ -1072,10 +1110,36 @@ def _build_mlx_cell_tiles(
         msg = "cell lengths must be finite and positive"
         raise ValueError(msg)
 
-    cell_list = build_periodic_cell_list(positions_np, cell, search_radius=search_radius)
+    n_atoms = int(positions_np.shape[0])
+    n_cells_array = _bounded_spatial_grid(
+        lengths.astype(np.float64),
+        search_radius=search_radius,
+        subdivision=DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION,
+        n_atoms=n_atoms,
+    )
+    n_cells = tuple(int(value) for value in n_cells_array)
+    cell_count = int(np.prod(n_cells_array.astype(np.int64)))
+    cell_widths = lengths.astype(np.float64) / n_cells_array.astype(np.float64)
+    wrapped = positions_np - np.floor(positions_np / lengths) * lengths
+    indices = np.floor(wrapped / lengths * n_cells_array).astype(np.int32)
+    indices = np.minimum(indices, n_cells_array - 1)
+    cell_ids = (
+        (indices[:, 0] * n_cells[1] + indices[:, 1]) * n_cells[2]
+        + indices[:, 2]
+    )
+    sorted_atoms = np.argsort(cell_ids, kind="stable").astype(np.int32, copy=False)
+    cell_counts = np.bincount(cell_ids, minlength=cell_count).astype(np.int32)
+    cell_starts = np.empty_like(cell_counts)
+    if cell_count:
+        cell_starts[0] = 0
+        np.cumsum(cell_counts[:-1], dtype=np.int64, out=cell_starts[1:])
+
     atom_block_rows: list[np.ndarray] = []
-    cell_block_ids: dict[tuple[int, int, int], tuple[int, ...]] = {}
-    for cell_index, members in cell_list.bins.items():
+    cell_block_ids: list[tuple[int, ...]] = [() for _ in range(cell_count)]
+    for cell_id in np.flatnonzero(cell_counts):
+        start = int(cell_starts[cell_id])
+        stop = start + int(cell_counts[cell_id])
+        members = sorted_atoms[start:stop]
         block_ids: list[int] = []
         for start in range(0, int(members.shape[0]), DEFAULT_MLX_CELL_TILE_BLOCK_SIZE):
             block = np.full((DEFAULT_MLX_CELL_TILE_BLOCK_SIZE,), -1, dtype=np.int32)
@@ -1083,7 +1147,7 @@ def _build_mlx_cell_tiles(
             block[: chunk.shape[0]] = chunk
             block_ids.append(len(atom_block_rows))
             atom_block_rows.append(block)
-        cell_block_ids[cell_index] = tuple(block_ids)
+        cell_block_ids[int(cell_id)] = tuple(block_ids)
 
     if atom_block_rows:
         atom_blocks = np.stack(atom_block_rows, axis=0)
@@ -1093,92 +1157,98 @@ def _build_mlx_cell_tiles(
             dtype=np.int32,
         )
 
+    task_left, task_right, _ = _spatial_cell_pair_tasks(
+        cell_counts,
+        n_cells,
+        cell_widths,
+        search_radius=search_radius,
+    )
+    candidate_tile_chunks: list[np.ndarray] = []
+    for left_cell, right_cell in zip(task_left, task_right, strict=True):
+        left_blocks = np.asarray(cell_block_ids[int(left_cell)], dtype=np.int32)
+        right_blocks = np.asarray(cell_block_ids[int(right_cell)], dtype=np.int32)
+        if int(left_cell) == int(right_cell):
+            left_index, right_index = np.triu_indices(left_blocks.shape[0])
+            tile_chunk = np.stack(
+                (left_blocks[left_index], right_blocks[right_index]),
+                axis=1,
+            )
+        else:
+            tile_chunk = np.stack(
+                (
+                    np.repeat(left_blocks, right_blocks.shape[0]),
+                    np.tile(right_blocks, left_blocks.shape[0]),
+                ),
+                axis=1,
+            )
+        if tile_chunk.shape[0]:
+            candidate_tile_chunks.append(tile_chunk.astype(np.int32, copy=False))
+    candidate_tiles = (
+        np.concatenate(candidate_tile_chunks, axis=0)
+        if candidate_tile_chunks
+        else np.empty((0, 2), dtype=np.int32)
+    )
+
     search_radius2 = float(search_radius) * float(search_radius)
-    offsets = tuple(product((-1, 0, 1), repeat=3))
-    tile_rows: list[tuple[int, int]] = []
+    tile_rows: list[np.ndarray] = []
     membership_rows: list[np.ndarray] = []
     raw_candidate_count = 0
     peak_tile_candidate_count = 0
     exact_pair_count = 0
+    upper_triangle = np.triu(
+        np.ones(
+            (DEFAULT_MLX_CELL_TILE_BLOCK_SIZE, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE),
+            dtype=np.bool_,
+        ),
+        k=1,
+    )
+    bit_weights = np.left_shift(
+        np.uint32(1),
+        np.arange(32, dtype=np.uint32),
+    )
+    for batch_start in range(0, candidate_tiles.shape[0], DEFAULT_MLX_CELL_TILE_BATCH):
+        tile_batch = candidate_tiles[
+            batch_start : batch_start + DEFAULT_MLX_CELL_TILE_BATCH
+        ]
+        left_atoms = atom_blocks[tile_batch[:, 0]]
+        right_atoms = atom_blocks[tile_batch[:, 1]]
+        valid = (left_atoms[:, :, None] >= 0) & (right_atoms[:, None, :] >= 0)
+        same_block = tile_batch[:, 0] == tile_batch[:, 1]
+        valid[same_block] &= upper_triangle
+        candidates_per_tile = np.sum(valid, axis=(1, 2), dtype=np.int32)
+        raw_candidate_count += int(np.sum(candidates_per_tile, dtype=np.int64))
+        if candidates_per_tile.shape[0]:
+            peak_tile_candidate_count = max(
+                peak_tile_candidate_count,
+                int(np.max(candidates_per_tile)),
+            )
 
-    for cell_index, _members in cell_list.bins.items():
-        neighbor_indices = sorted(
-            {
-                tuple(
-                    (cell_index[axis] + offset[axis]) % cell_list.n_cells[axis]
-                    for axis in range(3)
-                )
-                for offset in offsets
-            }
+        safe_left = np.maximum(left_atoms, 0)
+        safe_right = np.maximum(right_atoms, 0)
+        displacement = (
+            positions_np[safe_left][:, :, None, :]
+            - positions_np[safe_right][:, None, :, :]
         )
-        left_block_ids = cell_block_ids[cell_index]
-        for neighbor_index in neighbor_indices:
-            if neighbor_index < cell_index:
-                continue
-            neighbors = cell_list.bins.get(neighbor_index)
-            if neighbors is None:
-                continue
-            same_cell = neighbor_index == cell_index
-            right_block_ids = cell_block_ids[neighbor_index]
-            for left_position, left_block_id in enumerate(left_block_ids):
-                first_right = left_position if same_cell else 0
-                for right_block_id in right_block_ids[first_right:]:
-                    left_atoms = atom_blocks[left_block_id]
-                    right_atoms = atom_blocks[right_block_id]
-                    valid = (left_atoms[:, None] >= 0) & (right_atoms[None, :] >= 0)
-                    if left_block_id == right_block_id:
-                        valid &= np.triu(
-                            np.ones(
-                                (
-                                    DEFAULT_MLX_CELL_TILE_BLOCK_SIZE,
-                                    DEFAULT_MLX_CELL_TILE_BLOCK_SIZE,
-                                ),
-                                dtype=np.bool_,
-                            ),
-                            k=1,
-                        )
-                    tile_candidate_count = int(np.count_nonzero(valid))
-                    raw_candidate_count += tile_candidate_count
-                    peak_tile_candidate_count = max(
-                        peak_tile_candidate_count,
-                        tile_candidate_count,
-                    )
-                    if tile_candidate_count == 0:
-                        continue
-
-                    safe_left = np.maximum(left_atoms, 0)
-                    safe_right = np.maximum(right_atoms, 0)
-                    displacement = (
-                        positions_np[safe_left][:, None, :]
-                        - positions_np[safe_right][None, :, :]
-                    )
-                    displacement -= lengths * np.round(displacement / lengths)
-                    distance2 = np.sum(displacement * displacement, axis=-1)
-                    member = valid & (distance2 < search_radius2)
-                    active_lanes = np.flatnonzero(member.reshape(-1))
-                    if active_lanes.shape[0] == 0:
-                        continue
-
-                    mask_words = np.zeros(
-                        (
-                            (
-                                DEFAULT_MLX_CELL_TILE_BLOCK_SIZE
-                                * DEFAULT_MLX_CELL_TILE_BLOCK_SIZE
-                                + 31
-                            )
-                            // 32,
-                        ),
-                        dtype=np.uint32,
-                    )
-                    for lane in active_lanes:
-                        mask_words[int(lane) // 32] |= np.uint32(1 << (int(lane) % 32))
-                    tile_rows.append((left_block_id, right_block_id))
-                    membership_rows.append(mask_words)
-                    exact_pair_count += int(active_lanes.shape[0])
+        displacement -= lengths * np.round(displacement / lengths)
+        distance2 = np.sum(displacement * displacement, axis=-1)
+        member = valid & (distance2 < search_radius2)
+        flat_member = member.reshape((-1, 64)).astype(np.uint32, copy=False)
+        mask_words = np.stack(
+            (
+                np.sum(flat_member[:, :32] * bit_weights, axis=1, dtype=np.uint32),
+                np.sum(flat_member[:, 32:] * bit_weights, axis=1, dtype=np.uint32),
+            ),
+            axis=1,
+        )
+        nonempty = np.any(mask_words != 0, axis=1)
+        if np.any(nonempty):
+            tile_rows.append(tile_batch[nonempty])
+            membership_rows.append(mask_words[nonempty])
+            exact_pair_count += int(np.count_nonzero(member))
 
     if tile_rows:
-        tile_blocks = np.asarray(tile_rows, dtype=np.int32)
-        member_mask = np.stack(membership_rows, axis=0)
+        tile_blocks = np.concatenate(tile_rows, axis=0)
+        member_mask = np.concatenate(membership_rows, axis=0)
     else:
         tile_blocks = np.empty((0, 2), dtype=np.int32)
         member_mask = np.empty((0, 2), dtype=np.uint32)
@@ -1191,19 +1261,22 @@ def _build_mlx_cell_tiles(
     )
     stats = PairListStats(
         pair_count=exact_pair_count,
-        n_cells=cell_list.n_cells,
-        cell_count=cell_list.cell_count,
-        occupied_cell_count=cell_list.occupied_cell_count,
+        n_cells=n_cells,
+        cell_count=cell_count,
+        occupied_cell_count=int(np.count_nonzero(cell_counts)),
         search_radius=search_radius,
         estimated_pair_bytes=tiles.estimated_bytes,
-        estimated_cell_list_bytes=cell_list.estimated_bytes,
+        estimated_cell_list_bytes=(
+            n_atoms * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
+            + cell_count * 2 * _INT_BYTES
+        ),
         backend="mlx_cell_tiles",
         representation_kind="tiles",
         candidate_count=raw_candidate_count,
         estimated_candidate_bytes=(
             peak_tile_candidate_count * (3 * _FLOAT_BYTES + _BOOL_BYTES)
         ),
-        compaction_backend="cpu_tile_membership_mask",
+        compaction_backend="cpu_vectorized_tile_membership_mask",
         fallback_reason=None,
     )
     return NeighborList(

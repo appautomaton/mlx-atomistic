@@ -58,6 +58,7 @@ from mlx_atomistic.pme import (
     _pme_coulomb_nonreciprocal_strain_energy,
     _pme_coulomb_reciprocal_energy_forces_virial,
     _pme_coulomb_reciprocal_virial,
+    _prepared_pme_reciprocal_space_energy_forces,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
@@ -105,6 +106,16 @@ def _explicit_intramolecular_zero_virial(
 
 def _unit_pair_scale() -> mx.array:
     return mx.array(1.0, dtype=mx.float32)
+
+
+@dataclass(frozen=True)
+class _NonbondedForceBinding:
+    """Prepared ordinary-step binding for fused PME nonbonded forces."""
+
+    cell: Cell
+    pairs: mx.array
+    pme_plan: PMEExecutionPlan
+    aligned_lj_scales: mx.array
 
 
 def _topology_pair_scales(
@@ -1113,6 +1124,9 @@ class NonbondedPotential:
         if bool(np.any(np.asarray(epsilon) < 0.0)):
             msg = "epsilon values must be non-negative"
             raise ValueError(msg)
+        if not bool(np.all(np.isfinite(np.asarray(charges)))):
+            msg = "charges must be finite"
+            raise ValueError(msg)
         if not np.isfinite(float(self.coulomb_constant)):
             msg = "coulomb_constant must be finite"
             raise ValueError(msg)
@@ -1491,6 +1505,8 @@ class NonbondedPotential:
         object.__setattr__(self, "_pair_scale_cache", None)
         object.__setattr__(self, "_block_scale_cache", None)
         object.__setattr__(self, "_aligned_lj_scale_cache", None)
+        object.__setattr__(self, "_pme_direct_space_cache", None)
+        object.__setattr__(self, "_force_binding_cache", None)
 
     def _openmm_dispersion_coefficient(self) -> float:
         """Return OpenMM's unswitched long-range LJ correction coefficient."""
@@ -3286,6 +3302,87 @@ class NonbondedPotential:
             + self._periodic_coulomb_correction_forces(positions, cell)
         )
 
+    def _prepare_force_binding(
+        self,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+    ) -> _NonbondedForceBinding | NotImplementedType:
+        """Bind recurring fused PME state to one exact pair representation."""
+
+        if (
+            self.electrostatics != "pme"
+            or cell is None
+            or self.pme_config is None
+            or self.pme_plan is None
+        ):
+            return NotImplemented
+        cache = self._force_binding_cache
+        if (
+            cache is not None
+            and cache.cell is cell
+            and cache.pairs is pairs
+            and cache.pme_plan is self.pme_plan
+        ):
+            return cache
+        direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
+        if not self._supports_fused_pme_direct(cell, direct_space_pairs):
+            return NotImplemented
+        binding = _NonbondedForceBinding(
+            cell=cell,
+            pairs=direct_space_pairs,
+            pme_plan=self.pme_plan,
+            aligned_lj_scales=self._compact_aligned_lj_scales(
+                direct_space_pairs,
+            ),
+        )
+        object.__setattr__(self, "_force_binding_cache", binding)
+        return binding
+
+    def _forces_from_binding(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+    ) -> mx.array:
+        """Evaluate forces from a setup-validated fused PME binding."""
+
+        if not isinstance(binding, _NonbondedForceBinding):
+            msg = "nonbonded force binding has an incompatible type"
+            raise TypeError(msg)
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+
+        direct_forces = fused_parameterized_pme_direct_force_only(
+            positions,
+            binding.pairs,
+            mx.diag(binding.cell.matrix),
+            self.sigma,
+            self.epsilon,
+            self.charges,
+            binding.aligned_lj_scales,
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+        )
+        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            binding.pme_plan,
+            include_self_correction=False,
+        )
+        return (
+            direct_forces
+            + self._exception_lj_forces(positions, binding.cell)
+            + reciprocal_forces
+            + self._periodic_coulomb_correction_forces(
+                positions,
+                binding.cell,
+            )
+        )
+
     def _pme_energy_forces(
         self,
         positions: mx.array,
@@ -3430,6 +3527,14 @@ class NonbondedPotential:
         if self.pme_config is None:
             msg = "PME electrostatics requires pme_config"
             raise ValueError(msg)
+        cache = self._pme_direct_space_cache
+        if (
+            cache is not None
+            and cache[0] is cell
+            and cache[1] is pairs
+            and cache[2] is self.pme_plan
+        ):
+            return pairs
         report = pme_direct_space_policy_report(
             cell,
             config=self.pme_config,
@@ -3437,6 +3542,11 @@ class NonbondedPotential:
             plan=self.pme_plan,
         )
         if report["uses_shared_neighbor_policy"]:
+            object.__setattr__(
+                self,
+                "_pme_direct_space_cache",
+                (cell, pairs, self.pme_plan),
+            )
             return pairs
         reason = report.get("fallback_reason") or "pme_direct_space_shared_policy_unsupported"
         msg = f"PME production direct-space shared pair policy unsupported: {reason}"

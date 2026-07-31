@@ -66,7 +66,7 @@ def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():
     assert neighbors.candidate_count == tiles.raw_candidate_count
     assert neighbors.candidate_count >= neighbors.compact_pair_count
     assert neighbors.estimated_pair_bytes == tiles.estimated_bytes
-    assert neighbors.compaction_backend == "cpu_tile_membership_mask"
+    assert neighbors.compaction_backend == "cpu_vectorized_tile_membership_mask"
     assert tiles.block_size == 8
     assert tiles.exact_pair_count == oracle.pair_count
     assert tiles.padded_lane_count == tiles.tile_count * 64

@@ -462,6 +462,7 @@ def _production_neighbor_manager(
         sort_pairs=False,
         max_workers=GPCRMD_NEIGHBOR_WORKERS,
         backend="mlx_cell_pairs" if uses_pme else "auto",
+        displacement_check_backend="mlx_scalar",
     )
 
 
