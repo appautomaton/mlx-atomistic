@@ -16,7 +16,7 @@ device load.
 
 from __future__ import annotations
 
-from math import pi, sqrt
+from math import isfinite, pi, sqrt
 
 import mlx.core as mx
 
@@ -81,6 +81,7 @@ _pme_direct_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
+_aligned_topology_lj_scales_kernel_singleton = None
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -757,6 +758,72 @@ _PME_ORDER5_INTERPOLATE_SOURCE = r"""
         -charge * gradient.z * (float)mesh[2] / cell[2];
 """
 
+_ALIGNED_TOPOLOGY_LJ_SCALES_SOURCE = r"""
+    uint t = thread_position_in_grid.x;
+    if (t >= (uint)counts[0]) {
+        return;
+    }
+
+    int left = pairs_i[t];
+    int right = pairs_j[t];
+    if (left > right) {
+        int temporary = left;
+        left = right;
+        right = temporary;
+    }
+
+    bool excluded = false;
+    int lower = 0;
+    int upper = counts[1];
+    while (lower < upper) {
+        int middle = lower + (upper - lower) / 2;
+        int known_left = excluded_i[middle];
+        int known_right = excluded_j[middle];
+        if (
+            known_left < left
+            || (known_left == left && known_right < right)
+        ) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    if (
+        lower < counts[1]
+        && excluded_i[lower] == left
+        && excluded_j[lower] == right
+    ) {
+        excluded = true;
+    }
+
+    float scale = excluded ? 0.0f : 1.0f;
+    if (!excluded && params[0] != 1.0f && counts[2] > 0) {
+        lower = 0;
+        upper = counts[2];
+        while (lower < upper) {
+            int middle = lower + (upper - lower) / 2;
+            int known_left = one_four_i[middle];
+            int known_right = one_four_j[middle];
+            if (
+                known_left < left
+                || (known_left == left && known_right < right)
+            ) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        if (
+            lower < counts[2]
+            && one_four_i[lower] == left
+            && one_four_j[lower] == right
+        ) {
+            scale = params[0];
+        }
+    }
+    scales[t] = scale;
+"""
+
 
 def _lj_force_kernel():
     """Return the cached fused-LJ Metal kernel, building it on first call."""
@@ -952,6 +1019,105 @@ def _pme_order5_interpolate_kernel():
             header=_PME_ORDER5_HEADER,
         )
     return _pme_order5_interpolate_kernel_singleton
+
+
+def _aligned_topology_lj_scales_kernel():
+    """Return the cached topology-scale alignment Metal kernel."""
+
+    global _aligned_topology_lj_scales_kernel_singleton
+    if _aligned_topology_lj_scales_kernel_singleton is None:
+        _aligned_topology_lj_scales_kernel_singleton = mx.fast.metal_kernel(
+            name="aligned_topology_lj_scales",
+            input_names=[
+                "pairs_i",
+                "pairs_j",
+                "excluded_i",
+                "excluded_j",
+                "one_four_i",
+                "one_four_j",
+                "params",
+                "counts",
+            ],
+            output_names=["scales"],
+            source=_ALIGNED_TOPOLOGY_LJ_SCALES_SOURCE,
+        )
+    return _aligned_topology_lj_scales_kernel_singleton
+
+
+def aligned_topology_lj_scales(
+    pairs: mx.array,
+    excluded_pairs: mx.array,
+    one_four_pairs: mx.array,
+    *,
+    one_four_scale: float,
+) -> mx.array:
+    """Build pair-aligned topology LJ scales on Metal.
+
+    Args:
+        pairs: Candidate atom pairs with shape ``(n_pairs, 2)``.
+        excluded_pairs: Sorted excluded pairs with shape ``(n_excluded, 2)``.
+        one_four_pairs: Sorted non-excluded 1-4 pairs with shape ``(n_one_four, 2)``.
+        one_four_scale: LJ scale assigned to 1-4 pairs.
+
+    Returns:
+        Float32 scales with shape ``(n_pairs,)``. Excluded pairs are zero,
+        ordinary pairs are one, and 1-4 pairs use ``one_four_scale``.
+
+    Raises:
+        ValueError: If any pair array has the wrong shape or the scale is invalid.
+    """
+
+    pairs = as_mx_array(pairs, dtype=mx.int32)
+    excluded_pairs = as_mx_array(excluded_pairs, dtype=mx.int32)
+    one_four_pairs = as_mx_array(one_four_pairs, dtype=mx.int32)
+    for name, values in (
+        ("pairs", pairs),
+        ("excluded_pairs", excluded_pairs),
+        ("one_four_pairs", one_four_pairs),
+    ):
+        if values.ndim != 2 or values.shape[1] != 2:
+            msg = f"{name} must have shape (n, 2)"
+            raise ValueError(msg)
+    if not isfinite(float(one_four_scale)) or float(one_four_scale) < 0.0:
+        msg = "one_four_scale must be finite and non-negative"
+        raise ValueError(msg)
+
+    pair_count = int(pairs.shape[0])
+    if pair_count == 0:
+        return mx.zeros((0,), dtype=mx.float32)
+    if excluded_pairs.shape[0] == 0 and (
+        one_four_pairs.shape[0] == 0 or float(one_four_scale) == 1.0
+    ):
+        return mx.ones((pair_count,), dtype=mx.float32)
+
+    counts = mx.array(
+        [
+            pair_count,
+            int(excluded_pairs.shape[0]),
+            int(one_four_pairs.shape[0]),
+        ],
+        dtype=mx.int32,
+    )
+    params = mx.array([float(one_four_scale)], dtype=mx.float32)
+    threads = min(256, pair_count)
+    (scales,) = _aligned_topology_lj_scales_kernel()(
+        inputs=[
+            pairs[:, 0],
+            pairs[:, 1],
+            excluded_pairs[:, 0],
+            excluded_pairs[:, 1],
+            one_four_pairs[:, 0],
+            one_four_pairs[:, 1],
+            params,
+            counts,
+        ],
+        output_shapes=[(pair_count,)],
+        output_dtypes=[mx.float32],
+        grid=(pair_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return scales
 
 
 def pme_order5_charge_grid(

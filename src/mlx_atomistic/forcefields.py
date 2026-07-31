@@ -26,6 +26,7 @@ from mlx_atomistic.custom_force import (
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
+    aligned_topology_lj_scales,
     fused_parameterized_lj_forces,
     fused_parameterized_pme_direct_components,
     fused_parameterized_pme_direct_components_virial,
@@ -1319,8 +1320,17 @@ class NonbondedPotential:
             ),
             dtype=np.int32,
         ).reshape((-1, 2))
+        lj_one_four_pairs = np.asarray(
+            (
+                []
+                if self.topology is None or self.lj_one_four_scale == 1.0
+                else sorted(self.topology.one_four_set - excluded_one_four_pairs)
+            ),
+            dtype=np.int32,
+        ).reshape((-1, 2))
         correction_pairs_mx = mx.array(correction_pairs, dtype=mx.int32)
         one_four_pairs_mx = mx.array(one_four_pairs, dtype=mx.int32)
+        lj_one_four_pairs_mx = mx.array(lj_one_four_pairs, dtype=mx.int32)
         correction_charge_products = -(
             charges[correction_pairs_mx[:, 0]]
             * charges[correction_pairs_mx[:, 1]]
@@ -1433,6 +1443,16 @@ class NonbondedPotential:
             self,
             "_ewald_one_four_charge_products",
             one_four_charge_products,
+        )
+        object.__setattr__(
+            self,
+            "_aligned_lj_exclusion_pairs",
+            correction_pairs_mx,
+        )
+        object.__setattr__(
+            self,
+            "_aligned_lj_one_four_pairs",
+            lj_one_four_pairs_mx,
         )
         object.__setattr__(
             self,
@@ -1886,8 +1906,20 @@ class NonbondedPotential:
         cache = self._aligned_lj_scale_cache
         if cache is not None and cache[0] is pairs:
             return cache[1]
-        mask, lj_scales, _ = self._compact_pair_masks_and_scales(pairs)
-        aligned = mx.where(mask, lj_scales, 0.0).astype(mx.float32)
+        if (
+            "gpu" in str(mx.default_device()).lower()
+            and self.topology is not None
+            and self.topology.nonbonded_pair_policy == "lazy"
+        ):
+            aligned = aligned_topology_lj_scales(
+                pairs,
+                self._aligned_lj_exclusion_pairs,
+                self._aligned_lj_one_four_pairs,
+                one_four_scale=self.lj_one_four_scale,
+            )
+        else:
+            mask, lj_scales, _ = self._compact_pair_masks_and_scales(pairs)
+            aligned = mx.where(mask, lj_scales, 0.0).astype(mx.float32)
         object.__setattr__(
             self,
             "_aligned_lj_scale_cache",
