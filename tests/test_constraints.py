@@ -8,7 +8,13 @@ from mlx_atomistic.constraints import (
     SettleWaterConstraints,
 )
 from mlx_atomistic.core import Cell
-from mlx_atomistic.md import LennardJonesPotential, SimulationConfig, simulate_nve
+from mlx_atomistic.md import (
+    LangevinThermostat,
+    LennardJonesPotential,
+    SimulationConfig,
+    simulate_nve,
+    simulate_nvt,
+)
 
 
 def _distances(positions):
@@ -77,6 +83,63 @@ def test_periodic_distance_constraints_preserve_continuous_molecules():
     assert float(np.asarray(error)) <= 1.0e-6
 
 
+def test_distance_dynamics_step_matches_openmm_reference_oracle():
+    """One coupled SHAKE drift matches OpenMM's deterministic positions."""
+
+    positions = np.asarray(
+        [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+        dtype=np.float32,
+    )
+    velocities = np.asarray(
+        [
+            [0.12, -0.08, 0.04],
+            [-0.31, 0.27, 0.09],
+            [0.22, -0.14, -0.05],
+        ],
+        dtype=np.float32,
+    )
+    constraints = DistanceConstraints(
+        [(0, 1), (0, 2)],
+        distances=[0.1, 0.1],
+        max_iterations=20,
+    )
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=np.asarray([12.0, 1.0, 1.0], dtype=np.float32),
+        force_terms=ZeroForce(),
+        constraints=constraints,
+        config=SimulationConfig(
+            dt=0.004,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=7,
+        ),
+    )
+
+    expected_positions = np.asarray(
+        [
+            [0.00034848142, -0.00033830303, 0.00016],
+            [0.10033822298, 0.00108, 0.00036],
+            [0.00088, 0.09965963639, -0.0002],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.positions),
+        expected_positions,
+        rtol=0.0,
+        atol=2.0e-7,
+    )
+
+
 def test_settle_water_constraints_project_positions_exactly():
     constraints = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
     positions = np.asarray(
@@ -138,6 +201,73 @@ def test_settle_water_constraints_remove_pair_relative_velocity():
         assert abs(float(np.dot(relative, unit))) < 1e-6
     momentum_after = np.sum(np.asarray(constrained) * masses[:, None], axis=0)
     np.testing.assert_allclose(momentum_after, momentum_before, atol=1e-6)
+
+
+def test_settle_dynamics_step_matches_openmm_reference_oracle():
+    """One constrained drift matches OpenMM's deterministic SETTLE step."""
+
+    positions = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [-0.0125, 0.099215674, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    velocities = np.asarray(
+        [
+            [0.12, -0.08, 0.04],
+            [-0.31, 0.27, 0.09],
+            [0.22, -0.14, -0.05],
+        ],
+        dtype=np.float32,
+    )
+    constraints = SettleWaterConstraints(
+        [(0, 1, 2)],
+        oh_distance=0.1,
+        hh_distance=0.15,
+    )
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=np.asarray([16.0, 1.0, 1.0], dtype=np.float32),
+        force_terms=ZeroForce(),
+        constraints=constraints,
+        config=SimulationConfig(
+            dt=0.004,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=5,
+        ),
+    )
+
+    expected_positions = np.asarray(
+        [
+            [0.00043289735, -0.00027857105, 0.00016],
+            [0.10043156888, 0.00019681351, 0.00036],
+            [-0.01253792644, 0.09887599732, -0.0002],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.positions),
+        expected_positions,
+        rtol=0.0,
+        atol=2.0e-7,
+    )
+    final_positions = np.asarray(result.final_state.positions)
+    final_velocities = np.asarray(result.final_state.velocities)
+    for left, right in np.asarray(constraints.pairs):
+        displacement = final_positions[left] - final_positions[right]
+        relative_velocity = final_velocities[left] - final_velocities[right]
+        assert abs(float(np.dot(displacement, relative_velocity))) < 2.0e-6
 
 
 def test_settle_interoperates_with_generic_distance_constraints_in_nve():

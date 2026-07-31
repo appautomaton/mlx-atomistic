@@ -3657,7 +3657,7 @@ def _simulate_nvt(
                 pos, unnamed_terms, cell=cell, pairs=block_pairs, virtual_sites=None
             )
             next_accel = fscale * next_forces / masses_col
-            vel = vel_half + 0.5 * dt * next_accel
+            vel = middle + 0.5 * dt * next_accel
             return pos, vel, next_forces, prng
 
         _block_cache: dict[int, object] = {}
@@ -3948,9 +3948,36 @@ def _simulate_nvt(
         if cell is not None and config.wrap_positions:
             next_positions = cell.wrap(next_positions)
         constraint_error = _zero_constraint_error(next_positions)
+        velocity_before_final_kick = (
+            middle_velocities
+            if isinstance(thermostat, LangevinThermostat)
+            else velocities_half
+        )
         if constraints is not None:
-            next_positions, constraint_error = constraints.apply_positions(
+            unconstrained_positions = next_positions
+            step_projector = getattr(constraints, "apply_position_step", None)
+            if step_projector is None:
+                next_positions, constraint_error = constraints.apply_positions(
+                    next_positions,
+                    masses,
+                    cell,
+                )
+            else:
+                next_positions, constraint_error = step_projector(
+                    state.positions,
+                    next_positions,
+                    masses,
+                    cell,
+                )
+            position_correction = next_positions - unconstrained_positions
+            if cell is not None:
+                position_correction = cell.minimum_image(position_correction)
+            velocity_before_final_kick = (
+                velocity_before_final_kick + position_correction / config.dt
+            )
+            velocity_before_final_kick = constraints.apply_velocities(
                 next_positions,
+                velocity_before_final_kick,
                 masses,
                 cell,
             )
@@ -4038,7 +4065,7 @@ def _simulate_nvt(
             }
         force_evaluation_wall_seconds += perf_counter() - force_start
         next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
-        next_velocities = velocities_half + 0.5 * config.dt * next_acceleration
+        next_velocities = velocity_before_final_kick + 0.5 * config.dt * next_acceleration
         if constraints is not None:
             next_velocities = constraints.apply_velocities(
                 next_positions,
