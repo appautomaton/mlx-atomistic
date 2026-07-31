@@ -173,7 +173,122 @@ def test_neighbor_cutoff_mask_matches_mlx_and_preserves_compact_pair_order():
     } == {
         tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
     }
-    assert first.compaction_backend == "metal_prefix_scan"
+    assert first.compaction_backend == "metal_spatial_prefix_scan"
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "case",
+    ["empty", "single", "periodic-boundary", "periodic-alias", "dense"],
+)
+def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
+    """Spatial Metal emission is exact, unique, and repeatable at edge cases."""
+
+    if case == "empty":
+        positions = np.empty((0, 3), dtype=np.float32)
+        cell = Cell.cubic(4.0)
+        cutoff = 0.8
+    elif case == "single":
+        positions = np.array([[0.2, 0.3, 0.4]], dtype=np.float32)
+        cell = Cell.cubic(4.0)
+        cutoff = 0.8
+    elif case == "periodic-boundary":
+        positions = np.array(
+            [[0.01, 1.0, 1.0], [3.99, 1.0, 1.0], [2.0, 2.0, 2.0]],
+            dtype=np.float32,
+        )
+        cell = Cell.cubic(4.0)
+        cutoff = 0.1
+    elif case == "periodic-alias":
+        positions = np.array(
+            [
+                [0.05, 0.05, 0.05],
+                [0.35, 0.05, 0.05],
+                [1.85, 0.05, 0.05],
+                [1.85, 1.85, 1.85],
+            ],
+            dtype=np.float32,
+        )
+        cell = Cell.cubic(2.0)
+        cutoff = 1.6
+    else:
+        rng = np.random.default_rng(91)
+        positions = rng.uniform(0.0, 0.4, size=(64, 3)).astype(np.float32)
+        cell = Cell.cubic(4.0)
+        cutoff = 0.3
+
+    oracle = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.0,
+        sort_pairs=True,
+        backend="periodic_cell_list",
+    )
+    first = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.0,
+        sort_pairs=False,
+        backend="mlx_cell_pairs",
+    )
+    second = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.0,
+        sort_pairs=False,
+        backend="mlx_cell_pairs",
+    )
+    sorted_pairs = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.0,
+        sort_pairs=True,
+        backend="mlx_cell_pairs",
+    )
+
+    expected = np.asarray(oracle.pairs)
+    observed = np.asarray(first.pairs)
+    assert np.array_equal(observed, np.asarray(second.pairs))
+    assert {tuple(pair) for pair in observed.tolist()} == {
+        tuple(pair) for pair in expected.tolist()
+    }
+    assert first.pair_count == len({tuple(pair) for pair in observed.tolist()})
+    assert np.array_equal(np.asarray(sorted_pairs.pairs), expected)
+    assert first.candidate_count is not None
+    assert first.candidate_count >= first.pair_count
+    assert first.compaction_backend == "metal_spatial_prefix_scan"
+
+
+@pytest.mark.gpu
+def test_spatial_neighbor_manager_releases_rebuild_cache_once(monkeypatch):
+    """A completed spatial rebuild releases inactive Metal buffers at the next update."""
+
+    positions, cell = fcc_lattice(256, density=0.8)
+    manager = NeighborListManager(
+        cell,
+        cutoff=2.5,
+        skin=0.4,
+        backend="mlx_cell_pairs",
+    )
+    clear_calls = 0
+    clear_cache = mx.clear_cache
+
+    def counted_clear_cache():
+        nonlocal clear_calls
+        clear_calls += 1
+        clear_cache()
+
+    monkeypatch.setattr(mx, "clear_cache", counted_clear_cache)
+    manager.update(positions)
+    assert clear_calls == 0
+    manager.update(positions)
+    assert clear_calls == 1
+    manager.update(positions)
+    assert clear_calls == 1
 
 
 @pytest.mark.gpu

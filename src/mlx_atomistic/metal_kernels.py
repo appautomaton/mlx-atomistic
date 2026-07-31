@@ -82,6 +82,7 @@ _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
 _aligned_topology_lj_scales_kernel_singleton = None
+_neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
 
@@ -843,6 +844,42 @@ _NEIGHBOR_PAIR_CUTOFF_MASK_SOURCE = r"""
     close[t] = dx * dx + dy * dy + dz * dz < params[0];
 """
 
+_NEIGHBOR_CELL_PAIR_CANDIDATES_SOURCE = r"""
+    uint task = thread_position_in_grid.x;
+    if (task >= (uint)counts[0]) {
+        return;
+    }
+
+    int left_cell = cell_pairs[2 * task + 0];
+    int right_cell = cell_pairs[2 * task + 1];
+    int left_start = cell_starts[left_cell];
+    int right_start = cell_starts[right_cell];
+    int left_count = cell_counts[left_cell];
+    int right_count = cell_counts[right_cell];
+    int output = task_offsets[task];
+
+    if (left_cell == right_cell) {
+        for (int left = 0; left < left_count; left++) {
+            int atom_i = sorted_atoms[left_start + left];
+            for (int right = left + 1; right < right_count; right++) {
+                pairs_i[output] = atom_i;
+                pairs_j[output] = sorted_atoms[right_start + right];
+                output++;
+            }
+        }
+        return;
+    }
+
+    for (int left = 0; left < left_count; left++) {
+        int atom_i = sorted_atoms[left_start + left];
+        for (int right = 0; right < right_count; right++) {
+            pairs_i[output] = atom_i;
+            pairs_j[output] = sorted_atoms[right_start + right];
+            output++;
+        }
+    }
+"""
+
 _NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE = r"""
     uint t = thread_position_in_grid.x;
     if (t >= (uint)counts[0] || !close[t]) {
@@ -1096,6 +1133,27 @@ def _neighbor_pair_cutoff_mask_kernel():
     return _neighbor_pair_cutoff_mask_kernel_singleton
 
 
+def _neighbor_cell_pair_candidates_kernel():
+    """Return the cached spatial neighbor-candidate Metal kernel."""
+
+    global _neighbor_cell_pair_candidates_kernel_singleton
+    if _neighbor_cell_pair_candidates_kernel_singleton is None:
+        _neighbor_cell_pair_candidates_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_cell_pair_candidates",
+            input_names=[
+                "sorted_atoms",
+                "cell_starts",
+                "cell_counts",
+                "cell_pairs",
+                "task_offsets",
+                "counts",
+            ],
+            output_names=["pairs_i", "pairs_j"],
+            source=_NEIGHBOR_CELL_PAIR_CANDIDATES_SOURCE,
+        )
+    return _neighbor_cell_pair_candidates_kernel_singleton
+
+
 def _neighbor_pair_ordered_scatter_kernel():
     """Return the cached deterministic neighbor-compaction Metal kernel."""
 
@@ -1180,6 +1238,76 @@ def neighbor_pair_cutoff_mask(
     return close
 
 
+def _neighbor_cell_pair_candidates(
+    sorted_atoms: mx.array,
+    cell_starts: mx.array,
+    cell_counts: mx.array,
+    cell_pairs: mx.array,
+    task_offsets: mx.array,
+    *,
+    candidate_count: int,
+) -> tuple[mx.array, mx.array]:
+    """Emit atom-pair candidates for occupied spatial-cell tasks on Metal.
+
+    Args:
+        sorted_atoms: Atom indices grouped by cell with shape ``(n_atoms,)``.
+        cell_starts: Starting index of each cell in ``sorted_atoms``.
+        cell_counts: Number of atoms in each spatial cell.
+        cell_pairs: Canonical cell-pair tasks with shape ``(n_tasks, 2)``.
+        task_offsets: Exclusive output offset for each task.
+        candidate_count: Total output candidates across all tasks.
+
+    Returns:
+        Aligned left and right atom-index arrays. Same-cell tasks emit each
+        unique pair once; cross-cell tasks emit their Cartesian product.
+
+    Raises:
+        ValueError: If shapes or counts are inconsistent.
+    """
+
+    sorted_atoms = as_mx_array(sorted_atoms, dtype=mx.int32)
+    cell_starts = as_mx_array(cell_starts, dtype=mx.int32)
+    cell_counts = as_mx_array(cell_counts, dtype=mx.int32)
+    cell_pairs = as_mx_array(cell_pairs, dtype=mx.int32)
+    task_offsets = as_mx_array(task_offsets, dtype=mx.int32)
+    if sorted_atoms.ndim != 1:
+        msg = "sorted_atoms must be one-dimensional"
+        raise ValueError(msg)
+    if cell_starts.ndim != 1 or cell_counts.shape != cell_starts.shape:
+        msg = "cell_starts and cell_counts must have matching one-dimensional shapes"
+        raise ValueError(msg)
+    if cell_pairs.ndim != 2 or cell_pairs.shape[1] != 2:
+        msg = "cell_pairs must have shape (n_tasks, 2)"
+        raise ValueError(msg)
+    if task_offsets.shape != (cell_pairs.shape[0],):
+        msg = "task_offsets must contain one output offset per cell-pair task"
+        raise ValueError(msg)
+    if candidate_count < 0:
+        msg = "candidate_count must be non-negative"
+        raise ValueError(msg)
+
+    task_count = int(cell_pairs.shape[0])
+    if task_count == 0 or candidate_count == 0:
+        empty = mx.zeros((0,), dtype=mx.int32)
+        return empty, empty
+    threads = min(256, task_count)
+    pairs_i, pairs_j = _neighbor_cell_pair_candidates_kernel()(
+        inputs=[
+            sorted_atoms,
+            cell_starts,
+            cell_counts,
+            cell_pairs,
+            task_offsets,
+            mx.array([task_count], dtype=mx.int32),
+        ],
+        output_shapes=[(candidate_count,), (candidate_count,)],
+        output_dtypes=[mx.int32, mx.int32],
+        grid=(task_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+    )
+    return pairs_i, pairs_j
+
+
 def neighbor_pair_ordered_scatter(
     pairs_i: mx.array,
     pairs_j: mx.array,
@@ -1203,6 +1331,26 @@ def neighbor_pair_ordered_scatter(
     """
 
     pairs_i = as_mx_array(pairs_i, dtype=mx.int32)
+    return _neighbor_pair_ordered_scatter_sized(
+        pairs_i,
+        pairs_j,
+        close,
+        prefix,
+        accepted_count=int(pairs_i.shape[0]),
+    )
+
+
+def _neighbor_pair_ordered_scatter_sized(
+    pairs_i: mx.array,
+    pairs_j: mx.array,
+    close: mx.array,
+    prefix: mx.array,
+    *,
+    accepted_count: int,
+) -> tuple[mx.array, mx.array]:
+    """Scatter accepted candidates into an explicitly sized output."""
+
+    pairs_i = as_mx_array(pairs_i, dtype=mx.int32)
     pairs_j = as_mx_array(pairs_j, dtype=mx.int32)
     close = as_mx_array(close, dtype=mx.bool_)
     prefix = as_mx_array(prefix, dtype=mx.int32)
@@ -1220,6 +1368,13 @@ def neighbor_pair_ordered_scatter(
     if pair_count == 0:
         empty = mx.zeros((0,), dtype=mx.int32)
         return empty, empty
+    output_count = int(accepted_count)
+    if output_count < 0 or output_count > pair_count:
+        msg = "accepted_count must fit within the candidate-pair count"
+        raise ValueError(msg)
+    if output_count == 0:
+        empty = mx.zeros((0,), dtype=mx.int32)
+        return empty, empty
     threads = min(256, pair_count)
     accepted_i, accepted_j = _neighbor_pair_ordered_scatter_kernel()(
         inputs=[
@@ -1229,7 +1384,7 @@ def neighbor_pair_ordered_scatter(
             prefix,
             mx.array([pair_count], dtype=mx.int32),
         ],
-        output_shapes=[(pair_count,), (pair_count,)],
+        output_shapes=[(output_count,), (output_count,)],
         output_dtypes=[mx.int32, mx.int32],
         grid=(pair_count, 1, 1),
         threadgroup=(threads, 1, 1),

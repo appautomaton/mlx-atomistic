@@ -21,10 +21,12 @@ custom Metal kernels.
   mask in MLX, then records explicit CPU `argwhere` compaction metadata because
   this MLX runtime does not expose dynamic `argwhere`/`nonzero` pair emission.
 - `mlx_cell_pairs` is the large-system neighbor-list backend selected by the
-  neighbor manager's `auto` policy above the dense-pair atom limit. It keeps the
-  periodic cell/bin search space bounded, batches neighboring-cell candidates
-  into MLX distance-filter chunks, and emits compact pairs through CPU
-  compaction.
+  neighbor manager's `auto` policy above the dense-pair atom limit. On Metal it
+  bins and stably orders atoms in MLX, prunes a fine cell grid by bounding-box
+  distance, emits bounded candidate batches with a custom Metal kernel, and
+  compacts exact pairs by prefix scan. Only small cell-occupancy and task
+  metadata reaches the CPU; coordinates and compact pairs remain in MLX. The
+  CPU backend retains the established NumPy cell-list implementation.
 - `mlx_cell_blocks` keeps the periodic cell/bin candidate search in a
   fixed-shape block representation. It remains available for fixed-shape
   consumers and historical benchmark reproduction.
@@ -38,8 +40,11 @@ custom Metal kernels.
 
 ## Current Hot-Path Recommendation
 
-Do not write a custom Metal kernel first. The first decision point should come
-from `python -m mlx_atomistic.benchmarks.md_acceleration --json`.
+Measure with `python -m mlx_atomistic.benchmarks.md_acceleration --json` before
+changing a force path. The large-system neighbor emitter is now Metal-native,
+so the next scaling decision is whether to replace the explicit global pair
+array with a spatial tile representation consumed directly by the force
+kernel.
 
 The likely candidates are:
 
@@ -48,15 +53,11 @@ The likely candidates are:
   `mlx_pairs`;
 - DFT projector or solver work, if MD dense/tiled already scales well enough.
 
-For the current code shape, the most suspicious path is still neighbor-list
-construction: it uses Python dictionaries, Python sets, and NumPy loops. Dense
-MLX all-pairs should be measured first because the target machine has enough
-memory for thousands of particles.
-
 For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
-large-system route uses `mlx_cell_pairs`: CPU-side periodic binning bounds the
-candidate space, MLX evaluates batched neighboring-cell distance filters, and
-the backend emits compact pairs for the existing MLX pair force path. A
+large-system route uses `mlx_cell_pairs`. The historical implementation used
+CPU-side periodic bins and candidate arrays; the current Metal route uses a
+fine device-resident grid and an AABB-pruned canonical half-stencil, then emits
+and compacts candidates on Metal for the existing MLX pair force path. A
 92,001-atom GPCRmd 729 short-range proof run under
 `/tmp/mlx-atomistic-gpcrmd-729-mlx-cell-pairs` selected
 `nonbonded_runtime.backend=mlx_cell_pairs` with no fallback. It tested
@@ -64,22 +65,31 @@ the backend emits compact pairs for the existing MLX pair force path. A
 and recorded `elapsed_wall_seconds=23.05953904206399`,
 `neighbor_rebuild_wall_seconds=1.3890800829976797`,
 `force_evaluation_wall_seconds=11.277963876025751`, `skin=2.5`, and one
-rebuild. Direct rebuild microbenchmarks on 512-8192 particle FCC systems showed
-the batched `mlx_cell_pairs` builder matching `periodic_cell_list` pairs and
-running about 2.5-3x faster than the CPU builder. The under-5-second GPCRmd
-stretch target remains blocked by force-evaluation cost, import/orchestration
-overhead, and remaining CPU dynamic compaction.
+rebuild. Those figures describe the historical hybrid implementation. The
+under-5-second GPCRmd stretch target remains blocked by force evaluation,
+per-step synchronization, and the cost of rebuilding and consuming a global
+explicit pair array. Dynamic compaction is no longer a CPU bottleneck on Metal.
 
-A native pair emitter would benefit more than the GPCRmd notebook. It would
-accelerate any cutoff-based periodic run that currently pays CPU-side cost for
-compact neighbor-pair construction, including solvated proteins,
-protein-ligand systems, water boxes, membranes, coarse-grained systems, and
-benchmarks that use explicit pair lists. The difficult part is dynamic pair-list
-emission: MLX can evaluate dense distance masks and pair math well, but the
-runtime does not currently expose a NumPy-style one-argument `where(mask)` or
-`nonzero(mask)` compaction API for emitting variable-length `(i, j)` pairs.
-`mlx_cell_pairs` is the current pragmatic hybrid: bounded cell candidates and
-MLX distance filtering, with dynamic compaction still CPU-side.
+### Spatial Metal neighbor result
+
+The retained 2026-07-31 JAC fixed-cell PME ladder used the same 9 A cutoff,
+5.5 A skin, ten warmup steps, and 750 measured steps as its immediate control.
+These are one-time engineering measurements on an M5 Max, not a CI gate.
+
+| Atoms | Prior MLX | Spatial MLX | Time reduction | OpenMM | OpenMM / MLX | Peak process memory |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 23,558 | 12.6688 s | 8.7643 s | 30.8% | 0.6810 s | 12.9x | 1.76 GB |
+| 47,116 | 20.5108 s | 13.9166 s | 32.1% | 1.0945 s | 12.7x | 2.76 GB |
+| 94,232 | 40.4986 s | 24.3424 s | 39.9% | 1.6861 s | 14.4x | 4.80 GB |
+
+At 94,232 atoms the current 25x25x12 grid emits 184.1 million candidates,
+down 60.7% from 468.3 million, and retains about 60.5 million exact pairs. All
+three runs were finite, passed the existing constraint behavior, stayed below
+40 GB, and had passing late-memory plateaus. The result is a substantial
+retained gain but does not meet the one-order-of-magnitude OpenMM stretch
+target. The next large-system lever is spatial tiles or cell-pair tasks that
+feed the direct-space force kernel without materializing and repeatedly
+scanning the full explicit pair array.
 
 A fresh synthetic orthorhombic parity ladder now validates this route at
 1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001
