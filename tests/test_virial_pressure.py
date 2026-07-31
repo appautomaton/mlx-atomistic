@@ -521,6 +521,9 @@ def test_selected_intramolecular_terms_have_zero_analytic_cell_virial(
         pairs=None,
         masses=masses,
         molecule_ids=molecule_ids,
+        # These terms are exactly cell-invariant; use a larger step to keep
+        # float32 cancellation noise below the oracle tolerance.
+        strain_epsilon=1.0e-2,
     )
 
     np.testing.assert_allclose(np.asarray(analytic), 0.0, atol=2.0e-6)
