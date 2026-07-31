@@ -75,7 +75,10 @@ TRAJECTORY_NAME = "trajectory.npz"
 STEERED_TRAJECTORY_NAME = "steered_trajectory.npz"
 GPCRMD_RUN_REPORT_NAME = "gpcrmd_mlx_run_report.json"
 PRESSURE_DIAGNOSTIC_ATOM_LIMIT = 50_000
-GPCRMD_NEIGHBOR_SKIN = 2.5
+# Full 750-step JAC PME scaling on M5 Max (2026-07-31): 5.5 A reduced
+# 23k/47k/94k runtime by 18.6-27.0% over 2.5 A after Metal prefix compaction.
+# The 94k process tree peaked at 10.26 GB with a stable memory plateau.
+GPCRMD_NEIGHBOR_SKIN = 5.5
 GPCRMD_NEIGHBOR_WORKERS = max(1, min(8, os.cpu_count() or 1))
 
 
