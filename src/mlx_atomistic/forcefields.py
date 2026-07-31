@@ -26,6 +26,7 @@ from mlx_atomistic.custom_force import (
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
+    _prepared_parameterized_pme_direct_force_only,
     aligned_topology_lj_scales,
     fused_parameterized_lj_forces,
     fused_parameterized_pme_direct_components,
@@ -116,6 +117,9 @@ class _NonbondedForceBinding:
     pairs: mx.array
     pme_plan: PMEExecutionPlan
     aligned_lj_scales: mx.array
+    box_lengths_and_inverses: mx.array
+    half_sigma: mx.array
+    sqrt_epsilon: mx.array
 
 
 def _topology_pair_scales(
@@ -1507,6 +1511,8 @@ class NonbondedPotential:
         object.__setattr__(self, "_aligned_lj_scale_cache", None)
         object.__setattr__(self, "_pme_direct_space_cache", None)
         object.__setattr__(self, "_force_binding_cache", None)
+        object.__setattr__(self, "_prepared_lj_invariants_cache", None)
+        object.__setattr__(self, "_prepared_box_cache", None)
 
     def _openmm_dispersion_coefficient(self) -> float:
         """Return OpenMM's unswitched long-range LJ correction coefficient."""
@@ -3327,6 +3333,26 @@ class NonbondedPotential:
         direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
         if not self._supports_fused_pme_direct(cell, direct_space_pairs):
             return NotImplemented
+        lj_invariants = self._prepared_lj_invariants_cache
+        if lj_invariants is None:
+            half_sigma = 0.5 * self.sigma
+            sqrt_epsilon = mx.sqrt(self.epsilon)
+            mx.eval(half_sigma, sqrt_epsilon)
+            lj_invariants = (half_sigma, sqrt_epsilon)
+            object.__setattr__(
+                self,
+                "_prepared_lj_invariants_cache",
+                lj_invariants,
+            )
+        box_cache = self._prepared_box_cache
+        if box_cache is None or box_cache[0] is not cell:
+            box_lengths = mx.diag(cell.matrix)
+            box_lengths_and_inverses = mx.concatenate(
+                (box_lengths, 1.0 / box_lengths),
+            )
+            mx.eval(box_lengths_and_inverses)
+            box_cache = (cell, box_lengths_and_inverses)
+            object.__setattr__(self, "_prepared_box_cache", box_cache)
         binding = _NonbondedForceBinding(
             cell=cell,
             pairs=direct_space_pairs,
@@ -3334,6 +3360,9 @@ class NonbondedPotential:
             aligned_lj_scales=self._compact_aligned_lj_scales(
                 direct_space_pairs,
             ),
+            box_lengths_and_inverses=box_cache[1],
+            half_sigma=lj_invariants[0],
+            sqrt_epsilon=lj_invariants[1],
         )
         object.__setattr__(self, "_force_binding_cache", binding)
         return binding
@@ -3353,12 +3382,12 @@ class NonbondedPotential:
             msg = "positions must have shape (n_atoms, 3)"
             raise ValueError(msg)
 
-        direct_forces = fused_parameterized_pme_direct_force_only(
+        direct_forces = _prepared_parameterized_pme_direct_force_only(
             positions,
             binding.pairs,
-            mx.diag(binding.cell.matrix),
-            self.sigma,
-            self.epsilon,
+            binding.box_lengths_and_inverses,
+            binding.half_sigma,
+            binding.sqrt_epsilon,
             self.charges,
             binding.aligned_lj_scales,
             cutoff=self.cutoff,

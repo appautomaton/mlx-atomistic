@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from itertools import product
 from time import perf_counter
 from typing import Literal
@@ -1317,7 +1318,9 @@ def _build_mlx_spatial_cell_pair_list(
     """Build compact pairs from a device-resident, spatially pruned cell grid."""
 
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_pairs")
-    lengths = np.asarray(cell.lengths, dtype=np.float32)
+    lengths_mx = as_mx_array(cell.lengths, dtype=mx.float32)
+    mx.eval(lengths_mx)
+    lengths = np.asarray(lengths_mx, dtype=np.float32)
     if lengths.shape != (3,) or np.any(~np.isfinite(lengths)) or np.any(lengths <= 0.0):
         msg = "cell lengths must be finite and positive"
         raise ValueError(msg)
@@ -1346,7 +1349,6 @@ def _build_mlx_spatial_cell_pair_list(
     cell_count = int(np.prod(n_cells_array.astype(np.int64)))
     cell_widths = lengths64 / n_cells_array.astype(np.float64)
 
-    lengths_mx = mx.array(lengths, dtype=mx.float32)
     n_cells_mx = mx.array(n_cells_array, dtype=mx.int32)
     wrapped = positions_mx - mx.floor(positions_mx / lengths_mx) * lengths_mx
     cell_indices = mx.floor(wrapped / lengths_mx * n_cells_mx).astype(mx.int32)
@@ -1416,7 +1418,7 @@ def _build_mlx_spatial_cell_pair_list(
             positions_mx,
             candidates_i,
             candidates_j,
-            cell.lengths,
+            lengths_mx,
             search_radius=search_radius,
         )
         prefix = mx.cumsum(close.astype(mx.int32))
@@ -1436,7 +1438,9 @@ def _build_mlx_spatial_cell_pair_list(
         compact_chunks.append(compact)
         compact_pair_count += accepted_count
 
-    if compact_chunks:
+    if len(compact_chunks) == 1:
+        pairs = compact_chunks[0]
+    elif compact_chunks:
         pairs = mx.concatenate(compact_chunks, axis=0)
     else:
         pairs = mx.zeros((0, 2), dtype=mx.int32)
@@ -1445,7 +1449,8 @@ def _build_mlx_spatial_cell_pair_list(
         pairs = pairs[right_order]
         left_order = mx.argsort(pairs[:, 0])
         pairs = pairs[left_order]
-    mx.eval(pairs)
+    if len(compact_chunks) > 1 or sort_pairs:
+        mx.eval(pairs)
 
     occupied_cell_count = int(np.count_nonzero(cell_counts))
     estimated_cell_list_bytes = (
@@ -1490,11 +1495,44 @@ def _spatial_cell_pair_tasks(
     if cell_count == 0:
         empty = np.empty((0,), dtype=np.int32)
         return empty, empty, empty.astype(np.int64)
+    left, right, same = _spatial_cell_pair_template(
+        n_cells,
+        tuple(float(value) for value in cell_widths),
+        float(search_radius),
+    )
+    left_counts = cell_counts[left].astype(np.int64)
+    right_counts = cell_counts[right].astype(np.int64)
+    candidate_counts = left_counts * right_counts
+    same_counts = left_counts[same]
+    candidate_counts[same] = same_counts * np.maximum(same_counts - 1, 0) // 2
+    occupied = candidate_counts > 0
+    return (
+        left[occupied],
+        right[occupied],
+        candidate_counts[occupied],
+    )
+
+
+@lru_cache(maxsize=8)
+def _spatial_cell_pair_template(
+    n_cells: tuple[int, int, int],
+    cell_widths: tuple[float, float, float],
+    search_radius: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return immutable canonical cell-pair indices for fixed geometry."""
+
+    cell_count = int(np.prod(np.asarray(n_cells, dtype=np.int64)))
+    if cell_count == 0:
+        empty = np.empty((0,), dtype=np.int32)
+        empty.flags.writeable = False
+        same = np.empty((0,), dtype=np.bool_)
+        same.flags.writeable = False
+        return empty, empty, same
     cell_ids = np.arange(cell_count, dtype=np.int64)
     cell_x, cell_y, cell_z = np.unravel_index(cell_ids, n_cells)
     encoded_chunks: list[np.ndarray] = []
     for offset_x, offset_y, offset_z in _aabb_pruned_half_stencil(
-        cell_widths,
+        np.asarray(cell_widths, dtype=np.float64),
         search_radius=search_radius,
     ):
         neighbor_x = (cell_x + offset_x) % n_cells[0]
@@ -1505,22 +1543,13 @@ def _spatial_cell_pair_tasks(
         upper = np.maximum(cell_ids, neighbor_ids)
         encoded_chunks.append(lower * cell_count + upper)
     encoded = np.unique(np.concatenate(encoded_chunks))
-    left = encoded // cell_count
-    right = encoded % cell_count
-    left_counts = cell_counts[left]
-    right_counts = cell_counts[right]
+    left = (encoded // cell_count).astype(np.int32, copy=False)
+    right = (encoded % cell_count).astype(np.int32, copy=False)
     same = left == right
-    candidate_counts = np.where(
-        same,
-        left_counts.astype(np.int64) * np.maximum(left_counts.astype(np.int64) - 1, 0) // 2,
-        left_counts.astype(np.int64) * right_counts.astype(np.int64),
-    )
-    occupied = candidate_counts > 0
-    return (
-        left[occupied].astype(np.int32, copy=False),
-        right[occupied].astype(np.int32, copy=False),
-        candidate_counts[occupied],
-    )
+    left.flags.writeable = False
+    right.flags.writeable = False
+    same.flags.writeable = False
+    return left, right, same
 
 
 def _bounded_spatial_grid(

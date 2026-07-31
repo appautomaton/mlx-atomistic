@@ -75,9 +75,9 @@ TRAJECTORY_NAME = "trajectory.npz"
 STEERED_TRAJECTORY_NAME = "steered_trajectory.npz"
 GPCRMD_RUN_REPORT_NAME = "gpcrmd_mlx_run_report.json"
 PRESSURE_DIAGNOSTIC_ATOM_LIMIT = 50_000
-# Full 750-step JAC PME scaling on M5 Max (2026-07-31): 5.5 A reduced
-# 23k/47k/94k runtime by 18.6-27.0% over 2.5 A after Metal prefix compaction.
-# The 94k process tree peaked at 10.26 GB with a stable memory plateau.
+# The fixed-cell task cache changed the short-run optimum, but the decisive
+# matched 750-step JAC run remained faster at 5.5 A (18.036 versus 18.472 s at
+# 4.0 A) because it rebuilt 15 fewer times. Both runs preserved cutoff physics.
 GPCRMD_NEIGHBOR_SKIN = 5.5
 GPCRMD_NEIGHBOR_WORKERS = max(1, min(8, os.cpu_count() or 1))
 

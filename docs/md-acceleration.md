@@ -1,9 +1,9 @@
 # MLX-First MD Acceleration
 
 This milestone keeps Python as the user-facing API but moves the MD nonbonded
-hot path toward MLX array execution. The current priority is to measure how far
-dense and tiled MLX pair evaluation can go on Apple Silicon before introducing
-custom Metal kernels.
+hot path into MLX arrays and focused custom Metal kernels. The current priority
+is recurring fixed-cell PME throughput on Apple Silicon while preserving the
+existing force, constraint, and restart validation gates.
 
 ## Backends
 
@@ -38,17 +38,19 @@ custom Metal kernels.
 ## Current Hot-Path Recommendation
 
 Measure with `python -m mlx_atomistic.benchmarks.md_acceleration --json` before
-changing a force path. The large-system neighbor emitter is now Metal-native,
-so the next scaling decision is whether to replace the explicit global pair
-array with a spatial tile representation consumed directly by the force
-kernel.
+changing a force path. The large-system neighbor emitter and recurring direct
+force path are now Metal-native. The next structural decision is whether to
+replace the explicit global pair array with a spatial tile representation that
+can reduce force contributions locally before reaching global memory.
 
-The likely candidates are:
+The remaining candidates, in priority order, are:
 
-- dense/tiled pair evaluation, if MLX force accumulation dominates runtime;
-- neighbor-list construction, if `python_neighbor` is much slower than
-  `mlx_pairs`;
-- DFT projector or solver work, if MD dense/tiled already scales well enough.
+- a proper atom-tile direct-force kernel, because global float atomics still
+  dominate the large explicit-pair route;
+- fused rigid-water position and velocity projection, after an independent
+  parity gate for the full SETTLE update;
+- further neighbor rebuild work only when a matched trajectory shows it beats
+  the retained fixed-cell topology cache.
 
 For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
 large-system route uses `mlx_cell_pairs`. The historical implementation used
@@ -87,6 +89,39 @@ retained gain but does not meet the one-order-of-magnitude OpenMM stretch
 target. The next large-system lever is spatial tiles or cell-pair tasks that
 feed the direct-space force kernel without materializing and repeatedly
 scanning the full explicit pair array.
+
+### Prepared recurring-force result
+
+A later fixed-cell pass retained four additional changes without changing the
+cutoff, PME mesh, timestep, thermostat, or constraint tolerances:
+
+1. Fixed cell-pair topology is cached while dynamic occupancies and exact pair
+   membership are recomputed at every rebuild.
+2. Box reciprocals and Lorentz-Berthelot particle invariants are prepared once
+   for the recurring direct-space kernel.
+3. The first of two mathematically redundant SETTLE velocity projections is
+   skipped only for disjoint rigid-water groups; mixed or overlapping
+   constraints retain the full projection.
+4. Each prepared Metal worker processes eight adjacent compact pairs and
+   accumulates repeated left-atom forces in registers before global atomics.
+
+The fixed-topology cache first reduced the complete 94,232-atom, 750-step run
+from 24.3424 to 19.1477 seconds. The retained prepared-force and constraint
+changes then produced a complete 18.0356-second run: 25.9% below the original
+spatial result, 10.70 times the matched 1.6861-second OpenMM/OpenCL result, with
+a 3.43 GB peak. This is the latest stable complete number for the retained
+stack before the eight-pair worker change.
+
+Because later complete samples were thermally throttled, the eight-pair worker
+was admitted with position-balanced A/B evidence instead of an unmatched full
+run. On the 60.5-million-pair 94,232-atom list it reduced the isolated direct
+kernel by about 25%. Alternating 75-step trajectories reduced median measured
+time from 5.1243 to 4.8785 seconds (4.8%) while keeping constraint residuals
+near 1.5e-5 A. A bounded 92,001-atom GPCRmd 729 run also passed all finite-state,
+constraint, HMR, PME-plan reuse, trajectory, and checkpoint checks with a
+5.60 GB process peak. The strict one-order-of-magnitude OpenMM target requires
+a stable complete time at or below 16.8615 seconds and has not yet been
+demonstrated.
 
 A fresh synthetic orthorhombic parity ladder now validates this route at
 1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001

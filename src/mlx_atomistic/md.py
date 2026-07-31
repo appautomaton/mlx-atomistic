@@ -3559,6 +3559,7 @@ def _simulate_nvt(
     key = None
     velocity_decay = None
     noise_scale = None
+    thermal_scale = None
     nh_chain_position = None
     nh_chain_velocity = None
     nh_thermal_mass = None
@@ -3578,6 +3579,7 @@ def _simulate_nvt(
             * config.boltzmann_constant
             / config.kinetic_energy_scale
         )
+        thermal_scale = noise_scale / mx.sqrt(masses)[:, None]
         thermostat_metadata = _thermostat_metadata(
             thermostat,
             dof=temperature_dof,
@@ -4085,6 +4087,15 @@ def _simulate_nvt(
         )
 
     step_range = range(0) if _batched else range(1, config.steps + 1)
+    pre_force_velocity_projector = (
+        None
+        if constraints is None
+        else getattr(
+            constraints,
+            "_apply_pre_force_velocities",
+            constraints.apply_velocities,
+        )
+    )
     for local_step in step_range:
         current_step = config.initial_step + local_step
         current_time = config.initial_time + local_step * config.dt
@@ -4092,13 +4103,10 @@ def _simulate_nvt(
         if isinstance(thermostat, LangevinThermostat):
             velocities_half = state.velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + 0.5 * config.dt * velocities_half
-            if cell is not None and config.wrap_positions:
-                next_positions = cell.wrap(next_positions)
 
             keys = mx.random.split(key, 2)
             key = keys[0]
             noise = mx.random.normal(state.velocities.shape, key=keys[1])
-            thermal_scale = noise_scale / mx.sqrt(masses)[:, None]
             middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
 
             next_positions = next_positions + 0.5 * config.dt * middle_velocities
@@ -4145,7 +4153,7 @@ def _simulate_nvt(
             velocity_before_final_kick = (
                 velocity_before_final_kick + position_correction / config.dt
             )
-            velocity_before_final_kick = constraints.apply_velocities(
+            velocity_before_final_kick = pre_force_velocity_projector(
                 next_positions,
                 velocity_before_final_kick,
                 masses,

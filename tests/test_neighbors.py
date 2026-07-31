@@ -5,7 +5,13 @@ import pytest
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import LennardJonesPotential, simulate
-from mlx_atomistic.neighbors import NeighborListManager, NeighborTiles, build_neighbor_list
+from mlx_atomistic.neighbors import (
+    NeighborListManager,
+    NeighborTiles,
+    _spatial_cell_pair_tasks,
+    _spatial_cell_pair_template,
+    build_neighbor_list,
+)
 from mlx_atomistic.nonbonded import estimate_dense_nonbonded_bytes
 
 
@@ -27,6 +33,46 @@ def _neighbor_pair_set(neighbors):
     if neighbors.blocks is not None:
         return _block_pair_set(neighbors)
     return {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()}
+
+
+def test_spatial_cell_pair_template_reuses_fixed_geometry_without_stale_counts():
+    _spatial_cell_pair_template.cache_clear()
+    n_cells = (3, 2, 2)
+    widths = np.asarray([1.0, 1.5, 2.0], dtype=np.float64)
+    first_counts = np.ones((12,), dtype=np.int32)
+    first_left, first_right, first_candidates = _spatial_cell_pair_tasks(
+        first_counts,
+        n_cells,
+        widths,
+        search_radius=1.2,
+    )
+    second_counts = first_counts.copy()
+    second_counts[0] = 3
+    second_left, second_right, second_candidates = _spatial_cell_pair_tasks(
+        second_counts,
+        n_cells,
+        widths,
+        search_radius=1.2,
+    )
+
+    cached_left, cached_right, cached_same = _spatial_cell_pair_template(
+        n_cells,
+        tuple(float(value) for value in widths),
+        1.2,
+    )
+    cache = _spatial_cell_pair_template.cache_info()
+    assert cache.misses == 1
+    assert cache.hits == 2
+    assert not cached_left.flags.writeable
+    assert not cached_right.flags.writeable
+    assert not cached_same.flags.writeable
+    np.testing.assert_array_equal(cached_same, cached_left == cached_right)
+    first_pairs = set(zip(first_left.tolist(), first_right.tolist(), strict=True))
+    second_pairs = set(zip(second_left.tolist(), second_right.tolist(), strict=True))
+    assert first_pairs < second_pairs
+    assert (0, 0) not in first_pairs
+    assert (0, 0) in second_pairs
+    assert int(np.sum(first_candidates)) != int(np.sum(second_candidates))
 
 
 def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():

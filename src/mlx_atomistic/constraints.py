@@ -645,6 +645,18 @@ class SettleWaterConstraints:
             .add(hydrogen_b_correction)
         )
 
+    def _apply_pre_force_velocities(
+        self,
+        positions,
+        velocities,
+        masses,
+        cell: Cell | None = None,
+    ) -> mx.array:
+        """Skip the redundant first of two SETTLE velocity projections."""
+
+        del positions, masses, cell
+        return as_mx_array(velocities)
+
 
 @dataclass(frozen=True)
 class CompositeConstraints:
@@ -757,6 +769,29 @@ class CompositeConstraints:
                     masses,
                     cell,
                 )
+        return constrained
+
+    def _apply_pre_force_velocities(
+        self,
+        positions,
+        velocities,
+        masses,
+        cell: Cell | None = None,
+    ) -> mx.array:
+        """Project non-SETTLE children before the final constrained kick."""
+
+        if self._requires_iteration:
+            return self.apply_velocities(positions, velocities, masses, cell)
+        constrained = as_mx_array(velocities)
+        for constraint in self.constraints:
+            if isinstance(constraint, SettleWaterConstraints):
+                continue
+            constrained = constraint.apply_velocities(
+                positions,
+                constrained,
+                masses,
+                cell,
+            )
         return constrained
 
 

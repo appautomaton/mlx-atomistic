@@ -78,6 +78,7 @@ _parameterized_kernel_singleton = None
 _pme_direct_kernel_singleton = None
 _pme_direct_virial_kernel_singleton = None
 _pme_direct_force_only_kernel_singleton = None
+_prepared_pme_direct_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
@@ -85,6 +86,10 @@ _aligned_topology_lj_scales_kernel_singleton = None
 _neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
+
+# Neighbor compaction preserves short runs of a common left atom, so one worker
+# can sum those contributions locally before issuing global atomics.
+_PREPARED_PME_PAIRS_PER_WORKER = 8
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -304,10 +309,34 @@ _PARAMETERIZED_LJ_FORCE_SOURCE = r"""
 """
 
 _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
+#ifdef MLX_ATOMISTIC_PAIRS_PER_WORKER
+    // Compact neighbor pairs retain cell-task order. Processing a short run
+    // per worker reduces dispatch width and lets repeated left-atom forces
+    // accumulate in registers before reaching the global atomic buffer.
+    uint worker = thread_position_in_grid.x;
+    uint first_pair = worker * MLX_ATOMISTIC_PAIRS_PER_WORKER;
+    if (first_pair >= (uint)npair[0]) {
+        return;
+    }
+    int accumulated_i = -1;
+    float accumulated_fx = 0.0f;
+    float accumulated_fy = 0.0f;
+    float accumulated_fz = 0.0f;
+    for (
+        uint local_pair = 0;
+        local_pair < MLX_ATOMISTIC_PAIRS_PER_WORKER;
+        local_pair++
+    ) {
+        uint t = first_pair + local_pair;
+        if (t >= (uint)npair[0]) {
+            break;
+        }
+#else
     uint t = thread_position_in_grid.x;
     if (t >= (uint)npair[0]) {
         return;
     }
+#endif
     int i = pairs_i[t];
     int j = pairs_j[t];
 
@@ -317,9 +346,15 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
     float lx = box[0];
     float ly = box[1];
     float lz = box[2];
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+    dx -= lx * floor(dx * box[3] + 0.5f);
+    dy -= ly * floor(dy * box[4] + 0.5f);
+    dz -= lz * floor(dz * box[5] + 0.5f);
+#else
     dx -= lx * floor(dx / lx + 0.5f);
     dy -= ly * floor(dy / ly + 0.5f);
     dz -= lz * floor(dz / lz + 0.5f);
+#endif
 
     float r2 = dx * dx + dy * dy + dz * dz;
 #ifndef MLX_ATOMISTIC_FORCE_ONLY
@@ -332,13 +367,25 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
     float virial_z = 0.0f;
 #endif
     if (r2 > 0.0f && r2 < params[0]) {
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+        float inv_distance = rsqrt(r2);
+        float inv_r2 = inv_distance * inv_distance;
+        float distance = r2 * inv_distance;
+#else
         float distance = sqrt(r2);
+#endif
         float scalar = 0.0f;
         float lj_scale = lj_scales[t];
         if (lj_scale != 0.0f) {
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+            float sigma_ij = sigma[i] + sigma[j];
+            float epsilon_ij = epsilon[i] * epsilon[j];
+            float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+#else
             float sigma_ij = 0.5f * (sigma[i] + sigma[j]);
             float epsilon_ij = sqrt(epsilon[i] * epsilon[j]);
             float sigma2_over_r2 = sigma_ij * sigma_ij / r2;
+#endif
             float inv_r6 =
                 sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
             float inv_r12 = inv_r6 * inv_r6;
@@ -359,7 +406,11 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
             float switch_derivative = 0.0f;
             if (params[2] > 0.5f) {
                 float x = clamp(
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+                    (distance - params[3]) * params[9],
+#else
                     (distance - params[3]) / params[4],
+#endif
                     0.0f,
                     1.0f
                 );
@@ -373,7 +424,11 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
                 if (distance > params[3] && distance < params[5]) {
                     switch_derivative = -(
                         30.0f * x2 - 60.0f * x3 + 30.0f * x4
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+                    ) * params[9];
+#else
                     ) / params[4];
+#endif
                 }
             }
 #ifndef MLX_ATOMISTIC_FORCE_ONLY
@@ -384,9 +439,17 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
                 24.0f
                 * epsilon_ij
                 * (2.0f * inv_r12 - inv_r6)
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+                * inv_r2
+#else
                 / r2
+#endif
                 * switch_value
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+                - unswitched_energy * switch_derivative * inv_distance
+#else
                 - unswitched_energy * switch_derivative / distance
+#endif
             ) * lj_scale;
         }
 
@@ -398,8 +461,13 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
             params[6] * qij * erfc_term / distance;
 #endif
         scalar += params[6] * qij * (
+#ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
+            erfc_term * inv_r2 * inv_distance
+            + params[8] * exp(-params[7] * params[7] * r2) * inv_r2
+#else
             erfc_term / (r2 * distance)
             + params[8] * exp(-params[7] * params[7] * r2) / r2
+#endif
         );
 
         float fx = scalar * dx;
@@ -410,6 +478,34 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         virial_y = dy * fy;
         virial_z = dz * fz;
 #endif
+#ifdef MLX_ATOMISTIC_PAIRS_PER_WORKER
+        if (accumulated_i != i) {
+            if (accumulated_i >= 0) {
+                atomic_fetch_add_explicit(
+                    &forces[3 * accumulated_i + 0],
+                    accumulated_fx,
+                    memory_order_relaxed
+                );
+                atomic_fetch_add_explicit(
+                    &forces[3 * accumulated_i + 1],
+                    accumulated_fy,
+                    memory_order_relaxed
+                );
+                atomic_fetch_add_explicit(
+                    &forces[3 * accumulated_i + 2],
+                    accumulated_fz,
+                    memory_order_relaxed
+                );
+            }
+            accumulated_i = i;
+            accumulated_fx = 0.0f;
+            accumulated_fy = 0.0f;
+            accumulated_fz = 0.0f;
+        }
+        accumulated_fx += fx;
+        accumulated_fy += fy;
+        accumulated_fz += fz;
+#else
         atomic_fetch_add_explicit(
             &forces[3 * i + 0], fx, memory_order_relaxed
         );
@@ -419,6 +515,7 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         atomic_fetch_add_explicit(
             &forces[3 * i + 2], fz, memory_order_relaxed
         );
+#endif
         atomic_fetch_add_explicit(
             &forces[3 * j + 0], -fx, memory_order_relaxed
         );
@@ -450,6 +547,26 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
         &pair_virial[3 * t + 2], virial_z, memory_order_relaxed
     );
 #endif
+#ifdef MLX_ATOMISTIC_PAIRS_PER_WORKER
+    }
+    if (accumulated_i >= 0) {
+        atomic_fetch_add_explicit(
+            &forces[3 * accumulated_i + 0],
+            accumulated_fx,
+            memory_order_relaxed
+        );
+        atomic_fetch_add_explicit(
+            &forces[3 * accumulated_i + 1],
+            accumulated_fy,
+            memory_order_relaxed
+        );
+        atomic_fetch_add_explicit(
+            &forces[3 * accumulated_i + 2],
+            accumulated_fz,
+            memory_order_relaxed
+        );
+    }
+#endif
 """
 
 _PARAMETERIZED_PME_DIRECT_VIRIAL_SOURCE = (
@@ -457,6 +574,12 @@ _PARAMETERIZED_PME_DIRECT_VIRIAL_SOURCE = (
 )
 _PARAMETERIZED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     "#define MLX_ATOMISTIC_FORCE_ONLY 1\n" + _PARAMETERIZED_PME_DIRECT_SOURCE
+)
+_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
+    "#define MLX_ATOMISTIC_FORCE_ONLY 1\n"
+    "#define MLX_ATOMISTIC_PREPARED_INVARIANTS 1\n"
+    f"#define MLX_ATOMISTIC_PAIRS_PER_WORKER {_PREPARED_PME_PAIRS_PER_WORKER}u\n"
+    + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
 
 _PME_CUTOFF_CORRECTION_VIRIAL_SOURCE = r"""
@@ -989,6 +1112,33 @@ def _parameterized_pme_direct_force_only_kernel():
             atomic_outputs=True,
         )
     return _pme_direct_force_only_kernel_singleton
+
+
+def _prepared_pme_direct_force_only_kernel():
+    """Return the cached force-only kernel for setup-precomputed invariants."""
+
+    global _prepared_pme_direct_force_only_kernel_singleton
+    if _prepared_pme_direct_force_only_kernel_singleton is None:
+        _prepared_pme_direct_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="prepared_parameterized_pme_direct_force_only",
+            input_names=[
+                "positions",
+                "pairs_i",
+                "pairs_j",
+                "box",
+                "sigma",
+                "epsilon",
+                "charges",
+                "lj_scales",
+                "params",
+                "npair",
+            ],
+            output_names=["forces"],
+            source=_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _prepared_pme_direct_force_only_kernel_singleton
 
 
 def _parameterized_pme_direct_virial_kernel():
@@ -2238,6 +2388,101 @@ def fused_parameterized_pme_direct_force_only(
         output_shapes=[(n_atoms, 3)],
         output_dtypes=[mx.float32],
         grid=(n_pairs, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces
+
+
+def _prepared_parameterized_pme_direct_force_only(
+    positions: mx.array,
+    pairs: mx.array,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    lj_scales: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    coulomb_constant: float,
+    alpha: float,
+) -> mx.array:
+    """Evaluate prepared LJ plus PME direct forces with cached invariants."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    pairs = as_mx_array(pairs, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
+    sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    lj_scales = as_mx_array(lj_scales, dtype=mx.float32)
+    n_atoms = positions.shape[0]
+    n_pairs = pairs.shape[0]
+    if n_pairs == 0:
+        return mx.zeros_like(positions)
+    if cutoff is None or cutoff <= 0.0:
+        msg = "prepared PME direct forces require a positive cutoff"
+        raise ValueError(msg)
+    if alpha <= 0.0:
+        msg = "prepared PME direct forces require positive alpha"
+        raise ValueError(msg)
+    if box.shape != (6,):
+        msg = "box_lengths_and_inverses must have shape (6,)"
+        raise ValueError(msg)
+    if half_sigma.shape != (n_atoms,) or sqrt_epsilon.shape != (n_atoms,):
+        msg = "prepared LJ parameters must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if charges.shape != (n_atoms,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if int(lj_scales.size) != n_pairs:
+        msg = "lj_scales must contain one aligned value per pair"
+        raise ValueError(msg)
+    lj_scales = mx.reshape(lj_scales, (n_pairs,))
+
+    cutoff_value = float(cutoff)
+    has_switch = switch_distance is not None
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(has_switch),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+            1.0 / switch_width,
+        ],
+        dtype=mx.float32,
+    )
+    npair = mx.array([n_pairs], dtype=mx.int32)
+    worker_count = (
+        n_pairs + _PREPARED_PME_PAIRS_PER_WORKER - 1
+    ) // _PREPARED_PME_PAIRS_PER_WORKER
+    threads = min(64, worker_count)
+    (forces,) = _prepared_pme_direct_force_only_kernel()(
+        inputs=[
+            positions,
+            pairs[:, 0],
+            pairs[:, 1],
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            lj_scales,
+            params,
+            npair,
+        ],
+        output_shapes=[(n_atoms, 3)],
+        output_dtypes=[mx.float32],
+        grid=(worker_count, 1, 1),
         threadgroup=(threads, 1, 1),
         init_value=0.0,
     )
