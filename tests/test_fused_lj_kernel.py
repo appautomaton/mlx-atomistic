@@ -487,6 +487,48 @@ def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
         atol=5e-2,
     )
 
+    translated_positions = positions + mx.array(
+        [
+            [0.0, 0.0, 0.0],
+            [8.0, 0.0, 0.0],
+            [-8.0, 8.0, 0.0],
+            [16.0, -8.0, 8.0],
+        ],
+        dtype=mx.float32,
+    )
+    translated_pairs = build_neighbor_list(
+        translated_positions,
+        cell,
+        cutoff=3.0,
+        skin=0.3,
+        backend="mlx_cell_pairs",
+    ).interactions
+    translated_reference = potential.analytic_virial_tensor(
+        translated_positions,
+        cell=cell,
+        pairs=translated_pairs,
+        masses=masses,
+        molecule_ids=None,
+    )
+    translated_fused = (
+        potential._runtime_energy_forces_with_components_virial(
+            translated_positions,
+            cell,
+            translated_pairs,
+            masses=masses,
+            molecule_ids=None,
+        )
+    )
+    assert translated_fused is not NotImplemented
+    translated_virial = translated_fused[3]
+    mx.eval(translated_reference, translated_virial)
+    np.testing.assert_allclose(
+        np.diag(np.asarray(translated_virial)),
+        np.diag(np.asarray(translated_reference)),
+        rtol=3e-3,
+        atol=5e-2,
+    )
+
 
 @pytest.mark.gpu
 @pytest.mark.slow

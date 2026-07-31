@@ -4735,13 +4735,36 @@ def _npt_production_with_final_barostat_state(
     else:
         neighbor_list = None
     pairs = None if neighbor_list is None else neighbor_list.interactions
-    potential_energy, _, energy_by_term = _energy_forces_by_term(
-        final_state.positions,
-        named_terms,
-        cell=final_cell,
-        pairs=pairs,
-        virtual_sites=virtual_sites,
-    )
+    if config.pressure_diagnostics:
+        cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
+            neighbor_manager,
+            neighbor_list,
+            final_cell,
+        )
+        (
+            potential_energy,
+            _,
+            energy_by_term,
+            diagnostic_virial,
+        ) = _diagnostic_from_terms(
+            final_state.positions,
+            named_terms,
+            cell=final_cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+            virial_mode=config.pressure_virial_mode,
+            masses=final_state.masses,
+            cutoff_strain_pairs=cutoff_strain_pairs,
+        )
+    else:
+        potential_energy, _, energy_by_term = _energy_forces_by_term(
+            final_state.positions,
+            named_terms,
+            cell=final_cell,
+            pairs=pairs,
+            virtual_sites=virtual_sites,
+        )
+        diagnostic_virial = None
     kinetic_energy_value = kinetic_energy(
         final_state.velocities,
         final_state.masses,
@@ -4755,18 +4778,14 @@ def _npt_production_with_final_barostat_state(
         kinetic_energy_scale=config.kinetic_energy_scale,
         boltzmann_constant=config.boltzmann_constant,
     )
-    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics(
+    virial, pressure_tensor_value, pressure_value = _pressure_diagnostics_from_virial(
+        diagnostic_virial,
         final_state.positions,
         final_state.velocities,
         final_state.masses,
-        final_state.forces,
-        tuple(term for _, term in named_terms),
         cell=final_cell,
-        pairs=pairs,
         kinetic_energy_scale=config.kinetic_energy_scale,
         enabled=config.pressure_diagnostics,
-        virtual_sites=virtual_sites,
-        virial_mode=config.pressure_virial_mode,
     )
     constraint_error = (
         _zero_constraint_error(final_state.positions)

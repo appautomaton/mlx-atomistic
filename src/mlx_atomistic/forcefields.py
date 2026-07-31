@@ -3037,10 +3037,7 @@ class NonbondedPotential:
             ids,
             np.arange(particle_count, dtype=np.int32),
         ):
-            strain_centers = cell.cartesian_coordinates(
-                cell.fractional_coordinates(positions)
-                - mx.floor(cell.fractional_coordinates(positions))
-            )
+            strain_centers = positions
             molecular_correction = mx.zeros((3,), dtype=positions.dtype)
         else:
             molecule_count = int(np.max(ids)) + 1

@@ -1158,18 +1158,19 @@ def test_rejected_move_computes_the_committed_diagnostic_once(monkeypatch):
 
 
 def test_npt_computes_one_pressure_frame_per_committed_boundary(monkeypatch):
-    pressure_call_count = 0
+    legacy_pressure_call_count = 0
+    pressure_from_virial_call_count = 0
     pressure_diagnostics = md_module._pressure_diagnostics
     pressure_from_virial = md_module._pressure_diagnostics_from_virial
 
     def recording_pressure(*args, **kwargs):
-        nonlocal pressure_call_count
-        pressure_call_count += 1
+        nonlocal legacy_pressure_call_count
+        legacy_pressure_call_count += 1
         return pressure_diagnostics(*args, **kwargs)
 
     def recording_pressure_from_virial(*args, **kwargs):
-        nonlocal pressure_call_count
-        pressure_call_count += 1
+        nonlocal pressure_from_virial_call_count
+        pressure_from_virial_call_count += 1
         return pressure_from_virial(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -1207,7 +1208,8 @@ def test_npt_computes_one_pressure_frame_per_committed_boundary(monkeypatch):
         ),
     )
 
-    assert pressure_call_count == 3
+    assert legacy_pressure_call_count == 0
+    assert pressure_from_virial_call_count == 3
     assert np.asarray(result.pressure).shape == (3,)
 
 
