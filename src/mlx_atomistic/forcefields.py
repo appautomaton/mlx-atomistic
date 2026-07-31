@@ -1303,6 +1303,33 @@ class NonbondedPotential:
         exception_pair_set = {
             (min(int(i), int(j)), max(int(i), int(j))) for i, j in exception_pairs.tolist()
         }
+        correction_pair_set = set(exception_pair_set)
+        if self.topology is not None:
+            correction_pair_set.update(self.topology.exclusion_set)
+        correction_pairs = np.asarray(
+            sorted(correction_pair_set),
+            dtype=np.int32,
+        ).reshape((-1, 2))
+        excluded_one_four_pairs = set(correction_pair_set)
+        one_four_pairs = np.asarray(
+            (
+                []
+                if self.topology is None or self.coulomb_one_four_scale == 1.0
+                else sorted(self.topology.one_four_set - excluded_one_four_pairs)
+            ),
+            dtype=np.int32,
+        ).reshape((-1, 2))
+        correction_pairs_mx = mx.array(correction_pairs, dtype=mx.int32)
+        one_four_pairs_mx = mx.array(one_four_pairs, dtype=mx.int32)
+        correction_charge_products = -(
+            charges[correction_pairs_mx[:, 0]]
+            * charges[correction_pairs_mx[:, 1]]
+        )
+        one_four_charge_products = (
+            (self.coulomb_one_four_scale - 1.0)
+            * charges[one_four_pairs_mx[:, 0]]
+            * charges[one_four_pairs_mx[:, 1]]
+        )
         exceptions_excluded_by_topology = self.topology is not None and exception_pair_set.issubset(
             self.topology.exclusion_set
         )
@@ -1386,6 +1413,26 @@ class NonbondedPotential:
             self,
             "_exception_pair_codes",
             _encoded_pairs(exception_pair_set, sigma.shape[0]),
+        )
+        object.__setattr__(
+            self,
+            "_ewald_correction_pairs_cache",
+            correction_pairs_mx,
+        )
+        object.__setattr__(
+            self,
+            "_ewald_correction_charge_products",
+            correction_charge_products,
+        )
+        object.__setattr__(
+            self,
+            "_ewald_one_four_pairs_cache",
+            one_four_pairs_mx,
+        )
+        object.__setattr__(
+            self,
+            "_ewald_one_four_charge_products",
+            one_four_charge_products,
         )
         object.__setattr__(
             self,
@@ -2547,22 +2594,10 @@ class NonbondedPotential:
         return mx.zeros_like(positions).at[i].add(pair_forces).at[j].add(-pair_forces)
 
     def _ewald_correction_pairs(self) -> mx.array:
-        pairs = set(self._exception_pair_set)
-        if self.topology is not None:
-            pairs.update(self.topology.exclusion_set)
-        if not pairs:
-            return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
-        return mx.array(tuple(sorted(pairs)), dtype=mx.int32)
+        return self._ewald_correction_pairs_cache
 
     def _ewald_one_four_pairs(self) -> mx.array:
-        if self.topology is None or self.coulomb_one_four_scale == 1.0:
-            return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
-        excluded = set(self.topology.exclusion_set)
-        excluded.update(self._exception_pair_set)
-        pairs = [pair for pair in self.topology.one_four_set if pair not in excluded]
-        if not pairs:
-            return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
-        return mx.array(tuple(sorted(pairs)), dtype=mx.int32)
+        return self._ewald_one_four_pairs_cache
 
     def _periodic_coulomb_corrections(
         self,
@@ -2574,14 +2609,11 @@ class NonbondedPotential:
             correction_energy = _zero_energy(positions)
             correction_forces = mx.zeros_like(positions)
         else:
-            i = correction_pairs[:, 0]
-            j = correction_pairs[:, 1]
-            original_charge_products = self.charges[i] * self.charges[j]
             correction_energy, correction_forces = self._bare_coulomb_components(
                 positions,
                 cell,
                 correction_pairs,
-                -original_charge_products,
+                self._ewald_correction_charge_products,
             )
 
         exception_coulomb, exception_coulomb_forces = self._bare_coulomb_components(
@@ -2595,16 +2627,11 @@ class NonbondedPotential:
             one_four_energy = _zero_energy(positions)
             one_four_forces = mx.zeros_like(positions)
         else:
-            i = one_four_pairs[:, 0]
-            j = one_four_pairs[:, 1]
-            one_four_charge_products = (
-                (self.coulomb_one_four_scale - 1.0) * self.charges[i] * self.charges[j]
-            )
             one_four_energy, one_four_forces = self._bare_coulomb_components(
                 positions,
                 cell,
                 one_four_pairs,
-                one_four_charge_products,
+                self._ewald_one_four_charge_products,
             )
         energy = correction_energy + exception_coulomb + one_four_energy
         forces = correction_forces + exception_coulomb_forces + one_four_forces
@@ -2624,13 +2651,11 @@ class NonbondedPotential:
         if correction_pairs.shape[0] == 0:
             correction_forces = mx.zeros_like(positions)
         else:
-            i = correction_pairs[:, 0]
-            j = correction_pairs[:, 1]
             correction_forces = self._bare_coulomb_forces(
                 positions,
                 cell,
                 correction_pairs,
-                -(self.charges[i] * self.charges[j]),
+                self._ewald_correction_charge_products,
             )
 
         exception_forces = self._bare_coulomb_forces(
@@ -2643,13 +2668,11 @@ class NonbondedPotential:
         if one_four_pairs.shape[0] == 0:
             one_four_forces = mx.zeros_like(positions)
         else:
-            i = one_four_pairs[:, 0]
-            j = one_four_pairs[:, 1]
             one_four_forces = self._bare_coulomb_forces(
                 positions,
                 cell,
                 one_four_pairs,
-                (self.coulomb_one_four_scale - 1.0) * self.charges[i] * self.charges[j],
+                self._ewald_one_four_charge_products,
             )
         return correction_forces + exception_forces + one_four_forces
 
@@ -3722,13 +3745,9 @@ class NonbondedPotential:
             self._ewald_one_four_pairs(),
         )
         correction_products = (
-            -self.charges[correction_pairs[0][:, 0]] * self.charges[correction_pairs[0][:, 1]],
+            self._ewald_correction_charge_products,
             self.exception_charge_products,
-            (
-                (self.coulomb_one_four_scale - 1.0)
-                * self.charges[correction_pairs[2][:, 0]]
-                * self.charges[correction_pairs[2][:, 1]]
-            ),
+            self._ewald_one_four_charge_products,
         )
 
         def pair_coulomb_energies(

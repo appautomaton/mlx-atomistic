@@ -576,7 +576,6 @@ def test_nonbonded_ewald_topology_exclusions_and_exceptions_are_corrections():
         exception_sigma=[0.0],
         exception_epsilon=[0.0],
     )
-
     energy, _, components = term.energy_forces_with_components(positions, cell)
     full_ewald, _, _ = ewald_reference_coulomb_energy_forces(
         positions,
@@ -1249,6 +1248,8 @@ def test_nonbonded_pme_exclusions_exceptions_and_one_four_are_corrections():
         exception_sigma=[0.0],
         exception_epsilon=[0.0],
     )
+    correction_pairs = term._ewald_correction_pairs()
+    one_four_pairs = term._ewald_one_four_pairs()
 
     energy, _, components = term.energy_forces_with_components(positions, cell)
     full_pme, _, _ = pme_coulomb_energy_forces(positions, charges, cell, config=config)
@@ -1271,6 +1272,8 @@ def test_nonbonded_pme_exclusions_exceptions_and_one_four_are_corrections():
         np.array(full_pme) - excluded_and_exception + one_four_delta,
         atol=1e-6,
     )
+    assert term._ewald_correction_pairs() is correction_pairs
+    assert term._ewald_one_four_pairs() is one_four_pairs
 
 
 def test_nonbonded_switch_force_matches_finite_difference():
