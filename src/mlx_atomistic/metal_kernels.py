@@ -82,6 +82,7 @@ _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
 _aligned_topology_lj_scales_kernel_singleton = None
+_neighbor_pair_cutoff_mask_kernel_singleton = None
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -824,6 +825,23 @@ _ALIGNED_TOPOLOGY_LJ_SCALES_SOURCE = r"""
     scales[t] = scale;
 """
 
+_NEIGHBOR_PAIR_CUTOFF_MASK_SOURCE = r"""
+    uint t = thread_position_in_grid.x;
+    if (t >= (uint)counts[0]) {
+        return;
+    }
+
+    int i = pairs_i[t];
+    int j = pairs_j[t];
+    float dx = positions[3 * i + 0] - positions[3 * j + 0];
+    float dy = positions[3 * i + 1] - positions[3 * j + 1];
+    float dz = positions[3 * i + 2] - positions[3 * j + 2];
+    dx -= box[0] * rint(dx / box[0]);
+    dy -= box[1] * rint(dy / box[1]);
+    dz -= box[2] * rint(dz / box[2]);
+    close[t] = dx * dx + dy * dy + dz * dz < params[0];
+"""
+
 
 def _lj_force_kernel():
     """Return the cached fused-LJ Metal kernel, building it on first call."""
@@ -1042,6 +1060,91 @@ def _aligned_topology_lj_scales_kernel():
             source=_ALIGNED_TOPOLOGY_LJ_SCALES_SOURCE,
         )
     return _aligned_topology_lj_scales_kernel_singleton
+
+
+def _neighbor_pair_cutoff_mask_kernel():
+    """Return the cached neighbor cutoff-mask Metal kernel."""
+
+    global _neighbor_pair_cutoff_mask_kernel_singleton
+    if _neighbor_pair_cutoff_mask_kernel_singleton is None:
+        _neighbor_pair_cutoff_mask_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_pair_cutoff_mask",
+            input_names=[
+                "positions",
+                "pairs_i",
+                "pairs_j",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["close"],
+            source=_NEIGHBOR_PAIR_CUTOFF_MASK_SOURCE,
+        )
+    return _neighbor_pair_cutoff_mask_kernel_singleton
+
+
+def neighbor_pair_cutoff_mask(
+    positions: mx.array,
+    pairs_i: mx.array,
+    pairs_j: mx.array,
+    box_lengths: mx.array,
+    *,
+    search_radius: float,
+) -> mx.array:
+    """Return the periodic cutoff mask for aligned candidate pairs on Metal.
+
+    Args:
+        positions: Atomic coordinates with shape ``(n_atoms, 3)``.
+        pairs_i: Left atom indices with shape ``(n_pairs,)``.
+        pairs_j: Right atom indices with shape ``(n_pairs,)``.
+        box_lengths: Orthorhombic cell lengths with shape ``(3,)``.
+        search_radius: Positive neighbor search radius.
+
+    Returns:
+        Boolean mask with one entry per candidate pair.
+
+    Raises:
+        ValueError: If an input shape or the search radius is invalid.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    pairs_i = as_mx_array(pairs_i, dtype=mx.int32)
+    pairs_j = as_mx_array(pairs_j, dtype=mx.int32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if pairs_i.ndim != 1 or pairs_j.shape != pairs_i.shape:
+        msg = "pairs_i and pairs_j must have matching one-dimensional shapes"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if not isfinite(float(search_radius)) or float(search_radius) <= 0.0:
+        msg = "search_radius must be finite and positive"
+        raise ValueError(msg)
+
+    pair_count = int(pairs_i.shape[0])
+    if pair_count == 0:
+        return mx.zeros((0,), dtype=mx.bool_)
+    params = mx.array([float(search_radius) ** 2], dtype=mx.float32)
+    counts = mx.array([pair_count], dtype=mx.int32)
+    threads = min(256, pair_count)
+    (close,) = _neighbor_pair_cutoff_mask_kernel()(
+        inputs=[
+            positions,
+            pairs_i,
+            pairs_j,
+            box_lengths,
+            params,
+            counts,
+        ],
+        output_shapes=[(pair_count,)],
+        output_dtypes=[mx.bool_],
+        grid=(pair_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+    )
+    return close
 
 
 def aligned_topology_lj_scales(

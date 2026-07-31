@@ -17,6 +17,7 @@ from mlx_atomistic.cell_list import (
     estimate_pair_list_bytes,
 )
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.metal_kernels import neighbor_pair_cutoff_mask
 
 NeighborBackend = Literal[
     "auto",
@@ -992,10 +993,19 @@ def _mlx_filter_index_pairs_within_radius(
 ) -> np.ndarray:
     left_mx = mx.array(left, dtype=mx.int32)
     right_mx = mx.array(right, dtype=mx.int32)
-    displacement = positions_mx[left_mx] - positions_mx[right_mx]
-    displacement = cell.minimum_image(displacement)
-    r2 = mx.sum(displacement * displacement, axis=1)
-    close = r2 < search_radius * search_radius
+    if "gpu" in str(mx.default_device()).lower():
+        close = neighbor_pair_cutoff_mask(
+            positions_mx,
+            left_mx,
+            right_mx,
+            cell.lengths,
+            search_radius=search_radius,
+        )
+    else:
+        displacement = positions_mx[left_mx] - positions_mx[right_mx]
+        displacement = cell.minimum_image(displacement)
+        r2 = mx.sum(displacement * displacement, axis=1)
+        close = r2 < search_radius * search_radius
     mx.eval(close)
     selected = np.argwhere(np.asarray(close)).reshape(-1)
     if selected.shape[0] == 0:

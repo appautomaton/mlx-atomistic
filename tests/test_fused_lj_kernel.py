@@ -26,6 +26,7 @@ from mlx_atomistic.metal_kernels import (
     fused_lj_forces,
     fused_parameterized_pme_direct_components,
     fused_parameterized_pme_direct_force_only,
+    neighbor_pair_cutoff_mask,
 )
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 from mlx_atomistic.pme import PMEConfig
@@ -85,6 +86,68 @@ def test_fused_lj_matches_op_chain():
     mx.eval(e_gate, f_gate)
     assert abs(float(e_ref) - float(e_gate)) < 1e-2
     assert float(mx.max(mx.abs(f_ref - f_gate))) < 1e-3
+
+
+@pytest.mark.gpu
+def test_neighbor_cutoff_mask_matches_mlx_and_preserves_compact_pair_order():
+    """Fused neighbor masking preserves cutoff membership and deterministic order."""
+
+    rng = np.random.default_rng(37)
+    positions_np = rng.uniform(0.0, 8.0, size=(96, 3)).astype(np.float32)
+    positions_np[0] = [0.0, 0.0, 0.0]
+    positions_np[1] = [2.0, 0.0, 0.0]
+    positions_np[95] = [6.0, 0.0, 0.0]
+    positions = mx.array(positions_np)
+    cell = Cell.cubic(8.0)
+    pairs_i = mx.array([0, 0, 1, 3, 17, 31], dtype=mx.int32)
+    pairs_j = mx.array([1, 95, 2, 4, 18, 63], dtype=mx.int32)
+    search_radius = 2.0
+
+    displacement = cell.minimum_image(positions[pairs_i] - positions[pairs_j])
+    expected_mask = (
+        mx.sum(displacement * displacement, axis=1) < search_radius * search_radius
+    )
+    fused_mask = neighbor_pair_cutoff_mask(
+        positions,
+        pairs_i,
+        pairs_j,
+        cell.lengths,
+        search_radius=search_radius,
+    )
+    mx.eval(expected_mask, fused_mask)
+    assert np.array_equal(np.asarray(fused_mask), np.asarray(expected_mask))
+    assert not bool(np.asarray(fused_mask)[0])
+    assert not bool(np.asarray(fused_mask)[1])
+
+    first = build_neighbor_list(
+        positions_np,
+        cell,
+        cutoff=1.8,
+        skin=0.3,
+        sort_pairs=False,
+        backend="mlx_cell_pairs",
+    )
+    second = build_neighbor_list(
+        positions_np,
+        cell,
+        cutoff=1.8,
+        skin=0.3,
+        sort_pairs=False,
+        backend="mlx_cell_pairs",
+    )
+    oracle = build_neighbor_list(
+        positions_np,
+        cell,
+        cutoff=1.8,
+        skin=0.3,
+        backend="periodic_cell_list",
+    )
+    assert np.array_equal(np.asarray(first.pairs), np.asarray(second.pairs))
+    assert {
+        tuple(pair) for pair in np.asarray(first.pairs).tolist()
+    } == {
+        tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
+    }
 
 
 @pytest.mark.gpu
