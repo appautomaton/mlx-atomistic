@@ -27,6 +27,7 @@ from mlx_atomistic.metal_kernels import (
     fused_parameterized_pme_direct_components,
     fused_parameterized_pme_direct_force_only,
     neighbor_pair_cutoff_mask,
+    neighbor_pair_ordered_scatter,
 )
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 from mlx_atomistic.pme import PMEConfig
@@ -119,6 +120,30 @@ def test_neighbor_cutoff_mask_matches_mlx_and_preserves_compact_pair_order():
     assert not bool(np.asarray(fused_mask)[0])
     assert not bool(np.asarray(fused_mask)[1])
 
+    prefix = mx.cumsum(fused_mask.astype(mx.int32))
+    mx.eval(prefix)
+    accepted_count = int(np.asarray(prefix[-1]))
+    accepted_i, accepted_j = neighbor_pair_ordered_scatter(
+        pairs_i,
+        pairs_j,
+        fused_mask,
+        prefix,
+    )
+    compact = mx.stack(
+        (accepted_i[:accepted_count], accepted_j[:accepted_count]),
+        axis=1,
+    )
+    mx.eval(compact)
+    mask_np = np.asarray(expected_mask)
+    expected_pairs = np.stack(
+        (
+            np.asarray(pairs_i)[mask_np],
+            np.asarray(pairs_j)[mask_np],
+        ),
+        axis=1,
+    )
+    assert np.array_equal(np.asarray(compact), expected_pairs)
+
     first = build_neighbor_list(
         positions_np,
         cell,
@@ -148,6 +173,7 @@ def test_neighbor_cutoff_mask_matches_mlx_and_preserves_compact_pair_order():
     } == {
         tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
     }
+    assert first.compaction_backend == "metal_prefix_scan"
 
 
 @pytest.mark.gpu
