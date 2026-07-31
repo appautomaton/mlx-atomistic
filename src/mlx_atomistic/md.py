@@ -694,12 +694,15 @@ class NVTResult:
 
 @dataclass(frozen=True)
 class _NVTBoundaryDiagnostics:
-    """Diagnostics already committed at an NPT segment boundary."""
+    """State and diagnostics already committed at an NPT segment boundary."""
 
+    potential_energy: mx.array
+    forces: mx.array
     energy_by_term: dict[str, mx.array]
     virial_tensor: mx.array
     pressure_tensor: mx.array
     pressure: mx.array
+    constraint_error: mx.array
 
 
 @dataclass(frozen=True)
@@ -3407,16 +3410,27 @@ def _simulate_nvt(
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
     masses = as_mx_array([1.0] * positions.shape[0]) if masses is None else as_mx_array(masses)
-    constraint_error = _zero_constraint_error(positions)
-    if constraints is not None:
+    constraint_error = (
+        _zero_constraint_error(positions)
+        if initial_diagnostics is None
+        else initial_diagnostics.constraint_error
+    )
+    if constraints is not None and initial_diagnostics is None:
         positions, constraint_error = constraints.apply_positions(positions, masses, cell)
         velocities = constraints.apply_velocities(positions, velocities, masses, cell)
     temperature_dof = _temperature_degrees_of_freedom(positions, constraints)
 
     eval_positions = _neighbor_evaluation_positions(positions, virtual_sites)
-    neighbor_list = (
-        neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
-    )
+    if neighbor_manager is None:
+        neighbor_list = None
+    elif initial_diagnostics is None:
+        neighbor_list = neighbor_manager.update(eval_positions)
+    else:
+        _validate_neighbor_manager_cell(neighbor_manager, cell)
+        neighbor_list = neighbor_manager.neighbor_list
+        if neighbor_list is None:
+            msg = "NPT boundary reuse requires an initialized neighbor list"
+            raise RuntimeError(msg)
     pairs = None if neighbor_list is None else neighbor_list.interactions
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -3460,7 +3474,8 @@ def _simulate_nvt(
             energy_forces_by_term(positions)
         )
     else:
-        potential_energy, forces = energy_forces(positions)
+        potential_energy = initial_diagnostics.potential_energy
+        forces = initial_diagnostics.forces
         energy_by_term = dict(initial_diagnostics.energy_by_term)
         diagnostic_virial = initial_diagnostics.virial_tensor
     force_evaluation_wall_seconds += perf_counter() - force_start
@@ -4601,12 +4616,15 @@ def _nvt_boundary_diagnostics(
     segment: NVTResult,
 ) -> _NVTBoundaryDiagnostics:
     return _NVTBoundaryDiagnostics(
+        potential_energy=segment.potential_energy[-1],
+        forces=segment.final_state.forces,
         energy_by_term={
             name: values[-1] for name, values in segment.potential_energy_by_term.items()
         },
         virial_tensor=segment.virial_tensor[-1],
         pressure_tensor=segment.pressure_tensor[-1],
         pressure=segment.pressure[-1],
+        constraint_error=segment.constraint_max_error[-1],
     )
 
 

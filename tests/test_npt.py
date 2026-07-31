@@ -1255,6 +1255,55 @@ def test_barostat_uses_supplied_current_energy_without_recomputing_it():
     assert term.calls == 1
 
 
+def test_npt_reuses_committed_energy_and_forces_at_the_next_segment(monkeypatch):
+    evaluator_calls = 0
+    make_evaluator = md_module._make_energy_forces_evaluator
+
+    def recording_factory(*args, **kwargs):
+        evaluator = make_evaluator(*args, **kwargs)
+
+        def recording_evaluator(positions):
+            nonlocal evaluator_calls
+            evaluator_calls += 1
+            return evaluator(positions)
+
+        return recording_evaluator
+
+    monkeypatch.setattr(
+        md_module,
+        "_make_energy_forces_evaluator",
+        recording_factory,
+    )
+    result = simulate_npt(
+        np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+        np.zeros((1, 3), dtype=np.float32),
+        masses=np.ones((1,), dtype=np.float32),
+        cell=Cell.cubic(8.0),
+        force_terms=_ZeroForceTerm(),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=4,
+            sample_interval=2,
+            diagnostic_interval=2,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=0.0,
+            friction=0.0,
+            seed=11,
+        ),
+        barostat=MonteCarloBarostat(
+            pressure=0.0,
+            temperature=1.0,
+            interval=2,
+            seed=4,
+        ),
+    )
+
+    assert result.barostat_attempts == 2
+    assert evaluator_calls == result.barostat_attempts
+
+
 def test_invalid_candidate_pme_cutoff_fails_before_candidate_energy():
     positions = np.asarray(
         [
