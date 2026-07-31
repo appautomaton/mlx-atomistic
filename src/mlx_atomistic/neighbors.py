@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import product
 from time import perf_counter
 from typing import Literal
@@ -18,6 +18,8 @@ from mlx_atomistic.cell_list import (
 )
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _neighbor_cell_pair_candidates,
+    _neighbor_pair_ordered_scatter_sized,
     neighbor_pair_cutoff_mask,
     neighbor_pair_ordered_scatter,
 )
@@ -40,6 +42,9 @@ _ALLOWED_NEIGHBOR_BACKENDS = {
 _ALLOWED_NEIGHBOR_CHECK_BACKENDS = {"numpy", "mlx_scalar"}
 DEFAULT_MLX_DENSE_PAIR_LIMIT = 4096
 DEFAULT_MLX_CELL_PAIR_CANDIDATE_CHUNK = 1_000_000
+DEFAULT_MLX_SPATIAL_CANDIDATE_BATCH = 16_000_000
+DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION = 3
+DEFAULT_MLX_SPATIAL_MAX_CELLS_PER_ATOM = 4
 DEFAULT_MLX_CELL_BLOCK_SIZE = 256
 # Default neighbor backend for systems above the dense-pair limit. Measured on
 # M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
@@ -276,6 +281,12 @@ class NeighborListManager:
     updates_since_check: int = 0
     rebuild_wall_seconds: float = 0.0
     update_wall_seconds: float = 0.0
+    _cache_clear_pending: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.check_interval <= 0:
@@ -392,6 +403,7 @@ class NeighborListManager:
     def rebuild(self, positions) -> NeighborList:
         """Force a neighbor-list rebuild from current positions."""
 
+        self._release_pending_metal_cache()
         start = perf_counter()
         self.neighbor_list = build_neighbor_list(
             positions,
@@ -409,6 +421,9 @@ class NeighborListManager:
         self.rebuild_count += 1
         self.last_max_displacement = 0.0
         self.updates_since_check = 0
+        self._cache_clear_pending = (
+            self.neighbor_list.compaction_backend == "metal_spatial_prefix_scan"
+        )
         return self.neighbor_list
 
     def update(self, positions) -> NeighborList:
@@ -416,6 +431,7 @@ class NeighborListManager:
 
         start = perf_counter()
         try:
+            self._release_pending_metal_cache()
             if self.needs_rebuild(positions):
                 return self.rebuild(positions)
             if self.neighbor_list is None:
@@ -424,6 +440,15 @@ class NeighborListManager:
             return self.neighbor_list
         finally:
             self.update_wall_seconds += perf_counter() - start
+
+    def _release_pending_metal_cache(self) -> None:
+        """Release inactive rebuild temporaries at the next safe call boundary."""
+
+        if not self._cache_clear_pending:
+            return
+        self._cache_clear_pending = False
+        if _uses_metal_device():
+            mx.clear_cache()
 
     def build_cell_candidate(
         self,
@@ -503,6 +528,7 @@ class NeighborListManager:
         self.updates_since_check = candidate.updates_since_check
         self.rebuild_wall_seconds = candidate.rebuild_wall_seconds
         self.update_wall_seconds = candidate.update_wall_seconds
+        self._cache_clear_pending = candidate._cache_clear_pending
 
 
 def build_neighbor_list(
@@ -530,20 +556,31 @@ def build_neighbor_list(
         msg = "block_size must be positive"
         raise ValueError(msg)
 
-    positions_np = np.asarray(positions, dtype=np.float32)
-    if positions_np.ndim != 2 or positions_np.shape[1] != 3:
+    positions_mx = as_mx_array(positions)
+    if positions_mx.ndim != 2 or positions_mx.shape[1] != 3:
         msg = "positions must have shape (n_particles, 3)"
-        raise ValueError(msg)
-    if not np.all(np.isfinite(positions_np)):
-        msg = "positions must be finite"
         raise ValueError(msg)
     search_radius = cutoff + skin
     fallback_reason = None
     if backend == "auto":
-        if positions_np.shape[0] <= max_mlx_dense_atoms:
+        if positions_mx.shape[0] <= max_mlx_dense_atoms:
             backend = "mlx_dense_pairs"
         else:
             backend = DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND
+    if backend == "mlx_cell_pairs" and _uses_metal_device():
+        return _build_mlx_spatial_cell_pair_list(
+            positions_mx,
+            cell,
+            cutoff=cutoff,
+            skin=skin,
+            search_radius=search_radius,
+            sort_pairs=sort_pairs,
+        )
+
+    positions_np = np.asarray(positions_mx, dtype=np.float32)
+    if not np.all(np.isfinite(positions_np)):
+        msg = "positions must be finite"
+        raise ValueError(msg)
     if backend == "mlx_dense_pairs":
         return _build_mlx_dense_pair_list(
             positions_np,
@@ -554,7 +591,7 @@ def build_neighbor_list(
             max_atoms=max_mlx_dense_atoms,
         )
     if backend == "mlx_cell_pairs":
-        return _build_mlx_cell_pair_list(
+        return _build_mlx_cell_pair_list_cpu(
             positions_np,
             cell,
             cutoff=cutoff,
@@ -599,6 +636,10 @@ def build_neighbor_list(
         skin=skin,
         stats=stats,
     )
+
+
+def _uses_metal_device() -> bool:
+    return "gpu" in str(mx.default_device()).lower()
 
 
 def _require_orthorhombic_cell_for_compact_neighbor_backend(
@@ -856,7 +897,309 @@ def _count_candidate_pairs_within_radius(
     return int(np.count_nonzero(distance2 < search_radius * search_radius))
 
 
-def _build_mlx_cell_pair_list(
+def _build_mlx_spatial_cell_pair_list(
+    positions_mx: mx.array,
+    cell: Cell,
+    *,
+    cutoff: float,
+    skin: float,
+    search_radius: float,
+    sort_pairs: bool,
+    subdivision: int = DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION,
+    candidate_batch: int = DEFAULT_MLX_SPATIAL_CANDIDATE_BATCH,
+) -> NeighborList:
+    """Build compact pairs from a device-resident, spatially pruned cell grid."""
+
+    _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_pairs")
+    lengths = np.asarray(cell.lengths, dtype=np.float32)
+    if lengths.shape != (3,) or np.any(~np.isfinite(lengths)) or np.any(lengths <= 0.0):
+        msg = "cell lengths must be finite and positive"
+        raise ValueError(msg)
+    if subdivision <= 0:
+        msg = "spatial cell subdivision must be positive"
+        raise ValueError(msg)
+    if candidate_batch <= 0 or candidate_batch > np.iinfo(np.int32).max:
+        msg = "spatial candidate batch must be a positive int32-sized count"
+        raise ValueError(msg)
+
+    finite = mx.all(mx.isfinite(positions_mx))
+    mx.eval(finite)
+    if not bool(np.asarray(finite)):
+        msg = "positions must be finite"
+        raise ValueError(msg)
+
+    n_atoms = int(positions_mx.shape[0])
+    lengths64 = lengths.astype(np.float64)
+    n_cells_array = _bounded_spatial_grid(
+        lengths64,
+        search_radius=search_radius,
+        subdivision=subdivision,
+        n_atoms=n_atoms,
+    )
+    n_cells = tuple(int(value) for value in n_cells_array)
+    cell_count = int(np.prod(n_cells_array.astype(np.int64)))
+    cell_widths = lengths64 / n_cells_array.astype(np.float64)
+
+    lengths_mx = mx.array(lengths, dtype=mx.float32)
+    n_cells_mx = mx.array(n_cells_array, dtype=mx.int32)
+    wrapped = positions_mx - mx.floor(positions_mx / lengths_mx) * lengths_mx
+    cell_indices = mx.floor(wrapped / lengths_mx * n_cells_mx).astype(mx.int32)
+    cell_indices = mx.minimum(cell_indices, n_cells_mx - 1)
+    cell_ids = (
+        (cell_indices[:, 0] * n_cells[1] + cell_indices[:, 1]) * n_cells[2]
+        + cell_indices[:, 2]
+    )
+    sorted_atoms = mx.argsort(cell_ids).astype(mx.int32)
+    cell_counts_mx = mx.zeros((cell_count,), dtype=mx.int32).at[cell_ids].add(
+        mx.ones((n_atoms,), dtype=mx.int32)
+    )
+    mx.eval(sorted_atoms, cell_counts_mx)
+    cell_counts = np.asarray(cell_counts_mx, dtype=np.int32)
+    cell_starts = np.empty_like(cell_counts)
+    if cell_count:
+        cell_starts[0] = 0
+        np.cumsum(cell_counts[:-1], dtype=np.int64, out=cell_starts[1:])
+
+    task_left, task_right, task_candidate_counts = _spatial_cell_pair_tasks(
+        cell_counts,
+        n_cells,
+        cell_widths,
+        search_radius=search_radius,
+    )
+    candidate_count = int(np.sum(task_candidate_counts, dtype=np.int64))
+    if task_candidate_counts.size and int(np.max(task_candidate_counts)) > candidate_batch:
+        largest = int(np.max(task_candidate_counts))
+        msg = (
+            "one spatial cell-pair task exceeds the bounded Metal candidate batch: "
+            f"candidate_count={largest}, candidate_batch={candidate_batch}; "
+            "increase spatial subdivision or reduce local occupancy"
+        )
+        raise ValueError(msg)
+
+    cell_starts_mx = mx.array(cell_starts, dtype=mx.int32)
+    compact_chunks: list[mx.array] = []
+    compact_pair_count = 0
+    peak_candidate_count = 0
+    for task_start, task_stop in _spatial_task_batches(
+        task_candidate_counts,
+        candidate_batch=candidate_batch,
+    ):
+        batch_counts = task_candidate_counts[task_start:task_stop]
+        batch_candidate_count = int(np.sum(batch_counts, dtype=np.int64))
+        peak_candidate_count = max(peak_candidate_count, batch_candidate_count)
+        task_offsets = np.empty((batch_counts.shape[0],), dtype=np.int32)
+        task_offsets[0] = 0
+        if task_offsets.shape[0] > 1:
+            np.cumsum(batch_counts[:-1], dtype=np.int64, out=task_offsets[1:])
+        cell_pairs = np.stack(
+            (
+                task_left[task_start:task_stop],
+                task_right[task_start:task_stop],
+            ),
+            axis=1,
+        ).astype(np.int32, copy=False)
+        candidates_i, candidates_j = _neighbor_cell_pair_candidates(
+            sorted_atoms,
+            cell_starts_mx,
+            cell_counts_mx,
+            mx.array(cell_pairs, dtype=mx.int32),
+            mx.array(task_offsets, dtype=mx.int32),
+            candidate_count=batch_candidate_count,
+        )
+        close = neighbor_pair_cutoff_mask(
+            positions_mx,
+            candidates_i,
+            candidates_j,
+            cell.lengths,
+            search_radius=search_radius,
+        )
+        prefix = mx.cumsum(close.astype(mx.int32))
+        mx.eval(prefix)
+        accepted_count = int(np.asarray(prefix[-1]))
+        if accepted_count == 0:
+            continue
+        accepted_i, accepted_j = _neighbor_pair_ordered_scatter_sized(
+            candidates_i,
+            candidates_j,
+            close,
+            prefix,
+            accepted_count=accepted_count,
+        )
+        compact = mx.stack((accepted_i, accepted_j), axis=1)
+        mx.eval(compact)
+        compact_chunks.append(compact)
+        compact_pair_count += accepted_count
+
+    if compact_chunks:
+        pairs = mx.concatenate(compact_chunks, axis=0)
+    else:
+        pairs = mx.zeros((0, 2), dtype=mx.int32)
+    if sort_pairs and compact_pair_count:
+        right_order = mx.argsort(pairs[:, 1])
+        pairs = pairs[right_order]
+        left_order = mx.argsort(pairs[:, 0])
+        pairs = pairs[left_order]
+    mx.eval(pairs)
+
+    occupied_cell_count = int(np.count_nonzero(cell_counts))
+    estimated_cell_list_bytes = (
+        n_atoms * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
+        + cell_count * 2 * _INT_BYTES
+    )
+    stats = PairListStats(
+        pair_count=compact_pair_count,
+        n_cells=n_cells,
+        cell_count=cell_count,
+        occupied_cell_count=occupied_cell_count,
+        search_radius=search_radius,
+        estimated_pair_bytes=estimate_pair_list_bytes(compact_pair_count),
+        estimated_cell_list_bytes=estimated_cell_list_bytes,
+        backend="mlx_cell_pairs",
+        representation_kind="pairs",
+        candidate_count=candidate_count,
+        estimated_candidate_bytes=(
+            peak_candidate_count * (3 * _FLOAT_BYTES + _BOOL_BYTES)
+        ),
+        compaction_backend="metal_spatial_prefix_scan",
+        fallback_reason=None,
+    )
+    return NeighborList(
+        pairs,
+        cutoff=cutoff,
+        skin=skin,
+        stats=stats,
+    )
+
+
+def _spatial_cell_pair_tasks(
+    cell_counts: np.ndarray,
+    n_cells: tuple[int, int, int],
+    cell_widths: np.ndarray,
+    *,
+    search_radius: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return occupied canonical cell-pair tasks allowed by an AABB stencil."""
+
+    cell_count = int(np.prod(np.asarray(n_cells, dtype=np.int64)))
+    if cell_count == 0:
+        empty = np.empty((0,), dtype=np.int32)
+        return empty, empty, empty.astype(np.int64)
+    cell_ids = np.arange(cell_count, dtype=np.int64)
+    cell_x, cell_y, cell_z = np.unravel_index(cell_ids, n_cells)
+    encoded_chunks: list[np.ndarray] = []
+    for offset_x, offset_y, offset_z in _aabb_pruned_half_stencil(
+        cell_widths,
+        search_radius=search_radius,
+    ):
+        neighbor_x = (cell_x + offset_x) % n_cells[0]
+        neighbor_y = (cell_y + offset_y) % n_cells[1]
+        neighbor_z = (cell_z + offset_z) % n_cells[2]
+        neighbor_ids = (neighbor_x * n_cells[1] + neighbor_y) * n_cells[2] + neighbor_z
+        lower = np.minimum(cell_ids, neighbor_ids)
+        upper = np.maximum(cell_ids, neighbor_ids)
+        encoded_chunks.append(lower * cell_count + upper)
+    encoded = np.unique(np.concatenate(encoded_chunks))
+    left = encoded // cell_count
+    right = encoded % cell_count
+    left_counts = cell_counts[left]
+    right_counts = cell_counts[right]
+    same = left == right
+    candidate_counts = np.where(
+        same,
+        left_counts.astype(np.int64) * np.maximum(left_counts.astype(np.int64) - 1, 0) // 2,
+        left_counts.astype(np.int64) * right_counts.astype(np.int64),
+    )
+    occupied = candidate_counts > 0
+    return (
+        left[occupied].astype(np.int32, copy=False),
+        right[occupied].astype(np.int32, copy=False),
+        candidate_counts[occupied],
+    )
+
+
+def _bounded_spatial_grid(
+    lengths: np.ndarray,
+    *,
+    search_radius: float,
+    subdivision: int,
+    n_atoms: int,
+) -> np.ndarray:
+    """Return a fine grid without allocating a pathological number of empty cells."""
+
+    requested = np.maximum(
+        np.floor(lengths * float(subdivision) / float(search_radius)).astype(np.int64),
+        1,
+    )
+    max_cells = max(1, DEFAULT_MLX_SPATIAL_MAX_CELLS_PER_ATOM * n_atoms)
+    requested_count = int(np.prod(requested, dtype=np.int64))
+    if requested_count <= max_cells:
+        return requested.astype(np.int32)
+
+    scale = (float(max_cells) / float(requested_count)) ** (1.0 / 3.0)
+    bounded = np.maximum(np.floor(requested.astype(np.float64) * scale).astype(np.int64), 1)
+    while int(np.prod(bounded, dtype=np.int64)) > max_cells:
+        reducible = np.flatnonzero(bounded > 1)
+        if reducible.size == 0:
+            break
+        axis = int(reducible[np.argmax(bounded[reducible] / requested[reducible])])
+        bounded[axis] -= 1
+    return bounded.astype(np.int32)
+
+
+def _aabb_pruned_half_stencil(
+    cell_widths: np.ndarray,
+    *,
+    search_radius: float,
+) -> tuple[tuple[int, int, int], ...]:
+    """Return canonical cell offsets whose axis-aligned boxes can be in range."""
+
+    max_offsets = np.ceil(search_radius / cell_widths).astype(np.int32)
+    radius2 = float(search_radius) * float(search_radius)
+    tolerance = np.finfo(np.float64).eps * max(radius2, 1.0) * 16.0
+    offsets: list[tuple[int, int, int]] = []
+    for offset in product(
+        range(-int(max_offsets[0]), int(max_offsets[0]) + 1),
+        range(-int(max_offsets[1]), int(max_offsets[1]) + 1),
+        range(-int(max_offsets[2]), int(max_offsets[2]) + 1),
+    ):
+        if not _is_canonical_half_offset(offset):
+            continue
+        gap = np.maximum(np.abs(np.asarray(offset, dtype=np.float64)) - 1.0, 0.0)
+        minimum_distance2 = float(np.sum((gap * cell_widths) ** 2))
+        if minimum_distance2 <= radius2 + tolerance:
+            offsets.append(offset)
+    return tuple(offsets)
+
+
+def _is_canonical_half_offset(offset: tuple[int, int, int]) -> bool:
+    for component in offset:
+        if component:
+            return component > 0
+    return True
+
+
+def _spatial_task_batches(
+    task_candidate_counts: np.ndarray,
+    *,
+    candidate_batch: int,
+) -> tuple[tuple[int, int], ...]:
+    if task_candidate_counts.size == 0:
+        return ()
+    cumulative = np.cumsum(task_candidate_counts, dtype=np.int64)
+    batches: list[tuple[int, int]] = []
+    start = 0
+    prior = 0
+    while start < task_candidate_counts.shape[0]:
+        stop = int(np.searchsorted(cumulative, prior + candidate_batch, side="right"))
+        if stop <= start:
+            stop = start + 1
+        batches.append((start, stop))
+        prior = int(cumulative[stop - 1])
+        start = stop
+    return tuple(batches)
+
+
+def _build_mlx_cell_pair_list_cpu(
     positions_np: np.ndarray,
     cell: Cell,
     *,
