@@ -8,9 +8,10 @@ from types import NotImplementedType
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.neighbors import NeighborList
+from mlx_atomistic.neighbors import NeighborList, NeighborTiles
 from mlx_atomistic.virtual_sites import VirtualSiteManager
 
 
@@ -240,6 +241,7 @@ class _PreparedForcePipeline:
         self.route_profiler = route_profiler
         self._cached_neighbor_list: NeighborList | None = None
         self._cached_binding: _BoundForcePipeline | None = None
+        self._cached_context_identity: tuple[object, ...] | None = None
 
     @classmethod
     def prepare(
@@ -279,22 +281,53 @@ class _PreparedForcePipeline:
             A force evaluator bound to the exact list object.
         """
 
+        interactions = (
+            None if neighbor_list is None else neighbor_list.diagnostic_pairs
+        )
+        tiles = (
+            None
+            if neighbor_list is None
+            else neighbor_list.force_candidates(prefer_tiles=True)
+        )
+        if not isinstance(tiles, NeighborTiles):
+            tiles = None
+        term_context = []
+        for term in self.force_terms:
+            identify = getattr(term, "_force_binding_context_identity", None)
+            term_context.append(
+                identify(self.cell, interactions, tiles)
+                if callable(identify)
+                else id(term)
+            )
+        context_identity = (
+            None
+            if self.cell is None
+            else np.asarray(self.cell.matrix, dtype=np.float32).tobytes(),
+            str(mx.default_device()),
+            None if interactions is None else id(interactions),
+            None if interactions is None else str(interactions.dtype),
+            None if tiles is None else id(tiles),
+            None if tiles is None else tiles.generation,
+            tuple(term_context),
+        )
         if (
             neighbor_list is self._cached_neighbor_list
             and self._cached_binding is not None
+            and context_identity == self._cached_context_identity
         ):
             return self._cached_binding
-        interactions = (
-            None if neighbor_list is None else neighbor_list.interactions
-        )
         term_bindings: list[object | NotImplementedType] = []
         for term in self.force_terms:
             prepare = getattr(term, "_prepare_force_binding", None)
-            binding = (
-                prepare(self.cell, interactions)
-                if callable(prepare)
-                else NotImplemented
-            )
+            prepare_tiles = getattr(term, "_prepare_tile_force_binding", None)
+            if tiles is not None and callable(prepare_tiles):
+                binding = prepare_tiles(self.cell, interactions, tiles)
+            else:
+                binding = (
+                    prepare(self.cell, interactions)
+                    if callable(prepare)
+                    else NotImplemented
+                )
             term_bindings.append(binding)
         bound = _BoundForcePipeline(
             force_terms=self.force_terms,
@@ -306,6 +339,7 @@ class _PreparedForcePipeline:
         )
         self._cached_neighbor_list = neighbor_list
         self._cached_binding = bound
+        self._cached_context_identity = context_identity
         return bound
 
 

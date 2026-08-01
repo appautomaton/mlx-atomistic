@@ -103,15 +103,20 @@ def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():
     materialized = np.asarray(tiles.materialize_pairs())
     assert np.all(materialized[:, 0] < materialized[:, 1])
     assert np.unique(materialized, axis=0).shape[0] == materialized.shape[0]
-    assert neighbors.pairs.shape == (0, 2)
-    assert neighbors.interactions is tiles
+    np.testing.assert_array_equal(
+        np.asarray(neighbors.diagnostic_pairs),
+        np.asarray(oracle.pairs),
+    )
+    assert neighbors.interactions is neighbors.diagnostic_pairs
+    assert neighbors.force_candidates(prefer_tiles=False) is neighbors.diagnostic_pairs
+    assert neighbors.force_candidates(prefer_tiles=True) is tiles
     assert neighbors.backend == "mlx_cell_tiles"
     assert neighbors.representation_kind == "tiles"
     assert neighbors.pair_count == oracle.pair_count
     assert neighbors.compact_pair_count == oracle.pair_count
     assert neighbors.candidate_count == tiles.raw_candidate_count
     assert neighbors.candidate_count >= neighbors.compact_pair_count
-    assert neighbors.estimated_pair_bytes == tiles.estimated_bytes
+    assert neighbors.estimated_pair_bytes == tiles.estimated_bytes + oracle.pair_count * 8
     assert neighbors.compaction_backend == "cpu_vectorized_tile_membership_mask"
     assert tiles.block_size == 8
     assert tiles.exact_pair_count == oracle.pair_count
@@ -184,6 +189,52 @@ def test_neighbor_tiles_membership_uses_cutoff_plus_skin_not_force_cutoff():
 
     assert _neighbor_pair_set(neighbors) == {(0, 1), (1, 2)}
     assert _neighbor_pair_set(force_cutoff) == {(1, 2)}
+
+
+@pytest.mark.parametrize(
+    "positions",
+    [
+        np.empty((0, 3), dtype=np.float32),
+        np.asarray([[0.1, 0.1, 0.1]], dtype=np.float32),
+        np.asarray(
+            [[0.05, 0.1, 0.1], [7.95, 0.1, 0.1], [4.0, 4.0, 4.0]],
+            dtype=np.float32,
+        ),
+        np.asarray(
+            [[0.1, 0.1, 0.1], [0.7, 0.1, 0.1], [6.5, 6.5, 6.5]],
+            dtype=np.float32,
+        ),
+    ],
+    ids=["empty", "partial", "periodic-boundary", "sparse"],
+)
+def test_neighbor_tiles_dual_representation_matches_compact_oracle(positions):
+    cell = Cell.cubic(8.0)
+    oracle = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.0,
+        skin=0.2,
+        backend="mlx_cell_pairs",
+    )
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=1.0,
+        skin=0.2,
+        backend="mlx_cell_tiles",
+    )
+
+    assert neighbors.tiles is not None
+    assert neighbors.diagnostic_pairs.dtype == mx.int32
+    np.testing.assert_array_equal(
+        np.asarray(neighbors.diagnostic_pairs),
+        np.asarray(oracle.diagnostic_pairs),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(neighbors.tiles.materialize_pairs()),
+        np.asarray(oracle.diagnostic_pairs),
+    )
+    assert neighbors.tiles.exact_pair_count == oracle.compact_pair_count
 
 
 def test_neighbor_tile_manager_assigns_monotonic_rebuild_generations():
@@ -390,13 +441,20 @@ def test_mlx_cell_blocks_cover_periodic_cell_list_pairs_without_compaction():
     assert candidate.representation_kind == "blocks"
     assert candidate.blocks is not None
     assert candidate.interactions is candidate.blocks
-    assert candidate.pairs.shape == (0, 2)
+    np.testing.assert_array_equal(
+        np.asarray(candidate.diagnostic_pairs),
+        np.asarray(oracle.pairs),
+    )
     assert candidate.pair_count >= oracle.pair_count
     assert candidate.compact_pair_count == oracle.pair_count
     assert candidate.candidate_count == candidate.pair_count
     assert candidate.candidate_waste_count == candidate.candidate_count - oracle.pair_count
     assert candidate.candidate_waste_fraction is not None
-    assert candidate.estimated_pair_bytes == candidate.blocks.estimated_bytes
+    assert candidate.estimated_pair_bytes == (
+        candidate.blocks.estimated_bytes + oracle.pair_count * 8
+    )
+    assert candidate.stats is not None
+    assert candidate.stats.estimated_pair_bytes == candidate.estimated_pair_bytes
     assert candidate.estimated_compact_pair_bytes == oracle.pair_count * 8
     assert candidate.estimated_candidate_bytes == candidate.blocks.estimated_bytes
     assert candidate.compaction_backend is None

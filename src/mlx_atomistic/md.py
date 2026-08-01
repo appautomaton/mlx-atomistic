@@ -1169,7 +1169,9 @@ def _potential_energy_for_virial(
                 skin=0.0,
                 backend="mlx_cell_blocks",
             )
-            candidate_pairs = candidate_manager.update(evaluation_positions).interactions
+            candidate_pairs = candidate_manager.update(
+                evaluation_positions,
+            ).diagnostic_pairs
     energy, _ = _energy_forces_from_terms(
         positions,
         candidate_terms,
@@ -2108,7 +2110,7 @@ def _diagnostic_cutoff_strain_pairs(
             rtol=1.0e-7,
             atol=1.0e-8,
         )
-        or not isinstance(neighbor_list.interactions, mx.array)
+        or not isinstance(neighbor_list.diagnostic_pairs, mx.array)
         or not np.array_equal(
             np.asarray(neighbor_manager.cell.matrix),
             np.asarray(cell.matrix),
@@ -2126,7 +2128,7 @@ def _diagnostic_cutoff_strain_pairs(
     )
     if remaining_pair_margin + 1.0e-7 < required_shell:
         return None
-    return neighbor_list.interactions
+    return neighbor_list.diagnostic_pairs
 
 
 def _forces_from_terms(
@@ -3177,7 +3179,11 @@ def simulate_nve(
         if prepared_force_pipeline is None
         else prepared_force_pipeline.bind(neighbor_list)
     )
-    pairs = None if neighbor_list is None else neighbor_list.interactions
+    pairs = (
+        None
+        if neighbor_list is None
+        else neighbor_list.force_candidates(prefer_tiles=False)
+    )
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
@@ -3321,7 +3327,11 @@ def simulate_nve(
         )
         if prepared_force_pipeline is not None:
             force_binding = prepared_force_pipeline.bind(neighbor_list)
-        pairs = None if neighbor_list is None else neighbor_list.interactions
+        pairs = (
+            None
+            if neighbor_list is None
+            else neighbor_list.force_candidates(prefer_tiles=False)
+        )
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
         )
@@ -3725,7 +3735,11 @@ def _simulate_nvt(
             "neighbor_force_binding",
             binding_started,
         )
-    pairs = None if neighbor_list is None else neighbor_list.interactions
+    pairs = (
+        None
+        if neighbor_list is None
+        else neighbor_list.force_candidates(prefer_tiles=False)
+    )
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
@@ -4043,7 +4057,9 @@ def _simulate_nvt(
                     pos = cell.wrap(pos)
 
                 replay_neighbor_list = neighbor_manager.rebuild(pos)
-                replay_pairs = replay_neighbor_list.interactions
+                replay_pairs = replay_neighbor_list.force_candidates(
+                    prefer_tiles=False,
+                )
                 replay_pair_count = replay_neighbor_list.pair_count
                 replay_rebuild_count = neighbor_manager.rebuild_count
                 if prepared_force_pipeline is None:
@@ -4140,7 +4156,7 @@ def _simulate_nvt(
                 current_step = config.initial_step + local_step
                 current_time = config.initial_time + local_step * config.dt
 
-                pairs = neighbor_list.interactions
+                pairs = neighbor_list.force_candidates(prefer_tiles=False)
                 pair_count = neighbor_list.pair_count
                 rebuild_count = neighbor_manager.rebuild_count
 
@@ -4484,7 +4500,11 @@ def _simulate_nvt(
                     "neighbor_force_binding",
                     binding_started,
                 )
-        pairs = None if neighbor_list is None else neighbor_list.interactions
+        pairs = (
+            None
+            if neighbor_list is None
+            else neighbor_list.force_candidates(prefer_tiles=False)
+        )
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
         )
@@ -5343,7 +5363,7 @@ def _npt_production_with_final_barostat_state(
             raise RuntimeError(msg)
     else:
         neighbor_list = None
-    pairs = None if neighbor_list is None else neighbor_list.interactions
+    pairs = None if neighbor_list is None else neighbor_list.diagnostic_pairs
     if config.pressure_diagnostics:
         cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
             neighbor_manager,
@@ -5554,8 +5574,12 @@ def _attempt_barostat_move(
     else:
         old_neighbor_list = None
         proposed_neighbor_list = None
-    old_pairs = None if old_neighbor_list is None else old_neighbor_list.interactions
-    proposed_pairs = None if proposed_neighbor_list is None else proposed_neighbor_list.interactions
+    old_pairs = None if old_neighbor_list is None else old_neighbor_list.diagnostic_pairs
+    proposed_pairs = (
+        None
+        if proposed_neighbor_list is None
+        else proposed_neighbor_list.diagnostic_pairs
+    )
     old_energy = (
         _energy_forces_from_terms(
             state.positions,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, field, replace
 from types import NotImplementedType
 
@@ -35,7 +36,7 @@ from mlx_atomistic.metal_kernels import (
     fused_parameterized_pme_direct_forces,
     fused_pme_cutoff_correction_virial,
 )
-from mlx_atomistic.neighbors import NeighborBlocks, build_neighbor_list
+from mlx_atomistic.neighbors import NeighborBlocks, NeighborTiles, build_neighbor_list
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
     EwaldReferenceConfig,
@@ -120,6 +121,12 @@ class _NonbondedForceBinding:
     box_lengths_and_inverses: mx.array
     half_sigma: mx.array
     sqrt_epsilon: mx.array
+    cache_identity: tuple[object, ...]
+    pair_force_ready: bool = True
+    tile_geometry: NeighborTiles | None = None
+    tile_lj_enabled_mask: mx.array | None = None
+    tile_lj_one_four_mask: mx.array | None = None
+    tile_decline_reason: str | None = None
 
 
 def _topology_pair_scales(
@@ -1926,8 +1933,16 @@ class NonbondedPotential:
 
     def _compact_aligned_lj_scales(self, pairs: mx.array) -> mx.array:
         cache = self._aligned_lj_scale_cache
-        if cache is not None and cache[0] is pairs:
-            return cache[1]
+        scale_identity = (
+            builtins.id(self.topology),
+            builtins.id(self._aligned_lj_exclusion_pairs),
+            builtins.id(self._aligned_lj_one_four_pairs),
+            builtins.id(self._exception_pair_codes),
+            float(self.lj_one_four_scale),
+            str(mx.default_device()),
+        )
+        if cache is not None and cache[0] is pairs and cache[1] == scale_identity:
+            return cache[2]
         if (
             "gpu" in str(mx.default_device()).lower()
             and self.topology is not None
@@ -1945,9 +1960,84 @@ class NonbondedPotential:
         object.__setattr__(
             self,
             "_aligned_lj_scale_cache",
-            (pairs, aligned),
+            (pairs, scale_identity, aligned),
         )
         return aligned
+
+    def _tile_aligned_lj_masks(
+        self,
+        tiles: NeighborTiles,
+    ) -> tuple[mx.array, mx.array]:
+        """Return binding-owned LJ eligibility and one-four tile masks."""
+
+        atom_blocks = np.asarray(tiles.atom_blocks, dtype=np.int32)
+        tile_blocks = np.asarray(tiles.tile_blocks, dtype=np.int32)
+        member_words = np.asarray(tiles.member_mask, dtype=np.uint32)
+        enabled_words = np.zeros_like(member_words)
+        one_four_words = np.zeros_like(member_words)
+        bit_indices = np.arange(32, dtype=np.uint32)
+        bit_weights = np.left_shift(np.uint32(1), bit_indices)
+        n_atoms = int(self.sigma.shape[0])
+        for start in range(0, tiles.tile_count, 65_536):
+            stop = min(start + 65_536, tiles.tile_count)
+            words = member_words[start:stop]
+            active = np.concatenate(
+                (
+                    ((words[:, :1] >> bit_indices) & np.uint32(1)).astype(bool),
+                    ((words[:, 1:] >> bit_indices) & np.uint32(1)).astype(bool),
+                ),
+                axis=1,
+            )
+            block_pairs = tile_blocks[start:stop]
+            left = atom_blocks[block_pairs[:, 0]][:, :, None]
+            right = atom_blocks[block_pairs[:, 1]][:, None, :]
+            left = np.broadcast_to(left, (stop - start, 8, 8)).reshape((-1, 64))
+            right = np.broadcast_to(right, (stop - start, 8, 8)).reshape((-1, 64))
+            safe_left = np.maximum(left, 0).astype(np.int64, copy=False)
+            safe_right = np.maximum(right, 0).astype(np.int64, copy=False)
+            codes = (
+                np.minimum(safe_left, safe_right) * np.int64(n_atoms)
+                + np.maximum(safe_left, safe_right)
+            )
+            enabled = active & (left >= 0) & (right >= 0)
+            if self.topology is not None:
+                enabled &= ~_isin_sorted_codes(codes, self.topology._exclusion_codes)
+            if self.has_exceptions and (
+                self.topology is None or not self._exceptions_excluded_by_topology
+            ):
+                enabled &= ~_isin_sorted_codes(codes, self._exception_pair_codes)
+            one_four = enabled & _isin_sorted_codes(
+                codes,
+                (
+                    np.empty((0,), dtype=np.int64)
+                    if self.topology is None
+                    else self.topology._one_four_codes
+                ),
+            )
+            enabled_words[start:stop, 0] = np.sum(
+                enabled[:, :32].astype(np.uint32) * bit_weights,
+                axis=1,
+                dtype=np.uint32,
+            )
+            enabled_words[start:stop, 1] = np.sum(
+                enabled[:, 32:].astype(np.uint32) * bit_weights,
+                axis=1,
+                dtype=np.uint32,
+            )
+            one_four_words[start:stop, 0] = np.sum(
+                one_four[:, :32].astype(np.uint32) * bit_weights,
+                axis=1,
+                dtype=np.uint32,
+            )
+            one_four_words[start:stop, 1] = np.sum(
+                one_four[:, 32:].astype(np.uint32) * bit_weights,
+                axis=1,
+                dtype=np.uint32,
+            )
+        return (
+            mx.array(enabled_words, dtype=mx.uint32),
+            mx.array(one_four_words, dtype=mx.uint32),
+        )
 
     def _supports_fused_pme_direct(
         self,
@@ -3315,6 +3405,69 @@ class NonbondedPotential:
     ) -> _NonbondedForceBinding | NotImplementedType:
         """Bind recurring fused PME state to one exact pair representation."""
 
+        return self._prepare_force_binding_impl(cell, pairs, tiles=None)
+
+    def _prepare_tile_force_binding(
+        self,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+        tiles: NeighborTiles,
+    ) -> _NonbondedForceBinding | NotImplementedType:
+        """Prepare tile topology ownership while retaining compact-pair forces."""
+
+        return self._prepare_force_binding_impl(cell, pairs, tiles=tiles)
+
+    def _force_binding_context_identity(
+        self,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+        tiles: NeighborTiles | None,
+    ) -> tuple[object, ...]:
+        """Return every declared input that owns a prepared force binding."""
+
+        return (
+            None
+            if cell is None
+            else np.asarray(cell.matrix, dtype=np.float32).tobytes(),
+            builtins.id(self.pme_plan),
+            getattr(self.pme_plan, "fingerprint", None),
+            builtins.id(self.topology),
+            builtins.id(self.sigma),
+            builtins.id(self.epsilon),
+            builtins.id(self.charges),
+            builtins.id(self.exception_pairs),
+            builtins.id(self.exception_charge_products),
+            builtins.id(self.exception_sigma),
+            builtins.id(self.exception_epsilon),
+            builtins.id(self.nbfix_pairs),
+            builtins.id(self.nbfix_sigma),
+            builtins.id(self.nbfix_epsilon),
+            builtins.id(self._aligned_lj_exclusion_pairs),
+            builtins.id(self._aligned_lj_one_four_pairs),
+            repr(self.pme_config),
+            self.cutoff,
+            float(self.lj_one_four_scale),
+            float(self.coulomb_one_four_scale),
+            bool(self.lj_shift),
+            self.switch_distance,
+            str(mx.default_device()),
+            None if pairs is None else str(pairs.dtype),
+            str(self.sigma.dtype),
+            "tiles" if tiles is not None else "pairs",
+            builtins.id(pairs),
+            None if tiles is None else builtins.id(tiles),
+            None if tiles is None else tiles.generation,
+        )
+
+    def _prepare_force_binding_impl(
+        self,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+        *,
+        tiles: NeighborTiles | None,
+    ) -> _NonbondedForceBinding | NotImplementedType:
+        """Build one generation-bounded compact binding with optional tile masks."""
+
         if (
             self.electrostatics != "pme"
             or cell is None
@@ -3322,23 +3475,27 @@ class NonbondedPotential:
             or self.pme_plan is None
         ):
             return NotImplemented
-        cache = self._force_binding_cache
-        if (
-            cache is not None
-            and cache.cell is cell
-            and cache.pairs is pairs
-            and cache.pme_plan is self.pme_plan
-        ):
-            return cache
         direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
-        if not self._supports_fused_pme_direct(cell, direct_space_pairs):
+        pair_force_ready = self._supports_fused_pme_direct(cell, direct_space_pairs)
+        if not pair_force_ready and tiles is None:
             return NotImplemented
+        if not isinstance(direct_space_pairs, mx.array):
+            return NotImplemented
+        identity = self._force_binding_context_identity(
+            cell,
+            direct_space_pairs,
+            tiles,
+        )
+        cache = self._force_binding_cache
+        if cache is not None and cache.cache_identity == identity:
+            return cache
         lj_invariants = self._prepared_lj_invariants_cache
-        if lj_invariants is None:
+        lj_identity = (builtins.id(self.sigma), builtins.id(self.epsilon))
+        if lj_invariants is None or lj_invariants[:2] != lj_identity:
             half_sigma = 0.5 * self.sigma
             sqrt_epsilon = mx.sqrt(self.epsilon)
             mx.eval(half_sigma, sqrt_epsilon)
-            lj_invariants = (half_sigma, sqrt_epsilon)
+            lj_invariants = (*lj_identity, half_sigma, sqrt_epsilon)
             object.__setattr__(
                 self,
                 "_prepared_lj_invariants_cache",
@@ -3353,6 +3510,12 @@ class NonbondedPotential:
             mx.eval(box_lengths_and_inverses)
             box_cache = (cell, box_lengths_and_inverses)
             object.__setattr__(self, "_prepared_box_cache", box_cache)
+        tile_lj_enabled_mask = None
+        tile_lj_one_four_mask = None
+        if tiles is not None:
+            tile_lj_enabled_mask, tile_lj_one_four_mask = self._tile_aligned_lj_masks(
+                tiles,
+            )
         binding = _NonbondedForceBinding(
             cell=cell,
             pairs=direct_space_pairs,
@@ -3361,8 +3524,22 @@ class NonbondedPotential:
                 direct_space_pairs,
             ),
             box_lengths_and_inverses=box_cache[1],
-            half_sigma=lj_invariants[0],
-            sqrt_epsilon=lj_invariants[1],
+            half_sigma=lj_invariants[2],
+            sqrt_epsilon=lj_invariants[3],
+            cache_identity=identity,
+            pair_force_ready=pair_force_ready,
+            tile_geometry=tiles,
+            tile_lj_enabled_mask=tile_lj_enabled_mask,
+            tile_lj_one_four_mask=tile_lj_one_four_mask,
+            tile_decline_reason=(
+                None
+                if tiles is None
+                else (
+                    "tile_force_route_not_selected"
+                    if pair_force_ready
+                    else "tile_pair_kernel_unsupported"
+                )
+            ),
         )
         object.__setattr__(self, "_force_binding_cache", binding)
         return binding
@@ -3377,6 +3554,8 @@ class NonbondedPotential:
         if not isinstance(binding, _NonbondedForceBinding):
             msg = "nonbonded force binding has an incompatible type"
             raise TypeError(msg)
+        if not binding.pair_force_ready:
+            return NotImplemented
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:
             msg = "positions must have shape (n_atoms, 3)"
@@ -3423,6 +3602,8 @@ class NonbondedPotential:
         if not isinstance(binding, _NonbondedForceBinding):
             msg = "nonbonded force binding has an incompatible type"
             raise TypeError(msg)
+        if not binding.pair_force_ready:
+            return NotImplemented
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:
             msg = "positions must have shape (n_atoms, 3)"
@@ -3804,7 +3985,7 @@ class NonbondedPotential:
             skin=shell,
             backend="mlx_cell_pairs",
             sort_pairs=False,
-        ).interactions
+        ).diagnostic_pairs
         if isinstance(pairs, NeighborBlocks):
             msg = "cutoff strain pairs require compact pairs"
             raise ValueError(msg)
@@ -3966,22 +4147,21 @@ class NonbondedPotential:
             raise ValueError(msg)
 
         shell = float(np.max(np.asarray(cell.lengths, dtype=np.float64))) * strain_epsilon * 1.1
-        blocks = build_neighbor_list(
+        direct_space_pairs = build_neighbor_list(
             positions,
             cell,
             cutoff=float(self.cutoff),
             skin=shell,
-            backend="mlx_cell_blocks",
+            backend="mlx_cell_pairs",
             sort_pairs=False,
-        ).interactions
-        if not isinstance(blocks, NeighborBlocks):
-            msg = "component-wise finite-strain virial requires neighbor blocks"
-            raise ValueError(msg)
+        ).diagnostic_pairs
 
-        left = blocks.left
-        right = blocks.right
-        topology_mask, lj_scales, _ = self._block_masks_and_scales(blocks)
-        sigma_ij, epsilon_ij = self._mixed_block_parameters(left, right)
+        left = direct_space_pairs[:, 0]
+        right = direct_space_pairs[:, 1]
+        topology_mask, lj_scales, _ = self._compact_pair_masks_and_scales(
+            direct_space_pairs,
+        )
+        sigma_ij, epsilon_ij = self.mixed_pair_parameters(direct_space_pairs)
         charge_products = self.charges[left] * self.charges[right]
         correction_pairs = (
             self._ewald_correction_pairs(),
@@ -4040,7 +4220,7 @@ class NonbondedPotential:
                     strained_positions[left] - strained_positions[right]
                 )
                 r2 = mx.sum(displacement * displacement, axis=-1)
-                cutoff_mask = blocks.valid_mask & (r2 > 0.0) & (r2 < self.cutoff * self.cutoff)
+                cutoff_mask = (r2 > 0.0) & (r2 < self.cutoff * self.cutoff)
                 lj_mask = topology_mask & cutoff_mask
                 safe_r2 = mx.where(cutoff_mask, r2, 1.0)
                 distance = mx.sqrt(safe_r2)
@@ -4065,7 +4245,7 @@ class NonbondedPotential:
                     strained_cell,
                     coulomb_constant=self.coulomb_constant,
                     config=self.pme_config,
-                    direct_space_pairs=blocks,
+                    direct_space_pairs=direct_space_pairs,
                 )
                 states.append(
                     {

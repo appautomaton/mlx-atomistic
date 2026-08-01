@@ -39,24 +39,29 @@ class _DemandCountingTerm:
 
     def __init__(self):
         self.calls = []
+        self.pair_candidates = []
 
     def _runtime_forces(self, positions, *, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("forces")
         return mx.zeros_like(positions)
 
     def _runtime_energy(self, positions, *, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("energy")
         return mx.sum(positions * 0.0)
 
     def energy_forces(self, positions, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("energy_forces")
         return mx.sum(positions * 0.0), mx.zeros_like(positions)
 
     def energy_forces_with_components(self, positions, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("diagnostic")
         energy = mx.sum(positions * 0.0)
         return energy, mx.zeros_like(positions), {"zero": energy}
@@ -70,7 +75,8 @@ class _DemandCountingTerm:
         masses=None,
         molecule_ids=None,
     ):
-        del cell, pairs, masses, molecule_ids
+        del cell, masses, molecule_ids
+        self.pair_candidates.append(pairs)
         self.calls.append("virial")
         return mx.zeros((3, 3), dtype=positions.dtype)
 
@@ -276,12 +282,19 @@ def test_internal_force_evaluation_falls_back_when_private_hook_declines(mode):
 def test_nvt_ordinary_steps_request_forces_and_boundaries_request_diagnostics():
     term = _DemandCountingTerm()
     positions = np.zeros((2, 3), dtype=np.float32)
+    cell = Cell.cubic(6.0)
 
     simulate_nvt(
         positions,
         np.zeros_like(positions),
-        cell=Cell.cubic(6.0),
+        cell=cell,
         force_terms=term,
+        neighbor_manager=NeighborListManager(
+            cell,
+            cutoff=2.5,
+            skin=0.4,
+            backend="mlx_cell_tiles",
+        ),
         config=SimulationConfig(
             dt=0.001,
             steps=3,
@@ -297,6 +310,8 @@ def test_nvt_ordinary_steps_request_forces_and_boundaries_request_diagnostics():
     )
 
     assert term.calls == ["diagnostic", "forces", "forces", "diagnostic"]
+    assert term.pair_candidates
+    assert all(isinstance(pairs, mx.array) for pairs in term.pair_candidates)
 
 
 def test_langevin_thermostat_validation():
