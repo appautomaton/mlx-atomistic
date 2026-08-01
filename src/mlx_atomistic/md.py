@@ -16,6 +16,7 @@ from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
     SettleWaterConstraints,
+    _project_constraint_positions_unchecked,
 )
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.force_runtime import (
@@ -2460,11 +2461,13 @@ def _validate_runtime_sync_reason(reason: str) -> None:
 
 
 def _constraint_profile_name(constraint: object, operation: str) -> str:
-    family = (
-        "settle"
-        if isinstance(constraint, SettleWaterConstraints)
-        else "generic_constraints"
-    )
+    family = getattr(constraint, "_profile_family", None)
+    if family is None:
+        family = (
+            "settle"
+            if isinstance(constraint, SettleWaterConstraints)
+            else "generic_constraints"
+        )
     return f"{family}_{operation}"
 
 
@@ -2476,25 +2479,36 @@ def _profile_constraint_positions(
     profiler: _ExclusiveRouteProfiler,
     *,
     reference_positions: mx.array | None = None,
+    validate: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """Apply position constraints while attributing SETTLE and generic work."""
 
     if not isinstance(constraints, CompositeConstraints):
         started = profiler.start()
-        step_projector = getattr(constraints, "apply_position_step", None)
-        if reference_positions is None or step_projector is None:
-            constrained, error = constraints.apply_positions(
-                predicted_positions,
-                masses,
-                cell,
-            )
+        if validate:
+            step_projector = getattr(constraints, "apply_position_step", None)
+            if reference_positions is None or step_projector is None:
+                constrained, error = constraints.apply_positions(
+                    predicted_positions,
+                    masses,
+                    cell,
+                )
+            else:
+                constrained, error = step_projector(
+                    reference_positions,
+                    predicted_positions,
+                    masses,
+                    cell,
+                )
         else:
-            constrained, error = step_projector(
-                reference_positions,
+            constrained = _project_constraint_positions_unchecked(
+                constraints,
                 predicted_positions,
                 masses,
                 cell,
+                reference_positions=reference_positions,
             )
+            error = _zero_constraint_error(constrained)
         profiler.finish(
             _constraint_profile_name(constraints, "position"),
             started,
@@ -2527,13 +2541,16 @@ def _profile_constraint_positions(
                 started,
                 constrained,
             )
-    validation_started = profiler.start()
-    error = constraints.max_error(constrained, cell)
-    profiler.finish(
-        "constraint_validation",
-        validation_started,
-        error,
-    )
+    if validate:
+        validation_started = profiler.start()
+        error = constraints.max_error(constrained, cell)
+        profiler.finish(
+            "constraint_validation",
+            validation_started,
+            error,
+        )
+    else:
+        error = _zero_constraint_error(constrained)
     return constrained, error
 
 
@@ -4386,6 +4403,16 @@ def _simulate_nvt(
         )
         current_step = config.initial_step + local_step
         current_time = config.initial_time + local_step * config.dt
+        diagnostic_step = _is_diagnostic_step(
+            current_step,
+            config,
+            final=local_step == config.steps,
+        )
+        sample_step = (
+            current_step % config.sample_interval == 0
+            or local_step == config.steps
+        )
+        validate_constraint_step = diagnostic_step or sample_step
         acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         if isinstance(thermostat, LangevinThermostat):
             velocities_half = state.velocities + 0.5 * config.dt * acceleration
@@ -4436,6 +4463,15 @@ def _simulate_nvt(
                     masses,
                     cell,
                     route_profiler,
+                    reference_positions=state.positions,
+                    validate=validate_constraint_step,
+                )
+            elif not validate_constraint_step:
+                next_positions = _project_constraint_positions_unchecked(
+                    constraints,
+                    next_positions,
+                    masses,
+                    cell,
                     reference_positions=state.positions,
                 )
             elif step_projector is None:
@@ -4510,11 +4546,6 @@ def _simulate_nvt(
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        diagnostic_step = _is_diagnostic_step(
-            current_step,
-            config,
-            final=local_step == config.steps,
-        )
         deferred_final = defer_final_diagnostics and local_step == config.steps
         full_diagnostic_step = diagnostic_step and not deferred_final
         force_start = perf_counter()
@@ -4699,7 +4730,7 @@ def _simulate_nvt(
             )
 
         sampled_state_evaluated = False
-        if current_step % config.sample_interval == 0 or local_step == config.steps:
+        if sample_step:
             _materialize_sampled_state(
                 state,
                 runtime_sync=runtime_sync,

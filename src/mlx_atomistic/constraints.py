@@ -8,6 +8,12 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.metal_kernels import (
+    _settle_water_position_deltas,
+    _settle_water_velocity_deltas,
+    _shake_cluster_position_deltas,
+    _shake_cluster_velocity_deltas,
+)
 
 
 def _empty_pairs() -> mx.array:
@@ -185,6 +191,250 @@ class DistanceConstraints:
 
 
 @dataclass(frozen=True)
+class _ShakeClusterConstraints:
+    """Disjoint central-atom SHAKE clusters with one to three peripherals."""
+
+    cluster_atoms: object
+    peripheral_counts: object
+    distances: object
+    tolerance: float = 1e-5
+    max_iterations: int = 8
+
+    def __post_init__(self) -> None:
+        cluster_atoms = np.asarray(self.cluster_atoms, dtype=np.int32)
+        if cluster_atoms.size == 0:
+            cluster_atoms = np.empty((0, 4), dtype=np.int32)
+        if cluster_atoms.ndim != 2 or cluster_atoms.shape[1] != 4:
+            msg = "SHAKE cluster atoms must have shape (n_clusters, 4)"
+            raise ValueError(msg)
+        peripheral_counts = np.asarray(self.peripheral_counts, dtype=np.int32)
+        if peripheral_counts.shape != (cluster_atoms.shape[0],):
+            msg = "SHAKE peripheral counts must have shape (n_clusters,)"
+            raise ValueError(msg)
+        if np.any((peripheral_counts < 1) | (peripheral_counts > 3)):
+            msg = "SHAKE clusters require one to three peripheral atoms"
+            raise ValueError(msg)
+        distances = np.asarray(self.distances, dtype=np.float32)
+        if distances.ndim == 0:
+            distances = np.full(
+                (cluster_atoms.shape[0],),
+                float(distances),
+                dtype=np.float32,
+            )
+        if distances.shape != (cluster_atoms.shape[0],):
+            msg = "SHAKE distances must be scalar or have shape (n_clusters,)"
+            raise ValueError(msg)
+        if np.any(distances <= 0.0):
+            msg = "SHAKE distances must be positive"
+            raise ValueError(msg)
+        if self.tolerance <= 0.0:
+            msg = "SHAKE tolerance must be positive"
+            raise ValueError(msg)
+        if self.max_iterations <= 0:
+            msg = "SHAKE max_iterations must be positive"
+            raise ValueError(msg)
+
+        pair_rows: list[tuple[int, int]] = []
+        pair_distances: list[float] = []
+        scatter_rows: list[int] = []
+        scatter_slots: list[int] = []
+        scatter_atoms: list[int] = []
+        owned_atoms: set[int] = set()
+        for row, count in enumerate(peripheral_counts.tolist()):
+            active = cluster_atoms[row, : count + 1]
+            padding = cluster_atoms[row, count + 1 :]
+            if np.any(active < 0) or np.any(padding != -1):
+                msg = "SHAKE clusters require active atoms followed by -1 padding"
+                raise ValueError(msg)
+            active_atoms = [int(value) for value in active.tolist()]
+            if len(set(active_atoms)) != len(active_atoms):
+                msg = "SHAKE cluster atoms must be distinct"
+                raise ValueError(msg)
+            if owned_atoms.intersection(active_atoms):
+                msg = "SHAKE clusters must own disjoint atom sets"
+                raise ValueError(msg)
+            owned_atoms.update(active_atoms)
+            center = active_atoms[0]
+            for slot, peripheral in enumerate(active_atoms[1:], start=1):
+                pair_rows.append((center, peripheral))
+                pair_distances.append(float(distances[row]))
+                scatter_rows.append(row)
+                scatter_slots.append(slot)
+                scatter_atoms.append(peripheral)
+            scatter_rows.append(row)
+            scatter_slots.append(0)
+            scatter_atoms.append(center)
+
+        pairs = np.asarray(pair_rows, dtype=np.int32).reshape((-1, 2))
+        object.__setattr__(self, "cluster_atoms", mx.array(cluster_atoms, dtype=mx.int32))
+        object.__setattr__(
+            self,
+            "peripheral_counts",
+            mx.array(peripheral_counts, dtype=mx.int32),
+        )
+        object.__setattr__(self, "distances", as_mx_array(distances))
+        object.__setattr__(
+            self,
+            "_pair_constraints",
+            DistanceConstraints(
+                pairs,
+                distances=np.asarray(pair_distances, dtype=np.float32),
+                tolerance=self.tolerance,
+                max_iterations=self.max_iterations,
+            ),
+        )
+        object.__setattr__(self, "pairs", self._pair_constraints.pairs)
+        object.__setattr__(
+            self,
+            "_scatter_rows",
+            mx.array(np.asarray(scatter_rows, dtype=np.int32), dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
+            "_scatter_slots",
+            mx.array(np.asarray(scatter_slots, dtype=np.int32), dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
+            "_scatter_atoms",
+            mx.array(np.asarray(scatter_atoms, dtype=np.int32), dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
+            "_max_pair_index",
+            max(owned_atoms, default=-1),
+        )
+        object.__setattr__(self, "_profile_family", "shake_clusters")
+
+    @property
+    def cluster_count(self) -> int:
+        """Number of independent SHAKE clusters."""
+
+        return int(self.cluster_atoms.shape[0])
+
+    def _metal_compatible(self, cell: Cell | None) -> bool:
+        return bool(
+            mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+            and (cell is None or cell.is_orthorhombic)
+        )
+
+    @staticmethod
+    def _box(cell: Cell | None) -> mx.array:
+        return (
+            mx.ones((3,), dtype=mx.float32)
+            if cell is None
+            else mx.diag(cell.matrix)
+        )
+
+    def _scatter_deltas(self, values: mx.array, deltas: mx.array) -> mx.array:
+        return values.at[self._scatter_atoms].add(
+            deltas[self._scatter_rows, self._scatter_slots]
+        )
+
+    def max_error(self, positions, cell: Cell | None = None) -> mx.array:
+        """Return the maximum absolute distance error across all clusters."""
+
+        return self._pair_constraints.max_error(positions, cell)
+
+    def apply_positions(
+        self,
+        positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Project an arbitrary geometry through the reference SHAKE fallback."""
+
+        return self._pair_constraints.apply_positions(positions, masses, cell)
+
+    def apply_position_step(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Project one dynamics step with cluster-local Metal ownership."""
+
+        reference = as_mx_array(reference_positions)
+        predicted = as_mx_array(predicted_positions)
+        masses = as_mx_array(masses)
+        if self.cluster_count == 0:
+            return predicted, self.max_error(predicted, cell)
+        if reference.shape != predicted.shape:
+            msg = "reference_positions and predicted_positions must have matching shapes"
+            raise ValueError(msg)
+        if self._max_pair_index >= predicted.shape[0]:
+            msg = "SHAKE cluster atom index outside positions"
+            raise ValueError(msg)
+        if masses.shape != (predicted.shape[0],):
+            msg = "masses must have shape (n_particles,)"
+            raise ValueError(msg)
+        if not self._metal_compatible(cell):
+            return self._pair_constraints.apply_position_step(
+                reference,
+                predicted,
+                masses,
+                cell,
+            )
+        deltas = _shake_cluster_position_deltas(
+            reference,
+            predicted,
+            masses,
+            self.cluster_atoms,
+            self.peripheral_counts,
+            self.distances,
+            self._box(cell),
+            max_iterations=self.max_iterations,
+            periodic=cell is not None,
+        )
+        constrained = self._scatter_deltas(predicted, deltas)
+        return constrained, self.max_error(constrained, cell)
+
+    def apply_velocities(
+        self,
+        positions,
+        velocities,
+        masses,
+        cell: Cell | None = None,
+    ) -> mx.array:
+        """Remove cluster-constrained relative velocity components."""
+
+        positions = as_mx_array(positions)
+        velocities = as_mx_array(velocities)
+        masses = as_mx_array(masses)
+        if self.cluster_count == 0:
+            return velocities
+        if self._max_pair_index >= positions.shape[0]:
+            msg = "SHAKE cluster atom index outside positions"
+            raise ValueError(msg)
+        if positions.shape != velocities.shape:
+            msg = "positions and velocities must have matching shapes"
+            raise ValueError(msg)
+        if masses.shape != (positions.shape[0],):
+            msg = "masses must have shape (n_particles,)"
+            raise ValueError(msg)
+        if not self._metal_compatible(cell):
+            return self._pair_constraints.apply_velocities(
+                positions,
+                velocities,
+                masses,
+                cell,
+            )
+        deltas = _shake_cluster_velocity_deltas(
+            positions,
+            velocities,
+            masses,
+            self.cluster_atoms,
+            self.peripheral_counts,
+            self._box(cell),
+            max_iterations=self.max_iterations,
+            periodic=cell is not None,
+        )
+        return self._scatter_deltas(velocities, deltas)
+
+
+@dataclass(frozen=True)
 class SettleWaterConstraints:
     """Analytical rigid-water constraints for `(oxygen, hydrogen, hydrogen)` triplets."""
 
@@ -248,6 +498,32 @@ class SettleWaterConstraints:
         object.__setattr__(self, "distances", self._pair_constraints.distances)
         max_index = int(np.max(waters)) if waters.size else -1
         object.__setattr__(self, "_max_pair_index", max_index)
+        object.__setattr__(
+            self,
+            "_disjoint_waters",
+            len(set(int(value) for value in waters.reshape(-1))) == waters.size,
+        )
+        object.__setattr__(self, "_profile_family", "settle")
+
+    def _metal_compatible(self, cell: Cell | None) -> bool:
+        return bool(
+            self._disjoint_waters
+            and mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+            and (cell is None or cell.is_orthorhombic)
+        )
+
+    @staticmethod
+    def _box(cell: Cell | None) -> mx.array:
+        return (
+            mx.ones((3,), dtype=mx.float32)
+            if cell is None
+            else mx.diag(cell.matrix)
+        )
+
+    def _scatter_deltas(self, values: mx.array, deltas: mx.array) -> mx.array:
+        atoms = mx.reshape(self.waters, (-1,))
+        return values.at[atoms].add(mx.reshape(deltas, (-1, 3)))
 
     def max_error(self, positions, cell: Cell | None = None) -> mx.array:
         """Return the maximum absolute SETTLE distance error."""
@@ -358,6 +634,20 @@ class SettleWaterConstraints:
         if masses.shape != (predicted.shape[0],):
             msg = "masses must have shape (n_particles,)"
             raise ValueError(msg)
+
+        if self._metal_compatible(cell):
+            deltas = _settle_water_position_deltas(
+                reference,
+                predicted,
+                masses,
+                self.waters,
+                self._box(cell),
+                oh_distance=self.oh_distance,
+                hh_distance=self.hh_distance,
+                periodic=cell is not None,
+            )
+            constrained = self._scatter_deltas(predicted, deltas)
+            return constrained, self.max_error(constrained, cell)
 
         oxygen = self.waters[:, 0]
         hydrogen_a = self.waters[:, 1]
@@ -533,6 +823,17 @@ class SettleWaterConstraints:
         if masses.shape != (positions.shape[0],):
             msg = "masses must have shape (n_particles,)"
             raise ValueError(msg)
+
+        if self._metal_compatible(cell):
+            deltas = _settle_water_velocity_deltas(
+                positions,
+                constrained,
+                masses,
+                self.waters,
+                self._box(cell),
+                periodic=cell is not None,
+            )
+            return self._scatter_deltas(constrained, deltas)
 
         oxygen = self.waters[:, 0]
         hydrogen_a = self.waters[:, 1]
@@ -793,6 +1094,42 @@ class CompositeConstraints:
                 cell,
             )
         return constrained
+
+
+def _project_constraint_positions_unchecked(
+    constraints: object,
+    predicted_positions,
+    masses,
+    cell: Cell | None = None,
+    *,
+    reference_positions=None,
+) -> mx.array:
+    """Project positions without constructing a retained error diagnostic."""
+
+    constrained = as_mx_array(predicted_positions)
+    if isinstance(constraints, CompositeConstraints):
+        cycles = 8 if constraints._requires_iteration else 1
+        for _ in range(cycles):
+            for child in constraints.constraints:
+                constrained = _project_constraint_positions_unchecked(
+                    child,
+                    constrained,
+                    masses,
+                    cell,
+                    reference_positions=reference_positions,
+                )
+        return constrained
+    step_projector = getattr(constraints, "apply_position_step", None)
+    if reference_positions is None or step_projector is None:
+        constrained, _ = constraints.apply_positions(constrained, masses, cell)
+    else:
+        constrained, _ = step_projector(
+            reference_positions,
+            constrained,
+            masses,
+            cell,
+        )
+    return constrained
 
 
 def _unit_vectors_mx(values: mx.array, fallback: mx.array) -> mx.array:

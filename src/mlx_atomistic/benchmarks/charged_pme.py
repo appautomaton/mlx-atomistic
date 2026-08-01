@@ -35,6 +35,74 @@ _PROFILE_STATE_RTOL = 5.0e-5
 _PROFILE_STATE_ATOL = 1.0e-5
 
 
+def _constraint_route_inventory(
+    constraints: object | None,
+    *,
+    water_atom_count: int,
+    molecule_ids_present: bool,
+) -> dict[str, Any]:
+    """Summarize the runtime constraint routes selected from one artifact."""
+
+    routes = {
+        "settle": {"object_count": 0, "cluster_count": 0, "pair_count": 0},
+        "shake_clusters": {
+            "object_count": 0,
+            "cluster_count": 0,
+            "pair_count": 0,
+            "peripheral_count_histogram": {},
+        },
+        "generic": {"object_count": 0, "pair_count": 0},
+    }
+
+    def visit(constraint: object) -> None:
+        children = getattr(constraint, "constraints", None)
+        if children is not None:
+            for child in children:
+                visit(child)
+            return
+        pair_count = int(constraint.pairs.shape[0])
+        family = getattr(constraint, "_profile_family", None)
+        if family == "shake_clusters":
+            route = routes["shake_clusters"]
+            route["object_count"] += 1
+            route["cluster_count"] += int(constraint.cluster_count)
+            route["pair_count"] += pair_count
+            histogram = route["peripheral_count_histogram"]
+            for count in np.asarray(constraint.peripheral_counts, dtype=np.int32):
+                key = str(int(count))
+                histogram[key] = int(histogram.get(key, 0)) + 1
+        elif hasattr(constraint, "waters"):
+            route = routes["settle"]
+            route["object_count"] += 1
+            route["cluster_count"] += int(constraint.waters.shape[0])
+            route["pair_count"] += pair_count
+        else:
+            route = routes["generic"]
+            route["object_count"] += 1
+            route["pair_count"] += pair_count
+
+    if constraints is not None:
+        visit(constraints)
+    total_pair_count = sum(int(route["pair_count"]) for route in routes.values())
+    expected_pair_count = (
+        0 if constraints is None else int(constraints.pairs.shape[0])
+    )
+    water_route_complete = water_atom_count == 0 or (
+        molecule_ids_present and int(routes["settle"]["pair_count"]) > 0
+    )
+    return {
+        "routes": routes,
+        "total_pair_count": total_pair_count,
+        "expected_pair_count": expected_pair_count,
+        "pair_count_matches": total_pair_count == expected_pair_count,
+        "water_atom_count": int(water_atom_count),
+        "molecule_ids_present": bool(molecule_ids_present),
+        "performance_eligible": bool(
+            total_pair_count == expected_pair_count and water_route_complete
+        ),
+    }
+
+
 def prepare_payload(
     *,
     source: str | Path,
@@ -338,6 +406,15 @@ def runtime_payload(
             is not None,
             "nonbonded_pair_count": topology.nonbonded_pair_count,
         }
+        water_mask = np.asarray(
+            artifact.arrays.get("water_mask", np.asarray([], dtype=bool)),
+            dtype=bool,
+        )
+        constraint_routes = _constraint_route_inventory(
+            constraints,
+            water_atom_count=int(np.count_nonzero(water_mask[: artifact.atom_count])),
+            molecule_ids_present=artifact.molecule_ids.shape == (artifact.atom_count,),
+        )
         neighbor_report = {
             **measured_result.nonbonded_report,
             "manager_backend": neighbor_manager.backend,
@@ -372,6 +449,10 @@ def runtime_payload(
             "plan_reused_in_measurement": final_plan["reuse_count"] > reuse_after_warmup,
             "lazy_topology": topology_report["pair_policy"] == "lazy",
             "pair_cache_unmaterialized": not topology_report["pair_cache_materialized"],
+            "constraint_route_pair_count": constraint_routes["pair_count_matches"],
+            "performance_eligible_constraint_routes": constraint_routes[
+                "performance_eligible"
+            ],
             "compact_neighbor_pairs": (
                 neighbor_report["manager_backend"] == "mlx_cell_pairs"
                 and neighbor_report["representation"] == "pairs"
@@ -406,6 +487,7 @@ def runtime_payload(
             "pme": _pme_payload(nonbonded.pme_config),
             "plan": final_plan,
             "topology": topology_report,
+            "constraint_routes": constraint_routes,
             "neighbor": neighbor_report,
             "checks": checks,
             "finite": finite,

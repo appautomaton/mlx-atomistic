@@ -6,6 +6,7 @@ from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
     SettleWaterConstraints,
+    _ShakeClusterConstraints,
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.md import (
@@ -138,6 +139,86 @@ def test_distance_dynamics_step_matches_openmm_reference_oracle():
         rtol=0.0,
         atol=2.0e-7,
     )
+
+
+def test_disjoint_shake_clusters_match_generic_cpu_projection():
+    cluster_atoms = np.asarray(
+        [[0, 1, 2, 3], [4, 5, -1, -1]],
+        dtype=np.int32,
+    )
+    constraints = _ShakeClusterConstraints(
+        cluster_atoms,
+        peripheral_counts=[3, 1],
+        distances=[1.0, 1.2],
+        max_iterations=8,
+    )
+    reference = np.asarray(
+        [
+            [2.0, 2.0, 2.0],
+            [3.0, 2.0, 2.0],
+            [2.0, 3.0, 2.0],
+            [2.0, 2.0, 3.0],
+            [5.0, 5.0, 5.0],
+            [6.2, 5.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+    predicted = reference + np.asarray(
+        [
+            [0.02, -0.01, 0.01],
+            [-0.03, 0.02, 0.0],
+            [0.01, -0.02, 0.02],
+            [0.0, 0.01, -0.02],
+            [-0.01, 0.0, 0.02],
+            [0.03, -0.01, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    velocities = np.asarray(
+        [
+            [0.2, -0.1, 0.3],
+            [-0.3, 0.2, 0.1],
+            [0.1, -0.2, 0.0],
+            [0.0, 0.1, -0.2],
+            [0.4, -0.2, 0.1],
+            [-0.1, 0.3, -0.2],
+        ],
+        dtype=np.float32,
+    )
+    masses = np.asarray([12.0, 1.0, 1.0, 1.0, 14.0, 1.0], dtype=np.float32)
+    cell = Cell.cubic(12.0)
+
+    projected, error = constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    expected_positions, expected_error = constraints._pair_constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    projected_velocities = constraints.apply_velocities(
+        projected,
+        velocities,
+        masses,
+        cell,
+    )
+    expected_velocities = constraints._pair_constraints.apply_velocities(
+        expected_positions,
+        velocities,
+        masses,
+        cell,
+    )
+
+    np.testing.assert_allclose(np.asarray(projected), np.asarray(expected_positions))
+    np.testing.assert_allclose(
+        np.asarray(projected_velocities),
+        np.asarray(expected_velocities),
+    )
+    np.testing.assert_allclose(np.asarray(error), np.asarray(expected_error))
 
 
 def test_settle_water_constraints_project_positions_exactly():

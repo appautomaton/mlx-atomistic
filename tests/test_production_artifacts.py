@@ -18,6 +18,7 @@ from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
     SettleWaterConstraints,
+    _ShakeClusterConstraints,
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.minimize import minimize_energy
@@ -375,6 +376,52 @@ def test_artifact_constraints_partition_rigid_waters_from_residual_bonds():
     np.testing.assert_array_equal(np.asarray(settle.waters), [[0, 1, 2]])
     np.testing.assert_array_equal(np.asarray(remaining.pairs), [[3, 4]])
     assert remaining.max_iterations == 8
+
+
+def test_artifact_constraints_partition_disjoint_star_clusters_after_settle():
+    arrays = {
+        "symbols": np.asarray(
+            ["O", "H", "H", "C", "H", "H", "N", "H"],
+            dtype=str,
+        ),
+        "water_mask": np.asarray(
+            [True, True, True, False, False, False, False, False],
+            dtype=bool,
+        ),
+        "molecule_ids": np.asarray([0, 0, 0, 1, 1, 1, 2, 2], dtype=np.int32),
+        "masses": np.asarray(
+            [16.0, 1.0, 1.0, 12.0, 1.0, 1.0, 14.0, 1.0],
+            dtype=np.float32,
+        ),
+    }
+    pairs = np.asarray(
+        [[0, 1], [0, 2], [1, 2], [3, 4], [3, 5], [6, 7]],
+        dtype=np.int32,
+    )
+    distances = np.asarray(
+        [0.9572, 0.9572, 1.5139, 1.09, 1.09, 1.01],
+        dtype=np.float32,
+    )
+
+    constraints = _runtime_constraints_from_artifact(
+        arrays,
+        pairs,
+        distances,
+        system_atom_count=8,
+        max_iterations=40,
+    )
+
+    assert isinstance(constraints, CompositeConstraints)
+    settle, shake = constraints.constraints
+    assert isinstance(settle, SettleWaterConstraints)
+    assert isinstance(shake, _ShakeClusterConstraints)
+    assert not constraints._requires_iteration
+    np.testing.assert_array_equal(
+        np.asarray(shake.cluster_atoms),
+        [[3, 4, 5, -1], [6, 7, -1, -1]],
+    )
+    np.testing.assert_array_equal(np.asarray(shake.peripheral_counts), [2, 1])
+    np.testing.assert_allclose(np.asarray(shake.distances), [1.09, 1.01])
 
 
 def test_artifact_constraints_fail_closed_when_water_topology_is_incomplete():
