@@ -13,6 +13,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_atomistic.constraints import SettleWaterConstraints, _ShakeClusterConstraints
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
@@ -57,6 +58,160 @@ def _on_gpu(monkeypatch):
     yield
     mx.set_default_device(prev_device)
     mx.set_default_stream(mx.new_stream(prev_device))
+
+
+@pytest.mark.gpu
+def test_disjoint_shake_cluster_kernel_matches_mlx_reference():
+    """Cluster-owned SHAKE/RATTLE matches the pairwise MLX oracle on Metal."""
+
+    constraints = _ShakeClusterConstraints(
+        [[0, 1, 2, 3], [4, 5, -1, -1]],
+        peripheral_counts=[3, 1],
+        distances=[1.0, 1.2],
+        max_iterations=8,
+    )
+    reference = mx.array(
+        [
+            [2.0, 2.0, 2.0],
+            [3.0, 2.0, 2.0],
+            [2.0, 3.0, 2.0],
+            [2.0, 2.0, 3.0],
+            [5.0, 5.0, 5.0],
+            [6.2, 5.0, 5.0],
+        ],
+        dtype=mx.float32,
+    )
+    predicted = reference + mx.array(
+        [
+            [0.02, -0.01, 0.01],
+            [-0.03, 0.02, 0.0],
+            [0.01, -0.02, 0.02],
+            [0.0, 0.01, -0.02],
+            [-0.01, 0.0, 0.02],
+            [0.03, -0.01, 0.0],
+        ],
+        dtype=mx.float32,
+    )
+    velocities = mx.array(
+        [
+            [0.2, -0.1, 0.3],
+            [-0.3, 0.2, 0.1],
+            [0.1, -0.2, 0.0],
+            [0.0, 0.1, -0.2],
+            [0.4, -0.2, 0.1],
+            [-0.1, 0.3, -0.2],
+        ],
+        dtype=mx.float32,
+    )
+    masses = mx.array([12.0, 1.0, 1.0, 1.0, 14.0, 1.0], dtype=mx.float32)
+    cell = Cell.cubic(12.0)
+
+    expected_positions, _ = constraints._pair_constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    actual_positions, actual_error = constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    expected_velocities = constraints._pair_constraints.apply_velocities(
+        expected_positions,
+        velocities,
+        masses,
+        cell,
+    )
+    actual_velocities = constraints.apply_velocities(
+        actual_positions,
+        velocities,
+        masses,
+        cell,
+    )
+    mx.eval(
+        expected_positions,
+        actual_positions,
+        expected_velocities,
+        actual_velocities,
+        actual_error,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_positions),
+        np.asarray(expected_positions),
+        rtol=1.0e-6,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_velocities),
+        np.asarray(expected_velocities),
+        rtol=1.0e-5,
+        atol=2.0e-6,
+    )
+    assert float(np.asarray(actual_error)) <= 1.0e-5
+
+
+@pytest.mark.gpu
+def test_settle_water_kernels_match_openmm_position_oracle():
+    """Fused SETTLE position and velocity kernels preserve the reference step."""
+
+    class ZeroForce:
+        supports_virial = True
+
+        def energy_forces(self, values, cell=None, pairs=None):
+            del cell, pairs
+            return mx.sum(values[:, 0] * 0.0), mx.zeros_like(values)
+
+    positions = mx.array(
+        [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.0125, 0.099215674, 0.0]],
+        dtype=mx.float32,
+    )
+    velocities = mx.array(
+        [[0.12, -0.08, 0.04], [-0.31, 0.27, 0.09], [0.22, -0.14, -0.05]],
+        dtype=mx.float32,
+    )
+    constraints = SettleWaterConstraints(
+        [(0, 1, 2)],
+        oh_distance=0.1,
+        hh_distance=0.15,
+    )
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=mx.array([16.0, 1.0, 1.0], dtype=mx.float32),
+        force_terms=ZeroForce(),
+        constraints=constraints,
+        config=SimulationConfig(
+            dt=0.004,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(temperature=0.0, friction=0.0, seed=5),
+    )
+    mx.eval(result.final_state.positions, result.final_state.velocities)
+    expected_positions = np.asarray(
+        [
+            [0.00043289735, -0.00027857105, 0.00016],
+            [0.10043156888, 0.00019681351, 0.00036],
+            [-0.01253792644, 0.09887599732, -0.0002],
+        ]
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_state.positions),
+        expected_positions,
+        rtol=0.0,
+        atol=3.0e-7,
+    )
+    final_positions = np.asarray(result.final_state.positions)
+    final_velocities = np.asarray(result.final_state.velocities)
+    for left, right in np.asarray(constraints.pairs):
+        displacement = final_positions[left] - final_positions[right]
+        relative_velocity = final_velocities[left] - final_velocities[right]
+        assert abs(float(np.dot(displacement, relative_velocity))) < 2.0e-6
 
 
 @pytest.mark.gpu

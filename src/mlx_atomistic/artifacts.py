@@ -16,6 +16,7 @@ from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
     SettleWaterConstraints,
+    _ShakeClusterConstraints,
 )
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.forcefields import (
@@ -1966,36 +1967,177 @@ def _runtime_constraints_from_artifact(
     *,
     system_atom_count: int,
     max_iterations: int,
-) -> DistanceConstraints | SettleWaterConstraints | CompositeConstraints:
+) -> (
+    DistanceConstraints
+    | SettleWaterConstraints
+    | _ShakeClusterConstraints
+    | CompositeConstraints
+):
     partition = _rigid_water_constraint_partition(
         arrays,
         pairs,
         distances,
         system_atom_count=system_atom_count,
     )
-    if partition is None:
+    water_mask = np.asarray(
+        arrays.get("water_mask", np.asarray([], dtype=bool)),
+        dtype=bool,
+    )
+    if partition is None and bool(np.any(water_mask[:system_atom_count])):
         return DistanceConstraints(
             pairs,
             distances=distances,
             max_iterations=max_iterations,
         )
 
-    waters, water_rows, oh_distance, hh_distance = partition
-    settle = SettleWaterConstraints(
-        waters,
-        oh_distance=oh_distance,
-        hh_distance=hh_distance,
-    )
+    children: list[object] = []
     remaining_mask = np.ones((pairs.shape[0],), dtype=bool)
-    remaining_mask[water_rows] = False
-    if not np.any(remaining_mask):
-        return settle
-    remaining = DistanceConstraints(
+    if partition is not None:
+        waters, water_rows, oh_distance, hh_distance = partition
+        children.append(
+            SettleWaterConstraints(
+                waters,
+                oh_distance=oh_distance,
+                hh_distance=hh_distance,
+            )
+        )
+        remaining_mask[water_rows] = False
+
+    remaining_rows = np.flatnonzero(remaining_mask)
+    shake_partition = _shake_cluster_constraint_partition(
+        arrays,
         pairs[remaining_mask],
-        distances=distances[remaining_mask],
-        max_iterations=min(max_iterations, 8),
+        distances[remaining_mask],
+        system_atom_count=system_atom_count,
     )
-    return CompositeConstraints((settle, remaining))
+    if shake_partition is not None:
+        cluster_atoms, peripheral_counts, cluster_distances, shake_rows = (
+            shake_partition
+        )
+        children.append(
+            _ShakeClusterConstraints(
+                cluster_atoms,
+                peripheral_counts,
+                cluster_distances,
+                max_iterations=min(max_iterations, 8),
+            )
+        )
+        remaining_mask[remaining_rows[shake_rows]] = False
+
+    if np.any(remaining_mask):
+        children.append(
+            DistanceConstraints(
+                pairs[remaining_mask],
+                distances=distances[remaining_mask],
+                max_iterations=(
+                    min(max_iterations, 8) if children else max_iterations
+                ),
+            )
+        )
+    if len(children) == 1:
+        return children[0]
+    return CompositeConstraints(tuple(children))
+
+
+def _shake_cluster_constraint_partition(
+    arrays: dict[str, np.ndarray],
+    pairs: np.ndarray,
+    distances: np.ndarray,
+    *,
+    system_atom_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Select independent equal-peripheral star clusters for SHAKE/RATTLE."""
+
+    pairs = np.asarray(pairs, dtype=np.int32).reshape((-1, 2))
+    distances = np.asarray(distances, dtype=np.float32)
+    masses = np.asarray(
+        arrays.get("masses", np.asarray([], dtype=np.float32)),
+        dtype=np.float32,
+    )
+    if pairs.shape[0] == 0 or masses.shape[0] < system_atom_count:
+        return None
+    masses = masses[:system_atom_count]
+
+    atom_rows: dict[int, list[int]] = {}
+    for row, (left, right) in enumerate(pairs.tolist()):
+        atom_rows.setdefault(int(left), []).append(row)
+        atom_rows.setdefault(int(right), []).append(row)
+
+    selected_clusters: list[list[int]] = []
+    selected_counts: list[int] = []
+    selected_distances: list[float] = []
+    selected_rows: list[int] = []
+    unseen = set(range(pairs.shape[0]))
+    while unseen:
+        seed = min(unseen)
+        component_rows: set[int] = set()
+        pending = [seed]
+        while pending:
+            row = pending.pop()
+            if row in component_rows:
+                continue
+            component_rows.add(row)
+            unseen.discard(row)
+            left, right = pairs[row]
+            pending.extend(atom_rows[int(left)])
+            pending.extend(atom_rows[int(right)])
+
+        ordered_rows = sorted(component_rows)
+        edge_count = len(ordered_rows)
+        if edge_count < 1 or edge_count > 3:
+            continue
+        degrees: dict[int, int] = {}
+        for row in ordered_rows:
+            left, right = (int(value) for value in pairs[row])
+            degrees[left] = degrees.get(left, 0) + 1
+            degrees[right] = degrees.get(right, 0) + 1
+        if len(degrees) != edge_count + 1:
+            continue
+        if edge_count == 1:
+            center = int(pairs[ordered_rows[0], 0])
+        else:
+            centers = [atom for atom, degree in degrees.items() if degree == edge_count]
+            if len(centers) != 1:
+                continue
+            center = centers[0]
+        peripherals = sorted(atom for atom in degrees if atom != center)
+        if (
+            len(peripherals) != edge_count
+            or any(degrees[atom] != 1 for atom in peripherals)
+            or any(center not in pairs[row] for row in ordered_rows)
+        ):
+            continue
+        component_distances = distances[ordered_rows]
+        if not np.allclose(
+            component_distances,
+            component_distances[0],
+            rtol=1.0e-5,
+            atol=1.0e-6,
+        ):
+            continue
+        peripheral_masses = masses[peripherals]
+        if not np.allclose(
+            peripheral_masses,
+            peripheral_masses[0],
+            rtol=1.0e-5,
+            atol=1.0e-6,
+        ):
+            continue
+        cluster = [center, *peripherals]
+        cluster.extend([-1] * (4 - len(cluster)))
+        selected_clusters.append(cluster)
+        selected_counts.append(edge_count)
+        selected_distances.append(float(component_distances[0]))
+        selected_rows.extend(ordered_rows)
+
+    if not selected_clusters:
+        return None
+    return (
+        np.asarray(selected_clusters, dtype=np.int32),
+        np.asarray(selected_counts, dtype=np.int32),
+        np.asarray(selected_distances, dtype=np.float32),
+        np.asarray(sorted(selected_rows), dtype=np.int32),
+    )
 
 
 def _rigid_water_constraint_partition(

@@ -44,14 +44,12 @@ The first exact 8x8 atom-tile implementation was parity-correct but slower end
 to end and has been removed; it is evidence for a different future layout, not
 an alternate production backend.
 
-The remaining candidates, in priority order, are:
-
-- a spatially coherent direct-force layout that avoids both the global compact-
-  pair scan and the rejected 8x8 tile route's padded-lane expansion;
-- fused rigid-water position and velocity projection, after an independent
-  parity gate for the full SETTLE update;
-- further neighbor rebuild work only when a matched trajectory shows it beats
-  the retained fixed-cell topology cache.
+The current production path also uses specialized rigid-water/constraint
+kernels and one fused standard-bonded force dispatch. The next candidate is a
+spatially coherent direct-force layout that avoids both the global compact-pair
+scan and the rejected 8x8 tile route's padded-lane expansion. Further neighbor
+rebuild work is lower priority unless a fresh profile moves it above direct
+force evaluation.
 
 For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
 large-system route uses `mlx_cell_pairs`. The historical implementation used
@@ -127,9 +125,66 @@ kernel by about 25%. Alternating 75-step trajectories reduced median measured
 time from 5.1243 to 4.8785 seconds (4.8%) while keeping constraint residuals
 near 1.5e-5 A. A bounded 92,001-atom GPCRmd 729 run also passed all finite-state,
 constraint, HMR, PME-plan reuse, trajectory, and checkpoint checks with a
-5.60 GB process peak. The provisional one-order-of-magnitude target requires
-a stable complete time at or below 16.8615 seconds and has not yet been
-demonstrated.
+5.60 GB process peak. At that point, the provisional one-order-of-magnitude
+target still required a stable complete time at or below 16.8615 seconds and
+had not yet been demonstrated.
+
+### Complete-step pipeline result
+
+The 2026-08-01 pipeline pass used the same 94,232-atom JAC 2x2x1 system,
+9 A cutoff, 128x128x64 PME mesh, 4 fs timestep, 300 K target, 1/ps friction,
+ten warmup steps, and 75 measured steps throughout. It retained two changes:
+
+1. The 89,160 constraints are partitioned once into 28,092 exact three-site
+   SETTLE waters and 3,160 disjoint SHAKE clusters. The recurring position and
+   velocity projections use their specialized batched Metal kernels; no JAC
+   constraint remains on the generic path.
+2. Ordinary force-only steps combine the standard bond, angle, periodic
+   torsion, and improper families into one atomic Metal output. This removes
+   four dense 94,232x3 force outputs, their four outer additions, and the
+   equivalent of 13 separate scatter stages. Energy, virial, and component
+   diagnostics still use the original independently tested force terms.
+
+| Retained state | 75-step wall time | Change from corrected control |
+| --- | ---: | ---: |
+| Corrected pipeline control | 1.588653 s | baseline |
+| Specialized constraints | 1.142599--1.190142 s | 25.1--28.1% lower |
+| Constraints plus fused bonded forces, two-run median | 1.003149 s | 36.9% lower |
+| Matched OpenMM/OpenCL, single precision | 0.102947 s | reference |
+
+The final MLX/OpenMM ratio is `9.7586x`, so this named workload now meets the
+one-order-of-magnitude stretch target, narrowly. The manifest-bound comparison
+matches atom and force-term inventory, cell, PME method/cutoff/alpha/mesh,
+constraints, fixed-cell Langevin-middle protocol, timestep, warmups, measured
+steps, and timing boundary. Both engines include explicit final-device
+completion in the timer and exclude initialization and I/O. Their random-number
+implementations differ, so this is matched protocol throughput rather than
+trajectory identity.
+
+The two fused MLX samples were 1.001684 and 1.004613 seconds. The latter had a
+`3.21e-5 A` maximum constraint residual and a 3.86 GB process-tree peak. A
+fixed-coordinate production-force comparison gave `1.90e-4 kJ/mol/A` RMS and
+`0.01692 kJ/mol/A` maximum absolute force delta against a
+`437.69 kJ/mol/A` maximum reference force, consistent with the existing
+float32 atomic-scatter envelope. The OpenMM process tree peaked at 0.401 GB.
+
+Two attractive-looking experiments were removed after complete-step tests:
+
+- The atom-tile direct kernel improved isolated force time from 0.005970 to
+  0.004718 seconds, but its padded representation increased the full 75-step
+  run from 1.190142 to 1.506723 seconds and raised peak memory from about 3.90
+  to 6.06 GB.
+- A constraint-aware compiled trajectory block reduced neighbor rebuilding,
+  but repeated a much larger lazy graph. Even after rebuilds fell from nine to
+  two, it took 1.87596 seconds versus the 1.190142-second control.
+
+A synchronized post-constraint profile assigned 35.91% of wall time to direct
+LJ plus screened Coulomb, 14.48% to the then-unfused bonded terms, 12.12% to
+neighbor update/rebuild, 8.53% to constraints, 7.36% to force aggregation,
+6.16% to diagnostics, 6.06% to reciprocal PME, and 4.34% to PME corrections.
+The fused bonded route addresses the second item. Direct nonbonded work is now
+the clear next target, but it needs a better work layout rather than another
+padded tile wrapper or more Python-loop cleanup.
 
 ### Rejected atom-tile result
 

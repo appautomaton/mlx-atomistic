@@ -1,4 +1,4 @@
-"""Fused Metal kernels for recurring Lennard-Jones force paths.
+"""Fused Metal kernels for recurring molecular force paths.
 
 Collapses the per-step pairwise LJ force op-chain (gather -> minimum image -> r^2 ->
 LJ scalar -> scatter-add) into a single ``mx.fast.metal_kernel`` dispatch. Diagnostic
@@ -7,7 +7,9 @@ outputs and reductions entirely.
 
 The simple kernel covers scalar reduced-unit LJ. The parameterized kernel covers
 per-atom Lorentz-Berthelot parameters, topology scales, shifts, and smooth switching
-for the production biomolecular path. Unsupported cases fall back transparently.
+for the production biomolecular path. A separate force-only kernel combines standard
+bond, angle, periodic-torsion, and improper interactions into one output. Unsupported
+cases fall back transparently.
 
 Because ``tests/conftest.py`` forces ``MLX_ATOMISTIC_DEVICE=cpu``, the kernel is built
 lazily on first use (not at import) so importing this module never triggers a Metal
@@ -73,6 +75,252 @@ _LJ_FORCE_SOURCE = r"""
     atomic_store_explicit(&pair_energy[t], e, memory_order_relaxed);
 """
 
+_BONDED_FORCE_HEADER = r"""
+struct MLXAtomisticDihedralGeometry {
+    float phi;
+    float3 delta_ab;
+    float3 delta_bc;
+    float3 delta_cd;
+    float3 cross_ab_bc;
+    float3 cross_bc_cd;
+};
+
+float3 mlx_atomistic_bonded_displacement(
+    device const float* positions,
+    int left,
+    int right,
+    constant const float* box
+) {
+    float3 displacement = float3(
+        positions[3 * left + 0] - positions[3 * right + 0],
+        positions[3 * left + 1] - positions[3 * right + 1],
+        positions[3 * left + 2] - positions[3 * right + 2]
+    );
+    displacement.x -= box[0] * rint(displacement.x / box[0]);
+    displacement.y -= box[1] * rint(displacement.y / box[1]);
+    displacement.z -= box[2] * rint(displacement.z / box[2]);
+    return displacement;
+}
+
+void mlx_atomistic_add_bonded_force(
+    device atomic<float>* forces,
+    int atom,
+    float3 force
+) {
+    atomic_fetch_add_explicit(
+        &forces[3 * atom + 0], force.x, memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(
+        &forces[3 * atom + 1], force.y, memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(
+        &forces[3 * atom + 2], force.z, memory_order_relaxed
+    );
+}
+
+MLXAtomisticDihedralGeometry mlx_atomistic_dihedral_geometry(
+    device const float* positions,
+    int atom_i,
+    int atom_j,
+    int atom_k,
+    int atom_m,
+    constant const float* box
+) {
+    MLXAtomisticDihedralGeometry geometry;
+    geometry.delta_ab = mlx_atomistic_bonded_displacement(
+        positions, atom_j, atom_i, box
+    );
+    geometry.delta_bc = mlx_atomistic_bonded_displacement(
+        positions, atom_j, atom_k, box
+    );
+    geometry.delta_cd = mlx_atomistic_bonded_displacement(
+        positions, atom_m, atom_k, box
+    );
+    geometry.cross_ab_bc = cross(geometry.delta_ab, geometry.delta_bc);
+    geometry.cross_bc_cd = cross(geometry.delta_bc, geometry.delta_cd);
+    float norm_cross_1 = sqrt(max(
+        dot(geometry.cross_ab_bc, geometry.cross_ab_bc), 1.0e-12f
+    ));
+    float norm_cross_2 = sqrt(max(
+        dot(geometry.cross_bc_cd, geometry.cross_bc_cd), 1.0e-12f
+    ));
+    float cosine = clamp(
+        dot(geometry.cross_ab_bc, geometry.cross_bc_cd)
+            / (norm_cross_1 * norm_cross_2),
+        -0.999999f,
+        0.999999f
+    );
+    float angle = acos(cosine);
+    float sign = dot(geometry.delta_ab, geometry.cross_bc_cd) < 0.0f
+        ? -1.0f
+        : 1.0f;
+    geometry.phi = angle * sign;
+    return geometry;
+}
+
+void mlx_atomistic_apply_dihedral_force(
+    device atomic<float>* forces,
+    int atom_i,
+    int atom_j,
+    int atom_k,
+    int atom_m,
+    MLXAtomisticDihedralGeometry geometry,
+    float force_derivative
+) {
+    float norm_cross_1 = max(
+        dot(geometry.cross_ab_bc, geometry.cross_ab_bc), 1.0e-12f
+    );
+    float norm_cross_2 = max(
+        dot(geometry.cross_bc_cd, geometry.cross_bc_cd), 1.0e-12f
+    );
+    float norm_bc2 = max(dot(geometry.delta_bc, geometry.delta_bc), 1.0e-12f);
+    float norm_bc = sqrt(norm_bc2);
+    float3 force_i = (
+        -force_derivative * norm_bc / norm_cross_1
+    ) * geometry.cross_ab_bc;
+    float3 force_m = (
+        force_derivative * norm_bc / norm_cross_2
+    ) * geometry.cross_bc_cd;
+    float factor_j = dot(geometry.delta_ab, geometry.delta_bc) / norm_bc2;
+    float factor_k = dot(geometry.delta_cd, geometry.delta_bc) / norm_bc2;
+    float3 shared = factor_j * force_i - factor_k * force_m;
+    float3 force_j = -(force_i - shared);
+    float3 force_k = -(force_m + shared);
+    mlx_atomistic_add_bonded_force(forces, atom_i, force_i);
+    mlx_atomistic_add_bonded_force(forces, atom_j, force_j);
+    mlx_atomistic_add_bonded_force(forces, atom_k, force_k);
+    mlx_atomistic_add_bonded_force(forces, atom_m, force_m);
+}
+"""
+
+_BONDED_FORCE_SOURCE = r"""
+    uint task = thread_position_in_grid.x;
+    uint bond_count = (uint)counts[0];
+    uint angle_count = (uint)counts[1];
+    uint dihedral_count = (uint)counts[2];
+    uint improper_count = (uint)counts[3];
+    uint total_count = bond_count + angle_count + dihedral_count + improper_count;
+    if (task >= total_count) {
+        return;
+    }
+
+    if (task < bond_count) {
+        int atom_i = bond_atoms[2 * task + 0];
+        int atom_j = bond_atoms[2 * task + 1];
+        float3 displacement = mlx_atomistic_bonded_displacement(
+            positions, atom_i, atom_j, box
+        );
+        float distance = sqrt(max(dot(displacement, displacement), 1.0e-12f));
+        float scalar = -bond_k[task] * (
+            distance - bond_length[task]
+        ) / distance;
+        float3 force = scalar * displacement;
+        mlx_atomistic_add_bonded_force(forces, atom_i, force);
+        mlx_atomistic_add_bonded_force(forces, atom_j, -force);
+        return;
+    }
+    task -= bond_count;
+
+    if (task < angle_count) {
+        int atom_i = angle_atoms[3 * task + 0];
+        int atom_j = angle_atoms[3 * task + 1];
+        int atom_k = angle_atoms[3 * task + 2];
+        float3 left = mlx_atomistic_bonded_displacement(
+            positions, atom_i, atom_j, box
+        );
+        float3 right = mlx_atomistic_bonded_displacement(
+            positions, atom_k, atom_j, box
+        );
+        float left_norm2 = max(dot(left, left), 1.0e-12f);
+        float right_norm2 = max(dot(right, right), 1.0e-12f);
+        float left_norm = sqrt(left_norm2);
+        float right_norm = sqrt(right_norm2);
+        float cosine = clamp(
+            dot(left, right) / (left_norm * right_norm),
+            -0.999999f,
+            0.999999f
+        );
+        float theta = acos(cosine);
+        float sin_theta = sqrt(max(1.0f - cosine * cosine, 1.0e-12f));
+        float prefactor = angle_k[task] * (
+            theta - angle_target[task]
+        ) / sin_theta;
+        float3 left_force = prefactor * (
+            right / (left_norm * right_norm) - cosine * left / left_norm2
+        );
+        float3 right_force = prefactor * (
+            left / (left_norm * right_norm) - cosine * right / right_norm2
+        );
+        float3 center_force = -(left_force + right_force);
+        mlx_atomistic_add_bonded_force(forces, atom_i, left_force);
+        mlx_atomistic_add_bonded_force(forces, atom_j, center_force);
+        mlx_atomistic_add_bonded_force(forces, atom_k, right_force);
+        return;
+    }
+    task -= angle_count;
+
+    if (task < dihedral_count) {
+        int atom_i = dihedral_atoms[4 * task + 0];
+        int atom_j = dihedral_atoms[4 * task + 1];
+        int atom_k = dihedral_atoms[4 * task + 2];
+        int atom_m = dihedral_atoms[4 * task + 3];
+        MLXAtomisticDihedralGeometry geometry = mlx_atomistic_dihedral_geometry(
+            positions, atom_i, atom_j, atom_k, atom_m, box
+        );
+        float periodic_angle = (
+            dihedral_periodicity[task] * geometry.phi + dihedral_phase[task]
+        );
+        float force_derivative = (
+            dihedral_k[task]
+            * dihedral_periodicity[task]
+            * sin(periodic_angle)
+        );
+        mlx_atomistic_apply_dihedral_force(
+            forces,
+            atom_i,
+            atom_j,
+            atom_k,
+            atom_m,
+            geometry,
+            force_derivative
+        );
+        return;
+    }
+    task -= dihedral_count;
+
+    if (task < improper_count) {
+        int atom_i = improper_atoms[4 * task + 0];
+        int atom_j = improper_atoms[4 * task + 1];
+        int atom_k = improper_atoms[4 * task + 2];
+        int atom_m = improper_atoms[4 * task + 3];
+        MLXAtomisticDihedralGeometry geometry = mlx_atomistic_dihedral_geometry(
+            positions, atom_i, atom_j, atom_k, atom_m, box
+        );
+        float periodicity = improper_periodicity[task];
+        float shifted_angle = geometry.phi + improper_phase[task];
+        float force_derivative;
+        if (periodicity == 0.0f) {
+            float harmonic_delta = atan2(sin(shifted_angle), cos(shifted_angle));
+            force_derivative = -2.0f * improper_k[task] * harmonic_delta;
+        } else {
+            force_derivative = (
+                improper_k[task]
+                * periodicity
+                * sin(periodicity * geometry.phi + improper_phase[task])
+            );
+        }
+        mlx_atomistic_apply_dihedral_force(
+            forces,
+            atom_i,
+            atom_j,
+            atom_k,
+            atom_m,
+            geometry,
+            force_derivative
+        );
+    }
+"""
+
 _kernel_singleton = None
 _parameterized_kernel_singleton = None
 _pme_direct_kernel_singleton = None
@@ -86,6 +334,11 @@ _aligned_topology_lj_scales_kernel_singleton = None
 _neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
+_shake_cluster_position_kernel_singleton = None
+_shake_cluster_velocity_kernel_singleton = None
+_settle_water_position_kernel_singleton = None
+_settle_water_velocity_kernel_singleton = None
+_fused_bonded_force_only_kernel_singleton = None
 
 # Neighbor compaction preserves short runs of a common left atom, so one worker
 # can sum those contributions locally before issuing global atomics.
@@ -1015,6 +1268,441 @@ _NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE = r"""
     accepted_j[out] = max(i, j);
 """
 
+_CONSTRAINT_HEADER = r"""
+inline float3 constraint_load3(device const float* values, int atom) {
+    return float3(
+        values[3 * atom + 0],
+        values[3 * atom + 1],
+        values[3 * atom + 2]
+    );
+}
+
+inline float3 constraint_minimum_image(
+    float3 value,
+    constant const float* box,
+    int periodic
+) {
+    if (periodic != 0) {
+        value.x -= box[0] * rint(value.x / box[0]);
+        value.y -= box[1] * rint(value.y / box[1]);
+        value.z -= box[2] * rint(value.z / box[2]);
+    }
+    return value;
+}
+
+inline float3 constraint_safe_normalize(float3 value) {
+    return value * rsqrt(max(dot(value, value), 1.0e-20f));
+}
+"""
+
+_SETTLE_WATER_POSITION_SOURCE = r"""
+    uint water = thread_position_in_grid.x;
+    if (water >= (uint)params[0]) {
+        return;
+    }
+    int oxygen = waters[3 * water + 0];
+    int hydrogen_a = waters[3 * water + 1];
+    int hydrogen_b = waters[3 * water + 2];
+    int periodic = params[1];
+
+    float3 reference_o = constraint_load3(reference_positions, oxygen);
+    float3 reference_a = constraint_load3(reference_positions, hydrogen_a);
+    float3 reference_b = constraint_load3(reference_positions, hydrogen_b);
+    float3 predicted_o = constraint_load3(predicted_positions, oxygen);
+    float3 predicted_a = constraint_load3(predicted_positions, hydrogen_a);
+    float3 predicted_b = constraint_load3(predicted_positions, hydrogen_b);
+    float3 old_b = constraint_minimum_image(reference_a - reference_o, box, periodic);
+    float3 old_c = constraint_minimum_image(reference_b - reference_o, box, periodic);
+    float3 step_o = constraint_minimum_image(predicted_o - reference_o, box, periodic);
+    float3 step_a = constraint_minimum_image(predicted_a - reference_a, box, periodic);
+    float3 step_b = constraint_minimum_image(predicted_b - reference_b, box, periodic);
+
+    float mass_o = masses[oxygen];
+    float mass_a = masses[hydrogen_a];
+    float mass_b = masses[hydrogen_b];
+    float total_mass = mass_o + mass_a + mass_b;
+    float3 center = (
+        mass_o * step_o
+        + mass_a * (old_b + step_a)
+        + mass_b * (old_c + step_b)
+    ) / total_mass;
+    float3 centered_o = step_o - center;
+    float3 centered_a = old_b + step_a - center;
+    float3 centered_b = old_c + step_b - center;
+
+    float3 axis_z = constraint_safe_normalize(cross(old_b, old_c));
+    float3 axis_x = constraint_safe_normalize(cross(centered_o, axis_z));
+    float3 axis_y = constraint_safe_normalize(cross(axis_z, axis_x));
+    float old_b_x = dot(old_b, axis_x);
+    float old_b_y = dot(old_b, axis_y);
+    float old_c_x = dot(old_c, axis_x);
+    float old_c_y = dot(old_c, axis_y);
+    float centered_o_z = dot(centered_o, axis_z);
+    float centered_a_x = dot(centered_a, axis_x);
+    float centered_a_y = dot(centered_a, axis_y);
+    float centered_a_z = dot(centered_a, axis_z);
+    float centered_b_x = dot(centered_b, axis_x);
+    float centered_b_y = dot(centered_b, axis_y);
+    float centered_b_z = dot(centered_b, axis_z);
+
+    float half_hh = 0.5f * geometry[1];
+    float oxygen_to_h_axis = sqrt(max(geometry[0] * geometry[0] - half_hh * half_hh, 0.0f));
+    float oxygen_radius = oxygen_to_h_axis * (mass_a + mass_b) / total_mass;
+    float hydrogen_radius = oxygen_to_h_axis - oxygen_radius;
+    float sin_phi = clamp(centered_o_z / oxygen_radius, -1.0f, 1.0f);
+    float cos_phi = sqrt(max(1.0f - sin_phi * sin_phi, 0.0f));
+    float sin_psi = clamp(
+        (centered_a_z - centered_b_z) / max(2.0f * half_hh * cos_phi, 1.0e-20f),
+        -1.0f,
+        1.0f
+    );
+    float cos_psi = sqrt(max(1.0f - sin_psi * sin_psi, 0.0f));
+
+    float oxygen_y = oxygen_radius * cos_phi;
+    float hydrogen_x = -half_hh * cos_psi;
+    float hydrogen_a_y = -hydrogen_radius * cos_phi - half_hh * sin_psi * sin_phi;
+    float hydrogen_b_y = -hydrogen_radius * cos_phi + half_hh * sin_psi * sin_phi;
+    float hydrogen_x_squared = hydrogen_x * hydrogen_x;
+    float current_hh_squared = 4.0f * hydrogen_x_squared
+        + (hydrogen_a_y - hydrogen_b_y) * (hydrogen_a_y - hydrogen_b_y)
+        + (centered_a_z - centered_b_z) * (centered_a_z - centered_b_z);
+    float delta_x = 2.0f * hydrogen_x + sqrt(max(
+        4.0f * hydrogen_x_squared - current_hh_squared + geometry[1] * geometry[1],
+        0.0f
+    ));
+    hydrogen_x -= 0.5f * delta_x;
+
+    float alpha = hydrogen_x * (old_b_x - old_c_x)
+        + old_b_y * hydrogen_a_y + old_c_y * hydrogen_b_y;
+    float beta = hydrogen_x * (old_c_y - old_b_y)
+        + old_b_x * hydrogen_a_y + old_c_x * hydrogen_b_y;
+    float gamma = old_b_x * centered_a_y - centered_a_x * old_b_y
+        + old_c_x * centered_b_y - centered_b_x * old_c_y;
+    float alpha_beta_squared = alpha * alpha + beta * beta;
+    float sin_theta = (
+        alpha * gamma - beta * sqrt(max(alpha_beta_squared - gamma * gamma, 0.0f))
+    ) / max(alpha_beta_squared, 1.0e-20f);
+    sin_theta = clamp(sin_theta, -1.0f, 1.0f);
+    float cos_theta = sqrt(max(1.0f - sin_theta * sin_theta, 0.0f));
+
+    float oxygen_x = -oxygen_y * sin_theta;
+    oxygen_y *= cos_theta;
+    float hydrogen_a_x = hydrogen_x * cos_theta - hydrogen_a_y * sin_theta;
+    hydrogen_a_y = hydrogen_x * sin_theta + hydrogen_a_y * cos_theta;
+    float hydrogen_b_x = -hydrogen_x * cos_theta - hydrogen_b_y * sin_theta;
+    hydrogen_b_y = -hydrogen_x * sin_theta + hydrogen_b_y * cos_theta;
+
+    float3 projected_o = reference_o + center
+        + oxygen_x * axis_x + oxygen_y * axis_y + centered_o_z * axis_z;
+    float3 projected_a = reference_o + center
+        + hydrogen_a_x * axis_x + hydrogen_a_y * axis_y + centered_a_z * axis_z;
+    float3 projected_b = reference_o + center
+        + hydrogen_b_x * axis_x + hydrogen_b_y * axis_y + centered_b_z * axis_z;
+    float3 delta_o = projected_o - predicted_o;
+    float3 delta_a = projected_a - predicted_a;
+    float3 delta_b = projected_b - predicted_b;
+    uint output = 9 * water;
+    deltas[output + 0] = delta_o.x;
+    deltas[output + 1] = delta_o.y;
+    deltas[output + 2] = delta_o.z;
+    deltas[output + 3] = delta_a.x;
+    deltas[output + 4] = delta_a.y;
+    deltas[output + 5] = delta_a.z;
+    deltas[output + 6] = delta_b.x;
+    deltas[output + 7] = delta_b.y;
+    deltas[output + 8] = delta_b.z;
+"""
+
+_SETTLE_WATER_VELOCITY_SOURCE = r"""
+    uint water = thread_position_in_grid.x;
+    if (water >= (uint)params[0]) {
+        return;
+    }
+    int oxygen = waters[3 * water + 0];
+    int hydrogen_a = waters[3 * water + 1];
+    int hydrogen_b = waters[3 * water + 2];
+    int periodic = params[1];
+
+    float3 position_o = constraint_load3(positions, oxygen);
+    float3 position_a = constraint_load3(positions, hydrogen_a);
+    float3 position_b = constraint_load3(positions, hydrogen_b);
+    float3 velocity_o = constraint_load3(velocities, oxygen);
+    float3 velocity_a = constraint_load3(velocities, hydrogen_a);
+    float3 velocity_b = constraint_load3(velocities, hydrogen_b);
+    float3 q_oh_a = constraint_minimum_image(position_o - position_a, box, periodic);
+    float3 q_oh_b = constraint_minimum_image(position_o - position_b, box, periodic);
+    float3 q_hh = constraint_minimum_image(position_a - position_b, box, periodic);
+
+    float inverse_o = 1.0f / masses[oxygen];
+    float inverse_a = 1.0f / masses[hydrogen_a];
+    float inverse_b = 1.0f / masses[hydrogen_b];
+    float dot_oh = dot(q_oh_a, q_oh_b);
+    float dot_a_hh = dot(q_oh_a, q_hh);
+    float dot_b_hh = dot(q_oh_b, q_hh);
+    float3 row_0 = float3(
+        (inverse_o + inverse_a) * dot(q_oh_a, q_oh_a),
+        inverse_o * dot_oh,
+        -inverse_a * dot_a_hh
+    );
+    float3 row_1 = float3(
+        inverse_o * dot_oh,
+        (inverse_o + inverse_b) * dot(q_oh_b, q_oh_b),
+        inverse_b * dot_b_hh
+    );
+    float3 row_2 = float3(
+        -inverse_a * dot_a_hh,
+        inverse_b * dot_b_hh,
+        (inverse_a + inverse_b) * dot(q_hh, q_hh)
+    );
+    float3 rhs = -float3(
+        dot(q_oh_a, velocity_o - velocity_a),
+        dot(q_oh_b, velocity_o - velocity_b),
+        dot(q_hh, velocity_a - velocity_b)
+    );
+    float3 cross_12 = cross(row_1, row_2);
+    float determinant = dot(row_0, cross_12);
+    float safe_determinant = fabs(determinant) > 1.0e-20f ? determinant : 1.0f;
+    float3 multipliers = (
+        rhs.x * cross_12
+        + rhs.y * cross(row_2, row_0)
+        + rhs.z * cross(row_0, row_1)
+    ) / safe_determinant;
+    float3 correction_o = inverse_o * (
+        multipliers.x * q_oh_a + multipliers.y * q_oh_b
+    );
+    float3 correction_a = inverse_a * (
+        -multipliers.x * q_oh_a + multipliers.z * q_hh
+    );
+    float3 correction_b = inverse_b * (
+        -multipliers.y * q_oh_b - multipliers.z * q_hh
+    );
+    uint output = 9 * water;
+    deltas[output + 0] = correction_o.x;
+    deltas[output + 1] = correction_o.y;
+    deltas[output + 2] = correction_o.z;
+    deltas[output + 3] = correction_a.x;
+    deltas[output + 4] = correction_a.y;
+    deltas[output + 5] = correction_a.z;
+    deltas[output + 6] = correction_b.x;
+    deltas[output + 7] = correction_b.y;
+    deltas[output + 8] = correction_b.z;
+"""
+
+_SHAKE_CLUSTER_POSITION_SOURCE = r"""
+    uint cluster = thread_position_in_grid.x;
+    if (cluster >= (uint)params[0]) {
+        return;
+    }
+
+    int peripheral_count = peripheral_counts[cluster];
+    int atom[4];
+    float x[4];
+    float y[4];
+    float z[4];
+    float base_x[4];
+    float base_y[4];
+    float base_z[4];
+    float inverse_mass[4];
+    for (int slot = 0; slot < 4; slot++) {
+        atom[slot] = cluster_atoms[4 * cluster + slot];
+        if (slot <= peripheral_count) {
+            int index = atom[slot];
+            x[slot] = predicted_positions[3 * index + 0];
+            y[slot] = predicted_positions[3 * index + 1];
+            z[slot] = predicted_positions[3 * index + 2];
+            base_x[slot] = x[slot];
+            base_y[slot] = y[slot];
+            base_z[slot] = z[slot];
+            inverse_mass[slot] = 1.0f / masses[index];
+        } else {
+            x[slot] = 0.0f;
+            y[slot] = 0.0f;
+            z[slot] = 0.0f;
+            base_x[slot] = 0.0f;
+            base_y[slot] = 0.0f;
+            base_z[slot] = 0.0f;
+            inverse_mass[slot] = 0.0f;
+        }
+    }
+
+    float reference_x[3];
+    float reference_y[3];
+    float reference_z[3];
+    for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
+        int slot = peripheral + 1;
+        int center_atom = atom[0];
+        int outer_atom = atom[slot];
+        float dx = reference_positions[3 * center_atom + 0]
+            - reference_positions[3 * outer_atom + 0];
+        float dy = reference_positions[3 * center_atom + 1]
+            - reference_positions[3 * outer_atom + 1];
+        float dz = reference_positions[3 * center_atom + 2]
+            - reference_positions[3 * outer_atom + 2];
+        if (params[2] != 0) {
+            dx -= box[0] * rint(dx / box[0]);
+            dy -= box[1] * rint(dy / box[1]);
+            dz -= box[2] * rint(dz / box[2]);
+        }
+        reference_x[peripheral] = dx;
+        reference_y[peripheral] = dy;
+        reference_z[peripheral] = dz;
+    }
+
+    float target_squared = distances[cluster] * distances[cluster];
+    for (int iteration = 0; iteration < params[1]; iteration++) {
+        float center_delta_x = 0.0f;
+        float center_delta_y = 0.0f;
+        float center_delta_z = 0.0f;
+        for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
+            int slot = peripheral + 1;
+            float dx = x[0] - x[slot];
+            float dy = y[0] - y[slot];
+            float dz = z[0] - z[slot];
+            if (params[2] != 0) {
+                dx -= box[0] * rint(dx / box[0]);
+                dy -= box[1] * rint(dy / box[1]);
+                dz -= box[2] * rint(dz / box[2]);
+            }
+            float reference_dot = dx * reference_x[peripheral]
+                + dy * reference_y[peripheral]
+                + dz * reference_z[peripheral];
+            float denominator = 2.0f
+                * (inverse_mass[0] + inverse_mass[slot])
+                * reference_dot;
+            if (fabs(denominator) <= 1.0e-20f) {
+                denominator = denominator < 0.0f ? -1.0e-20f : 1.0e-20f;
+            }
+            float error_squared = target_squared - (dx * dx + dy * dy + dz * dz);
+            float multiplier = error_squared / denominator;
+            float correction_x = multiplier * reference_x[peripheral];
+            float correction_y = multiplier * reference_y[peripheral];
+            float correction_z = multiplier * reference_z[peripheral];
+            center_delta_x += inverse_mass[0] * correction_x;
+            center_delta_y += inverse_mass[0] * correction_y;
+            center_delta_z += inverse_mass[0] * correction_z;
+            x[slot] -= inverse_mass[slot] * correction_x;
+            y[slot] -= inverse_mass[slot] * correction_y;
+            z[slot] -= inverse_mass[slot] * correction_z;
+        }
+        x[0] += center_delta_x;
+        y[0] += center_delta_y;
+        z[0] += center_delta_z;
+    }
+
+    for (int slot = 0; slot < 4; slot++) {
+        uint output = 12 * cluster + 3 * slot;
+        if (slot <= peripheral_count) {
+            deltas[output + 0] = x[slot] - base_x[slot];
+            deltas[output + 1] = y[slot] - base_y[slot];
+            deltas[output + 2] = z[slot] - base_z[slot];
+        } else {
+            deltas[output + 0] = 0.0f;
+            deltas[output + 1] = 0.0f;
+            deltas[output + 2] = 0.0f;
+        }
+    }
+"""
+
+_SHAKE_CLUSTER_VELOCITY_SOURCE = r"""
+    uint cluster = thread_position_in_grid.x;
+    if (cluster >= (uint)params[0]) {
+        return;
+    }
+
+    int peripheral_count = peripheral_counts[cluster];
+    int atom[4];
+    float vx[4];
+    float vy[4];
+    float vz[4];
+    float base_vx[4];
+    float base_vy[4];
+    float base_vz[4];
+    float inverse_mass[4];
+    float unit_x[3];
+    float unit_y[3];
+    float unit_z[3];
+    for (int slot = 0; slot < 4; slot++) {
+        atom[slot] = cluster_atoms[4 * cluster + slot];
+        if (slot <= peripheral_count) {
+            int index = atom[slot];
+            vx[slot] = velocities[3 * index + 0];
+            vy[slot] = velocities[3 * index + 1];
+            vz[slot] = velocities[3 * index + 2];
+            base_vx[slot] = vx[slot];
+            base_vy[slot] = vy[slot];
+            base_vz[slot] = vz[slot];
+            inverse_mass[slot] = 1.0f / masses[index];
+        } else {
+            vx[slot] = 0.0f;
+            vy[slot] = 0.0f;
+            vz[slot] = 0.0f;
+            base_vx[slot] = 0.0f;
+            base_vy[slot] = 0.0f;
+            base_vz[slot] = 0.0f;
+            inverse_mass[slot] = 0.0f;
+        }
+    }
+
+    for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
+        int slot = peripheral + 1;
+        int center_atom = atom[0];
+        int outer_atom = atom[slot];
+        float dx = positions[3 * center_atom + 0] - positions[3 * outer_atom + 0];
+        float dy = positions[3 * center_atom + 1] - positions[3 * outer_atom + 1];
+        float dz = positions[3 * center_atom + 2] - positions[3 * outer_atom + 2];
+        if (params[2] != 0) {
+            dx -= box[0] * rint(dx / box[0]);
+            dy -= box[1] * rint(dy / box[1]);
+            dz -= box[2] * rint(dz / box[2]);
+        }
+        float inverse_length = rsqrt(max(dx * dx + dy * dy + dz * dz, 1.0e-20f));
+        unit_x[peripheral] = dx * inverse_length;
+        unit_y[peripheral] = dy * inverse_length;
+        unit_z[peripheral] = dz * inverse_length;
+    }
+
+    for (int iteration = 0; iteration < params[1]; iteration++) {
+        float center_delta_x = 0.0f;
+        float center_delta_y = 0.0f;
+        float center_delta_z = 0.0f;
+        for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
+            int slot = peripheral + 1;
+            float relative = (vx[0] - vx[slot]) * unit_x[peripheral]
+                + (vy[0] - vy[slot]) * unit_y[peripheral]
+                + (vz[0] - vz[slot]) * unit_z[peripheral];
+            float weight_center = inverse_mass[0]
+                / (inverse_mass[0] + inverse_mass[slot]);
+            float weight_outer = inverse_mass[slot]
+                / (inverse_mass[0] + inverse_mass[slot]);
+            float correction_x = relative * unit_x[peripheral];
+            float correction_y = relative * unit_y[peripheral];
+            float correction_z = relative * unit_z[peripheral];
+            center_delta_x -= weight_center * correction_x;
+            center_delta_y -= weight_center * correction_y;
+            center_delta_z -= weight_center * correction_z;
+            vx[slot] += weight_outer * correction_x;
+            vy[slot] += weight_outer * correction_y;
+            vz[slot] += weight_outer * correction_z;
+        }
+        vx[0] += center_delta_x;
+        vy[0] += center_delta_y;
+        vz[0] += center_delta_z;
+    }
+
+    for (int slot = 0; slot < 4; slot++) {
+        uint output = 12 * cluster + 3 * slot;
+        if (slot <= peripheral_count) {
+            deltas[output + 0] = vx[slot] - base_vx[slot];
+            deltas[output + 1] = vy[slot] - base_vy[slot];
+            deltas[output + 2] = vz[slot] - base_vz[slot];
+        } else {
+            deltas[output + 0] = 0.0f;
+            deltas[output + 1] = 0.0f;
+            deltas[output + 2] = 0.0f;
+        }
+    }
+"""
+
 
 def _lj_force_kernel():
     """Return the cached fused-LJ Metal kernel, building it on first call."""
@@ -1324,6 +2012,130 @@ def _neighbor_pair_ordered_scatter_kernel():
     return _neighbor_pair_ordered_scatter_kernel_singleton
 
 
+def _shake_cluster_position_kernel():
+    """Return the cached disjoint SHAKE-cluster position kernel."""
+
+    global _shake_cluster_position_kernel_singleton
+    if _shake_cluster_position_kernel_singleton is None:
+        _shake_cluster_position_kernel_singleton = mx.fast.metal_kernel(
+            name="shake_cluster_positions",
+            input_names=[
+                "reference_positions",
+                "predicted_positions",
+                "masses",
+                "cluster_atoms",
+                "peripheral_counts",
+                "distances",
+                "box",
+                "params",
+            ],
+            output_names=["deltas"],
+            source=_SHAKE_CLUSTER_POSITION_SOURCE,
+        )
+    return _shake_cluster_position_kernel_singleton
+
+
+def _shake_cluster_velocity_kernel():
+    """Return the cached disjoint SHAKE-cluster velocity kernel."""
+
+    global _shake_cluster_velocity_kernel_singleton
+    if _shake_cluster_velocity_kernel_singleton is None:
+        _shake_cluster_velocity_kernel_singleton = mx.fast.metal_kernel(
+            name="shake_cluster_velocities",
+            input_names=[
+                "positions",
+                "velocities",
+                "masses",
+                "cluster_atoms",
+                "peripheral_counts",
+                "box",
+                "params",
+            ],
+            output_names=["deltas"],
+            source=_SHAKE_CLUSTER_VELOCITY_SOURCE,
+        )
+    return _shake_cluster_velocity_kernel_singleton
+
+
+def _settle_water_position_kernel():
+    """Return the cached analytical SETTLE position kernel."""
+
+    global _settle_water_position_kernel_singleton
+    if _settle_water_position_kernel_singleton is None:
+        _settle_water_position_kernel_singleton = mx.fast.metal_kernel(
+            name="settle_water_positions",
+            input_names=[
+                "reference_positions",
+                "predicted_positions",
+                "masses",
+                "waters",
+                "geometry",
+                "box",
+                "params",
+            ],
+            output_names=["deltas"],
+            source=_SETTLE_WATER_POSITION_SOURCE,
+            header=_CONSTRAINT_HEADER,
+        )
+    return _settle_water_position_kernel_singleton
+
+
+def _settle_water_velocity_kernel():
+    """Return the cached analytical SETTLE velocity kernel."""
+
+    global _settle_water_velocity_kernel_singleton
+    if _settle_water_velocity_kernel_singleton is None:
+        _settle_water_velocity_kernel_singleton = mx.fast.metal_kernel(
+            name="settle_water_velocities",
+            input_names=[
+                "positions",
+                "velocities",
+                "masses",
+                "waters",
+                "box",
+                "params",
+            ],
+            output_names=["deltas"],
+            source=_SETTLE_WATER_VELOCITY_SOURCE,
+            header=_CONSTRAINT_HEADER,
+        )
+    return _settle_water_velocity_kernel_singleton
+
+
+def _fused_bonded_force_only_kernel():
+    """Return the cached force-only bonded-interaction Metal kernel."""
+
+    global _fused_bonded_force_only_kernel_singleton
+    if _fused_bonded_force_only_kernel_singleton is None:
+        _fused_bonded_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="fused_bonded_force_only",
+            input_names=[
+                "positions",
+                "box",
+                "bond_atoms",
+                "bond_k",
+                "bond_length",
+                "angle_atoms",
+                "angle_k",
+                "angle_target",
+                "dihedral_atoms",
+                "dihedral_k",
+                "dihedral_periodicity",
+                "dihedral_phase",
+                "improper_atoms",
+                "improper_k",
+                "improper_periodicity",
+                "improper_phase",
+                "counts",
+            ],
+            output_names=["forces"],
+            source=_BONDED_FORCE_SOURCE,
+            header=_BONDED_FORCE_HEADER,
+            atomic_outputs=True,
+        )
+    return _fused_bonded_force_only_kernel_singleton
+
+
 def neighbor_pair_cutoff_mask(
     positions: mx.array,
     pairs_i: mx.array,
@@ -1543,6 +2355,253 @@ def _neighbor_pair_ordered_scatter_sized(
     return accepted_i, accepted_j
 
 
+def _settle_water_position_deltas(
+    reference_positions: mx.array,
+    predicted_positions: mx.array,
+    masses: mx.array,
+    waters: mx.array,
+    box_lengths: mx.array,
+    *,
+    oh_distance: float,
+    hh_distance: float,
+    periodic: bool,
+) -> mx.array:
+    """Return analytical SETTLE position deltas from one Metal dispatch."""
+
+    reference_positions = as_mx_array(reference_positions, dtype=mx.float32)
+    predicted_positions = as_mx_array(predicted_positions, dtype=mx.float32)
+    masses = as_mx_array(masses, dtype=mx.float32)
+    waters = as_mx_array(waters, dtype=mx.int32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    water_count = int(waters.shape[0])
+    if reference_positions.shape != predicted_positions.shape:
+        msg = "reference and predicted positions must have matching shapes"
+        raise ValueError(msg)
+    if predicted_positions.ndim != 2 or predicted_positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if masses.shape != (predicted_positions.shape[0],):
+        msg = "masses must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if waters.ndim != 2 or waters.shape[1] != 3:
+        msg = "waters must have shape (n_waters, 3)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if water_count == 0:
+        return mx.zeros((0, 3, 3), dtype=mx.float32)
+    threads = min(256, water_count)
+    (deltas,) = _settle_water_position_kernel()(
+        inputs=[
+            reference_positions,
+            predicted_positions,
+            masses,
+            waters,
+            mx.array([oh_distance, hh_distance], dtype=mx.float32),
+            box_lengths,
+            mx.array([water_count, int(periodic)], dtype=mx.int32),
+        ],
+        output_shapes=[(water_count, 3, 3)],
+        output_dtypes=[mx.float32],
+        grid=(water_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return deltas
+
+
+def _settle_water_velocity_deltas(
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    waters: mx.array,
+    box_lengths: mx.array,
+    *,
+    periodic: bool,
+) -> mx.array:
+    """Return analytical SETTLE velocity deltas from one Metal dispatch."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    velocities = as_mx_array(velocities, dtype=mx.float32)
+    masses = as_mx_array(masses, dtype=mx.float32)
+    waters = as_mx_array(waters, dtype=mx.int32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    water_count = int(waters.shape[0])
+    if positions.shape != velocities.shape:
+        msg = "positions and velocities must have matching shapes"
+        raise ValueError(msg)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if masses.shape != (positions.shape[0],):
+        msg = "masses must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if waters.ndim != 2 or waters.shape[1] != 3:
+        msg = "waters must have shape (n_waters, 3)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if water_count == 0:
+        return mx.zeros((0, 3, 3), dtype=mx.float32)
+    threads = min(256, water_count)
+    (deltas,) = _settle_water_velocity_kernel()(
+        inputs=[
+            positions,
+            velocities,
+            masses,
+            waters,
+            box_lengths,
+            mx.array([water_count, int(periodic)], dtype=mx.int32),
+        ],
+        output_shapes=[(water_count, 3, 3)],
+        output_dtypes=[mx.float32],
+        grid=(water_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return deltas
+
+
+def _shake_cluster_position_deltas(
+    reference_positions: mx.array,
+    predicted_positions: mx.array,
+    masses: mx.array,
+    cluster_atoms: mx.array,
+    peripheral_counts: mx.array,
+    distances: mx.array,
+    box_lengths: mx.array,
+    *,
+    max_iterations: int,
+    periodic: bool,
+) -> mx.array:
+    """Return per-cluster SHAKE position deltas from one Metal dispatch."""
+
+    reference_positions = as_mx_array(reference_positions, dtype=mx.float32)
+    predicted_positions = as_mx_array(predicted_positions, dtype=mx.float32)
+    masses = as_mx_array(masses, dtype=mx.float32)
+    cluster_atoms = as_mx_array(cluster_atoms, dtype=mx.int32)
+    peripheral_counts = as_mx_array(peripheral_counts, dtype=mx.int32)
+    distances = as_mx_array(distances, dtype=mx.float32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    cluster_count = int(cluster_atoms.shape[0])
+    if reference_positions.shape != predicted_positions.shape:
+        msg = "reference and predicted positions must have matching shapes"
+        raise ValueError(msg)
+    if predicted_positions.ndim != 2 or predicted_positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if masses.shape != (predicted_positions.shape[0],):
+        msg = "masses must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if cluster_atoms.ndim != 2 or cluster_atoms.shape[1] != 4:
+        msg = "cluster_atoms must have shape (n_clusters, 4)"
+        raise ValueError(msg)
+    if peripheral_counts.shape != (cluster_count,):
+        msg = "peripheral_counts must have shape (n_clusters,)"
+        raise ValueError(msg)
+    if distances.shape != (cluster_count,):
+        msg = "distances must have shape (n_clusters,)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if max_iterations <= 0:
+        msg = "max_iterations must be positive"
+        raise ValueError(msg)
+    if cluster_count == 0:
+        return mx.zeros((0, 4, 3), dtype=mx.float32)
+    threads = min(256, cluster_count)
+    (deltas,) = _shake_cluster_position_kernel()(
+        inputs=[
+            reference_positions,
+            predicted_positions,
+            masses,
+            cluster_atoms,
+            peripheral_counts,
+            distances,
+            box_lengths,
+            mx.array(
+                [cluster_count, max_iterations, int(periodic)],
+                dtype=mx.int32,
+            ),
+        ],
+        output_shapes=[(cluster_count, 4, 3)],
+        output_dtypes=[mx.float32],
+        grid=(cluster_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return deltas
+
+
+def _shake_cluster_velocity_deltas(
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    cluster_atoms: mx.array,
+    peripheral_counts: mx.array,
+    box_lengths: mx.array,
+    *,
+    max_iterations: int,
+    periodic: bool,
+) -> mx.array:
+    """Return per-cluster RATTLE velocity deltas from one Metal dispatch."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    velocities = as_mx_array(velocities, dtype=mx.float32)
+    masses = as_mx_array(masses, dtype=mx.float32)
+    cluster_atoms = as_mx_array(cluster_atoms, dtype=mx.int32)
+    peripheral_counts = as_mx_array(peripheral_counts, dtype=mx.int32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    cluster_count = int(cluster_atoms.shape[0])
+    if positions.shape != velocities.shape:
+        msg = "positions and velocities must have matching shapes"
+        raise ValueError(msg)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if masses.shape != (positions.shape[0],):
+        msg = "masses must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if cluster_atoms.ndim != 2 or cluster_atoms.shape[1] != 4:
+        msg = "cluster_atoms must have shape (n_clusters, 4)"
+        raise ValueError(msg)
+    if peripheral_counts.shape != (cluster_count,):
+        msg = "peripheral_counts must have shape (n_clusters,)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if max_iterations <= 0:
+        msg = "max_iterations must be positive"
+        raise ValueError(msg)
+    if cluster_count == 0:
+        return mx.zeros((0, 4, 3), dtype=mx.float32)
+    threads = min(256, cluster_count)
+    (deltas,) = _shake_cluster_velocity_kernel()(
+        inputs=[
+            positions,
+            velocities,
+            masses,
+            cluster_atoms,
+            peripheral_counts,
+            box_lengths,
+            mx.array(
+                [cluster_count, max_iterations, int(periodic)],
+                dtype=mx.int32,
+            ),
+        ],
+        output_shapes=[(cluster_count, 4, 3)],
+        output_dtypes=[mx.float32],
+        grid=(cluster_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return deltas
+
+
 def aligned_topology_lj_scales(
     pairs: mx.array,
     excluded_pairs: mx.array,
@@ -1734,6 +2793,122 @@ def pme_order5_energy_forces(
         init_value=0.0,
     )
     return mx.sum(atom_energy), forces
+
+
+def _fused_bonded_force_only(
+    positions: mx.array,
+    box_lengths: mx.array,
+    bond_atoms: mx.array,
+    bond_k: mx.array,
+    bond_length: mx.array,
+    angle_atoms: mx.array,
+    angle_k: mx.array,
+    angle_target: mx.array,
+    dihedral_atoms: mx.array,
+    dihedral_k: mx.array,
+    dihedral_periodicity: mx.array,
+    dihedral_phase: mx.array,
+    improper_atoms: mx.array,
+    improper_k: mx.array,
+    improper_periodicity: mx.array,
+    improper_phase: mx.array,
+) -> mx.array:
+    """Evaluate four standard bonded families in one force-only dispatch."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    bond_atoms = as_mx_array(bond_atoms, dtype=mx.int32)
+    bond_k = as_mx_array(bond_k, dtype=mx.float32)
+    bond_length = as_mx_array(bond_length, dtype=mx.float32)
+    angle_atoms = as_mx_array(angle_atoms, dtype=mx.int32)
+    angle_k = as_mx_array(angle_k, dtype=mx.float32)
+    angle_target = as_mx_array(angle_target, dtype=mx.float32)
+    dihedral_atoms = as_mx_array(dihedral_atoms, dtype=mx.int32)
+    dihedral_k = as_mx_array(dihedral_k, dtype=mx.float32)
+    dihedral_periodicity = as_mx_array(dihedral_periodicity, dtype=mx.float32)
+    dihedral_phase = as_mx_array(dihedral_phase, dtype=mx.float32)
+    improper_atoms = as_mx_array(improper_atoms, dtype=mx.int32)
+    improper_k = as_mx_array(improper_k, dtype=mx.float32)
+    improper_periodicity = as_mx_array(improper_periodicity, dtype=mx.float32)
+    improper_phase = as_mx_array(improper_phase, dtype=mx.float32)
+
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    counts = (
+        bond_atoms.shape[0],
+        angle_atoms.shape[0],
+        dihedral_atoms.shape[0],
+        improper_atoms.shape[0],
+    )
+    arrays = (
+        (bond_atoms, bond_k, bond_length, 2, "bond"),
+        (angle_atoms, angle_k, angle_target, 3, "angle"),
+        (
+            dihedral_atoms,
+            dihedral_k,
+            dihedral_periodicity,
+            4,
+            "dihedral",
+        ),
+        (
+            improper_atoms,
+            improper_k,
+            improper_periodicity,
+            4,
+            "improper",
+        ),
+    )
+    for atoms, first_parameter, second_parameter, width, family in arrays:
+        count = atoms.shape[0]
+        if atoms.ndim != 2 or atoms.shape[1] != width:
+            msg = f"{family}_atoms must have shape (n, {width})"
+            raise ValueError(msg)
+        if first_parameter.shape != (count,) or second_parameter.shape != (count,):
+            msg = f"{family} parameters must have shape ({count},)"
+            raise ValueError(msg)
+    if dihedral_phase.shape != (counts[2],):
+        msg = f"dihedral_phase must have shape ({counts[2]},)"
+        raise ValueError(msg)
+    if improper_phase.shape != (counts[3],):
+        msg = f"improper_phase must have shape ({counts[3]},)"
+        raise ValueError(msg)
+
+    total_count = sum(counts)
+    if total_count == 0:
+        return mx.zeros_like(positions)
+    count_array = mx.array(counts, dtype=mx.int32)
+    threads = min(256, total_count)
+    (forces,) = _fused_bonded_force_only_kernel()(
+        inputs=[
+            positions,
+            box_lengths,
+            mx.reshape(bond_atoms, (-1,)),
+            bond_k,
+            bond_length,
+            mx.reshape(angle_atoms, (-1,)),
+            angle_k,
+            angle_target,
+            mx.reshape(dihedral_atoms, (-1,)),
+            dihedral_k,
+            dihedral_periodicity,
+            dihedral_phase,
+            mx.reshape(improper_atoms, (-1,)),
+            improper_k,
+            improper_periodicity,
+            improper_phase,
+            count_array,
+        ],
+        output_shapes=[positions.shape],
+        output_dtypes=[mx.float32],
+        grid=(total_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces
 
 
 def fused_lj_forces(
