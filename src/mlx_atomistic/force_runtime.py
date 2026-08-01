@@ -11,6 +11,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.forcefields import _prepare_fused_bonded_force_binding
 from mlx_atomistic.neighbors import NeighborList, NeighborTiles
 from mlx_atomistic.virtual_sites import VirtualSiteManager
 
@@ -108,6 +109,7 @@ class _BoundForcePipeline:
     interactions: object | None
     cell: Cell | None
     virtual_sites: VirtualSiteManager | None
+    fused_bonded_binding: object | None = None
     route_profiler: _ExclusiveRouteProfiler | None = None
 
     def forces(
@@ -134,11 +136,42 @@ class _BoundForcePipeline:
             else as_mx_array(evaluation_positions)
         )
         total_forces = mx.zeros_like(eval_positions)
-        for term, binding in zip(
-            self.force_terms,
-            self.term_bindings,
-            strict=True,
+        fused_term_indices: frozenset[int] = frozenset()
+        if self.fused_bonded_binding is not None:
+            fused_term_indices = self.fused_bonded_binding.term_indices
+            fused_started = (
+                None
+                if self.route_profiler is None
+                else self.route_profiler.start()
+            )
+            fused_forces = self.fused_bonded_binding.forces(eval_positions)
+            if fused_started is not None:
+                self.route_profiler.finish(
+                    "bonded_fused",
+                    fused_started,
+                    fused_forces,
+                )
+            aggregation_started = (
+                None
+                if self.route_profiler is None
+                else self.route_profiler.start()
+            )
+            total_forces = total_forces + fused_forces
+            if aggregation_started is not None:
+                self.route_profiler.finish(
+                    "force_aggregation",
+                    aggregation_started,
+                    total_forces,
+                )
+        for term_index, (term, binding) in enumerate(
+            zip(
+                self.force_terms,
+                self.term_bindings,
+                strict=True,
+            )
         ):
+            if term_index in fused_term_indices:
+                continue
             bound_method = getattr(term, "_forces_from_binding", None)
             profiled_bound_method = getattr(
                 term,
@@ -239,6 +272,10 @@ class _PreparedForcePipeline:
         self.cell = cell
         self.virtual_sites = virtual_sites
         self.route_profiler = route_profiler
+        self.fused_bonded_binding = _prepare_fused_bonded_force_binding(
+            force_terms,
+            cell,
+        )
         self._cached_neighbor_list: NeighborList | None = None
         self._cached_binding: _BoundForcePipeline | None = None
         self._cached_context_identity: tuple[object, ...] | None = None
@@ -335,6 +372,7 @@ class _PreparedForcePipeline:
             interactions=interactions,
             cell=self.cell,
             virtual_sites=self.virtual_sites,
+            fused_bonded_binding=self.fused_bonded_binding,
             route_profiler=self.route_profiler,
         )
         self._cached_neighbor_list = neighbor_list

@@ -1,4 +1,4 @@
-"""Fused Metal kernels for recurring Lennard-Jones force paths.
+"""Fused Metal kernels for recurring molecular force paths.
 
 Collapses the per-step pairwise LJ force op-chain (gather -> minimum image -> r^2 ->
 LJ scalar -> scatter-add) into a single ``mx.fast.metal_kernel`` dispatch. Diagnostic
@@ -7,7 +7,9 @@ outputs and reductions entirely.
 
 The simple kernel covers scalar reduced-unit LJ. The parameterized kernel covers
 per-atom Lorentz-Berthelot parameters, topology scales, shifts, and smooth switching
-for the production biomolecular path. Unsupported cases fall back transparently.
+for the production biomolecular path. A separate force-only kernel combines standard
+bond, angle, periodic-torsion, and improper interactions into one output. Unsupported
+cases fall back transparently.
 
 Because ``tests/conftest.py`` forces ``MLX_ATOMISTIC_DEVICE=cpu``, the kernel is built
 lazily on first use (not at import) so importing this module never triggers a Metal
@@ -73,6 +75,252 @@ _LJ_FORCE_SOURCE = r"""
     atomic_store_explicit(&pair_energy[t], e, memory_order_relaxed);
 """
 
+_BONDED_FORCE_HEADER = r"""
+struct MLXAtomisticDihedralGeometry {
+    float phi;
+    float3 delta_ab;
+    float3 delta_bc;
+    float3 delta_cd;
+    float3 cross_ab_bc;
+    float3 cross_bc_cd;
+};
+
+float3 mlx_atomistic_bonded_displacement(
+    device const float* positions,
+    int left,
+    int right,
+    constant const float* box
+) {
+    float3 displacement = float3(
+        positions[3 * left + 0] - positions[3 * right + 0],
+        positions[3 * left + 1] - positions[3 * right + 1],
+        positions[3 * left + 2] - positions[3 * right + 2]
+    );
+    displacement.x -= box[0] * rint(displacement.x / box[0]);
+    displacement.y -= box[1] * rint(displacement.y / box[1]);
+    displacement.z -= box[2] * rint(displacement.z / box[2]);
+    return displacement;
+}
+
+void mlx_atomistic_add_bonded_force(
+    device atomic<float>* forces,
+    int atom,
+    float3 force
+) {
+    atomic_fetch_add_explicit(
+        &forces[3 * atom + 0], force.x, memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(
+        &forces[3 * atom + 1], force.y, memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(
+        &forces[3 * atom + 2], force.z, memory_order_relaxed
+    );
+}
+
+MLXAtomisticDihedralGeometry mlx_atomistic_dihedral_geometry(
+    device const float* positions,
+    int atom_i,
+    int atom_j,
+    int atom_k,
+    int atom_m,
+    constant const float* box
+) {
+    MLXAtomisticDihedralGeometry geometry;
+    geometry.delta_ab = mlx_atomistic_bonded_displacement(
+        positions, atom_j, atom_i, box
+    );
+    geometry.delta_bc = mlx_atomistic_bonded_displacement(
+        positions, atom_j, atom_k, box
+    );
+    geometry.delta_cd = mlx_atomistic_bonded_displacement(
+        positions, atom_m, atom_k, box
+    );
+    geometry.cross_ab_bc = cross(geometry.delta_ab, geometry.delta_bc);
+    geometry.cross_bc_cd = cross(geometry.delta_bc, geometry.delta_cd);
+    float norm_cross_1 = sqrt(max(
+        dot(geometry.cross_ab_bc, geometry.cross_ab_bc), 1.0e-12f
+    ));
+    float norm_cross_2 = sqrt(max(
+        dot(geometry.cross_bc_cd, geometry.cross_bc_cd), 1.0e-12f
+    ));
+    float cosine = clamp(
+        dot(geometry.cross_ab_bc, geometry.cross_bc_cd)
+            / (norm_cross_1 * norm_cross_2),
+        -0.999999f,
+        0.999999f
+    );
+    float angle = acos(cosine);
+    float sign = dot(geometry.delta_ab, geometry.cross_bc_cd) < 0.0f
+        ? -1.0f
+        : 1.0f;
+    geometry.phi = angle * sign;
+    return geometry;
+}
+
+void mlx_atomistic_apply_dihedral_force(
+    device atomic<float>* forces,
+    int atom_i,
+    int atom_j,
+    int atom_k,
+    int atom_m,
+    MLXAtomisticDihedralGeometry geometry,
+    float force_derivative
+) {
+    float norm_cross_1 = max(
+        dot(geometry.cross_ab_bc, geometry.cross_ab_bc), 1.0e-12f
+    );
+    float norm_cross_2 = max(
+        dot(geometry.cross_bc_cd, geometry.cross_bc_cd), 1.0e-12f
+    );
+    float norm_bc2 = max(dot(geometry.delta_bc, geometry.delta_bc), 1.0e-12f);
+    float norm_bc = sqrt(norm_bc2);
+    float3 force_i = (
+        -force_derivative * norm_bc / norm_cross_1
+    ) * geometry.cross_ab_bc;
+    float3 force_m = (
+        force_derivative * norm_bc / norm_cross_2
+    ) * geometry.cross_bc_cd;
+    float factor_j = dot(geometry.delta_ab, geometry.delta_bc) / norm_bc2;
+    float factor_k = dot(geometry.delta_cd, geometry.delta_bc) / norm_bc2;
+    float3 shared = factor_j * force_i - factor_k * force_m;
+    float3 force_j = -(force_i - shared);
+    float3 force_k = -(force_m + shared);
+    mlx_atomistic_add_bonded_force(forces, atom_i, force_i);
+    mlx_atomistic_add_bonded_force(forces, atom_j, force_j);
+    mlx_atomistic_add_bonded_force(forces, atom_k, force_k);
+    mlx_atomistic_add_bonded_force(forces, atom_m, force_m);
+}
+"""
+
+_BONDED_FORCE_SOURCE = r"""
+    uint task = thread_position_in_grid.x;
+    uint bond_count = (uint)counts[0];
+    uint angle_count = (uint)counts[1];
+    uint dihedral_count = (uint)counts[2];
+    uint improper_count = (uint)counts[3];
+    uint total_count = bond_count + angle_count + dihedral_count + improper_count;
+    if (task >= total_count) {
+        return;
+    }
+
+    if (task < bond_count) {
+        int atom_i = bond_atoms[2 * task + 0];
+        int atom_j = bond_atoms[2 * task + 1];
+        float3 displacement = mlx_atomistic_bonded_displacement(
+            positions, atom_i, atom_j, box
+        );
+        float distance = sqrt(max(dot(displacement, displacement), 1.0e-12f));
+        float scalar = -bond_k[task] * (
+            distance - bond_length[task]
+        ) / distance;
+        float3 force = scalar * displacement;
+        mlx_atomistic_add_bonded_force(forces, atom_i, force);
+        mlx_atomistic_add_bonded_force(forces, atom_j, -force);
+        return;
+    }
+    task -= bond_count;
+
+    if (task < angle_count) {
+        int atom_i = angle_atoms[3 * task + 0];
+        int atom_j = angle_atoms[3 * task + 1];
+        int atom_k = angle_atoms[3 * task + 2];
+        float3 left = mlx_atomistic_bonded_displacement(
+            positions, atom_i, atom_j, box
+        );
+        float3 right = mlx_atomistic_bonded_displacement(
+            positions, atom_k, atom_j, box
+        );
+        float left_norm2 = max(dot(left, left), 1.0e-12f);
+        float right_norm2 = max(dot(right, right), 1.0e-12f);
+        float left_norm = sqrt(left_norm2);
+        float right_norm = sqrt(right_norm2);
+        float cosine = clamp(
+            dot(left, right) / (left_norm * right_norm),
+            -0.999999f,
+            0.999999f
+        );
+        float theta = acos(cosine);
+        float sin_theta = sqrt(max(1.0f - cosine * cosine, 1.0e-12f));
+        float prefactor = angle_k[task] * (
+            theta - angle_target[task]
+        ) / sin_theta;
+        float3 left_force = prefactor * (
+            right / (left_norm * right_norm) - cosine * left / left_norm2
+        );
+        float3 right_force = prefactor * (
+            left / (left_norm * right_norm) - cosine * right / right_norm2
+        );
+        float3 center_force = -(left_force + right_force);
+        mlx_atomistic_add_bonded_force(forces, atom_i, left_force);
+        mlx_atomistic_add_bonded_force(forces, atom_j, center_force);
+        mlx_atomistic_add_bonded_force(forces, atom_k, right_force);
+        return;
+    }
+    task -= angle_count;
+
+    if (task < dihedral_count) {
+        int atom_i = dihedral_atoms[4 * task + 0];
+        int atom_j = dihedral_atoms[4 * task + 1];
+        int atom_k = dihedral_atoms[4 * task + 2];
+        int atom_m = dihedral_atoms[4 * task + 3];
+        MLXAtomisticDihedralGeometry geometry = mlx_atomistic_dihedral_geometry(
+            positions, atom_i, atom_j, atom_k, atom_m, box
+        );
+        float periodic_angle = (
+            dihedral_periodicity[task] * geometry.phi + dihedral_phase[task]
+        );
+        float force_derivative = (
+            dihedral_k[task]
+            * dihedral_periodicity[task]
+            * sin(periodic_angle)
+        );
+        mlx_atomistic_apply_dihedral_force(
+            forces,
+            atom_i,
+            atom_j,
+            atom_k,
+            atom_m,
+            geometry,
+            force_derivative
+        );
+        return;
+    }
+    task -= dihedral_count;
+
+    if (task < improper_count) {
+        int atom_i = improper_atoms[4 * task + 0];
+        int atom_j = improper_atoms[4 * task + 1];
+        int atom_k = improper_atoms[4 * task + 2];
+        int atom_m = improper_atoms[4 * task + 3];
+        MLXAtomisticDihedralGeometry geometry = mlx_atomistic_dihedral_geometry(
+            positions, atom_i, atom_j, atom_k, atom_m, box
+        );
+        float periodicity = improper_periodicity[task];
+        float shifted_angle = geometry.phi + improper_phase[task];
+        float force_derivative;
+        if (periodicity == 0.0f) {
+            float harmonic_delta = atan2(sin(shifted_angle), cos(shifted_angle));
+            force_derivative = -2.0f * improper_k[task] * harmonic_delta;
+        } else {
+            force_derivative = (
+                improper_k[task]
+                * periodicity
+                * sin(periodicity * geometry.phi + improper_phase[task])
+            );
+        }
+        mlx_atomistic_apply_dihedral_force(
+            forces,
+            atom_i,
+            atom_j,
+            atom_k,
+            atom_m,
+            geometry,
+            force_derivative
+        );
+    }
+"""
+
 _kernel_singleton = None
 _parameterized_kernel_singleton = None
 _pme_direct_kernel_singleton = None
@@ -90,6 +338,7 @@ _shake_cluster_position_kernel_singleton = None
 _shake_cluster_velocity_kernel_singleton = None
 _settle_water_position_kernel_singleton = None
 _settle_water_velocity_kernel_singleton = None
+_fused_bonded_force_only_kernel_singleton = None
 
 # Neighbor compaction preserves short runs of a common left atom, so one worker
 # can sum those contributions locally before issuing global atomics.
@@ -1853,6 +2102,40 @@ def _settle_water_velocity_kernel():
     return _settle_water_velocity_kernel_singleton
 
 
+def _fused_bonded_force_only_kernel():
+    """Return the cached force-only bonded-interaction Metal kernel."""
+
+    global _fused_bonded_force_only_kernel_singleton
+    if _fused_bonded_force_only_kernel_singleton is None:
+        _fused_bonded_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="fused_bonded_force_only",
+            input_names=[
+                "positions",
+                "box",
+                "bond_atoms",
+                "bond_k",
+                "bond_length",
+                "angle_atoms",
+                "angle_k",
+                "angle_target",
+                "dihedral_atoms",
+                "dihedral_k",
+                "dihedral_periodicity",
+                "dihedral_phase",
+                "improper_atoms",
+                "improper_k",
+                "improper_periodicity",
+                "improper_phase",
+                "counts",
+            ],
+            output_names=["forces"],
+            source=_BONDED_FORCE_SOURCE,
+            header=_BONDED_FORCE_HEADER,
+            atomic_outputs=True,
+        )
+    return _fused_bonded_force_only_kernel_singleton
+
+
 def neighbor_pair_cutoff_mask(
     positions: mx.array,
     pairs_i: mx.array,
@@ -2510,6 +2793,122 @@ def pme_order5_energy_forces(
         init_value=0.0,
     )
     return mx.sum(atom_energy), forces
+
+
+def _fused_bonded_force_only(
+    positions: mx.array,
+    box_lengths: mx.array,
+    bond_atoms: mx.array,
+    bond_k: mx.array,
+    bond_length: mx.array,
+    angle_atoms: mx.array,
+    angle_k: mx.array,
+    angle_target: mx.array,
+    dihedral_atoms: mx.array,
+    dihedral_k: mx.array,
+    dihedral_periodicity: mx.array,
+    dihedral_phase: mx.array,
+    improper_atoms: mx.array,
+    improper_k: mx.array,
+    improper_periodicity: mx.array,
+    improper_phase: mx.array,
+) -> mx.array:
+    """Evaluate four standard bonded families in one force-only dispatch."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    bond_atoms = as_mx_array(bond_atoms, dtype=mx.int32)
+    bond_k = as_mx_array(bond_k, dtype=mx.float32)
+    bond_length = as_mx_array(bond_length, dtype=mx.float32)
+    angle_atoms = as_mx_array(angle_atoms, dtype=mx.int32)
+    angle_k = as_mx_array(angle_k, dtype=mx.float32)
+    angle_target = as_mx_array(angle_target, dtype=mx.float32)
+    dihedral_atoms = as_mx_array(dihedral_atoms, dtype=mx.int32)
+    dihedral_k = as_mx_array(dihedral_k, dtype=mx.float32)
+    dihedral_periodicity = as_mx_array(dihedral_periodicity, dtype=mx.float32)
+    dihedral_phase = as_mx_array(dihedral_phase, dtype=mx.float32)
+    improper_atoms = as_mx_array(improper_atoms, dtype=mx.int32)
+    improper_k = as_mx_array(improper_k, dtype=mx.float32)
+    improper_periodicity = as_mx_array(improper_periodicity, dtype=mx.float32)
+    improper_phase = as_mx_array(improper_phase, dtype=mx.float32)
+
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    counts = (
+        bond_atoms.shape[0],
+        angle_atoms.shape[0],
+        dihedral_atoms.shape[0],
+        improper_atoms.shape[0],
+    )
+    arrays = (
+        (bond_atoms, bond_k, bond_length, 2, "bond"),
+        (angle_atoms, angle_k, angle_target, 3, "angle"),
+        (
+            dihedral_atoms,
+            dihedral_k,
+            dihedral_periodicity,
+            4,
+            "dihedral",
+        ),
+        (
+            improper_atoms,
+            improper_k,
+            improper_periodicity,
+            4,
+            "improper",
+        ),
+    )
+    for atoms, first_parameter, second_parameter, width, family in arrays:
+        count = atoms.shape[0]
+        if atoms.ndim != 2 or atoms.shape[1] != width:
+            msg = f"{family}_atoms must have shape (n, {width})"
+            raise ValueError(msg)
+        if first_parameter.shape != (count,) or second_parameter.shape != (count,):
+            msg = f"{family} parameters must have shape ({count},)"
+            raise ValueError(msg)
+    if dihedral_phase.shape != (counts[2],):
+        msg = f"dihedral_phase must have shape ({counts[2]},)"
+        raise ValueError(msg)
+    if improper_phase.shape != (counts[3],):
+        msg = f"improper_phase must have shape ({counts[3]},)"
+        raise ValueError(msg)
+
+    total_count = sum(counts)
+    if total_count == 0:
+        return mx.zeros_like(positions)
+    count_array = mx.array(counts, dtype=mx.int32)
+    threads = min(256, total_count)
+    (forces,) = _fused_bonded_force_only_kernel()(
+        inputs=[
+            positions,
+            box_lengths,
+            mx.reshape(bond_atoms, (-1,)),
+            bond_k,
+            bond_length,
+            mx.reshape(angle_atoms, (-1,)),
+            angle_k,
+            angle_target,
+            mx.reshape(dihedral_atoms, (-1,)),
+            dihedral_k,
+            dihedral_periodicity,
+            dihedral_phase,
+            mx.reshape(improper_atoms, (-1,)),
+            improper_k,
+            improper_periodicity,
+            improper_phase,
+            count_array,
+        ],
+        output_shapes=[positions.shape],
+        output_dtypes=[mx.float32],
+        grid=(total_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces
 
 
 def fused_lj_forces(

@@ -27,6 +27,7 @@ from mlx_atomistic.custom_force import (
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
+    _fused_bonded_force_only,
     _prepared_parameterized_pme_direct_force_only,
     aligned_topology_lj_scales,
     fused_parameterized_lj_forces,
@@ -917,6 +918,79 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
             .add(force_m)
         )
         return energy, forces
+
+
+@dataclass(frozen=True)
+class _FusedBondedForceBinding:
+    """Prepared force-only binding for the four standard bonded families."""
+
+    term_indices: frozenset[int]
+    box_lengths: mx.array
+    bond: HarmonicBondPotential
+    angle: HarmonicAnglePotential
+    dihedral: PeriodicDihedralPotential
+    improper: ImproperDihedralPotential
+
+    def forces(self, positions: mx.array) -> mx.array:
+        """Evaluate all bound bonded interactions in one Metal dispatch."""
+
+        return _fused_bonded_force_only(
+            positions,
+            self.box_lengths,
+            self.bond.bonds,
+            self.bond.k,
+            self.bond.length,
+            self.angle.angles,
+            self.angle.k,
+            self.angle.angle,
+            self.dihedral.dihedrals,
+            self.dihedral.k,
+            self.dihedral.periodicity,
+            self.dihedral.phase,
+            self.improper.dihedrals,
+            self.improper.k,
+            self.improper.periodicity,
+            self.improper.phase,
+        )
+
+
+def _prepare_fused_bonded_force_binding(
+    force_terms: tuple[object, ...],
+    cell: Cell | None,
+) -> _FusedBondedForceBinding | None:
+    """Prepare the exact standard bonded family set for one Metal dispatch."""
+
+    if (
+        "gpu" not in str(mx.default_device()).lower()
+        or cell is None
+        or not cell.is_orthorhombic
+    ):
+        return None
+    family_types = (
+        HarmonicBondPotential,
+        HarmonicAnglePotential,
+        PeriodicDihedralPotential,
+        ImproperDihedralPotential,
+    )
+    matched: dict[type[object], tuple[int, object]] = {}
+    for index, term in enumerate(force_terms):
+        term_type = type(term)
+        if term_type not in family_types:
+            continue
+        if term_type in matched:
+            return None
+        matched[term_type] = (index, term)
+    if set(matched) != set(family_types):
+        return None
+    term_indices = frozenset(index for index, _ in matched.values())
+    return _FusedBondedForceBinding(
+        term_indices=term_indices,
+        box_lengths=mx.diag(cell.matrix),
+        bond=matched[HarmonicBondPotential][1],
+        angle=matched[HarmonicAnglePotential][1],
+        dihedral=matched[PeriodicDihedralPotential][1],
+        improper=matched[ImproperDihedralPotential][1],
+    )
 
 
 @dataclass(frozen=True)
