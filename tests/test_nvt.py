@@ -837,9 +837,59 @@ def test_dynamic_neighbor_nvt_reports_rebuilds():
         cell=cell,
         force_terms=potential,
         neighbor_manager=manager,
-        config=SimulationConfig(dt=0.001, steps=3, sample_interval=3),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+        ),
         thermostat=LangevinThermostat(temperature=1.0, friction=0.2, seed=5),
     )
 
     assert int(np.array(result.rebuild_count)[-1]) >= 1
     assert int(np.array(result.pair_count)[-1]) > 0
+
+
+def test_nvt_runtime_profile_is_opt_in_reconciled_and_state_preserving():
+    positions, velocities, cell, potential = _small_system()
+    thermostat = LangevinThermostat(temperature=1.0, friction=0.2, seed=5)
+    normal = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        config=SimulationConfig(dt=0.001, steps=3, sample_interval=3),
+        thermostat=thermostat,
+    )
+    profiled = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+            runtime_profile=True,
+        ),
+        thermostat=thermostat,
+    )
+
+    assert normal.route_profile == {}
+    assert profiled.route_profile["reconciled"] is True
+    assert profiled.route_profile["residual_seconds"] >= 0.0
+    assert "integration_thermostat" in profiled.route_profile["routes"]
+    assert "other_force_terms" in profiled.route_profile["routes"]
+    np.testing.assert_allclose(
+        np.asarray(profiled.final_state.positions),
+        np.asarray(normal.final_state.positions),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(profiled.final_state.velocities),
+        np.asarray(normal.final_state.velocities),
+        rtol=1e-6,
+        atol=1e-6,
+    )

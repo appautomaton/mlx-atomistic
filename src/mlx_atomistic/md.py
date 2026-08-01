@@ -12,9 +12,16 @@ from typing import Any, Literal, Protocol
 import mlx.core as mx
 import numpy as np
 
-from mlx_atomistic.constraints import DistanceConstraints
+from mlx_atomistic.constraints import (
+    CompositeConstraints,
+    DistanceConstraints,
+    SettleWaterConstraints,
+)
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.force_runtime import _PreparedForcePipeline
+from mlx_atomistic.force_runtime import (
+    _ExclusiveRouteProfiler,
+    _PreparedForcePipeline,
+)
 from mlx_atomistic.metal_kernels import fused_lj_forces
 from mlx_atomistic.neighbors import (
     NeighborBlocks,
@@ -477,6 +484,7 @@ class SimulationConfig:
     block_size: int = 1
     center_of_mass_motion_interval: int | None = None
     wrap_positions: bool = True
+    runtime_profile: bool = False
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -685,6 +693,7 @@ class NVTResult:
     thermostat_metadata: dict[str, Any] = field(default_factory=dict)
     nonbonded_report: dict[str, int | float | str | None] = field(default_factory=dict)
     runtime_sync_report: dict[str, int | float] = field(default_factory=dict)
+    route_profile: dict[str, Any] = field(default_factory=dict)
 
     @property
     def temperature_error(self) -> mx.array:
@@ -2448,6 +2457,207 @@ def _validate_runtime_sync_reason(reason: str) -> None:
         raise ValueError(msg)
 
 
+def _constraint_profile_name(constraint: object, operation: str) -> str:
+    family = (
+        "settle"
+        if isinstance(constraint, SettleWaterConstraints)
+        else "generic_constraints"
+    )
+    return f"{family}_{operation}"
+
+
+def _profile_constraint_positions(
+    constraints: object,
+    predicted_positions: mx.array,
+    masses: mx.array,
+    cell: Cell | None,
+    profiler: _ExclusiveRouteProfiler,
+    *,
+    reference_positions: mx.array | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Apply position constraints while attributing SETTLE and generic work."""
+
+    if not isinstance(constraints, CompositeConstraints):
+        started = profiler.start()
+        step_projector = getattr(constraints, "apply_position_step", None)
+        if reference_positions is None or step_projector is None:
+            constrained, error = constraints.apply_positions(
+                predicted_positions,
+                masses,
+                cell,
+            )
+        else:
+            constrained, error = step_projector(
+                reference_positions,
+                predicted_positions,
+                masses,
+                cell,
+            )
+        profiler.finish(
+            _constraint_profile_name(constraints, "position"),
+            started,
+            constrained,
+            error,
+        )
+        return constrained, error
+
+    constrained = as_mx_array(predicted_positions)
+    cycles = 8 if constraints._requires_iteration else 1
+    for _ in range(cycles):
+        for child in constraints.constraints:
+            started = profiler.start()
+            step_projector = getattr(child, "apply_position_step", None)
+            if reference_positions is None or step_projector is None:
+                constrained, _ = child.apply_positions(
+                    constrained,
+                    masses,
+                    cell,
+                )
+            else:
+                constrained, _ = step_projector(
+                    reference_positions,
+                    constrained,
+                    masses,
+                    cell,
+                )
+            profiler.finish(
+                _constraint_profile_name(child, "position"),
+                started,
+                constrained,
+            )
+    validation_started = profiler.start()
+    error = constraints.max_error(constrained, cell)
+    profiler.finish(
+        "constraint_validation",
+        validation_started,
+        error,
+    )
+    return constrained, error
+
+
+def _profile_constraint_pre_force_velocities(
+    constraints: object,
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    cell: Cell | None,
+    profiler: _ExclusiveRouteProfiler,
+) -> mx.array:
+    """Apply the pre-force velocity projection with exclusive attribution."""
+
+    if not isinstance(constraints, CompositeConstraints):
+        projector = getattr(
+            constraints,
+            "_apply_pre_force_velocities",
+            constraints.apply_velocities,
+        )
+        started = profiler.start()
+        constrained = projector(positions, velocities, masses, cell)
+        profiler.finish(
+            _constraint_profile_name(constraints, "pre_force_velocity"),
+            started,
+            constrained,
+        )
+        return constrained
+
+    if constraints._requires_iteration:
+        return _profile_constraint_velocities(
+            constraints,
+            positions,
+            velocities,
+            masses,
+            cell,
+            profiler,
+            operation="pre_force_velocity",
+        )
+    constrained = as_mx_array(velocities)
+    for child in constraints.constraints:
+        if isinstance(child, SettleWaterConstraints):
+            continue
+        started = profiler.start()
+        constrained = child.apply_velocities(
+            positions,
+            constrained,
+            masses,
+            cell,
+        )
+        profiler.finish(
+            _constraint_profile_name(child, "pre_force_velocity"),
+            started,
+            constrained,
+        )
+    return constrained
+
+
+def _profile_constraint_velocities(
+    constraints: object,
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    cell: Cell | None,
+    profiler: _ExclusiveRouteProfiler,
+    *,
+    operation: str = "velocity",
+) -> mx.array:
+    """Apply final velocity constraints with SETTLE/generic attribution."""
+
+    if not isinstance(constraints, CompositeConstraints):
+        started = profiler.start()
+        constrained = constraints.apply_velocities(
+            positions,
+            velocities,
+            masses,
+            cell,
+        )
+        profiler.finish(
+            _constraint_profile_name(constraints, operation),
+            started,
+            constrained,
+        )
+        return constrained
+
+    constrained = as_mx_array(velocities)
+    cycles = 8 if constraints._requires_iteration else 1
+    for _ in range(cycles):
+        for child in constraints.constraints:
+            started = profiler.start()
+            constrained = child.apply_velocities(
+                positions,
+                constrained,
+                masses,
+                cell,
+            )
+            profiler.finish(
+                _constraint_profile_name(child, operation),
+                started,
+                constrained,
+            )
+    return constrained
+
+
+def _neighbor_profile_values(neighbor_list: NeighborList | None) -> tuple[mx.array, ...]:
+    if neighbor_list is None:
+        return ()
+    values = [neighbor_list.pairs]
+    if neighbor_list.blocks is not None:
+        values.extend(
+            (
+                neighbor_list.blocks.left,
+                neighbor_list.blocks.right,
+                neighbor_list.blocks.valid_mask,
+            )
+        )
+    if neighbor_list.tiles is not None:
+        values.extend(
+            (
+                neighbor_list.tiles.atom_blocks,
+                neighbor_list.tiles.tile_blocks,
+                neighbor_list.tiles.member_mask,
+            )
+        )
+    return tuple(values)
+
+
 def _validate_compact_nonbonded_backend(
     force_terms: tuple[ForceTerm, ...],
     *,
@@ -3306,7 +3516,6 @@ def simulate_nve(
                     runtime_sync=runtime_sync,
                     sync_reason="failure_check",
                 )
-
     potential_energy_series = mx.stack(potential_energies)
     kinetic_energy_series = mx.stack(kinetic_energies)
     runtime_sync_report = runtime_sync.to_report()
@@ -3412,6 +3621,9 @@ def _simulate_nvt(
 
     if config is None:
         config = SimulationConfig()
+    route_profiler = (
+        _ExclusiveRouteProfiler() if config.runtime_profile else None
+    )
     virtual_sites = config.virtual_sites
     reporters_tuple = _normalize_reporters(reporters)
     runtime_sync = _RuntimeSyncRecorder()
@@ -3440,11 +3652,40 @@ def _simulate_nvt(
         else initial_diagnostics.constraint_error
     )
     if constraints is not None and initial_diagnostics is None:
-        positions, constraint_error = constraints.apply_positions(positions, masses, cell)
-        velocities = constraints.apply_velocities(positions, velocities, masses, cell)
+        if route_profiler is None:
+            positions, constraint_error = constraints.apply_positions(
+                positions,
+                masses,
+                cell,
+            )
+            velocities = constraints.apply_velocities(
+                positions,
+                velocities,
+                masses,
+                cell,
+            )
+        else:
+            positions, constraint_error = _profile_constraint_positions(
+                constraints,
+                positions,
+                masses,
+                cell,
+                route_profiler,
+            )
+            velocities = _profile_constraint_velocities(
+                constraints,
+                positions,
+                velocities,
+                masses,
+                cell,
+                route_profiler,
+            )
     temperature_dof = _temperature_degrees_of_freedom(positions, constraints)
 
     eval_positions = _neighbor_evaluation_positions(positions, virtual_sites)
+    neighbor_started = (
+        None if route_profiler is None else route_profiler.start()
+    )
     if neighbor_manager is None:
         neighbor_list = None
     elif initial_diagnostics is None:
@@ -3455,6 +3696,12 @@ def _simulate_nvt(
         if neighbor_list is None:
             msg = "NPT boundary reuse requires an initialized neighbor list"
             raise RuntimeError(msg)
+    if neighbor_started is not None:
+        route_profiler.finish(
+            "neighbor_update_rebuild",
+            neighbor_started,
+            _neighbor_profile_values(neighbor_list),
+        )
     prepared_force_pipeline = (
         None
         if neighbor_manager is None or neighbor_manager.check_interval != 1
@@ -3462,13 +3709,22 @@ def _simulate_nvt(
             unnamed_terms,
             cell=cell,
             virtual_sites=virtual_sites,
+            route_profiler=route_profiler,
         )
+    )
+    binding_started = (
+        None if route_profiler is None else route_profiler.start()
     )
     force_binding = (
         None
         if prepared_force_pipeline is None
         else prepared_force_pipeline.bind(neighbor_list)
     )
+    if binding_started is not None:
+        route_profiler.finish(
+            "neighbor_force_binding",
+            binding_started,
+        )
     pairs = None if neighbor_list is None else neighbor_list.interactions
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -3507,6 +3763,9 @@ def _simulate_nvt(
         virtual_sites=virtual_sites,
     )
     force_start = perf_counter()
+    diagnostic_profile_started = (
+        None if route_profiler is None else route_profiler.start()
+    )
     if initial_diagnostics is None:
         potential_energy, forces, energy_by_term, diagnostic_virial = (
             energy_forces_by_term(positions)
@@ -3516,6 +3775,15 @@ def _simulate_nvt(
         forces = initial_diagnostics.forces
         energy_by_term = dict(initial_diagnostics.energy_by_term)
         diagnostic_virial = initial_diagnostics.virial_tensor
+    if diagnostic_profile_started is not None:
+        route_profiler.finish(
+            "diagnostics_reporting",
+            diagnostic_profile_started,
+            potential_energy,
+            forces,
+            energy_by_term,
+            diagnostic_virial,
+        )
     force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
@@ -3664,7 +3932,7 @@ def _simulate_nvt(
         runtime_sync=runtime_sync,
     )
 
-    _batched = _langevin_block_execution_enabled(
+    _batched = route_profiler is None and _langevin_block_execution_enabled(
         config,
         thermostat=thermostat,
         neighbor_manager=neighbor_manager,
@@ -4097,6 +4365,9 @@ def _simulate_nvt(
         )
     )
     for local_step in step_range:
+        integration_started = (
+            None if route_profiler is None else route_profiler.start()
+        )
         current_step = config.initial_step + local_step
         current_time = config.initial_time + local_step * config.dt
         acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
@@ -4131,10 +4402,27 @@ def _simulate_nvt(
             if isinstance(thermostat, LangevinThermostat)
             else velocities_half
         )
+        if integration_started is not None:
+            route_profiler.finish(
+                "integration_thermostat",
+                integration_started,
+                next_positions,
+                velocity_before_final_kick,
+                key,
+            )
         if constraints is not None:
             unconstrained_positions = next_positions
             step_projector = getattr(constraints, "apply_position_step", None)
-            if step_projector is None:
+            if route_profiler is not None:
+                next_positions, constraint_error = _profile_constraint_positions(
+                    constraints,
+                    next_positions,
+                    masses,
+                    cell,
+                    route_profiler,
+                    reference_positions=state.positions,
+                )
+            elif step_projector is None:
                 next_positions, constraint_error = constraints.apply_positions(
                     next_positions,
                     masses,
@@ -4153,19 +4441,49 @@ def _simulate_nvt(
             velocity_before_final_kick = (
                 velocity_before_final_kick + position_correction / config.dt
             )
-            velocity_before_final_kick = pre_force_velocity_projector(
-                next_positions,
-                velocity_before_final_kick,
-                masses,
-                cell,
-            )
+            if route_profiler is None:
+                velocity_before_final_kick = pre_force_velocity_projector(
+                    next_positions,
+                    velocity_before_final_kick,
+                    masses,
+                    cell,
+                )
+            else:
+                velocity_before_final_kick = (
+                    _profile_constraint_pre_force_velocities(
+                        constraints,
+                        next_positions,
+                        velocity_before_final_kick,
+                        masses,
+                        cell,
+                        route_profiler,
+                    )
+                )
 
+        neighbor_started = (
+            None if route_profiler is None else route_profiler.start()
+        )
         eval_positions = _neighbor_evaluation_positions(next_positions, virtual_sites)
         neighbor_list = (
             neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
         )
+        if neighbor_started is not None:
+            route_profiler.finish(
+                "neighbor_update_rebuild",
+                neighbor_started,
+                eval_positions,
+                _neighbor_profile_values(neighbor_list),
+            )
         if prepared_force_pipeline is not None:
+            binding_started = (
+                None if route_profiler is None else route_profiler.start()
+            )
             force_binding = prepared_force_pipeline.bind(neighbor_list)
+            if binding_started is not None:
+                route_profiler.finish(
+                    "neighbor_force_binding",
+                    binding_started,
+                )
         pairs = None if neighbor_list is None else neighbor_list.interactions
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -4180,6 +4498,16 @@ def _simulate_nvt(
         deferred_final = defer_final_diagnostics and local_step == config.steps
         full_diagnostic_step = diagnostic_step and not deferred_final
         force_start = perf_counter()
+        force_profile_started = (
+            None
+            if route_profiler is None
+            or (
+                force_binding is not None
+                and not full_diagnostic_step
+                and not deferred_final
+            )
+            else route_profiler.start()
+        )
         diagnostic_virial = None
         if neighbor_manager is None and full_diagnostic_step:
             (
@@ -4250,16 +4578,53 @@ def _simulate_nvt(
             energy_by_term = {
                 name: energies[-1] for name, energies in potential_energy_by_term.items()
             }
+        if force_profile_started is not None:
+            force_profile_name = (
+                "diagnostics_reporting"
+                if full_diagnostic_step or deferred_final
+                else "other_force_terms"
+            )
+            route_profiler.finish(
+                force_profile_name,
+                force_profile_started,
+                potential_energy,
+                next_forces,
+                energy_by_term,
+                diagnostic_virial,
+            )
         force_evaluation_wall_seconds += perf_counter() - force_start
+        final_integration_started = (
+            None if route_profiler is None else route_profiler.start()
+        )
         next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = velocity_before_final_kick + 0.5 * config.dt * next_acceleration
-        if constraints is not None:
-            next_velocities = constraints.apply_velocities(
-                next_positions,
+        if final_integration_started is not None:
+            route_profiler.finish(
+                "integration_thermostat",
+                final_integration_started,
+                next_acceleration,
                 next_velocities,
-                masses,
-                cell,
             )
+        if constraints is not None:
+            if route_profiler is None:
+                next_velocities = constraints.apply_velocities(
+                    next_positions,
+                    next_velocities,
+                    masses,
+                    cell,
+                )
+            else:
+                next_velocities = _profile_constraint_velocities(
+                    constraints,
+                    next_positions,
+                    next_velocities,
+                    masses,
+                    cell,
+                    route_profiler,
+                )
+        post_integration_started = (
+            None if route_profiler is None else route_profiler.start()
+        )
         if (
             config.center_of_mass_motion_interval is not None
             and current_step % config.center_of_mass_motion_interval == 0
@@ -4301,6 +4666,16 @@ def _simulate_nvt(
                 boltzmann_constant=config.boltzmann_constant,
                 chain_position=float(np.asarray(nh_chain_position)),
                 chain_velocity=float(np.asarray(nh_chain_velocity)),
+            )
+        if post_integration_started is not None:
+            route_profiler.finish(
+                "integration_thermostat",
+                post_integration_started,
+                state.positions,
+                state.velocities,
+                state.forces,
+                nh_chain_position,
+                nh_chain_velocity,
             )
 
         sampled_state_evaluated = False
@@ -4424,6 +4799,7 @@ def _simulate_nvt(
     potential_energy_series = mx.stack(potential_energies)
     kinetic_energy_series = mx.stack(kinetic_energies)
     runtime_sync_report = runtime_sync.to_report()
+    route_profile = {} if route_profiler is None else route_profiler.report()
     return NVTResult(
         sampled_positions=mx.stack(sampled_positions),
         sampled_velocities=mx.stack(sampled_velocities),
@@ -4455,6 +4831,7 @@ def _simulate_nvt(
             runtime_sync_report=runtime_sync_report,
         ),
         runtime_sync_report=runtime_sync_report,
+        route_profile=route_profile,
     )
 
 

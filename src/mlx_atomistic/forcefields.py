@@ -3412,6 +3412,79 @@ class NonbondedPotential:
             )
         )
 
+    def _profile_forces_from_binding(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+        route_profiler,
+    ) -> mx.array:
+        """Evaluate one prepared PME force call with exclusive route barriers."""
+
+        if not isinstance(binding, _NonbondedForceBinding):
+            msg = "nonbonded force binding has an incompatible type"
+            raise TypeError(msg)
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+
+        direct_started = route_profiler.start()
+        direct_forces = _prepared_parameterized_pme_direct_force_only(
+            positions,
+            binding.pairs,
+            binding.box_lengths_and_inverses,
+            binding.half_sigma,
+            binding.sqrt_epsilon,
+            self.charges,
+            binding.aligned_lj_scales,
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+        )
+        route_profiler.finish(
+            "direct_lj_screened_coulomb",
+            direct_started,
+            direct_forces,
+        )
+
+        reciprocal_started = route_profiler.start()
+        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            binding.pme_plan,
+            include_self_correction=False,
+        )
+        route_profiler.finish(
+            "reciprocal_pme",
+            reciprocal_started,
+            reciprocal_forces,
+        )
+
+        correction_started = route_profiler.start()
+        correction_forces = self._exception_lj_forces(
+            positions,
+            binding.cell,
+        ) + self._periodic_coulomb_correction_forces(
+            positions,
+            binding.cell,
+        )
+        route_profiler.finish(
+            "pme_exceptions_corrections",
+            correction_started,
+            correction_forces,
+        )
+
+        aggregation_started = route_profiler.start()
+        forces = direct_forces + reciprocal_forces + correction_forces
+        route_profiler.finish(
+            "force_aggregation",
+            aggregation_started,
+            forces,
+        )
+        return forces
+
     def _pme_energy_forces(
         self,
         positions: mx.array,
