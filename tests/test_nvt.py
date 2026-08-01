@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -81,32 +79,6 @@ class _DemandCountingTerm:
         self.pair_candidates.append(pairs)
         self.calls.append("virial")
         return mx.zeros((3, 3), dtype=positions.dtype)
-
-
-class _PreparedTileCountingTerm(_DemandCountingTerm):
-    def __init__(self):
-        super().__init__()
-        self.tile_force_calls = 0
-        self.pair_force_calls = 0
-
-    def _prepare_tile_force_binding(self, cell, pairs, tiles):
-        return SimpleNamespace(
-            cell=cell,
-            pairs=pairs,
-            tiles=tiles,
-            tile_force_ready=True,
-            tile_decline_reason="tile_force_route_not_selected",
-        )
-
-    def _tile_forces_from_binding(self, positions, binding):
-        assert binding.tiles is not None
-        self.tile_force_calls += 1
-        return mx.zeros_like(positions)
-
-    def _forces_from_binding(self, positions, binding):
-        assert isinstance(binding.pairs, mx.array)
-        self.pair_force_calls += 1
-        return mx.zeros_like(positions)
 
 
 @pytest.mark.parametrize(
@@ -340,107 +312,6 @@ def test_nvt_ordinary_steps_request_forces_and_boundaries_request_diagnostics():
     assert term.calls == ["diagnostic", "forces", "forces", "diagnostic"]
     assert term.pair_candidates
     assert all(isinstance(pairs, mx.array) for pairs in term.pair_candidates)
-
-
-def test_nvt_atom_tiles_are_limited_to_ordinary_force_steps():
-    term = _PreparedTileCountingTerm()
-    fallback = _DemandCountingTerm()
-    positions = np.zeros((2, 3), dtype=np.float32)
-    cell = Cell.cubic(6.0)
-
-    result = simulate_nvt(
-        positions,
-        np.zeros_like(positions),
-        cell=cell,
-        force_terms=(term, fallback),
-        neighbor_manager=NeighborListManager(
-            cell,
-            cutoff=2.5,
-            skin=0.4,
-            backend="mlx_cell_tiles",
-        ),
-        config=SimulationConfig(
-            dt=0.001,
-            steps=3,
-            sample_interval=3,
-            diagnostic_interval=3,
-            pressure_diagnostics=False,
-            direct_force_backend="atom-tiles",
-        ),
-        thermostat=LangevinThermostat(
-            temperature=0.0,
-            friction=0.0,
-            seed=3,
-        ),
-    )
-
-    assert term.tile_force_calls == 2
-    assert term.pair_force_calls == 0
-    assert fallback.calls == ["diagnostic", "forces", "forces", "diagnostic"]
-    assert all(isinstance(pairs, mx.array) for pairs in fallback.pair_candidates)
-    assert result.force_route_report["selected_backend"] == "atom-tiles"
-    assert result.force_route_report["tile_selected_term_count"] == 1
-    assert result.force_route_report["compact_fallback_term_count"] == 1
-    assert result.force_route_report["tile_decline_reasons"] == []
-
-
-def test_nvt_atom_tile_route_survives_split_restart():
-    positions = np.array([[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]], dtype=np.float32)
-    velocities = np.array([[0.01, 0.0, 0.0], [-0.01, 0.0, 0.0]], dtype=np.float32)
-    cell = Cell.cubic(6.0)
-
-    def run(start_positions, start_velocities, *, steps, initial_step=0):
-        return simulate_nvt(
-            start_positions,
-            start_velocities,
-            cell=cell,
-            force_terms=_PreparedTileCountingTerm(),
-            neighbor_manager=NeighborListManager(
-                cell,
-                cutoff=2.5,
-                skin=0.4,
-                backend="mlx_cell_tiles",
-            ),
-            config=SimulationConfig(
-                dt=0.001,
-                steps=steps,
-                initial_step=initial_step,
-                initial_time=initial_step * 0.001,
-                sample_interval=steps,
-                diagnostic_interval=steps,
-                pressure_diagnostics=False,
-                direct_force_backend="atom-tiles",
-            ),
-            thermostat=LangevinThermostat(
-                temperature=0.0,
-                friction=0.0,
-                seed=5,
-                rng_step_offset=initial_step,
-            ),
-        )
-
-    uninterrupted = run(positions, velocities, steps=4)
-    first = run(positions, velocities, steps=2)
-    resumed = run(
-        first.final_state.positions,
-        first.final_state.velocities,
-        steps=2,
-        initial_step=2,
-    )
-
-    np.testing.assert_allclose(
-        np.asarray(resumed.final_state.positions),
-        np.asarray(uninterrupted.final_state.positions),
-        rtol=0.0,
-        atol=1.0e-7,
-    )
-    np.testing.assert_allclose(
-        np.asarray(resumed.final_state.velocities),
-        np.asarray(uninterrupted.final_state.velocities),
-        rtol=0.0,
-        atol=1.0e-7,
-    )
-    assert resumed.force_route_report["selected_backend"] == "atom-tiles"
 
 
 def test_langevin_thermostat_validation():

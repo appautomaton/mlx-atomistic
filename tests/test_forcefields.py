@@ -1145,22 +1145,6 @@ def test_nonbonded_tile_binding_owns_topology_masks_and_compact_fallback(
     assert binding.pairs is neighbors.diagnostic_pairs
     assert binding.tile_geometry is tiles
     assert binding.tile_decline_reason is not None
-    assert not binding.tile_force_ready
-    assert binding.tile_launch_grid == (tiles.tile_count * 64, 1, 1)
-    assert binding.tile_threadgroup == (64, 1, 1)
-    assert binding.tile_topology_bytes == (
-        binding.tile_lj_enabled_mask.nbytes
-        + binding.tile_lj_one_four_mask.nbytes
-    )
-    assert binding.tile_threadgroup_temporary_bytes > 0
-    assert binding.tile_global_update_proxy <= 6 * tiles.exact_pair_count
-    assert (
-        term._tile_forces_from_binding(
-            mx.array(positions, dtype=mx.float32),
-            binding,
-        )
-        is NotImplemented
-    )
     enabled_words = np.asarray(binding.tile_lj_enabled_mask, dtype=np.uint32)
     one_four_words = np.asarray(binding.tile_lj_one_four_mask, dtype=np.uint32)
     enabled = []
@@ -1241,7 +1225,6 @@ def test_nonbonded_tile_binding_owns_topology_masks_and_compact_fallback(
     dtype_binding = pipeline.bind(neighbors)
     assert dtype_binding is not device_binding
     assert dtype_binding.term_bindings[0] is not device_binding.term_bindings[0]
-    assert not dtype_binding.term_bindings[0].tile_force_ready
 
     generation_tiles = replace(tiles, generation=tiles.generation + 1)
     generation_binding = term._prepare_tile_force_binding(

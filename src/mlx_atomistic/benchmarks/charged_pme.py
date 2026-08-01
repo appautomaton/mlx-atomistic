@@ -18,10 +18,6 @@ from mlx_atomistic.artifacts import build_mlx_system_from_artifact, load_prepare
 from mlx_atomistic.benchmarks import get_hardware_info
 from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
-from mlx_atomistic.metal_kernels import (
-    _PREPARED_PME_PAIRS_PER_WORKER,
-    _prepared_parameterized_pme_direct_force_only,
-)
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.prep.io import JSON_NAME, NPZ_NAME, load_prepared_system, save_prepared_system
 from mlx_atomistic.prep.supercell import (
@@ -35,10 +31,8 @@ SUPERCELL_SUMMARY_NAME = "supercell_summary.json"
 RUNTIME_SCHEMA = "mlx_atomistic.charged_pme_runtime.v2"
 PROFILE_SCHEMA = "mlx_atomistic.charged_pme_profile.v1"
 OPENMM_ADMISSION_SCHEMA = "mlx_atomistic.openmm_runtime_admission.v1"
-KERNEL_AB_SCHEMA = "mlx_atomistic.charged_pme_tile_kernel_ab.v1"
 _PROFILE_STATE_RTOL = 5.0e-5
 _PROFILE_STATE_ATOL = 1.0e-5
-_TILE_KERNEL_CANDIDATE_BASE = "aa00358"
 
 
 def prepare_payload(
@@ -142,7 +136,6 @@ def runtime_payload(
     sample_interval: int | None = None,
     diagnostic_interval: int | None = None,
     runtime_profile: bool = False,
-    direct_backend: str = "explicit-pairs",
 ) -> dict[str, Any]:
     """Run bounded fixed-cell charged-PME NVT with one reusable plan.
 
@@ -163,8 +156,6 @@ def runtime_payload(
             only the final step. Defaults to ``None``.
         runtime_profile: Enable synchronized benchmark-only route attribution.
             Defaults to ``False``.
-        direct_backend: Ordinary direct-force backend, ``explicit-pairs`` or
-            ``atom-tiles``. Defaults to ``explicit-pairs``.
 
     Returns:
         JSON-serializable passing, failed, blocked, or resource-ceiling payload.
@@ -190,7 +181,6 @@ def runtime_payload(
         "sample_interval": sample_interval,
         "diagnostic_interval": diagnostic_interval,
         "runtime_profile": bool(runtime_profile),
-        "direct_backend": direct_backend,
         "status": "blocked",
         "passed": False,
         "blockers": [],
@@ -214,8 +204,6 @@ def runtime_payload(
         validation_blockers.append("sample_interval_must_be_positive")
     if diagnostic_interval <= 0:
         validation_blockers.append("diagnostic_interval_must_be_positive")
-    if direct_backend not in {"explicit-pairs", "atom-tiles"}:
-        validation_blockers.append("direct_backend_must_be_explicit_pairs_or_atom_tiles")
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
     validation_blockers.extend(
         f"missing_prepared_input:{path}" for path in required if not path.is_file()
@@ -241,18 +229,13 @@ def runtime_payload(
         if topology is None:
             raise ValueError("charged PME runtime requires a topology-aware nonbonded term")
         cutoff = float(nonbonded.cutoff)
-        neighbor_backend = (
-            "mlx_cell_tiles"
-            if direct_backend == "atom-tiles"
-            else "mlx_cell_pairs"
-        )
         neighbor_manager = NeighborListManager(
             system.cell,
             cutoff=cutoff,
             skin=neighbor_skin,
             check_interval=neighbor_check_interval,
             sort_pairs=False,
-            backend=neighbor_backend,
+            backend="mlx_cell_pairs",
             displacement_check_backend="mlx_scalar",
         )
         setup_seconds = time.perf_counter() - setup_started
@@ -286,7 +269,6 @@ def runtime_payload(
                 simulation_units=simulation_units,
                 sample_interval=warmups,
                 diagnostic_interval=warmups,
-                direct_force_backend=direct_backend,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -315,7 +297,6 @@ def runtime_payload(
                 sample_interval=sample_interval,
                 diagnostic_interval=diagnostic_interval,
                 runtime_profile=runtime_profile,
-                direct_force_backend=direct_backend,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -392,36 +373,8 @@ def runtime_payload(
             "lazy_topology": topology_report["pair_policy"] == "lazy",
             "pair_cache_unmaterialized": not topology_report["pair_cache_materialized"],
             "compact_neighbor_pairs": (
-                neighbor_list is not None
-                and isinstance(neighbor_list.diagnostic_pairs, mx.array)
-            ),
-            "neighbor_representation_matches_backend": (
-                (
-                    direct_backend == "explicit-pairs"
-                    and neighbor_report["manager_backend"] == "mlx_cell_pairs"
-                    and neighbor_report["representation"] == "pairs"
-                )
-                or (
-                    direct_backend == "atom-tiles"
-                    and neighbor_report["manager_backend"] == "mlx_cell_tiles"
-                    and neighbor_report["representation"] == "tiles"
-                )
-            ),
-            "direct_force_backend_selected": (
-                measured_result.force_route_report.get("selected_backend")
-                == direct_backend
-            ),
-            "no_unintended_tile_fallback": (
-                direct_backend != "atom-tiles"
-                or (
-                    measured_result.force_route_report.get(
-                        "tile_selected_term_count"
-                    )
-                    == 1
-                    and not measured_result.force_route_report.get(
-                        "tile_decline_reasons"
-                    )
-                )
+                neighbor_report["manager_backend"] == "mlx_cell_pairs"
+                and neighbor_report["representation"] == "pairs"
             ),
             "no_neighbor_fallback": neighbor_report["fallback_reason"] is None,
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
@@ -502,7 +455,6 @@ def runtime_payload(
             },
             "runtime_sync": measured_result.runtime_sync_report,
             "route_profile": measured_result.route_profile,
-            "force_route": measured_result.force_route_report,
         }
         return _write_runtime_payload(payload, out_path)
     except MemoryError as exc:  # pragma: no cover - host resource dependent.
@@ -714,347 +666,6 @@ def _profile_tile_inventory(
     }
 
 
-def _timed_force_call(call) -> tuple[mx.array, float]:
-    """Evaluate one force callable behind an explicit completion barrier."""
-
-    started = time.perf_counter()
-    forces = call()
-    if forces is NotImplemented:
-        raise RuntimeError("tile force candidate declined after binding")
-    mx.eval(forces)
-    return forces, time.perf_counter() - started
-
-
-def _prepared_pair_global_update_proxy(pairs: mx.array) -> int:
-    """Estimate coordinate atomics issued by the prepared pair kernel."""
-
-    pair_array = np.asarray(pairs, dtype=np.int32)
-    left_updates = 0
-    for start in range(0, pair_array.shape[0], _PREPARED_PME_PAIRS_PER_WORKER):
-        left = pair_array[
-            start : start + _PREPARED_PME_PAIRS_PER_WORKER,
-            0,
-        ]
-        if left.size:
-            left_updates += 1 + int(np.count_nonzero(left[1:] != left[:-1]))
-    return 3 * (left_updates + int(pair_array.shape[0]))
-
-
-def kernel_ab_payload(
-    *,
-    prepared: str | Path,
-    warmups: int,
-    evaluations: int,
-    out: str | Path,
-    neighbor_skin: float = 5.5,
-) -> dict[str, Any]:
-    """Measure the isolated explicit-pair and unselected tile force kernels.
-
-    Args:
-        prepared: Strict production prepared-system directory.
-        warmups: Warm calls per route before interleaved measurement.
-        evaluations: Interleaved measured calls per route.
-        out: JSON output path.
-        neighbor_skin: Verlet-list skin in angstrom. Defaults to ``5.5``.
-
-    Returns:
-        Fixed-coordinate correctness, launch, memory, and latency evidence.
-    """
-
-    prepared_path = Path(prepared)
-    out_path = Path(out)
-    base = {
-        "kind": KERNEL_AB_SCHEMA,
-        "prepared": str(prepared_path),
-        "out": str(out_path),
-        "warmups": int(warmups),
-        "evaluations": int(evaluations),
-        "neighbor_skin": float(neighbor_skin),
-        "candidate_ownership": {
-            "base_commit": _TILE_KERNEL_CANDIDATE_BASE,
-            "production_selected": False,
-            "owned_surfaces": [
-                "src/mlx_atomistic/metal_kernels.py:tile_pme_candidate",
-                "src/mlx_atomistic/forcefields.py:tile_pme_candidate_binding",
-                "src/mlx_atomistic/benchmarks/charged_pme.py:kernel_ab",
-                "tests/test_fused_lj_kernel.py:tile_tests",
-                "tests/test_forcefields.py:tile_candidate_metadata_assertions",
-                "results/jac-md-metal-hotpath/tile-kernel/",
-            ],
-        },
-        "status": "blocked",
-        "passed": False,
-        "blockers": [],
-        "hardware": get_hardware_info(),
-        "runtime": asdict(get_runtime_info()),
-    }
-    blockers = []
-    if warmups <= 0:
-        blockers.append("warmups_must_be_positive")
-    if evaluations < 3:
-        blockers.append("evaluations_must_be_at_least_three")
-    if not np.isfinite(neighbor_skin) or neighbor_skin < 0.0:
-        blockers.append("neighbor_skin_must_be_finite_nonnegative")
-    required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
-    blockers.extend(
-        f"missing_prepared_input:{path}" for path in required if not path.is_file()
-    )
-    if blockers:
-        return _write_runtime_payload({**base, "blockers": blockers}, out_path)
-
-    try:
-        reset_peak = getattr(mx, "reset_peak_memory", None)
-        if callable(reset_peak):
-            reset_peak()
-        memory_before = {
-            "active_bytes": _mlx_memory_value("get_active_memory"),
-            "peak_bytes": _mlx_memory_value("get_peak_memory"),
-            "cache_bytes": _mlx_memory_value("get_cache_memory"),
-        }
-        setup_started = time.perf_counter()
-        artifact = load_prepared_mlx_artifact(prepared_path, require_production=True)
-        system, force_terms, _ = build_mlx_system_from_artifact(
-            artifact,
-            eager_nonbonded_pair_limit=0,
-        )
-        if system.cell is None or not system.cell.is_orthorhombic:
-            raise ValueError("kernel A/B requires a fixed orthorhombic cell")
-        bound_terms = _bind_pme_plans(force_terms, system.cell)
-        nonbonded = _find_pme_term(bound_terms)
-        tile_manager = NeighborListManager(
-            system.cell,
-            cutoff=float(nonbonded.cutoff),
-            skin=neighbor_skin,
-            check_interval=1,
-            sort_pairs=False,
-            backend="mlx_cell_tiles",
-            displacement_check_backend="mlx_scalar",
-        )
-        neighbors = tile_manager.update(system.positions)
-        tiles = neighbors.tiles
-        if tiles is None:
-            raise RuntimeError("mlx_cell_tiles did not produce NeighborTiles")
-        pairs = neighbors.diagnostic_pairs
-        binding = nonbonded._prepare_tile_force_binding(
-            system.cell,
-            pairs,
-            tiles,
-        )
-        if binding is NotImplemented:
-            raise RuntimeError("nonbonded tile binding declined")
-        if not binding.tile_force_ready:
-            raise RuntimeError(
-                "tile force candidate ineligible: "
-                f"{binding.tile_decline_reason}"
-            )
-        mx.eval(
-            pairs,
-            binding.aligned_lj_scales,
-            tiles.atom_blocks,
-            tiles.tile_blocks,
-            tiles.member_mask,
-            binding.tile_lj_enabled_mask,
-            binding.tile_lj_one_four_mask,
-        )
-        setup_seconds = time.perf_counter() - setup_started
-        memory_after_setup = {
-            "active_bytes": _mlx_memory_value("get_active_memory"),
-            "peak_bytes": _mlx_memory_value("get_peak_memory"),
-            "cache_bytes": _mlx_memory_value("get_cache_memory"),
-        }
-
-        def pair_call():
-            return _prepared_parameterized_pme_direct_force_only(
-                system.positions,
-                binding.pairs,
-                binding.box_lengths_and_inverses,
-                binding.half_sigma,
-                binding.sqrt_epsilon,
-                nonbonded.charges,
-                binding.aligned_lj_scales,
-                cutoff=nonbonded.cutoff,
-                shift=nonbonded.lj_shift,
-                switch_distance=nonbonded.switch_distance,
-                coulomb_constant=nonbonded.coulomb_constant,
-                alpha=nonbonded.pme_config.alpha,
-            )
-
-        def tile_call():
-            return nonbonded._tile_direct_forces_from_binding(
-                system.positions,
-                binding,
-            )
-
-        pair_warm_seconds = []
-        tile_warm_seconds = []
-        reference_forces = None
-        candidate_forces = None
-        for _ in range(warmups):
-            reference_forces, elapsed = _timed_force_call(pair_call)
-            pair_warm_seconds.append(elapsed)
-            candidate_forces, elapsed = _timed_force_call(tile_call)
-            tile_warm_seconds.append(elapsed)
-
-        pair_seconds = []
-        tile_seconds = []
-        for evaluation in range(evaluations):
-            order = ((pair_call, pair_seconds), (tile_call, tile_seconds))
-            if evaluation % 2:
-                order = tuple(reversed(order))
-            for call, samples in order:
-                forces, elapsed = _timed_force_call(call)
-                samples.append(elapsed)
-                if call is pair_call:
-                    reference_forces = forces
-                else:
-                    candidate_forces = forces
-        if reference_forces is None or candidate_forces is None:
-            raise RuntimeError("kernel A/B produced no force samples")
-        reference_np = np.asarray(reference_forces, dtype=np.float32)
-        candidate_np = np.asarray(candidate_forces, dtype=np.float32)
-        force_delta = candidate_np - reference_np
-        max_abs_delta = float(np.max(np.abs(force_delta), initial=0.0))
-        rms_delta = float(
-            np.sqrt(np.mean(force_delta.astype(np.float64) ** 2))
-        )
-        parity = bool(
-            np.allclose(
-                candidate_np,
-                reference_np,
-                rtol=1.0e-5,
-                atol=2.0e-3,
-            )
-        )
-        pair_median = float(np.median(pair_seconds))
-        tile_median = float(np.median(tile_seconds))
-        speedup_fraction = (
-            pair_median / tile_median - 1.0 if tile_median > 0.0 else 0.0
-        )
-        memory_after_measurement = {
-            "active_bytes": _mlx_memory_value("get_active_memory"),
-            "peak_bytes": _mlx_memory_value("get_peak_memory"),
-            "cache_bytes": _mlx_memory_value("get_cache_memory"),
-            "max_rss_mb": max_rss_mb(),
-        }
-        exact_pairs = int(pairs.shape[0])
-        pair_worker_count = (
-            exact_pairs + _PREPARED_PME_PAIRS_PER_WORKER - 1
-        ) // _PREPARED_PME_PAIRS_PER_WORKER
-        checks = {
-            "fixed_orthorhombic_float32_metal": binding.tile_force_ready,
-            "pair_inventory_matches": tiles.exact_pair_count == exact_pairs,
-            "force_parity": parity,
-            "production_unselected": (
-                binding.tile_decline_reason == "tile_force_route_not_selected"
-            ),
-            "finite_timings": bool(
-                np.all(np.isfinite(pair_seconds))
-                and np.all(np.isfinite(tile_seconds))
-                and pair_median > 0.0
-                and tile_median > 0.0
-            ),
-        }
-        passed = all(checks.values())
-        payload = {
-            **base,
-            "status": "ok" if passed else "failed",
-            "passed": passed,
-            "blockers": [] if passed else [
-                name for name, value in checks.items() if not value
-            ],
-            "atom_count": artifact.atom_count,
-            "checks": checks,
-            "inventory": {
-                "exact_lanes": tiles.exact_pair_count,
-                "scheduled_lanes": tiles.padded_lane_count,
-                "tile_count": tiles.tile_count,
-                "block_count": tiles.block_count,
-                "padding_lanes": tiles.padding_waste_count,
-            },
-            "launch": {
-                "pair": {
-                    "grid": [pair_worker_count, 1, 1],
-                    "threadgroup": [min(64, pair_worker_count), 1, 1],
-                    "pairs_per_worker": _PREPARED_PME_PAIRS_PER_WORKER,
-                },
-                "tile": {
-                    "grid": list(binding.tile_launch_grid),
-                    "threadgroup": list(binding.tile_threadgroup),
-                    "lanes_per_tile": 64,
-                },
-            },
-            "global_update_proxy": {
-                "pair_coordinate_atomics": _prepared_pair_global_update_proxy(pairs),
-                "tile_coordinate_atomics": binding.tile_global_update_proxy,
-            },
-            "bytes": {
-                "pair_geometry": int(pairs.size) * 4,
-                "pair_topology": int(binding.aligned_lj_scales.size) * 4,
-                "tile_geometry": tiles.estimated_bytes,
-                "tile_topology": binding.tile_topology_bytes,
-                "tile_threadgroup_temporary": (
-                    binding.tile_threadgroup_temporary_bytes
-                ),
-                "force_output": int(system.positions.size) * 4,
-            },
-            "force_delta": {
-                "max_absolute": max_abs_delta,
-                "rms": rms_delta,
-                "rtol": 1.0e-5,
-                "atol": 2.0e-3,
-            },
-            "timings": {
-                "setup_seconds": setup_seconds,
-                "pair_warm_seconds": pair_warm_seconds,
-                "tile_warm_seconds": tile_warm_seconds,
-                "pair_warm_latency_median_seconds": float(
-                    np.median(pair_warm_seconds)
-                ),
-                "tile_warm_latency_median_seconds": float(
-                    np.median(tile_warm_seconds)
-                ),
-                "pair_measured_seconds": pair_seconds,
-                "tile_measured_seconds": tile_seconds,
-                "pair_median_seconds": pair_median,
-                "tile_median_seconds": tile_median,
-                "tile_speedup_fraction": speedup_fraction,
-            },
-            "admission": {
-                "required_speedup_fraction": 0.10,
-                "speedup_passed": speedup_fraction >= 0.10,
-                "correctness_passed": parity,
-                "candidate_admitted": parity and speedup_fraction >= 0.10,
-                "coordinator_decision_required": True,
-            },
-            "memory": {
-                "before": memory_before,
-                "after_setup": memory_after_setup,
-                "after_measurement": memory_after_measurement,
-            },
-        }
-        return _write_runtime_payload(payload, out_path)
-    except MemoryError as exc:  # pragma: no cover - host resource dependent.
-        return _write_runtime_payload(
-            {
-                **base,
-                "status": "resource_ceiling",
-                "blockers": [f"MemoryError:{exc}"],
-                "memory": {"max_rss_mb": max_rss_mb()},
-            },
-            out_path,
-        )
-    except Exception as exc:  # pragma: no cover - real Metal/artifact dependent.
-        return _write_runtime_payload(
-            {
-                **base,
-                "status": "failed",
-                "blockers": [f"{type(exc).__name__}:{exc}"],
-                "memory": {"max_rss_mb": max_rss_mb()},
-            },
-            out_path,
-        )
-
-
 def profile_payload(
     *,
     prepared: str | Path,
@@ -1245,7 +856,6 @@ def _simulation_config(
     sample_interval: int,
     diagnostic_interval: int,
     runtime_profile: bool = False,
-    direct_force_backend: str = "explicit-pairs",
 ) -> SimulationConfig:
     return SimulationConfig(
         dt=dt_ps,
@@ -1255,7 +865,6 @@ def _simulation_config(
         pressure_diagnostics=False,
         compile_force_evaluator=False,
         runtime_profile=runtime_profile,
-        direct_force_backend=direct_force_backend,
         **simulation_units,
     )
 
@@ -1370,11 +979,6 @@ def main(argv: list[str] | None = None) -> None:
     runtime_parser.add_argument("--neighbor-check-interval", type=int, default=1)
     runtime_parser.add_argument("--sample-interval", type=int, default=None)
     runtime_parser.add_argument("--diagnostic-interval", type=int, default=None)
-    runtime_parser.add_argument(
-        "--direct-backend",
-        choices=("explicit-pairs", "atom-tiles"),
-        default="explicit-pairs",
-    )
     runtime_parser.add_argument("--out", type=Path, required=True)
     profile_parser = commands.add_parser(
         "profile",
@@ -1392,15 +996,6 @@ def main(argv: list[str] | None = None) -> None:
     profile_parser.add_argument("--openmm-manifest", type=Path, default=None)
     profile_parser.add_argument("--manifest-comparison", type=Path, default=None)
     profile_parser.add_argument("--out", type=Path, required=True)
-    kernel_ab_parser = commands.add_parser(
-        "kernel-ab",
-        help="compare explicit-pair and unselected tile direct-force kernels",
-    )
-    kernel_ab_parser.add_argument("--prepared", type=Path, required=True)
-    kernel_ab_parser.add_argument("--warmups", type=int, default=3)
-    kernel_ab_parser.add_argument("--evaluations", type=int, default=4)
-    kernel_ab_parser.add_argument("--neighbor-skin", type=float, default=5.5)
-    kernel_ab_parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.command == "prepare":
@@ -1426,7 +1021,6 @@ def main(argv: list[str] | None = None) -> None:
             neighbor_check_interval=args.neighbor_check_interval,
             sample_interval=args.sample_interval,
             diagnostic_interval=args.diagnostic_interval,
-            direct_backend=args.direct_backend,
             out=args.out,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1450,17 +1044,6 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True))
         if not payload["passed"]:
             raise SystemExit(2)
-    elif args.command == "kernel-ab":
-        payload = kernel_ab_payload(
-            prepared=args.prepared,
-            warmups=args.warmups,
-            evaluations=args.evaluations,
-            neighbor_skin=args.neighbor_skin,
-            out=args.out,
-        )
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        if not payload["passed"]:
-            raise SystemExit(2)
 
 
 if __name__ == "__main__":
@@ -1468,13 +1051,11 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "KERNEL_AB_SCHEMA",
     "OPENMM_ADMISSION_SCHEMA",
     "PROFILE_SCHEMA",
     "RUNTIME_SCHEMA",
     "SUPERCELL_SUMMARY_NAME",
     "audit_openmm_runtime_artifacts",
-    "kernel_ab_payload",
     "main",
     "prepare_payload",
     "profile_payload",

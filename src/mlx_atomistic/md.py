@@ -485,7 +485,6 @@ class SimulationConfig:
     center_of_mass_motion_interval: int | None = None
     wrap_positions: bool = True
     runtime_profile: bool = False
-    direct_force_backend: str = "explicit-pairs"
 
     def __post_init__(self) -> None:
         if self.dt <= 0.0:
@@ -525,9 +524,6 @@ class SimulationConfig:
             raise ValueError(msg)
         if self.block_size < 1:
             msg = "block_size must be a positive integer (1 = per-step execution)"
-            raise ValueError(msg)
-        if self.direct_force_backend not in {"explicit-pairs", "atom-tiles"}:
-            msg = "direct_force_backend must be 'explicit-pairs' or 'atom-tiles'"
             raise ValueError(msg)
         if (
             self.center_of_mass_motion_interval is not None
@@ -698,7 +694,6 @@ class NVTResult:
     nonbonded_report: dict[str, int | float | str | None] = field(default_factory=dict)
     runtime_sync_report: dict[str, int | float] = field(default_factory=dict)
     route_profile: dict[str, Any] = field(default_factory=dict)
-    force_route_report: dict[str, Any] = field(default_factory=dict)
 
     @property
     def temperature_error(self) -> mx.array:
@@ -2837,7 +2832,6 @@ def _langevin_block_execution_enabled(
 
     return (
         config.block_size > 1
-        and config.direct_force_backend == "explicit-pairs"
         and isinstance(thermostat, LangevinThermostat)
         and neighbor_manager is not None
         and constraints is None
@@ -3726,7 +3720,6 @@ def _simulate_nvt(
             cell=cell,
             virtual_sites=virtual_sites,
             route_profiler=route_profiler,
-            direct_force_backend=config.direct_force_backend,
         )
     )
     binding_started = (
@@ -4859,18 +4852,6 @@ def _simulate_nvt(
         ),
         runtime_sync_report=runtime_sync_report,
         route_profile=route_profile,
-        force_route_report=(
-            {
-                "requested_backend": config.direct_force_backend,
-                "selected_backend": None,
-                "tile_capable_term_count": 0,
-                "tile_selected_term_count": 0,
-                "compact_fallback_term_count": len(unnamed_terms),
-                "tile_decline_reasons": ["force_pipeline_unavailable"],
-            }
-            if prepared_force_pipeline is None
-            else prepared_force_pipeline.route_report()
-        ),
     )
 
 
