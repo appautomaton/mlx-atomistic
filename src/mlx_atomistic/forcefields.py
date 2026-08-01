@@ -27,7 +27,11 @@ from mlx_atomistic.custom_force import (
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
+    _TILE_PME_LANES_PER_TILE,
+    _TILE_PME_THREADGROUP_SIZE,
+    _TILE_PME_THREADGROUP_TEMPORARY_BYTES,
     _prepared_parameterized_pme_direct_force_only,
+    _tile_parameterized_pme_direct_force_only,
     aligned_topology_lj_scales,
     fused_parameterized_lj_forces,
     fused_parameterized_pme_direct_components,
@@ -127,6 +131,13 @@ class _NonbondedForceBinding:
     tile_lj_enabled_mask: mx.array | None = None
     tile_lj_one_four_mask: mx.array | None = None
     tile_decline_reason: str | None = None
+    # Unselected tile-kernel candidate metadata, owned against aa00358.
+    tile_force_ready: bool = False
+    tile_launch_grid: tuple[int, int, int] | None = None
+    tile_threadgroup: tuple[int, int, int] | None = None
+    tile_topology_bytes: int = 0
+    tile_threadgroup_temporary_bytes: int = 0
+    tile_global_update_proxy: int = 0
 
 
 def _topology_pair_scales(
@@ -2060,6 +2071,63 @@ class NonbondedPotential:
             and not self.has_nbfix
         )
 
+    def _tile_force_candidate_decline_reason(
+        self,
+        cell: Cell,
+        pairs: mx.array,
+        tiles: NeighborTiles,
+    ) -> str | None:
+        """Return why the private tile-force candidate must fail closed."""
+
+        if not self._supports_fused_pme_direct(cell, pairs):
+            return "tile_pair_kernel_unsupported"
+        metal = getattr(mx, "metal", None)
+        if metal is None or not metal.is_available():
+            return "tile_requires_available_metal"
+        if any(
+            values.dtype != mx.float32
+            for values in (self.sigma, self.epsilon, self.charges, cell.matrix)
+        ):
+            return "tile_requires_float32"
+        if (
+            tiles.block_size != 8
+            or tiles.atom_blocks.dtype != mx.int32
+            or tiles.tile_blocks.dtype != mx.int32
+            or tiles.member_mask.dtype != mx.uint32
+            or tiles.member_mask.shape != (tiles.tile_count, 2)
+        ):
+            return "tile_geometry_unsupported"
+        return None
+
+    @staticmethod
+    def _tile_global_update_proxy(tiles: NeighborTiles) -> int:
+        """Count bounded three-component endpoint updates from membership."""
+
+        tile_blocks = np.asarray(tiles.tile_blocks, dtype=np.int32)
+        words = np.asarray(tiles.member_mask, dtype=np.uint32)
+        if tiles.tile_count == 0:
+            return 0
+        bit_indices = np.arange(32, dtype=np.uint32)
+        active = np.concatenate(
+            (
+                ((words[:, :1] >> bit_indices) & np.uint32(1)).astype(bool),
+                ((words[:, 1:] >> bit_indices) & np.uint32(1)).astype(bool),
+            ),
+            axis=1,
+        ).reshape((-1, 8, 8))
+        left_endpoints = np.any(active, axis=2)
+        right_endpoints = np.any(active, axis=1)
+        same_block = tile_blocks[:, 0] == tile_blocks[:, 1]
+        endpoint_count = int(np.sum(left_endpoints[~same_block], dtype=np.int64))
+        endpoint_count += int(np.sum(right_endpoints[~same_block], dtype=np.int64))
+        endpoint_count += int(
+            np.sum(
+                left_endpoints[same_block] | right_endpoints[same_block],
+                dtype=np.int64,
+            )
+        )
+        return 3 * endpoint_count
+
     def _block_components(
         self,
         positions: mx.array,
@@ -3512,10 +3580,40 @@ class NonbondedPotential:
             object.__setattr__(self, "_prepared_box_cache", box_cache)
         tile_lj_enabled_mask = None
         tile_lj_one_four_mask = None
+        tile_decline_reason = None
+        tile_force_ready = False
+        tile_launch_grid = None
+        tile_threadgroup = None
+        tile_topology_bytes = 0
+        tile_threadgroup_temporary_bytes = 0
+        tile_global_update_proxy = 0
         if tiles is not None:
             tile_lj_enabled_mask, tile_lj_one_four_mask = self._tile_aligned_lj_masks(
                 tiles,
             )
+            tile_decline_reason = self._tile_force_candidate_decline_reason(
+                cell,
+                direct_space_pairs,
+                tiles,
+            )
+            tile_force_ready = tile_decline_reason is None
+            tile_launch_grid = (
+                tiles.tile_count * _TILE_PME_LANES_PER_TILE,
+                1,
+                1,
+            )
+            tile_threadgroup = (_TILE_PME_THREADGROUP_SIZE, 1, 1)
+            tile_topology_bytes = int(
+                (
+                    tile_lj_enabled_mask.size
+                    + tile_lj_one_four_mask.size
+                )
+                * 4
+            )
+            tile_threadgroup_temporary_bytes = (
+                _TILE_PME_THREADGROUP_TEMPORARY_BYTES
+            )
+            tile_global_update_proxy = self._tile_global_update_proxy(tiles)
         binding = _NonbondedForceBinding(
             cell=cell,
             pairs=direct_space_pairs,
@@ -3536,13 +3634,92 @@ class NonbondedPotential:
                 if tiles is None
                 else (
                     "tile_force_route_not_selected"
-                    if pair_force_ready
-                    else "tile_pair_kernel_unsupported"
+                    if tile_force_ready
+                    else tile_decline_reason
                 )
             ),
+            tile_force_ready=tile_force_ready,
+            tile_launch_grid=tile_launch_grid,
+            tile_threadgroup=tile_threadgroup,
+            tile_topology_bytes=tile_topology_bytes,
+            tile_threadgroup_temporary_bytes=tile_threadgroup_temporary_bytes,
+            tile_global_update_proxy=tile_global_update_proxy,
         )
         object.__setattr__(self, "_force_binding_cache", binding)
         return binding
+
+    def _tile_direct_forces_from_binding(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+    ) -> mx.array | NotImplementedType:
+        """Evaluate the unselected tile candidate's direct-space forces."""
+
+        if not isinstance(binding, _NonbondedForceBinding):
+            msg = "nonbonded force binding has an incompatible type"
+            raise TypeError(msg)
+        geometry = binding.tile_geometry
+        if (
+            not binding.tile_force_ready
+            or geometry is None
+            or binding.tile_lj_enabled_mask is None
+            or binding.tile_lj_one_four_mask is None
+            or self._tile_force_candidate_decline_reason(
+                binding.cell,
+                binding.pairs,
+                geometry,
+            )
+            is not None
+        ):
+            return NotImplemented
+        if not isinstance(positions, mx.array) or positions.dtype != mx.float32:
+            return NotImplemented
+        if positions.shape != (self.sigma.shape[0], 3):
+            return NotImplemented
+        return _tile_parameterized_pme_direct_force_only(
+            positions,
+            geometry.atom_blocks,
+            geometry.tile_blocks,
+            geometry.member_mask,
+            binding.tile_lj_enabled_mask,
+            binding.tile_lj_one_four_mask,
+            binding.box_lengths_and_inverses,
+            binding.half_sigma,
+            binding.sqrt_epsilon,
+            self.charges,
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            one_four_scale=self.lj_one_four_scale,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+        )
+
+    def _tile_forces_from_binding(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+    ) -> mx.array | NotImplementedType:
+        """Evaluate complete forces through the unselected tile candidate."""
+
+        direct_forces = self._tile_direct_forces_from_binding(positions, binding)
+        if direct_forces is NotImplemented:
+            return NotImplemented
+        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            binding.pme_plan,
+            include_self_correction=False,
+        )
+        return (
+            direct_forces
+            + self._exception_lj_forces(positions, binding.cell)
+            + reciprocal_forces
+            + self._periodic_coulomb_correction_forces(
+                positions,
+                binding.cell,
+            )
+        )
 
     def _forces_from_binding(
         self,

@@ -9,10 +9,13 @@ atomic scatter is summation-order non-deterministic, the same property as the ex
 
 from __future__ import annotations
 
+from math import erf, exp, sqrt
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.forcefields as forcefields_module
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
@@ -23,13 +26,14 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.metal_kernels import (
+    _tile_parameterized_pme_direct_force_only,
     fused_lj_forces,
     fused_parameterized_pme_direct_components,
     fused_parameterized_pme_direct_force_only,
     neighbor_pair_cutoff_mask,
     neighbor_pair_ordered_scatter,
 )
-from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
+from mlx_atomistic.neighbors import NeighborListManager, NeighborTiles, build_neighbor_list
 from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.topology import Topology
 
@@ -57,6 +61,87 @@ def _on_gpu(monkeypatch):
     yield
     mx.set_default_device(prev_device)
     mx.set_default_stream(mx.new_stream(prev_device))
+
+
+def _mask_words(lanes: list[int]) -> np.ndarray:
+    words = np.zeros((2,), dtype=np.uint32)
+    for lane in lanes:
+        word, bit = divmod(lane, 32)
+        words[word] |= np.uint32(1) << np.uint32(bit)
+    return words
+
+
+def _explicit_pme_direct_forces(
+    positions: np.ndarray,
+    pairs: np.ndarray,
+    sigma: np.ndarray,
+    epsilon: np.ndarray,
+    charges: np.ndarray,
+    lj_scales: np.ndarray,
+    box_lengths: np.ndarray,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    coulomb_constant: float,
+    alpha: float,
+) -> np.ndarray:
+    """Return a host reference for the prepared direct-force equations."""
+
+    forces = np.zeros_like(positions, dtype=np.float64)
+    cutoff2 = cutoff * cutoff
+    for pair_index, (left, right) in enumerate(pairs):
+        displacement = positions[left].astype(np.float64) - positions[right]
+        displacement -= box_lengths * np.floor(displacement / box_lengths + 0.5)
+        r2 = float(np.dot(displacement, displacement))
+        if r2 <= 0.0 or r2 >= cutoff2:
+            continue
+        distance = sqrt(r2)
+        scalar = 0.0
+        lj_scale = float(lj_scales[pair_index])
+        if lj_scale != 0.0:
+            sigma_ij = 0.5 * (float(sigma[left]) + float(sigma[right]))
+            epsilon_ij = sqrt(float(epsilon[left]) * float(epsilon[right]))
+            sigma2_over_r2 = sigma_ij * sigma_ij / r2
+            inv_r6 = sigma2_over_r2**3
+            inv_r12 = inv_r6 * inv_r6
+            unswitched_energy = 4.0 * epsilon_ij * (inv_r12 - inv_r6)
+            if shift:
+                sigma2_over_rc2 = sigma_ij * sigma_ij / cutoff2
+                inv_rc6 = sigma2_over_rc2**3
+                unswitched_energy -= 4.0 * epsilon_ij * (
+                    inv_rc6 * inv_rc6 - inv_rc6
+                )
+            switch_value = 1.0
+            switch_derivative = 0.0
+            if switch_distance is not None:
+                width = cutoff - switch_distance
+                x = min(max((distance - switch_distance) / width, 0.0), 1.0)
+                switch_value = 1.0 - (10.0 * x**3 - 15.0 * x**4 + 6.0 * x**5)
+                if switch_distance < distance < cutoff:
+                    switch_derivative = -(
+                        30.0 * x**2 - 60.0 * x**3 + 30.0 * x**4
+                    ) / width
+            scalar += (
+                24.0 * epsilon_ij * (2.0 * inv_r12 - inv_r6)
+                / r2
+                * switch_value
+                - unswitched_energy * switch_derivative / distance
+            ) * lj_scale
+        qij = float(charges[left]) * float(charges[right])
+        erfc_term = 1.0 - erf(alpha * distance)
+        scalar += coulomb_constant * qij * (
+            erfc_term / (r2 * distance)
+            + 2.0
+            * alpha
+            / sqrt(np.pi)
+            * exp(-(alpha * alpha) * r2)
+            / r2
+        )
+        pair_force = scalar * displacement
+        forces[left] += pair_force
+        forces[right] -= pair_force
+    return forces.astype(np.float32)
 
 
 @pytest.mark.gpu
@@ -557,6 +642,326 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+@pytest.mark.gpu
+def test_tile_pme_direct_reduces_shared_endpoints_and_repeats_without_races(
+    monkeypatch,
+):
+    """The 64-lane tile candidate reduces both endpoints before atomics."""
+
+    positions_np = np.asarray(
+        [
+            [0.20, 0.20, 0.20],
+            [2.80, 0.25, 0.20],
+            [3.35, 0.20, 0.20],
+            [0.30, 2.10, 0.25],
+            [1.65, 2.15, 0.35],
+            [3.10, 2.25, 0.40],
+            [0.25, 4.05, 0.30],
+            [2.05, 4.15, 0.25],
+            [1.15, 0.95, 1.70],
+            [3.75, 0.90, 1.75],
+            [0.95, 2.95, 1.85],
+            [2.80, 3.05, 1.80],
+            [4.55, 2.90, 1.70],
+            [0.35, 4.85, 1.90],
+            [2.25, 5.10, 1.75],
+            [4.10, 4.80, 1.80],
+            [1.30, 1.80, 3.45],
+            [3.65, 2.00, 3.55],
+        ],
+        dtype=np.float32,
+    )
+    atom_blocks = np.asarray(
+        [
+            np.arange(0, 8, dtype=np.int32),
+            np.arange(8, 16, dtype=np.int32),
+            [16, 17, -1, -1, -1, -1, -1, -1],
+        ],
+        dtype=np.int32,
+    )
+    tile_blocks = np.asarray(
+        [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]],
+        dtype=np.int32,
+    )
+    lane_rows = [
+        [1, 2, 3 * 8 + 4, 5 * 8 + 7],
+        [0, 1 * 8 + 1, 2 * 8 + 4, 7 * 8 + 7],
+        [0, 1 * 8 + 1, 6 * 8 + 0],
+        [1, 2, 3 * 8 + 5, 6 * 8 + 7],
+        [0, 2 * 8 + 1, 7 * 8 + 0],
+        [1],
+    ]
+    member_mask = np.stack([_mask_words(lanes) for lanes in lane_rows])
+    exact_pair_count = sum(len(lanes) for lanes in lane_rows)
+    tiles = NeighborTiles(
+        atom_blocks=mx.array(atom_blocks, dtype=mx.int32),
+        tile_blocks=mx.array(tile_blocks, dtype=mx.int32),
+        member_mask=mx.array(member_mask, dtype=mx.uint32),
+        exact_pair_count=exact_pair_count,
+        raw_candidate_count=exact_pair_count + 9,
+    )
+    pairs = tiles.materialize_pairs(sort=False)
+    cell = Cell.cubic(12.0)
+    sigma_np = np.linspace(0.90, 1.20, positions_np.shape[0], dtype=np.float32)
+    epsilon_np = np.linspace(0.12, 0.30, positions_np.shape[0], dtype=np.float32)
+    charges_np = np.linspace(-0.35, 0.40, positions_np.shape[0], dtype=np.float32)
+    charges_np -= np.mean(charges_np, dtype=np.float32)
+    topology = Topology.from_sequences(
+        n_atoms=positions_np.shape[0],
+        bonds=[(0, 1), (8, 9)],
+        one_four_pairs=[(0, 8), (7, 15)],
+        eager_nonbonded_pair_limit=0,
+    )
+    config = PMEConfig(
+        mesh_shape=(16, 16, 16),
+        alpha=0.31,
+        real_cutoff=3.0,
+        assignment_order=5,
+    )
+    potential = NonbondedPotential(
+        sigma=sigma_np,
+        epsilon=epsilon_np,
+        charges=charges_np,
+        cutoff=3.0,
+        lj_shift=True,
+        switch_distance=2.4,
+        electrostatics="pme",
+        pme_config=config,
+        topology=topology,
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.75,
+        exception_pairs=[(1, 9)],
+        exception_charge_products=[0.025],
+        exception_sigma=[1.05],
+        exception_epsilon=[0.08],
+    ).bind_pme_plan(cell)
+    binding = potential._prepare_tile_force_binding(cell, pairs, tiles)
+    assert binding is not NotImplemented
+    assert binding.tile_force_ready
+    assert binding.tile_decline_reason == "tile_force_route_not_selected"
+    assert binding.tile_launch_grid == (tiles.tile_count * 64, 1, 1)
+    assert binding.tile_threadgroup == (64, 1, 1)
+    assert binding.tile_global_update_proxy < 6 * tiles.exact_pair_count
+    assert np.any(tile_blocks[:, 0] == tile_blocks[:, 1])
+    assert np.any(atom_blocks < 0)
+    block_frequency = np.bincount(tile_blocks.reshape(-1))
+    assert int(np.max(block_frequency)) > 1
+
+    pair_mask, pair_lj_scales, _ = potential._compact_pair_masks_and_scales(pairs)
+    aligned_lj_scales = np.where(
+        np.asarray(pair_mask),
+        np.asarray(pair_lj_scales),
+        0.0,
+    ).astype(np.float32)
+    reference_direct = _explicit_pme_direct_forces(
+        positions_np,
+        np.asarray(pairs, dtype=np.int32),
+        sigma_np,
+        epsilon_np,
+        charges_np,
+        aligned_lj_scales,
+        np.asarray(cell.lengths, dtype=np.float64),
+        cutoff=potential.cutoff,
+        shift=potential.lj_shift,
+        switch_distance=potential.switch_distance,
+        coulomb_constant=potential.coulomb_constant,
+        alpha=config.alpha,
+    )
+    positions = mx.array(positions_np, dtype=mx.float32)
+    assert (
+        potential._tile_direct_forces_from_binding(
+            positions.astype(mx.float16),
+            binding,
+        )
+        is NotImplemented
+    )
+    repeated = [
+        potential._tile_direct_forces_from_binding(positions, binding)
+        for _ in range(24)
+    ]
+    assert all(result is not NotImplemented for result in repeated)
+    mx.eval(*repeated)
+    for result in repeated:
+        np.testing.assert_allclose(
+            np.asarray(result),
+            reference_direct,
+            rtol=2.0e-5,
+            atol=2.0e-3,
+        )
+
+    reference_full = potential._forces_from_binding(positions, binding)
+    candidate_full = potential._tile_forces_from_binding(positions, binding)
+    assert candidate_full is not NotImplemented
+    mx.eval(reference_full, candidate_full)
+    np.testing.assert_allclose(
+        np.asarray(candidate_full),
+        np.asarray(reference_full),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+
+    def _unexpected_tile_route(*args, **kwargs):
+        raise AssertionError("production force binding selected the tile candidate")
+
+    monkeypatch.setattr(
+        forcefields_module,
+        "_tile_parameterized_pme_direct_force_only",
+        _unexpected_tile_route,
+    )
+    production_forces = potential._forces_from_binding(positions, binding)
+    mx.eval(production_forces)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("seed", [19, 41])
+def test_tile_pme_direct_random_geometry_matches_host_explicit_pairs(seed):
+    """Random tile inventories match a host explicit-pair force reference."""
+
+    rng = np.random.default_rng(seed)
+    lattice = (
+        np.stack(np.meshgrid(np.arange(3), np.arange(3), np.arange(3)), axis=-1)
+        .reshape((-1, 3))
+        .astype(np.float32)
+    )
+    positions_np = 0.7 + 1.65 * lattice[:23]
+    positions_np += rng.uniform(-0.08, 0.08, size=positions_np.shape).astype(np.float32)
+    sigma_np = rng.uniform(0.85, 1.15, size=23).astype(np.float32)
+    epsilon_np = rng.uniform(0.1, 0.35, size=23).astype(np.float32)
+    charges_np = rng.uniform(-0.45, 0.45, size=23).astype(np.float32)
+    charges_np -= np.mean(charges_np, dtype=np.float32)
+    cell = Cell.cubic(9.0)
+    topology = Topology.from_sequences(
+        n_atoms=23,
+        bonds=[(0, 1), (5, 6), (12, 13)],
+        one_four_pairs=[(0, 4), (5, 9)],
+        eager_nonbonded_pair_limit=0,
+    )
+    config = PMEConfig(
+        mesh_shape=(16, 16, 16),
+        alpha=0.34,
+        real_cutoff=2.6,
+    )
+    potential = NonbondedPotential(
+        sigma=sigma_np,
+        epsilon=epsilon_np,
+        charges=charges_np,
+        cutoff=2.6,
+        lj_shift=bool(seed % 2),
+        switch_distance=None if seed % 2 else 2.1,
+        electrostatics="pme",
+        pme_config=config,
+        topology=topology,
+        lj_one_four_scale=0.5,
+    ).bind_pme_plan(cell)
+    neighbors = build_neighbor_list(
+        positions_np,
+        cell,
+        cutoff=2.6,
+        skin=0.35,
+        sort_pairs=False,
+        backend="mlx_cell_tiles",
+    )
+    tiles = neighbors.tiles
+    assert tiles is not None
+    binding = potential._prepare_tile_force_binding(
+        cell,
+        neighbors.diagnostic_pairs,
+        tiles,
+    )
+    assert binding is not NotImplemented
+    assert binding.tile_force_ready
+    pairs = neighbors.diagnostic_pairs
+    pair_mask, pair_lj_scales, _ = potential._compact_pair_masks_and_scales(pairs)
+    aligned_lj_scales = np.where(
+        np.asarray(pair_mask),
+        np.asarray(pair_lj_scales),
+        0.0,
+    ).astype(np.float32)
+    reference = _explicit_pme_direct_forces(
+        positions_np,
+        np.asarray(pairs, dtype=np.int32),
+        sigma_np,
+        epsilon_np,
+        charges_np,
+        aligned_lj_scales,
+        np.asarray(cell.lengths, dtype=np.float64),
+        cutoff=potential.cutoff,
+        shift=potential.lj_shift,
+        switch_distance=potential.switch_distance,
+        coulomb_constant=potential.coulomb_constant,
+        alpha=config.alpha,
+    )
+    observed = potential._tile_direct_forces_from_binding(
+        mx.array(positions_np, dtype=mx.float32),
+        binding,
+    )
+    assert observed is not NotImplemented
+    mx.eval(observed)
+    np.testing.assert_allclose(
+        np.asarray(observed),
+        reference,
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+
+
+@pytest.mark.gpu
+def test_tile_pme_direct_empty_sparse_mask_and_skin_only_lane():
+    """Empty masks stay zero and member lanes still honor the force cutoff."""
+
+    positions = mx.array(
+        [[0.0, 0.0, 0.0], [3.2, 0.0, 0.0]],
+        dtype=mx.float32,
+    )
+    atom_blocks = mx.array(
+        [[0, 1, -1, -1, -1, -1, -1, -1]],
+        dtype=mx.int32,
+    )
+    tile_blocks = mx.array([[0, 0]], dtype=mx.int32)
+    empty_mask = mx.zeros((1, 2), dtype=mx.uint32)
+    box = mx.array([12.0, 12.0, 12.0, 1 / 12.0, 1 / 12.0, 1 / 12.0])
+    common = {
+        "box_lengths_and_inverses": box,
+        "half_sigma": mx.array([0.5, 0.55], dtype=mx.float32),
+        "sqrt_epsilon": mx.array([0.4, 0.5], dtype=mx.float32),
+        "charges": mx.array([0.3, -0.2], dtype=mx.float32),
+        "cutoff": 3.0,
+        "shift": True,
+        "switch_distance": 2.4,
+        "one_four_scale": 0.5,
+        "coulomb_constant": 1.0,
+        "alpha": 0.35,
+    }
+    empty = _tile_parameterized_pme_direct_force_only(
+        positions,
+        atom_blocks,
+        tile_blocks,
+        empty_mask,
+        empty_mask,
+        empty_mask,
+        **common,
+    )
+    skin_only_mask = mx.array(
+        np.asarray([_mask_words([1])], dtype=np.uint32),
+        dtype=mx.uint32,
+    )
+    skin_only = _tile_parameterized_pme_direct_force_only(
+        positions,
+        atom_blocks,
+        tile_blocks,
+        skin_only_mask,
+        skin_only_mask,
+        empty_mask,
+        **common,
+    )
+    mx.eval(empty, skin_only)
+    np.testing.assert_array_equal(np.asarray(empty), np.zeros((2, 3), dtype=np.float32))
+    np.testing.assert_array_equal(
+        np.asarray(skin_only),
+        np.zeros((2, 3), dtype=np.float32),
+    )
 
 
 @pytest.mark.gpu

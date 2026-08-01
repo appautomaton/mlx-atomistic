@@ -79,6 +79,10 @@ _pme_direct_kernel_singleton = None
 _pme_direct_virial_kernel_singleton = None
 _pme_direct_force_only_kernel_singleton = None
 _prepared_pme_direct_force_only_kernel_singleton = None
+# Tile-kernel candidate ownership starts at aa00358. Keep this singleton, its
+# source/binding below, the forcefield candidate metadata, benchmark command,
+# and tile-only tests removable as one unselected unit until admission.
+_tile_pme_direct_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
@@ -90,6 +94,17 @@ _neighbor_pair_ordered_scatter_kernel_singleton = None
 # Neighbor compaction preserves short runs of a common left atom, so one worker
 # can sum those contributions locally before issuing global atomics.
 _PREPARED_PME_PAIRS_PER_WORKER = 8
+
+_TILE_PME_BLOCK_SIZE = 8
+_TILE_PME_LANES_PER_TILE = _TILE_PME_BLOCK_SIZE * _TILE_PME_BLOCK_SIZE
+_TILE_PME_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
+# Two int atom tables; two blocks each of positions, half-sigma,
+# sqrt-epsilon, and charge; then three 64-lane pair-force tables.
+_TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
+    2 * _TILE_PME_BLOCK_SIZE * 4
+    + 2 * _TILE_PME_BLOCK_SIZE * (3 + 1 + 1 + 1) * 4
+    + 3 * _TILE_PME_LANES_PER_TILE * 4
+)
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -581,6 +596,215 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     f"#define MLX_ATOMISTIC_PAIRS_PER_WORKER {_PREPARED_PME_PAIRS_PER_WORKER}u\n"
     + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
+
+# Candidate-owned force-only tile kernel, based on aa00358. One 64-lane
+# threadgroup owns one 8x8 block tile. Pair lanes publish their force to
+# threadgroup memory, a full threadgroup barrier synchronizes both Metal SIMD
+# groups, and reducer lanes issue at most one three-component global update per
+# participating endpoint. Same-block tiles combine row and column reductions
+# before the update, so one atom is never updated twice by its tile.
+_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint tile = threadgroup_position_in_grid.x;
+    uint left_slot = lane >> 3;
+    uint right_slot = lane & 7u;
+
+    threadgroup int left_atoms[8];
+    threadgroup int right_atoms[8];
+    threadgroup float left_positions[24];
+    threadgroup float right_positions[24];
+    threadgroup float left_half_sigma[8];
+    threadgroup float right_half_sigma[8];
+    threadgroup float left_sqrt_epsilon[8];
+    threadgroup float right_sqrt_epsilon[8];
+    threadgroup float left_charges[8];
+    threadgroup float right_charges[8];
+    threadgroup float pair_fx[64];
+    threadgroup float pair_fy[64];
+    threadgroup float pair_fz[64];
+
+    int left_block = tile_blocks[2 * tile + 0];
+    int right_block = tile_blocks[2 * tile + 1];
+    bool same_block = left_block == right_block;
+    if (lane < 8u) {
+        int left_atom = atom_blocks[8 * left_block + lane];
+        int right_atom = atom_blocks[8 * right_block + lane];
+        left_atoms[lane] = left_atom;
+        right_atoms[lane] = right_atom;
+        int safe_left = max(left_atom, 0);
+        int safe_right = max(right_atom, 0);
+        left_positions[3 * lane + 0] = positions[3 * safe_left + 0];
+        left_positions[3 * lane + 1] = positions[3 * safe_left + 1];
+        left_positions[3 * lane + 2] = positions[3 * safe_left + 2];
+        right_positions[3 * lane + 0] = positions[3 * safe_right + 0];
+        right_positions[3 * lane + 1] = positions[3 * safe_right + 1];
+        right_positions[3 * lane + 2] = positions[3 * safe_right + 2];
+        left_half_sigma[lane] = half_sigma[safe_left];
+        right_half_sigma[lane] = half_sigma[safe_right];
+        left_sqrt_epsilon[lane] = sqrt_epsilon[safe_left];
+        right_sqrt_epsilon[lane] = sqrt_epsilon[safe_right];
+        left_charges[lane] = charges[safe_left];
+        right_charges[lane] = charges[safe_right];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+    uint word = lane >> 5;
+    uint bit = lane & 31u;
+    bool member = ((member_mask[2 * tile + word] >> bit) & 1u) != 0u;
+    int i = left_atoms[left_slot];
+    int j = right_atoms[right_slot];
+    if (member && i >= 0 && j >= 0) {
+        float dx = left_positions[3 * left_slot + 0]
+            - right_positions[3 * right_slot + 0];
+        float dy = left_positions[3 * left_slot + 1]
+            - right_positions[3 * right_slot + 1];
+        float dz = left_positions[3 * left_slot + 2]
+            - right_positions[3 * right_slot + 2];
+        float lx = box[0];
+        float ly = box[1];
+        float lz = box[2];
+        dx -= lx * floor(dx * box[3] + 0.5f);
+        dy -= ly * floor(dy * box[4] + 0.5f);
+        dz -= lz * floor(dz * box[5] + 0.5f);
+        float r2 = dx * dx + dy * dy + dz * dz;
+        if (r2 > 0.0f && r2 < params[0]) {
+            float inv_distance = rsqrt(r2);
+            float inv_r2 = inv_distance * inv_distance;
+            float distance = r2 * inv_distance;
+            float scalar = 0.0f;
+            bool lj_enabled =
+                ((lj_enabled_mask[2 * tile + word] >> bit) & 1u) != 0u;
+            if (lj_enabled) {
+                bool one_four =
+                    ((lj_one_four_mask[2 * tile + word] >> bit) & 1u) != 0u;
+                float lj_scale = one_four ? params[10] : 1.0f;
+                float sigma_ij = left_half_sigma[left_slot]
+                    + right_half_sigma[right_slot];
+                float epsilon_ij = left_sqrt_epsilon[left_slot]
+                    * right_sqrt_epsilon[right_slot];
+                float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+                float inv_r6 =
+                    sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
+                float inv_r12 = inv_r6 * inv_r6;
+                float unswitched_energy =
+                    4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                if (params[1] > 0.5f) {
+                    float sigma2_over_rc2 =
+                        sigma_ij * sigma_ij / params[0];
+                    float inv_rc6 = sigma2_over_rc2
+                        * sigma2_over_rc2 * sigma2_over_rc2;
+                    unswitched_energy -= 4.0f * epsilon_ij
+                        * (inv_rc6 * inv_rc6 - inv_rc6);
+                }
+
+                float switch_value = 1.0f;
+                float switch_derivative = 0.0f;
+                if (params[2] > 0.5f) {
+                    float x = clamp(
+                        (distance - params[3]) * params[9],
+                        0.0f,
+                        1.0f
+                    );
+                    float x2 = x * x;
+                    float x3 = x2 * x;
+                    float x4 = x3 * x;
+                    float x5 = x4 * x;
+                    switch_value = 1.0f
+                        - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
+                    if (distance > params[3] && distance < params[5]) {
+                        switch_derivative = -(
+                            30.0f * x2 - 60.0f * x3 + 30.0f * x4
+                        ) * params[9];
+                    }
+                }
+                scalar += (
+                    24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
+                    * inv_r2 * switch_value
+                    - unswitched_energy * switch_derivative * inv_distance
+                ) * lj_scale;
+            }
+
+            float qij = left_charges[left_slot] * right_charges[right_slot];
+            float erfc_term =
+                1.0f - mlx_atomistic_erf(params[7] * distance);
+            scalar += params[6] * qij * (
+                erfc_term * inv_r2 * inv_distance
+                + params[8] * exp(-params[7] * params[7] * r2) * inv_r2
+            );
+            fx = scalar * dx;
+            fy = scalar * dy;
+            fz = scalar * dz;
+        }
+    }
+    pair_fx[lane] = fx;
+    pair_fy[lane] = fy;
+    pair_fz[lane] = fz;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane < 8u) {
+        float reduced_fx = 0.0f;
+        float reduced_fy = 0.0f;
+        float reduced_fz = 0.0f;
+        for (uint other = 0u; other < 8u; other++) {
+            uint pair_lane = 8u * lane + other;
+            reduced_fx += pair_fx[pair_lane];
+            reduced_fy += pair_fy[pair_lane];
+            reduced_fz += pair_fz[pair_lane];
+        }
+        if (same_block) {
+            for (uint other = 0u; other < 8u; other++) {
+                uint pair_lane = 8u * other + lane;
+                reduced_fx -= pair_fx[pair_lane];
+                reduced_fy -= pair_fy[pair_lane];
+                reduced_fz -= pair_fz[pair_lane];
+            }
+        }
+        int atom = left_atoms[lane];
+        if (
+            atom >= 0
+            && (reduced_fx != 0.0f || reduced_fy != 0.0f || reduced_fz != 0.0f)
+        ) {
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 0], reduced_fx, memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 1], reduced_fy, memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 2], reduced_fz, memory_order_relaxed
+            );
+        }
+    } else if (lane < 16u && !same_block) {
+        uint slot = lane - 8u;
+        float reduced_fx = 0.0f;
+        float reduced_fy = 0.0f;
+        float reduced_fz = 0.0f;
+        for (uint other = 0u; other < 8u; other++) {
+            uint pair_lane = 8u * other + slot;
+            reduced_fx -= pair_fx[pair_lane];
+            reduced_fy -= pair_fy[pair_lane];
+            reduced_fz -= pair_fz[pair_lane];
+        }
+        int atom = right_atoms[slot];
+        if (
+            atom >= 0
+            && (reduced_fx != 0.0f || reduced_fy != 0.0f || reduced_fz != 0.0f)
+        ) {
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 0], reduced_fx, memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 1], reduced_fy, memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 2], reduced_fz, memory_order_relaxed
+            );
+        }
+    }
+"""
 
 _PME_CUTOFF_CORRECTION_VIRIAL_SOURCE = r"""
     uint t = thread_position_in_grid.x;
@@ -1139,6 +1363,34 @@ def _prepared_pme_direct_force_only_kernel():
             atomic_outputs=True,
         )
     return _prepared_pme_direct_force_only_kernel_singleton
+
+
+def _tile_pme_direct_force_only_kernel():
+    """Return the cached unselected 8x8 tile force candidate."""
+
+    global _tile_pme_direct_force_only_kernel_singleton
+    if _tile_pme_direct_force_only_kernel_singleton is None:
+        _tile_pme_direct_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="tile_prepared_parameterized_pme_direct_force_only",
+            input_names=[
+                "positions",
+                "atom_blocks",
+                "tile_blocks",
+                "member_mask",
+                "lj_enabled_mask",
+                "lj_one_four_mask",
+                "box",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "params",
+            ],
+            output_names=["forces"],
+            source=_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _tile_pme_direct_force_only_kernel_singleton
 
 
 def _parameterized_pme_direct_virial_kernel():
@@ -2484,6 +2736,134 @@ def _prepared_parameterized_pme_direct_force_only(
         output_dtypes=[mx.float32],
         grid=(worker_count, 1, 1),
         threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces
+
+
+def _tile_parameterized_pme_direct_force_only(
+    positions: mx.array,
+    atom_blocks: mx.array,
+    tile_blocks: mx.array,
+    member_mask: mx.array,
+    lj_enabled_mask: mx.array,
+    lj_one_four_mask: mx.array,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    one_four_scale: float,
+    coulomb_constant: float,
+    alpha: float,
+) -> mx.array:
+    """Evaluate the unselected prepared 8x8 tile force candidate.
+
+    Geometry and exact Verlet membership remain encoded as block tables and
+    bit masks. This binding never decodes or materializes explicit pairs.
+    """
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
+    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    lj_enabled_mask = as_mx_array(lj_enabled_mask, dtype=mx.uint32)
+    lj_one_four_mask = as_mx_array(lj_one_four_mask, dtype=mx.uint32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
+    sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    n_atoms = int(positions.shape[0])
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
+        msg = "atom_blocks must have shape (n_blocks, 8)"
+        raise ValueError(msg)
+    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
+        msg = "tile_blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    tile_count = int(tile_blocks.shape[0])
+    mask_shape = (tile_count, 2)
+    if member_mask.shape != mask_shape:
+        msg = "member_mask must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if lj_enabled_mask.shape != mask_shape or lj_one_four_mask.shape != mask_shape:
+        msg = "tile LJ masks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if box.shape != (6,):
+        msg = "box_lengths_and_inverses must have shape (6,)"
+        raise ValueError(msg)
+    if half_sigma.shape != (n_atoms,) or sqrt_epsilon.shape != (n_atoms,):
+        msg = "prepared LJ parameters must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if charges.shape != (n_atoms,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if cutoff is None or not isfinite(float(cutoff)) or cutoff <= 0.0:
+        msg = "tile PME direct forces require a finite positive cutoff"
+        raise ValueError(msg)
+    if not isfinite(float(alpha)) or alpha <= 0.0:
+        msg = "tile PME direct forces require finite positive alpha"
+        raise ValueError(msg)
+    if not isfinite(float(coulomb_constant)):
+        msg = "coulomb_constant must be finite"
+        raise ValueError(msg)
+    if not isfinite(float(one_four_scale)) or one_four_scale < 0.0:
+        msg = "one_four_scale must be finite and non-negative"
+        raise ValueError(msg)
+    cutoff_value = float(cutoff)
+    if switch_distance is not None and (
+        not isfinite(float(switch_distance))
+        or float(switch_distance) < 0.0
+        or float(switch_distance) >= cutoff_value
+    ):
+        msg = "switch_distance must be finite, non-negative, and below cutoff"
+        raise ValueError(msg)
+    if tile_count == 0:
+        return mx.zeros_like(positions)
+
+    has_switch = switch_distance is not None
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(has_switch),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+            1.0 / switch_width,
+            float(one_four_scale),
+        ],
+        dtype=mx.float32,
+    )
+    (forces,) = _tile_pme_direct_force_only_kernel()(
+        inputs=[
+            positions,
+            atom_blocks,
+            tile_blocks,
+            member_mask,
+            lj_enabled_mask,
+            lj_one_four_mask,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            params,
+        ],
+        output_shapes=[(n_atoms, 3)],
+        output_dtypes=[mx.float32],
+        grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
+        threadgroup=(_TILE_PME_THREADGROUP_SIZE, 1, 1),
         init_value=0.0,
     )
     return forces
