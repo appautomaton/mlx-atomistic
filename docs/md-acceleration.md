@@ -39,14 +39,15 @@ existing force, constraint, and restart validation gates.
 
 Measure with `python -m mlx_atomistic.benchmarks.md_acceleration --json` before
 changing a force path. The large-system neighbor emitter and recurring direct
-force path are now Metal-native. The next structural decision is whether to
-replace the explicit global pair array with a spatial tile representation that
-can reduce force contributions locally before reaching global memory.
+force path are now Metal-native. Production remains on compact explicit pairs.
+The first exact 8x8 atom-tile implementation was parity-correct but slower end
+to end and has been removed; it is evidence for a different future layout, not
+an alternate production backend.
 
 The remaining candidates, in priority order, are:
 
-- a proper atom-tile direct-force kernel, because global float atomics still
-  dominate the large explicit-pair route;
+- a spatially coherent direct-force layout that avoids both the global compact-
+  pair scan and the rejected 8x8 tile route's padded-lane expansion;
 - fused rigid-water position and velocity projection, after an independent
   parity gate for the full SETTLE update;
 - further neighbor rebuild work only when a matched trajectory shows it beats
@@ -75,11 +76,11 @@ The retained 2026-07-31 JAC fixed-cell PME ladder used the same 9 A cutoff,
 5.5 A skin, ten warmup steps, and 750 measured steps as its immediate control.
 These are one-time engineering measurements on an M5 Max, not a CI gate.
 
-| Atoms | Prior MLX | Spatial MLX | Time reduction | OpenMM | OpenMM / MLX | Peak process memory |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 23,558 | 12.6688 s | 8.7643 s | 30.8% | 0.6810 s | 12.9x | 1.76 GB |
-| 47,116 | 20.5108 s | 13.9166 s | 32.1% | 1.0945 s | 12.7x | 2.76 GB |
-| 94,232 | 40.4986 s | 24.3424 s | 39.9% | 1.6861 s | 14.4x | 4.80 GB |
+| Atoms | Prior MLX | Spatial MLX | Time reduction | OpenMM artifact | Peak process memory |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 23,558 | 12.6688 s | 8.7643 s | 30.8% | 0.6810 s | 1.76 GB |
+| 47,116 | 20.5108 s | 13.9166 s | 32.1% | 1.0945 s | 2.76 GB |
+| 94,232 | 40.4986 s | 24.3424 s | 39.9% | 1.6861 s | 4.80 GB |
 
 At 94,232 atoms the current 25x25x12 grid emits 184.1 million candidates,
 down 60.7% from 468.3 million, and retains about 60.5 million exact pairs. All
@@ -89,6 +90,12 @@ retained gain but does not meet the one-order-of-magnitude OpenMM stretch
 target. The next large-system lever is spatial tiles or cell-pair tasks that
 feed the direct-space force kernel without materializing and repeatedly
 scanning the full explicit pair array.
+
+The OpenMM values in this historical ladder are provisional context. The local
+artifact does not bind integration, timestep, thermostat, constraints,
+completion, timing boundary, and workload identity strongly enough for a
+publishable cross-engine ratio. Its 1.6861-second value therefore defines only
+the provisional 16.8615-second ten-times stretch target.
 
 ### Prepared recurring-force result
 
@@ -108,9 +115,10 @@ cutoff, PME mesh, timestep, thermostat, or constraint tolerances:
 The fixed-topology cache first reduced the complete 94,232-atom, 750-step run
 from 24.3424 to 19.1477 seconds. The retained prepared-force and constraint
 changes then produced a complete 18.0356-second run: 25.9% below the original
-spatial result, 10.70 times the matched 1.6861-second OpenMM/OpenCL result, with
-a 3.43 GB peak. This is the latest stable complete number for the retained
-stack before the eight-pair worker change.
+spatial result, with a 3.43 GB peak. This is the latest stable complete number
+for the retained stack before the eight-pair worker change. No formal
+MLX/OpenMM ratio is reported because the OpenMM artifact did not pass the
+current comparability manifest gate.
 
 Because later complete samples were thermally throttled, the eight-pair worker
 was admitted with position-balanced A/B evidence instead of an unmatched full
@@ -119,9 +127,37 @@ kernel by about 25%. Alternating 75-step trajectories reduced median measured
 time from 5.1243 to 4.8785 seconds (4.8%) while keeping constraint residuals
 near 1.5e-5 A. A bounded 92,001-atom GPCRmd 729 run also passed all finite-state,
 constraint, HMR, PME-plan reuse, trajectory, and checkpoint checks with a
-5.60 GB process peak. The strict one-order-of-magnitude OpenMM target requires
+5.60 GB process peak. The provisional one-order-of-magnitude target requires
 a stable complete time at or below 16.8615 seconds and has not yet been
 demonstrated.
+
+### Rejected atom-tile result
+
+The 2026-07-31 atom-tile experiment tested the full route instead of assuming
+that a faster kernel would make the trajectory faster. Its isolated 8x8 Metal
+kernel reduced median direct-force latency from 0.005548 to 0.004257 seconds,
+a 30.33% win, and matched the explicit-pair force within the established
+float32 tolerance. Initial integration lost badly because tile construction
+and CPU topology binding raised the 94,232-atom, 75-step wall time from the
+1.850210-second explicit-pair control to 34.429230 seconds.
+
+One bounded lifecycle correction then derived tiles from the exact compact-
+pair oracle and packed topology masks on Metal. It reduced the atom-tile wall
+time from 34.821962 to 2.963867 seconds, geometry construction from 7.933098 to
+0.280091 seconds, and topology binding from 24.648279 to 0.012191 seconds. All
+finite-state, constraint, neighbor, PME-reuse, route, and no-fallback checks
+passed. The corrected route nevertheless remained 60.19% slower than explicit
+pairs and increased the short-run process-tree peak from 4.17 to 8.06 GB. Its
+9,664,362 tiles represented 60,504,316 exact pairs through 618,519,168 padded
+lanes, so the construction fix did not make the complete representation
+competitive.
+
+The conditional repeat and 750-step proof were not run because the first exact
+comparison was decisive and projected about 29.6 seconds for 750 steps, above
+both the retained complete result and the 16.8615-second stretch target. The
+tile kernel, production routing, experimental selector, and candidate-only
+metadata were removed. Exact compact-pair ownership remains as the verified
+production foundation.
 
 A fresh synthetic orthorhombic parity ladder now validates this route at
 1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001

@@ -597,12 +597,11 @@ def audit_openmm_runtime_artifacts(
 def _default_openmm_artifact_paths(
     prepared: Path,
 ) -> tuple[Path, Path, Path]:
-    repository_root = Path.cwd()
+    artifact_root = prepared.parent
     return (
-        repository_root
-        / "results/larger-system-scaling/jac-2x2x1-modern/openmm-corrected-750.json",
-        prepared.parent / "openmm_workload_manifest.json",
-        prepared.parent / "manifest_comparison.json",
+        artifact_root / "openmm_runtime.json",
+        artifact_root / "openmm_workload_manifest.json",
+        artifact_root / "manifest_comparison.json",
     )
 
 
