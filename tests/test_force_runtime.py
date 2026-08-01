@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 
@@ -26,6 +28,43 @@ class _PreparedTerm:
         cell, pairs = binding
         assert cell is not None
         assert pairs is not None
+        return mx.ones_like(positions)
+
+
+class _PreparedTileTerm(_PreparedTerm):
+    def __init__(self, *, ready=True):
+        super().__init__()
+        self.ready = ready
+        self.tile_force_calls = 0
+
+    def _prepare_tile_force_binding(self, cell, pairs, tiles):
+        self.prepare_calls += 1
+        return SimpleNamespace(
+            cell=cell,
+            pairs=pairs,
+            tiles=tiles,
+            tile_force_ready=self.ready,
+            tile_decline_reason=None if self.ready else "test_decline",
+        )
+
+    def _prepare_force_binding(self, cell, pairs):
+        self.prepare_calls += 1
+        return SimpleNamespace(
+            cell=cell,
+            pairs=pairs,
+            tiles=None,
+            tile_force_ready=False,
+            tile_decline_reason="tile_geometry_unavailable",
+        )
+
+    def _tile_forces_from_binding(self, positions, binding):
+        assert binding.tiles is not None
+        self.tile_force_calls += 1
+        return mx.ones_like(positions) * 3.0
+
+    def _forces_from_binding(self, positions, binding):
+        assert binding.pairs is not None
+        self.force_calls += 1
         return mx.ones_like(positions)
 
 
@@ -68,3 +107,64 @@ def test_prepared_pipeline_binds_once_per_neighbor_generation():
     assert term.force_calls == 2
     np.testing.assert_array_equal(np.asarray(first_forces), np.ones_like(positions))
     np.testing.assert_array_equal(np.asarray(second_forces), np.ones_like(positions))
+
+
+def test_prepared_pipeline_selects_tiles_only_when_requested_and_ready():
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(6.0)
+    tile_neighbors = NeighborListManager(
+        cell,
+        cutoff=1.5,
+        skin=0.4,
+        backend="mlx_cell_tiles",
+    ).update(positions)
+
+    selected_term = _PreparedTileTerm()
+    selected = _PreparedForcePipeline.prepare(
+        (selected_term,),
+        cell=cell,
+        direct_force_backend="atom-tiles",
+    ).bind(tile_neighbors)
+    selected_forces = selected.forces(mx.array(positions))
+
+    control_term = _PreparedTileTerm()
+    control = _PreparedForcePipeline.prepare(
+        (control_term,),
+        cell=cell,
+    ).bind(tile_neighbors)
+    control_forces = control.forces(mx.array(positions))
+
+    np.testing.assert_array_equal(
+        np.asarray(selected_forces),
+        np.full_like(positions, 3.0),
+    )
+    np.testing.assert_array_equal(np.asarray(control_forces), np.ones_like(positions))
+    assert selected.route_report()["selected_backend"] == "atom-tiles"
+    assert selected.route_report()["tile_decline_reasons"] == []
+    assert control.route_report()["selected_backend"] == "explicit-pairs"
+
+
+def test_prepared_pipeline_records_declined_tile_fallback():
+    positions = np.array([[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]], dtype=np.float32)
+    cell = Cell.cubic(6.0)
+    neighbors = NeighborListManager(
+        cell,
+        cutoff=1.5,
+        skin=0.4,
+        backend="mlx_cell_tiles",
+    ).update(positions)
+    term = _PreparedTileTerm(ready=False)
+    bound = _PreparedForcePipeline.prepare(
+        (term,),
+        cell=cell,
+        direct_force_backend="atom-tiles",
+    ).bind(neighbors)
+
+    forces = bound.forces(mx.array(positions))
+
+    np.testing.assert_array_equal(np.asarray(forces), np.ones_like(positions))
+    assert bound.route_report()["selected_backend"] == "explicit-pairs"
+    assert bound.route_report()["tile_decline_reasons"] == ["test_decline"]

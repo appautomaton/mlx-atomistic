@@ -142,6 +142,7 @@ def runtime_payload(
     sample_interval: int | None = None,
     diagnostic_interval: int | None = None,
     runtime_profile: bool = False,
+    direct_backend: str = "explicit-pairs",
 ) -> dict[str, Any]:
     """Run bounded fixed-cell charged-PME NVT with one reusable plan.
 
@@ -162,6 +163,8 @@ def runtime_payload(
             only the final step. Defaults to ``None``.
         runtime_profile: Enable synchronized benchmark-only route attribution.
             Defaults to ``False``.
+        direct_backend: Ordinary direct-force backend, ``explicit-pairs`` or
+            ``atom-tiles``. Defaults to ``explicit-pairs``.
 
     Returns:
         JSON-serializable passing, failed, blocked, or resource-ceiling payload.
@@ -187,6 +190,7 @@ def runtime_payload(
         "sample_interval": sample_interval,
         "diagnostic_interval": diagnostic_interval,
         "runtime_profile": bool(runtime_profile),
+        "direct_backend": direct_backend,
         "status": "blocked",
         "passed": False,
         "blockers": [],
@@ -210,6 +214,8 @@ def runtime_payload(
         validation_blockers.append("sample_interval_must_be_positive")
     if diagnostic_interval <= 0:
         validation_blockers.append("diagnostic_interval_must_be_positive")
+    if direct_backend not in {"explicit-pairs", "atom-tiles"}:
+        validation_blockers.append("direct_backend_must_be_explicit_pairs_or_atom_tiles")
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
     validation_blockers.extend(
         f"missing_prepared_input:{path}" for path in required if not path.is_file()
@@ -235,13 +241,18 @@ def runtime_payload(
         if topology is None:
             raise ValueError("charged PME runtime requires a topology-aware nonbonded term")
         cutoff = float(nonbonded.cutoff)
+        neighbor_backend = (
+            "mlx_cell_tiles"
+            if direct_backend == "atom-tiles"
+            else "mlx_cell_pairs"
+        )
         neighbor_manager = NeighborListManager(
             system.cell,
             cutoff=cutoff,
             skin=neighbor_skin,
             check_interval=neighbor_check_interval,
             sort_pairs=False,
-            backend="mlx_cell_pairs",
+            backend=neighbor_backend,
             displacement_check_backend="mlx_scalar",
         )
         setup_seconds = time.perf_counter() - setup_started
@@ -275,6 +286,7 @@ def runtime_payload(
                 simulation_units=simulation_units,
                 sample_interval=warmups,
                 diagnostic_interval=warmups,
+                direct_force_backend=direct_backend,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -303,6 +315,7 @@ def runtime_payload(
                 sample_interval=sample_interval,
                 diagnostic_interval=diagnostic_interval,
                 runtime_profile=runtime_profile,
+                direct_force_backend=direct_backend,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -379,8 +392,36 @@ def runtime_payload(
             "lazy_topology": topology_report["pair_policy"] == "lazy",
             "pair_cache_unmaterialized": not topology_report["pair_cache_materialized"],
             "compact_neighbor_pairs": (
-                neighbor_report["manager_backend"] == "mlx_cell_pairs"
-                and neighbor_report["representation"] == "pairs"
+                neighbor_list is not None
+                and isinstance(neighbor_list.diagnostic_pairs, mx.array)
+            ),
+            "neighbor_representation_matches_backend": (
+                (
+                    direct_backend == "explicit-pairs"
+                    and neighbor_report["manager_backend"] == "mlx_cell_pairs"
+                    and neighbor_report["representation"] == "pairs"
+                )
+                or (
+                    direct_backend == "atom-tiles"
+                    and neighbor_report["manager_backend"] == "mlx_cell_tiles"
+                    and neighbor_report["representation"] == "tiles"
+                )
+            ),
+            "direct_force_backend_selected": (
+                measured_result.force_route_report.get("selected_backend")
+                == direct_backend
+            ),
+            "no_unintended_tile_fallback": (
+                direct_backend != "atom-tiles"
+                or (
+                    measured_result.force_route_report.get(
+                        "tile_selected_term_count"
+                    )
+                    == 1
+                    and not measured_result.force_route_report.get(
+                        "tile_decline_reasons"
+                    )
+                )
             ),
             "no_neighbor_fallback": neighbor_report["fallback_reason"] is None,
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
@@ -461,6 +502,7 @@ def runtime_payload(
             },
             "runtime_sync": measured_result.runtime_sync_report,
             "route_profile": measured_result.route_profile,
+            "force_route": measured_result.force_route_report,
         }
         return _write_runtime_payload(payload, out_path)
     except MemoryError as exc:  # pragma: no cover - host resource dependent.
@@ -1203,6 +1245,7 @@ def _simulation_config(
     sample_interval: int,
     diagnostic_interval: int,
     runtime_profile: bool = False,
+    direct_force_backend: str = "explicit-pairs",
 ) -> SimulationConfig:
     return SimulationConfig(
         dt=dt_ps,
@@ -1212,6 +1255,7 @@ def _simulation_config(
         pressure_diagnostics=False,
         compile_force_evaluator=False,
         runtime_profile=runtime_profile,
+        direct_force_backend=direct_force_backend,
         **simulation_units,
     )
 
@@ -1326,6 +1370,11 @@ def main(argv: list[str] | None = None) -> None:
     runtime_parser.add_argument("--neighbor-check-interval", type=int, default=1)
     runtime_parser.add_argument("--sample-interval", type=int, default=None)
     runtime_parser.add_argument("--diagnostic-interval", type=int, default=None)
+    runtime_parser.add_argument(
+        "--direct-backend",
+        choices=("explicit-pairs", "atom-tiles"),
+        default="explicit-pairs",
+    )
     runtime_parser.add_argument("--out", type=Path, required=True)
     profile_parser = commands.add_parser(
         "profile",
@@ -1377,6 +1426,7 @@ def main(argv: list[str] | None = None) -> None:
             neighbor_check_interval=args.neighbor_check_interval,
             sample_interval=args.sample_interval,
             diagnostic_interval=args.diagnostic_interval,
+            direct_backend=args.direct_backend,
             out=args.out,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))

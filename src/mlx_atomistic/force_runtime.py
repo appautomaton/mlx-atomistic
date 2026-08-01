@@ -109,6 +109,9 @@ class _BoundForcePipeline:
     cell: Cell | None
     virtual_sites: VirtualSiteManager | None
     route_profiler: _ExclusiveRouteProfiler | None = None
+    direct_force_backend: str = "explicit-pairs"
+    tile_route_selected: tuple[bool, ...] = ()
+    tile_decline_reasons: tuple[str | None, ...] = ()
 
     def forces(
         self,
@@ -134,19 +137,25 @@ class _BoundForcePipeline:
             else as_mx_array(evaluation_positions)
         )
         total_forces = mx.zeros_like(eval_positions)
-        for term, binding in zip(
+        for term, binding, tile_selected in zip(
             self.force_terms,
             self.term_bindings,
+            self.tile_route_selected,
             strict=True,
         ):
             bound_method = getattr(term, "_forces_from_binding", None)
+            tile_bound_method = getattr(term, "_tile_forces_from_binding", None)
             profiled_bound_method = getattr(
                 term,
                 "_profile_forces_from_binding",
                 None,
             )
             route_started = None
-            if (
+            if tile_selected and callable(tile_bound_method):
+                if self.route_profiler is not None:
+                    route_started = self.route_profiler.start()
+                forces = tile_bound_method(eval_positions, binding)
+            elif (
                 self.route_profiler is not None
                 and binding is not NotImplemented
                 and callable(profiled_bound_method)
@@ -183,7 +192,11 @@ class _BoundForcePipeline:
                 )
             if route_started is not None:
                 self.route_profiler.finish(
-                    "other_force_terms",
+                    (
+                        "atom_tile_complete_force"
+                        if tile_selected
+                        else "other_force_terms"
+                    ),
                     route_started,
                     forces,
                 )
@@ -220,6 +233,35 @@ class _BoundForcePipeline:
             )
         return redistributed
 
+    def route_report(self) -> dict[str, Any]:
+        """Return static prepared-route selection and fallback evidence."""
+
+        capable = tuple(
+            callable(getattr(term, "_tile_forces_from_binding", None))
+            for term in self.force_terms
+        )
+        selected_count = sum(self.tile_route_selected)
+        decline_reasons = [
+            reason
+            for is_capable, selected, reason in zip(
+                capable,
+                self.tile_route_selected,
+                self.tile_decline_reasons,
+                strict=True,
+            )
+            if is_capable and not selected and reason is not None
+        ]
+        return {
+            "requested_backend": self.direct_force_backend,
+            "selected_backend": (
+                "atom-tiles" if selected_count > 0 else "explicit-pairs"
+            ),
+            "tile_capable_term_count": sum(capable),
+            "tile_selected_term_count": selected_count,
+            "compact_fallback_term_count": len(self.force_terms) - selected_count,
+            "tile_decline_reasons": decline_reasons,
+        }
+
 
 class _PreparedForcePipeline:
     """Own setup-validated force terms and cache their neighbor binding."""
@@ -231,6 +273,7 @@ class _PreparedForcePipeline:
         cell: Cell | None,
         virtual_sites: VirtualSiteManager | None,
         route_profiler: _ExclusiveRouteProfiler | None,
+        direct_force_backend: str,
     ) -> None:
         if not force_terms:
             msg = "force_terms must not be empty"
@@ -239,6 +282,10 @@ class _PreparedForcePipeline:
         self.cell = cell
         self.virtual_sites = virtual_sites
         self.route_profiler = route_profiler
+        if direct_force_backend not in {"explicit-pairs", "atom-tiles"}:
+            msg = "direct_force_backend must be 'explicit-pairs' or 'atom-tiles'"
+            raise ValueError(msg)
+        self.direct_force_backend = direct_force_backend
         self._cached_neighbor_list: NeighborList | None = None
         self._cached_binding: _BoundForcePipeline | None = None
         self._cached_context_identity: tuple[object, ...] | None = None
@@ -251,6 +298,7 @@ class _PreparedForcePipeline:
         cell: Cell | None,
         virtual_sites: VirtualSiteManager | None = None,
         route_profiler: _ExclusiveRouteProfiler | None = None,
+        direct_force_backend: str = "explicit-pairs",
     ) -> _PreparedForcePipeline:
         """Create a fixed-cell force pipeline.
 
@@ -259,6 +307,7 @@ class _PreparedForcePipeline:
             cell: Current periodic cell, or ``None`` for nonperiodic work.
             virtual_sites: Optional virtual-site mapping.
             route_profiler: Optional synchronized benchmark-only route profiler.
+            direct_force_backend: Ordinary force-only route selection.
 
         Returns:
             A pipeline ready to bind a neighbor-list generation.
@@ -269,6 +318,7 @@ class _PreparedForcePipeline:
             cell=cell,
             virtual_sites=virtual_sites,
             route_profiler=route_profiler,
+            direct_force_backend=direct_force_backend,
         )
 
     def bind(self, neighbor_list: NeighborList | None) -> _BoundForcePipeline:
@@ -317,6 +367,8 @@ class _PreparedForcePipeline:
         ):
             return self._cached_binding
         term_bindings: list[object | NotImplementedType] = []
+        tile_route_selected: list[bool] = []
+        tile_decline_reasons: list[str | None] = []
         for term in self.force_terms:
             prepare = getattr(term, "_prepare_force_binding", None)
             prepare_tiles = getattr(term, "_prepare_tile_force_binding", None)
@@ -329,6 +381,32 @@ class _PreparedForcePipeline:
                     else NotImplemented
                 )
             term_bindings.append(binding)
+            tile_capable = callable(
+                getattr(term, "_tile_forces_from_binding", None)
+            )
+            tile_ready = bool(
+                binding is not NotImplemented
+                and getattr(binding, "tile_force_ready", False)
+            )
+            selected = (
+                self.direct_force_backend == "atom-tiles"
+                and tile_capable
+                and tile_ready
+            )
+            tile_route_selected.append(selected)
+            decline_reason = None
+            if (
+                self.direct_force_backend == "atom-tiles"
+                and tile_capable
+                and not selected
+            ):
+                decline_reason = (
+                    "tile_binding_unavailable"
+                    if binding is NotImplemented
+                    else getattr(binding, "tile_decline_reason", None)
+                    or "tile_geometry_unavailable"
+                )
+            tile_decline_reasons.append(decline_reason)
         bound = _BoundForcePipeline(
             force_terms=self.force_terms,
             term_bindings=tuple(term_bindings),
@@ -336,11 +414,28 @@ class _PreparedForcePipeline:
             cell=self.cell,
             virtual_sites=self.virtual_sites,
             route_profiler=self.route_profiler,
+            direct_force_backend=self.direct_force_backend,
+            tile_route_selected=tuple(tile_route_selected),
+            tile_decline_reasons=tuple(tile_decline_reasons),
         )
         self._cached_neighbor_list = neighbor_list
         self._cached_binding = bound
         self._cached_context_identity = context_identity
         return bound
+
+    def route_report(self) -> dict[str, Any]:
+        """Return the latest bound force-route evidence."""
+
+        if self._cached_binding is None:
+            return {
+                "requested_backend": self.direct_force_backend,
+                "selected_backend": None,
+                "tile_capable_term_count": 0,
+                "tile_selected_term_count": 0,
+                "compact_fallback_term_count": 0,
+                "tile_decline_reasons": ["force_pipeline_not_bound"],
+            }
+        return self._cached_binding.route_report()
 
 
 def _evaluation_positions(

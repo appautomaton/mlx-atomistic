@@ -1752,6 +1752,18 @@ def test_charged_pme_runtime_requires_warmup_and_two_measured_steps(tmp_path):
     assert "measured_steps_must_be_at_least_two" in payload["blockers"]
 
 
+def test_charged_pme_runtime_rejects_unknown_direct_backend(tmp_path):
+    payload = charged_pme.runtime_payload(
+        prepared=tmp_path / "missing",
+        warmups=1,
+        steps=2,
+        direct_backend="unknown",
+        out=tmp_path / "runtime.json",
+    )
+
+    assert "direct_backend_must_be_explicit_pairs_or_atom_tiles" in payload["blockers"]
+
+
 def _write_openmm_admission_inputs(tmp_path, *, complete):
     runtime_path = tmp_path / "openmm-runtime.json"
     manifest_path = tmp_path / "openmm-manifest.json"
