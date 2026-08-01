@@ -33,6 +33,14 @@ PROFILE_SCHEMA = "mlx_atomistic.charged_pme_profile.v1"
 OPENMM_ADMISSION_SCHEMA = "mlx_atomistic.openmm_runtime_admission.v1"
 _PROFILE_STATE_RTOL = 5.0e-5
 _PROFILE_STATE_ATOL = 1.0e-5
+_PROCESS_MEMORY_LIMIT_BYTES = 40_000_000_000
+_SPATIAL_DIRECT_MIN_COMPLETE_SPEEDUP = 0.15
+# The isolated direct-force median varies by several percentage points under
+# low-power Metal. Keep this as a bounded smell gate; the position-balanced
+# complete-wall A/B below is the authoritative retention gate.
+_SPATIAL_DIRECT_MIN_KERNEL_SPEEDUP = 0.25
+_SPARSE_CORRECTION_MIN_SPEEDUP = 0.20
+_RUNTIME_NEIGHBOR_BACKENDS = frozenset({"mlx_cell_pairs", "mlx_cell_tiles"})
 
 
 def _constraint_route_inventory(
@@ -204,6 +212,7 @@ def runtime_payload(
     sample_interval: int | None = None,
     diagnostic_interval: int | None = None,
     runtime_profile: bool = False,
+    neighbor_backend: str = "mlx_cell_tiles",
 ) -> dict[str, Any]:
     """Run bounded fixed-cell charged-PME NVT with one reusable plan.
 
@@ -224,6 +233,8 @@ def runtime_payload(
             only the final step. Defaults to ``None``.
         runtime_profile: Enable synchronized benchmark-only route attribution.
             Defaults to ``False``.
+        neighbor_backend: Exact spatial tile candidate or compact-pair control.
+            Defaults to ``mlx_cell_tiles``.
 
     Returns:
         JSON-serializable passing, failed, blocked, or resource-ceiling payload.
@@ -249,6 +260,8 @@ def runtime_payload(
         "sample_interval": sample_interval,
         "diagnostic_interval": diagnostic_interval,
         "runtime_profile": bool(runtime_profile),
+        "neighbor_backend": str(neighbor_backend),
+        "process_memory_limit_bytes": _PROCESS_MEMORY_LIMIT_BYTES,
         "status": "blocked",
         "passed": False,
         "blockers": [],
@@ -272,6 +285,8 @@ def runtime_payload(
         validation_blockers.append("sample_interval_must_be_positive")
     if diagnostic_interval <= 0:
         validation_blockers.append("diagnostic_interval_must_be_positive")
+    if neighbor_backend not in _RUNTIME_NEIGHBOR_BACKENDS:
+        validation_blockers.append("neighbor_backend_must_be_pairs_or_tiles")
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
     validation_blockers.extend(
         f"missing_prepared_input:{path}" for path in required if not path.is_file()
@@ -303,7 +318,7 @@ def runtime_payload(
             skin=neighbor_skin,
             check_interval=neighbor_check_interval,
             sort_pairs=False,
-            backend="mlx_cell_pairs",
+            backend=neighbor_backend,
             displacement_check_backend="mlx_scalar",
         )
         setup_seconds = time.perf_counter() - setup_started
@@ -432,6 +447,18 @@ def runtime_payload(
             ),
         }
         final_plan = plan.to_dict()
+        process_peak_bytes = int(max_rss_mb() * 1024.0 * 1024.0)
+        memory = {
+            "max_rss_mb": process_peak_bytes / (1024.0 * 1024.0),
+            "process_peak_bytes": process_peak_bytes,
+            "process_memory_limit_bytes": _PROCESS_MEMORY_LIMIT_BYTES,
+            "mlx_active_memory_bytes": _mlx_memory_value("get_active_memory"),
+            "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
+            "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
+        }
+        expected_representation = (
+            "tiles" if neighbor_backend == "mlx_cell_tiles" else "pairs"
+        )
         checks = {
             "warmup_completed": warmups >= 1,
             "measured_steps_completed": steps >= 2,
@@ -453,23 +480,41 @@ def runtime_payload(
             "performance_eligible_constraint_routes": constraint_routes[
                 "performance_eligible"
             ],
-            "compact_neighbor_pairs": (
-                neighbor_report["manager_backend"] == "mlx_cell_pairs"
-                and neighbor_report["representation"] == "pairs"
+            "expected_neighbor_representation": (
+                neighbor_report["manager_backend"] == neighbor_backend
+                and neighbor_report["representation"] == expected_representation
             ),
             "no_neighbor_fallback": neighbor_report["fallback_reason"] is None,
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
+            "process_memory_within_limit": (
+                process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES
+            ),
+            "mlx_peak_memory_within_limit": (
+                isinstance(memory["mlx_peak_memory_bytes"], int)
+                and memory["mlx_peak_memory_bytes"] <= _PROCESS_MEMORY_LIMIT_BYTES
+            ),
         }
         if runtime_profile:
             route_profile = measured_result.route_profile
             routes = route_profile.get("routes", {})
+            expected_direct_route = (
+                "direct_spatial_tiles"
+                if neighbor_backend == "mlx_cell_tiles"
+                else "direct_lj_screened_coulomb"
+            )
+            unexpected_direct_route = (
+                "direct_lj_screened_coulomb"
+                if neighbor_backend == "mlx_cell_tiles"
+                else "direct_spatial_tiles"
+            )
             checks.update(
                 {
                     "route_profile_reconciled": bool(
                         route_profile.get("reconciled", False)
                     ),
-                    "route_profile_direct": (
-                        "direct_lj_screened_coulomb" in routes
+                    "route_profile_expected_direct": expected_direct_route in routes,
+                    "route_profile_no_direct_fallback": (
+                        unexpected_direct_route not in routes
                     ),
                     "route_profile_reciprocal": "reciprocal_pme" in routes,
                     "route_profile_neighbor": "neighbor_update_rebuild" in routes,
@@ -512,12 +557,7 @@ def runtime_payload(
                 "openmm_ratio": None,
                 "comparison_status": "not_reported_without_matching_runtime_manifest",
             },
-            "memory": {
-                "max_rss_mb": max_rss_mb(),
-                "mlx_active_memory_bytes": _mlx_memory_value("get_active_memory"),
-                "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
-                "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
-            },
+            "memory": memory,
             "state": {
                 "potential_energy_kj_mol": _last_float(
                     measured_result.potential_energy
@@ -700,7 +740,8 @@ def _profile_tile_inventory(
     )
     if system.cell is None:
         raise ValueError("tile inventory requires a periodic cell")
-    nonbonded = _find_pme_term(tuple(force_terms))
+    bound_terms = _bind_pme_plans(force_terms, system.cell)
+    nonbonded = _find_pme_term(bound_terms)
     tile_manager = NeighborListManager(
         system.cell,
         cutoff=float(nonbonded.cutoff),
@@ -714,7 +755,13 @@ def _profile_tile_inventory(
     tiles = neighbor_list.tiles
     if tiles is None:
         raise RuntimeError("mlx_cell_tiles did not produce NeighborTiles")
-    mx.eval(tiles.atom_blocks, tiles.tile_blocks, tiles.member_mask)
+    mx.eval(
+        tiles.atom_blocks,
+        tiles.tile_blocks,
+        tiles.member_mask,
+        tiles.force_group_starts,
+        tiles.force_group_counts,
+    )
     pair_manager = NeighborListManager(
         system.cell,
         cutoff=float(nonbonded.cutoff),
@@ -724,15 +771,123 @@ def _profile_tile_inventory(
         backend="mlx_cell_pairs",
         displacement_check_backend="mlx_scalar",
     )
-    reference_pairs = pair_manager.update(system.positions).pairs
+    pair_neighbors = pair_manager.update(system.positions)
+    reference_pairs = pair_neighbors.pairs
     if reference_pairs is None:
         raise RuntimeError("mlx_cell_pairs did not produce compact pairs")
     reference_pair_count = int(reference_pairs.shape[0])
+    tile_binding = nonbonded._prepare_tile_force_binding(
+        system.cell,
+        neighbor_list.diagnostic_pairs,
+        tiles,
+    )
+    pair_binding = nonbonded._prepare_force_binding(
+        system.cell,
+        pair_neighbors.diagnostic_pairs,
+    )
+    if tile_binding is NotImplemented or pair_binding is NotImplemented:
+        raise RuntimeError("JAC direct-force bindings were not admitted")
+    if tile_binding.tile_decline_reason is not None:
+        raise RuntimeError(
+            f"spatial tile force route declined: {tile_binding.tile_decline_reason}"
+        )
+    tile_forces = nonbonded._direct_forces_from_binding(
+        system.positions,
+        tile_binding,
+    )
+    pair_forces = nonbonded._direct_forces_from_binding(
+        system.positions,
+        pair_binding,
+    )
+    mx.eval(tile_forces, pair_forces)
+    force_delta = np.asarray(tile_forces) - np.asarray(pair_forces)
+    force_rms_delta = float(np.sqrt(np.mean(force_delta * force_delta)))
+    force_max_delta = float(np.max(np.abs(force_delta)))
+    force_max_reference = float(np.max(np.abs(np.asarray(pair_forces))))
+
+    reference_corrections = nonbonded._exception_lj_forces(
+        system.positions,
+        system.cell,
+    ) + nonbonded._periodic_coulomb_correction_forces(
+        system.positions,
+        system.cell,
+    )
+    fused_corrections = nonbonded._prepared_sparse_correction_forces(
+        system.positions,
+        tile_binding,
+    )
+    mx.eval(reference_corrections, fused_corrections)
+    correction_delta = np.asarray(fused_corrections) - np.asarray(reference_corrections)
+    correction_rms_delta = float(np.sqrt(np.mean(correction_delta * correction_delta)))
+    correction_max_delta = float(np.max(np.abs(correction_delta)))
+
+    def interleaved_medians(reference_call, candidate_call) -> tuple[float, float]:
+        calls = {"reference": reference_call, "candidate": candidate_call}
+        for _ in range(2):
+            for call in calls.values():
+                value = call()
+                mx.eval(value)
+        samples = {"reference": [], "candidate": []}
+        for sample in range(6):
+            ordered = (
+                ("reference", "candidate")
+                if sample % 2 == 0
+                else ("candidate", "reference")
+            )
+            for name in ordered:
+                started = time.perf_counter()
+                value = calls[name]()
+                mx.eval(value)
+                samples[name].append(time.perf_counter() - started)
+        return (
+            float(np.median(samples["reference"])),
+            float(np.median(samples["candidate"])),
+        )
+
+    pair_direct_seconds, tile_direct_seconds = interleaved_medians(
+        lambda: nonbonded._direct_forces_from_binding(system.positions, pair_binding),
+        lambda: nonbonded._direct_forces_from_binding(system.positions, tile_binding),
+    )
+    reference_correction_seconds, fused_correction_seconds = interleaved_medians(
+        lambda: nonbonded._exception_lj_forces(
+            system.positions,
+            system.cell,
+        )
+        + nonbonded._periodic_coulomb_correction_forces(
+            system.positions,
+            system.cell,
+        ),
+        lambda: nonbonded._prepared_sparse_correction_forces(
+            system.positions,
+            tile_binding,
+        ),
+    )
+    diagnostic_pair_bytes = int(neighbor_list.diagnostic_pairs.size) * 4
+    tile_topology_bytes = sum(
+        int(values.size) * 4
+        for values in (
+            tile_binding.tile_lj_enabled_mask,
+            tile_binding.tile_lj_one_four_mask,
+        )
+        if values is not None
+    )
+    pair_scale_bytes = (
+        0
+        if tile_binding.aligned_lj_scales is None
+        else int(tile_binding.aligned_lj_scales.size) * 4
+    )
+    persistent_breakdown = {
+        "tile_geometry_bytes": tiles.estimated_bytes,
+        "diagnostic_pair_bytes": diagnostic_pair_bytes,
+        "tile_topology_mask_bytes": tile_topology_bytes,
+        "pair_scale_bytes": pair_scale_bytes,
+    }
     return {
         "backend": tile_manager.backend,
         "block_size": tiles.block_size,
         "block_count": tiles.block_count,
         "tile_count": tiles.tile_count,
+        "force_group_count": tiles.force_group_count,
         "exact_pair_count": tiles.exact_pair_count,
         "reference_pair_count": reference_pair_count,
         "pair_inventory_matches": tiles.exact_pair_count == reference_pair_count,
@@ -740,7 +895,32 @@ def _profile_tile_inventory(
         "padded_lane_count": tiles.padded_lane_count,
         "padding_waste_count": tiles.padding_waste_count,
         "padding_waste_fraction": tiles.padding_waste_fraction,
-        "estimated_persistent_bytes": tiles.estimated_bytes,
+        "estimated_persistent_bytes": sum(persistent_breakdown.values()),
+        "estimated_persistent_bytes_breakdown": persistent_breakdown,
+        "active_lane_fraction": (
+            0.0
+            if tiles.padded_lane_count == 0
+            else tiles.exact_pair_count / tiles.padded_lane_count
+        ),
+        "force_rms_delta_kj_mol_angstrom": force_rms_delta,
+        "force_max_delta_kj_mol_angstrom": force_max_delta,
+        "force_max_reference_kj_mol_angstrom": force_max_reference,
+        "correction_force_rms_delta_kj_mol_angstrom": correction_rms_delta,
+        "correction_force_max_delta_kj_mol_angstrom": correction_max_delta,
+        "reference_correction_median_seconds": reference_correction_seconds,
+        "fused_correction_median_seconds": fused_correction_seconds,
+        "correction_speedup_fraction": (
+            0.0
+            if reference_correction_seconds <= 0.0
+            else 1.0 - fused_correction_seconds / reference_correction_seconds
+        ),
+        "pair_direct_median_seconds": pair_direct_seconds,
+        "tile_direct_median_seconds": tile_direct_seconds,
+        "direct_speedup_fraction": (
+            0.0
+            if pair_direct_seconds <= 0.0
+            else 1.0 - tile_direct_seconds / pair_direct_seconds
+        ),
         "rebuild_wall_seconds": tile_manager.rebuild_wall_seconds,
         "update_wall_seconds": tile_manager.update_wall_seconds,
         "reference_pair_rebuild_wall_seconds": pair_manager.rebuild_wall_seconds,
@@ -762,7 +942,7 @@ def profile_payload(
     openmm_manifest: str | Path | None = None,
     manifest_comparison: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run one clean and one synchronized charged-PME route profile.
+    """Run a matched pair/tile A/B and synchronized charged-PME route profile.
 
     Args:
         prepared: Strict production prepared-system directory.
@@ -779,12 +959,16 @@ def profile_payload(
         manifest_comparison: Optional persisted manifest comparison override.
 
     Returns:
-        Combined clean, instrumented, tile-inventory, and admission evidence.
+        Combined position-balanced pair/tile controls, instrumented tile,
+        tile-inventory, and admission evidence.
     """
 
     prepared_path = Path(prepared)
     out_path = Path(out)
+    pair_before_path = out_path.parent / "pair-control-before.json"
     clean_path = out_path.parent / "clean.json"
+    clean_repeat_path = out_path.parent / "clean-repeat.json"
+    pair_after_path = out_path.parent / "pair-control-after.json"
     instrumented_path = out_path.parent / "instrumented.json"
     admission_path = out_path.parent / "openmm-admission.json"
     default_runtime, default_manifest, default_comparison = (
@@ -802,6 +986,19 @@ def profile_payload(
         ),
         out=admission_path,
     )
+    pair_control_before = runtime_payload(
+        prepared=prepared_path,
+        warmups=warmups,
+        steps=steps,
+        out=pair_before_path,
+        dt_ps=dt_ps,
+        temperature_k=temperature_k,
+        seed=seed,
+        neighbor_skin=neighbor_skin,
+        neighbor_check_interval=neighbor_check_interval,
+        runtime_profile=False,
+        neighbor_backend="mlx_cell_pairs",
+    )
     clean = runtime_payload(
         prepared=prepared_path,
         warmups=warmups,
@@ -813,6 +1010,33 @@ def profile_payload(
         neighbor_skin=neighbor_skin,
         neighbor_check_interval=neighbor_check_interval,
         runtime_profile=False,
+        neighbor_backend="mlx_cell_tiles",
+    )
+    clean_repeat = runtime_payload(
+        prepared=prepared_path,
+        warmups=warmups,
+        steps=steps,
+        out=clean_repeat_path,
+        dt_ps=dt_ps,
+        temperature_k=temperature_k,
+        seed=seed,
+        neighbor_skin=neighbor_skin,
+        neighbor_check_interval=neighbor_check_interval,
+        runtime_profile=False,
+        neighbor_backend="mlx_cell_tiles",
+    )
+    pair_control_after = runtime_payload(
+        prepared=prepared_path,
+        warmups=warmups,
+        steps=steps,
+        out=pair_after_path,
+        dt_ps=dt_ps,
+        temperature_k=temperature_k,
+        seed=seed,
+        neighbor_skin=neighbor_skin,
+        neighbor_check_interval=neighbor_check_interval,
+        runtime_profile=False,
+        neighbor_backend="mlx_cell_pairs",
     )
     instrumented = runtime_payload(
         prepared=prepared_path,
@@ -825,10 +1049,17 @@ def profile_payload(
         neighbor_skin=neighbor_skin,
         neighbor_check_interval=neighbor_check_interval,
         runtime_profile=True,
+        neighbor_backend="mlx_cell_tiles",
     )
     tile_inventory: dict[str, Any] | None = None
     inventory_blocker = None
-    if clean.get("passed") and instrumented.get("passed"):
+    if (
+        pair_control_before.get("passed")
+        and clean.get("passed")
+        and clean_repeat.get("passed")
+        and pair_control_after.get("passed")
+        and instrumented.get("passed")
+    ):
         try:
             tile_inventory = _profile_tile_inventory(
                 prepared_path,
@@ -847,36 +1078,161 @@ def profile_payload(
         "temperature_k",
         "constraint_max_error_angstrom",
     )
-    clean_state = clean.get("state", {})
-    instrumented_state = instrumented.get("state", {})
-    state_consistent = all(
-        key in clean_state
-        and key in instrumented_state
-        and np.isclose(
-            float(clean_state[key]),
-            float(instrumented_state[key]),
-            # The synchronized profile deliberately uses the per-step route so
-            # its timers are exclusive, while the clean sample uses the
-            # compiled block route. Float32 reduction order may therefore
-            # diverge slightly even though both paths remain scientifically
-            # equivalent.
-            rtol=_PROFILE_STATE_RTOL,
-            atol=_PROFILE_STATE_ATOL,
+    def states_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        return all(
+            key in left
+            and key in right
+            and np.isclose(
+                float(left[key]),
+                float(right[key]),
+                rtol=_PROFILE_STATE_RTOL,
+                atol=_PROFILE_STATE_ATOL,
+            )
+            for key in state_fields
         )
-        for key in state_fields
+
+    clean_samples = (clean, clean_repeat)
+    clean_states = [sample.get("state", {}) for sample in clean_samples]
+    instrumented_state = instrumented.get("state", {})
+    clean_instrumented_state_consistent = all(
+        states_match(state, instrumented_state) for state in clean_states
     )
+    control_candidate_state_consistent = all(
+        states_match(control.get("state", {}), candidate_state)
+        for control in (pair_control_before, pair_control_after)
+        for candidate_state in clean_states
+    )
+    pair_control_seconds = [
+        float(control.get("timings", {}).get("measured_seconds", math.inf))
+        for control in (pair_control_before, pair_control_after)
+    ]
+    pair_control_median_seconds = (
+        float(np.median(pair_control_seconds))
+        if all(math.isfinite(value) and value > 0.0 for value in pair_control_seconds)
+        else math.inf
+    )
+    tile_candidate_seconds = [
+        float(sample.get("timings", {}).get("measured_seconds", math.inf))
+        for sample in clean_samples
+    ]
+    tile_candidate_median_seconds = (
+        float(np.median(tile_candidate_seconds))
+        if all(math.isfinite(value) and value > 0.0 for value in tile_candidate_seconds)
+        else math.inf
+    )
+    complete_wall_speedup_fraction = (
+        0.0
+        if not math.isfinite(pair_control_median_seconds)
+        or pair_control_median_seconds <= 0.0
+        or not math.isfinite(tile_candidate_median_seconds)
+        else 1.0 - tile_candidate_median_seconds / pair_control_median_seconds
+    )
+    profile_process_peak_bytes = int(max_rss_mb() * 1024.0 * 1024.0)
+    profile_memory = {
+        "max_rss_mb": profile_process_peak_bytes / (1024.0 * 1024.0),
+        "process_peak_bytes": profile_process_peak_bytes,
+        "process_memory_limit_bytes": _PROCESS_MEMORY_LIMIT_BYTES,
+        "mlx_active_memory_bytes": _mlx_memory_value("get_active_memory"),
+        "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
+        "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
+    }
     checks = {
+        "pair_control_before_passed": pair_control_before.get("passed") is True,
         "clean_passed": clean.get("passed") is True,
+        "clean_repeat_passed": clean_repeat.get("passed") is True,
+        "pair_control_after_passed": pair_control_after.get("passed") is True,
         "instrumented_passed": instrumented.get("passed") is True,
+        "complete_wall_speedup": (
+            complete_wall_speedup_fraction >= _SPATIAL_DIRECT_MIN_COMPLETE_SPEEDUP
+        ),
         "route_profile_reconciled": route_profile.get("reconciled") is True,
-        "direct_route_present": "direct_lj_screened_coulomb" in routes,
+        "spatial_tile_route_present": "direct_spatial_tiles" in routes,
+        "compact_pair_fallback_absent": "direct_lj_screened_coulomb" not in routes,
         "reciprocal_route_present": "reciprocal_pme" in routes,
         "neighbor_route_present": "neighbor_update_rebuild" in routes,
         "integration_route_present": "integration_thermostat" in routes,
-        "clean_instrumented_state_consistent": state_consistent,
+        "clean_instrumented_state_consistent": clean_instrumented_state_consistent,
+        "control_candidate_state_consistent": control_candidate_state_consistent,
+        "process_memory_within_limit": (
+            profile_process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES
+        ),
+        "mlx_peak_memory_within_limit": (
+            isinstance(profile_memory["mlx_peak_memory_bytes"], int)
+            and profile_memory["mlx_peak_memory_bytes"]
+            <= _PROCESS_MEMORY_LIMIT_BYTES
+        ),
         "tile_inventory_present": tile_inventory is not None,
+        "tile_pair_inventory_matches": (
+            tile_inventory is not None
+            and tile_inventory.get("pair_inventory_matches") is True
+        ),
+        "tile_force_rms_within_tolerance": (
+            tile_inventory is not None
+            and float(tile_inventory.get("force_rms_delta_kj_mol_angstrom", math.inf))
+            <= 2.0e-4
+        ),
+        "tile_force_max_within_tolerance": (
+            tile_inventory is not None
+            and float(tile_inventory.get("force_max_delta_kj_mol_angstrom", math.inf))
+            <= 2.0e-2
+        ),
+        "tile_active_lane_fraction": (
+            tile_inventory is not None
+            and float(tile_inventory.get("active_lane_fraction", 0.0)) >= 0.30
+        ),
+        "tile_scheduled_lane_bound": (
+            tile_inventory is not None
+            and int(tile_inventory.get("padded_lane_count", 200_000_001))
+            <= 200_000_000
+        ),
+        "tile_direct_latency_speedup": (
+            tile_inventory is not None
+            and float(tile_inventory.get("direct_speedup_fraction", 0.0))
+            >= _SPATIAL_DIRECT_MIN_KERNEL_SPEEDUP
+        ),
+        "tile_persistent_estimate_within_limit": (
+            tile_inventory is not None
+            and int(
+                tile_inventory.get(
+                    "estimated_persistent_bytes",
+                    _PROCESS_MEMORY_LIMIT_BYTES + 1,
+                )
+            )
+            <= _PROCESS_MEMORY_LIMIT_BYTES
+        ),
+        "correction_force_rms_within_tolerance": (
+            tile_inventory is not None
+            and float(
+                tile_inventory.get(
+                    "correction_force_rms_delta_kj_mol_angstrom",
+                    math.inf,
+                )
+            )
+            <= 2.0e-4
+        ),
+        "correction_force_max_within_tolerance": (
+            tile_inventory is not None
+            and float(
+                tile_inventory.get(
+                    "correction_force_max_delta_kj_mol_angstrom",
+                    math.inf,
+                )
+            )
+            <= 2.0e-2
+        ),
+        "correction_latency_speedup": (
+            tile_inventory is not None
+            and float(tile_inventory.get("correction_speedup_fraction", 0.0))
+            >= _SPARSE_CORRECTION_MIN_SPEEDUP
+        ),
     }
     diagnostics = {
+        "pair_control_seconds": pair_control_seconds,
+        "pair_control_median_seconds": pair_control_median_seconds,
+        "tile_candidate_seconds": tile_candidate_seconds,
+        "tile_candidate_median_seconds": tile_candidate_median_seconds,
+        "complete_wall_speedup_fraction": complete_wall_speedup_fraction,
+        "complete_wall_speedup_gate": _SPATIAL_DIRECT_MIN_COMPLETE_SPEEDUP,
         "tile_pair_inventory_matches": (
             tile_inventory is not None
             and tile_inventory.get("pair_inventory_matches") is True
@@ -887,6 +1243,38 @@ def profile_payload(
             else int(tile_inventory["exact_pair_count"])
             - int(tile_inventory["reference_pair_count"])
         ),
+        "tile_force_rms_delta_kj_mol_angstrom": (
+            None
+            if tile_inventory is None
+            else tile_inventory["force_rms_delta_kj_mol_angstrom"]
+        ),
+        "tile_force_max_delta_kj_mol_angstrom": (
+            None
+            if tile_inventory is None
+            else tile_inventory["force_max_delta_kj_mol_angstrom"]
+        ),
+        "tile_direct_speedup_fraction": (
+            None
+            if tile_inventory is None
+            else tile_inventory["direct_speedup_fraction"]
+        ),
+        "tile_direct_speedup_gate": _SPATIAL_DIRECT_MIN_KERNEL_SPEEDUP,
+        "correction_force_rms_delta_kj_mol_angstrom": (
+            None
+            if tile_inventory is None
+            else tile_inventory["correction_force_rms_delta_kj_mol_angstrom"]
+        ),
+        "correction_force_max_delta_kj_mol_angstrom": (
+            None
+            if tile_inventory is None
+            else tile_inventory["correction_force_max_delta_kj_mol_angstrom"]
+        ),
+        "correction_speedup_fraction": (
+            None
+            if tile_inventory is None
+            else tile_inventory["correction_speedup_fraction"]
+        ),
+        "correction_speedup_gate": _SPARSE_CORRECTION_MIN_SPEEDUP,
     }
     passed = all(checks.values())
     payload = {
@@ -896,18 +1284,15 @@ def profile_payload(
         "blockers": [name for name, value in checks.items() if not value]
         + ([] if inventory_blocker is None else [f"tile_inventory:{inventory_blocker}"]),
         "prepared": str(prepared_path),
+        "pair_controls": [pair_control_before, pair_control_after],
         "clean": clean,
+        "clean_samples": [clean, clean_repeat],
         "instrumented": instrumented,
         "tile_inventory": tile_inventory,
         "openmm_admission": admission,
         "checks": checks,
         "diagnostics": diagnostics,
-        "memory": {
-            "max_rss_mb": max_rss_mb(),
-            "mlx_active_memory_bytes": _mlx_memory_value("get_active_memory"),
-            "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
-            "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
-        },
+        "memory": profile_memory,
     }
     return _write_runtime_payload(payload, out_path)
 
@@ -1060,6 +1445,11 @@ def main(argv: list[str] | None = None) -> None:
     runtime_parser.add_argument("--neighbor-check-interval", type=int, default=1)
     runtime_parser.add_argument("--sample-interval", type=int, default=None)
     runtime_parser.add_argument("--diagnostic-interval", type=int, default=None)
+    runtime_parser.add_argument(
+        "--neighbor-backend",
+        choices=sorted(_RUNTIME_NEIGHBOR_BACKENDS),
+        default="mlx_cell_tiles",
+    )
     runtime_parser.add_argument("--out", type=Path, required=True)
     profile_parser = commands.add_parser(
         "profile",
@@ -1102,6 +1492,7 @@ def main(argv: list[str] | None = None) -> None:
             neighbor_check_interval=args.neighbor_check_interval,
             sample_interval=args.sample_interval,
             diagnostic_interval=args.diagnostic_interval,
+            neighbor_backend=args.neighbor_backend,
             out=args.out,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))

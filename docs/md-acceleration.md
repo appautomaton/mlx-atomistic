@@ -27,29 +27,36 @@ existing force, constraint, and restart validation gates.
 - `mlx_cell_blocks` keeps the periodic cell/bin candidate search in a
   fixed-shape block representation. It remains available for fixed-shape
   consumers and historical benchmark reproduction.
+- `mlx_cell_tiles` spatially sorts atoms into eight-atom blocks, retains exact
+  cutoff-plus-skin membership masks over non-empty 8x8 tiles, and groups tiles
+  sharing a left block for the prepared orthorhombic PME force route. It keeps
+  compact pairs as a diagnostic oracle during this development stage.
 - `python_neighbor` means the Python/NumPy cell-list builder is included in the
   benchmark before MLX pair evaluation.
 - `auto` uses dense MLX when no pair list is supplied and the dense memory
   estimate fits the configured budget; otherwise it falls back to tiled MLX.
   For neighbor-list managers, `auto` selects `mlx_dense_pairs` for supported
   small systems and `mlx_cell_pairs` above the small-system limit. The
-  production PME runner explicitly selects `mlx_cell_pairs`.
+  charged-PME performance runner explicitly selects `mlx_cell_tiles`; general
+  neighbor managers retain the established pair-oriented `auto` behavior.
 
 ## Current Hot-Path Recommendation
 
 Measure with `python -m mlx_atomistic.benchmarks.md_acceleration --json` before
 changing a force path. The large-system neighbor emitter and recurring direct
-force path are now Metal-native. Production remains on compact explicit pairs.
-The first exact 8x8 atom-tile implementation was parity-correct but slower end
-to end and has been removed; it is evidence for a different future layout, not
-an alternate production backend.
+force path are now Metal-native. The first canonical-ID 8x8 atom-tile
+implementation was parity-correct but slower end to end and was removed. The
+later retained route instead creates blocks from spatial order and groups
+same-left tiles, while preserving canonical atom indices at force scatter.
 
 The current production path also uses specialized rigid-water/constraint
-kernels and one fused standard-bonded force dispatch. The next candidate is a
-spatially coherent direct-force layout that avoids both the global compact-pair
-scan and the rejected 8x8 tile route's padded-lane expansion. Further neighbor
-rebuild work is lower priority unless a fresh profile moves it above direct
-force evaluation.
+kernels and one fused standard-bonded force dispatch. The charged-PME
+development runner now selects spatial tiles inside its narrow supported
+envelope and fails its profile gate on a compact-pair fallback. General
+large-system execution remains pair-oriented until the tile envelope is
+broadened deliberately. The next performance work should reduce remaining
+direct atomics and host-controlled rebuild work rather than add another wrapper
+around the same 8x8 schedule.
 
 For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
 large-system route uses `mlx_cell_pairs`. The historical implementation used
@@ -182,14 +189,59 @@ A synchronized post-constraint profile assigned 35.91% of wall time to direct
 LJ plus screened Coulomb, 14.48% to the then-unfused bonded terms, 12.12% to
 neighbor update/rebuild, 8.53% to constraints, 7.36% to force aggregation,
 6.16% to diagnostics, 6.06% to reciprocal PME, and 4.34% to PME corrections.
-The fused bonded route addresses the second item. Direct nonbonded work is now
-the clear next target, but it needs a better work layout rather than another
-padded tile wrapper or more Python-loop cleanup.
+The fused bonded route addressed the second item. The next pass therefore
+changed the direct-space work layout instead of adding another Python-loop
+cleanup.
+
+### Retained spatial-direct increment
+
+The retained 2026-08-01 development candidate is structurally different from
+the rejected atom-tile experiment below. It builds spatially sorted eight-atom
+blocks, evaluates exact cutoff membership for each 8x8 block pair on Metal,
+and compacts only accepted tiles. Accepted tiles are sorted by their left block
+and scheduled in groups of up to four, allowing one threadgroup to reuse the
+left atom coordinates and parameters and to reduce its atomic force writes.
+Small cell-count and task metadata still cross the host boundary during a
+rebuild. The existing exact compact-pair inventory remains the correctness
+oracle.
+
+The same pass combines sparse PME exclusions, Coulomb exceptions, 1-4 terms,
+and LJ exceptions into one Metal force buffer. This is a force-only production
+optimization; diagnostic energy and component paths remain independently
+observable.
+
+| Bounded development check | Before | Retained candidate | Change |
+| --- | ---: | ---: | ---: |
+| Isolated direct-space force | 5.52227 ms | 3.79931 ms | 31.20% lower |
+| Sparse PME correction force | 0.568062 ms | 0.262083 ms | 53.86% lower |
+| Complete 75-step trajectory, median | 0.933094 s | 0.601954 s | 35.49% lower |
+
+The spatial inventory contains 60,502,167 exact pairs in 2,751,445 tiles, or
+176,092,480 padded lanes with 34.36% occupancy. Direct-force agreement with the
+compact-pair route was `6.32e-5 kJ/mol/A` RMS and `6.71e-4 kJ/mol/A` maximum;
+the fused correction comparison was `4.68e-5 kJ/mol/A` RMS and
+`3.05e-4 kJ/mol/A` maximum. The complete trajectory remained finite, reused
+its PME plan, ended below a `3.51e-5 A` maximum constraint residual, and peaked
+at 5.69 GB across the process tree with a passing late-memory plateau check.
+The current development representation intentionally retains the 484 MB exact
+pair array as a diagnostic oracle; tile geometry, topology masks, and that
+oracle total about 578 MB of persistent indexed state. Per-pair LJ scales are
+no longer constructed for an admitted tile route.
+
+The complete gate used the position-balanced order pairs, tiles, tiles, pairs.
+The pair samples were 1.045140 and 0.821048 seconds; the tile samples were
+0.577860 and 0.626048 seconds. This clears the 0.85-second development target,
+but the candidate does not replace the existing manifest-bound 1.003149-second
+MLX result or establish a new OpenMM ratio. The main remaining costs are
+direct-space work, neighbor update/rebuild, constraints, reciprocal PME, force
+aggregation, and Python-side launch orchestration.
 
 ### Rejected atom-tile result
 
-The 2026-07-31 atom-tile experiment tested the full route instead of assuming
-that a faster kernel would make the trajectory faster. Its isolated 8x8 Metal
+The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
+of assuming that a faster kernel would make the trajectory faster. Its tiles
+were derived from the compact-pair list, unlike the retained spatially built
+route above. Its isolated 8x8 Metal
 kernel reduced median direct-force latency from 0.005548 to 0.004257 seconds,
 a 30.33% win, and matched the explicit-pair force within the established
 float32 tolerance. Initial integration lost badly because tile construction
@@ -210,9 +262,9 @@ competitive.
 The conditional repeat and 750-step proof were not run because the first exact
 comparison was decisive and projected about 29.6 seconds for 750 steps, above
 both the retained complete result and the 16.8615-second stretch target. The
-tile kernel, production routing, experimental selector, and candidate-only
-metadata were removed. Exact compact-pair ownership remains as the verified
-production foundation.
+candidate tile kernel, production routing, experimental selector, and metadata
+were removed. Exact compact-pair ownership remains the verified correctness
+foundation for the later spatial route.
 
 A fresh synthetic orthorhombic parity ladder now validates this route at
 1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001

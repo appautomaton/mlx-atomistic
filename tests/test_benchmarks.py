@@ -1866,15 +1866,21 @@ def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
 
     def fake_runtime_payload(**kwargs):
         profiled = kwargs["runtime_profile"]
+        backend = kwargs["neighbor_backend"]
         return {
             "passed": True,
             "state": state,
             "neighbor": {"compact_pair_count": 24},
+            "timings": {
+                "measured_seconds": (
+                    1.0 if backend == "mlx_cell_pairs" else 0.8
+                )
+            },
             "route_profile": (
                 {
                     "reconciled": True,
                     "routes": {
-                        "direct_lj_screened_coulomb": {},
+                        "direct_spatial_tiles": {},
                         "reciprocal_pme": {},
                         "neighbor_update_rebuild": {},
                         "integration_thermostat": {},
@@ -1886,6 +1892,7 @@ def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
         }
 
     monkeypatch.setattr(charged_pme, "runtime_payload", fake_runtime_payload)
+    monkeypatch.setattr(charged_pme, "_mlx_memory_value", lambda _name: 1024)
     monkeypatch.setattr(
         charged_pme,
         "_profile_tile_inventory",
@@ -1893,6 +1900,15 @@ def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
             "exact_pair_count": 24,
             "reference_pair_count": 24,
             "pair_inventory_matches": True,
+            "force_rms_delta_kj_mol_angstrom": 1.0e-4,
+            "force_max_delta_kj_mol_angstrom": 1.0e-2,
+            "active_lane_fraction": 0.5,
+            "padded_lane_count": 64,
+            "estimated_persistent_bytes": 1024,
+            "direct_speedup_fraction": 0.3,
+            "correction_force_rms_delta_kj_mol_angstrom": 1.0e-4,
+            "correction_force_max_delta_kj_mol_angstrom": 1.0e-2,
+            "correction_speedup_fraction": 0.25,
         },
     )
 
@@ -1909,10 +1925,88 @@ def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
 
     assert payload["passed"] is True
     assert payload["checks"]["route_profile_reconciled"] is True
+    assert payload["checks"]["complete_wall_speedup"] is True
+    assert payload["checks"]["compact_pair_fallback_absent"] is True
+    assert payload["checks"]["tile_direct_latency_speedup"] is True
+    assert payload["checks"]["correction_latency_speedup"] is True
+    assert payload["diagnostics"]["complete_wall_speedup_fraction"] == pytest.approx(
+        0.2
+    )
     assert payload["diagnostics"]["tile_pair_inventory_matches"] is True
     assert payload["diagnostics"]["tile_pair_inventory_delta"] == 0
     assert payload["openmm_admission"]["status"] == "provisional"
     assert json.loads((tmp_path / "profile.json").read_text())["passed"] is True
+
+
+def test_charged_pme_profile_rejects_complete_regression_and_pair_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    state = {
+        "potential_energy_kj_mol": -10.0,
+        "kinetic_energy_kj_mol": 2.0,
+        "total_energy_kj_mol": -8.0,
+        "temperature_k": 300.0,
+        "constraint_max_error_angstrom": 1.0e-6,
+    }
+
+    def fake_runtime_payload(**kwargs):
+        backend = kwargs["neighbor_backend"]
+        profiled = kwargs["runtime_profile"]
+        return {
+            "passed": True,
+            "state": state,
+            "timings": {
+                "measured_seconds": 1.0 if backend == "mlx_cell_pairs" else 0.95
+            },
+            "route_profile": (
+                {
+                    "reconciled": True,
+                    "routes": {
+                        "direct_spatial_tiles": {},
+                        "direct_lj_screened_coulomb": {},
+                        "reciprocal_pme": {},
+                        "neighbor_update_rebuild": {},
+                        "integration_thermostat": {},
+                    },
+                }
+                if profiled
+                else {}
+            ),
+        }
+
+    monkeypatch.setattr(charged_pme, "runtime_payload", fake_runtime_payload)
+    monkeypatch.setattr(charged_pme, "_mlx_memory_value", lambda _name: 1024)
+    monkeypatch.setattr(
+        charged_pme,
+        "_profile_tile_inventory",
+        lambda *args, **kwargs: {
+            "exact_pair_count": 24,
+            "reference_pair_count": 24,
+            "pair_inventory_matches": True,
+            "force_rms_delta_kj_mol_angstrom": 1.0e-4,
+            "force_max_delta_kj_mol_angstrom": 1.0e-2,
+            "active_lane_fraction": 0.5,
+            "padded_lane_count": 64,
+            "estimated_persistent_bytes": 1024,
+            "direct_speedup_fraction": 0.35,
+            "correction_force_rms_delta_kj_mol_angstrom": 1.0e-4,
+            "correction_force_max_delta_kj_mol_angstrom": 1.0e-2,
+            "correction_speedup_fraction": 0.25,
+        },
+    )
+
+    payload = charged_pme.profile_payload(
+        prepared=tmp_path / "prepared",
+        warmups=1,
+        steps=2,
+        seed=17,
+        out=tmp_path / "profile.json",
+    )
+
+    assert payload["passed"] is False
+    assert "complete_wall_speedup" in payload["blockers"]
+    assert "compact_pair_fallback_absent" in payload["blockers"]
 
 
 def test_charged_pme_profile_resolves_new_report_schema(tmp_path):

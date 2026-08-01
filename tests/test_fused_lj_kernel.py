@@ -15,6 +15,7 @@ import pytest
 
 from mlx_atomistic.constraints import SettleWaterConstraints, _ShakeClusterConstraints
 from mlx_atomistic.core import Cell
+from mlx_atomistic.force_runtime import _PreparedForcePipeline
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import (
@@ -24,13 +25,20 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.metal_kernels import (
+    _prepared_parameterized_pme_direct_force_only,
+    _tile_parameterized_pme_direct_force_only,
     fused_lj_forces,
     fused_parameterized_pme_direct_components,
     fused_parameterized_pme_direct_force_only,
+    fused_sparse_pme_correction_forces,
     neighbor_pair_cutoff_mask,
     neighbor_pair_ordered_scatter,
 )
-from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
+from mlx_atomistic.neighbors import (
+    NeighborListManager,
+    NeighborTiles,
+    build_neighbor_list,
+)
 from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.topology import Topology
 
@@ -404,6 +412,14 @@ def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
         sort_pairs=True,
         backend="mlx_cell_pairs",
     )
+    tiled = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.0,
+        sort_pairs=True,
+        backend="mlx_cell_tiles",
+    )
 
     expected = np.asarray(oracle.pairs)
     observed = np.asarray(first.pairs)
@@ -413,9 +429,296 @@ def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
     }
     assert first.pair_count == len({tuple(pair) for pair in observed.tolist()})
     assert np.array_equal(np.asarray(sorted_pairs.pairs), expected)
+    assert np.array_equal(np.asarray(tiled.pairs), expected)
+    assert tiled.tiles is not None
+    assert np.array_equal(np.asarray(tiled.tiles.materialize_pairs()), expected)
+    assert tiled.tiles.force_group_starts is not None
+    assert tiled.tiles.force_group_counts is not None
     assert first.candidate_count is not None
     assert first.candidate_count >= first.pair_count
     assert first.compaction_backend == "metal_spatial_prefix_scan"
+    assert tiled.compaction_backend == "metal_spatial_tile_prefix_scan"
+
+
+@pytest.mark.gpu
+def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
+    """Device-built spatial tiles preserve membership, topology, and forces."""
+
+    rng = np.random.default_rng(41)
+    lattice = (
+        np.stack(np.meshgrid(np.arange(3), np.arange(3), np.arange(3)), axis=-1)
+        .reshape((-1, 3))
+        .astype(np.float32)
+    )
+    positions_np = 0.6 + 1.65 * lattice[:23]
+    positions_np += rng.uniform(-0.08, 0.08, size=positions_np.shape).astype(np.float32)
+    positions_np[0, 0] = 0.05
+    positions_np[-1, 0] = 8.95
+    positions = mx.array(positions_np, dtype=mx.float32)
+    cell = Cell.cubic(9.0)
+    pair_neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.6,
+        skin=0.35,
+        sort_pairs=True,
+        backend="mlx_cell_pairs",
+    )
+    tile_neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.6,
+        skin=0.35,
+        sort_pairs=True,
+        backend="mlx_cell_tiles",
+    )
+    assert tile_neighbors.tiles is not None
+    assert tile_neighbors.compaction_backend == "metal_spatial_tile_prefix_scan"
+    tile_blocks = np.asarray(tile_neighbors.tiles.tile_blocks)
+    group_starts = np.asarray(tile_neighbors.tiles.force_group_starts)
+    group_counts = np.asarray(tile_neighbors.tiles.force_group_counts)
+    group_ends = group_starts + group_counts
+    assert np.all(tile_blocks[1:, 0] >= tile_blocks[:-1, 0])
+    assert group_starts[0] == 0
+    assert np.all(group_starts[1:] == group_ends[:-1])
+    assert group_ends[-1] == tile_neighbors.tiles.tile_count
+    assert np.all(group_counts >= 1)
+    assert np.all(group_counts <= 4)
+    assert np.all(tile_blocks[group_starts, 0] == tile_blocks[group_ends - 1, 0])
+    np.testing.assert_array_equal(
+        np.asarray(tile_neighbors.diagnostic_pairs),
+        np.asarray(pair_neighbors.diagnostic_pairs),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(tile_neighbors.tiles.materialize_pairs()),
+        np.asarray(pair_neighbors.diagnostic_pairs),
+    )
+
+    sigma = rng.uniform(0.85, 1.15, size=23).astype(np.float32)
+    epsilon = rng.uniform(0.1, 0.35, size=23).astype(np.float32)
+    charges = rng.uniform(-0.45, 0.45, size=23).astype(np.float32)
+    charges -= np.mean(charges, dtype=np.float32)
+    topology = Topology.from_sequences(
+        n_atoms=23,
+        bonds=[(0, 1), (5, 6), (12, 13)],
+        one_four_pairs=[(0, 4), (5, 9)],
+        eager_nonbonded_pair_limit=0,
+    )
+    potential = NonbondedPotential(
+        sigma=sigma,
+        epsilon=epsilon,
+        charges=charges,
+        cutoff=2.6,
+        lj_shift=True,
+        switch_distance=2.1,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.34,
+            real_cutoff=2.6,
+        ),
+        topology=topology,
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.75,
+        exception_pairs=[(1, 9)],
+        exception_charge_products=[0.025],
+        exception_sigma=[1.05],
+        exception_epsilon=[0.08],
+    ).bind_pme_plan(cell)
+    tile_binding = potential._prepare_tile_force_binding(
+        cell,
+        tile_neighbors.diagnostic_pairs,
+        tile_neighbors.tiles,
+    )
+    assert tile_binding is not NotImplemented
+    assert tile_binding.tile_decline_reason is None
+    assert tile_binding.aligned_lj_scales is None
+    pair_binding = potential._prepare_force_binding(
+        cell,
+        pair_neighbors.diagnostic_pairs,
+    )
+    assert pair_binding is not NotImplemented
+
+    tile_direct = potential._direct_forces_from_binding(positions, tile_binding)
+    pair_direct = potential._direct_forces_from_binding(positions, pair_binding)
+    fused_corrections = potential._prepared_sparse_correction_forces(
+        positions,
+        tile_binding,
+    )
+    reference_corrections = potential._exception_lj_forces(
+        positions,
+        cell,
+    ) + potential._periodic_coulomb_correction_forces(
+        positions,
+        cell,
+    )
+    tile_full = potential._forces_from_binding(positions, tile_binding)
+    pair_full = potential._forces_from_binding(positions, pair_binding)
+    pipeline = _PreparedForcePipeline.prepare((potential,), cell=cell)
+    routed_forces = pipeline.bind(tile_neighbors).forces(positions)
+    mx.eval(
+        tile_direct,
+        pair_direct,
+        fused_corrections,
+        reference_corrections,
+        tile_full,
+        pair_full,
+        routed_forces,
+    )
+    np.testing.assert_allclose(
+        np.asarray(tile_direct),
+        np.asarray(pair_direct),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(tile_full),
+        np.asarray(pair_full),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fused_corrections),
+        np.asarray(reference_corrections),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(routed_forces),
+        np.asarray(pair_full),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+
+
+@pytest.mark.gpu
+def test_sparse_pme_correction_uses_reference_half_box_tie_convention():
+    """Sparse correction forces match Cell.minimum_image at exactly half a box."""
+
+    positions = mx.array([[3.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=mx.float32)
+    pairs = mx.array([[0, 1]], dtype=mx.int32)
+    cell = Cell.cubic(6.0)
+    box_lengths = mx.diag(cell.matrix)
+    box = mx.concatenate((box_lengths, 1.0 / box_lengths))
+    observed = fused_sparse_pme_correction_forces(
+        positions,
+        pairs,
+        box,
+        mx.array([1.0], dtype=mx.float32),
+        mx.array([0.0], dtype=mx.float32),
+        mx.array([0.0], dtype=mx.float32),
+        coulomb_constant=1.0,
+    )
+    displacement = cell.minimum_image(positions[0] - positions[1])
+    expected_force = displacement / mx.power(mx.sum(displacement * displacement), 1.5)
+    expected = mx.stack((expected_force, -expected_force))
+    mx.eval(observed, expected)
+    np.testing.assert_allclose(np.asarray(observed), np.asarray(expected), rtol=1e-6)
+
+
+@pytest.mark.gpu
+def test_direct_plus_sparse_correction_matches_reference_at_half_box():
+    """Pair and tile PME force sums share Cell's exact half-box convention."""
+
+    positions = mx.array([[3.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=mx.float32)
+    pairs = mx.array([[0, 1]], dtype=mx.int32)
+    cell = Cell.cubic(6.0)
+    box_lengths = mx.diag(cell.matrix)
+    box = mx.concatenate((box_lengths, 1.0 / box_lengths))
+    charges = mx.array([1.0, -1.0], dtype=mx.float32)
+    alpha = 0.35
+    direct = fused_parameterized_pme_direct_force_only(
+        positions,
+        pairs,
+        box_lengths,
+        mx.ones((2,), dtype=mx.float32),
+        mx.zeros((2,), dtype=mx.float32),
+        charges,
+        mx.zeros((1,), dtype=mx.float32),
+        cutoff=3.1,
+        shift=False,
+        switch_distance=None,
+        coulomb_constant=1.0,
+        alpha=alpha,
+    )
+    prepared_direct = _prepared_parameterized_pme_direct_force_only(
+        positions,
+        pairs,
+        box,
+        mx.full((2,), 0.5, dtype=mx.float32),
+        mx.zeros((2,), dtype=mx.float32),
+        charges,
+        mx.zeros((1,), dtype=mx.float32),
+        cutoff=3.1,
+        shift=False,
+        switch_distance=None,
+        coulomb_constant=1.0,
+        alpha=alpha,
+    )
+    tile_direct = _tile_parameterized_pme_direct_force_only(
+        positions,
+        mx.array([[0, 1, -1, -1, -1, -1, -1, -1]], dtype=mx.int32),
+        mx.array([[0, 0]], dtype=mx.int32),
+        mx.array([[2, 0]], dtype=mx.uint32),
+        mx.zeros((1, 2), dtype=mx.uint32),
+        mx.zeros((1, 2), dtype=mx.uint32),
+        mx.array([0], dtype=mx.int32),
+        mx.array([1], dtype=mx.int32),
+        box,
+        mx.full((2,), 0.5, dtype=mx.float32),
+        mx.zeros((2,), dtype=mx.float32),
+        charges,
+        cutoff=3.1,
+        shift=False,
+        switch_distance=None,
+        one_four_scale=0.5,
+        coulomb_constant=1.0,
+        alpha=alpha,
+    )
+    correction = fused_sparse_pme_correction_forces(
+        positions,
+        pairs,
+        box,
+        mx.array([1.0], dtype=mx.float32),
+        mx.array([0.0], dtype=mx.float32),
+        mx.array([0.0], dtype=mx.float32),
+        coulomb_constant=1.0,
+    )
+
+    displacement = cell.minimum_image(positions[0] - positions[1])
+    r2 = mx.sum(displacement * displacement)
+    distance = mx.sqrt(r2)
+    erfc_term = 1.0 - mx.erf(alpha * distance)
+    direct_scalar = -(
+        erfc_term / (r2 * distance)
+        + (2.0 * alpha / np.sqrt(np.pi)) * mx.exp(-(alpha * alpha) * r2) / r2
+    )
+    correction_scalar = 1.0 / (r2 * distance)
+    expected_atom = (direct_scalar + correction_scalar) * displacement
+    expected = mx.stack((expected_atom, -expected_atom))
+    observed = [value + correction for value in (direct, prepared_direct, tile_direct)]
+    mx.eval(expected, *observed)
+    for value in observed:
+        np.testing.assert_allclose(np.asarray(value), np.asarray(expected), rtol=2e-6)
+
+
+@pytest.mark.gpu
+def test_neighbor_tiles_reject_invalid_force_group_schedule():
+    """Tile geometry rejects schedules that mix different left blocks."""
+
+    with pytest.raises(ValueError, match="same-left"):
+        NeighborTiles(
+            atom_blocks=mx.array(
+                [[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]],
+                dtype=mx.int32,
+            ),
+            tile_blocks=mx.array([[0, 0], [1, 1]], dtype=mx.int32),
+            member_mask=mx.array([[1, 0], [1, 0]], dtype=mx.uint32),
+            exact_pair_count=2,
+            raw_candidate_count=2,
+            force_group_starts=mx.array([0], dtype=mx.int32),
+            force_group_counts=mx.array([2], dtype=mx.int32),
+        )
 
 
 @pytest.mark.gpu

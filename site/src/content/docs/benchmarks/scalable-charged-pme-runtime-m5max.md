@@ -202,6 +202,37 @@ The older **[runtime]** row correctly retains `openmm_ratio: null` because its
 original artifact predates this stronger manifest; historical evidence is not
 rewritten retroactively.
 
+## Spatial-direct development update
+
+A later bounded pass changed the recurring Metal work layout without changing
+the admitted workload or physics. It builds exact-cutoff 8x8 tiles from
+spatially sorted atom blocks, groups up to four tiles sharing a left block, and
+reuses that block while locally reducing force writes. A second kernel fuses
+sparse PME exclusions, Coulomb exceptions, 1-4 corrections, and LJ exceptions
+into one force buffer.
+
+| Development check | Existing route | Spatial/fused route | Change |
+| --- | ---: | ---: | ---: |
+| Direct-space force | 5.52227 ms | 3.79931 ms | 31.20% lower |
+| Sparse PME corrections | 0.568062 ms | 0.262083 ms | 53.86% lower |
+| Complete 75-step trajectory, median | 0.933094 s | 0.601954 s | 35.49% lower |
+
+The tile inventory reproduced all 60,502,167 compact pairs. Direct-force error
+was `6.32e-5 kJ/mol/A` RMS and `6.71e-4 kJ/mol/A` maximum; correction-force
+error was `4.68e-5 kJ/mol/A` RMS and `3.05e-4 kJ/mol/A` maximum. The complete
+run stayed finite, ended below a `3.51e-5 A` maximum constraint residual, and
+peaked at 5.69 GB across the process tree with a passing late-memory plateau
+check. The dual development representation reports 578 MB of persistent tile,
+topology-mask, and diagnostic-pair state; admitted tiles no longer allocate the
+additional per-pair LJ-scale array.
+
+This is development evidence, not a replacement for the manifest-bound
+1.003149-second MLX result or its `9.7586x` OpenMM ratio above. The bounded gate
+used the position-balanced order pairs, tiles, tiles, pairs; pair samples were
+1.045140 and 0.821048 seconds, while tile samples were 0.577860 and 0.626048
+seconds. This clears the 0.85-second development target, but no new cross-engine
+ratio is claimed without a fresh manifest-bound OpenMM comparison.
+
 ## Reproduce
 
 ```bash
