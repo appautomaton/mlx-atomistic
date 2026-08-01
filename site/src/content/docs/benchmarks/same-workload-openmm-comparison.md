@@ -19,7 +19,7 @@ performance ratios.
 | `tip4p-ew-water` | `comparable` | 6.0068 ms/eval | 0.0003339 ms/eval | 0.00005558 OpenMM/MLX latency | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-phase3-controlled.json`; `results/same-workload-openmm-comparison/openmm-tip4p-ew-water.json` |
 | `dhfr-implicit` | `comparable` | 0.3095 ns/day | 1.3136 ns/day | 4.2447 OpenMM/MLX throughput | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
 | `dhfr-explicit-pme` | `parity-passed; runtime diagnostic` | 0.047433 ns/day for one MLX step; fixed-coordinate parity passed | matching fixed-coordinate OpenMM OpenCL energy/forces; historical 752.5 ns/day remains context only | none | `results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json`; `results/scalable-charged-pme-runtime/jac-1x/charged_pme_parity_report.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
-| `jac-charged-pme-94k` | `parity-passed; runtime diagnostic` | 0.041907 ns/day for the two-step MLX gate | matching fixed-coordinate OpenMM OpenCL energy/forces; no matching NVT runtime row | none | `results/scalable-charged-pme-runtime/jac-2x2x1/charged_pme_parity_report.json`; `results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json`; `results/scalable-charged-pme-runtime/jac-2x2x1/profile/pme-profile.json`; [`scalable-charged-pme-runtime-m5max.md`](./scalable-charged-pme-runtime-m5max.md) |
+| `jac-charged-pme-94k` | `comparable` | 1.004613 s/75 steps | 0.102947 s/75 steps, OpenCL single precision | 9.7586 MLX/OpenMM latency | matched artifacts under `results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/`; fixed-coordinate parity under `results/scalable-charged-pme-runtime/jac-2x2x1/`; [`scalable-charged-pme-runtime-m5max.md`](./scalable-charged-pme-runtime-m5max.md) |
 
 ## Interpretation
 
@@ -72,10 +72,12 @@ different operation families, so the runtime timing does not inherit a ratio
 from the parity result or from the historical OpenMM OpenCL benchmark.
 
 `jac-charged-pme-94k` extends the same manifest-matched parity contract to the
-94,232-atom 2x2x1 JAC supercell and adds a bounded MLX NVT/profile row. Energy
-and complete-force comparison is valid because the manifests match. Throughput
-remains diagnostic because the OpenMM side does not provide the same NVT
-operation, step count, timing schema, and PME runtime manifest.
+94,232-atom 2x2x1 JAC supercell. The later 75-step run also matches the NVT
+operation, timestep, thermostat, constraints, PME configuration, warmup and
+measurement counts, precision, and timing boundary. Its `9.7586x` MLX/OpenMM
+latency ratio is therefore comparable for this exact Apple M5 Max protocol.
+Independent random streams mean the trajectories are statistically, not
+pathwise, comparable.
 
 ## Reproducer
 
@@ -94,6 +96,8 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with openmm python scripts/run
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 2,2,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-2x2x1
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.charged_pme runtime --prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --warmups 1 --steps 2 --out results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.pme_performance --fixture-dir results/scalable-charged-pme-runtime/jac-2x2x1 --iterations 2 --warmups 1 --out-dir results/scalable-charged-pme-runtime/jac-2x2x1/profile --json
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-sync python -m mlx_atomistic.benchmarks.charged_pme runtime --prepared results/larger-system-scaling/jac-2x2x1-modern/prepared --warmups 10 --steps 75 --seed 17 --out results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/mlx_runtime.json
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-sync python scripts/run_openmm_charged_pme_runtime.py --mlx-prepared results/larger-system-scaling/jac-2x2x1-modern/prepared --mlx-runtime results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/mlx_runtime.json --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 2,2,1 --platform OpenCL --precision single --warmups 10 --steps 75 --out results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2
 ```
 
 Comparison summary:

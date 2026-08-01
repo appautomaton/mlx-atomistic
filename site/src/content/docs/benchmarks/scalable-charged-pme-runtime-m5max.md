@@ -3,12 +3,14 @@ title: "Scalable Charged PME Runtime (M5 Max)"
 ---
 
 
-Date: 2026-07-15
+Date: 2026-07-15; runtime comparison updated 2026-08-01
 
 Status: `validated-envelope`. The MLX/Metal product runtime passed independent
 OpenMM energy/force parity and a bounded fixed-cell NVT gate for the charged
 94,232-atom AMBER20 JAC 2x2x1 supercell. This is the validated workload; it is
-not a GPCRmd membrane run or a general PME production certification.
+not a GPCRmd membrane run or a general PME production certification. A later
+manifest-bound 75-step MLX/OpenMM run established a `9.7586x` throughput ratio
+for this exact workload.
 
 ## Raw evidence
 
@@ -21,6 +23,8 @@ files:
   `results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json`
 - **[profile]**
   `results/scalable-charged-pme-runtime/jac-2x2x1/profile/pme-profile.json`
+- **[matched runtime]**
+  `results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/`
 
 The complete force arrays are stored at
 `results/scalable-charged-pme-runtime/jac-2x2x1/complete_force_comparison.npz`,
@@ -169,14 +173,34 @@ real-space reference was intentionally disabled above `4096` atoms; the
 validated direct path used shared `mlx_cell_blocks` with no fallback.
 **[profile]**
 
-## Comparison status
+## Matched NVT performance update
 
-Energy and complete-force parity are valid same-workload comparisons because
-the fixed-coordinate manifests matched. No OpenMM/MLX NVT throughput ratio is
-reported: **[runtime]** records `openmm_ratio: null` and
-`not_reported_without_matching_runtime_manifest`. Existing OpenMM DHFR and
-ApoA1 throughput reports use different systems or runtime schemas and are
-reference context only.
+The 2026-08-01 comparison closes the earlier runtime-manifest blocker without
+changing the physics. Both engines used 94,232 atoms, the same force-term and
+constraint inventory, fixed orthorhombic cell, 9 A cutoff, alpha 0.35 A^-1,
+128x128x64 PME mesh, 4 fs Langevin-middle steps at 300 K and 1/ps friction,
+ten warmups, 75 measured steps, and single-precision GPU execution. Explicit
+final-state/device completion is inside both timers; setup, warmup, and I/O are
+outside.
+
+| Engine | Accelerator | 75 steps | Time per step | Process-tree peak |
+| --- | --- | ---: | ---: | ---: |
+| MLX | Metal, Apple M5 Max | 1.004613 s | 0.013395 s | 3.86 GB |
+| OpenMM | OpenCL, Apple M5 Max | 0.102947 s | 0.001373 s | 0.401 GB |
+
+The admitted ratio is `MLX/OpenMM = 9.7586x`, which narrowly passes the
+one-order-of-magnitude stretch target for this named workload. The two final
+MLX samples were 1.001684 and 1.004613 seconds, giving a 1.003149-second median.
+The retained pipeline is 36.9% faster than its corrected 1.588653-second
+control. The final MLX maximum constraint residual was `3.21e-5 A`; OpenMM's
+was `1.19e-5 A`. Both states were finite.
+
+The comparison manifest and static admission report pass every required field.
+The engines use independent random-number implementations, so the comparison
+claims matched protocol throughput, not identical stochastic trajectories.
+The older **[runtime]** row correctly retains `openmm_ratio: null` because its
+original artifact predates this stronger manifest; historical evidence is not
+rewritten retroactively.
 
 ## Reproduce
 
@@ -202,6 +226,21 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python \
   --warmups 1 --steps 2 \
   --out results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json
 
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-sync python \
+  -m mlx_atomistic.benchmarks.charged_pme runtime \
+  --prepared results/larger-system-scaling/jac-2x2x1-modern/prepared \
+  --warmups 10 --steps 75 --seed 17 \
+  --out results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/mlx_runtime.json
+
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-sync python \
+  scripts/run_openmm_charged_pme_runtime.py \
+  --mlx-prepared results/larger-system-scaling/jac-2x2x1-modern/prepared \
+  --mlx-runtime results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/mlx_runtime.json \
+  --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop \
+  --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd \
+  --replicas 2,2,1 --platform OpenCL --precision single \
+  --warmups 10 --steps 75 --out results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2
+
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python \
   -m mlx_atomistic.benchmarks.pme_performance \
   --fixture-dir results/scalable-charged-pme-runtime/jac-2x2x1 \
@@ -217,12 +256,13 @@ platforms produce a blocked result rather than a synthetic pass.
 
 - Validated: this charged AMBER20 JAC 2x2x1 workload, fixed orthorhombic cell,
   94,232 atoms, 128x128x64 mesh, order-5 assignment, 9 A cutoff, and explicit
-  uniform neutralizing plasma.
+  uniform neutralizing plasma. The 75-step matched NVT comparison also supports
+  a descriptive `9.7586x` MLX/OpenMM ratio for this exact protocol and host.
 - Admitted but not broadly certified: fixed-cell orthorhombic PME up to the
   runtime checks of 100,000 atoms and 1,048,576 mesh points when all other
   configuration checks pass.
 - Not claimed by this JAC row: the separately measured GPCRmd membrane result,
   production NPT or cell changes, analytic PME virial, triclinic PME, universal
-  charged-system coverage, a long stability trajectory, or an OpenMM
-  throughput ratio. The bounded GPCRmd result is documented independently in
+  charged-system coverage, a long stability trajectory, or a general OpenMM
+  throughput claim. The bounded GPCRmd result is documented independently in
   [`gpcrmd-729-pme-runtime-m5max.md`](./gpcrmd-729-pme-runtime-m5max.md).
