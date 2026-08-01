@@ -1,5 +1,7 @@
+from dataclasses import replace
 from math import pi
 
+import mlx.core as mx
 import numpy as np
 import pytest
 
@@ -8,6 +10,7 @@ from mlx_atomistic import PMEConfig as ExportedPMEConfig
 from mlx_atomistic import PMEExecutionPlan as ExportedPMEExecutionPlan
 from mlx_atomistic import RBDihedralPotential as ExportedRBDihedralPotential
 from mlx_atomistic.core import Cell
+from mlx_atomistic.force_runtime import _PreparedForcePipeline
 from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
@@ -758,6 +761,16 @@ def test_nonbonded_pme_refuses_non_finite_coulomb_constant_and_config_fields():
     else:
         raise AssertionError("PME nonbonded accepted invalid pme_config.charge_tolerance")
 
+    with pytest.raises(ValueError, match="charges must be finite"):
+        NonbondedPotential(
+            **{**valid_kwargs, "charges": [1.0, np.nan]},
+            pme_config=PMEConfig(
+                mesh_shape=(16, 16, 16),
+                alpha=0.35,
+                real_cutoff=5.0,
+            ),
+        )
+
 
 def test_nonbonded_pme_matches_standalone_pme_without_lj():
     positions = np.array(
@@ -1072,6 +1085,167 @@ def test_nonbonded_pair_scale_cache_keeps_provider_identity(
         np.asarray(expected_forces),
         atol=1e-6,
     )
+
+
+def test_nonbonded_tile_binding_owns_topology_masks_and_compact_fallback(
+    monkeypatch,
+):
+    positions = np.asarray(
+        [
+            [0.2, 0.2, 0.2],
+            [1.0, 0.2, 0.2],
+            [1.8, 0.2, 0.2],
+            [2.6, 0.2, 0.2],
+        ],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(12.0)
+    topology = Topology.from_sequences(
+        n_atoms=4,
+        bonds=[(0, 1)],
+        dihedrals=[(0, 1, 2, 3)],
+        exclude_bonds=True,
+        eager_nonbonded_pair_limit=0,
+    )
+    term = NonbondedPotential(
+        sigma=[1.0, 1.1, 1.2, 1.3],
+        epsilon=[0.2, 0.2, 0.2, 0.2],
+        charges=[0.2, -0.2, 0.1, -0.1],
+        topology=topology,
+        lj_one_four_scale=0.5,
+        exception_pairs=[(1, 2)],
+        exception_charge_products=[0.0],
+        exception_sigma=[0.0],
+        exception_epsilon=[0.0],
+        cutoff=4.0,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=4.0,
+        ),
+    ).bind_pme_plan(cell)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=4.0,
+        skin=0.2,
+        backend="mlx_cell_tiles",
+    )
+    tiles = neighbors.tiles
+    assert tiles is not None
+
+    binding = term._prepare_tile_force_binding(
+        cell,
+        neighbors.diagnostic_pairs,
+        tiles,
+    )
+
+    assert binding is not NotImplemented
+    assert binding.pairs is neighbors.diagnostic_pairs
+    assert binding.tile_geometry is tiles
+    assert binding.tile_decline_reason is not None
+    enabled_words = np.asarray(binding.tile_lj_enabled_mask, dtype=np.uint32)
+    one_four_words = np.asarray(binding.tile_lj_one_four_mask, dtype=np.uint32)
+    enabled = []
+    one_four = []
+    for tile_index, words in enumerate(np.asarray(tiles.member_mask, dtype=np.uint32)):
+        for lane in tiles._active_lanes(words):
+            word, bit = divmod(lane, 32)
+            enabled.append(bool((enabled_words[tile_index, word] >> bit) & 1))
+            one_four.append(bool((one_four_words[tile_index, word] >> bit) & 1))
+    lane_pairs = np.asarray(tiles.materialize_pairs(sort=False))
+    lane_scales = np.where(
+        enabled,
+        np.where(one_four, term.lj_one_four_scale, 1.0),
+        0.0,
+    )
+    expected_pairs = np.asarray(neighbors.diagnostic_pairs)
+    expected_scales = np.asarray(
+        term._compact_aligned_lj_scales(neighbors.diagnostic_pairs),
+    )
+    lane_by_pair = {
+        tuple(pair): scale for pair, scale in zip(lane_pairs, lane_scales, strict=True)
+    }
+    np.testing.assert_allclose(
+        np.asarray([lane_by_pair[tuple(pair)] for pair in expected_pairs]),
+        expected_scales,
+    )
+
+    pipeline = _PreparedForcePipeline.prepare((term,), cell=cell)
+    prepared = pipeline.bind(neighbors)
+    assert prepared.term_bindings[0] is binding
+    fallback_forces = prepared.forces(mx.array(positions, dtype=mx.float32))
+    expected_forces = term.energy_forces(
+        positions,
+        cell,
+        pairs=neighbors.diagnostic_pairs,
+    )[1]
+    np.testing.assert_allclose(
+        np.asarray(fallback_forces),
+        np.asarray(expected_forces),
+        atol=1.0e-6,
+    )
+    assert pipeline.bind(neighbors) is prepared
+
+    assert (
+        term._prepare_tile_force_binding(
+            cell,
+            neighbors.diagnostic_pairs,
+            tiles,
+        )
+        is binding
+    )
+    replacement = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=4.0,
+        skin=0.2,
+        backend="mlx_cell_tiles",
+    )
+    replacement_binding = term._prepare_tile_force_binding(
+        cell,
+        replacement.diagnostic_pairs,
+        replacement.tiles,
+    )
+    assert replacement_binding is not binding
+    assert term._force_binding_cache is replacement_binding
+
+    monkeypatch.setattr(
+        forcefields_module.mx,
+        "default_device",
+        lambda: "test-alternate-device",
+    )
+    object.__setattr__(term, "pme_plan", term.build_pme_plan(cell))
+    device_binding = pipeline.bind(neighbors)
+    assert device_binding is not prepared
+    assert device_binding.term_bindings[0] is not binding
+
+    object.__setattr__(term, "sigma", term.sigma.astype(mx.float16))
+    dtype_binding = pipeline.bind(neighbors)
+    assert dtype_binding is not device_binding
+    assert dtype_binding.term_bindings[0] is not device_binding.term_bindings[0]
+
+    generation_tiles = replace(tiles, generation=tiles.generation + 1)
+    generation_binding = term._prepare_tile_force_binding(
+        cell,
+        neighbors.diagnostic_pairs,
+        generation_tiles,
+    )
+    assert generation_binding is not dtype_binding.term_bindings[0]
+    assert term._force_binding_cache is generation_binding
+    object.__setattr__(neighbors, "tiles", generation_tiles)
+    generation_pipeline_binding = pipeline.bind(neighbors)
+    assert generation_pipeline_binding is not dtype_binding
+    assert generation_pipeline_binding.term_bindings[0] is generation_binding
+    object.__setattr__(neighbors, "tiles", tiles)
+
+    replacement_cell = Cell.cubic(13.0)
+    object.__setattr__(term, "pme_plan", term.build_pme_plan(replacement_cell))
+    pipeline.cell = replacement_cell
+    cell_binding = pipeline.bind(neighbors)
+    assert cell_binding is not dtype_binding
+    assert cell_binding.term_bindings[0] is not generation_binding
 
 
 def test_nonbonded_pme_fails_closed_for_unsafe_shared_direct_space_policy():

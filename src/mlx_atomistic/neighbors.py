@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from itertools import product
 from time import perf_counter
 from typing import Literal
@@ -30,6 +31,7 @@ NeighborBackend = Literal[
     "mlx_dense_pairs",
     "mlx_cell_pairs",
     "mlx_cell_blocks",
+    "mlx_cell_tiles",
 ]
 NeighborCheckBackend = Literal["numpy", "mlx_scalar"]
 _ALLOWED_NEIGHBOR_BACKENDS = {
@@ -38,6 +40,7 @@ _ALLOWED_NEIGHBOR_BACKENDS = {
     "mlx_dense_pairs",
     "mlx_cell_pairs",
     "mlx_cell_blocks",
+    "mlx_cell_tiles",
 }
 _ALLOWED_NEIGHBOR_CHECK_BACKENDS = {"numpy", "mlx_scalar"}
 DEFAULT_MLX_DENSE_PAIR_LIMIT = 4096
@@ -46,6 +49,8 @@ DEFAULT_MLX_SPATIAL_CANDIDATE_BATCH = 16_000_000
 DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION = 3
 DEFAULT_MLX_SPATIAL_MAX_CELLS_PER_ATOM = 4
 DEFAULT_MLX_CELL_BLOCK_SIZE = 256
+DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 8
+DEFAULT_MLX_CELL_TILE_BATCH = 65_536
 # Default neighbor backend for systems above the dense-pair limit. Measured on
 # M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
 # ("mlx_cell_pairs") beats the fixed-shape padded-block path ("mlx_cell_blocks")
@@ -143,6 +148,146 @@ class NeighborBlocks:
 
 
 @dataclass(frozen=True)
+class NeighborTiles:
+    """Exact Verlet membership encoded over fixed eight-atom block tiles.
+
+    The representation is geometry-only. Each bit in ``member_mask`` records
+    one pair that was inside ``cutoff + skin`` at rebuild time. Empty tiles are
+    omitted, and materializing explicit pairs is an opt-in diagnostic action.
+    """
+
+    atom_blocks: mx.array
+    tile_blocks: mx.array
+    member_mask: mx.array
+    exact_pair_count: int
+    raw_candidate_count: int
+    generation: int = 0
+    block_size: int = DEFAULT_MLX_CELL_TILE_BLOCK_SIZE
+
+    def __post_init__(self) -> None:
+        if self.block_size != DEFAULT_MLX_CELL_TILE_BLOCK_SIZE:
+            msg = (
+                "NeighborTiles require the fixed atom block size "
+                f"{DEFAULT_MLX_CELL_TILE_BLOCK_SIZE}"
+            )
+            raise ValueError(msg)
+        if self.atom_blocks.ndim != 2 or self.atom_blocks.shape[1] != self.block_size:
+            msg = "atom_blocks must have shape (n_blocks, block_size)"
+            raise ValueError(msg)
+        if self.tile_blocks.ndim != 2 or self.tile_blocks.shape[1] != 2:
+            msg = "tile_blocks must have shape (n_tiles, 2)"
+            raise ValueError(msg)
+        if self.member_mask.shape != (self.tile_count, self.mask_word_count):
+            msg = "member_mask must contain one bit per tile lane"
+            raise ValueError(msg)
+        if self.atom_blocks.dtype != mx.int32 or self.tile_blocks.dtype != mx.int32:
+            msg = "atom_blocks and tile_blocks must use int32 indices"
+            raise ValueError(msg)
+        if self.member_mask.dtype != mx.uint32:
+            msg = "member_mask must use uint32 words"
+            raise ValueError(msg)
+        if self.exact_pair_count < 0 or self.exact_pair_count > self.padded_lane_count:
+            msg = "exact_pair_count must fit within padded tile lanes"
+            raise ValueError(msg)
+        if self.raw_candidate_count < self.exact_pair_count:
+            msg = "raw_candidate_count must include every exact Verlet pair"
+            raise ValueError(msg)
+        if self.generation < 0:
+            msg = "generation must be non-negative"
+            raise ValueError(msg)
+
+    @property
+    def block_count(self) -> int:
+        """Number of fixed-width atom blocks."""
+
+        return int(self.atom_blocks.shape[0])
+
+    @property
+    def tile_count(self) -> int:
+        """Number of retained non-empty block-pair tiles."""
+
+        return int(self.tile_blocks.shape[0])
+
+    @property
+    def lanes_per_tile(self) -> int:
+        """Number of atom-pair lanes in one padded tile."""
+
+        return self.block_size * self.block_size
+
+    @property
+    def mask_word_count(self) -> int:
+        """Number of 32-bit membership words stored for each tile."""
+
+        return (self.lanes_per_tile + 31) // 32
+
+    @property
+    def padded_lane_count(self) -> int:
+        """Number of scheduled tile lanes including inactive padding."""
+
+        return self.tile_count * self.lanes_per_tile
+
+    @property
+    def padding_waste_count(self) -> int:
+        """Number of scheduled lanes that are not exact Verlet members."""
+
+        return self.padded_lane_count - self.exact_pair_count
+
+    @property
+    def padding_waste_fraction(self) -> float:
+        """Fraction of scheduled tile lanes outside exact Verlet membership."""
+
+        if self.padded_lane_count == 0:
+            return 0.0
+        return self.padding_waste_count / self.padded_lane_count
+
+    @property
+    def estimated_bytes(self) -> int:
+        """Estimated persistent bytes for block, tile, and membership arrays."""
+
+        return int(
+            (self.atom_blocks.size + self.tile_blocks.size + self.member_mask.size)
+            * _INT_BYTES
+        )
+
+    def materialize_pairs(self, *, sort: bool = True) -> mx.array:
+        """Decode exact Verlet members for diagnostics and tests.
+
+        Args:
+            sort: Whether to return canonical lexicographic pair order.
+
+        Returns:
+            Exact unique atom pairs with shape ``(exact_pair_count, 2)``.
+        """
+
+        atom_blocks = np.asarray(self.atom_blocks, dtype=np.int32)
+        tile_blocks = np.asarray(self.tile_blocks, dtype=np.int32)
+        member_mask = np.asarray(self.member_mask, dtype=np.uint32)
+        pairs = np.empty((self.exact_pair_count, 2), dtype=np.int32)
+        output = 0
+        for tile_index, (left_block, right_block) in enumerate(tile_blocks):
+            for lane in self._active_lanes(member_mask[tile_index]):
+                left_slot, right_slot = divmod(lane, self.block_size)
+                left_atom = int(atom_blocks[left_block, left_slot])
+                right_atom = int(atom_blocks[right_block, right_slot])
+                pairs[output, 0] = min(left_atom, right_atom)
+                pairs[output, 1] = max(left_atom, right_atom)
+                output += 1
+        if sort and pairs.shape[0]:
+            order = np.lexsort((pairs[:, 1], pairs[:, 0]))
+            pairs = pairs[order]
+        return mx.array(pairs, dtype=mx.int32)
+
+    @staticmethod
+    def _active_lanes(mask_words: np.ndarray):
+        for word_index, raw_word in enumerate(mask_words):
+            word = int(raw_word)
+            while word:
+                bit = (word & -word).bit_length() - 1
+                yield word_index * 32 + bit
+                word &= word - 1
+
+
+@dataclass(frozen=True)
 class NeighborList:
     """Neighbor interactions for pairwise potentials."""
 
@@ -151,6 +296,24 @@ class NeighborList:
     skin: float = 0.0
     stats: PairListStats | None = None
     blocks: NeighborBlocks | None = None
+    tiles: NeighborTiles | None = None
+
+    def __post_init__(self) -> None:
+        if self.blocks is not None and self.tiles is not None:
+            msg = "a neighbor list may contain blocks or tiles, not both"
+            raise ValueError(msg)
+        if self.pairs.ndim != 2 or self.pairs.shape[1] != 2:
+            msg = "pairs must have shape (n_pairs, 2)"
+            raise ValueError(msg)
+        if self.pairs.dtype != mx.int32:
+            msg = "pairs must use int32 indices"
+            raise ValueError(msg)
+        if self.blocks is not None and self.blocks.compact_pair_count != self.pairs.shape[0]:
+            msg = "block compact_pair_count must match the diagnostic pairs"
+            raise ValueError(msg)
+        if self.tiles is not None and self.tiles.exact_pair_count != self.pairs.shape[0]:
+            msg = "tile exact_pair_count must match the diagnostic pairs"
+            raise ValueError(msg)
 
     @property
     def pair_count(self) -> int:
@@ -158,22 +321,49 @@ class NeighborList:
 
         if self.blocks is not None:
             return self.blocks.candidate_count
+        if self.tiles is not None:
+            return self.tiles.exact_pair_count
         return self.pairs.shape[0]
 
     @property
     def compact_pair_count(self) -> int:
         """Number of compact pairs accepted by the neighbor search radius."""
 
-        if self.blocks is not None:
-            return self.blocks.compact_pair_count
-        if self.stats is not None:
-            return self.stats.pair_count
         return int(self.pairs.shape[0])
 
     @property
-    def interactions(self) -> mx.array | NeighborBlocks:
+    def diagnostic_pairs(self) -> mx.array:
+        """Return the compact cutoff-plus-skin pairs for this generation."""
+
+        return self.pairs
+
+    def force_candidates(
+        self,
+        *,
+        prefer_tiles: bool,
+    ) -> mx.array | NeighborTiles:
+        """Select compact pairs or exact tiles for force binding.
+
+        Args:
+            prefer_tiles: Return exact tiles when they are present. Otherwise,
+                return the compact pair representation.
+
+        Returns:
+            Exact tiles only when requested and available, or compact pairs.
+        """
+
+        if prefer_tiles and self.tiles is not None:
+            return self.tiles
+        return self.diagnostic_pairs
+
+    @property
+    def interactions(self) -> mx.array | NeighborBlocks | NeighborTiles:
         """Return the active force-evaluation representation."""
 
+        # Keep the compatibility surface pair-oriented for exact tiles until a
+        # production tile force route is selected explicitly.
+        if self.tiles is not None:
+            return self.diagnostic_pairs
         return self.blocks if self.blocks is not None else self.pairs
 
     @property
@@ -187,7 +377,13 @@ class NeighborList:
         """Estimated bytes for the compact int32 pair array."""
 
         if self.blocks is not None:
-            return self.blocks.estimated_bytes
+            return self.blocks.estimated_bytes + estimate_pair_list_bytes(
+                self.compact_pair_count,
+            )
+        if self.tiles is not None:
+            return self.tiles.estimated_bytes + estimate_pair_list_bytes(
+                self.compact_pair_count,
+            )
         if self.stats is None:
             return int(self.pair_count) * 2 * np.dtype(np.int32).itemsize
         return self.stats.estimated_pair_bytes
@@ -405,7 +601,7 @@ class NeighborListManager:
 
         self._release_pending_metal_cache()
         start = perf_counter()
-        self.neighbor_list = build_neighbor_list(
+        neighbor_list = build_neighbor_list(
             positions,
             self.cell,
             cutoff=self.cutoff,
@@ -416,6 +612,15 @@ class NeighborListManager:
             max_mlx_dense_atoms=self.max_mlx_dense_atoms,
             block_size=self.block_size,
         )
+        if neighbor_list.tiles is not None:
+            neighbor_list = replace(
+                neighbor_list,
+                tiles=replace(
+                    neighbor_list.tiles,
+                    generation=self.rebuild_count + 1,
+                ),
+            )
+        self.neighbor_list = neighbor_list
         self.rebuild_wall_seconds += perf_counter() - start
         self.reference_positions = as_mx_array(positions)
         self.rebuild_count += 1
@@ -438,6 +643,43 @@ class NeighborListManager:
                 msg = "neighbor list manager has no current neighbor list"
                 raise RuntimeError(msg)
             return self.neighbor_list
+        finally:
+            self.update_wall_seconds += perf_counter() - start
+
+    def _admit_block(
+        self,
+        max_displacement: mx.array,
+        admissible: mx.array,
+    ) -> bool:
+        """Commit one device-measured integration block when its list stayed valid.
+
+        Args:
+            max_displacement: Maximum minimum-image displacement reached anywhere
+                in the proposed block.
+            admissible: Scalar boolean that is true only when every proposed
+                position was finite and stayed within the rebuild threshold.
+
+        Returns:
+            ``True`` when the current neighbor list safely covers the whole
+            block. ``False`` requests exact per-step replay from the block start.
+        """
+
+        start = perf_counter()
+        try:
+            mx.eval(max_displacement, admissible)
+            if not bool(np.asarray(admissible)):
+                return False
+            displacement = float(np.asarray(max_displacement))
+            if not np.isfinite(displacement):
+                return False
+            if displacement > self.rebuild_threshold:
+                return False
+            if self.neighbor_list is None or self.reference_positions is None:
+                msg = "neighbor list manager has no current neighbor list"
+                raise RuntimeError(msg)
+            self.last_max_displacement = displacement
+            self.updates_since_check = 0
+            return True
         finally:
             self.update_wall_seconds += perf_counter() - start
 
@@ -608,6 +850,15 @@ def build_neighbor_list(
             search_radius=search_radius,
             sort_pairs=sort_pairs,
             block_size=block_size,
+        )
+    if backend == "mlx_cell_tiles":
+        return _build_mlx_cell_tiles(
+            positions_np,
+            cell,
+            cutoff=cutoff,
+            skin=skin,
+            search_radius=search_radius,
+            sort_pairs=sort_pairs,
         )
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, backend)
     pair_array, stats = build_periodic_pair_list(
@@ -814,7 +1065,7 @@ def _build_mlx_cell_blocks(
         order = np.lexsort((candidate_pairs[:, 1], candidate_pairs[:, 0]))
         candidate_pairs = candidate_pairs[order]
 
-    compact_pair_count = _count_candidate_pairs_within_radius(
+    compact_pairs = _filter_candidate_pairs_within_radius(
         positions_np,
         cell,
         candidate_pairs,
@@ -823,7 +1074,7 @@ def _build_mlx_cell_blocks(
     blocks = _candidate_pairs_to_blocks(
         candidate_pairs,
         block_size=block_size,
-        compact_pair_count=compact_pair_count,
+        compact_pair_count=int(compact_pairs.shape[0]),
     )
     stats = PairListStats(
         pair_count=blocks.candidate_count,
@@ -831,7 +1082,10 @@ def _build_mlx_cell_blocks(
         cell_count=cell_list.cell_count,
         occupied_cell_count=cell_list.occupied_cell_count,
         search_radius=search_radius,
-        estimated_pair_bytes=blocks.estimated_bytes,
+        estimated_pair_bytes=(
+            blocks.estimated_bytes
+            + estimate_pair_list_bytes(int(compact_pairs.shape[0]))
+        ),
         estimated_cell_list_bytes=cell_list.estimated_bytes,
         backend="mlx_cell_blocks",
         representation_kind="blocks",
@@ -841,7 +1095,7 @@ def _build_mlx_cell_blocks(
         fallback_reason=None,
     )
     return NeighborList(
-        mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32),
+        mx.array(compact_pairs, dtype=mx.int32),
         cutoff=cutoff,
         skin=skin,
         stats=stats,
@@ -882,6 +1136,248 @@ def _candidate_pairs_to_blocks(
     )
 
 
+def _build_mlx_cell_tiles(
+    positions_np: np.ndarray,
+    cell: Cell,
+    *,
+    cutoff: float,
+    skin: float,
+    search_radius: float,
+    sort_pairs: bool,
+) -> NeighborList:
+    """Build exact cutoff-plus-skin membership over eight-atom block tiles."""
+
+    _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_tiles")
+    lengths = np.asarray(cell.lengths, dtype=np.float32)
+    if lengths.shape != (3,) or np.any(~np.isfinite(lengths)) or np.any(lengths <= 0.0):
+        msg = "cell lengths must be finite and positive"
+        raise ValueError(msg)
+
+    n_atoms = int(positions_np.shape[0])
+    n_cells_array = _bounded_spatial_grid(
+        lengths.astype(np.float64),
+        search_radius=search_radius,
+        subdivision=DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION,
+        n_atoms=n_atoms,
+    )
+    n_cells = tuple(int(value) for value in n_cells_array)
+    cell_count = int(np.prod(n_cells_array.astype(np.int64)))
+    cell_widths = lengths.astype(np.float64) / n_cells_array.astype(np.float64)
+    wrapped = positions_np - np.floor(positions_np / lengths) * lengths
+    indices = np.floor(wrapped / lengths * n_cells_array).astype(np.int32)
+    indices = np.minimum(indices, n_cells_array - 1)
+    cell_ids = (
+        (indices[:, 0] * n_cells[1] + indices[:, 1]) * n_cells[2]
+        + indices[:, 2]
+    )
+    sorted_atoms = np.argsort(cell_ids, kind="stable").astype(np.int32, copy=False)
+    cell_counts = np.bincount(cell_ids, minlength=cell_count).astype(np.int32)
+    cell_starts = np.empty_like(cell_counts)
+    if cell_count:
+        cell_starts[0] = 0
+        np.cumsum(cell_counts[:-1], dtype=np.int64, out=cell_starts[1:])
+
+    atom_block_rows: list[np.ndarray] = []
+    cell_block_ids: list[tuple[int, ...]] = [() for _ in range(cell_count)]
+    for cell_id in np.flatnonzero(cell_counts):
+        start = int(cell_starts[cell_id])
+        stop = start + int(cell_counts[cell_id])
+        members = sorted_atoms[start:stop]
+        block_ids: list[int] = []
+        for start in range(0, int(members.shape[0]), DEFAULT_MLX_CELL_TILE_BLOCK_SIZE):
+            block = np.full((DEFAULT_MLX_CELL_TILE_BLOCK_SIZE,), -1, dtype=np.int32)
+            chunk = members[start : start + DEFAULT_MLX_CELL_TILE_BLOCK_SIZE]
+            block[: chunk.shape[0]] = chunk
+            block_ids.append(len(atom_block_rows))
+            atom_block_rows.append(block)
+        cell_block_ids[int(cell_id)] = tuple(block_ids)
+
+    if atom_block_rows:
+        atom_blocks = np.stack(atom_block_rows, axis=0)
+    else:
+        atom_blocks = np.empty(
+            (0, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE),
+            dtype=np.int32,
+        )
+
+    task_left, task_right, _ = _spatial_cell_pair_tasks(
+        cell_counts,
+        n_cells,
+        cell_widths,
+        search_radius=search_radius,
+    )
+    candidate_tile_chunks: list[np.ndarray] = []
+    for left_cell, right_cell in zip(task_left, task_right, strict=True):
+        left_blocks = np.asarray(cell_block_ids[int(left_cell)], dtype=np.int32)
+        right_blocks = np.asarray(cell_block_ids[int(right_cell)], dtype=np.int32)
+        if int(left_cell) == int(right_cell):
+            left_index, right_index = np.triu_indices(left_blocks.shape[0])
+            tile_chunk = np.stack(
+                (left_blocks[left_index], right_blocks[right_index]),
+                axis=1,
+            )
+        else:
+            tile_chunk = np.stack(
+                (
+                    np.repeat(left_blocks, right_blocks.shape[0]),
+                    np.tile(right_blocks, left_blocks.shape[0]),
+                ),
+                axis=1,
+            )
+        if tile_chunk.shape[0]:
+            candidate_tile_chunks.append(tile_chunk.astype(np.int32, copy=False))
+    candidate_tiles = (
+        np.concatenate(candidate_tile_chunks, axis=0)
+        if candidate_tile_chunks
+        else np.empty((0, 2), dtype=np.int32)
+    )
+
+    search_radius2 = float(search_radius) * float(search_radius)
+    tile_rows: list[np.ndarray] = []
+    membership_rows: list[np.ndarray] = []
+    compact_pair_rows: list[np.ndarray] = []
+    raw_candidate_count = 0
+    peak_tile_candidate_count = 0
+    exact_pair_count = 0
+    upper_triangle = np.triu(
+        np.ones(
+            (DEFAULT_MLX_CELL_TILE_BLOCK_SIZE, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE),
+            dtype=np.bool_,
+        ),
+        k=1,
+    )
+    bit_weights = np.left_shift(
+        np.uint32(1),
+        np.arange(32, dtype=np.uint32),
+    )
+    positions_mx = (
+        mx.array(positions_np, dtype=mx.float32) if _uses_metal_device() else None
+    )
+    lengths_mx = (
+        mx.array(lengths, dtype=mx.float32) if positions_mx is not None else None
+    )
+    for batch_start in range(0, candidate_tiles.shape[0], DEFAULT_MLX_CELL_TILE_BATCH):
+        tile_batch = candidate_tiles[
+            batch_start : batch_start + DEFAULT_MLX_CELL_TILE_BATCH
+        ]
+        left_atoms = atom_blocks[tile_batch[:, 0]]
+        right_atoms = atom_blocks[tile_batch[:, 1]]
+        valid = (left_atoms[:, :, None] >= 0) & (right_atoms[:, None, :] >= 0)
+        same_block = tile_batch[:, 0] == tile_batch[:, 1]
+        valid[same_block] &= upper_triangle
+        candidates_per_tile = np.sum(valid, axis=(1, 2), dtype=np.int32)
+        raw_candidate_count += int(np.sum(candidates_per_tile, dtype=np.int64))
+        if candidates_per_tile.shape[0]:
+            peak_tile_candidate_count = max(
+                peak_tile_candidate_count,
+                int(np.max(candidates_per_tile)),
+            )
+
+        safe_left = np.maximum(left_atoms, 0)
+        safe_right = np.maximum(right_atoms, 0)
+        if positions_mx is None or lengths_mx is None:
+            displacement = (
+                positions_np[safe_left][:, :, None, :]
+                - positions_np[safe_right][:, None, :, :]
+            )
+            displacement -= lengths * np.round(displacement / lengths)
+            distance2 = np.sum(displacement * displacement, axis=-1)
+            close = distance2 < search_radius2
+        else:
+            lane_left = np.broadcast_to(safe_left[:, :, None], valid.shape)
+            lane_right = np.broadcast_to(safe_right[:, None, :], valid.shape)
+            close_mx = neighbor_pair_cutoff_mask(
+                positions_mx,
+                mx.array(lane_left.reshape(-1), dtype=mx.int32),
+                mx.array(lane_right.reshape(-1), dtype=mx.int32),
+                lengths_mx,
+                search_radius=search_radius,
+            )
+            mx.eval(close_mx)
+            close = np.asarray(close_mx).reshape(valid.shape)
+        member = valid & close
+        flat_member = member.reshape((-1, 64)).astype(np.uint32, copy=False)
+        mask_words = np.stack(
+            (
+                np.sum(flat_member[:, :32] * bit_weights, axis=1, dtype=np.uint32),
+                np.sum(flat_member[:, 32:] * bit_weights, axis=1, dtype=np.uint32),
+            ),
+            axis=1,
+        )
+        nonempty = np.any(mask_words != 0, axis=1)
+        if np.any(nonempty):
+            tile_rows.append(tile_batch[nonempty])
+            membership_rows.append(mask_words[nonempty])
+            tile_index, left_slot, right_slot = np.nonzero(member)
+            accepted_left = left_atoms[tile_index, left_slot]
+            accepted_right = right_atoms[tile_index, right_slot]
+            compact_pair_rows.append(
+                np.stack(
+                    (
+                        np.minimum(accepted_left, accepted_right),
+                        np.maximum(accepted_left, accepted_right),
+                    ),
+                    axis=1,
+                ).astype(np.int32, copy=False)
+            )
+            exact_pair_count += int(tile_index.shape[0])
+
+    if tile_rows:
+        tile_blocks = np.concatenate(tile_rows, axis=0)
+        member_mask = np.concatenate(membership_rows, axis=0)
+    else:
+        tile_blocks = np.empty((0, 2), dtype=np.int32)
+        member_mask = np.empty((0, 2), dtype=np.uint32)
+    compact_pairs = (
+        np.concatenate(compact_pair_rows, axis=0)
+        if compact_pair_rows
+        else np.empty((0, 2), dtype=np.int32)
+    )
+    if sort_pairs and compact_pairs.shape[0]:
+        order = np.lexsort((compact_pairs[:, 1], compact_pairs[:, 0]))
+        compact_pairs = compact_pairs[order]
+    tiles = NeighborTiles(
+        atom_blocks=mx.array(atom_blocks, dtype=mx.int32),
+        tile_blocks=mx.array(tile_blocks, dtype=mx.int32),
+        member_mask=mx.array(member_mask, dtype=mx.uint32),
+        exact_pair_count=exact_pair_count,
+        raw_candidate_count=raw_candidate_count,
+    )
+    stats = PairListStats(
+        pair_count=exact_pair_count,
+        n_cells=n_cells,
+        cell_count=cell_count,
+        occupied_cell_count=int(np.count_nonzero(cell_counts)),
+        search_radius=search_radius,
+        estimated_pair_bytes=(
+            tiles.estimated_bytes + estimate_pair_list_bytes(exact_pair_count)
+        ),
+        estimated_cell_list_bytes=(
+            n_atoms * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
+            + cell_count * 2 * _INT_BYTES
+        ),
+        backend="mlx_cell_tiles",
+        representation_kind="tiles",
+        candidate_count=raw_candidate_count,
+        estimated_candidate_bytes=(
+            peak_tile_candidate_count * (3 * _FLOAT_BYTES + _BOOL_BYTES)
+        ),
+        compaction_backend=(
+            "metal_tile_membership_mask"
+            if positions_mx is not None
+            else "cpu_vectorized_tile_membership_mask"
+        ),
+        fallback_reason=None,
+    )
+    return NeighborList(
+        mx.array(compact_pairs, dtype=mx.int32),
+        cutoff=cutoff,
+        skin=skin,
+        stats=stats,
+        tiles=tiles,
+    )
+
+
 def _count_candidate_pairs_within_radius(
     positions_np: np.ndarray,
     cell: Cell,
@@ -889,12 +1385,34 @@ def _count_candidate_pairs_within_radius(
     *,
     search_radius: float,
 ) -> int:
+    return int(
+        _filter_candidate_pairs_within_radius(
+            positions_np,
+            cell,
+            pairs,
+            search_radius=search_radius,
+        ).shape[0]
+    )
+
+
+def _filter_candidate_pairs_within_radius(
+    positions_np: np.ndarray,
+    cell: Cell,
+    pairs: np.ndarray,
+    *,
+    search_radius: float,
+) -> np.ndarray:
+    """Return candidate pairs inside the strict periodic search radius."""
+
     if pairs.shape[0] == 0:
-        return 0
+        return np.empty((0, 2), dtype=np.int32)
     displacement = positions_np[pairs[:, 0]] - positions_np[pairs[:, 1]]
     displacement = np.asarray(cell.minimum_image(as_mx_array(displacement)))
     distance2 = np.sum(displacement * displacement, axis=1)
-    return int(np.count_nonzero(distance2 < search_radius * search_radius))
+    return pairs[distance2 < search_radius * search_radius].astype(
+        np.int32,
+        copy=False,
+    )
 
 
 def _build_mlx_spatial_cell_pair_list(
@@ -911,7 +1429,9 @@ def _build_mlx_spatial_cell_pair_list(
     """Build compact pairs from a device-resident, spatially pruned cell grid."""
 
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_pairs")
-    lengths = np.asarray(cell.lengths, dtype=np.float32)
+    lengths_mx = as_mx_array(cell.lengths, dtype=mx.float32)
+    mx.eval(lengths_mx)
+    lengths = np.asarray(lengths_mx, dtype=np.float32)
     if lengths.shape != (3,) or np.any(~np.isfinite(lengths)) or np.any(lengths <= 0.0):
         msg = "cell lengths must be finite and positive"
         raise ValueError(msg)
@@ -940,7 +1460,6 @@ def _build_mlx_spatial_cell_pair_list(
     cell_count = int(np.prod(n_cells_array.astype(np.int64)))
     cell_widths = lengths64 / n_cells_array.astype(np.float64)
 
-    lengths_mx = mx.array(lengths, dtype=mx.float32)
     n_cells_mx = mx.array(n_cells_array, dtype=mx.int32)
     wrapped = positions_mx - mx.floor(positions_mx / lengths_mx) * lengths_mx
     cell_indices = mx.floor(wrapped / lengths_mx * n_cells_mx).astype(mx.int32)
@@ -1010,7 +1529,7 @@ def _build_mlx_spatial_cell_pair_list(
             positions_mx,
             candidates_i,
             candidates_j,
-            cell.lengths,
+            lengths_mx,
             search_radius=search_radius,
         )
         prefix = mx.cumsum(close.astype(mx.int32))
@@ -1030,7 +1549,9 @@ def _build_mlx_spatial_cell_pair_list(
         compact_chunks.append(compact)
         compact_pair_count += accepted_count
 
-    if compact_chunks:
+    if len(compact_chunks) == 1:
+        pairs = compact_chunks[0]
+    elif compact_chunks:
         pairs = mx.concatenate(compact_chunks, axis=0)
     else:
         pairs = mx.zeros((0, 2), dtype=mx.int32)
@@ -1039,7 +1560,8 @@ def _build_mlx_spatial_cell_pair_list(
         pairs = pairs[right_order]
         left_order = mx.argsort(pairs[:, 0])
         pairs = pairs[left_order]
-    mx.eval(pairs)
+    if len(compact_chunks) > 1 or sort_pairs:
+        mx.eval(pairs)
 
     occupied_cell_count = int(np.count_nonzero(cell_counts))
     estimated_cell_list_bytes = (
@@ -1084,11 +1606,44 @@ def _spatial_cell_pair_tasks(
     if cell_count == 0:
         empty = np.empty((0,), dtype=np.int32)
         return empty, empty, empty.astype(np.int64)
+    left, right, same = _spatial_cell_pair_template(
+        n_cells,
+        tuple(float(value) for value in cell_widths),
+        float(search_radius),
+    )
+    left_counts = cell_counts[left].astype(np.int64)
+    right_counts = cell_counts[right].astype(np.int64)
+    candidate_counts = left_counts * right_counts
+    same_counts = left_counts[same]
+    candidate_counts[same] = same_counts * np.maximum(same_counts - 1, 0) // 2
+    occupied = candidate_counts > 0
+    return (
+        left[occupied],
+        right[occupied],
+        candidate_counts[occupied],
+    )
+
+
+@lru_cache(maxsize=8)
+def _spatial_cell_pair_template(
+    n_cells: tuple[int, int, int],
+    cell_widths: tuple[float, float, float],
+    search_radius: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return immutable canonical cell-pair indices for fixed geometry."""
+
+    cell_count = int(np.prod(np.asarray(n_cells, dtype=np.int64)))
+    if cell_count == 0:
+        empty = np.empty((0,), dtype=np.int32)
+        empty.flags.writeable = False
+        same = np.empty((0,), dtype=np.bool_)
+        same.flags.writeable = False
+        return empty, empty, same
     cell_ids = np.arange(cell_count, dtype=np.int64)
     cell_x, cell_y, cell_z = np.unravel_index(cell_ids, n_cells)
     encoded_chunks: list[np.ndarray] = []
     for offset_x, offset_y, offset_z in _aabb_pruned_half_stencil(
-        cell_widths,
+        np.asarray(cell_widths, dtype=np.float64),
         search_radius=search_radius,
     ):
         neighbor_x = (cell_x + offset_x) % n_cells[0]
@@ -1099,22 +1654,13 @@ def _spatial_cell_pair_tasks(
         upper = np.maximum(cell_ids, neighbor_ids)
         encoded_chunks.append(lower * cell_count + upper)
     encoded = np.unique(np.concatenate(encoded_chunks))
-    left = encoded // cell_count
-    right = encoded % cell_count
-    left_counts = cell_counts[left]
-    right_counts = cell_counts[right]
+    left = (encoded // cell_count).astype(np.int32, copy=False)
+    right = (encoded % cell_count).astype(np.int32, copy=False)
     same = left == right
-    candidate_counts = np.where(
-        same,
-        left_counts.astype(np.int64) * np.maximum(left_counts.astype(np.int64) - 1, 0) // 2,
-        left_counts.astype(np.int64) * right_counts.astype(np.int64),
-    )
-    occupied = candidate_counts > 0
-    return (
-        left[occupied].astype(np.int32, copy=False),
-        right[occupied].astype(np.int32, copy=False),
-        candidate_counts[occupied],
-    )
+    left.flags.writeable = False
+    right.flags.writeable = False
+    same.flags.writeable = False
+    return left, right, same
 
 
 def _bounded_spatial_grid(

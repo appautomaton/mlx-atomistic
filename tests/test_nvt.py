@@ -39,24 +39,29 @@ class _DemandCountingTerm:
 
     def __init__(self):
         self.calls = []
+        self.pair_candidates = []
 
     def _runtime_forces(self, positions, *, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("forces")
         return mx.zeros_like(positions)
 
     def _runtime_energy(self, positions, *, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("energy")
         return mx.sum(positions * 0.0)
 
     def energy_forces(self, positions, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("energy_forces")
         return mx.sum(positions * 0.0), mx.zeros_like(positions)
 
     def energy_forces_with_components(self, positions, cell=None, pairs=None):
-        del cell, pairs
+        del cell
+        self.pair_candidates.append(pairs)
         self.calls.append("diagnostic")
         energy = mx.sum(positions * 0.0)
         return energy, mx.zeros_like(positions), {"zero": energy}
@@ -70,7 +75,8 @@ class _DemandCountingTerm:
         masses=None,
         molecule_ids=None,
     ):
-        del cell, pairs, masses, molecule_ids
+        del cell, masses, molecule_ids
+        self.pair_candidates.append(pairs)
         self.calls.append("virial")
         return mx.zeros((3, 3), dtype=positions.dtype)
 
@@ -276,12 +282,19 @@ def test_internal_force_evaluation_falls_back_when_private_hook_declines(mode):
 def test_nvt_ordinary_steps_request_forces_and_boundaries_request_diagnostics():
     term = _DemandCountingTerm()
     positions = np.zeros((2, 3), dtype=np.float32)
+    cell = Cell.cubic(6.0)
 
     simulate_nvt(
         positions,
         np.zeros_like(positions),
-        cell=Cell.cubic(6.0),
+        cell=cell,
         force_terms=term,
+        neighbor_manager=NeighborListManager(
+            cell,
+            cutoff=2.5,
+            skin=0.4,
+            backend="mlx_cell_tiles",
+        ),
         config=SimulationConfig(
             dt=0.001,
             steps=3,
@@ -297,6 +310,8 @@ def test_nvt_ordinary_steps_request_forces_and_boundaries_request_diagnostics():
     )
 
     assert term.calls == ["diagnostic", "forces", "forces", "diagnostic"]
+    assert term.pair_candidates
+    assert all(isinstance(pairs, mx.array) for pairs in term.pair_candidates)
 
 
 def test_langevin_thermostat_validation():
@@ -610,6 +625,71 @@ def test_batched_langevin_zero_force_retains_thermal_noise():
     )
 
 
+@pytest.mark.parametrize("check_interval", [1, 4])
+def test_batched_langevin_replays_when_skin_is_crossed_mid_block(check_interval):
+    """A block that invalidates its Verlet list must replay before using new pairs."""
+
+    positions = np.asarray(
+        [[2.0, 5.0, 5.0], [3.8, 5.0, 5.0]],
+        dtype=np.float32,
+    )
+    velocities = np.asarray(
+        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    cell = Cell.cubic(10.0)
+    potential = LennardJonesPotential(cutoff=1.5)
+
+    def run(block_size, interval):
+        manager = NeighborListManager(
+            cell,
+            cutoff=1.5,
+            skin=0.2,
+            check_interval=interval,
+            backend="mlx_cell_pairs",
+            displacement_check_backend="mlx_scalar",
+        )
+        result = simulate_nvt(
+            positions,
+            velocities,
+            cell=cell,
+            force_terms=potential,
+            neighbor_manager=manager,
+            config=SimulationConfig(
+                dt=0.05,
+                steps=4,
+                sample_interval=4,
+                diagnostic_interval=4,
+                pressure_diagnostics=False,
+                block_size=block_size,
+            ),
+            thermostat=LangevinThermostat(
+                temperature=0.0,
+                friction=0.0,
+                seed=29,
+            ),
+        )
+        return result, manager
+
+    reference, reference_manager = run(1, 1)
+    batched, batched_manager = run(4, check_interval)
+
+    assert reference_manager.rebuild_count >= 2
+    assert batched_manager.rebuild_count >= reference_manager.rebuild_count
+    np.testing.assert_allclose(
+        np.asarray(batched.final_state.positions),
+        np.asarray(reference.final_state.positions),
+        rtol=0.0,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(batched.final_state.velocities),
+        np.asarray(reference.final_state.velocities),
+        rtol=2.0e-5,
+        atol=2.0e-6,
+    )
+
+
 def test_batched_block_size_falls_back_without_neighbor_manager():
     """block_size > 1 on the dense path (no manager) must still run correctly."""
     positions, velocities, cell, potential = _batched_fcc_system(n=108)
@@ -772,9 +852,59 @@ def test_dynamic_neighbor_nvt_reports_rebuilds():
         cell=cell,
         force_terms=potential,
         neighbor_manager=manager,
-        config=SimulationConfig(dt=0.001, steps=3, sample_interval=3),
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+        ),
         thermostat=LangevinThermostat(temperature=1.0, friction=0.2, seed=5),
     )
 
     assert int(np.array(result.rebuild_count)[-1]) >= 1
     assert int(np.array(result.pair_count)[-1]) > 0
+
+
+def test_nvt_runtime_profile_is_opt_in_reconciled_and_state_preserving():
+    positions, velocities, cell, potential = _small_system()
+    thermostat = LangevinThermostat(temperature=1.0, friction=0.2, seed=5)
+    normal = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        config=SimulationConfig(dt=0.001, steps=3, sample_interval=3),
+        thermostat=thermostat,
+    )
+    profiled = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+            runtime_profile=True,
+        ),
+        thermostat=thermostat,
+    )
+
+    assert normal.route_profile == {}
+    assert profiled.route_profile["reconciled"] is True
+    assert profiled.route_profile["residual_seconds"] >= 0.0
+    assert "integration_thermostat" in profiled.route_profile["routes"]
+    assert "other_force_terms" in profiled.route_profile["routes"]
+    np.testing.assert_allclose(
+        np.asarray(profiled.final_state.positions),
+        np.asarray(normal.final_state.positions),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(profiled.final_state.velocities),
+        np.asarray(normal.final_state.velocities),
+        rtol=1e-6,
+        atol=1e-6,
+    )

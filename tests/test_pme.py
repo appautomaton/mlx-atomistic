@@ -25,6 +25,7 @@ from mlx_atomistic.pme import (
     _interpolate_bspline_mx,
     _interpolate_cic_mx,
     _pme_coulomb_reciprocal_virial,
+    _prepared_pme_reciprocal_space_energy_forces,
     assign_charges_bspline,
     assign_charges_cic,
     pme_coulomb_direct_space_energy_forces,
@@ -141,10 +142,42 @@ def test_pme_execution_plan_materializes_once_and_reuses_all_force_scopes(monkey
     )
 
 
+def test_prepared_reciprocal_pme_matches_checked_path_without_readmission(monkeypatch):
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    plan = PMEExecutionPlan(cell, config=config)
+    expected_energy, expected_forces = pme_coulomb_reciprocal_space_energy_forces(
+        _positions(),
+        _charges(),
+        cell,
+        config=config,
+        plan=plan,
+    )
+
+    def unexpected_validation(*args, **kwargs):
+        raise AssertionError("prepared PME repeated public input admission")
+
+    monkeypatch.setattr(pme_module, "_validate_inputs_mx", unexpected_validation)
+    actual_energy, actual_forces = _prepared_pme_reciprocal_space_energy_forces(
+        _positions(),
+        _charges(),
+        plan,
+    )
+
+    np.testing.assert_allclose(np.asarray(actual_energy), np.asarray(expected_energy), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(actual_forces), np.asarray(expected_forces), atol=1e-6)
+    assert plan.reuse_count == 2
+
+
 def test_pme_execution_plan_rejects_mismatches_and_rebuilds_explicitly():
     cell = Cell.cubic(12.0)
     config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
     plan = PMEExecutionPlan(cell, config=config, coulomb_constant=2.0)
+
+    with pytest.raises(AttributeError, match=r"use rebuild\(\)"):
+        plan.config = PMEConfig(mesh_shape=(20, 16, 16), alpha=0.35)
+    with pytest.raises(AttributeError, match=r"use rebuild\(\)"):
+        plan.coulomb_constant = 3.0
 
     with pytest.raises(PMEPlanMismatchError, match="pme_execution_plan_mismatch") as error:
         plan.validate(Cell.cubic(13.0), config=config, coulomb_constant=2.0)

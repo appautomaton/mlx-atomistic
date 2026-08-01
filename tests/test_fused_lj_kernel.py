@@ -486,6 +486,12 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
         pairs=pairs,
     )
     assert runtime_force_only is not NotImplemented
+    prepared_binding = potential._prepare_force_binding(cell, pairs)
+    assert prepared_binding is not NotImplemented
+    prepared_force_only = potential._forces_from_binding(
+        positions,
+        prepared_binding,
+    )
 
     mx.eval(
         reference_energy,
@@ -497,6 +503,7 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
         direct_reference_forces,
         direct_force_only,
         runtime_force_only,
+        prepared_force_only,
         *runtime_components.values(),
     )
     assert potential._aligned_lj_scale_cache is not None
@@ -532,6 +539,12 @@ def test_fused_parameterized_pme_direct_matches_decomposed_path():
     )
     np.testing.assert_allclose(
         np.asarray(runtime_force_only),
+        np.asarray(reference_forces),
+        rtol=1e-5,
+        atol=2e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(prepared_force_only),
         np.asarray(reference_forces),
         rtol=1e-5,
         atol=2e-4,

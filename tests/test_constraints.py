@@ -335,6 +335,83 @@ def test_overlapping_composite_constraints_project_all_relative_velocities():
         assert abs(float(np.dot(relative, displacement))) < 1e-5
 
 
+def test_disjoint_composite_skips_only_redundant_pre_force_settle_projection():
+    settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
+    tether = DistanceConstraints([(3, 4)], distances=[1.2], max_iterations=4)
+    constraints = CompositeConstraints((settle, tether))
+    positions = mx.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [-0.125, 0.99215674, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.2, 0.0, 0.0],
+        ],
+        dtype=mx.float32,
+    )
+    velocities = mx.array(
+        [
+            [0.3, -0.2, 0.1],
+            [-0.1, 0.4, 0.2],
+            [0.2, -0.3, 0.1],
+            [0.5, 0.1, -0.2],
+            [-0.4, 0.2, 0.3],
+        ],
+        dtype=mx.float32,
+    )
+    kick = mx.array(
+        [
+            [0.01, 0.03, -0.02],
+            [-0.02, 0.01, 0.04],
+            [0.03, -0.02, 0.01],
+            [-0.01, 0.02, 0.03],
+            [0.02, -0.03, -0.01],
+        ],
+        dtype=mx.float32,
+    )
+    masses = mx.array([16.0, 1.0, 1.0, 12.0, 1.0], dtype=mx.float32)
+
+    full_pre = constraints.apply_velocities(positions, velocities, masses)
+    full_final = constraints.apply_velocities(positions, full_pre + kick, masses)
+    reduced_pre = constraints._apply_pre_force_velocities(
+        positions,
+        velocities,
+        masses,
+    )
+    reduced_final = constraints.apply_velocities(
+        positions,
+        reduced_pre + kick,
+        masses,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(reduced_final),
+        np.asarray(full_final),
+        rtol=1e-6,
+        atol=2e-7,
+    )
+
+
+def test_overlapping_composite_retains_full_pre_force_projection():
+    settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
+    tether = DistanceConstraints([(0, 3)], distances=[2.0], max_iterations=4)
+    constraints = CompositeConstraints((settle, tether))
+    positions = mx.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-0.125, 0.99215674, 0.0], [2.0, 0.0, 0.0]],
+        dtype=mx.float32,
+    )
+    velocities = mx.array(
+        [[0.3, -0.1, 0.2], [-0.2, 0.4, 0.0], [0.1, -0.3, 0.2], [-0.4, 0.2, -0.1]],
+        dtype=mx.float32,
+    )
+    masses = mx.array([16.0, 1.0, 1.0, 12.0], dtype=mx.float32)
+
+    expected = constraints.apply_velocities(positions, velocities, masses)
+    actual = constraints._apply_pre_force_velocities(positions, velocities, masses)
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=0.0, atol=0.0)
+
+
 def test_settle_rejects_malformed_water_topology():
     with pytest.raises(ValueError, match="shape"):
         SettleWaterConstraints([(0, 1)])

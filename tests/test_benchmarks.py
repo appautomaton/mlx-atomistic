@@ -1752,6 +1752,169 @@ def test_charged_pme_runtime_requires_warmup_and_two_measured_steps(tmp_path):
     assert "measured_steps_must_be_at_least_two" in payload["blockers"]
 
 
+def _write_openmm_admission_inputs(tmp_path, *, complete):
+    runtime_path = tmp_path / "openmm-runtime.json"
+    manifest_path = tmp_path / "openmm-manifest.json"
+    comparison_path = tmp_path / "manifest-comparison.json"
+    runtime = {
+        "atom_count": 8,
+        "replicas": [1, 1, 1],
+        "steps": 750,
+        "warmups": 10,
+        "elapsed_seconds": 1.5,
+        "pme": {
+            "mesh_shape": [32, 32, 32],
+            "alpha_per_angstrom": 0.35,
+            "cutoff_angstrom": 9.0,
+        },
+        "platform_properties": {
+            "Precision": "single",
+            "DeviceName": "Synthetic GPU",
+        },
+    }
+    manifest = {
+        "manifest_hash": "workload",
+        "workload": {
+            "operation": (
+                "fixed_cell_nvt_step"
+                if complete
+                else "fixed_coordinate_total_energy_and_complete_forces"
+            ),
+            "atom_count": 8,
+            "replicas": [1, 1, 1],
+        },
+        "pme": {
+            "mesh_shape": [32, 32, 32],
+            "alpha_per_angstrom": 0.35,
+            "real_cutoff_angstrom": 9.0,
+        },
+    }
+    if complete:
+        runtime.update(
+            {
+                "operation": "fixed_cell_nvt_step",
+                "dt_ps": 0.004,
+                "thermostat": {"kind": "langevin"},
+                "constraint_protocol": {"kind": "settle"},
+                "completion_barrier": "explicit_device_completion_inside_timer",
+                "timing_boundary": {
+                    "initialization_included": False,
+                    "io_included": False,
+                },
+                "workload_manifest_hash": "workload",
+            }
+        )
+    runtime_path.write_text(json.dumps(runtime))
+    manifest_path.write_text(json.dumps(manifest))
+    comparison_path.write_text(json.dumps({"matched": True}))
+    return runtime_path, manifest_path, comparison_path
+
+
+def test_charged_pme_openmm_manifest_audit_is_fail_closed(tmp_path):
+    runtime_path, manifest_path, comparison_path = _write_openmm_admission_inputs(
+        tmp_path,
+        complete=False,
+    )
+
+    payload = charged_pme.audit_openmm_runtime_artifacts(
+        runtime_path=runtime_path,
+        workload_manifest_path=manifest_path,
+        manifest_comparison_path=comparison_path,
+    )
+
+    assert payload["status"] == "provisional"
+    assert payload["admitted"] is False
+    assert "runtime_operation_declared" in payload["blockers"]
+    assert "completion_barrier_declared" in payload["blockers"]
+    assert payload["target_seconds_at_ten_times"] == pytest.approx(15.0)
+
+
+def test_charged_pme_openmm_manifest_audit_admits_complete_runtime(tmp_path):
+    runtime_path, manifest_path, comparison_path = _write_openmm_admission_inputs(
+        tmp_path,
+        complete=True,
+    )
+
+    payload = charged_pme.audit_openmm_runtime_artifacts(
+        runtime_path=runtime_path,
+        workload_manifest_path=manifest_path,
+        manifest_comparison_path=comparison_path,
+        out=tmp_path / "admission.json",
+    )
+
+    assert payload["status"] == "admitted"
+    assert payload["admitted"] is True
+    assert payload["blockers"] == []
+    assert json.loads((tmp_path / "admission.json").read_text()) == payload
+
+
+def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_path, manifest_path, comparison_path = _write_openmm_admission_inputs(
+        tmp_path,
+        complete=False,
+    )
+    state = {
+        "potential_energy_kj_mol": -10.0,
+        "kinetic_energy_kj_mol": 2.0,
+        "total_energy_kj_mol": -8.0,
+        "temperature_k": 300.0,
+        "constraint_max_error_angstrom": 1.0e-6,
+    }
+
+    def fake_runtime_payload(**kwargs):
+        profiled = kwargs["runtime_profile"]
+        return {
+            "passed": True,
+            "state": state,
+            "neighbor": {"compact_pair_count": 24},
+            "route_profile": (
+                {
+                    "reconciled": True,
+                    "routes": {
+                        "direct_lj_screened_coulomb": {},
+                        "reciprocal_pme": {},
+                        "neighbor_update_rebuild": {},
+                        "integration_thermostat": {},
+                    },
+                }
+                if profiled
+                else {}
+            ),
+        }
+
+    monkeypatch.setattr(charged_pme, "runtime_payload", fake_runtime_payload)
+    monkeypatch.setattr(
+        charged_pme,
+        "_profile_tile_inventory",
+        lambda *args, **kwargs: {
+            "exact_pair_count": 24,
+            "reference_pair_count": 24,
+            "pair_inventory_matches": True,
+        },
+    )
+
+    payload = charged_pme.profile_payload(
+        prepared=tmp_path / "prepared",
+        warmups=1,
+        steps=2,
+        seed=17,
+        openmm_runtime=runtime_path,
+        openmm_manifest=manifest_path,
+        manifest_comparison=comparison_path,
+        out=tmp_path / "profile.json",
+    )
+
+    assert payload["passed"] is True
+    assert payload["checks"]["route_profile_reconciled"] is True
+    assert payload["diagnostics"]["tile_pair_inventory_matches"] is True
+    assert payload["diagnostics"]["tile_pair_inventory_delta"] == 0
+    assert payload["openmm_admission"]["status"] == "provisional"
+    assert json.loads((tmp_path / "profile.json").read_text())["passed"] is True
+
+
 def test_charged_pme_profile_resolves_new_report_schema(tmp_path):
     report_path = tmp_path / pme_performance.CHARGED_PARITY_REPORT_NAME
     prepared = tmp_path / "prepared"
