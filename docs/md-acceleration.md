@@ -367,6 +367,43 @@ the 5% complete-wall retention threshold. The retained change is therefore the
 kernel work schedule only; the neighbor lifecycle, integrator sequence,
 constraints, and scientific workload are unchanged.
 
+### Guarded intra-step force submission
+
+The next retained change overlaps host graph construction with Metal execution
+without changing the integrator or adding a synchronization barrier. On an
+ordinary constrained Langevin step with a prepared spatial-tile force pipeline,
+the runtime submits the completed force graph through `mx.async_eval` before it
+builds the final kick and constraint graph. CPU execution, diagnostics, the
+final step, synchronized route profiling, non-Langevin dynamics, non-tile
+neighbors, and unsupported force paths keep their previous synchronous route.
+
+The evidence categories are intentionally separate:
+
+| Evidence type | Result |
+| --- | --- |
+| Measured structural census | One steady 5DFR step contained 181 MLX primitive nodes, including 28 in the force subgraph. This is not a Metal-dispatch count. |
+| Measured host opportunity | Post-force host graph construction took about 0.361 ms/step; asynchronous submission took about 0.023 ms. |
+| Estimated ceiling | At most about 17.8% of a 5DFR step could be hidden if all eligible host work overlapped. This was a design bound, not a predicted result. |
+| Measured 75-step 5DFR gate | Control median 0.158528 s; candidate median 0.143178 s; 9.68% lower. Both C-to-A comparisons agreed. |
+| Measured 75-step JAC transfer | Control median 0.754487 s; candidate median 0.765292 s; 1.43% higher and inside the 2% neutrality limit. One 1.244 s candidate outlier prevents a broader claim. |
+| Measured 750-step 5DFR confirmation | 2.037116 s to 1.956978 s; 3.93% lower, or 127.239 to 132.449 ns/day. |
+
+The complete candidate run remained finite, ended at the same `1.35e-5 A`
+constraint residual as its paired control, reused the same PME plan, and peaked
+at 2.60 GB across the bounded process tree. The long-run gain is smaller than
+the short gate, so this is classified as a modest scheduling improvement. It
+does not change the scientific operations and does not close the remaining
+OpenMM throughput gap.
+
+A second experiment built fixed atom-owner maps for disjoint SETTLE and SHAKE
+families and replaced their recurring sparse-scatter application chains with
+one dense per-atom Metal write. Metal parity covered periodic positions,
+pre-force velocities, final velocities, unconstrained atoms, noncontiguous
+indices, and one-to-three SHAKE peripherals; CPU, overlap, and profiler
+fallbacks also passed. The complete 75-step 5DFR median changed from 0.142829
+to 0.139473 seconds, only 2.35%, with inconsistent paired gains. The specialized
+kernel, maps, and tests were therefore removed under the 5% retention rule.
+
 Two later pipeline experiments were also rejected by the same bounded 75-step
 5DFR gate. Coalescing SETTLE and SHAKE sparse constraint writes changed complete
 wall time from 0.202904 to 0.574724 seconds, a 2.83x regression, because this
