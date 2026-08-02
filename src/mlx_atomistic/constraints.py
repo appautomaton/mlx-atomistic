@@ -347,20 +347,20 @@ class _ShakeClusterConstraints:
 
         return self._pair_constraints.apply_positions(positions, masses, cell)
 
-    def apply_position_step(
+    def _project_position_step(
         self,
         reference_positions,
         predicted_positions,
         masses,
         cell: Cell | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        """Project one dynamics step with cluster-local Metal ownership."""
+    ) -> tuple[mx.array, mx.array | None]:
+        """Project one dynamics step and preserve any fallback error result."""
 
         reference = as_mx_array(reference_positions)
         predicted = as_mx_array(predicted_positions)
         masses = as_mx_array(masses)
         if self.cluster_count == 0:
-            return predicted, self.max_error(predicted, cell)
+            return predicted, None
         if reference.shape != predicted.shape:
             msg = "reference_positions and predicted_positions must have matching shapes"
             raise ValueError(msg)
@@ -389,7 +389,46 @@ class _ShakeClusterConstraints:
             periodic=cell is not None,
         )
         constrained = self._scatter_deltas(predicted, deltas)
-        return constrained, self.max_error(constrained, cell)
+        return constrained, None
+
+    def apply_position_step(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Project one dynamics step with cluster-local Metal ownership."""
+
+        constrained, fallback_error = self._project_position_step(
+            reference_positions,
+            predicted_positions,
+            masses,
+            cell,
+        )
+        error = (
+            self.max_error(constrained, cell)
+            if fallback_error is None
+            else fallback_error
+        )
+        return constrained, error
+
+    def _apply_position_step_unchecked(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> mx.array:
+        """Project one step without constructing a Metal error diagnostic."""
+
+        constrained, _ = self._project_position_step(
+            reference_positions,
+            predicted_positions,
+            masses,
+            cell,
+        )
+        return constrained
 
     def apply_velocities(
         self,
@@ -486,6 +525,11 @@ class SettleWaterConstraints:
         object.__setattr__(self, "waters", mx.array(waters, dtype=mx.int32))
         object.__setattr__(
             self,
+            "_flat_water_atoms",
+            mx.array(waters.reshape(-1), dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
             "_pair_constraints",
             DistanceConstraints(
                 np.asarray(pair_rows, dtype=np.int32).reshape((-1, 2)),
@@ -522,8 +566,9 @@ class SettleWaterConstraints:
         )
 
     def _scatter_deltas(self, values: mx.array, deltas: mx.array) -> mx.array:
-        atoms = mx.reshape(self.waters, (-1,))
-        return values.at[atoms].add(mx.reshape(deltas, (-1, 3)))
+        return values.at[self._flat_water_atoms].add(
+            mx.reshape(deltas, (-1, 3))
+        )
 
     def max_error(self, positions, cell: Cell | None = None) -> mx.array:
         """Return the maximum absolute SETTLE distance error."""
@@ -611,20 +656,20 @@ class SettleWaterConstraints:
         )
         return constrained, self.max_error(constrained, cell)
 
-    def apply_position_step(
+    def _project_position_step(
         self,
         reference_positions,
         predicted_positions,
         masses,
         cell: Cell | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        """Apply the SETTLE dynamics projection from a constrained reference state."""
+    ) -> tuple[mx.array, mx.array | None]:
+        """Project one SETTLE step without constructing its error diagnostic."""
 
         reference = as_mx_array(reference_positions)
         predicted = as_mx_array(predicted_positions)
         masses = as_mx_array(masses)
         if self.pairs.shape[0] == 0:
-            return predicted, self.max_error(predicted, cell)
+            return predicted, None
         if reference.shape != predicted.shape:
             msg = "reference_positions and predicted_positions must have matching shapes"
             raise ValueError(msg)
@@ -647,7 +692,7 @@ class SettleWaterConstraints:
                 periodic=cell is not None,
             )
             constrained = self._scatter_deltas(predicted, deltas)
-            return constrained, self.max_error(constrained, cell)
+            return constrained, None
 
         oxygen = self.waters[:, 0]
         hydrogen_a = self.waters[:, 1]
@@ -801,7 +846,41 @@ class SettleWaterConstraints:
             .at[hydrogen_b]
             .add(projected_b - predicted[hydrogen_b])
         )
+        return constrained, None
+
+    def apply_position_step(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply the SETTLE dynamics projection from a constrained reference state."""
+
+        constrained, _ = self._project_position_step(
+            reference_positions,
+            predicted_positions,
+            masses,
+            cell,
+        )
         return constrained, self.max_error(constrained, cell)
+
+    def _apply_position_step_unchecked(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> mx.array:
+        """Project one SETTLE step without constructing its error diagnostic."""
+
+        constrained, _ = self._project_position_step(
+            reference_positions,
+            predicted_positions,
+            masses,
+            cell,
+        )
+        return constrained
 
     def apply_velocities(
         self,
@@ -1119,8 +1198,20 @@ def _project_constraint_positions_unchecked(
                     reference_positions=reference_positions,
                 )
         return constrained
+    unchecked_step_projector = getattr(
+        constraints,
+        "_apply_position_step_unchecked",
+        None,
+    )
     step_projector = getattr(constraints, "apply_position_step", None)
-    if reference_positions is None or step_projector is None:
+    if reference_positions is not None and unchecked_step_projector is not None:
+        constrained = unchecked_step_projector(
+            reference_positions,
+            constrained,
+            masses,
+            cell,
+        )
+    elif reference_positions is None or step_projector is None:
         constrained, _ = constraints.apply_positions(constrained, masses, cell)
     else:
         constrained, _ = step_projector(
