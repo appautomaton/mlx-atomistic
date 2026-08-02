@@ -29,6 +29,7 @@ from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.metal_kernels import (
     _fused_bonded_force_only,
     _prepared_parameterized_pme_direct_force_only,
+    _tile_parameterized_pme_direct_force_only,
     aligned_topology_lj_scales,
     fused_parameterized_lj_forces,
     fused_parameterized_pme_direct_components,
@@ -36,6 +37,8 @@ from mlx_atomistic.metal_kernels import (
     fused_parameterized_pme_direct_force_only,
     fused_parameterized_pme_direct_forces,
     fused_pme_cutoff_correction_virial,
+    fused_sparse_pme_correction_forces,
+    tile_topology_lj_masks,
 )
 from mlx_atomistic.neighbors import NeighborBlocks, NeighborTiles, build_neighbor_list
 from mlx_atomistic.nonbonded import (
@@ -118,7 +121,7 @@ class _NonbondedForceBinding:
     cell: Cell
     pairs: mx.array
     pme_plan: PMEExecutionPlan
-    aligned_lj_scales: mx.array
+    aligned_lj_scales: mx.array | None
     box_lengths_and_inverses: mx.array
     half_sigma: mx.array
     sqrt_epsilon: mx.array
@@ -1428,6 +1431,10 @@ class NonbondedPotential:
             dtype=np.int32,
         ).reshape((-1, 2))
         correction_pairs_mx = mx.array(correction_pairs, dtype=mx.int32)
+        exception_pairs_mx = mx.array(exception_pairs, dtype=mx.int32)
+        exception_charge_products_mx = as_mx_array(charge_products)
+        exception_sigma_mx = as_mx_array(exception_sigma)
+        exception_epsilon_mx = as_mx_array(exception_epsilon)
         one_four_pairs_mx = mx.array(one_four_pairs, dtype=mx.int32)
         lj_one_four_pairs_mx = mx.array(lj_one_four_pairs, dtype=mx.int32)
         correction_charge_products = -(
@@ -1438,6 +1445,34 @@ class NonbondedPotential:
             (self.coulomb_one_four_scale - 1.0)
             * charges[one_four_pairs_mx[:, 0]]
             * charges[one_four_pairs_mx[:, 1]]
+        )
+        sparse_correction_pairs = mx.concatenate(
+            (correction_pairs_mx, exception_pairs_mx, one_four_pairs_mx),
+            axis=0,
+        )
+        sparse_correction_charge_products = mx.concatenate(
+            (
+                correction_charge_products,
+                exception_charge_products_mx,
+                one_four_charge_products,
+            ),
+            axis=0,
+        )
+        sparse_correction_lj_sigma = mx.concatenate(
+            (
+                mx.zeros((correction_pairs.shape[0],), dtype=mx.float32),
+                exception_sigma_mx,
+                mx.zeros((one_four_pairs.shape[0],), dtype=mx.float32),
+            ),
+            axis=0,
+        )
+        sparse_correction_lj_epsilon = mx.concatenate(
+            (
+                mx.zeros((correction_pairs.shape[0],), dtype=mx.float32),
+                exception_epsilon_mx,
+                mx.zeros((one_four_pairs.shape[0],), dtype=mx.float32),
+            ),
+            axis=0,
         )
         exceptions_excluded_by_topology = self.topology is not None and exception_pair_set.issubset(
             self.topology.exclusion_set
@@ -1501,10 +1536,10 @@ class NonbondedPotential:
         object.__setattr__(self, "sigma", sigma)
         object.__setattr__(self, "epsilon", epsilon)
         object.__setattr__(self, "charges", charges)
-        object.__setattr__(self, "exception_pairs", mx.array(exception_pairs, dtype=mx.int32))
-        object.__setattr__(self, "exception_charge_products", as_mx_array(charge_products))
-        object.__setattr__(self, "exception_sigma", as_mx_array(exception_sigma))
-        object.__setattr__(self, "exception_epsilon", as_mx_array(exception_epsilon))
+        object.__setattr__(self, "exception_pairs", exception_pairs_mx)
+        object.__setattr__(self, "exception_charge_products", exception_charge_products_mx)
+        object.__setattr__(self, "exception_sigma", exception_sigma_mx)
+        object.__setattr__(self, "exception_epsilon", exception_epsilon_mx)
         object.__setattr__(self, "nbfix_pairs", mx.array(nbfix_pairs, dtype=mx.int32))
         object.__setattr__(self, "nbfix_sigma", as_mx_array(nbfix_sigma))
         object.__setattr__(self, "nbfix_epsilon", as_mx_array(nbfix_epsilon))
@@ -1542,6 +1577,26 @@ class NonbondedPotential:
             self,
             "_ewald_one_four_charge_products",
             one_four_charge_products,
+        )
+        object.__setattr__(
+            self,
+            "_sparse_correction_pairs",
+            sparse_correction_pairs,
+        )
+        object.__setattr__(
+            self,
+            "_sparse_correction_charge_products",
+            sparse_correction_charge_products,
+        )
+        object.__setattr__(
+            self,
+            "_sparse_correction_lj_sigma",
+            sparse_correction_lj_sigma,
+        )
+        object.__setattr__(
+            self,
+            "_sparse_correction_lj_epsilon",
+            sparse_correction_lj_epsilon,
         )
         object.__setattr__(
             self,
@@ -2043,6 +2098,17 @@ class NonbondedPotential:
         tiles: NeighborTiles,
     ) -> tuple[mx.array, mx.array]:
         """Return binding-owned LJ eligibility and one-four tile masks."""
+
+        if "gpu" in str(mx.default_device()).lower():
+            enabled, one_four = tile_topology_lj_masks(
+                tiles.atom_blocks,
+                tiles.tile_blocks,
+                tiles.member_mask,
+                self._aligned_lj_exclusion_pairs,
+                self._aligned_lj_one_four_pairs,
+            )
+            mx.eval(enabled, one_four)
+            return enabled, one_four
 
         atom_blocks = np.asarray(tiles.atom_blocks, dtype=np.int32)
         tile_blocks = np.asarray(tiles.tile_blocks, dtype=np.int32)
@@ -3590,12 +3656,20 @@ class NonbondedPotential:
             tile_lj_enabled_mask, tile_lj_one_four_mask = self._tile_aligned_lj_masks(
                 tiles,
             )
+        tile_force_ready = bool(
+            tiles is not None
+            and pair_force_ready
+            and tiles.force_group_starts is not None
+            and tiles.force_group_counts is not None
+        )
         binding = _NonbondedForceBinding(
             cell=cell,
             pairs=direct_space_pairs,
             pme_plan=self.pme_plan,
-            aligned_lj_scales=self._compact_aligned_lj_scales(
-                direct_space_pairs,
+            aligned_lj_scales=(
+                None
+                if tile_force_ready
+                else self._compact_aligned_lj_scales(direct_space_pairs)
             ),
             box_lengths_and_inverses=box_cache[1],
             half_sigma=lj_invariants[2],
@@ -3609,14 +3683,43 @@ class NonbondedPotential:
                 None
                 if tiles is None
                 else (
-                    "tile_force_route_not_selected"
-                    if pair_force_ready
-                    else "tile_pair_kernel_unsupported"
+                    None
+                    if tile_force_ready
+                    else (
+                        "tile_pair_kernel_unsupported"
+                        if not pair_force_ready
+                        else "tile_force_schedule_unavailable"
+                    )
                 )
             ),
         )
         object.__setattr__(self, "_force_binding_cache", binding)
         return binding
+
+    def _prepared_sparse_correction_forces(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+    ) -> mx.array:
+        """Evaluate recurring PME sparse corrections through one GPU force buffer."""
+
+        if "gpu" not in str(mx.default_device()).lower():
+            return self._exception_lj_forces(
+                positions,
+                binding.cell,
+            ) + self._periodic_coulomb_correction_forces(
+                positions,
+                binding.cell,
+            )
+        return fused_sparse_pme_correction_forces(
+            positions,
+            self._sparse_correction_pairs,
+            binding.box_lengths_and_inverses,
+            self._sparse_correction_charge_products,
+            self._sparse_correction_lj_sigma,
+            self._sparse_correction_lj_epsilon,
+            coulomb_constant=self.coulomb_constant,
+        )
 
     def _forces_from_binding(
         self,
@@ -3635,7 +3738,60 @@ class NonbondedPotential:
             msg = "positions must have shape (n_atoms, 3)"
             raise ValueError(msg)
 
-        direct_forces = _prepared_parameterized_pme_direct_force_only(
+        direct_forces = self._direct_forces_from_binding(positions, binding)
+        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            binding.pme_plan,
+            include_self_correction=False,
+        )
+        return (
+            direct_forces
+            + reciprocal_forces
+            + self._prepared_sparse_correction_forces(
+                positions,
+                binding,
+            )
+        )
+
+    def _direct_forces_from_binding(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+    ) -> mx.array:
+        """Evaluate the admitted spatial-tile or compact-pair direct route."""
+
+        tiles = binding.tile_geometry
+        if (
+            tiles is not None
+            and binding.tile_decline_reason is None
+            and binding.tile_lj_enabled_mask is not None
+            and binding.tile_lj_one_four_mask is not None
+        ):
+            return _tile_parameterized_pme_direct_force_only(
+                positions,
+                tiles.atom_blocks,
+                tiles.tile_blocks,
+                tiles.member_mask,
+                binding.tile_lj_enabled_mask,
+                binding.tile_lj_one_four_mask,
+                tiles.force_group_starts,
+                tiles.force_group_counts,
+                binding.box_lengths_and_inverses,
+                binding.half_sigma,
+                binding.sqrt_epsilon,
+                self.charges,
+                cutoff=self.cutoff,
+                shift=self.lj_shift,
+                switch_distance=self.switch_distance,
+                one_four_scale=self.lj_one_four_scale,
+                coulomb_constant=self.coulomb_constant,
+                alpha=self.pme_config.alpha,
+            )
+        if binding.aligned_lj_scales is None:
+            msg = "compact-pair fallback requires aligned LJ scales"
+            raise RuntimeError(msg)
+        return _prepared_parameterized_pme_direct_force_only(
             positions,
             binding.pairs,
             binding.box_lengths_and_inverses,
@@ -3648,21 +3804,6 @@ class NonbondedPotential:
             switch_distance=self.switch_distance,
             coulomb_constant=self.coulomb_constant,
             alpha=self.pme_config.alpha,
-        )
-        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
-            positions,
-            self.charges,
-            binding.pme_plan,
-            include_self_correction=False,
-        )
-        return (
-            direct_forces
-            + self._exception_lj_forces(positions, binding.cell)
-            + reciprocal_forces
-            + self._periodic_coulomb_correction_forces(
-                positions,
-                binding.cell,
-            )
         )
 
     def _profile_forces_from_binding(
@@ -3684,22 +3825,14 @@ class NonbondedPotential:
             raise ValueError(msg)
 
         direct_started = route_profiler.start()
-        direct_forces = _prepared_parameterized_pme_direct_force_only(
-            positions,
-            binding.pairs,
-            binding.box_lengths_and_inverses,
-            binding.half_sigma,
-            binding.sqrt_epsilon,
-            self.charges,
-            binding.aligned_lj_scales,
-            cutoff=self.cutoff,
-            shift=self.lj_shift,
-            switch_distance=self.switch_distance,
-            coulomb_constant=self.coulomb_constant,
-            alpha=self.pme_config.alpha,
-        )
+        direct_forces = self._direct_forces_from_binding(positions, binding)
         route_profiler.finish(
-            "direct_lj_screened_coulomb",
+            (
+                "direct_spatial_tiles"
+                if binding.tile_geometry is not None
+                and binding.tile_decline_reason is None
+                else "direct_lj_screened_coulomb"
+            ),
             direct_started,
             direct_forces,
         )
@@ -3718,12 +3851,9 @@ class NonbondedPotential:
         )
 
         correction_started = route_profiler.start()
-        correction_forces = self._exception_lj_forces(
+        correction_forces = self._prepared_sparse_correction_forces(
             positions,
-            binding.cell,
-        ) + self._periodic_coulomb_correction_forces(
-            positions,
-            binding.cell,
+            binding,
         )
         route_profiler.finish(
             "pme_exceptions_corrections",

@@ -327,6 +327,8 @@ _pme_direct_kernel_singleton = None
 _pme_direct_virial_kernel_singleton = None
 _pme_direct_force_only_kernel_singleton = None
 _prepared_pme_direct_force_only_kernel_singleton = None
+_tile_pme_direct_force_only_kernel_singleton = None
+_sparse_pme_correction_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
@@ -334,6 +336,12 @@ _aligned_topology_lj_scales_kernel_singleton = None
 _neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
+_neighbor_cell_tile_candidates_kernel_singleton = None
+_neighbor_tile_membership_kernel_singleton = None
+_neighbor_tile_ordered_scatter_kernel_singleton = None
+_neighbor_tile_force_groups_kernel_singleton = None
+_neighbor_tile_pair_scatter_kernel_singleton = None
+_tile_topology_lj_masks_kernel_singleton = None
 _shake_cluster_position_kernel_singleton = None
 _shake_cluster_velocity_kernel_singleton = None
 _settle_water_position_kernel_singleton = None
@@ -343,6 +351,16 @@ _fused_bonded_force_only_kernel_singleton = None
 # Neighbor compaction preserves short runs of a common left atom, so one worker
 # can sum those contributions locally before issuing global atomics.
 _PREPARED_PME_PAIRS_PER_WORKER = 8
+
+_TILE_PME_BLOCK_SIZE = 8
+_TILE_PME_LANES_PER_TILE = _TILE_PME_BLOCK_SIZE * _TILE_PME_BLOCK_SIZE
+_TILE_PME_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
+_TILE_MEMBERSHIP_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
+_TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
+    2 * _TILE_PME_BLOCK_SIZE * 4
+    + 2 * _TILE_PME_BLOCK_SIZE * (3 + 1 + 1 + 1) * 4
+    + 3 * _TILE_PME_LANES_PER_TILE * 4
+)
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -600,13 +618,13 @@ _PARAMETERIZED_PME_DIRECT_SOURCE = r"""
     float ly = box[1];
     float lz = box[2];
 #ifdef MLX_ATOMISTIC_PREPARED_INVARIANTS
-    dx -= lx * floor(dx * box[3] + 0.5f);
-    dy -= ly * floor(dy * box[4] + 0.5f);
-    dz -= lz * floor(dz * box[5] + 0.5f);
+    dx -= lx * rint(dx * box[3]);
+    dy -= ly * rint(dy * box[4]);
+    dz -= lz * rint(dz * box[5]);
 #else
-    dx -= lx * floor(dx / lx + 0.5f);
-    dy -= ly * floor(dy / ly + 0.5f);
-    dz -= lz * floor(dz / lz + 0.5f);
+    dx -= lx * rint(dx / lx);
+    dy -= ly * rint(dy / ly);
+    dz -= lz * rint(dz / lz);
 #endif
 
     float r2 = dx * dx + dy * dy + dz * dz;
@@ -834,6 +852,278 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     f"#define MLX_ATOMISTIC_PAIRS_PER_WORKER {_PREPARED_PME_PAIRS_PER_WORKER}u\n"
     + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
+
+# One 64-thread group walks a short contiguous run of tiles with a common left
+# block. It loads that block once and accumulates its force across the run, while
+# each right block is still reduced locally. This preserves exact 8x8 geometry
+# but removes repeated global writes and parameter gathers for the shared side.
+_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint group = threadgroup_position_in_grid.x;
+    int group_start = force_group_starts[group];
+    int group_count = force_group_counts[group];
+
+    threadgroup int left_atoms[8];
+    threadgroup int right_atoms[8];
+    threadgroup float left_positions[24];
+    threadgroup float right_positions[24];
+    threadgroup float left_half_sigma[8];
+    threadgroup float right_half_sigma[8];
+    threadgroup float left_sqrt_epsilon[8];
+    threadgroup float right_sqrt_epsilon[8];
+    threadgroup float left_charges[8];
+    threadgroup float right_charges[8];
+    threadgroup float pair_fx[64];
+    threadgroup float pair_fy[64];
+    threadgroup float pair_fz[64];
+
+    int left_block = tile_blocks[2 * group_start + 0];
+    if (lane < 8u) {
+        int left_atom = atom_blocks[8 * left_block + lane];
+        left_atoms[lane] = left_atom;
+        int safe_left = max(left_atom, 0);
+        left_positions[3 * lane + 0] = positions[3 * safe_left + 0];
+        left_positions[3 * lane + 1] = positions[3 * safe_left + 1];
+        left_positions[3 * lane + 2] = positions[3 * safe_left + 2];
+        left_half_sigma[lane] = half_sigma[safe_left];
+        left_sqrt_epsilon[lane] = sqrt_epsilon[safe_left];
+        left_charges[lane] = charges[safe_left];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float accumulated_left_fx = 0.0f;
+    float accumulated_left_fy = 0.0f;
+    float accumulated_left_fz = 0.0f;
+    uint left_slot = lane >> 3;
+    uint right_slot = lane & 7u;
+    uint word = lane >> 5;
+    uint bit = lane & 31u;
+
+    for (int local_tile = 0; local_tile < group_count; local_tile++) {
+        int tile = group_start + local_tile;
+        int tile_left_block = tile_blocks[2 * tile + 0];
+        int right_block = tile_blocks[2 * tile + 1];
+        bool same_block = tile_left_block == right_block;
+        if (lane < 8u) {
+            int right_atom = atom_blocks[8 * right_block + lane];
+            right_atoms[lane] = right_atom;
+            int safe_right = max(right_atom, 0);
+            right_positions[3 * lane + 0] = positions[3 * safe_right + 0];
+            right_positions[3 * lane + 1] = positions[3 * safe_right + 1];
+            right_positions[3 * lane + 2] = positions[3 * safe_right + 2];
+            right_half_sigma[lane] = half_sigma[safe_right];
+            right_sqrt_epsilon[lane] = sqrt_epsilon[safe_right];
+            right_charges[lane] = charges[safe_right];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool member = ((member_mask[2 * tile + word] >> bit) & 1u) != 0u;
+        int i = left_atoms[left_slot];
+        int j = right_atoms[right_slot];
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+        if (member && i >= 0 && j >= 0) {
+            float dx = left_positions[3 * left_slot + 0]
+                - right_positions[3 * right_slot + 0];
+            float dy = left_positions[3 * left_slot + 1]
+                - right_positions[3 * right_slot + 1];
+            float dz = left_positions[3 * left_slot + 2]
+                - right_positions[3 * right_slot + 2];
+            float lx = box[0];
+            float ly = box[1];
+            float lz = box[2];
+            dx -= lx * rint(dx * box[3]);
+            dy -= ly * rint(dy * box[4]);
+            dz -= lz * rint(dz * box[5]);
+            float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 > 0.0f && r2 < params[0]) {
+                float inv_distance = rsqrt(r2);
+                float inv_r2 = inv_distance * inv_distance;
+                float distance = r2 * inv_distance;
+                float scalar = 0.0f;
+                bool lj_enabled =
+                    ((lj_enabled_mask[2 * tile + word] >> bit) & 1u) != 0u;
+                if (lj_enabled) {
+                    bool one_four =
+                        ((lj_one_four_mask[2 * tile + word] >> bit) & 1u) != 0u;
+                    float lj_scale = one_four ? params[10] : 1.0f;
+                    float sigma_ij = left_half_sigma[left_slot]
+                        + right_half_sigma[right_slot];
+                    float epsilon_ij = left_sqrt_epsilon[left_slot]
+                        * right_sqrt_epsilon[right_slot];
+                    float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+                    float inv_r6 =
+                        sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
+                    float inv_r12 = inv_r6 * inv_r6;
+                    float unswitched_energy =
+                        4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                    if (params[1] > 0.5f) {
+                        float sigma2_over_rc2 = sigma_ij * sigma_ij / params[0];
+                        float inv_rc6 = sigma2_over_rc2
+                            * sigma2_over_rc2 * sigma2_over_rc2;
+                        unswitched_energy -= 4.0f * epsilon_ij
+                            * (inv_rc6 * inv_rc6 - inv_rc6);
+                    }
+
+                    float switch_value = 1.0f;
+                    float switch_derivative = 0.0f;
+                    if (params[2] > 0.5f) {
+                        float x = clamp(
+                            (distance - params[3]) * params[9],
+                            0.0f,
+                            1.0f
+                        );
+                        float x2 = x * x;
+                        float x3 = x2 * x;
+                        float x4 = x3 * x;
+                        float x5 = x4 * x;
+                        switch_value = 1.0f
+                            - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
+                        if (distance > params[3] && distance < params[5]) {
+                            switch_derivative = -(
+                                30.0f * x2 - 60.0f * x3 + 30.0f * x4
+                            ) * params[9];
+                        }
+                    }
+                    scalar += (
+                        24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
+                        * inv_r2 * switch_value
+                        - unswitched_energy * switch_derivative * inv_distance
+                    ) * lj_scale;
+                }
+
+                float qij = left_charges[left_slot] * right_charges[right_slot];
+                float erfc_term =
+                    1.0f - mlx_atomistic_erf(params[7] * distance);
+                scalar += params[6] * qij * (
+                    erfc_term * inv_r2 * inv_distance
+                    + params[8] * exp(-params[7] * params[7] * r2) * inv_r2
+                );
+                fx = scalar * dx;
+                fy = scalar * dy;
+                fz = scalar * dz;
+            }
+        }
+        pair_fx[lane] = fx;
+        pair_fy[lane] = fy;
+        pair_fz[lane] = fz;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane < 8u) {
+            float reduced_fx = 0.0f;
+            float reduced_fy = 0.0f;
+            float reduced_fz = 0.0f;
+            for (uint other = 0u; other < 8u; other++) {
+                uint pair_lane = 8u * lane + other;
+                reduced_fx += pair_fx[pair_lane];
+                reduced_fy += pair_fy[pair_lane];
+                reduced_fz += pair_fz[pair_lane];
+            }
+            if (same_block) {
+                for (uint other = 0u; other < 8u; other++) {
+                    uint pair_lane = 8u * other + lane;
+                    reduced_fx -= pair_fx[pair_lane];
+                    reduced_fy -= pair_fy[pair_lane];
+                    reduced_fz -= pair_fz[pair_lane];
+                }
+            }
+            accumulated_left_fx += reduced_fx;
+            accumulated_left_fy += reduced_fy;
+            accumulated_left_fz += reduced_fz;
+        } else if (lane < 16u && !same_block) {
+            uint slot = lane - 8u;
+            float reduced_fx = 0.0f;
+            float reduced_fy = 0.0f;
+            float reduced_fz = 0.0f;
+            for (uint other = 0u; other < 8u; other++) {
+                uint pair_lane = 8u * other + slot;
+                reduced_fx -= pair_fx[pair_lane];
+                reduced_fy -= pair_fy[pair_lane];
+                reduced_fz -= pair_fz[pair_lane];
+            }
+            int atom = right_atoms[slot];
+            if (
+                atom >= 0
+                && (reduced_fx != 0.0f || reduced_fy != 0.0f || reduced_fz != 0.0f)
+            ) {
+                atomic_fetch_add_explicit(
+                    &forces[3 * atom + 0], reduced_fx, memory_order_relaxed
+                );
+                atomic_fetch_add_explicit(
+                    &forces[3 * atom + 1], reduced_fy, memory_order_relaxed
+                );
+                atomic_fetch_add_explicit(
+                    &forces[3 * atom + 2], reduced_fz, memory_order_relaxed
+                );
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane < 8u) {
+        int atom = left_atoms[lane];
+        if (
+            atom >= 0
+            && (
+                accumulated_left_fx != 0.0f
+                || accumulated_left_fy != 0.0f
+                || accumulated_left_fz != 0.0f
+            )
+        ) {
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 0], accumulated_left_fx, memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 1], accumulated_left_fy, memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &forces[3 * atom + 2], accumulated_left_fz, memory_order_relaxed
+            );
+        }
+    }
+"""
+
+_SPARSE_PME_CORRECTION_FORCE_ONLY_SOURCE = r"""
+    uint t = thread_position_in_grid.x;
+    if (t >= (uint)npair[0]) {
+        return;
+    }
+
+    int atom_i = pairs_i[t];
+    int atom_j = pairs_j[t];
+    float dx = positions[3 * atom_i + 0] - positions[3 * atom_j + 0];
+    float dy = positions[3 * atom_i + 1] - positions[3 * atom_j + 1];
+    float dz = positions[3 * atom_i + 2] - positions[3 * atom_j + 2];
+    dx -= box[0] * rint(dx * box[3]);
+    dy -= box[1] * rint(dy * box[4]);
+    dz -= box[2] * rint(dz * box[5]);
+    float r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 <= 0.0f) {
+        return;
+    }
+
+    float inv_distance = rsqrt(r2);
+    float inv_r2 = inv_distance * inv_distance;
+    float scalar = params[0] * charge_products[t] * inv_r2 * inv_distance;
+    float epsilon = lj_epsilon[t];
+    if (epsilon > 0.0f) {
+        float sigma2_over_r2 = lj_sigma[t] * lj_sigma[t] * inv_r2;
+        float inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
+        float inv_r12 = inv_r6 * inv_r6;
+        scalar += 24.0f * epsilon * (2.0f * inv_r12 - inv_r6) * inv_r2;
+    }
+
+    float fx = scalar * dx;
+    float fy = scalar * dy;
+    float fz = scalar * dz;
+    atomic_fetch_add_explicit(&forces[3 * atom_i + 0], fx, memory_order_relaxed);
+    atomic_fetch_add_explicit(&forces[3 * atom_i + 1], fy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&forces[3 * atom_i + 2], fz, memory_order_relaxed);
+    atomic_fetch_add_explicit(&forces[3 * atom_j + 0], -fx, memory_order_relaxed);
+    atomic_fetch_add_explicit(&forces[3 * atom_j + 1], -fy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&forces[3 * atom_j + 2], -fz, memory_order_relaxed);
+"""
 
 _PME_CUTOFF_CORRECTION_VIRIAL_SOURCE = r"""
     uint t = thread_position_in_grid.x;
@@ -1266,6 +1556,224 @@ _NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE = r"""
     int j = pairs_j[t];
     accepted_i[out] = min(i, j);
     accepted_j[out] = max(i, j);
+"""
+
+_NEIGHBOR_CELL_TILE_CANDIDATES_SOURCE = r"""
+    uint task = thread_position_in_grid.x;
+    if (task >= (uint)counts[0]) {
+        return;
+    }
+
+    int left_cell = cell_pairs[2 * task + 0];
+    int right_cell = cell_pairs[2 * task + 1];
+    int left_start = cell_block_starts[left_cell];
+    int right_start = cell_block_starts[right_cell];
+    int left_count = cell_block_counts[left_cell];
+    int right_count = cell_block_counts[right_cell];
+    int output = task_offsets[task];
+
+    if (left_cell == right_cell) {
+        for (int left = 0; left < left_count; left++) {
+            for (int right = left; right < right_count; right++) {
+                tile_left[output] = left_start + left;
+                tile_right[output] = right_start + right;
+                output++;
+            }
+        }
+        return;
+    }
+
+    for (int left = 0; left < left_count; left++) {
+        for (int right = 0; right < right_count; right++) {
+            tile_left[output] = left_start + left;
+            tile_right[output] = right_start + right;
+            output++;
+        }
+    }
+"""
+
+_NEIGHBOR_TILE_MEMBERSHIP_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint tile = threadgroup_position_in_grid.x;
+    uint left_slot = lane >> 3;
+    uint right_slot = lane & 7u;
+    threadgroup uint active[64];
+
+    int left_block = tile_blocks[2 * tile + 0];
+    int right_block = tile_blocks[2 * tile + 1];
+    int atom_i = atom_blocks[8 * left_block + left_slot];
+    int atom_j = atom_blocks[8 * right_block + right_slot];
+    bool valid = atom_i >= 0 && atom_j >= 0;
+    if (left_block == right_block) {
+        valid = valid && left_slot < right_slot;
+    }
+    bool close = false;
+    if (valid) {
+        float dx = positions[3 * atom_i + 0] - positions[3 * atom_j + 0];
+        float dy = positions[3 * atom_i + 1] - positions[3 * atom_j + 1];
+        float dz = positions[3 * atom_i + 2] - positions[3 * atom_j + 2];
+        dx -= box[0] * rint(dx / box[0]);
+        dy -= box[1] * rint(dy / box[1]);
+        dz -= box[2] * rint(dz / box[2]);
+        close = dx * dx + dy * dy + dz * dz < params[0];
+    }
+    active[lane] = close ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane < 2u) {
+        uint word = 0u;
+        uint base = 32u * lane;
+        for (uint bit = 0u; bit < 32u; bit++) {
+            word |= active[base + bit] << bit;
+        }
+        member_mask[2 * tile + lane] = word;
+    }
+    if (lane == 0u) {
+        int total = 0;
+        for (uint index = 0u; index < 64u; index++) {
+            total += (int)active[index];
+        }
+        member_counts[tile] = total;
+    }
+"""
+
+_NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE = r"""
+    uint tile = thread_position_in_grid.x;
+    if (tile >= (uint)counts[0] || member_counts[tile] == 0) {
+        return;
+    }
+    uint output = (uint)(prefix[tile] - 1);
+    accepted_tile_blocks[2 * output + 0] = tile_blocks[2 * tile + 0];
+    accepted_tile_blocks[2 * output + 1] = tile_blocks[2 * tile + 1];
+    accepted_member_mask[2 * output + 0] = member_mask[2 * tile + 0];
+    accepted_member_mask[2 * output + 1] = member_mask[2 * tile + 1];
+"""
+
+_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
+    uint block = thread_position_in_grid.x;
+    if (block >= (uint)counts[0] || tile_counts[block] == 0) {
+        return;
+    }
+
+    int tile_count = tile_counts[block];
+    int tile_start = tile_prefix[block] - tile_count;
+    int group_count = group_counts[block];
+    int group_start = group_prefix[block] - group_count;
+    int tiles_per_group = counts[1];
+    for (int local = 0; local < group_count; local++) {
+        int consumed = local * tiles_per_group;
+        int output = group_start + local;
+        force_group_starts[output] = tile_start + consumed;
+        force_group_counts[output] = min(tiles_per_group, tile_count - consumed);
+    }
+"""
+
+_NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint tile = threadgroup_position_in_grid.x;
+    uint word_index = lane >> 5;
+    uint bit_index = lane & 31u;
+    threadgroup uint scan[64];
+
+    uint word = member_mask[2 * tile + word_index];
+    uint active = (word >> bit_index) & 1u;
+    scan[lane] = active;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1u; offset < 64u; offset <<= 1u) {
+        uint addend = lane >= offset ? scan[lane - offset] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scan[lane] += addend;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active == 0u) {
+        return;
+    }
+
+    uint base = (uint)(member_prefix[tile] - member_counts[tile]);
+    uint output = base + scan[lane] - 1u;
+    int left_block = tile_blocks[2 * tile + 0];
+    int right_block = tile_blocks[2 * tile + 1];
+    int atom_i = atom_blocks[8 * left_block + (lane >> 3)];
+    int atom_j = atom_blocks[8 * right_block + (lane & 7u)];
+    accepted_i[output] = min(atom_i, atom_j);
+    accepted_j[output] = max(atom_i, atom_j);
+"""
+
+_TILE_TOPOLOGY_LJ_MASKS_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint tile = threadgroup_position_in_grid.x;
+    uint word_index = lane >> 5;
+    uint bit_index = lane & 31u;
+    threadgroup uint enabled[64];
+    threadgroup uint one_four[64];
+
+    uint member_word = member_mask[2 * tile + word_index];
+    bool member = ((member_word >> bit_index) & 1u) != 0u;
+    int left_block = tile_blocks[2 * tile + 0];
+    int right_block = tile_blocks[2 * tile + 1];
+    int atom_i = atom_blocks[8 * left_block + (lane >> 3)];
+    int atom_j = atom_blocks[8 * right_block + (lane & 7u)];
+    int left = min(atom_i, atom_j);
+    int right = max(atom_i, atom_j);
+
+    bool excluded = false;
+    if (member) {
+        int lower = 0;
+        int upper = counts[1];
+        while (lower < upper) {
+            int middle = lower + (upper - lower) / 2;
+            int known_left = excluded_i[middle];
+            int known_right = excluded_j[middle];
+            if (
+                known_left < left
+                || (known_left == left && known_right < right)
+            ) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        excluded = lower < counts[1]
+            && excluded_i[lower] == left
+            && excluded_j[lower] == right;
+    }
+
+    bool scaled = false;
+    if (member && !excluded && counts[2] > 0) {
+        int lower = 0;
+        int upper = counts[2];
+        while (lower < upper) {
+            int middle = lower + (upper - lower) / 2;
+            int known_left = one_four_i[middle];
+            int known_right = one_four_j[middle];
+            if (
+                known_left < left
+                || (known_left == left && known_right < right)
+            ) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        scaled = lower < counts[2]
+            && one_four_i[lower] == left
+            && one_four_j[lower] == right;
+    }
+    enabled[lane] = member && !excluded ? 1u : 0u;
+    one_four[lane] = scaled ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane < 2u) {
+        uint enabled_word = 0u;
+        uint one_four_word = 0u;
+        uint base = 32u * lane;
+        for (uint bit = 0u; bit < 32u; bit++) {
+            enabled_word |= enabled[base + bit] << bit;
+            one_four_word |= one_four[base + bit] << bit;
+        }
+        lj_enabled_mask[2 * tile + lane] = enabled_word;
+        lj_one_four_mask[2 * tile + lane] = one_four_word;
+    }
 """
 
 _CONSTRAINT_HEADER = r"""
@@ -1829,6 +2337,61 @@ def _prepared_pme_direct_force_only_kernel():
     return _prepared_pme_direct_force_only_kernel_singleton
 
 
+def _tile_pme_direct_force_only_kernel():
+    """Return the cached spatial 8x8 tile direct-force kernel."""
+
+    global _tile_pme_direct_force_only_kernel_singleton
+    if _tile_pme_direct_force_only_kernel_singleton is None:
+        _tile_pme_direct_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="spatial_tile_prepared_parameterized_pme_direct_force_only",
+            input_names=[
+                "positions",
+                "atom_blocks",
+                "tile_blocks",
+                "member_mask",
+                "lj_enabled_mask",
+                "lj_one_four_mask",
+                "force_group_starts",
+                "force_group_counts",
+                "box",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "params",
+            ],
+            output_names=["forces"],
+            source=_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _tile_pme_direct_force_only_kernel_singleton
+
+
+def _sparse_pme_correction_force_only_kernel():
+    """Return the cached fused sparse PME-correction force kernel."""
+
+    global _sparse_pme_correction_force_only_kernel_singleton
+    if _sparse_pme_correction_force_only_kernel_singleton is None:
+        _sparse_pme_correction_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="sparse_pme_correction_force_only",
+            input_names=[
+                "positions",
+                "pairs_i",
+                "pairs_j",
+                "box",
+                "charge_products",
+                "lj_sigma",
+                "lj_epsilon",
+                "params",
+                "npair",
+            ],
+            output_names=["forces"],
+            source=_SPARSE_PME_CORRECTION_FORCE_ONLY_SOURCE,
+            atomic_outputs=True,
+        )
+    return _sparse_pme_correction_force_only_kernel_singleton
+
+
 def _parameterized_pme_direct_virial_kernel():
     """Return the cached diagnostic fused LJ/PME-direct virial kernel."""
 
@@ -2010,6 +2573,123 @@ def _neighbor_pair_ordered_scatter_kernel():
             source=_NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE,
         )
     return _neighbor_pair_ordered_scatter_kernel_singleton
+
+
+def _neighbor_cell_tile_candidates_kernel():
+    """Return the cached spatial cell-block tile-emission kernel."""
+
+    global _neighbor_cell_tile_candidates_kernel_singleton
+    if _neighbor_cell_tile_candidates_kernel_singleton is None:
+        _neighbor_cell_tile_candidates_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_cell_tile_candidates",
+            input_names=[
+                "cell_block_starts",
+                "cell_block_counts",
+                "cell_pairs",
+                "task_offsets",
+                "counts",
+            ],
+            output_names=["tile_left", "tile_right"],
+            source=_NEIGHBOR_CELL_TILE_CANDIDATES_SOURCE,
+        )
+    return _neighbor_cell_tile_candidates_kernel_singleton
+
+
+def _neighbor_tile_membership_kernel():
+    """Return the cached exact spatial-tile membership kernel."""
+
+    global _neighbor_tile_membership_kernel_singleton
+    if _neighbor_tile_membership_kernel_singleton is None:
+        _neighbor_tile_membership_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_membership",
+            input_names=["positions", "atom_blocks", "tile_blocks", "box", "params"],
+            output_names=["member_mask", "member_counts"],
+            source=_NEIGHBOR_TILE_MEMBERSHIP_SOURCE,
+        )
+    return _neighbor_tile_membership_kernel_singleton
+
+
+def _neighbor_tile_ordered_scatter_kernel():
+    """Return the cached non-empty spatial-tile compaction kernel."""
+
+    global _neighbor_tile_ordered_scatter_kernel_singleton
+    if _neighbor_tile_ordered_scatter_kernel_singleton is None:
+        _neighbor_tile_ordered_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_ordered_scatter",
+            input_names=[
+                "tile_blocks",
+                "member_mask",
+                "member_counts",
+                "prefix",
+                "counts",
+            ],
+            output_names=["accepted_tile_blocks", "accepted_member_mask"],
+            source=_NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE,
+        )
+    return _neighbor_tile_ordered_scatter_kernel_singleton
+
+
+def _neighbor_tile_force_groups_kernel():
+    """Return the cached spatial-tile force-group schedule kernel."""
+
+    global _neighbor_tile_force_groups_kernel_singleton
+    if _neighbor_tile_force_groups_kernel_singleton is None:
+        _neighbor_tile_force_groups_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_force_groups",
+            input_names=[
+                "tile_counts",
+                "tile_prefix",
+                "group_counts",
+                "group_prefix",
+                "counts",
+            ],
+            output_names=["force_group_starts", "force_group_counts"],
+            source=_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE,
+        )
+    return _neighbor_tile_force_groups_kernel_singleton
+
+
+def _neighbor_tile_pair_scatter_kernel():
+    """Return the cached tile-membership diagnostic-pair decoder."""
+
+    global _neighbor_tile_pair_scatter_kernel_singleton
+    if _neighbor_tile_pair_scatter_kernel_singleton is None:
+        _neighbor_tile_pair_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_pair_scatter",
+            input_names=[
+                "atom_blocks",
+                "tile_blocks",
+                "member_mask",
+                "member_counts",
+                "member_prefix",
+            ],
+            output_names=["accepted_i", "accepted_j"],
+            source=_NEIGHBOR_TILE_PAIR_SCATTER_SOURCE,
+        )
+    return _neighbor_tile_pair_scatter_kernel_singleton
+
+
+def _tile_topology_lj_masks_kernel():
+    """Return the cached tile-aligned topology-mask kernel."""
+
+    global _tile_topology_lj_masks_kernel_singleton
+    if _tile_topology_lj_masks_kernel_singleton is None:
+        _tile_topology_lj_masks_kernel_singleton = mx.fast.metal_kernel(
+            name="tile_topology_lj_masks",
+            input_names=[
+                "atom_blocks",
+                "tile_blocks",
+                "member_mask",
+                "excluded_i",
+                "excluded_j",
+                "one_four_i",
+                "one_four_j",
+                "counts",
+            ],
+            output_names=["lj_enabled_mask", "lj_one_four_mask"],
+            source=_TILE_TOPOLOGY_LJ_MASKS_SOURCE,
+        )
+    return _tile_topology_lj_masks_kernel_singleton
 
 
 def _shake_cluster_position_kernel():
@@ -2268,6 +2948,312 @@ def _neighbor_cell_pair_candidates(
         threadgroup=(threads, 1, 1),
     )
     return pairs_i, pairs_j
+
+
+def _neighbor_cell_tile_candidates(
+    cell_block_starts: mx.array,
+    cell_block_counts: mx.array,
+    cell_pairs: mx.array,
+    task_offsets: mx.array,
+    *,
+    candidate_count: int,
+) -> mx.array:
+    """Emit spatial block-pair tile candidates on Metal."""
+
+    cell_block_starts = as_mx_array(cell_block_starts, dtype=mx.int32)
+    cell_block_counts = as_mx_array(cell_block_counts, dtype=mx.int32)
+    cell_pairs = as_mx_array(cell_pairs, dtype=mx.int32)
+    task_offsets = as_mx_array(task_offsets, dtype=mx.int32)
+    if (
+        cell_block_starts.ndim != 1
+        or cell_block_counts.shape != cell_block_starts.shape
+    ):
+        msg = "cell block starts and counts must have matching one-dimensional shapes"
+        raise ValueError(msg)
+    if cell_pairs.ndim != 2 or cell_pairs.shape[1] != 2:
+        msg = "cell_pairs must have shape (n_tasks, 2)"
+        raise ValueError(msg)
+    if task_offsets.shape != (cell_pairs.shape[0],):
+        msg = "task_offsets must contain one output offset per cell-pair task"
+        raise ValueError(msg)
+    if candidate_count < 0:
+        msg = "candidate_count must be non-negative"
+        raise ValueError(msg)
+    task_count = int(cell_pairs.shape[0])
+    if task_count == 0 or candidate_count == 0:
+        return mx.zeros((0, 2), dtype=mx.int32)
+    threads = min(256, task_count)
+    tile_left, tile_right = _neighbor_cell_tile_candidates_kernel()(
+        inputs=[
+            cell_block_starts,
+            cell_block_counts,
+            cell_pairs,
+            task_offsets,
+            mx.array([task_count], dtype=mx.int32),
+        ],
+        output_shapes=[(candidate_count,), (candidate_count,)],
+        output_dtypes=[mx.int32, mx.int32],
+        grid=(task_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+    )
+    return mx.stack((tile_left, tile_right), axis=1)
+
+
+def _neighbor_tile_membership(
+    positions: mx.array,
+    atom_blocks: mx.array,
+    tile_blocks: mx.array,
+    box_lengths: mx.array,
+    *,
+    search_radius: float,
+) -> tuple[mx.array, mx.array]:
+    """Encode exact cutoff-plus-skin membership for spatial 8x8 tiles."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
+    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
+        msg = "atom_blocks must have shape (n_blocks, 8)"
+        raise ValueError(msg)
+    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
+        msg = "tile_blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if box_lengths.shape != (3,):
+        msg = "box_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if not isfinite(float(search_radius)) or float(search_radius) <= 0.0:
+        msg = "search_radius must be finite and positive"
+        raise ValueError(msg)
+    tile_count = int(tile_blocks.shape[0])
+    if tile_count == 0:
+        return (
+            mx.zeros((0, 2), dtype=mx.uint32),
+            mx.zeros((0,), dtype=mx.int32),
+        )
+    member_mask, member_counts = _neighbor_tile_membership_kernel()(
+        inputs=[
+            positions,
+            atom_blocks,
+            tile_blocks,
+            box_lengths,
+            mx.array([float(search_radius) ** 2], dtype=mx.float32),
+        ],
+        output_shapes=[(tile_count, 2), (tile_count,)],
+        output_dtypes=[mx.uint32, mx.int32],
+        grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
+        threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
+        init_value=0,
+    )
+    return member_mask, member_counts
+
+
+def _neighbor_tile_ordered_scatter_sized(
+    tile_blocks: mx.array,
+    member_mask: mx.array,
+    member_counts: mx.array,
+    prefix: mx.array,
+    *,
+    accepted_count: int,
+) -> tuple[mx.array, mx.array]:
+    """Compact non-empty spatial tiles into explicitly sized outputs."""
+
+    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    member_counts = as_mx_array(member_counts, dtype=mx.int32)
+    prefix = as_mx_array(prefix, dtype=mx.int32)
+    tile_count = int(tile_blocks.shape[0])
+    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
+        msg = "tile_blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if member_mask.shape != (tile_count, 2):
+        msg = "member_mask must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if member_counts.shape != (tile_count,) or prefix.shape != (tile_count,):
+        msg = "member_counts and prefix must contain one value per tile"
+        raise ValueError(msg)
+    if accepted_count < 0 or accepted_count > tile_count:
+        msg = "accepted_count must fit within the candidate tile count"
+        raise ValueError(msg)
+    if accepted_count == 0:
+        return (
+            mx.zeros((0, 2), dtype=mx.int32),
+            mx.zeros((0, 2), dtype=mx.uint32),
+        )
+    accepted_tiles, accepted_mask = _neighbor_tile_ordered_scatter_kernel()(
+        inputs=[
+            tile_blocks,
+            member_mask,
+            member_counts,
+            prefix,
+            mx.array([tile_count], dtype=mx.int32),
+        ],
+        output_shapes=[(accepted_count, 2), (accepted_count, 2)],
+        output_dtypes=[mx.int32, mx.uint32],
+        grid=(tile_count, 1, 1),
+        threadgroup=(min(256, tile_count), 1, 1),
+        init_value=0,
+    )
+    return accepted_tiles, accepted_mask
+
+
+def _neighbor_tile_force_groups_sized(
+    tile_counts: mx.array,
+    tile_prefix: mx.array,
+    group_counts: mx.array,
+    group_prefix: mx.array,
+    *,
+    accepted_count: int,
+    tiles_per_group: int,
+) -> tuple[mx.array, mx.array]:
+    """Build contiguous same-left-block force groups from tile row counts."""
+
+    tile_counts = as_mx_array(tile_counts, dtype=mx.int32)
+    tile_prefix = as_mx_array(tile_prefix, dtype=mx.int32)
+    group_counts = as_mx_array(group_counts, dtype=mx.int32)
+    group_prefix = as_mx_array(group_prefix, dtype=mx.int32)
+    block_count = int(tile_counts.shape[0])
+    if any(
+        values.shape != (block_count,)
+        for values in (tile_prefix, group_counts, group_prefix)
+    ):
+        msg = "tile and group counts/prefixes must have matching one-dimensional shapes"
+        raise ValueError(msg)
+    if tiles_per_group <= 0:
+        msg = "tiles_per_group must be positive"
+        raise ValueError(msg)
+    if accepted_count < 0:
+        msg = "accepted_count must be non-negative"
+        raise ValueError(msg)
+    if accepted_count == 0:
+        empty = mx.zeros((0,), dtype=mx.int32)
+        return empty, empty
+    force_group_starts, force_group_sizes = _neighbor_tile_force_groups_kernel()(
+        inputs=[
+            tile_counts,
+            tile_prefix,
+            group_counts,
+            group_prefix,
+            mx.array([block_count, tiles_per_group], dtype=mx.int32),
+        ],
+        output_shapes=[(accepted_count,), (accepted_count,)],
+        output_dtypes=[mx.int32, mx.int32],
+        grid=(block_count, 1, 1),
+        threadgroup=(min(256, block_count), 1, 1),
+        init_value=0,
+    )
+    return force_group_starts, force_group_sizes
+
+
+def _neighbor_tile_member_pairs_sized(
+    atom_blocks: mx.array,
+    tile_blocks: mx.array,
+    member_mask: mx.array,
+    member_counts: mx.array,
+    member_prefix: mx.array,
+    *,
+    accepted_count: int,
+) -> mx.array:
+    """Decode diagnostic pairs from already-computed tile membership."""
+
+    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
+    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    member_counts = as_mx_array(member_counts, dtype=mx.int32)
+    member_prefix = as_mx_array(member_prefix, dtype=mx.int32)
+    tile_count = int(tile_blocks.shape[0])
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
+        msg = "atom_blocks must have shape (n_blocks, 8)"
+        raise ValueError(msg)
+    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
+        msg = "tile_blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if member_mask.shape != (tile_count, 2):
+        msg = "member_mask must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if member_counts.shape != (tile_count,) or member_prefix.shape != (tile_count,):
+        msg = "member counts and prefix must contain one value per tile"
+        raise ValueError(msg)
+    if accepted_count < 0 or (tile_count == 0 and accepted_count != 0):
+        msg = "accepted_count is incompatible with tile membership"
+        raise ValueError(msg)
+    if accepted_count == 0:
+        return mx.zeros((0, 2), dtype=mx.int32)
+    accepted_i, accepted_j = _neighbor_tile_pair_scatter_kernel()(
+        inputs=[
+            atom_blocks,
+            tile_blocks,
+            member_mask,
+            member_counts,
+            member_prefix,
+        ],
+        output_shapes=[(accepted_count,), (accepted_count,)],
+        output_dtypes=[mx.int32, mx.int32],
+        grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
+        threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
+        init_value=0,
+    )
+    return mx.stack((accepted_i, accepted_j), axis=1)
+
+
+def tile_topology_lj_masks(
+    atom_blocks: mx.array,
+    tile_blocks: mx.array,
+    member_mask: mx.array,
+    excluded_pairs: mx.array,
+    one_four_pairs: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Build tile-aligned LJ eligibility and 1-4 masks on Metal."""
+
+    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
+    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    excluded_pairs = as_mx_array(excluded_pairs, dtype=mx.int32)
+    one_four_pairs = as_mx_array(one_four_pairs, dtype=mx.int32)
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
+        msg = "atom_blocks must have shape (n_blocks, 8)"
+        raise ValueError(msg)
+    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
+        msg = "tile_blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    tile_count = int(tile_blocks.shape[0])
+    if member_mask.shape != (tile_count, 2):
+        msg = "member_mask must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    for name, values in (
+        ("excluded_pairs", excluded_pairs),
+        ("one_four_pairs", one_four_pairs),
+    ):
+        if values.ndim != 2 or values.shape[1] != 2:
+            msg = f"{name} must have shape (n, 2)"
+            raise ValueError(msg)
+    if tile_count == 0:
+        empty = mx.zeros((0, 2), dtype=mx.uint32)
+        return empty, empty
+    enabled_mask, one_four_mask = _tile_topology_lj_masks_kernel()(
+        inputs=[
+            atom_blocks,
+            tile_blocks,
+            member_mask,
+            excluded_pairs[:, 0],
+            excluded_pairs[:, 1],
+            one_four_pairs[:, 0],
+            one_four_pairs[:, 1],
+            mx.array(
+                [tile_count, int(excluded_pairs.shape[0]), int(one_four_pairs.shape[0])],
+                dtype=mx.int32,
+            ),
+        ],
+        output_shapes=[(tile_count, 2), (tile_count, 2)],
+        output_dtypes=[mx.uint32, mx.uint32],
+        grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
+        threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
+        init_value=0,
+    )
+    return enabled_mask, one_four_mask
 
 
 def neighbor_pair_ordered_scatter(
@@ -3659,6 +4645,205 @@ def _prepared_parameterized_pme_direct_force_only(
         output_dtypes=[mx.float32],
         grid=(worker_count, 1, 1),
         threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces
+
+
+def _tile_parameterized_pme_direct_force_only(
+    positions: mx.array,
+    atom_blocks: mx.array,
+    tile_blocks: mx.array,
+    member_mask: mx.array,
+    lj_enabled_mask: mx.array,
+    lj_one_four_mask: mx.array,
+    force_group_starts: mx.array,
+    force_group_counts: mx.array,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    one_four_scale: float,
+    coulomb_constant: float,
+    alpha: float,
+) -> mx.array:
+    """Evaluate prepared direct forces from exact spatial 8x8 tiles."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
+    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    lj_enabled_mask = as_mx_array(lj_enabled_mask, dtype=mx.uint32)
+    lj_one_four_mask = as_mx_array(lj_one_four_mask, dtype=mx.uint32)
+    force_group_starts = as_mx_array(force_group_starts, dtype=mx.int32)
+    force_group_counts = as_mx_array(force_group_counts, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
+    sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    n_atoms = int(positions.shape[0])
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
+        msg = "atom_blocks must have shape (n_blocks, 8)"
+        raise ValueError(msg)
+    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
+        msg = "tile_blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    tile_count = int(tile_blocks.shape[0])
+    mask_shape = (tile_count, 2)
+    if member_mask.shape != mask_shape:
+        msg = "member_mask must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    if lj_enabled_mask.shape != mask_shape or lj_one_four_mask.shape != mask_shape:
+        msg = "tile LJ masks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    group_count = int(force_group_starts.shape[0])
+    if force_group_starts.ndim != 1 or force_group_counts.shape != (group_count,):
+        msg = "tile force group starts and counts must have matching vector shapes"
+        raise ValueError(msg)
+    if box.shape != (6,):
+        msg = "box_lengths_and_inverses must have shape (6,)"
+        raise ValueError(msg)
+    if half_sigma.shape != (n_atoms,) or sqrt_epsilon.shape != (n_atoms,):
+        msg = "prepared LJ parameters must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if charges.shape != (n_atoms,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if cutoff is None or not isfinite(float(cutoff)) or cutoff <= 0.0:
+        msg = "tile PME direct forces require a finite positive cutoff"
+        raise ValueError(msg)
+    if not isfinite(float(alpha)) or alpha <= 0.0:
+        msg = "tile PME direct forces require finite positive alpha"
+        raise ValueError(msg)
+    if not isfinite(float(coulomb_constant)):
+        msg = "coulomb_constant must be finite"
+        raise ValueError(msg)
+    if not isfinite(float(one_four_scale)) or one_four_scale < 0.0:
+        msg = "one_four_scale must be finite and non-negative"
+        raise ValueError(msg)
+    cutoff_value = float(cutoff)
+    if switch_distance is not None and (
+        not isfinite(float(switch_distance))
+        or float(switch_distance) < 0.0
+        or float(switch_distance) >= cutoff_value
+    ):
+        msg = "switch_distance must be finite, non-negative, and below cutoff"
+        raise ValueError(msg)
+    if tile_count == 0:
+        return mx.zeros_like(positions)
+    if group_count == 0:
+        msg = "non-empty tile geometry requires at least one force group"
+        raise ValueError(msg)
+
+    has_switch = switch_distance is not None
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(has_switch),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+            1.0 / switch_width,
+            float(one_four_scale),
+        ],
+        dtype=mx.float32,
+    )
+    (forces,) = _tile_pme_direct_force_only_kernel()(
+        inputs=[
+            positions,
+            atom_blocks,
+            tile_blocks,
+            member_mask,
+            lj_enabled_mask,
+            lj_one_four_mask,
+            force_group_starts,
+            force_group_counts,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            params,
+        ],
+        output_shapes=[(n_atoms, 3)],
+        output_dtypes=[mx.float32],
+        grid=(group_count * _TILE_PME_THREADGROUP_SIZE, 1, 1),
+        threadgroup=(_TILE_PME_THREADGROUP_SIZE, 1, 1),
+        init_value=0.0,
+    )
+    return forces
+
+
+def fused_sparse_pme_correction_forces(
+    positions: mx.array,
+    pairs: mx.array,
+    box_lengths_and_inverses: mx.array,
+    charge_products: mx.array,
+    lj_sigma: mx.array,
+    lj_epsilon: mx.array,
+    *,
+    coulomb_constant: float,
+) -> mx.array:
+    """Evaluate sparse PME exclusions, exceptions, and 1-4 force corrections."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    pairs = as_mx_array(pairs, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    charge_products = as_mx_array(charge_products, dtype=mx.float32)
+    lj_sigma = as_mx_array(lj_sigma, dtype=mx.float32)
+    lj_epsilon = as_mx_array(lj_epsilon, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        msg = "pairs must have shape (n_pairs, 2)"
+        raise ValueError(msg)
+    pair_count = int(pairs.shape[0])
+    for name, values in (
+        ("charge_products", charge_products),
+        ("lj_sigma", lj_sigma),
+        ("lj_epsilon", lj_epsilon),
+    ):
+        if values.shape != (pair_count,):
+            msg = f"{name} must have shape (n_pairs,)"
+            raise ValueError(msg)
+    if box.shape != (6,):
+        msg = "box_lengths_and_inverses must have shape (6,)"
+        raise ValueError(msg)
+    if not isfinite(float(coulomb_constant)):
+        msg = "coulomb_constant must be finite"
+        raise ValueError(msg)
+    if pair_count == 0:
+        return mx.zeros_like(positions)
+    (forces,) = _sparse_pme_correction_force_only_kernel()(
+        inputs=[
+            positions,
+            pairs[:, 0],
+            pairs[:, 1],
+            box,
+            charge_products,
+            lj_sigma,
+            lj_epsilon,
+            mx.array([float(coulomb_constant)], dtype=mx.float32),
+            mx.array([pair_count], dtype=mx.int32),
+        ],
+        output_shapes=[positions.shape],
+        output_dtypes=[mx.float32],
+        grid=(pair_count, 1, 1),
+        threadgroup=(min(256, pair_count), 1, 1),
         init_value=0.0,
     )
     return forces
