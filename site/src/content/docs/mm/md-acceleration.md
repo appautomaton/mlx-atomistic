@@ -420,6 +420,20 @@ were removed. The second result also narrows the remaining diagnosis:
 force-buffer addition is measurable under synchronized profiling, but it is
 not a material complete-trajectory bottleneck.
 
+An ordinary-step graph-pruning experiment then separated SETTLE/SHAKE position
+projection from its discarded error result and hoisted three invocation- or
+topology-invariant MLX values. Checked CPU and Metal parity passed, but a
+steady-step graph capture shrank only from 153 to 149 MLX primitives: two
+`ExpandDims` and two `Reshape` nodes. The error result was already absent from
+the materialized Metal graph, so this was primarily a small host-construction
+change rather than the expected compute deletion. In the real-Metal
+`C1 -> A1 -> A2 -> C2` gate, control walls were 0.144676 and 0.148414 seconds;
+candidate walls were 0.143181 and 0.143799 seconds. The candidate median was
+2.08% lower, with both paired directions favorable, while all finite-state,
+constraint, and 40 GB memory checks passed. Because that result was below the
+3% immediate-rejection line and the 5% retention threshold, the implementation
+and candidate-only tests were removed. No JAC or 750-step run was performed.
+
 ### Rejected atom-tile result
 
 The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
