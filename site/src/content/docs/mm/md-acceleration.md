@@ -370,6 +370,19 @@ the 5% complete-wall retention threshold. The retained change is therefore the
 kernel work schedule only; the neighbor lifecycle, integrator sequence,
 constraints, and scientific workload are unchanged.
 
+Two later pipeline experiments were also rejected by the same bounded 75-step
+5DFR gate. Coalescing SETTLE and SHAKE sparse constraint writes changed complete
+wall time from 0.202904 to 0.574724 seconds, a 2.83x regression, because this
+system constrains nearly every atom and the added concatenation and scatter
+work outweighed fewer full-position additions. Flattening the prepared force
+pipeline and replacing its nested MLX additions with one cached Metal
+force-buffer sum changed 0.158592 to 0.159115 seconds, 0.33% slower. Both paths
+remained finite and inside the constraint and 40 GB memory gates, but neither
+earned a repeat, JAC transfer, or 750-step run. Their implementation and tests
+were removed. The second result also narrows the remaining diagnosis:
+force-buffer addition is measurable under synchronized profiling, but it is
+not a material complete-trajectory bottleneck.
+
 ### Rejected atom-tile result
 
 The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
