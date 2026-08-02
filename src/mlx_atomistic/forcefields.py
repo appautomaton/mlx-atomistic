@@ -64,7 +64,7 @@ from mlx_atomistic.pme import (
     _pme_coulomb_nonreciprocal_strain_energy,
     _pme_coulomb_reciprocal_energy_forces_virial,
     _pme_coulomb_reciprocal_virial,
-    _prepared_pme_reciprocal_space_energy_forces,
+    _prepared_pme_reciprocal_space_forces,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
@@ -3739,11 +3739,10 @@ class NonbondedPotential:
             raise ValueError(msg)
 
         direct_forces = self._direct_forces_from_binding(positions, binding)
-        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+        reciprocal_forces = _prepared_pme_reciprocal_space_forces(
             positions,
             self.charges,
             binding.pme_plan,
-            include_self_correction=False,
         )
         return (
             direct_forces
@@ -3838,11 +3837,10 @@ class NonbondedPotential:
         )
 
         reciprocal_started = route_profiler.start()
-        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+        reciprocal_forces = _prepared_pme_reciprocal_space_forces(
             positions,
             self.charges,
             binding.pme_plan,
-            include_self_correction=False,
         )
         route_profiler.finish(
             "reciprocal_pme",

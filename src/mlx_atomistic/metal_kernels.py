@@ -332,6 +332,7 @@ _sparse_pme_correction_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
+_pme_order5_force_only_kernel_singleton = None
 _aligned_topology_lj_scales_kernel_singleton = None
 _neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
@@ -1391,7 +1392,9 @@ _PME_ORDER5_INTERPOLATE_SOURCE = r"""
 
     int ny = mesh[1];
     int nz = mesh[2];
+#ifdef MLX_ATOMISTIC_PME_WRITE_ENERGY
     float potential = 0.0f;
+#endif
     float3 gradient = float3(0.0f);
     for (int x_offset = 0; x_offset < 5; x_offset++) {
         int x = (anchor.x + x_offset + mesh[0]) % mesh[0];
@@ -1403,7 +1406,9 @@ _PME_ORDER5_INTERPOLATE_SOURCE = r"""
                 float wx = weights[x_offset].x;
                 float wy = weights[y_offset].y;
                 float wz = weights[z_offset].z;
+#ifdef MLX_ATOMISTIC_PME_WRITE_ENERGY
                 potential += wx * wy * wz * grid_value;
+#endif
                 gradient.x += (
                     derivatives[x_offset].x * wy * wz * grid_value
                 );
@@ -1418,7 +1423,9 @@ _PME_ORDER5_INTERPOLATE_SOURCE = r"""
     }
 
     float charge = charges[atom];
+#ifdef MLX_ATOMISTIC_PME_WRITE_ENERGY
     atom_energy[atom] = 0.5f * charge * potential;
+#endif
     forces[3 * atom + 0] =
         -charge * gradient.x * (float)mesh[0] / cell[0];
     forces[3 * atom + 1] =
@@ -2485,9 +2492,34 @@ def _pme_order5_interpolate_kernel():
             ],
             output_names=["atom_energy", "forces"],
             source=_PME_ORDER5_INTERPOLATE_SOURCE,
-            header=_PME_ORDER5_HEADER,
+            header=(
+                _PME_ORDER5_HEADER
+                + "\n#define MLX_ATOMISTIC_PME_WRITE_ENERGY 1\n"
+            ),
         )
     return _pme_order5_interpolate_kernel_singleton
+
+
+def _pme_order5_force_only_kernel():
+    """Return the cached order-five PME force-only interpolation kernel."""
+
+    global _pme_order5_force_only_kernel_singleton
+    if _pme_order5_force_only_kernel_singleton is None:
+        _pme_order5_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="pme_order5_force_only",
+            input_names=[
+                "positions",
+                "charges",
+                "potential_grid",
+                "cell",
+                "mesh",
+                "counts",
+            ],
+            output_names=["forces"],
+            source=_PME_ORDER5_INTERPOLATE_SOURCE,
+            header=_PME_ORDER5_HEADER,
+        )
+    return _pme_order5_force_only_kernel_singleton
 
 
 def _aligned_topology_lj_scales_kernel():
@@ -3779,6 +3811,54 @@ def pme_order5_energy_forces(
         init_value=0.0,
     )
     return mx.sum(atom_energy), forces
+
+
+def _pme_order5_forces(
+    positions: mx.array,
+    charges: mx.array,
+    potential_grid: mx.array,
+    cell_lengths: mx.array,
+) -> mx.array:
+    """Interpolate order-five PME forces without producing particle energies."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    potential_grid = as_mx_array(potential_grid, dtype=mx.float32)
+    cell_lengths = as_mx_array(cell_lengths, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        msg = "positions must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    atom_count = int(positions.shape[0])
+    if charges.shape != (atom_count,):
+        msg = "charges must have shape (n_atoms,)"
+        raise ValueError(msg)
+    if potential_grid.ndim != 3:
+        msg = "potential_grid must be three-dimensional"
+        raise ValueError(msg)
+    if cell_lengths.shape != (3,):
+        msg = "cell_lengths must have shape (3,)"
+        raise ValueError(msg)
+    if atom_count == 0:
+        return mx.zeros_like(positions)
+    mesh = mx.array(potential_grid.shape, dtype=mx.int32)
+    counts = mx.array([atom_count], dtype=mx.int32)
+    threads = min(256, atom_count)
+    (forces,) = _pme_order5_force_only_kernel()(
+        inputs=[
+            positions,
+            charges,
+            potential_grid,
+            cell_lengths,
+            mesh,
+            counts,
+        ],
+        output_shapes=[(atom_count, 3)],
+        output_dtypes=[mx.float32],
+        grid=(atom_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return forces
 
 
 def _fused_bonded_force_only(
