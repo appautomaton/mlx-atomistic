@@ -289,8 +289,15 @@ remained finite, reused one PME plan, ended at a `1.51e-5 A` maximum constraint
 error, peaked at 2.25 GB across the process tree, and passed the late-memory
 plateau check. A fresh OpenMM/OpenCL reference measured 475.947 ns/day, making
 the contextual throughput gap about 5.47x. That ratio is not a formal
-manifest-matched comparison because the OpenMM reference minimizes before
-timing and includes center-of-mass removal.
+manifest-matched comparison. The upstream `pme` benchmark performs five
+initial integration steps and a pre-timer energy query, then includes its final
+energy query inside the timed interval. It does not minimize this workload.
+OpenMM also enables center-of-mass motion removal by default, while the
+historical MLX row above omitted that operation. The OpenMM result has no
+persisted mesh, Ewald alpha, or timing-boundary manifest, so the ratio remains
+contextual and the omitted MLX operation slightly favored MLX. The charged-PME
+runner now derives the center-of-mass removal cadence from the prepared
+artifact so future measurements do not repeat that mismatch.
 
 The fixed-coordinate tile inventory exactly matched all 14,699,933 compact
 pairs. Direct-force differences were `6.10e-5 kJ/mol/A` RMS and
@@ -304,6 +311,29 @@ windows, 23,000--24,000 and 90,000--100,000, with the existing fixed-cell,
 orthorhombic, order-5 PME, 9 A cutoff, 5.5 A skin, and no-NBFIX gates. The gap
 between those windows continues to use compact pairs rather than extrapolating
 from unmeasured sizes.
+
+### Rejected two-step neighbor admission
+
+The 2026-08-02 experiment delayed the constrained NVT neighbor-displacement
+decision for two steps, then either committed both steps or rolled back and
+replayed them with the authoritative per-step path. The matched 5DFR runs used
+the same prepared artifact, Metal route, 5.5 A skin, and per-step
+center-of-mass motion removal on both sides.
+
+| 750-step 5DFR route | Run 1 | Run 2 | Median wall | Median throughput |
+| --- | ---: | ---: | ---: | ---: |
+| Exact per-step admission | 2.326254 s | 2.348854 s | 2.337554 s | 110.888 ns/day |
+| Two-step transaction | 2.356621 s | 2.425385 s | 2.391003 s | 108.429 ns/day |
+
+The transaction was 2.29% slower by median wall time and was therefore
+removed. It accepted 338--339 epochs but replayed 42--44 steps. Combining two
+checks reduced host decision count without reducing displacement work: the
+single materialization evaluated a two-step lazy graph, while rejected epochs
+also repeated integration and one force evaluation. Median measured neighbor
+update time consequently rose instead of falling. All runs stayed finite,
+constraint errors remained below `1.70e-5 A`, and the hard-bounded process-tree
+peak stayed below 2.52 GB, so this was a performance rejection rather than a
+correctness or memory failure.
 
 ### Rejected atom-tile result
 

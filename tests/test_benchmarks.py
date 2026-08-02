@@ -1752,6 +1752,23 @@ def test_charged_pme_runtime_requires_warmup_and_two_measured_steps(tmp_path):
     assert "measured_steps_must_be_at_least_two" in payload["blockers"]
 
 
+def test_charged_pme_runtime_config_propagates_cmm_removal_cadence():
+    config = charged_pme._simulation_config(
+        steps=2,
+        dt_ps=0.004,
+        simulation_units={
+            "kinetic_energy_scale": 1.0,
+            "force_to_acceleration_scale": 1.0,
+            "boltzmann_constant": 1.0,
+        },
+        sample_interval=2,
+        diagnostic_interval=2,
+        center_of_mass_motion_interval=1,
+    )
+
+    assert config.center_of_mass_motion_interval == 1
+
+
 def _write_openmm_admission_inputs(tmp_path, *, complete):
     runtime_path = tmp_path / "openmm-runtime.json"
     manifest_path = tmp_path / "openmm-manifest.json"

@@ -57,7 +57,7 @@ from mlx_atomistic.prep.io import (
     load_prepared_system,
     write_view_pdb,
 )
-from mlx_atomistic.prep.schema import PreparedSystem
+from mlx_atomistic.prep.schema import PreparedSystem, center_of_mass_motion_interval
 from mlx_atomistic.protocols import (
     MinimizeThenNVTProtocol,
     ProtocolCompatibilityError,
@@ -222,27 +222,6 @@ def _initialize_system_velocities(
 
 def _simulation_config_with_virtual_sites(*, virtual_sites=None, **kwargs) -> SimulationConfig:
     return SimulationConfig(virtual_sites=virtual_sites, **kwargs)
-
-
-def _center_of_mass_motion_interval(
-    protocol_metadata: dict[str, Any],
-) -> int | None:
-    policy = dict(protocol_metadata).get("center_of_mass_motion")
-    if policy is None:
-        return None
-    if not isinstance(policy, dict):
-        msg = "center_of_mass_motion protocol metadata must be a mapping"
-        raise TypeError(msg)
-    if not bool(policy.get("enabled", False)):
-        return None
-    if policy.get("force") != "CMMotionRemover":
-        msg = "unsupported center_of_mass_motion force"
-        raise ValueError(msg)
-    frequency = int(policy.get("frequency_steps", 0))
-    if frequency <= 0:
-        msg = "center_of_mass_motion frequency_steps must be positive"
-        raise ValueError(msg)
-    return frequency
 
 
 class _VirtualSiteForceAdapter:
@@ -982,7 +961,7 @@ def run_mlx(
         not bound_pme_plan or (use_npt and lazy_nonbonded)
     )
     hmr_state = artifact.hmr_state
-    center_of_mass_motion_interval = _center_of_mass_motion_interval(
+    cmm_interval = center_of_mass_motion_interval(
         prepared_system.metadata.protocol_metadata
     )
     compile_force_evaluator = _compile_force_evaluator_safe(force_terms)
@@ -1097,7 +1076,7 @@ def run_mlx(
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
-                center_of_mass_motion_interval=center_of_mass_motion_interval,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
@@ -1132,7 +1111,7 @@ def run_mlx(
             seed=seed,
             diagnostic_interval=diagnostic_interval,
             compile_force_evaluator=compile_force_evaluator,
-            center_of_mass_motion_interval=center_of_mass_motion_interval,
+            center_of_mass_motion_interval=cmm_interval,
             ensemble=protocol_report.metadata["ensemble"],
             proof_mode=protocol_report.metadata["proof_mode"],
             barostat=protocol_report.metadata["barostat"],
@@ -1188,7 +1167,7 @@ def run_mlx(
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
-                center_of_mass_motion_interval=center_of_mass_motion_interval,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
