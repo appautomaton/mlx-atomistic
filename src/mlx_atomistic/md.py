@@ -2917,6 +2917,86 @@ def _zero_constraint_error(positions: mx.array) -> mx.array:
     return mx.sum(positions[:, 0] * 0.0)
 
 
+def _langevin_pre_force_step(
+    positions: mx.array,
+    velocities: mx.array,
+    forces: mx.array,
+    key: mx.array,
+    masses: mx.array,
+    *,
+    dt: float,
+    force_to_acceleration_scale: float,
+    velocity_decay: float,
+    thermal_scale: mx.array,
+    cell: Cell | None,
+    wrap_positions: bool,
+    constraints: object | None,
+    pre_force_velocity_projector: object | None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Advance one ordinary Langevin step to the force boundary."""
+
+    acceleration = force_to_acceleration_scale * forces / masses[:, None]
+    velocities_half = velocities + 0.5 * dt * acceleration
+    next_positions = positions + 0.5 * dt * velocities_half
+
+    keys = mx.random.split(key, 2)
+    next_key = keys[0]
+    noise = mx.random.normal(velocities.shape, key=keys[1])
+    middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
+    next_positions = next_positions + 0.5 * dt * middle_velocities
+    if cell is not None and wrap_positions:
+        next_positions = cell.wrap(next_positions)
+
+    velocity_before_final_kick = middle_velocities
+    if constraints is not None:
+        unconstrained_positions = next_positions
+        next_positions = _project_constraint_positions_unchecked(
+            constraints,
+            next_positions,
+            masses,
+            cell,
+            reference_positions=positions,
+        )
+        position_correction = next_positions - unconstrained_positions
+        if cell is not None:
+            position_correction = cell.minimum_image(position_correction)
+        velocity_before_final_kick = (
+            velocity_before_final_kick + position_correction / dt
+        )
+        velocity_before_final_kick = pre_force_velocity_projector(
+            next_positions,
+            velocity_before_final_kick,
+            masses,
+            cell,
+        )
+    return next_positions, velocity_before_final_kick, next_key
+
+
+def _langevin_post_force_step(
+    positions: mx.array,
+    velocity_before_final_kick: mx.array,
+    forces: mx.array,
+    masses: mx.array,
+    *,
+    dt: float,
+    force_to_acceleration_scale: float,
+    constraints: object | None,
+    cell: Cell | None,
+) -> mx.array:
+    """Finish one ordinary Langevin step after force construction."""
+
+    acceleration = force_to_acceleration_scale * forces / masses[:, None]
+    velocities = velocity_before_final_kick + 0.5 * dt * acceleration
+    if constraints is not None:
+        velocities = constraints.apply_velocities(
+            positions,
+            velocities,
+            masses,
+            cell,
+        )
+    return velocities
+
+
 def _materialize_sampled_state(
     state: SimulationState,
     *,
@@ -4452,8 +4532,36 @@ def _simulate_nvt(
             or local_step == config.steps
         )
         validate_constraint_step = diagnostic_step or sample_step
-        acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
-        if isinstance(thermostat, LangevinThermostat):
+        ordinary_langevin_step = bool(
+            isinstance(thermostat, LangevinThermostat)
+            and constraints is not None
+            and route_profiler is None
+            and not validate_constraint_step
+        )
+        if ordinary_langevin_step:
+            next_positions, velocity_before_final_kick, key = (
+                _langevin_pre_force_step(
+                    state.positions,
+                    state.velocities,
+                    state.forces,
+                    key,
+                    masses,
+                    dt=config.dt,
+                    force_to_acceleration_scale=config.force_to_acceleration_scale,
+                    velocity_decay=velocity_decay,
+                    thermal_scale=thermal_scale,
+                    cell=cell,
+                    wrap_positions=config.wrap_positions,
+                    constraints=constraints,
+                    pre_force_velocity_projector=pre_force_velocity_projector,
+                )
+            )
+            constraint_error = _zero_constraint_error(next_positions)
+        else:
+            acceleration = (
+                config.force_to_acceleration_scale * state.forces / masses[:, None]
+            )
+        if isinstance(thermostat, LangevinThermostat) and not ordinary_langevin_step:
             velocities_half = state.velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + 0.5 * config.dt * velocities_half
 
@@ -4463,7 +4571,7 @@ def _simulate_nvt(
             middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
 
             next_positions = next_positions + 0.5 * config.dt * middle_velocities
-        else:
+        elif not ordinary_langevin_step:
             current_kinetic = kinetic_energy(
                 state.velocities,
                 masses,
@@ -4476,14 +4584,19 @@ def _simulate_nvt(
             scaled_velocities = state.velocities * thermostat_scale
             velocities_half = scaled_velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + config.dt * velocities_half
-        if cell is not None and config.wrap_positions:
+        if (
+            not ordinary_langevin_step
+            and cell is not None
+            and config.wrap_positions
+        ):
             next_positions = cell.wrap(next_positions)
-        constraint_error = _zero_constraint_error(next_positions)
-        velocity_before_final_kick = (
-            middle_velocities
-            if isinstance(thermostat, LangevinThermostat)
-            else velocities_half
-        )
+        if not ordinary_langevin_step:
+            constraint_error = _zero_constraint_error(next_positions)
+            velocity_before_final_kick = (
+                middle_velocities
+                if isinstance(thermostat, LangevinThermostat)
+                else velocities_half
+            )
         if integration_started is not None:
             route_profiler.finish(
                 "integration_thermostat",
@@ -4492,7 +4605,7 @@ def _simulate_nvt(
                 velocity_before_final_kick,
                 key,
             )
-        if constraints is not None:
+        if constraints is not None and not ordinary_langevin_step:
             unconstrained_positions = next_positions
             step_projector = getattr(constraints, "apply_position_step", None)
             if route_profiler is not None:
@@ -4695,16 +4808,32 @@ def _simulate_nvt(
         final_integration_started = (
             None if route_profiler is None else route_profiler.start()
         )
-        next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
-        next_velocities = velocity_before_final_kick + 0.5 * config.dt * next_acceleration
-        if final_integration_started is not None:
+        if ordinary_langevin_step:
+            next_velocities = _langevin_post_force_step(
+                next_positions,
+                velocity_before_final_kick,
+                next_forces,
+                masses,
+                dt=config.dt,
+                force_to_acceleration_scale=config.force_to_acceleration_scale,
+                constraints=constraints,
+                cell=cell,
+            )
+        else:
+            next_acceleration = (
+                config.force_to_acceleration_scale * next_forces / masses[:, None]
+            )
+            next_velocities = (
+                velocity_before_final_kick + 0.5 * config.dt * next_acceleration
+            )
+        if final_integration_started is not None and not ordinary_langevin_step:
             route_profiler.finish(
                 "integration_thermostat",
                 final_integration_started,
                 next_acceleration,
                 next_velocities,
             )
-        if constraints is not None:
+        if constraints is not None and not ordinary_langevin_step:
             if route_profiler is None:
                 next_velocities = constraints.apply_velocities(
                     next_positions,
