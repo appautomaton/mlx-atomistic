@@ -20,6 +20,7 @@ from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.prep.io import JSON_NAME, NPZ_NAME, load_prepared_system, save_prepared_system
+from mlx_atomistic.prep.schema import center_of_mass_motion_interval
 from mlx_atomistic.prep.supercell import (
     normalize_supercell_replicas,
     prepared_supercell_summary,
@@ -300,6 +301,9 @@ def runtime_payload(
     try:
         setup_started = time.perf_counter()
         artifact = load_prepared_mlx_artifact(prepared_path, require_production=True)
+        cmm_interval = center_of_mass_motion_interval(
+            dict(artifact.metadata.get("protocol_metadata", {}))
+        )
         system, force_terms, constraints = build_mlx_system_from_artifact(
             artifact,
             eager_nonbonded_pair_limit=0,
@@ -352,6 +356,7 @@ def runtime_payload(
                 simulation_units=simulation_units,
                 sample_interval=warmups,
                 diagnostic_interval=warmups,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -380,6 +385,7 @@ def runtime_payload(
                 sample_interval=sample_interval,
                 diagnostic_interval=diagnostic_interval,
                 runtime_profile=runtime_profile,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -533,6 +539,7 @@ def runtime_payload(
             "plan": final_plan,
             "topology": topology_report,
             "constraint_routes": constraint_routes,
+            "center_of_mass_motion_interval": cmm_interval,
             "neighbor": neighbor_report,
             "checks": checks,
             "finite": finite,
@@ -1322,6 +1329,7 @@ def _simulation_config(
     sample_interval: int,
     diagnostic_interval: int,
     runtime_profile: bool = False,
+    center_of_mass_motion_interval: int | None = None,
 ) -> SimulationConfig:
     return SimulationConfig(
         dt=dt_ps,
@@ -1331,6 +1339,7 @@ def _simulation_config(
         pressure_diagnostics=False,
         compile_force_evaluator=False,
         runtime_profile=runtime_profile,
+        center_of_mass_motion_interval=center_of_mass_motion_interval,
         **simulation_units,
     )
 
