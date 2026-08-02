@@ -187,6 +187,8 @@ def test_default_generated_benchmark_paths_are_gitignored():
     paths = [
         "outputs/benchmarks/pme-profile/pme-profile.json",
         "outputs/benchmarks/dhfr-artifacts/dhfr-implicit/prepared_system.json",
+        "outputs/benchmarks/dhfr-artifacts/"
+        "dhfr-amber20-jac-pme/prepared_system.json",
         "outputs/benchmarks/same-workload-openmm-comparison/mlx-dhfr-implicit.json",
         "outputs/benchmarks/same-workload-lj-scaling/summary.json",
     ]

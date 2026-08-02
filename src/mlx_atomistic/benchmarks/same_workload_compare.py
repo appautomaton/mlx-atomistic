@@ -44,11 +44,11 @@ PAIR_SPECS = {
         "mlx_raw_output_path": f"{OUTPUT_ROOT}/mlx-dhfr-implicit.json",
         "openmm_raw_output_path": f"{OUTPUT_ROOT}/openmm-dhfr-implicit.json",
     },
-    "dhfr-explicit-pme": {
+    "dhfr-amber20-jac-pme": {
         "metric": "ns_per_day",
         "metric_family": "ns/day",
-        "mlx_raw_output_path": f"{OUTPUT_ROOT}/mlx-dhfr-explicit-pme.json",
-        "openmm_raw_output_path": f"{OUTPUT_ROOT}/openmm-dhfr-explicit-pme.json",
+        "mlx_raw_output_path": f"{OUTPUT_ROOT}/mlx-dhfr-amber20-jac-pme.json",
+        "openmm_raw_output_path": f"{OUTPUT_ROOT}/openmm-dhfr-amber20-jac-pme.json",
     },
 }
 
@@ -61,8 +61,8 @@ OPENMM_PAIR_BY_KEY = {
     "tip4p_ew_water": "tip4p-ew-water",
     "dhfr-implicit": "dhfr-implicit",
     "dhfr_implicit": "dhfr-implicit",
-    "dhfr-explicit-pme": "dhfr-explicit-pme",
-    "dhfr_explicit_pme": "dhfr-explicit-pme",
+    "dhfr-amber20-jac-pme": "dhfr-amber20-jac-pme",
+    "amber20_dhfr_jac_pme": "dhfr-amber20-jac-pme",
 }
 
 
@@ -290,7 +290,7 @@ def _classify_controlled_parity(
             "GBSA operations differ; ratio suppressed "
             f"(MLX operation={mlx_operation}, OpenMM OBC force={openmm_force})",
         )
-    if pair_id in {"dhfr-implicit", "dhfr-explicit-pme"}:
+    if pair_id in {"dhfr-implicit", "dhfr-amber20-jac-pme"}:
         return _classify_dhfr_parity(pair_id, mlx_row, openmm_row)
     return None
 

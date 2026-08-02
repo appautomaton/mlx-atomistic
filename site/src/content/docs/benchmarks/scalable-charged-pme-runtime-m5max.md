@@ -7,8 +7,10 @@ Date: 2026-07-15; runtime comparison updated 2026-08-01
 
 Status: `validated-envelope`. The MLX/Metal product runtime passed independent
 OpenMM energy/force parity and a bounded fixed-cell NVT gate for the charged
-94,232-atom AMBER20 JAC 2x2x1 supercell. This is the validated workload; it is
-not a GPCRmd membrane run or a general PME production certification. A later
+94,232-atom 2x2x1 replication of the AMBER20 JAC DHFR preparation. `JAC` is
+the AMBER20 file stem for DHFR, not a different protein. This is the validated
+workload; it is not the separately prepared OpenMM 5DFR case, a GPCRmd
+membrane run, or a general PME production certification. A later
 manifest-bound 75-step MLX/OpenMM run established a `9.7586x` throughput ratio
 for this exact workload.
 
@@ -36,7 +38,7 @@ Source for every value in this table: **[parity]**.
 
 | Field | Validated value |
 | --- | --- |
-| System | AMBER20 JAC, deterministic 2x2x1 replication |
+| System | DHFR · AMBER20 JAC preparation, deterministic 2x2x1 replication |
 | Operation | Fixed-coordinate total energy and complete forces |
 | Atoms | 94,232 |
 | Cell | Orthorhombic, 123.2894 x 123.2894 x 61.6447 A |
@@ -238,7 +240,7 @@ ratio is claimed without a fresh manifest-bound OpenMM comparison.
 ```bash
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python \
   -m mlx_atomistic.benchmarks.charged_pme prepare \
-  --source results/dhfr-artifacts/dhfr-explicit-pme \
+  --source results/dhfr-artifacts/dhfr-amber20-jac-pme \
   --replicas 2,2,1 --assignment-order 5 \
   --background-policy uniform_neutralizing_plasma \
   --out results/scalable-charged-pme-runtime/jac-2x2x1/prepared

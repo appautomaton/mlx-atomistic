@@ -1,4 +1,4 @@
-"""DHFR benchmark readiness and MLX-side benchmark entrypoint."""
+"""DHFR and AMBER JAC benchmark readiness and MLX-side entrypoint."""
 
 from __future__ import annotations
 
@@ -32,10 +32,10 @@ from mlx_atomistic.prep.io import save_prepared_system
 from mlx_atomistic.prep.topology_import import TopologyImportError, import_amber_prmtop
 from mlx_atomistic.runtime import get_runtime_info
 
-BENCHMARK_NAME = "dhfr"
-COMMAND = default_benchmark_command(BENCHMARK_NAME)
+COMMAND = default_benchmark_command("dhfr")
 
 DEFAULT_ARTIFACT_ROOT = Path("outputs/benchmarks/dhfr-artifacts")
+AMBER20_JAC_CASE = "dhfr-amber20-jac-pme"
 OPENMM_DHFR_SOLVATED = Path(
     "vendors/openmm/examples/benchmarks/5dfr_solv-cube_equil.pdb"
 )
@@ -55,10 +55,12 @@ PME_REQUIRED_ARRAYS = (
 
 
 @dataclass(frozen=True)
-class DHFRCaseSpec:
-    """Input and semantic metadata for one DHFR benchmark case."""
+class BenchmarkCaseSpec:
+    """Input and semantic metadata for one protein benchmark case."""
 
     case: str
+    benchmark_name: str
+    display_name: str
     fixture: str
     solvent_model: str
     electrostatics_model: str
@@ -71,24 +73,30 @@ class DHFRCaseSpec:
 
 
 CASE_SPECS = {
-    "dhfr-implicit": DHFRCaseSpec(
+    "dhfr-implicit": BenchmarkCaseSpec(
         case="dhfr-implicit",
+        benchmark_name="dhfr",
+        display_name="DHFR",
         fixture="dhfr_implicit",
         solvent_model="implicit",
         electrostatics_model="gbsa_obc",
         force_field_family="caller-provided-dhfr-gbsa",
         timing_metric="ns_per_day",
     ),
-    "dhfr-explicit-pme": DHFRCaseSpec(
-        case="dhfr-explicit-pme",
-        fixture="dhfr_explicit_pme",
+    AMBER20_JAC_CASE: BenchmarkCaseSpec(
+        case=AMBER20_JAC_CASE,
+        benchmark_name="dhfr",
+        display_name="DHFR · AMBER20 JAC",
+        fixture="amber20_dhfr_jac_pme",
         solvent_model="explicit",
         electrostatics_model="pme",
         force_field_family="caller-provided-amber-pme",
         timing_metric="ns_per_day",
     ),
-    OPENMM_5DFR_CASE: DHFRCaseSpec(
+    OPENMM_5DFR_CASE: BenchmarkCaseSpec(
         case=OPENMM_5DFR_CASE,
+        benchmark_name="dhfr",
+        display_name="DHFR",
         fixture="openmm_5dfr_amber99sb_tip3p_pme",
         solvent_model="explicit",
         electrostatics_model="pme",
@@ -133,8 +141,10 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     return readiness_payload(case_spec=case_spec, repo_root=args.repo_root)
 
 
-def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None) -> dict[str, Any]:
-    """Return normalized DHFR input-readiness metadata without running dynamics."""
+def readiness_payload(
+    *, case_spec: BenchmarkCaseSpec, repo_root: Path | None = None
+) -> dict[str, Any]:
+    """Return normalized protein-benchmark readiness without running dynamics."""
 
     root = Path.cwd() if repo_root is None else Path(repo_root)
     input_status = _input_status(case_spec, root)
@@ -150,7 +160,9 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
     )
     blocker = None
     if input_status["missing_input_paths"]:
-        blocker = "missing DHFR input path(s): " + ", ".join(input_status["missing_input_paths"])
+        blocker = f"missing {case_spec.display_name} input path(s): " + ", ".join(
+            input_status["missing_input_paths"]
+        )
     payload: dict[str, Any] = {
         "case": case_spec.case,
         "comparison_pair_id": case_spec.case,
@@ -184,7 +196,7 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
     }
     return normalize_benchmark_payload(
         payload,
-        benchmark_name=BENCHMARK_NAME,
+        benchmark_name=case_spec.benchmark_name,
         fixture=case_spec.fixture,
         timing_metric=case_spec.timing_metric,
         hardware=get_hardware_info(),
@@ -201,12 +213,12 @@ def readiness_payload(*, case_spec: DHFRCaseSpec, repo_root: Path | None = None)
 
 def prepare_payload(
     *,
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     repo_root: Path | None = None,
     artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
     implicit_prep_script: Path | None = None,
 ) -> dict[str, Any]:
-    """Prepare a DHFR artifact when inputs and compatibility metadata are available."""
+    """Prepare an artifact when benchmark inputs and metadata are available."""
 
     return _prepare_payload(
         case_spec=case_spec,
@@ -218,12 +230,12 @@ def prepare_payload(
 
 def _prepare_payload(
     *,
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     repo_root: Path | None = None,
     artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
     implicit_prep_script: Path | None = None,
 ) -> dict[str, Any]:
-    """Prepare a DHFR artifact with explicit local reference inputs."""
+    """Prepare a protein artifact from explicit local reference inputs."""
 
     root = Path.cwd() if repo_root is None else Path(repo_root)
     payload = readiness_payload(case_spec=case_spec, repo_root=root)
@@ -259,13 +271,13 @@ def _prepare_payload(
 
 def runtime_payload(
     *,
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     steps: int,
     repo_root: Path | None = None,
     artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
     implicit_prep_script: Path | None = None,
 ) -> dict[str, Any]:
-    """Return the DHFR runtime benchmark row or a concrete runtime blocker."""
+    """Return the runtime benchmark row or a concrete runtime blocker."""
 
     payload = _prepare_payload(
         case_spec=case_spec,
@@ -294,7 +306,7 @@ def runtime_payload(
 
 def _prepare_implicit_gbsa(
     *,
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     repo_root: Path,
     payload: dict[str, Any],
     artifact_root: Path,
@@ -455,14 +467,14 @@ def _runtime_blocker_category(payload: dict[str, Any]) -> str:
         return "amber_import_unsupported_terms"
     if "PME readiness blocked" in blocker:
         return "pme_readiness"
-    if "missing DHFR input path" in blocker:
+    if "missing " in blocker and " input path" in blocker:
         return "input_absence"
     return "artifact_runtime_gap"
 
 
 def _run_prepared_artifact_runtime(
     *,
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     repo_root: Path,
     steps: int,
     payload: dict[str, Any],
@@ -482,7 +494,7 @@ def _run_prepared_artifact_runtime(
         force_terms = _bind_runtime_pme_plan(force_terms, system.cell)
         neighbor_manager = _runtime_neighbor_manager(force_terms, system.cell)
     except (ValueError, FileNotFoundError) as exc:
-        blocker = f"DHFR prepared artifact runtime setup blocked: {exc}"
+        blocker = f"{case_spec.display_name} artifact runtime setup blocked: {exc}"
         payload.update(
             {
                 "status": "blocked",
@@ -532,7 +544,7 @@ def _run_prepared_artifact_runtime(
         temperature = _last_scalar(result.temperature)
         constraint_max_error = _last_scalar(result.constraint_max_error)
     except (ValueError, FloatingPointError) as exc:
-        blocker = f"DHFR bounded MLX runtime blocked: {exc}"
+        blocker = f"{case_spec.display_name} bounded MLX runtime blocked: {exc}"
         payload.update(
             {
                 "status": "blocked",
@@ -557,7 +569,11 @@ def _run_prepared_artifact_runtime(
     payload.update(
         {
             "status": "ok" if finite else "failed",
-            "blocker": None if finite else "DHFR bounded MLX runtime produced non-finite values",
+            "blocker": (
+                None
+                if finite
+                else f"{case_spec.display_name} bounded MLX runtime produced non-finite values"
+            ),
             "prepare": False,
             "runtime_attempted": True,
             "runtime_stage": "completed" if finite else "failed",
@@ -679,7 +695,7 @@ def _last_scalar(values: Any) -> float:
 
 def _prepare_explicit_pme(
     *,
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     repo_root: Path,
     payload: dict[str, Any],
     artifact_root: Path,
@@ -738,7 +754,7 @@ def _prepare_explicit_pme(
                 "artifact_status": "blocked",
                 "unsupported_terms": unsupported_terms,
                 "pme": {
-                    "config": _pme_config_payload(_default_dhfr_pme_config()),
+                    "config": _pme_config_payload(_default_amber20_jac_pme_config()),
                     "coordinate_format": _amber_coordinate_format(
                         repo_root / case_spec.amber_coordinates_path
                     )
@@ -845,7 +861,7 @@ def _run_openmm_5dfr_prep(*, repo_root: Path, artifact_dir: Path) -> None:
 
 
 def _artifact_relative_path(
-    case_spec: DHFRCaseSpec,
+    case_spec: BenchmarkCaseSpec,
     *,
     artifact_root: Path,
 ) -> Path:
@@ -855,7 +871,7 @@ def _artifact_relative_path(
 
 
 def _with_pme_metadata(prepared: Any) -> Any:
-    pme_config = _default_dhfr_pme_config()
+    pme_config = _default_amber20_jac_pme_config()
     report = dict(prepared.metadata.compatibility_report)
     required_terms = list(report.get("required_terms", ()))
     supported_terms = list(report.get("supported_terms", ()))
@@ -893,7 +909,7 @@ def _with_pme_metadata(prepared: Any) -> Any:
     )
 
 
-def _default_dhfr_pme_config() -> PMEConfig:
+def _default_amber20_jac_pme_config() -> PMEConfig:
     return PMEConfig(
         mesh_shape=(64, 64, 64),
         alpha=0.35,
@@ -929,7 +945,7 @@ def _pme_config_from_arrays(arrays: dict[str, np.ndarray]) -> PMEConfig:
     )
 
 
-def _force_term_required_arrays(case_spec: DHFRCaseSpec) -> list[str]:
+def _force_term_required_arrays(case_spec: BenchmarkCaseSpec) -> list[str]:
     if case_spec.solvent_model == "implicit":
         return list(GBSA_REQUIRED_ARRAYS)
     return list(PME_REQUIRED_ARRAYS)
@@ -964,12 +980,12 @@ def _amber_coordinate_format(path: Path) -> str:
     return "netcdf" if path.read_bytes()[:3] == b"CDF" else "formatted_restart"
 
 
-def _input_status(case_spec: DHFRCaseSpec, repo_root: Path) -> dict[str, Any]:
+def _input_status(case_spec: BenchmarkCaseSpec, repo_root: Path) -> dict[str, Any]:
     existing: list[str] = []
     missing: list[str] = []
     if not case_spec.input_paths:
-        missing.append("caller-provided DHFR input path(s)")
-    if case_spec.case == "dhfr-explicit-pme":
+        missing.append(f"caller-provided {case_spec.display_name} input path(s)")
+    if case_spec.case == AMBER20_JAC_CASE:
         if case_spec.amber_topology_path is None:
             missing.append("caller-provided AMBER topology path")
         if case_spec.amber_coordinates_path is None:
@@ -999,7 +1015,7 @@ def _pdb_atom_count(path: Path) -> int | None:
     return count
 
 
-def _cell_metadata_available(case_spec: DHFRCaseSpec, repo_root: Path) -> bool:
+def _cell_metadata_available(case_spec: BenchmarkCaseSpec, repo_root: Path) -> bool:
     if case_spec.amber_coordinates_path is not None:
         return (repo_root / case_spec.amber_coordinates_path).exists()
     if case_spec.primary_structure_path is None:
@@ -1035,12 +1051,13 @@ def _format_human_payload(payload: dict[str, Any]) -> str:
     status = payload["status"]
     case = payload["case"]
     atom_count = payload.get("atom_count")
+    display_name = CASE_SPECS[case].display_name
     if status == "blocked":
-        return f"DHFR {case}: blocked ({payload['blocker']})"
-    return f"DHFR {case}: ready, atom_count={atom_count}"
+        return f"{display_name} {case}: blocked ({payload['blocker']})"
+    return f"{display_name} {case}: ready, atom_count={atom_count}"
 
 
-def _case_spec_from_args(args: argparse.Namespace) -> DHFRCaseSpec:
+def _case_spec_from_args(args: argparse.Namespace) -> BenchmarkCaseSpec:
     spec = CASE_SPECS[args.case]
     if spec.case == OPENMM_5DFR_CASE:
         if args.amber_topology is not None or args.amber_coordinates is not None:
