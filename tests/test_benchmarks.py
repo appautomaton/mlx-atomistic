@@ -109,16 +109,19 @@ def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     )
 
 
-def test_dhfr_readiness_requires_explicit_inputs_for_both_cases():
+def test_dhfr_and_jac_readiness_require_explicit_inputs():
     implicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-implicit"])
-    explicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"])
+    explicit = dhfr.readiness_payload(
+        case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE]
+    )
 
     _assert_normalized_payload(implicit, timing_metric="ns_per_day", status="blocked")
     _assert_normalized_payload(explicit, timing_metric="ns_per_day", status="blocked")
     assert implicit["case"] == "dhfr-implicit"
-    assert explicit["case"] == "dhfr-explicit-pme"
+    assert explicit["case"] == "dhfr-amber20-jac-pme"
+    assert explicit["benchmark_name"] == "dhfr"
     assert implicit["comparison_pair_id"] == "dhfr-implicit"
-    assert explicit["comparison_pair_id"] == "dhfr-explicit-pme"
+    assert explicit["comparison_pair_id"] == "dhfr-amber20-jac-pme"
     assert implicit["solvent_model"] == "implicit"
     assert explicit["solvent_model"] == "explicit"
     assert implicit["electrostatics_model"] == "gbsa_obc"
@@ -129,19 +132,19 @@ def test_dhfr_readiness_requires_explicit_inputs_for_both_cases():
     assert explicit["atom_count"] is None
     assert explicit["cell_metadata_available"] is False
     assert "caller-provided DHFR input path" in implicit["blocker"]
-    assert "caller-provided DHFR input path" in explicit["blocker"]
+    assert "caller-provided DHFR · AMBER20 JAC input path" in explicit["blocker"]
 
 
-def test_dhfr_readiness_missing_inputs_fail_closed(tmp_path):
+def test_jac_readiness_missing_inputs_fail_closed(tmp_path):
     payload = dhfr.readiness_payload(
-        case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"],
+        case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE],
         repo_root=tmp_path,
     )
 
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["input_status"]["all_inputs_present"] is False
     assert payload["input_status"]["downloads_attempted"] is False
-    assert "caller-provided DHFR input path" in payload["blocker"]
+    assert "caller-provided DHFR · AMBER20 JAC input path" in payload["blocker"]
 
 
 @pytest.mark.slow
@@ -157,13 +160,17 @@ def test_dhfr_implicit_prepare_blocks_without_explicit_inputs():
 
 
 @pytest.mark.slow
-def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
-    payload = dhfr.prepare_payload(case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"])
+def test_jac_explicit_prepare_reports_amber_or_pme_gate():
+    payload = dhfr.prepare_payload(
+        case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE]
+    )
 
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["prepare"] is True
     assert payload["electrostatics_model"] == "pme"
-    assert payload["artifact_path"].startswith("outputs/benchmarks/dhfr-artifacts/")
+    assert payload["artifact_path"] == (
+        "outputs/benchmarks/dhfr-artifacts/dhfr-amber20-jac-pme"
+    )
     assert payload["force_term_required_arrays"] == [
         "pme_mesh_shape",
         "pme_alpha",
@@ -174,7 +181,7 @@ def test_dhfr_explicit_prepare_reports_amber_or_pme_gate():
         "pme_background_policy",
     ]
     assert payload["artifact_status"] == "not_attempted"
-    assert "caller-provided DHFR input path" in payload["blocker"]
+    assert "caller-provided DHFR · AMBER20 JAC input path" in payload["blocker"]
 
 
 @pytest.mark.slow
@@ -194,23 +201,23 @@ def test_dhfr_implicit_runtime_blocks_without_explicit_inputs():
 
 
 @pytest.mark.slow
-def test_dhfr_explicit_runtime_blocks_without_explicit_inputs():
+def test_jac_explicit_runtime_blocks_without_explicit_inputs():
     payload = dhfr.runtime_payload(
-        case_spec=dhfr.CASE_SPECS["dhfr-explicit-pme"],
+        case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE],
         steps=1,
     )
 
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
-    assert payload["comparison_pair_id"] == "dhfr-explicit-pme"
+    assert payload["comparison_pair_id"] == "dhfr-amber20-jac-pme"
     assert payload["step_count"] == 1
     assert payload["runtime_attempted"] is False
     assert payload["runtime_stage"] == "blocked"
     assert payload["runtime_blocker_category"] == "input_absence"
-    assert "caller-provided DHFR input path" in payload["blocker"]
+    assert "caller-provided DHFR · AMBER20 JAC input path" in payload["blocker"]
 
 
-def test_dhfr_explicit_pme_defaults_to_charged_order_five_contract():
-    config = dhfr._default_dhfr_pme_config()
+def test_jac_explicit_pme_defaults_to_charged_order_five_contract():
+    config = dhfr._default_amber20_jac_pme_config()
 
     assert config.assignment_order == 5
     assert config.background_policy == "uniform_neutralizing_plasma"
@@ -219,22 +226,24 @@ def test_dhfr_explicit_pme_defaults_to_charged_order_five_contract():
     assert config.real_cutoff == pytest.approx(9.0)
 
 
-def test_dhfr_explicit_pme_cli_requires_caller_provided_jac_inputs():
-    args = dhfr._parse_args(["--case", "dhfr-explicit-pme", "--steps", "1", "--json"])
+def test_jac_explicit_pme_cli_requires_caller_provided_jac_inputs():
+    args = dhfr._parse_args(
+        ["--case", "dhfr-amber20-jac-pme", "--steps", "1", "--json"]
+    )
 
     spec = dhfr._case_spec_from_args(args)
 
     assert spec.amber_topology_path is None
     assert spec.amber_coordinates_path is None
     assert spec.input_paths == ()
-    assert dhfr.CASE_SPECS["dhfr-explicit-pme"].input_paths == ()
+    assert dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE].input_paths == ()
 
     topology = Path("caller/JAC.prmtop")
     coordinates = Path("caller/JAC.inpcrd")
     explicit_args = dhfr._parse_args(
         [
             "--case",
-            "dhfr-explicit-pme",
+            "dhfr-amber20-jac-pme",
             "--steps",
             "1",
             "--amber-topology",
@@ -252,18 +261,25 @@ def test_dhfr_explicit_pme_cli_requires_caller_provided_jac_inputs():
     assert explicit_spec.input_paths == (topology, coordinates)
 
 
-def test_openmm_5dfr_case_is_exact_and_distinct_from_jac():
+def test_openmm_5dfr_and_amber20_jac_are_distinct_dhfr_preparations():
     target = dhfr.CASE_SPECS[dhfr.OPENMM_5DFR_CASE]
-    jac = dhfr.CASE_SPECS["dhfr-explicit-pme"]
+    jac = dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE]
 
     assert target.case == _EXPLICIT_PREP.CASE_ID
     assert target.input_paths == (dhfr.OPENMM_DHFR_SOLVATED,)
     assert target.force_field_family == "openmm-amber99sb-tip3p"
     assert target.fixture == "openmm_5dfr_amber99sb_tip3p_pme"
     assert jac.input_paths == ()
+    assert target.benchmark_name == jac.benchmark_name == "dhfr"
+    assert jac.fixture == "amber20_dhfr_jac_pme"
     assert jac.force_field_family == "caller-provided-amber-pme"
     assert target.case != jac.case
     assert target.fixture != jac.fixture
+
+
+def test_legacy_dhfr_name_for_jac_is_rejected():
+    with pytest.raises(SystemExit):
+        dhfr._parse_args(["--case", "dhfr-explicit-pme", "--readiness"])
 
 
 def test_openmm_5dfr_cli_rejects_jac_and_source_substitution():
@@ -1058,7 +1074,7 @@ def test_openmm_import_failure_does_not_mask_invalid_input(tmp_path):
     assert "synthetic missing openmm" not in result.stderr
 
 
-def test_openmm_dhfr_missing_inputs_report_normalized_blocker(tmp_path):
+def test_openmm_jac_missing_inputs_report_normalized_blocker(tmp_path):
     script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_openmm_dhfr.py"
 
     result = subprocess.run(
@@ -1066,7 +1082,7 @@ def test_openmm_dhfr_missing_inputs_report_normalized_blocker(tmp_path):
             sys.executable,
             str(script),
             "--case",
-            "dhfr-explicit-pme",
+            "dhfr-amber20-jac-pme",
             "--platform",
             "Reference",
             "--steps",
@@ -1579,7 +1595,7 @@ def test_same_workload_comparison_controlled_pair_status_gates_retain_reasons():
     assert rows["tip4p-ew-water"]["openmm_to_mlx_ratio"] is None
 
 
-def test_same_workload_comparison_dhfr_blocked_rows_suppress_ratio():
+def test_same_workload_comparison_protein_rows_suppress_blocked_ratio():
     mlx_payloads = [
         {
             "comparison_pair_id": "dhfr-implicit",
@@ -1593,7 +1609,7 @@ def test_same_workload_comparison_dhfr_blocked_rows_suppress_ratio():
             "electrostatics_model": "gbsa_obc",
         },
         {
-            "comparison_pair_id": "dhfr-explicit-pme",
+            "comparison_pair_id": "dhfr-amber20-jac-pme",
             "status": "blocked",
             "blocker": "AMBER explicit PME artifact import blocked",
             "timing_metric": "ns_per_day",
@@ -1617,8 +1633,8 @@ def test_same_workload_comparison_dhfr_blocked_rows_suppress_ratio():
             "electrostatics_model": "gbsa_obc",
         },
         {
-            "case": "dhfr-explicit-pme",
-            "fixture": "dhfr_explicit_pme",
+            "case": "dhfr-amber20-jac-pme",
+            "fixture": "amber20_dhfr_jac_pme",
             "status": "ok",
             "timing_metric": "ns_per_day",
             "timing_value": 1.0,
@@ -1638,9 +1654,9 @@ def test_same_workload_comparison_dhfr_blocked_rows_suppress_ratio():
     assert rows["dhfr-implicit"]["comparison_status"] == "blocked"
     assert "missing GBSA/OBC" in rows["dhfr-implicit"]["blocker"]
     assert rows["dhfr-implicit"]["openmm_to_mlx_ratio"] is None
-    assert rows["dhfr-explicit-pme"]["comparison_status"] == "blocked"
-    assert "AMBER explicit PME" in rows["dhfr-explicit-pme"]["blocker"]
-    assert rows["dhfr-explicit-pme"]["openmm_to_mlx_ratio"] is None
+    assert rows["dhfr-amber20-jac-pme"]["comparison_status"] == "blocked"
+    assert "AMBER explicit PME" in rows["dhfr-amber20-jac-pme"]["blocker"]
+    assert rows["dhfr-amber20-jac-pme"]["openmm_to_mlx_ratio"] is None
 
 
 def test_same_workload_comparison_dhfr_semantic_mismatch_is_diagnostic():
@@ -2019,7 +2035,7 @@ def test_charged_pme_profile_resolves_new_report_schema(tmp_path):
                 "kind": "mlx_atomistic.charged_pme_parity",
                 "status": "passed",
                 "passed": True,
-                "fixture": "amber20_jac",
+                "fixture": "amber20_dhfr_jac_pme",
                 "atom_count": 94232,
                 "force_metrics": {
                     "energy_error_per_atom_kj_mol": 0.001,

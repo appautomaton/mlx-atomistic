@@ -1,4 +1,4 @@
-"""Run OpenMM reference DHFR benchmark rows.
+"""Run OpenMM reference DHFR and AMBER JAC benchmark rows.
 
 This is a reference-engine script. OpenMM stays outside the product runtime and
 is imported only after CLI validation and input-readiness checks pass.
@@ -17,7 +17,6 @@ from typing import Any
 
 from mlx_atomistic.benchmarks import get_hardware_info, normalize_benchmark_payload
 
-BENCHMARK_NAME = "openmm_dhfr_reference"
 ENGINE = "openmm-reference"
 TIMING_METRIC = "ns_per_day"
 COMMAND = "uv run python scripts/benchmark_openmm_dhfr.py"
@@ -31,6 +30,8 @@ AMBER20_JAC_INPCRD = Path("results/inputs/Amber20_Benchmark_Suite/PME/Coordinate
 @dataclass(frozen=True)
 class CaseSpec:
     case: str
+    benchmark_name: str
+    display_name: str
     fixture: str
     input_paths: tuple[Path, ...]
     timing_metric: str = TIMING_METRIC
@@ -46,6 +47,8 @@ class CaseSpec:
 CASE_SPECS = {
     "dhfr-implicit": CaseSpec(
         case="dhfr-implicit",
+        benchmark_name="openmm_dhfr_reference",
+        display_name="DHFR",
         fixture="dhfr_implicit",
         input_paths=(OPENMM_DHFR_MINIMIZED,),
         solvent_model="implicit",
@@ -55,9 +58,11 @@ CASE_SPECS = {
         friction_per_ps=91.0,
         cutoff_nm=2.0,
     ),
-    "dhfr-explicit-pme": CaseSpec(
-        case="dhfr-explicit-pme",
-        fixture="dhfr_explicit_pme",
+    "dhfr-amber20-jac-pme": CaseSpec(
+        case="dhfr-amber20-jac-pme",
+        benchmark_name="openmm_dhfr_reference",
+        display_name="DHFR · AMBER20 JAC",
+        fixture="amber20_dhfr_jac_pme",
         input_paths=(AMBER20_JAC_PRMTOP, AMBER20_JAC_INPCRD),
         solvent_model="explicit",
         electrostatics_model="pme",
@@ -68,6 +73,8 @@ CASE_SPECS = {
     ),
     "dhfr-5dfr-pme": CaseSpec(
         case="dhfr-5dfr-pme",
+        benchmark_name="openmm_dhfr_reference",
+        display_name="DHFR",
         fixture="openmm_5dfr_amber99sb_tip3p_pme",
         input_paths=(OPENMM_DHFR_SOLVATED,),
         solvent_model="explicit",
@@ -97,7 +104,7 @@ def main() -> None:
 
 
 def build_payload(args: argparse.Namespace) -> dict[str, Any]:
-    """Build a normalized runnable or blocked OpenMM DHFR reference payload."""
+    """Build a normalized runnable or blocked OpenMM reference payload."""
 
     _validate_args(args)
     spec = _case_spec(args)
@@ -138,7 +145,7 @@ def run_reference(
     input_status: dict[str, Any],
     atom_count: int | None,
 ) -> dict[str, Any]:
-    """Run the requested DHFR case through OpenMM."""
+    """Run the requested protein benchmark case through OpenMM."""
 
     api = _load_openmm()
     platform = api.openmm.Platform.getPlatformByName(args.platform)
@@ -356,7 +363,7 @@ def _normalize_payload(
     payload["timing_value"] = payload.get(spec.timing_metric)
     return normalize_benchmark_payload(
         payload,
-        benchmark_name=BENCHMARK_NAME,
+        benchmark_name=spec.benchmark_name,
         fixture=spec.fixture,
         timing_metric=spec.timing_metric,
         hardware=get_hardware_info(),
@@ -429,7 +436,7 @@ def _raw_input_metadata(spec: CaseSpec, repo_root: Path) -> list[dict[str, Any]]
 
 
 def _input_atom_count(spec: CaseSpec, repo_root: Path) -> int | None:
-    if spec.case == "dhfr-explicit-pme":
+    if spec.case == "dhfr-amber20-jac-pme":
         count = _amber_prmtop_atom_count(repo_root / AMBER20_JAC_PRMTOP)
         if count is not None:
             return count
@@ -487,11 +494,13 @@ def _available_platforms(api: OpenMMApi) -> list[str]:
 def _format_human_payload(payload: dict[str, Any]) -> str:
     if payload["status"] == "blocked":
         return (
-            f"OpenMM DHFR {payload['case']} on {payload['requested_platform']}: blocked; "
+            f"OpenMM {CASE_SPECS[payload['case']].display_name} {payload['case']} "
+            f"on {payload['requested_platform']}: blocked; "
             f"blocker={payload['blocker']}"
         )
     return (
-        f"OpenMM DHFR {payload['case']} on {payload['platform']}: "
+        f"OpenMM {CASE_SPECS[payload['case']].display_name} {payload['case']} "
+        f"on {payload['platform']}: "
         f"{payload['ns_per_day']:.3f} ns/day, atom_count={payload['atom_count']}"
     )
 
