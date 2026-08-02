@@ -2914,7 +2914,7 @@ def _notify_reporters(
 
 
 def _zero_constraint_error(positions: mx.array) -> mx.array:
-    return mx.array(0.0, dtype=positions.dtype)
+    return mx.sum(positions[:, 0] * 0.0)
 
 
 def _materialize_sampled_state(
@@ -3705,10 +3705,8 @@ def _simulate_nvt(
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
     masses = as_mx_array([1.0] * positions.shape[0]) if masses is None else as_mx_array(masses)
-    masses_col = masses[:, None]
-    zero_constraint_error = _zero_constraint_error(positions)
     constraint_error = (
-        zero_constraint_error
+        _zero_constraint_error(positions)
         if initial_diagnostics is None
         else initial_diagnostics.constraint_error
     )
@@ -4017,6 +4015,7 @@ def _simulate_nvt(
         # Use the same arithmetic as the per-step loop below (division by the
         # mass column, not multiply-by-reciprocal) so the batched trajectory is
         # bit-for-bit identical, not just close.
+        masses_col = masses[:, None]
         sqrt_masses_col = mx.sqrt(masses)[:, None]
 
         def _langevin_substep(pos, vel, forces, prng, block_pairs):
@@ -4453,7 +4452,7 @@ def _simulate_nvt(
             or local_step == config.steps
         )
         validate_constraint_step = diagnostic_step or sample_step
-        acceleration = config.force_to_acceleration_scale * state.forces / masses_col
+        acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         if isinstance(thermostat, LangevinThermostat):
             velocities_half = state.velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + 0.5 * config.dt * velocities_half
@@ -4479,7 +4478,7 @@ def _simulate_nvt(
             next_positions = state.positions + config.dt * velocities_half
         if cell is not None and config.wrap_positions:
             next_positions = cell.wrap(next_positions)
-        constraint_error = zero_constraint_error
+        constraint_error = _zero_constraint_error(next_positions)
         velocity_before_final_kick = (
             middle_velocities
             if isinstance(thermostat, LangevinThermostat)
@@ -4696,7 +4695,7 @@ def _simulate_nvt(
         final_integration_started = (
             None if route_profiler is None else route_profiler.start()
         )
-        next_acceleration = config.force_to_acceleration_scale * next_forces / masses_col
+        next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
         next_velocities = velocity_before_final_kick + 0.5 * config.dt * next_acceleration
         if final_integration_started is not None:
             route_profiler.finish(
