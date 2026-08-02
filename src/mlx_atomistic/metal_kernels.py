@@ -355,13 +355,9 @@ _PREPARED_PME_PAIRS_PER_WORKER = 8
 
 _TILE_PME_BLOCK_SIZE = 8
 _TILE_PME_LANES_PER_TILE = _TILE_PME_BLOCK_SIZE * _TILE_PME_BLOCK_SIZE
-_TILE_PME_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
+_TILE_PME_THREADGROUP_SIZE = 32
 _TILE_MEMBERSHIP_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
-_TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
-    2 * _TILE_PME_BLOCK_SIZE * 4
-    + 2 * _TILE_PME_BLOCK_SIZE * (3 + 1 + 1 + 1) * 4
-    + 3 * _TILE_PME_LANES_PER_TILE * 4
-)
+_TILE_PME_THREADGROUP_TEMPORARY_BYTES = _TILE_PME_BLOCK_SIZE * (1 + 3 + 1 + 1 + 1) * 4
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -854,10 +850,11 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
 
-# One 64-thread group walks a short contiguous run of tiles with a common left
-# block. It loads that block once and accumulates its force across the run, while
-# each right block is still reduced locally. This preserves exact 8x8 geometry
-# but removes repeated global writes and parameter gathers for the shared side.
+# One 32-lane SIMD group owns up to four right tiles for a shared eight-atom
+# left block. Each lane accumulates one right atom across all eight left atoms,
+# while SIMD reductions produce the eight left forces without the repeated
+# threadgroup barriers and pair-force scratch buffers used by the previous
+# tile schedule.
 _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
     uint lane = thread_position_in_threadgroup.x;
     uint group = threadgroup_position_in_grid.x;
@@ -865,18 +862,10 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
     int group_count = force_group_counts[group];
 
     threadgroup int left_atoms[8];
-    threadgroup int right_atoms[8];
     threadgroup float left_positions[24];
-    threadgroup float right_positions[24];
     threadgroup float left_half_sigma[8];
-    threadgroup float right_half_sigma[8];
     threadgroup float left_sqrt_epsilon[8];
-    threadgroup float right_sqrt_epsilon[8];
     threadgroup float left_charges[8];
-    threadgroup float right_charges[8];
-    threadgroup float pair_fx[64];
-    threadgroup float pair_fy[64];
-    threadgroup float pair_fz[64];
 
     int left_block = tile_blocks[2 * group_start + 0];
     if (lane < 8u) {
@@ -892,45 +881,38 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float accumulated_left_fx = 0.0f;
-    float accumulated_left_fy = 0.0f;
-    float accumulated_left_fz = 0.0f;
-    uint left_slot = lane >> 3;
+    uint local_tile = lane >> 3;
     uint right_slot = lane & 7u;
-    uint word = lane >> 5;
-    uint bit = lane & 31u;
+    bool tile_active = local_tile < (uint)group_count;
+    int safe_local_tile = min((int)local_tile, group_count - 1);
+    int tile = group_start + safe_local_tile;
+    int right_block = tile_blocks[2 * tile + 1];
+    int right_atom = atom_blocks[8 * right_block + right_slot];
+    int safe_right = max(right_atom, 0);
+    float right_x = positions[3 * safe_right + 0];
+    float right_y = positions[3 * safe_right + 1];
+    float right_z = positions[3 * safe_right + 2];
+    float right_half_sigma_value = half_sigma[safe_right];
+    float right_sqrt_epsilon_value = sqrt_epsilon[safe_right];
+    float right_charge = charges[safe_right];
+    float accumulated_right_fx = 0.0f;
+    float accumulated_right_fy = 0.0f;
+    float accumulated_right_fz = 0.0f;
 
-    for (int local_tile = 0; local_tile < group_count; local_tile++) {
-        int tile = group_start + local_tile;
-        int tile_left_block = tile_blocks[2 * tile + 0];
-        int right_block = tile_blocks[2 * tile + 1];
-        bool same_block = tile_left_block == right_block;
-        if (lane < 8u) {
-            int right_atom = atom_blocks[8 * right_block + lane];
-            right_atoms[lane] = right_atom;
-            int safe_right = max(right_atom, 0);
-            right_positions[3 * lane + 0] = positions[3 * safe_right + 0];
-            right_positions[3 * lane + 1] = positions[3 * safe_right + 1];
-            right_positions[3 * lane + 2] = positions[3 * safe_right + 2];
-            right_half_sigma[lane] = half_sigma[safe_right];
-            right_sqrt_epsilon[lane] = sqrt_epsilon[safe_right];
-            right_charges[lane] = charges[safe_right];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        bool member = ((member_mask[2 * tile + word] >> bit) & 1u) != 0u;
-        int i = left_atoms[left_slot];
-        int j = right_atoms[right_slot];
+    for (uint left_slot = 0u; left_slot < 8u; left_slot++) {
+        uint pair_lane = 8u * left_slot + right_slot;
+        uint word = pair_lane >> 5;
+        uint bit = pair_lane & 31u;
+        bool member = tile_active
+            && ((member_mask[2 * tile + word] >> bit) & 1u) != 0u;
+        int left_atom = left_atoms[left_slot];
         float fx = 0.0f;
         float fy = 0.0f;
         float fz = 0.0f;
-        if (member && i >= 0 && j >= 0) {
-            float dx = left_positions[3 * left_slot + 0]
-                - right_positions[3 * right_slot + 0];
-            float dy = left_positions[3 * left_slot + 1]
-                - right_positions[3 * right_slot + 1];
-            float dz = left_positions[3 * left_slot + 2]
-                - right_positions[3 * right_slot + 2];
+        if (member && left_atom >= 0 && right_atom >= 0) {
+            float dx = left_positions[3 * left_slot + 0] - right_x;
+            float dy = left_positions[3 * left_slot + 1] - right_y;
+            float dz = left_positions[3 * left_slot + 2] - right_z;
             float lx = box[0];
             float ly = box[1];
             float lz = box[2];
@@ -950,9 +932,9 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                         ((lj_one_four_mask[2 * tile + word] >> bit) & 1u) != 0u;
                     float lj_scale = one_four ? params[10] : 1.0f;
                     float sigma_ij = left_half_sigma[left_slot]
-                        + right_half_sigma[right_slot];
+                        + right_half_sigma_value;
                     float epsilon_ij = left_sqrt_epsilon[left_slot]
-                        * right_sqrt_epsilon[right_slot];
+                        * right_sqrt_epsilon_value;
                     float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
                     float inv_r6 =
                         sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
@@ -994,7 +976,7 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                     ) * lj_scale;
                 }
 
-                float qij = left_charges[left_slot] * right_charges[right_slot];
+                float qij = left_charges[left_slot] * right_charge;
                 float erfc_term =
                     1.0f - mlx_atomistic_erf(params[7] * distance);
                 scalar += params[6] * qij * (
@@ -1006,82 +988,52 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                 fz = scalar * dz;
             }
         }
-        pair_fx[lane] = fx;
-        pair_fy[lane] = fy;
-        pair_fz[lane] = fz;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (lane < 8u) {
-            float reduced_fx = 0.0f;
-            float reduced_fy = 0.0f;
-            float reduced_fz = 0.0f;
-            for (uint other = 0u; other < 8u; other++) {
-                uint pair_lane = 8u * lane + other;
-                reduced_fx += pair_fx[pair_lane];
-                reduced_fy += pair_fy[pair_lane];
-                reduced_fz += pair_fz[pair_lane];
-            }
-            if (same_block) {
-                for (uint other = 0u; other < 8u; other++) {
-                    uint pair_lane = 8u * other + lane;
-                    reduced_fx -= pair_fx[pair_lane];
-                    reduced_fy -= pair_fy[pair_lane];
-                    reduced_fz -= pair_fz[pair_lane];
-                }
-            }
-            accumulated_left_fx += reduced_fx;
-            accumulated_left_fy += reduced_fy;
-            accumulated_left_fz += reduced_fz;
-        } else if (lane < 16u && !same_block) {
-            uint slot = lane - 8u;
-            float reduced_fx = 0.0f;
-            float reduced_fy = 0.0f;
-            float reduced_fz = 0.0f;
-            for (uint other = 0u; other < 8u; other++) {
-                uint pair_lane = 8u * other + slot;
-                reduced_fx -= pair_fx[pair_lane];
-                reduced_fy -= pair_fy[pair_lane];
-                reduced_fz -= pair_fz[pair_lane];
-            }
-            int atom = right_atoms[slot];
-            if (
-                atom >= 0
-                && (reduced_fx != 0.0f || reduced_fy != 0.0f || reduced_fz != 0.0f)
-            ) {
-                atomic_fetch_add_explicit(
-                    &forces[3 * atom + 0], reduced_fx, memory_order_relaxed
-                );
-                atomic_fetch_add_explicit(
-                    &forces[3 * atom + 1], reduced_fy, memory_order_relaxed
-                );
-                atomic_fetch_add_explicit(
-                    &forces[3 * atom + 2], reduced_fz, memory_order_relaxed
-                );
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (lane < 8u) {
-        int atom = left_atoms[lane];
+        accumulated_right_fx -= fx;
+        accumulated_right_fy -= fy;
+        accumulated_right_fz -= fz;
+        float reduced_left_fx = simd_sum(fx);
+        float reduced_left_fy = simd_sum(fy);
+        float reduced_left_fz = simd_sum(fz);
         if (
-            atom >= 0
+            lane == left_slot
+            && left_atom >= 0
             && (
-                accumulated_left_fx != 0.0f
-                || accumulated_left_fy != 0.0f
-                || accumulated_left_fz != 0.0f
+                reduced_left_fx != 0.0f
+                || reduced_left_fy != 0.0f
+                || reduced_left_fz != 0.0f
             )
         ) {
             atomic_fetch_add_explicit(
-                &forces[3 * atom + 0], accumulated_left_fx, memory_order_relaxed
+                &forces[3 * left_atom + 0], reduced_left_fx, memory_order_relaxed
             );
             atomic_fetch_add_explicit(
-                &forces[3 * atom + 1], accumulated_left_fy, memory_order_relaxed
+                &forces[3 * left_atom + 1], reduced_left_fy, memory_order_relaxed
             );
             atomic_fetch_add_explicit(
-                &forces[3 * atom + 2], accumulated_left_fz, memory_order_relaxed
+                &forces[3 * left_atom + 2], reduced_left_fz, memory_order_relaxed
             );
         }
+    }
+
+    if (
+        tile_active
+        && right_atom >= 0
+        && (
+            accumulated_right_fx != 0.0f
+            || accumulated_right_fy != 0.0f
+            || accumulated_right_fz != 0.0f
+        )
+    ) {
+        atomic_fetch_add_explicit(
+            &forces[3 * right_atom + 0], accumulated_right_fx, memory_order_relaxed
+        );
+        atomic_fetch_add_explicit(
+            &forces[3 * right_atom + 1], accumulated_right_fy, memory_order_relaxed
+        );
+        atomic_fetch_add_explicit(
+            &forces[3 * right_atom + 2], accumulated_right_fz, memory_order_relaxed
+        );
     }
 """
 

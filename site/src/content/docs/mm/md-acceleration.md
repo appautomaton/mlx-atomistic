@@ -338,6 +338,38 @@ constraint errors remained below `1.70e-5 A`, and the hard-bounded process-tree
 peak stayed below 2.52 GB, so this was a performance rejection rather than a
 correctness or memory failure.
 
+### Retained 32-lane spatial direct-force schedule
+
+The 2026-08-02 follow-up replaced the spatial direct kernel's 64-thread,
+pair-scratch schedule with one 32-lane SIMD group for up to four tiles sharing
+an eight-atom left block. Each lane retains one right atom in registers and
+walks the eight left atoms. SIMD reductions produce the left-atom forces, while
+each lane writes its accumulated right-atom force once. This preserves the
+exact tile membership and topology masks while removing the repeated per-tile
+barriers, 64-pair threadgroup scratch arrays, and repeated right-atom writes.
+
+| Complete constrained NVT gate | Control | 32-lane schedule | Wall reduction |
+| --- | ---: | ---: | ---: |
+| 23,558-atom 5DFR, 75-step median | 0.174411 s | 0.152943 s | 12.31% |
+| 23,558-atom 5DFR, 750 steps | 2.337554 s | 2.066392 s | 11.60% |
+| 94,232-atom JAC, matched 75-step sample | 0.931896 s | 0.850194 s | 8.77% |
+
+The 750-step 5DFR run reached 125.436 ns/day, remained finite, ended at a
+`1.62e-5 A` maximum constraint residual, and peaked at 2.10 GB across the
+bounded process tree. The JAC transfer retained its complete SETTLE/SHAKE
+partition, ended at `3.33e-5 A`, and peaked at 5.21 GB. All 22 Metal parity
+tests for the fused direct, topology, constraint, and neighbor kernels passed.
+The JAC row is a back-to-back code A/B; its absolute wall time should not be
+compared with older samples collected under different machine conditions.
+
+Four adjacent ideas were measured and removed. On-demand exact-pair decoding
+made the complete 5DFR path 1.8% slower, a speculative second Metal stream was
+6.6% slower, omitting the disjoint SHAKE pre-force projection was 1.7% slower,
+and a handwritten fused BAOAB drift improved the median by only 0.5%. None met
+the 5% complete-wall retention threshold. The retained change is therefore the
+kernel work schedule only; the neighbor lifecycle, integrator sequence,
+constraints, and scientific workload are unchanged.
+
 ### Rejected atom-tile result
 
 The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
