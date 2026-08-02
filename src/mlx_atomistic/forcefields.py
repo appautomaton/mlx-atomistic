@@ -925,7 +925,7 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
 
 @dataclass(frozen=True)
 class _FusedBondedForceBinding:
-    """Prepared force-only binding for the four standard bonded families."""
+    """Prepared force-only binding for available standard bonded families."""
 
     term_indices: frozenset[int]
     box_lengths: mx.array
@@ -961,7 +961,7 @@ def _prepare_fused_bonded_force_binding(
     force_terms: tuple[object, ...],
     cell: Cell | None,
 ) -> _FusedBondedForceBinding | None:
-    """Prepare the exact standard bonded family set for one Metal dispatch."""
+    """Prepare supported standard bonded families for one Metal dispatch."""
 
     if (
         "gpu" not in str(mx.default_device()).lower()
@@ -983,16 +983,39 @@ def _prepare_fused_bonded_force_binding(
         if term_type in matched:
             return None
         matched[term_type] = (index, term)
-    if set(matched) != set(family_types):
+    if len(matched) < 2:
         return None
+    empty_terms = {
+        HarmonicBondPotential: HarmonicBondPotential((), k=0.0, length=0.0),
+        HarmonicAnglePotential: HarmonicAnglePotential((), k=0.0, angle=0.0),
+        PeriodicDihedralPotential: PeriodicDihedralPotential(
+            (),
+            k=0.0,
+            periodicity=0.0,
+            phase=0.0,
+        ),
+        ImproperDihedralPotential: ImproperDihedralPotential(
+            (),
+            k=0.0,
+            periodicity=0.0,
+            phase=0.0,
+        ),
+    }
+    selected = {
+        family_type: matched.get(
+            family_type,
+            (-1, empty_terms[family_type]),
+        )[1]
+        for family_type in family_types
+    }
     term_indices = frozenset(index for index, _ in matched.values())
     return _FusedBondedForceBinding(
         term_indices=term_indices,
         box_lengths=mx.diag(cell.matrix),
-        bond=matched[HarmonicBondPotential][1],
-        angle=matched[HarmonicAnglePotential][1],
-        dihedral=matched[PeriodicDihedralPotential][1],
-        improper=matched[ImproperDihedralPotential][1],
+        bond=selected[HarmonicBondPotential],
+        angle=selected[HarmonicAnglePotential],
+        dihedral=selected[PeriodicDihedralPotential],
+        improper=selected[ImproperDihedralPotential],
     )
 
 

@@ -41,6 +41,18 @@ def test_prepared_pipeline_preserves_generic_force_fallback():
     np.testing.assert_allclose(np.asarray(forces), -2.0 * np.asarray(positions))
 
 
+def test_prepared_pipeline_accumulates_multiple_force_terms():
+    positions = mx.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    pipeline = _PreparedForcePipeline.prepare(
+        (_FallbackTerm(), _FallbackTerm()),
+        cell=None,
+    )
+
+    forces = pipeline.bind(None).forces(positions)
+
+    np.testing.assert_allclose(np.asarray(forces), -4.0 * np.asarray(positions))
+
+
 def test_prepared_pipeline_binds_once_per_neighbor_generation():
     positions = np.array(
         [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [2.0, 0.0, 0.0]],

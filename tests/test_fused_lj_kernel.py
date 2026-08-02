@@ -35,8 +35,10 @@ from mlx_atomistic.metal_kernels import (
     neighbor_pair_ordered_scatter,
 )
 from mlx_atomistic.neighbors import (
+    _MLX_MD_CACHE_LIMIT_BYTES,
     NeighborListManager,
     NeighborTiles,
+    _bounded_metal_md_cache,
     build_neighbor_list,
 )
 from mlx_atomistic.pme import PMEConfig
@@ -747,6 +749,44 @@ def test_spatial_neighbor_manager_releases_rebuild_cache_once(monkeypatch):
     assert clear_calls == 1
     manager.update(positions)
     assert clear_calls == 1
+
+
+@pytest.mark.gpu
+def test_md_cache_scope_bounds_allocator_without_clearing_each_rebuild(monkeypatch):
+    """MD uses a bounded reusable cache and restores the caller's policy."""
+
+    positions, cell = fcc_lattice(256, density=0.8)
+    manager = NeighborListManager(
+        cell,
+        cutoff=2.5,
+        skin=0.4,
+        backend="mlx_cell_pairs",
+    )
+    clear_calls = 0
+    cache_transitions = []
+    clear_cache = mx.clear_cache
+    set_cache_limit = mx.set_cache_limit
+
+    def counted_clear_cache():
+        nonlocal clear_calls
+        clear_calls += 1
+        clear_cache()
+
+    def recorded_cache_limit(limit):
+        previous = set_cache_limit(limit)
+        cache_transitions.append((limit, previous))
+        return previous
+
+    monkeypatch.setattr(mx, "clear_cache", counted_clear_cache)
+    monkeypatch.setattr(mx, "set_cache_limit", recorded_cache_limit)
+    with _bounded_metal_md_cache():
+        manager.update(positions)
+        manager.update(positions)
+
+    assert clear_calls == 0
+    assert cache_transitions[0][0] == _MLX_MD_CACHE_LIMIT_BYTES
+    assert cache_transitions[1][0] == cache_transitions[0][1]
+    assert len(cache_transitions) == 2
 
 
 @pytest.mark.gpu

@@ -260,6 +260,51 @@ seconds. Both experiments were removed. The retained tile route is now selected
 by production only inside the measured envelope above; compact pairs remain the
 fallback, and checkpoint resume preserves the originally recorded backend.
 
+### 23,558-atom 5DFR transfer result
+
+A second fixed-cell PME workload confirmed that the retained optimizations are
+not specific to the 94,232-atom JAC replication. The 5DFR system contains
+23,558 atoms, 7,023 SETTLE waters, and 790 disjoint SHAKE clusters. It uses a
+56x56x56 order-5 PME mesh, 9 A cutoff, 5.5 A skin, 4 fs timestep, ten warmups,
+and 750 measured NVT steps.
+
+Three general runtime corrections were retained. Standard bonded-force fusion
+now accepts any unique set of at least two supported families, so 5DFR's bond,
+angle, and periodic-torsion terms no longer miss the Metal route merely because
+the artifact has no improper torsions. Force accumulation adopts the first
+force output directly instead of allocating a zero array and adding it. MD
+execution also applies a scoped 4 GB MLX cache limit and restores the caller's
+allocator policy afterward; this replaces a full cache clear after every
+spatial rebuild while leaving direct neighbor-manager use fail-safe.
+
+| Complete 750-step 5DFR result | Wall time | Throughput |
+| --- | ---: | ---: |
+| Earlier compact-pair result | 7.046576 s | 36.7838 ns/day |
+| Bonded fusion plus direct force seeding | 3.988908 s | 64.9802 ns/day |
+| Scoped 4 GB cache, compact pairs | 3.682865 s | 70.3800 ns/day |
+| Scoped cache plus spatial tiles | 2.979058 s | 87.0074 ns/day |
+
+The final tile result is 57.72% lower than the earlier compact-pair result. It
+remained finite, reused one PME plan, ended at a `1.51e-5 A` maximum constraint
+error, peaked at 2.25 GB across the process tree, and passed the late-memory
+plateau check. A fresh OpenMM/OpenCL reference measured 475.947 ns/day, making
+the contextual throughput gap about 5.47x. That ratio is not a formal
+manifest-matched comparison because the OpenMM reference minimizes before
+timing and includes center-of-mass removal.
+
+The fixed-coordinate tile inventory exactly matched all 14,699,933 compact
+pairs. Direct-force differences were `6.10e-5 kJ/mol/A` RMS and
+`6.71e-4 kJ/mol/A` maximum against a `671.76 kJ/mol/A` maximum reference force.
+Sparse-correction differences were `4.61e-5 kJ/mol/A` RMS and
+`2.44e-4 kJ/mol/A` maximum. The tile direct kernel was 23.95% faster than the
+pair kernel in the interleaved probe.
+
+Production tile routing is therefore limited to two measured atom-count
+windows, 23,000--24,000 and 90,000--100,000, with the existing fixed-cell,
+orthorhombic, order-5 PME, 9 A cutoff, 5.5 A skin, and no-NBFIX gates. The gap
+between those windows continues to use compact pairs rather than extrapolating
+from unmeasured sizes.
+
 ### Rejected atom-tile result
 
 The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead

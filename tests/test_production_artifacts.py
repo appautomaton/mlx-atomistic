@@ -998,6 +998,16 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
         require_production=True,
         fixed_cell=True,
     )
+    measured_small_system = SimpleNamespace(
+        cell=system.cell,
+        positions=SimpleNamespace(ndim=2, shape=(23_558, 3)),
+    )
+    selected_small = runner._production_neighbor_manager(
+        measured_small_system,
+        (pme_term,),
+        require_production=True,
+        fixed_cell=True,
+    )
     pinned_pairs = runner._production_neighbor_manager(
         system,
         (pme_term,),
@@ -1013,6 +1023,7 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
     )
 
     assert selected is not None and selected.backend == "mlx_cell_tiles"
+    assert selected_small is not None and selected_small.backend == "mlx_cell_tiles"
     assert pinned_pairs is not None and pinned_pairs.backend == "mlx_cell_pairs"
     assert npt is not None and npt.backend == "mlx_cell_pairs"
     nbfix_term = SimpleNamespace(**{**vars(pme_term), "has_nbfix": True})
@@ -1022,15 +1033,15 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
             "pme_config": replace(pme_term.pme_config, assignment_order=4),
         }
     )
-    small_system = SimpleNamespace(
+    unmeasured_mid_system = SimpleNamespace(
         cell=system.cell,
-        positions=SimpleNamespace(ndim=2, shape=(89_999, 3)),
+        positions=SimpleNamespace(ndim=2, shape=(50_000, 3)),
     )
     for candidate_system, candidate_term, skin in (
         (system, nbfix_term, runner.GPCRMD_NEIGHBOR_SKIN),
         (system, order_four_term, runner.GPCRMD_NEIGHBOR_SKIN),
         (system, pme_term, 4.0),
-        (small_system, pme_term, runner.GPCRMD_NEIGHBOR_SKIN),
+        (unmeasured_mid_system, pme_term, runner.GPCRMD_NEIGHBOR_SKIN),
     ):
         fallback = runner._production_neighbor_manager(
             candidate_system,

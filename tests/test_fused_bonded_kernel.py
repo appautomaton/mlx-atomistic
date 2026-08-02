@@ -35,8 +35,17 @@ def _on_gpu(monkeypatch):
 
 
 @pytest.mark.gpu
-def test_fused_bonded_pipeline_matches_standard_force_terms():
-    """One fused dispatch preserves all four standard bonded force formulas."""
+@pytest.mark.parametrize(
+    "included_families",
+    [
+        frozenset({"angle", "dihedral"}),
+        frozenset({"bond", "angle", "dihedral"}),
+        frozenset({"bond", "angle", "dihedral", "improper"}),
+    ],
+    ids=["two-families", "three-families", "four-families"],
+)
+def test_fused_bonded_pipeline_matches_standard_force_terms(included_families):
+    """One fused dispatch preserves each available standard bonded formula."""
 
     positions = mx.array(
         [
@@ -52,29 +61,34 @@ def test_fused_bonded_pipeline_matches_standard_force_terms():
         dtype=mx.float32,
     )
     cell = Cell.cubic(8.0)
-    terms = (
-        HarmonicBondPotential(
+    available_terms = {
+        "bond": HarmonicBondPotential(
             [(0, 1), (1, 2), (4, 5)],
             k=[120.0, 80.0, 95.0],
             length=[0.4, 0.75, 0.8],
         ),
-        HarmonicAnglePotential(
+        "angle": HarmonicAnglePotential(
             [(0, 1, 2), (4, 5, 6)],
             k=[30.0, 45.0],
             angle=[1.8, 2.0],
         ),
-        PeriodicDihedralPotential(
+        "dihedral": PeriodicDihedralPotential(
             [(0, 1, 2, 3), (4, 5, 6, 7)],
             k=[2.5, 1.7],
             periodicity=[3.0, 2.0],
             phase=[0.3, -0.2],
         ),
-        ImproperDihedralPotential(
+        "improper": ImproperDihedralPotential(
             [(0, 2, 1, 3), (4, 6, 5, 7)],
             k=[1.2, 0.8],
             periodicity=[0.0, 2.0],
             phase=[0.1, -0.4],
         ),
+    }
+    terms = tuple(
+        term
+        for family, term in available_terms.items()
+        if family in included_families
     )
     reference = mx.zeros_like(positions)
     for term in terms:

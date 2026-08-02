@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from itertools import product
@@ -57,6 +60,7 @@ DEFAULT_MLX_CELL_BLOCK_SIZE = 256
 DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 8
 DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE = 4
 DEFAULT_MLX_CELL_TILE_BATCH = 65_536
+_MLX_MD_CACHE_LIMIT_BYTES = 4_000_000_000
 # Default neighbor backend for systems above the dense-pair limit. Measured on
 # M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
 # ("mlx_cell_pairs") beats the fixed-shape padded-block path ("mlx_cell_blocks")
@@ -68,6 +72,26 @@ DEFAULT_LARGE_SYSTEM_NEIGHBOR_BACKEND: NeighborBackend = "mlx_cell_pairs"
 _BOOL_BYTES = np.dtype(np.bool_).itemsize
 _FLOAT_BYTES = np.dtype(np.float32).itemsize
 _INT_BYTES = np.dtype(np.int32).itemsize
+_MLX_MD_CACHE_POLICY_ACTIVE: ContextVar[bool] = ContextVar(
+    "mlx_atomistic_mlx_md_cache_policy_active",
+    default=False,
+)
+
+
+@contextmanager
+def _bounded_metal_md_cache() -> Iterator[None]:
+    """Bound reusable Metal buffers for one MD execution and restore policy."""
+
+    if not _uses_metal_device():
+        yield
+        return
+    previous_limit = mx.set_cache_limit(_MLX_MD_CACHE_LIMIT_BYTES)
+    token = _MLX_MD_CACHE_POLICY_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _MLX_MD_CACHE_POLICY_ACTIVE.reset(token)
+        mx.set_cache_limit(previous_limit)
 
 
 @dataclass(frozen=True)
@@ -766,7 +790,7 @@ class NeighborListManager:
         if not self._cache_clear_pending:
             return
         self._cache_clear_pending = False
-        if _uses_metal_device():
+        if _uses_metal_device() and not _MLX_MD_CACHE_POLICY_ACTIVE.get():
             mx.clear_cache()
 
     def build_cell_candidate(

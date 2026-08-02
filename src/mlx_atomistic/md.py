@@ -28,6 +28,7 @@ from mlx_atomistic.neighbors import (
     NeighborBlocks,
     NeighborList,
     NeighborListManager,
+    _bounded_metal_md_cache,
 )
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
@@ -3118,6 +3119,7 @@ def simulate(
     )
 
 
+@_bounded_metal_md_cache()
 def simulate_nve(
     positions,
     velocities,
@@ -3636,6 +3638,7 @@ def simulate_nvt(
     )
 
 
+@_bounded_metal_md_cache()
 def _simulate_nvt(
     positions,
     velocities,
@@ -4893,6 +4896,7 @@ def _simulate_nvt(
     )
 
 
+@_bounded_metal_md_cache()
 def simulate_npt(
     positions,
     velocities,

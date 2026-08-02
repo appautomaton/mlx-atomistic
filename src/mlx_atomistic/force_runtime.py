@@ -135,7 +135,7 @@ class _BoundForcePipeline:
             if evaluation_positions is None
             else as_mx_array(evaluation_positions)
         )
-        total_forces = mx.zeros_like(eval_positions)
+        total_forces: mx.array | None = None
         fused_term_indices: frozenset[int] = frozenset()
         if self.fused_bonded_binding is not None:
             fused_term_indices = self.fused_bonded_binding.term_indices
@@ -151,18 +151,7 @@ class _BoundForcePipeline:
                     fused_started,
                     fused_forces,
                 )
-            aggregation_started = (
-                None
-                if self.route_profiler is None
-                else self.route_profiler.start()
-            )
-            total_forces = total_forces + fused_forces
-            if aggregation_started is not None:
-                self.route_profiler.finish(
-                    "force_aggregation",
-                    aggregation_started,
-                    total_forces,
-                )
+            total_forces = fused_forces
         for term_index, (term, binding) in enumerate(
             zip(
                 self.force_terms,
@@ -220,12 +209,16 @@ class _BoundForcePipeline:
                     route_started,
                     forces,
                 )
+            force_array = as_mx_array(forces)
+            if total_forces is None:
+                total_forces = force_array
+                continue
             aggregation_started = (
                 None
                 if self.route_profiler is None
                 else self.route_profiler.start()
             )
-            total_forces = total_forces + as_mx_array(forces)
+            total_forces = total_forces + force_array
             if aggregation_started is not None:
                 self.route_profiler.finish(
                     "force_aggregation",
@@ -235,6 +228,9 @@ class _BoundForcePipeline:
         if not self.force_terms:
             msg = "force_terms must not be empty"
             raise ValueError(msg)
+        if total_forces is None:
+            msg = "force pipeline did not produce forces"
+            raise RuntimeError(msg)
         redistribution_started = (
             None
             if self.route_profiler is None

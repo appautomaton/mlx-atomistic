@@ -97,10 +97,13 @@ The product runtime now has a measured charged-PME validation workload:
   lazy topology, shared exact direct-space neighbors, and no fallback.
 
 For Metal fixed-cell production runs, the spatial `mlx_cell_tiles` route is
-selected only for 90,000--100,000 atoms with order-5 PME, 9 A cutoff, 5.5 A
-skin, an orthorhombic cell, and no NBFIX. Other PME workloads retain compact
-pairs. Checkpoint resume pins the recorded neighbor backend and fails closed if
-that backend is no longer admissible.
+selected only in the independently measured 23,000--24,000 and
+90,000--100,000 atom windows, with order-5 PME, 9 A cutoff, 5.5 A skin, an
+orthorhombic cell, and no NBFIX. Other PME workloads retain compact pairs.
+Checkpoint resume pins the recorded neighbor backend and fails closed if that
+backend is no longer admissible. The 23,558-atom 5DFR transfer result, including
+750-step timing, memory, constraints, and pair-versus-tile force parity, is
+recorded in [`md-acceleration.md`](./md-acceleration.md).
 
 The quantitative record and the three gitignored raw JSON paths are in
 [`scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md).

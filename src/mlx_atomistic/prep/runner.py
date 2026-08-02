@@ -80,8 +80,10 @@ PRESSURE_DIAGNOSTIC_ATOM_LIMIT = 50_000
 # 4.0 A) because it rebuilt 15 fewer times. Both runs preserved cutoff physics.
 GPCRMD_NEIGHBOR_SKIN = 5.5
 GPCRMD_NEIGHBOR_WORKERS = max(1, min(8, os.cpu_count() or 1))
-_PRODUCTION_TILE_PME_MIN_ATOMS = 90_000
-_PRODUCTION_TILE_PME_MAX_ATOMS = 100_000
+_PRODUCTION_TILE_PME_ATOM_WINDOWS = (
+    (23_000, 24_000),
+    (90_000, 100_000),
+)
 _PRODUCTION_TILE_PME_CUTOFF = 9.0
 _CHECKPOINT_NEIGHBOR_BACKENDS = frozenset(
     {
@@ -424,8 +426,9 @@ def _production_tile_pme_eligible(
     positions = getattr(system, "positions", None)
     if positions is not None and getattr(positions, "ndim", 0) == 2:
         atom_count = int(positions.shape[0])
-    if not _PRODUCTION_TILE_PME_MIN_ATOMS <= atom_count <= (
-        _PRODUCTION_TILE_PME_MAX_ATOMS
+    if not any(
+        minimum <= atom_count <= maximum
+        for minimum, maximum in _PRODUCTION_TILE_PME_ATOM_WINDOWS
     ):
         return False
     for term in pme_terms:
