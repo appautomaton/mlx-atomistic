@@ -13,7 +13,12 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_atomistic.constraints import SettleWaterConstraints, _ShakeClusterConstraints
+import mlx_atomistic.md as md_module
+from mlx_atomistic.constraints import (
+    DistanceConstraints,
+    SettleWaterConstraints,
+    _ShakeClusterConstraints,
+)
 from mlx_atomistic.core import Cell
 from mlx_atomistic.force_runtime import _PreparedForcePipeline
 from mlx_atomistic.forcefields import NonbondedPotential
@@ -222,6 +227,120 @@ def test_settle_water_kernels_match_openmm_position_oracle():
         displacement = final_positions[left] - final_positions[right]
         relative_velocity = final_velocities[left] - final_velocities[right]
         assert abs(float(np.dot(displacement, relative_velocity))) < 2.0e-6
+
+
+@pytest.mark.gpu
+def test_spatial_constrained_nvt_async_submission_is_guarded_and_state_preserving(
+    monkeypatch,
+):
+    """One async force submission overlaps only ordinary prepared Metal steps."""
+
+    positions = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [2.0, 1.0, 1.0],
+            [1.0, 2.3, 1.0],
+            [2.4, 2.2, 1.1],
+            [4.0, 4.0, 4.0],
+            [5.1, 4.0, 4.0],
+            [4.0, 5.2, 4.0],
+            [5.2, 5.1, 4.2],
+        ],
+        dtype=np.float32,
+    )
+    velocities = np.zeros_like(positions)
+    masses = np.ones((positions.shape[0],), dtype=np.float32)
+    cell = Cell.cubic(8.0)
+    constraints = DistanceConstraints([(0, 1)], distances=[1.0], max_iterations=8)
+
+    def run(*, runtime_profile=False):
+        potential = NonbondedPotential(
+            sigma=np.full((positions.shape[0],), 0.8, dtype=np.float32),
+            epsilon=np.full((positions.shape[0],), 0.05, dtype=np.float32),
+            charges=np.zeros((positions.shape[0],), dtype=np.float32),
+            cutoff=2.5,
+        )
+        manager = NeighborListManager(
+            cell,
+            cutoff=2.5,
+            skin=0.4,
+            check_interval=1,
+            backend="mlx_cell_tiles",
+            displacement_check_backend="mlx_scalar",
+        )
+        return simulate_nvt(
+            positions,
+            velocities,
+            masses=masses,
+            cell=cell,
+            force_terms=potential,
+            neighbor_manager=manager,
+            constraints=constraints,
+            config=SimulationConfig(
+                dt=0.0005,
+                steps=5,
+                sample_interval=5,
+                diagnostic_interval=2,
+                pressure_diagnostics=False,
+                runtime_profile=runtime_profile,
+            ),
+            thermostat=LangevinThermostat(temperature=0.0, friction=0.0, seed=17),
+        )
+
+    original_async_eval = mx.async_eval
+    submissions = []
+
+    def record_async_eval(*values):
+        submissions.append(values)
+        return original_async_eval(*values)
+
+    monkeypatch.setattr(mx, "async_eval", record_async_eval)
+    asynchronous = run()
+    assert len(submissions) == 2
+
+    profiled = run(runtime_profile=True)
+    assert profiled.route_profile["reconciled"] is True
+    assert len(submissions) == 2
+
+    monkeypatch.setattr(
+        md_module,
+        "_async_force_submission_enabled",
+        lambda *args, **kwargs: False,
+    )
+    synchronous = run()
+    mx.eval(
+        asynchronous.final_state.positions,
+        asynchronous.final_state.velocities,
+        asynchronous.final_state.forces,
+        synchronous.final_state.positions,
+        synchronous.final_state.velocities,
+        synchronous.final_state.forces,
+    )
+
+    for asynchronous_values, synchronous_values in (
+        (asynchronous.final_state.positions, synchronous.final_state.positions),
+        (asynchronous.final_state.velocities, synchronous.final_state.velocities),
+        (asynchronous.final_state.forces, synchronous.final_state.forces),
+        (asynchronous.potential_energy, synchronous.potential_energy),
+        (asynchronous.constraint_max_error, synchronous.constraint_max_error),
+        (asynchronous.pair_count, synchronous.pair_count),
+        (asynchronous.rebuild_count, synchronous.rebuild_count),
+    ):
+        np.testing.assert_allclose(
+            np.asarray(asynchronous_values),
+            np.asarray(synchronous_values),
+            rtol=1.0e-6,
+            atol=2.0e-6,
+        )
+    assert {
+        key: value
+        for key, value in asynchronous.runtime_sync_report.items()
+        if key.endswith("_count")
+    } == {
+        key: value
+        for key, value in synchronous.runtime_sync_report.items()
+        if key.endswith("_count")
+    }
 
 
 @pytest.mark.gpu

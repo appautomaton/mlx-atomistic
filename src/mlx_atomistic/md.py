@@ -2865,6 +2865,28 @@ def _langevin_block_execution_enabled(
     )
 
 
+def _async_force_submission_enabled(
+    config: SimulationConfig,
+    *,
+    thermostat: object,
+    constraints: object | None,
+    prepared_force_pipeline: _PreparedForcePipeline | None,
+    neighbor_list: NeighborList | None,
+) -> bool:
+    """Whether one NVT step may submit its force graph without blocking."""
+
+    return (
+        not config.runtime_profile
+        and isinstance(thermostat, LangevinThermostat)
+        and constraints is not None
+        and prepared_force_pipeline is not None
+        and neighbor_list is not None
+        and neighbor_list.tiles is not None
+        and "gpu" in str(mx.default_device()).lower()
+        and callable(getattr(mx, "async_eval", None))
+    )
+
+
 def _normalize_reporters(
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None,
 ) -> tuple[RuntimeReporter, ...]:
@@ -3980,6 +4002,13 @@ def _simulate_nvt(
         constraints=constraints,
         virtual_sites=virtual_sites,
     )
+    async_force_submission = _async_force_submission_enabled(
+        config,
+        thermostat=thermostat,
+        constraints=constraints,
+        prepared_force_pipeline=prepared_force_pipeline,
+        neighbor_list=neighbor_list,
+    )
     if _batched:
         fscale = config.force_to_acceleration_scale
         dt = config.dt
@@ -4654,6 +4683,15 @@ def _simulate_nvt(
                 diagnostic_virial,
             )
         force_evaluation_wall_seconds += perf_counter() - force_start
+        if (
+            async_force_submission
+            and force_binding is not None
+            and neighbor_list is not None
+            and neighbor_list.tiles is not None
+            and not full_diagnostic_step
+            and not deferred_final
+        ):
+            mx.async_eval(next_forces)
         final_integration_started = (
             None if route_profiler is None else route_profiler.start()
         )
