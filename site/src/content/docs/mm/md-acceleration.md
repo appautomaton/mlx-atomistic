@@ -40,8 +40,10 @@ existing force, constraint, and restart validation gates.
   estimate fits the configured budget; otherwise it falls back to tiled MLX.
   For neighbor-list managers, `auto` selects `mlx_dense_pairs` for supported
   small systems and `mlx_cell_pairs` above the small-system limit. The
-  charged-PME performance runner explicitly selects `mlx_cell_tiles`; general
-  neighbor managers retain the established pair-oriented `auto` behavior.
+  charged-PME performance runner explicitly selects `mlx_cell_tiles`.
+  Production fixed-cell PME also selects tiles only inside the measured Metal
+  envelope: 90,000--100,000 atoms, order-5 assignment, 9 A cutoff, 5.5 A skin,
+  orthorhombic cell, and no NBFIX. Every other PME case keeps compact pairs.
 
 ## Current Hot-Path Recommendation
 
@@ -55,7 +57,10 @@ same-left tiles, while preserving canonical atom indices at force scatter.
 The current production path also uses specialized rigid-water/constraint
 kernels and one fused standard-bonded force dispatch. The charged-PME
 development runner now selects spatial tiles inside its narrow supported
-envelope and fails its profile gate on a compact-pair fallback. General
+envelope and fails its profile gate on a compact-pair fallback. The production
+runner uses the same conservative envelope and records the selected backend in
+checkpoints; resume pins that backend rather than silently changing the force
+representation. General
 large-system execution remains pair-oriented until the tile envelope is
 broadened deliberately. The next performance work should reduce remaining
 direct atomics and host-controlled rebuild work rather than add another wrapper
@@ -238,6 +243,25 @@ but the candidate does not replace the existing manifest-bound 1.003149-second
 MLX result or establish a new OpenMM ratio. The main remaining costs are
 direct-space work, neighbor update/rebuild, constraints, reciprocal PME, force
 aggregation, and Python-side launch orchestration.
+
+### Production routing follow-up
+
+A fresh raw 75-step bundle on 2026-08-01 reproduced the retained route at a
+0.558220-second tile median versus a 0.859394-second compact-pair control
+median, 35.04% lower. All force, inventory, constraint, finite-state, PME-plan,
+and 40 GB memory gates passed. The recurring order-5 reciprocal path now omits
+particle-energy output and reduction during force-only steps. Its synchronized
+route time fell from 0.081776 to 0.067008 seconds across 74 calls, 18.06%, while
+complete clean wall remained statistically flat at 0.560536 seconds.
+
+Two bounded direct-force experiments were rejected. Raising the same-left tile
+group width from four to eight improved the isolated tile kernel by 5.53% but
+changed complete wall from 0.558220 to 0.559019 seconds. A two-pass non-atomic
+right-block reducer produced a 264 MB temporary tile-force buffer, reduced the
+direct advantage over pairs to 8.52%, and raised complete wall to 0.734520
+seconds. Both experiments were removed. The retained tile route is now selected
+by production only inside the measured envelope above; compact pairs remain the
+fallback, and checkpoint resume preserves the originally recorded backend.
 
 ### Rejected atom-tile result
 

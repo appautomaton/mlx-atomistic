@@ -97,7 +97,13 @@ The product runtime now has a measured charged-PME validation workload:
 - independent OpenMM manifest match plus passing total/component energy and
   complete-force bounds;
 - one warmup plus two measured finite NVT steps using one reusable PME plan,
-  lazy topology, shared `NeighborBlocks`, and no fallback.
+  lazy topology, shared exact direct-space neighbors, and no fallback.
+
+For Metal fixed-cell production runs, the spatial `mlx_cell_tiles` route is
+selected only for 90,000--100,000 atoms with order-5 PME, 9 A cutoff, 5.5 A
+skin, an orthorhombic cell, and no NBFIX. Other PME workloads retain compact
+pairs. Checkpoint resume pins the recorded neighbor backend and fails closed if
+that backend is no longer admissible.
 
 The quantitative record and the three gitignored raw JSON paths are in
 [`scalable-charged-pme-runtime-m5max.md`](../benchmarks/scalable-charged-pme-runtime-m5max.md).

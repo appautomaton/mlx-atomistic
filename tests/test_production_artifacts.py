@@ -968,6 +968,101 @@ def test_gpcrmd_production_neighbor_manager_uses_compact_pme_pairs():
         )
 
 
+def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
+    monkeypatch,
+):
+    import mlx_atomistic.prep.runner as runner
+
+    monkeypatch.setattr(runner.mx, "default_device", lambda: "Device(gpu, 0)")
+    topology = Topology.from_sequences(n_atoms=94_232, eager_nonbonded_pair_limit=0)
+    system = SimpleNamespace(
+        cell=Cell.cubic(124.0),
+        positions=SimpleNamespace(ndim=2, shape=(94_232, 3)),
+    )
+    pme_term = SimpleNamespace(
+        topology=topology,
+        cutoff=9.0,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(128, 128, 64),
+            alpha=0.35,
+            real_cutoff=9.0,
+            assignment_order=5,
+        ),
+        has_nbfix=False,
+    )
+
+    selected = runner._production_neighbor_manager(
+        system,
+        (pme_term,),
+        require_production=True,
+        fixed_cell=True,
+    )
+    pinned_pairs = runner._production_neighbor_manager(
+        system,
+        (pme_term,),
+        require_production=True,
+        fixed_cell=True,
+        recorded_backend="mlx_cell_pairs",
+    )
+    npt = runner._production_neighbor_manager(
+        system,
+        (pme_term,),
+        require_production=True,
+        fixed_cell=False,
+    )
+
+    assert selected is not None and selected.backend == "mlx_cell_tiles"
+    assert pinned_pairs is not None and pinned_pairs.backend == "mlx_cell_pairs"
+    assert npt is not None and npt.backend == "mlx_cell_pairs"
+    nbfix_term = SimpleNamespace(**{**vars(pme_term), "has_nbfix": True})
+    order_four_term = SimpleNamespace(
+        **{
+            **vars(pme_term),
+            "pme_config": replace(pme_term.pme_config, assignment_order=4),
+        }
+    )
+    small_system = SimpleNamespace(
+        cell=system.cell,
+        positions=SimpleNamespace(ndim=2, shape=(89_999, 3)),
+    )
+    for candidate_system, candidate_term, skin in (
+        (system, nbfix_term, runner.GPCRMD_NEIGHBOR_SKIN),
+        (system, order_four_term, runner.GPCRMD_NEIGHBOR_SKIN),
+        (system, pme_term, 4.0),
+        (small_system, pme_term, runner.GPCRMD_NEIGHBOR_SKIN),
+    ):
+        fallback = runner._production_neighbor_manager(
+            candidate_system,
+            (candidate_term,),
+            require_production=True,
+            fixed_cell=True,
+            neighbor_skin=skin,
+        )
+        assert fallback is not None and fallback.backend == "mlx_cell_pairs"
+    with pytest.raises(ValueError, match="outside the current production envelope"):
+        runner._production_neighbor_manager(
+            system,
+            (pme_term,),
+            require_production=True,
+            fixed_cell=False,
+            recorded_backend="mlx_cell_tiles",
+        )
+
+    contract = runner._runtime_execution_contract(
+        (pme_term,),
+        neighbor_manager=selected,
+        nonbonded_report={
+            "backend": "mlx_cell_tiles",
+            "representation_kind": "tiles",
+            "fallback_reason": None,
+        },
+        fixed_cell=True,
+    )
+    assert contract["shared_direct_space_neighbors"] is True
+    assert contract["neighbor_representation"] == "tiles"
+
+
 def test_gpcrmd_short_range_prototype_pme_artifact_runs_cutoff_not_pme(tmp_path):
     from mlx_atomistic.io import load_npz_trajectory
     from mlx_atomistic.prep.runner import TRAJECTORY_NAME, run_gpcrmd_mlx
