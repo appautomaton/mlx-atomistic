@@ -479,6 +479,40 @@ tests were removed. JAC and 750-step runs were not performed. This result is
 specific to the current 23,558-atom staged route; it does not claim that
 `mx.compile` is generally ineffective elsewhere in MLX Atomistic.
 
+### Neighbor rebuild lifecycle experiments
+
+The 2026-08-03 phase tested six independent ways to shorten the complete
+spatial-tile rebuild lifecycle. Every candidate first preserved the 23,558-atom
+5DFR inventory exactly: 14,699,933 pairs, 646,965 non-empty tiles, 163,090
+force groups, and six byte-identical array digests. Process-tree peaks remained
+between 0.85 and 1.00 GB under the 40 GB limit. The retention gate required at
+least 10% local improvement in an interleaved `C1 -> A1 -> A2 -> C2` test
+before any JAC or 750-step transfer.
+
+| Candidate | Measured boundary | 5DFR result | Decision |
+|---|---|---:|---|
+| Fused tile compaction and pair emission | Complete rebuild | 2.64% slower | Rejected |
+| Stable linear force-group placement | Complete rebuild | 8.73% slower | Rejected |
+| One-transfer prefix tails | Complete rebuild | At most about 4.2% after settling | Rejected |
+| Unified schedule-validation ownership | Complete rebuild | 0.017% faster; paired directions disagreed | Rejected |
+| Deferred topology-mask materialization | Rebuild, binding, and first force | 0.37% faster | Rejected |
+| Same-position finite certificate | Real manager-update rebuild | 5.54% slower | Rejected |
+
+The structural findings still narrow future work. A race-free stable linear
+placement was possible, but scanning each left-block row cost more than MLX
+`argsort` plus gathers. The prefix-tail experiment showed that slices created
+after an `mx.eval` can add scalar work, but its benefit did not reproduce the
+10% gate. Schedule validation and topology-mask waits could be moved safely,
+yet complete-boundary timing showed that the waits were either too small or
+merely transferred to first force evaluation. The finite certificate removed
+one reduction but added more host bookkeeping than it saved.
+
+No candidate reached local admission, so no JAC or 750-step run was performed.
+All candidate product code and candidate-only tests were removed. The retained
+tree therefore keeps the pre-phase spatial-tile rebuild, validation, topology,
+and finite-check behavior without new runtime complexity.
+
+
 ### Rejected atom-tile result
 
 The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
