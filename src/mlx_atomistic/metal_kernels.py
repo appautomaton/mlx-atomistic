@@ -340,7 +340,6 @@ _neighbor_pair_ordered_scatter_kernel_singleton = None
 _neighbor_cell_tile_candidates_kernel_singleton = None
 _neighbor_tile_membership_kernel_singleton = None
 _neighbor_tile_ordered_scatter_kernel_singleton = None
-_neighbor_tile_stable_placement_kernel_singleton = None
 _neighbor_tile_force_groups_kernel_singleton = None
 _neighbor_tile_pair_scatter_kernel_singleton = None
 _tile_topology_lj_masks_kernel_singleton = None
@@ -1609,48 +1608,6 @@ _NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE = r"""
     accepted_member_mask[2 * output + 1] = member_mask[2 * tile + 1];
 """
 
-_NEIGHBOR_TILE_STABLE_PLACEMENT_SOURCE = r"""
-    uint block = thread_position_in_grid.x;
-    if (block >= (uint)counts[0] || tile_counts[block] == 0) {
-        return;
-    }
-
-    int local_left = block_local[block];
-    int output = tile_prefix[block] - tile_counts[block];
-    int task_start = block_task_starts[block];
-    int task_end = task_start + block_task_counts[block];
-
-    for (int task = task_start; task < task_end; task++) {
-        int left_cell = cell_pairs[2 * task + 0];
-        int right_cell = cell_pairs[2 * task + 1];
-        int right_count = cell_block_counts[right_cell];
-        int candidate;
-        int candidate_end;
-        if (left_cell == right_cell) {
-            int left_count = cell_block_counts[left_cell];
-            candidate = (
-                task_offsets[task]
-                + local_left * left_count
-                - local_left * (local_left - 1) / 2
-            );
-            candidate_end = candidate + left_count - local_left;
-        } else {
-            candidate = task_offsets[task] + local_left * right_count;
-            candidate_end = candidate + right_count;
-        }
-        for (; candidate < candidate_end; candidate++) {
-            if (member_counts[candidate] == 0) {
-                continue;
-            }
-            accepted_tile_blocks[2 * output + 0] = tile_blocks[2 * candidate + 0];
-            accepted_tile_blocks[2 * output + 1] = tile_blocks[2 * candidate + 1];
-            accepted_member_mask[2 * output + 0] = member_mask[2 * candidate + 0];
-            accepted_member_mask[2 * output + 1] = member_mask[2 * candidate + 1];
-            output++;
-        }
-    }
-"""
-
 _NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
     uint block = thread_position_in_grid.x;
     if (block >= (uint)counts[0] || tile_counts[block] == 0) {
@@ -2656,33 +2613,6 @@ def _neighbor_tile_ordered_scatter_kernel():
     return _neighbor_tile_ordered_scatter_kernel_singleton
 
 
-def _neighbor_tile_stable_placement_kernel():
-    """Return the cached deterministic left-block placement Metal kernel."""
-
-    global _neighbor_tile_stable_placement_kernel_singleton
-    if _neighbor_tile_stable_placement_kernel_singleton is None:
-        _neighbor_tile_stable_placement_kernel_singleton = mx.fast.metal_kernel(
-            name="neighbor_tile_stable_placement",
-            input_names=[
-                "tile_blocks",
-                "member_mask",
-                "member_counts",
-                "cell_block_counts",
-                "cell_pairs",
-                "task_offsets",
-                "block_local",
-                "block_task_starts",
-                "block_task_counts",
-                "tile_counts",
-                "tile_prefix",
-                "counts",
-            ],
-            output_names=["accepted_tile_blocks", "accepted_member_mask"],
-            source=_NEIGHBOR_TILE_STABLE_PLACEMENT_SOURCE,
-        )
-    return _neighbor_tile_stable_placement_kernel_singleton
-
-
 def _neighbor_tile_force_groups_kernel():
     """Return the cached spatial-tile force-group schedule kernel."""
 
@@ -3149,95 +3079,6 @@ def _neighbor_tile_ordered_scatter_sized(
         output_dtypes=[mx.int32, mx.uint32],
         grid=(tile_count, 1, 1),
         threadgroup=(min(256, tile_count), 1, 1),
-        init_value=0,
-    )
-    return accepted_tiles, accepted_mask
-
-
-def _neighbor_tile_stable_placement_sized(
-    tile_blocks: mx.array,
-    member_mask: mx.array,
-    member_counts: mx.array,
-    cell_block_counts: mx.array,
-    cell_pairs: mx.array,
-    task_offsets: mx.array,
-    block_local: mx.array,
-    block_task_starts: mx.array,
-    block_task_counts: mx.array,
-    tile_counts: mx.array,
-    tile_prefix: mx.array,
-    *,
-    accepted_count: int,
-) -> tuple[mx.array, mx.array]:
-    """Place non-empty tiles in stable left-block order without sorting."""
-
-    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
-    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
-    member_counts = as_mx_array(member_counts, dtype=mx.int32)
-    cell_block_counts = as_mx_array(cell_block_counts, dtype=mx.int32)
-    cell_pairs = as_mx_array(cell_pairs, dtype=mx.int32)
-    task_offsets = as_mx_array(task_offsets, dtype=mx.int32)
-    block_local = as_mx_array(block_local, dtype=mx.int32)
-    block_task_starts = as_mx_array(block_task_starts, dtype=mx.int32)
-    block_task_counts = as_mx_array(block_task_counts, dtype=mx.int32)
-    tile_counts = as_mx_array(tile_counts, dtype=mx.int32)
-    tile_prefix = as_mx_array(tile_prefix, dtype=mx.int32)
-    candidate_count = int(tile_blocks.shape[0])
-    block_count = int(block_local.shape[0])
-    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
-        msg = "tile_blocks must have shape (n_tiles, 2)"
-        raise ValueError(msg)
-    if member_mask.shape != (candidate_count, 2):
-        msg = "member_mask must have shape (n_tiles, 2)"
-        raise ValueError(msg)
-    if member_counts.shape != (candidate_count,):
-        msg = "member_counts must contain one value per tile"
-        raise ValueError(msg)
-    task_count = int(cell_pairs.shape[0])
-    if cell_pairs.ndim != 2 or cell_pairs.shape[1] != 2:
-        msg = "cell_pairs must have shape (n_tasks, 2)"
-        raise ValueError(msg)
-    if task_offsets.shape != (task_count,):
-        msg = "task_offsets must contain one output offset per task"
-        raise ValueError(msg)
-    if any(
-        values.shape != (block_count,)
-        for values in (
-            block_task_starts,
-            block_task_counts,
-            tile_counts,
-            tile_prefix,
-        )
-    ):
-        msg = "block placement arrays must have matching one-dimensional shapes"
-        raise ValueError(msg)
-    if accepted_count < 0 or accepted_count > candidate_count:
-        msg = "accepted_count must fit within the candidate tile count"
-        raise ValueError(msg)
-    if accepted_count == 0:
-        return (
-            mx.zeros((0, 2), dtype=mx.int32),
-            mx.zeros((0, 2), dtype=mx.uint32),
-        )
-    accepted_tiles, accepted_mask = _neighbor_tile_stable_placement_kernel()(
-        inputs=[
-            tile_blocks,
-            member_mask,
-            member_counts,
-            cell_block_counts,
-            cell_pairs,
-            task_offsets,
-            block_local,
-            block_task_starts,
-            block_task_counts,
-            tile_counts,
-            tile_prefix,
-            mx.array([block_count], dtype=mx.int32),
-        ],
-        output_shapes=[(accepted_count, 2), (accepted_count, 2)],
-        output_dtypes=[mx.int32, mx.uint32],
-        grid=(block_count, 1, 1),
-        threadgroup=(min(256, block_count), 1, 1),
         init_value=0,
     )
     return accepted_tiles, accepted_mask

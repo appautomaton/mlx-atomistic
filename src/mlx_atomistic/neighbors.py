@@ -28,7 +28,7 @@ from mlx_atomistic.metal_kernels import (
     _neighbor_tile_force_groups_sized,
     _neighbor_tile_member_pairs_sized,
     _neighbor_tile_membership,
-    _neighbor_tile_stable_placement_sized,
+    _neighbor_tile_ordered_scatter_sized,
     neighbor_pair_cutoff_mask,
     neighbor_pair_ordered_scatter,
 )
@@ -1396,36 +1396,19 @@ def _build_mlx_spatial_cell_tile_list(
         mx.eval(nonempty_prefix, member_prefix)
         tile_count = int(np.asarray(nonempty_prefix[-1]))
         exact_pair_count = int(np.asarray(member_prefix[-1]))
-        active_tiles = (member_counts > 0).astype(mx.int32)
-        tile_counts_by_left = mx.zeros((block_count,), dtype=mx.int32).at[
-            candidate_tiles[:, 0]
-        ].add(active_tiles)
-        tile_prefix_by_left = mx.cumsum(tile_counts_by_left)
-        task_counts_by_left_cell = np.bincount(
-            task_left,
-            minlength=cell_count,
-        ).astype(np.int32, copy=False)
-        task_starts_by_left_cell = np.empty((cell_count,), dtype=np.int32)
-        task_starts_by_left_cell[0] = 0
-        np.cumsum(
-            task_counts_by_left_cell[:-1],
-            dtype=np.int64,
-            out=task_starts_by_left_cell[1:],
-        )
-        tile_blocks, member_mask = _neighbor_tile_stable_placement_sized(
+        tile_blocks, member_mask = _neighbor_tile_ordered_scatter_sized(
             candidate_tiles,
             candidate_mask,
             member_counts,
-            mx.array(cell_block_counts, dtype=mx.int32),
-            mx.array(cell_pairs, dtype=mx.int32),
-            mx.array(task_offsets, dtype=mx.int32),
-            mx.array(block_local, dtype=mx.int32),
-            mx.array(task_starts_by_left_cell[block_cells], dtype=mx.int32),
-            mx.array(task_counts_by_left_cell[block_cells], dtype=mx.int32),
-            tile_counts_by_left,
-            tile_prefix_by_left,
+            nonempty_prefix,
             accepted_count=tile_count,
         )
+        # Cell-pair tasks are spatially coherent but periodic canonicalization
+        # does not guarantee monotonic block IDs. Group only the much smaller
+        # non-empty tile inventory so every force group owns one left block.
+        force_order = mx.argsort(tile_blocks[:, 0])
+        tile_blocks = tile_blocks[force_order]
+        member_mask = member_mask[force_order]
         pairs = _neighbor_tile_member_pairs_sized(
             atom_blocks,
             candidate_tiles,
@@ -1434,6 +1417,10 @@ def _build_mlx_spatial_cell_tile_list(
             member_prefix,
             accepted_count=exact_pair_count,
         )
+        tile_counts_by_left = mx.zeros((block_count,), dtype=mx.int32).at[
+            tile_blocks[:, 0]
+        ].add(mx.ones((tile_count,), dtype=mx.int32))
+        tile_prefix_by_left = mx.cumsum(tile_counts_by_left)
         force_groups_by_left = (
             tile_counts_by_left + DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE - 1
         ) // DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE
