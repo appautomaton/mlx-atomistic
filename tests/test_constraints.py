@@ -6,6 +6,7 @@ from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
     SettleWaterConstraints,
+    _project_constraint_positions_unchecked,
     _ShakeClusterConstraints,
 )
 from mlx_atomistic.core import Cell
@@ -349,6 +350,43 @@ def test_settle_dynamics_step_matches_openmm_reference_oracle():
         displacement = final_positions[left] - final_positions[right]
         relative_velocity = final_velocities[left] - final_velocities[right]
         assert abs(float(np.dot(displacement, relative_velocity))) < 2.0e-6
+
+
+def test_unchecked_settle_projection_matches_checked_cpu_positions():
+    constraints = SettleWaterConstraints(
+        [(0, 1, 2)],
+        oh_distance=0.1,
+        hh_distance=0.15,
+    )
+    reference = mx.array(
+        [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.0125, 0.099215674, 0.0]],
+        dtype=mx.float32,
+    )
+    predicted = reference + mx.array(
+        [[0.001, -0.002, 0.0], [-0.002, 0.001, 0.0], [0.001, 0.001, 0.0]],
+        dtype=mx.float32,
+    )
+    masses = mx.array([16.0, 1.0, 1.0], dtype=mx.float32)
+
+    checked, error = constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+    )
+    unchecked = _project_constraint_positions_unchecked(
+        constraints,
+        predicted,
+        masses,
+        reference_positions=reference,
+    )
+    mx.eval(checked, unchecked, error)
+
+    np.testing.assert_array_equal(np.asarray(unchecked), np.asarray(checked))
+    assert float(np.asarray(error)) <= constraints.tolerance
+    np.testing.assert_array_equal(
+        np.asarray(constraints._flat_water_atoms),
+        np.asarray([0, 1, 2], dtype=np.int32),
+    )
 
 
 def test_settle_interoperates_with_generic_distance_constraints_in_nve():

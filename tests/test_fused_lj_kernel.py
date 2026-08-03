@@ -15,8 +15,10 @@ import pytest
 
 import mlx_atomistic.md as md_module
 from mlx_atomistic.constraints import (
+    CompositeConstraints,
     DistanceConstraints,
     SettleWaterConstraints,
+    _project_constraint_positions_unchecked,
     _ShakeClusterConstraints,
 )
 from mlx_atomistic.core import Cell
@@ -227,6 +229,93 @@ def test_settle_water_kernels_match_openmm_position_oracle():
         displacement = final_positions[left] - final_positions[right]
         relative_velocity = final_velocities[left] - final_velocities[right]
         assert abs(float(np.dot(displacement, relative_velocity))) < 2.0e-6
+
+
+@pytest.mark.gpu
+def test_unchecked_constraint_projection_skips_error_graph_and_matches_checked_positions(
+    monkeypatch,
+):
+    """Ordinary Metal projection skips errors without changing positions."""
+
+    settle = SettleWaterConstraints(
+        [(0, 1, 2)],
+        oh_distance=0.1,
+        hh_distance=0.15,
+    )
+    shake = _ShakeClusterConstraints(
+        [[3, 4, 5, 6]],
+        peripheral_counts=[3],
+        distances=[0.1],
+        max_iterations=8,
+    )
+    constraints = CompositeConstraints((settle, shake))
+    reference = mx.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.1, 1.0, 1.0],
+            [0.9875, 1.099215674, 1.0],
+            [3.0, 3.0, 3.0],
+            [3.1, 3.0, 3.0],
+            [3.0, 3.1, 3.0],
+            [3.0, 3.0, 3.1],
+        ],
+        dtype=mx.float32,
+    )
+    predicted = reference + mx.array(
+        [
+            [0.001, -0.002, 0.0],
+            [-0.002, 0.001, 0.0],
+            [0.001, 0.001, 0.0],
+            [0.002, -0.001, 0.001],
+            [-0.001, 0.002, 0.0],
+            [0.0, -0.002, 0.001],
+            [0.001, 0.0, -0.002],
+        ],
+        dtype=mx.float32,
+    )
+    masses = mx.array([16.0, 1.0, 1.0, 12.0, 1.0, 1.0, 1.0])
+    cell = Cell.cubic(8.0)
+    calls = {"settle": 0, "shake": 0}
+    original_settle_error = SettleWaterConstraints.max_error
+    original_shake_error = _ShakeClusterConstraints.max_error
+
+    def counted_settle_error(self, positions, cell=None):
+        calls["settle"] += 1
+        return original_settle_error(self, positions, cell)
+
+    def counted_shake_error(self, positions, cell=None):
+        calls["shake"] += 1
+        return original_shake_error(self, positions, cell)
+
+    monkeypatch.setattr(SettleWaterConstraints, "max_error", counted_settle_error)
+    monkeypatch.setattr(_ShakeClusterConstraints, "max_error", counted_shake_error)
+    checked, error = constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    assert calls["settle"] > 0
+    assert calls["shake"] > 0
+
+    calls.update(settle=0, shake=0)
+    unchecked = _project_constraint_positions_unchecked(
+        constraints,
+        predicted,
+        masses,
+        cell,
+        reference_positions=reference,
+    )
+    assert calls == {"settle": 0, "shake": 0}
+    mx.eval(checked, unchecked, error)
+
+    np.testing.assert_allclose(
+        np.asarray(unchecked),
+        np.asarray(checked),
+        rtol=0.0,
+        atol=2.0e-7,
+    )
+    assert np.isfinite(float(np.asarray(error)))
 
 
 @pytest.mark.gpu
