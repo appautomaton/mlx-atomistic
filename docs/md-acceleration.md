@@ -512,6 +512,60 @@ All candidate product code and candidate-only tests were removed. The retained
 tree therefore keeps the pre-phase spatial-tile rebuild, validation, topology,
 and finite-check behavior without new runtime complexity.
 
+### Cumulative interaction stack
+
+A later 2026-08-03 phase revisited the decision method, not the scientific
+workload. The earlier fixed 3%, 5%, and 10% per-candidate thresholds were useful
+for rejecting obvious regressions, but they could not answer whether several
+small changes improve the same graph when composed. The cumulative phase
+therefore reconstructed exact source variants, measured interactions directly,
+and retained no result by adding isolated percentages.
+
+The final ordinary-step stack contains three changes:
+
+1. projection-only ordinary SETTLE/SHAKE work that omits discarded error graphs
+   while checked diagnostic steps keep the public fail-closed path;
+2. immutable dense atom-owner maps and one Metal write for eligible disjoint
+   SETTLE/SHAKE position and velocity updates, with the prior fallbacks intact;
+3. one fused Metal BAOAB drift operation before the retained asynchronous force
+   boundary.
+
+Together they reduce the captured steady-step graph from 126 to 101 MLX
+primitives. More importantly, the complete runtime results are favorable:
+
+| Evidence | Control | Retained stack | Direct result |
+|---|---:|---:|---:|
+| 5DFR, 23,558 atoms, 75 steps, C-A-A-C medians | 0.143160 s | 0.129063 s | 9.85% faster; paired gains 10.63% and 9.06% |
+| Fresh 5DFR confirmation pair | 0.135353 s | 0.130723 s | 3.42% faster |
+| Remove fused BAOAB from the final graph | 0.143556 s | 0.129007 s | Complete stack 10.13% faster |
+| Disable dense ownership in the final graph | 0.143125 s | 0.129982 s | Complete stack 9.18% faster |
+| Restore checked ordinary constraint work | 0.144781 s | 0.129209 s | Complete stack 10.76% faster |
+| JAC, 94,232 atoms, 75 steps, C-A-A-C medians | 0.756679 s | 0.730588 s | 3.45% faster; paired gains 6.45% and 0.24% |
+| 5DFR, 750-step paired confirmation | 2.019479 s | 1.807516 s | 10.50% faster; 128.35 to 143.40 ns/day |
+
+Every run used the same prepared artifact, seed, timestep, cutoff, skin,
+per-step admission, PME plan, sampling cadence, and spatial-tile route. All
+finite-state and constraint gates passed. The largest process-tree peaks were
+1.36 GB for the short composition work, 5.22 GB for JAC, and 2.29 GB for the
+750-step pair, all below the 40 GB limit. These M5 Max measurements were made
+in low-power mode.
+
+The larger leave-one-out effects do not mean each component independently
+provides about 10%. Earlier isolated results ranged from regression to a few
+percent. They mean the three changes alter the same ordinary constraint and
+integration graph and are valuable as one interaction-tested stack.
+
+The rebuild substack remained empty. Fresh prefix-tail extraction was 3.10%
+slower, adding unified schedule validation made that full lifecycle another
+1.08% slower, and topology-mask deferral was closed because it only moved the
+wait into first force. A new left-major row-compaction design then removed the
+accepted-tile `argsort`, permutation, two gathers, and pre-gather
+intermediates while preserving all six pair/tile/mask/group digests. Its
+device descriptor, count, prefix, and compaction pipeline was nevertheless
+6.60% slower, with both paired directions regressive, so all candidate code
+and tests were removed. The retained result is therefore the three-component
+ordinary-step stack plus the existing neighbor rebuild path.
+
 
 ### Rejected atom-tile result
 
