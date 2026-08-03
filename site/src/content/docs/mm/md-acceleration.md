@@ -434,6 +434,24 @@ constraint, and 40 GB memory checks passed. Because that result was below the
 3% immediate-rejection line and the 5% retention threshold, the implementation
 and candidate-only tests were removed. No JAC or 750-step run was performed.
 
+A follow-up staged-compilation experiment placed separate `mx.compile` units
+around the ordinary constrained-Langevin work before and after the retained
+asynchronous force submission. Compiled/eager Metal parity passed across
+forced neighbor rebuilds, NPT and unsupported routes stayed eager, and no
+additional synchronization caller appeared. Graph capture reduced the same
+steady step from 153 primitives when eager to 112 with pre-force compilation,
+147 with post-force compilation, and 106 with both; the category signatures
+were unchanged across a rebuild. Structural fusion nevertheless did not
+improve the complete trajectory. In the real-Metal `C1 -> A1 -> A2 -> C2`
+gate, control walls were 0.143491 and 0.143358 seconds, while candidate walls
+were 0.142737 and 0.144577 seconds. The candidate median was 0.16% slower and
+the paired directions disagreed. All finite-state, constraint, route, and
+40 GB memory gates passed, but the result triggered immediate rejection. The
+compiled units, eager extraction, eligibility plumbing, and candidate-only
+tests were removed. JAC and 750-step runs were not performed. This result is
+specific to the current 23,558-atom staged route; it does not claim that
+`mx.compile` is generally ineffective elsewhere in MLX Atomistic.
+
 ### Rejected atom-tile result
 
 The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
