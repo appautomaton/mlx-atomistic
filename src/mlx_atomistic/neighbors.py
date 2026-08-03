@@ -25,10 +25,9 @@ from mlx_atomistic.metal_kernels import (
     _neighbor_cell_pair_candidates,
     _neighbor_cell_tile_candidates,
     _neighbor_pair_ordered_scatter_sized,
+    _neighbor_tile_compact_pairs_sized,
     _neighbor_tile_force_groups_sized,
-    _neighbor_tile_member_pairs_sized,
     _neighbor_tile_membership,
-    _neighbor_tile_ordered_scatter_sized,
     neighbor_pair_cutoff_mask,
     neighbor_pair_ordered_scatter,
 )
@@ -1396,12 +1395,15 @@ def _build_mlx_spatial_cell_tile_list(
         mx.eval(nonempty_prefix, member_prefix)
         tile_count = int(np.asarray(nonempty_prefix[-1]))
         exact_pair_count = int(np.asarray(member_prefix[-1]))
-        tile_blocks, member_mask = _neighbor_tile_ordered_scatter_sized(
+        tile_blocks, member_mask, pairs = _neighbor_tile_compact_pairs_sized(
+            atom_blocks,
             candidate_tiles,
             candidate_mask,
             member_counts,
             nonempty_prefix,
-            accepted_count=tile_count,
+            member_prefix,
+            accepted_tile_count=tile_count,
+            accepted_pair_count=exact_pair_count,
         )
         # Cell-pair tasks are spatially coherent but periodic canonicalization
         # does not guarantee monotonic block IDs. Group only the much smaller
@@ -1409,14 +1411,6 @@ def _build_mlx_spatial_cell_tile_list(
         force_order = mx.argsort(tile_blocks[:, 0])
         tile_blocks = tile_blocks[force_order]
         member_mask = member_mask[force_order]
-        pairs = _neighbor_tile_member_pairs_sized(
-            atom_blocks,
-            candidate_tiles,
-            candidate_mask,
-            member_counts,
-            member_prefix,
-            accepted_count=exact_pair_count,
-        )
         tile_counts_by_left = mx.zeros((block_count,), dtype=mx.int32).at[
             tile_blocks[:, 0]
         ].add(mx.ones((tile_count,), dtype=mx.int32))

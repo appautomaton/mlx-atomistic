@@ -339,9 +339,8 @@ _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
 _neighbor_cell_tile_candidates_kernel_singleton = None
 _neighbor_tile_membership_kernel_singleton = None
-_neighbor_tile_ordered_scatter_kernel_singleton = None
+_neighbor_tile_compact_pairs_kernel_singleton = None
 _neighbor_tile_force_groups_kernel_singleton = None
-_neighbor_tile_pair_scatter_kernel_singleton = None
 _tile_topology_lj_masks_kernel_singleton = None
 _shake_cluster_position_kernel_singleton = None
 _shake_cluster_velocity_kernel_singleton = None
@@ -1596,40 +1595,21 @@ _NEIGHBOR_TILE_MEMBERSHIP_SOURCE = r"""
     }
 """
 
-_NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE = r"""
-    uint tile = thread_position_in_grid.x;
+_NEIGHBOR_TILE_COMPACT_PAIRS_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint tile = threadgroup_position_in_grid.x;
     if (tile >= (uint)counts[0] || member_counts[tile] == 0) {
         return;
     }
-    uint output = (uint)(prefix[tile] - 1);
-    accepted_tile_blocks[2 * output + 0] = tile_blocks[2 * tile + 0];
-    accepted_tile_blocks[2 * output + 1] = tile_blocks[2 * tile + 1];
-    accepted_member_mask[2 * output + 0] = member_mask[2 * tile + 0];
-    accepted_member_mask[2 * output + 1] = member_mask[2 * tile + 1];
-"""
 
-_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
-    uint block = thread_position_in_grid.x;
-    if (block >= (uint)counts[0] || tile_counts[block] == 0) {
-        return;
+    if (lane == 0u) {
+        uint output = (uint)(nonempty_prefix[tile] - 1);
+        accepted_tile_blocks[2 * output + 0] = tile_blocks[2 * tile + 0];
+        accepted_tile_blocks[2 * output + 1] = tile_blocks[2 * tile + 1];
+        accepted_member_mask[2 * output + 0] = member_mask[2 * tile + 0];
+        accepted_member_mask[2 * output + 1] = member_mask[2 * tile + 1];
     }
 
-    int tile_count = tile_counts[block];
-    int tile_start = tile_prefix[block] - tile_count;
-    int group_count = group_counts[block];
-    int group_start = group_prefix[block] - group_count;
-    int tiles_per_group = counts[1];
-    for (int local = 0; local < group_count; local++) {
-        int consumed = local * tiles_per_group;
-        int output = group_start + local;
-        force_group_starts[output] = tile_start + consumed;
-        force_group_counts[output] = min(tiles_per_group, tile_count - consumed);
-    }
-"""
-
-_NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
-    uint lane = thread_position_in_threadgroup.x;
-    uint tile = threadgroup_position_in_grid.x;
     uint word_index = lane >> 5;
     uint bit_index = lane & 31u;
     threadgroup uint scan[64];
@@ -1656,6 +1636,25 @@ _NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
     int atom_j = atom_blocks[8 * right_block + (lane & 7u)];
     accepted_i[output] = min(atom_i, atom_j);
     accepted_j[output] = max(atom_i, atom_j);
+"""
+
+_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
+    uint block = thread_position_in_grid.x;
+    if (block >= (uint)counts[0] || tile_counts[block] == 0) {
+        return;
+    }
+
+    int tile_count = tile_counts[block];
+    int tile_start = tile_prefix[block] - tile_count;
+    int group_count = group_counts[block];
+    int group_start = group_prefix[block] - group_count;
+    int tiles_per_group = counts[1];
+    for (int local = 0; local < group_count; local++) {
+        int consumed = local * tiles_per_group;
+        int output = group_start + local;
+        force_group_starts[output] = tile_start + consumed;
+        force_group_counts[output] = min(tiles_per_group, tile_count - consumed);
+    }
 """
 
 _TILE_TOPOLOGY_LJ_MASKS_SOURCE = r"""
@@ -2593,24 +2592,31 @@ def _neighbor_tile_membership_kernel():
     return _neighbor_tile_membership_kernel_singleton
 
 
-def _neighbor_tile_ordered_scatter_kernel():
-    """Return the cached non-empty spatial-tile compaction kernel."""
+def _neighbor_tile_compact_pairs_kernel():
+    """Return the cached fused tile compaction and exact-pair producer."""
 
-    global _neighbor_tile_ordered_scatter_kernel_singleton
-    if _neighbor_tile_ordered_scatter_kernel_singleton is None:
-        _neighbor_tile_ordered_scatter_kernel_singleton = mx.fast.metal_kernel(
-            name="neighbor_tile_ordered_scatter",
+    global _neighbor_tile_compact_pairs_kernel_singleton
+    if _neighbor_tile_compact_pairs_kernel_singleton is None:
+        _neighbor_tile_compact_pairs_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_compact_pairs",
             input_names=[
+                "atom_blocks",
                 "tile_blocks",
                 "member_mask",
                 "member_counts",
-                "prefix",
+                "nonempty_prefix",
+                "member_prefix",
                 "counts",
             ],
-            output_names=["accepted_tile_blocks", "accepted_member_mask"],
-            source=_NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE,
+            output_names=[
+                "accepted_tile_blocks",
+                "accepted_member_mask",
+                "accepted_i",
+                "accepted_j",
+            ],
+            source=_NEIGHBOR_TILE_COMPACT_PAIRS_SOURCE,
         )
-    return _neighbor_tile_ordered_scatter_kernel_singleton
+    return _neighbor_tile_compact_pairs_kernel_singleton
 
 
 def _neighbor_tile_force_groups_kernel():
@@ -2631,26 +2637,6 @@ def _neighbor_tile_force_groups_kernel():
             source=_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE,
         )
     return _neighbor_tile_force_groups_kernel_singleton
-
-
-def _neighbor_tile_pair_scatter_kernel():
-    """Return the cached tile-membership diagnostic-pair decoder."""
-
-    global _neighbor_tile_pair_scatter_kernel_singleton
-    if _neighbor_tile_pair_scatter_kernel_singleton is None:
-        _neighbor_tile_pair_scatter_kernel_singleton = mx.fast.metal_kernel(
-            name="neighbor_tile_pair_scatter",
-            input_names=[
-                "atom_blocks",
-                "tile_blocks",
-                "member_mask",
-                "member_counts",
-                "member_prefix",
-            ],
-            output_names=["accepted_i", "accepted_j"],
-            source=_NEIGHBOR_TILE_PAIR_SCATTER_SOURCE,
-        )
-    return _neighbor_tile_pair_scatter_kernel_singleton
 
 
 def _tile_topology_lj_masks_kernel():
@@ -3035,53 +3021,83 @@ def _neighbor_tile_membership(
     return member_mask, member_counts
 
 
-def _neighbor_tile_ordered_scatter_sized(
+def _neighbor_tile_compact_pairs_sized(
+    atom_blocks: mx.array,
     tile_blocks: mx.array,
     member_mask: mx.array,
     member_counts: mx.array,
-    prefix: mx.array,
+    nonempty_prefix: mx.array,
+    member_prefix: mx.array,
     *,
-    accepted_count: int,
-) -> tuple[mx.array, mx.array]:
-    """Compact non-empty spatial tiles into explicitly sized outputs."""
+    accepted_tile_count: int,
+    accepted_pair_count: int,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Compact non-empty tiles and emit exact pairs in one candidate traversal."""
 
+    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
     tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
     member_mask = as_mx_array(member_mask, dtype=mx.uint32)
     member_counts = as_mx_array(member_counts, dtype=mx.int32)
-    prefix = as_mx_array(prefix, dtype=mx.int32)
+    nonempty_prefix = as_mx_array(nonempty_prefix, dtype=mx.int32)
+    member_prefix = as_mx_array(member_prefix, dtype=mx.int32)
     tile_count = int(tile_blocks.shape[0])
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
+        msg = "atom_blocks must have shape (n_blocks, 8)"
+        raise ValueError(msg)
     if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
         msg = "tile_blocks must have shape (n_tiles, 2)"
         raise ValueError(msg)
     if member_mask.shape != (tile_count, 2):
         msg = "member_mask must have shape (n_tiles, 2)"
         raise ValueError(msg)
-    if member_counts.shape != (tile_count,) or prefix.shape != (tile_count,):
-        msg = "member_counts and prefix must contain one value per tile"
+    if any(
+        values.shape != (tile_count,)
+        for values in (member_counts, nonempty_prefix, member_prefix)
+    ):
+        msg = "member counts and prefixes must contain one value per tile"
         raise ValueError(msg)
-    if accepted_count < 0 or accepted_count > tile_count:
-        msg = "accepted_count must fit within the candidate tile count"
+    if accepted_tile_count < 0 or accepted_tile_count > tile_count:
+        msg = "accepted_tile_count must fit within the candidate tile count"
         raise ValueError(msg)
-    if accepted_count == 0:
+    if (
+        accepted_pair_count < accepted_tile_count
+        or accepted_pair_count > 64 * tile_count
+    ):
+        msg = "accepted_pair_count must fit within active candidate lanes"
+        raise ValueError(msg)
+    if accepted_tile_count == 0:
+        if accepted_pair_count != 0:
+            msg = "empty accepted tiles cannot contain accepted pairs"
+            raise ValueError(msg)
         return (
             mx.zeros((0, 2), dtype=mx.int32),
             mx.zeros((0, 2), dtype=mx.uint32),
+            mx.zeros((0, 2), dtype=mx.int32),
         )
-    accepted_tiles, accepted_mask = _neighbor_tile_ordered_scatter_kernel()(
-        inputs=[
-            tile_blocks,
-            member_mask,
-            member_counts,
-            prefix,
-            mx.array([tile_count], dtype=mx.int32),
-        ],
-        output_shapes=[(accepted_count, 2), (accepted_count, 2)],
-        output_dtypes=[mx.int32, mx.uint32],
-        grid=(tile_count, 1, 1),
-        threadgroup=(min(256, tile_count), 1, 1),
-        init_value=0,
+    accepted_tiles, accepted_mask, accepted_i, accepted_j = (
+        _neighbor_tile_compact_pairs_kernel()(
+            inputs=[
+                atom_blocks,
+                tile_blocks,
+                member_mask,
+                member_counts,
+                nonempty_prefix,
+                member_prefix,
+                mx.array([tile_count], dtype=mx.int32),
+            ],
+            output_shapes=[
+                (accepted_tile_count, 2),
+                (accepted_tile_count, 2),
+                (accepted_pair_count,),
+                (accepted_pair_count,),
+            ],
+            output_dtypes=[mx.int32, mx.uint32, mx.int32, mx.int32],
+            grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
+            threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
+            init_value=0,
+        )
     )
-    return accepted_tiles, accepted_mask
+    return accepted_tiles, accepted_mask, mx.stack((accepted_i, accepted_j), axis=1)
 
 
 def _neighbor_tile_force_groups_sized(
@@ -3130,57 +3146,6 @@ def _neighbor_tile_force_groups_sized(
         init_value=0,
     )
     return force_group_starts, force_group_sizes
-
-
-def _neighbor_tile_member_pairs_sized(
-    atom_blocks: mx.array,
-    tile_blocks: mx.array,
-    member_mask: mx.array,
-    member_counts: mx.array,
-    member_prefix: mx.array,
-    *,
-    accepted_count: int,
-) -> mx.array:
-    """Decode diagnostic pairs from already-computed tile membership."""
-
-    atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
-    tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
-    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
-    member_counts = as_mx_array(member_counts, dtype=mx.int32)
-    member_prefix = as_mx_array(member_prefix, dtype=mx.int32)
-    tile_count = int(tile_blocks.shape[0])
-    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
-        msg = "atom_blocks must have shape (n_blocks, 8)"
-        raise ValueError(msg)
-    if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
-        msg = "tile_blocks must have shape (n_tiles, 2)"
-        raise ValueError(msg)
-    if member_mask.shape != (tile_count, 2):
-        msg = "member_mask must have shape (n_tiles, 2)"
-        raise ValueError(msg)
-    if member_counts.shape != (tile_count,) or member_prefix.shape != (tile_count,):
-        msg = "member counts and prefix must contain one value per tile"
-        raise ValueError(msg)
-    if accepted_count < 0 or (tile_count == 0 and accepted_count != 0):
-        msg = "accepted_count is incompatible with tile membership"
-        raise ValueError(msg)
-    if accepted_count == 0:
-        return mx.zeros((0, 2), dtype=mx.int32)
-    accepted_i, accepted_j = _neighbor_tile_pair_scatter_kernel()(
-        inputs=[
-            atom_blocks,
-            tile_blocks,
-            member_mask,
-            member_counts,
-            member_prefix,
-        ],
-        output_shapes=[(accepted_count,), (accepted_count,)],
-        output_dtypes=[mx.int32, mx.int32],
-        grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
-        threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
-        init_value=0,
-    )
-    return mx.stack((accepted_i, accepted_j), axis=1)
 
 
 def tile_topology_lj_masks(

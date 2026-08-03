@@ -30,6 +30,7 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.metal_kernels import (
+    _neighbor_tile_compact_pairs_sized,
     _prepared_parameterized_pme_direct_force_only,
     _tile_parameterized_pme_direct_force_only,
     fused_lj_forces,
@@ -559,6 +560,76 @@ def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
     assert first.candidate_count >= first.pair_count
     assert first.compaction_backend == "metal_spatial_prefix_scan"
     assert tiled.compaction_backend == "metal_spatial_tile_prefix_scan"
+
+
+@pytest.mark.gpu
+def test_spatial_tile_compaction_emits_exact_pairs_in_one_pass():
+    """Fused tile compaction preserves tile order, masks, and pair order."""
+
+    atom_blocks = mx.array(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [8, 9, 10, 11, 12, 13, 14, 15],
+        ],
+        dtype=mx.int32,
+    )
+    candidate_tiles = mx.array([[0, 0], [0, 1], [1, 1]], dtype=mx.int32)
+    candidate_mask = mx.array(
+        [
+            [(1 << 1) | (1 << 2) | (1 << 11), 0],
+            [0, 0],
+            [(1 << 1) | (1 << 10), 0],
+        ],
+        dtype=mx.uint32,
+    )
+    member_counts = mx.array([3, 0, 2], dtype=mx.int32)
+    nonempty_prefix = mx.array([1, 1, 2], dtype=mx.int32)
+    member_prefix = mx.array([3, 3, 5], dtype=mx.int32)
+
+    tiles, masks, pairs = _neighbor_tile_compact_pairs_sized(
+        atom_blocks,
+        candidate_tiles,
+        candidate_mask,
+        member_counts,
+        nonempty_prefix,
+        member_prefix,
+        accepted_tile_count=2,
+        accepted_pair_count=5,
+    )
+    mx.eval(tiles, masks, pairs)
+
+    np.testing.assert_array_equal(
+        np.asarray(tiles),
+        np.asarray([[0, 0], [1, 1]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(masks),
+        np.asarray(
+            [
+                [(1 << 1) | (1 << 2) | (1 << 11), 0],
+                [(1 << 1) | (1 << 10), 0],
+            ],
+            dtype=np.uint32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(pairs),
+        np.asarray([[0, 1], [0, 2], [1, 3], [8, 9], [9, 10]], dtype=np.int32),
+    )
+
+    empty_tiles, empty_masks, empty_pairs = _neighbor_tile_compact_pairs_sized(
+        atom_blocks,
+        mx.zeros((0, 2), dtype=mx.int32),
+        mx.zeros((0, 2), dtype=mx.uint32),
+        mx.zeros((0,), dtype=mx.int32),
+        mx.zeros((0,), dtype=mx.int32),
+        mx.zeros((0,), dtype=mx.int32),
+        accepted_tile_count=0,
+        accepted_pair_count=0,
+    )
+    assert empty_tiles.shape == (0, 2)
+    assert empty_masks.shape == (0, 2)
+    assert empty_pairs.shape == (0, 2)
 
 
 @pytest.mark.gpu
