@@ -939,6 +939,36 @@ def test_neighbor_list_manager_mlx_scalar_rebuild_policy_matches_numpy():
     assert exercise("mlx_scalar") == exercise("numpy")
 
 
+@pytest.mark.parametrize("displacement_check_backend", ["numpy", "mlx_scalar"])
+def test_neighbor_admission_threshold_is_strict_float32(
+    displacement_check_backend,
+):
+    """An exact threshold stays current and its next float rebuilds."""
+
+    positions = np.asarray(
+        [[0.0, 1.0, 1.0], [2.2, 1.0, 1.0], [1.0, 2.2, 1.0]],
+        dtype=np.float32,
+    )
+
+    def check(offset):
+        manager = NeighborListManager(
+            Cell.cubic(6.0),
+            cutoff=1.5,
+            skin=0.5,
+            check_interval=1,
+            displacement_check_backend=displacement_check_backend,
+        )
+        payload = as_mx_array if displacement_check_backend == "mlx_scalar" else np.asarray
+        initial = manager.update(payload(positions))
+        moved = positions.copy()
+        moved[0, 0] = offset
+        return manager.update(payload(moved)) is not initial
+
+    threshold = np.float32(0.25)
+    assert check(threshold) is False
+    assert check(np.nextafter(threshold, np.float32(np.inf))) is True
+
+
 def test_neighbor_list_manager_rejects_non_finite_positions_after_valid_build():
     positions = np.array(
         [

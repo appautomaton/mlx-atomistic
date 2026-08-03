@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import mlx_atomistic.md as md_module
+import mlx_atomistic.neighbors as neighbors_module
 from mlx_atomistic.constraints import (
     DistanceConstraints,
     SettleWaterConstraints,
@@ -89,6 +90,7 @@ def test_neighbor_admission_metal_reduction_matches_mlx_oracle():
         (257, [12.0, 9.0, 7.0]),
         (513, [15.0, 11.0, 9.0]),
     ):
+        cell = Cell.orthorhombic(lengths)
         box = mx.array(lengths, dtype=mx.float32)
         reference = mx.array(
             rng.uniform(0.0, 1.0, size=(atom_count, 3))
@@ -107,7 +109,7 @@ def test_neighbor_admission_metal_reduction_matches_mlx_oracle():
         actual_bits, nonfinite = _neighbor_admission_reduction(
             positions,
             reference,
-            box,
+            cell.matrix,
         )
         mx.eval(expected, actual_bits, nonfinite)
         actual = np.asarray(actual_bits, dtype=np.uint32).view(np.float32)[0]
@@ -123,7 +125,7 @@ def test_neighbor_admission_metal_reduction_handles_partial_groups_and_nonfinite
     empty_bits, empty_nonfinite = _neighbor_admission_reduction(
         empty,
         empty,
-        mx.array([8.0, 9.0, 10.0], dtype=mx.float32),
+        Cell.orthorhombic([8.0, 9.0, 10.0]).matrix,
     )
     mx.eval(empty_bits, empty_nonfinite)
     assert int(np.asarray(empty_bits)[0]) == 0
@@ -136,7 +138,7 @@ def test_neighbor_admission_metal_reduction_handles_partial_groups_and_nonfinite
     actual_bits, nonfinite = _neighbor_admission_reduction(
         positions,
         reference,
-        mx.array([8.0, 9.0, 10.0], dtype=mx.float32),
+        Cell.orthorhombic([8.0, 9.0, 10.0]).matrix,
     )
     mx.eval(actual_bits, nonfinite)
     actual = np.asarray(actual_bits, dtype=np.uint32).view(np.float32)[0]
@@ -149,10 +151,142 @@ def test_neighbor_admission_metal_reduction_handles_partial_groups_and_nonfinite
         _, nonfinite = _neighbor_admission_reduction(
             mx.array(invalid_positions),
             reference,
-            mx.array([8.0, 9.0, 10.0], dtype=mx.float32),
+            Cell.orthorhombic([8.0, 9.0, 10.0]).matrix,
         )
         mx.eval(nonfinite)
         assert int(np.asarray(nonfinite)[0]) == 1
+
+
+@pytest.mark.gpu
+def test_neighbor_admission_metal_manager_matches_oracle_across_rebuilds(
+    monkeypatch,
+):
+    """The fused manager makes the same decisions through cell and list changes."""
+
+    base = np.asarray(
+        [
+            [0.1, 1.0, 1.0],
+            [2.2, 1.0, 1.0],
+            [1.0, 2.2, 1.0],
+            [7.9, 3.0, 3.0],
+        ],
+        dtype=np.float32,
+    )
+
+    def make_manager():
+        return NeighborListManager(
+            Cell.orthorhombic([8.0, 9.0, 10.0]),
+            cutoff=1.5,
+            skin=0.5,
+            check_interval=1,
+            backend="mlx_dense_pairs",
+            displacement_check_backend="mlx_scalar",
+        )
+
+    fused = make_manager()
+    oracle = make_manager()
+    fused.update(mx.array(base))
+    oracle.update(mx.array(base))
+    original_enabled = neighbors_module._fused_neighbor_admission_enabled
+
+    for step, offset in enumerate((0.125, 0.25, 0.25000003, 0.5), start=1):
+        moved = base.copy()
+        moved[0, 0] = np.float32(base[0, 0] - offset)
+        if step == 4:
+            fused.cell = Cell.orthorhombic([8.5, 9.5, 10.5])
+            oracle.cell = Cell.orthorhombic([8.5, 9.5, 10.5])
+        fused_list = fused.update(mx.array(moved))
+        monkeypatch.setattr(
+            neighbors_module,
+            "_fused_neighbor_admission_enabled",
+            lambda *args: False,
+        )
+        oracle_list = oracle.update(mx.array(moved))
+        monkeypatch.setattr(
+            neighbors_module,
+            "_fused_neighbor_admission_enabled",
+            original_enabled,
+        )
+        assert fused.rebuild_count == oracle.rebuild_count
+        assert fused.last_max_displacement == oracle.last_max_displacement
+        assert fused_list.pair_count == oracle_list.pair_count
+        np.testing.assert_array_equal(
+            np.asarray(fused.reference_positions),
+            np.asarray(oracle.reference_positions),
+        )
+
+    def fused_rebuilds(offset):
+        manager = make_manager()
+        reference = base.copy()
+        reference[0, 0] = 0.0
+        initial = manager.update(mx.array(reference))
+        moved = reference.copy()
+        moved[0, 0] = offset
+        return manager.update(mx.array(moved)) is not initial
+
+    threshold = np.float32(0.25)
+    assert fused_rebuilds(threshold) is False
+    assert fused_rebuilds(
+        np.nextafter(threshold, np.float32(np.inf))
+    ) is True
+
+
+@pytest.mark.gpu
+def test_neighbor_admission_metal_preserves_one_sync_and_fallbacks(monkeypatch):
+    """One producer precedes one admission sync and unsupported cells stay eager."""
+
+    positions = mx.array(
+        [[1.0, 1.0, 1.0], [2.2, 1.0, 1.0], [1.0, 2.2, 1.0]],
+        dtype=mx.float32,
+    )
+    manager = NeighborListManager(
+        Cell.cubic(6.0),
+        cutoff=1.5,
+        skin=0.4,
+        check_interval=1,
+        backend="mlx_dense_pairs",
+        displacement_check_backend="mlx_scalar",
+    )
+    manager.update(positions)
+    events = []
+    original_reduction = neighbors_module._neighbor_admission_reduction
+    original_eval = mx.eval
+    original_rebuild = manager.rebuild
+
+    def record_reduction(*args):
+        events.append("producer")
+        return original_reduction(*args)
+
+    def record_eval(*args):
+        events.append("eval")
+        return original_eval(*args)
+
+    def record_rebuild(*args):
+        events.append("rebuild")
+        return original_rebuild(*args)
+
+    monkeypatch.setattr(
+        neighbors_module,
+        "_neighbor_admission_reduction",
+        record_reduction,
+    )
+    monkeypatch.setattr(mx, "eval", record_eval)
+    monkeypatch.setattr(manager, "rebuild", record_rebuild)
+    moved = positions + mx.array(
+        [[0.25, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        dtype=mx.float32,
+    )
+    manager.update(moved)
+    assert events[:3] == ["producer", "eval", "rebuild"]
+    assert events[: events.index("rebuild")].count("eval") == 1
+
+    triclinic = Cell.triclinic(
+        [[6.0, 0.0, 0.0], [0.2, 6.0, 0.0], [0.0, 0.0, 6.0]]
+    )
+    assert not neighbors_module._fused_neighbor_admission_enabled(
+        positions,
+        triclinic,
+    )
 
 
 @pytest.mark.gpu

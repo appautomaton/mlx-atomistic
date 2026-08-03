@@ -1488,9 +1488,12 @@ _NEIGHBOR_ADMISSION_REDUCTION_SOURCE = r"""
             float dx = px - reference[3 * atom + 0];
             float dy = py - reference[3 * atom + 1];
             float dz = pz - reference[3 * atom + 2];
-            dx -= box[0] * rint(dx / box[0]);
-            dy -= box[1] * rint(dy / box[1]);
-            dz -= box[2] * rint(dz / box[2]);
+            float lx = cell[0];
+            float ly = cell[4];
+            float lz = cell[8];
+            dx -= lx * rint(dx / lx);
+            dy -= ly * rint(dy / ly);
+            dz -= lz * rint(dz / lz);
             float distance2 = dx * dx + dy * dy + dz * dz;
             distance2_bits = as_type<uint>(distance2);
         }
@@ -2579,7 +2582,7 @@ def _neighbor_admission_reduction_kernel():
     if _neighbor_admission_reduction_kernel_singleton is None:
         _neighbor_admission_reduction_kernel_singleton = mx.fast.metal_kernel(
             name="neighbor_admission_reduction",
-            input_names=["positions", "reference", "box", "counts"],
+            input_names=["positions", "reference", "cell", "counts"],
             output_names=["max_distance2_bits", "nonfinite_flag"],
             source=_NEIGHBOR_ADMISSION_REDUCTION_SOURCE,
             atomic_outputs=True,
@@ -2936,21 +2939,21 @@ def neighbor_pair_cutoff_mask(
 def _neighbor_admission_reduction(
     positions: mx.array,
     reference_positions: mx.array,
-    box_lengths: mx.array,
+    cell_matrix: mx.array,
 ) -> tuple[mx.array, mx.array]:
     """Return raw maximum-distance bits and a non-finite-position flag."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     reference_positions = as_mx_array(reference_positions, dtype=mx.float32)
-    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    cell_matrix = as_mx_array(cell_matrix, dtype=mx.float32)
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
         raise ValueError(msg)
     if reference_positions.shape != positions.shape:
         msg = "reference_positions must match positions"
         raise ValueError(msg)
-    if box_lengths.shape != (3,):
-        msg = "box_lengths must have shape (3,)"
+    if cell_matrix.shape != (3, 3):
+        msg = "cell_matrix must have shape (3, 3)"
         raise ValueError(msg)
 
     atom_count = int(positions.shape[0])
@@ -2963,7 +2966,7 @@ def _neighbor_admission_reduction(
         inputs=[
             positions,
             reference_positions,
-            box_lengths,
+            cell_matrix,
             mx.array([atom_count], dtype=mx.uint32),
         ],
         output_shapes=[(1,), (1,)],

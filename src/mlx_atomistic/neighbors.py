@@ -22,6 +22,7 @@ from mlx_atomistic.cell_list import (
 )
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _neighbor_admission_reduction,
     _neighbor_cell_pair_candidates,
     _neighbor_cell_tile_candidates,
     _neighbor_pair_ordered_scatter_sized,
@@ -681,18 +682,34 @@ class NeighborListManager:
         if reference.shape != positions_mx.shape:
             msg = "positions must match the neighbor-list reference shape"
             raise ValueError(msg)
-        finite = mx.all(mx.isfinite(positions_mx))
-        if positions_mx.shape[0] == 0:
-            max_displacement = mx.array(0.0, dtype=mx.float32)
+        if _fused_neighbor_admission_enabled(positions_mx, self.cell):
+            max_distance2_bits, nonfinite_flag = _neighbor_admission_reduction(
+                positions_mx,
+                reference,
+                self.cell.matrix,
+            )
+            mx.eval(max_distance2_bits, nonfinite_flag)
+            if bool(np.asarray(nonfinite_flag, dtype=np.uint32)[0]):
+                msg = "positions must be finite"
+                raise ValueError(msg)
+            max_distance2 = np.asarray(
+                max_distance2_bits,
+                dtype=np.uint32,
+            ).view(np.float32)[0]
+            max_displacement = np.float32(np.sqrt(np.float32(max_distance2)))
         else:
-            displacement = positions_mx - reference
-            displacement = self.cell.minimum_image(displacement)
-            distance2 = mx.sum(displacement * displacement, axis=1)
-            max_displacement = mx.sqrt(mx.max(distance2))
-        mx.eval(finite, max_displacement)
-        if not bool(np.asarray(finite)):
-            msg = "positions must be finite"
-            raise ValueError(msg)
+            finite = mx.all(mx.isfinite(positions_mx))
+            if positions_mx.shape[0] == 0:
+                max_displacement = mx.array(0.0, dtype=mx.float32)
+            else:
+                displacement = positions_mx - reference
+                displacement = self.cell.minimum_image(displacement)
+                distance2 = mx.sum(displacement * displacement, axis=1)
+                max_displacement = mx.sqrt(mx.max(distance2))
+            mx.eval(finite, max_displacement)
+            if not bool(np.asarray(finite)):
+                msg = "positions must be finite"
+                raise ValueError(msg)
         self.last_max_displacement = float(np.asarray(max_displacement))
         return self.last_max_displacement > self.rebuild_threshold
 
@@ -1001,6 +1018,16 @@ def build_neighbor_list(
 
 def _uses_metal_device() -> bool:
     return "gpu" in str(mx.default_device()).lower()
+
+
+def _fused_neighbor_admission_enabled(positions: mx.array, cell: Cell) -> bool:
+    """Return whether one Metal reduction can own this admission check."""
+
+    return (
+        _uses_metal_device()
+        and cell.is_orthorhombic
+        and int(positions.shape[0]) > 0
+    )
 
 
 def _require_orthorhombic_cell_for_compact_neighbor_backend(
