@@ -17,6 +17,7 @@ from mlx_atomistic.constraints import (
     DistanceConstraints,
     SettleWaterConstraints,
     _project_constraint_positions_unchecked,
+    _ShakeClusterConstraints,
 )
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.force_runtime import (
@@ -2887,6 +2888,45 @@ def _async_force_submission_enabled(
     )
 
 
+def _staged_integration_constraints_supported(constraints: object | None) -> bool:
+    """Whether constraints match the disjoint production SETTLE/SHAKE route."""
+
+    if not isinstance(constraints, CompositeConstraints):
+        return False
+    if constraints._requires_iteration or len(constraints.constraints) != 2:
+        return False
+    child_types = {type(child) for child in constraints.constraints}
+    return child_types == {SettleWaterConstraints, _ShakeClusterConstraints}
+
+
+def _staged_integration_compile_enabled(
+    config: SimulationConfig,
+    *,
+    allow_staged_compile: bool,
+    thermostat: object,
+    constraints: object | None,
+    cell: Cell | None,
+    prepared_force_pipeline: _PreparedForcePipeline | None,
+    neighbor_list: NeighborList | None,
+) -> bool:
+    """Whether one fixed-cell NVT invocation owns staged compilation."""
+
+    return bool(
+        allow_staged_compile
+        and cell is not None
+        and cell.is_orthorhombic
+        and config.virtual_sites is None
+        and _staged_integration_constraints_supported(constraints)
+        and _async_force_submission_enabled(
+            config,
+            thermostat=thermostat,
+            constraints=constraints,
+            prepared_force_pipeline=prepared_force_pipeline,
+            neighbor_list=neighbor_list,
+        )
+    )
+
+
 def _normalize_reporters(
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None,
 ) -> tuple[RuntimeReporter, ...]:
@@ -3737,6 +3777,7 @@ def simulate_nvt(
         thermostat=thermostat,
         constraints=constraints,
         reporters=reporters,
+        _allow_staged_compile=True,
     )
 
 
@@ -3755,6 +3796,7 @@ def _simulate_nvt(
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
     initial_diagnostics: _NVTBoundaryDiagnostics | None = None,
     defer_final_diagnostics: bool = False,
+    _allow_staged_compile: bool = False,
 ) -> NVTResult:
     """Run the NVT core with optional NPT boundary-diagnostic reuse."""
 
@@ -4089,6 +4131,57 @@ def _simulate_nvt(
         prepared_force_pipeline=prepared_force_pipeline,
         neighbor_list=neighbor_list,
     )
+    pre_force_velocity_projector = (
+        None
+        if constraints is None
+        else getattr(
+            constraints,
+            "_apply_pre_force_velocities",
+            constraints.apply_velocities,
+        )
+    )
+    compiled_pre_force_step = None
+    compiled_post_force_step = None
+    staged_compile_eligible = _staged_integration_compile_enabled(
+        config,
+        allow_staged_compile=_allow_staged_compile,
+        thermostat=thermostat,
+        constraints=constraints,
+        cell=cell,
+        prepared_force_pipeline=prepared_force_pipeline,
+        neighbor_list=neighbor_list,
+    )
+    if staged_compile_eligible:
+
+        def staged_pre_force_step(pos, vel, forces, prng):
+            return _langevin_pre_force_step(
+                pos,
+                vel,
+                forces,
+                prng,
+                masses,
+                dt=config.dt,
+                force_to_acceleration_scale=config.force_to_acceleration_scale,
+                velocity_decay=velocity_decay,
+                thermal_scale=thermal_scale,
+                cell=cell,
+                wrap_positions=config.wrap_positions,
+                constraints=constraints,
+                pre_force_velocity_projector=pre_force_velocity_projector,
+            )
+
+        def staged_post_force_step(pos, vel, forces):
+            return _langevin_post_force_step(
+                pos,
+                vel,
+                forces,
+                masses,
+                dt=config.dt,
+                force_to_acceleration_scale=config.force_to_acceleration_scale,
+                constraints=constraints,
+                cell=cell,
+            )
+
     if _batched:
         fscale = config.force_to_acceleration_scale
         dt = config.dt
@@ -4507,15 +4600,6 @@ def _simulate_nvt(
         )
 
     step_range = range(0) if _batched else range(1, config.steps + 1)
-    pre_force_velocity_projector = (
-        None
-        if constraints is None
-        else getattr(
-            constraints,
-            "_apply_pre_force_velocities",
-            constraints.apply_velocities,
-        )
-    )
     for local_step in step_range:
         integration_started = (
             None if route_profiler is None else route_profiler.start()
@@ -4539,23 +4623,38 @@ def _simulate_nvt(
             and not validate_constraint_step
         )
         if ordinary_langevin_step:
-            next_positions, velocity_before_final_kick, key = (
-                _langevin_pre_force_step(
-                    state.positions,
-                    state.velocities,
-                    state.forces,
-                    key,
-                    masses,
-                    dt=config.dt,
-                    force_to_acceleration_scale=config.force_to_acceleration_scale,
-                    velocity_decay=velocity_decay,
-                    thermal_scale=thermal_scale,
-                    cell=cell,
-                    wrap_positions=config.wrap_positions,
-                    constraints=constraints,
-                    pre_force_velocity_projector=pre_force_velocity_projector,
+            if staged_compile_eligible and compiled_pre_force_step is None:
+                compiled_pre_force_step = mx.compile(staged_pre_force_step)
+                compiled_post_force_step = mx.compile(staged_post_force_step)
+            if compiled_pre_force_step is None:
+                next_positions, velocity_before_final_kick, key = (
+                    _langevin_pre_force_step(
+                        state.positions,
+                        state.velocities,
+                        state.forces,
+                        key,
+                        masses,
+                        dt=config.dt,
+                        force_to_acceleration_scale=(
+                            config.force_to_acceleration_scale
+                        ),
+                        velocity_decay=velocity_decay,
+                        thermal_scale=thermal_scale,
+                        cell=cell,
+                        wrap_positions=config.wrap_positions,
+                        constraints=constraints,
+                        pre_force_velocity_projector=pre_force_velocity_projector,
+                    )
                 )
-            )
+            else:
+                next_positions, velocity_before_final_kick, key = (
+                    compiled_pre_force_step(
+                        state.positions,
+                        state.velocities,
+                        state.forces,
+                        key,
+                    )
+                )
             constraint_error = _zero_constraint_error(next_positions)
         else:
             acceleration = (
@@ -4809,16 +4908,25 @@ def _simulate_nvt(
             None if route_profiler is None else route_profiler.start()
         )
         if ordinary_langevin_step:
-            next_velocities = _langevin_post_force_step(
-                next_positions,
-                velocity_before_final_kick,
-                next_forces,
-                masses,
-                dt=config.dt,
-                force_to_acceleration_scale=config.force_to_acceleration_scale,
-                constraints=constraints,
-                cell=cell,
-            )
+            if compiled_post_force_step is None:
+                next_velocities = _langevin_post_force_step(
+                    next_positions,
+                    velocity_before_final_kick,
+                    next_forces,
+                    masses,
+                    dt=config.dt,
+                    force_to_acceleration_scale=(
+                        config.force_to_acceleration_scale
+                    ),
+                    constraints=constraints,
+                    cell=cell,
+                )
+            else:
+                next_velocities = compiled_post_force_step(
+                    next_positions,
+                    velocity_before_final_kick,
+                    next_forces,
+                )
         else:
             next_acceleration = (
                 config.force_to_acceleration_scale * next_forces / masses[:, None]

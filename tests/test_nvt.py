@@ -1,9 +1,16 @@
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
 import mlx_atomistic.md as md_module
-from mlx_atomistic.constraints import DistanceConstraints
+from mlx_atomistic.constraints import (
+    CompositeConstraints,
+    DistanceConstraints,
+    SettleWaterConstraints,
+    _ShakeClusterConstraints,
+)
 from mlx_atomistic.core import Cell
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import (
@@ -17,6 +24,7 @@ from mlx_atomistic.md import (
     _langevin_block_execution_enabled,
     _langevin_post_force_step,
     _langevin_pre_force_step,
+    _staged_integration_compile_enabled,
     simulate_nve,
     simulate_nvt,
 )
@@ -179,6 +187,100 @@ def test_ordinary_constrained_langevin_uses_step_units_between_validation_steps(
     mx.eval(result.final_state.positions, result.final_state.velocities)
 
     assert calls == {"pre": 2, "post": 2}
+    assert bool(np.isfinite(np.asarray(result.final_state.positions)).all())
+
+
+def test_staged_compile_requires_explicit_fixed_nvt_ownership(monkeypatch):
+    constraints = CompositeConstraints(
+        (
+            SettleWaterConstraints(
+                [(0, 1, 2)],
+                oh_distance=1.0,
+                hh_distance=1.58,
+            ),
+            _ShakeClusterConstraints(
+                [[3, 4, -1, -1]],
+                peripheral_counts=[1],
+                distances=[1.0],
+            ),
+        )
+    )
+    config = SimulationConfig(runtime_profile=False)
+    thermostat = LangevinThermostat()
+    cell = Cell.cubic(8.0)
+    neighbor_list = SimpleNamespace(tiles=object())
+    prepared_pipeline = object()
+    monkeypatch.setattr(
+        md_module,
+        "_async_force_submission_enabled",
+        lambda *args, **kwargs: True,
+    )
+
+    assert not _staged_integration_compile_enabled(
+        config,
+        allow_staged_compile=False,
+        thermostat=thermostat,
+        constraints=constraints,
+        cell=cell,
+        prepared_force_pipeline=prepared_pipeline,
+        neighbor_list=neighbor_list,
+    )
+    assert _staged_integration_compile_enabled(
+        config,
+        allow_staged_compile=True,
+        thermostat=thermostat,
+        constraints=constraints,
+        cell=cell,
+        prepared_force_pipeline=prepared_pipeline,
+        neighbor_list=neighbor_list,
+    )
+    assert not _staged_integration_compile_enabled(
+        config,
+        allow_staged_compile=True,
+        thermostat=thermostat,
+        constraints=DistanceConstraints([(0, 1)], distances=[1.0]),
+        cell=cell,
+        prepared_force_pipeline=prepared_pipeline,
+        neighbor_list=neighbor_list,
+    )
+
+
+def test_final_only_nvt_does_not_construct_staged_wrappers(monkeypatch):
+    positions, velocities, cell, potential = _small_system()
+    constraints = DistanceConstraints([(0, 1)], distances=[1.2])
+    monkeypatch.setattr(
+        md_module,
+        "_staged_integration_compile_enabled",
+        lambda *args, **kwargs: True,
+    )
+
+    def unexpected_compile(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("final-only invocation must not construct wrappers")
+
+    monkeypatch.setattr(mx, "compile", unexpected_compile)
+    result = simulate_nvt(
+        positions,
+        velocities,
+        masses=np.ones(4, dtype=np.float32),
+        cell=cell,
+        force_terms=potential,
+        constraints=constraints,
+        config=SimulationConfig(
+            dt=0.002,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(
+            temperature=1.0,
+            friction=0.5,
+            seed=7,
+        ),
+    )
+    mx.eval(result.final_state.positions)
+
     assert bool(np.isfinite(np.asarray(result.final_state.positions)).all())
 
 
