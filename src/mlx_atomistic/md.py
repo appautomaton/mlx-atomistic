@@ -2887,6 +2887,35 @@ def _async_force_submission_enabled(
     )
 
 
+def _dense_affine_constraint_candidate_enabled(
+    *,
+    thermostat: object,
+    constraints: object | None,
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    cell: Cell | None,
+    async_force_submission: bool,
+) -> bool:
+    """Whether this run can use private dense affine constraint writes."""
+
+    readiness = getattr(constraints, "_dense_affine_velocity_step_ready", None)
+    pre_force_hook = getattr(
+        constraints,
+        "_apply_pre_force_affine_velocities",
+        None,
+    )
+    final_hook = getattr(constraints, "_apply_final_affine_velocities", None)
+    return bool(
+        async_force_submission
+        and isinstance(thermostat, LangevinThermostat)
+        and callable(readiness)
+        and callable(pre_force_hook)
+        and callable(final_hook)
+        and readiness(positions, velocities, masses, cell)
+    )
+
+
 def _normalize_reporters(
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None,
 ) -> tuple[RuntimeReporter, ...]:
@@ -4033,6 +4062,17 @@ def _simulate_nvt(
         prepared_force_pipeline=prepared_force_pipeline,
         neighbor_list=neighbor_list,
     )
+    dense_affine_constraint_candidate = (
+        _dense_affine_constraint_candidate_enabled(
+            thermostat=thermostat,
+            constraints=constraints,
+            positions=state.positions,
+            velocities=state.velocities,
+            masses=masses,
+            cell=cell,
+            async_force_submission=async_force_submission,
+        )
+    )
     if _batched:
         fscale = config.force_to_acceleration_scale
         dt = config.dt
@@ -4475,6 +4515,9 @@ def _simulate_nvt(
             or local_step == config.steps
         )
         validate_constraint_step = diagnostic_step or sample_step
+        dense_affine_constraint_step = (
+            dense_affine_constraint_candidate and not validate_constraint_step
+        )
         if isinstance(thermostat, LangevinThermostat):
             keys = mx.random.split(key, 2)
             key = keys[0]
@@ -4574,20 +4617,35 @@ def _simulate_nvt(
                     masses,
                     cell,
                 )
-            position_correction = next_positions - unconstrained_positions
-            if cell is not None:
-                position_correction = cell.minimum_image(position_correction)
-            velocity_before_final_kick = (
-                velocity_before_final_kick + position_correction / config.dt
-            )
-            if route_profiler is None:
+            affine_pre_force_velocities = None
+            if dense_affine_constraint_step:
+                affine_pre_force_velocities = (
+                    constraints._apply_pre_force_affine_velocities(
+                        next_positions,
+                        unconstrained_positions,
+                        velocity_before_final_kick,
+                        masses,
+                        cell,
+                        time_step=config.dt,
+                    )
+                )
+            if affine_pre_force_velocities is not None:
+                velocity_before_final_kick = affine_pre_force_velocities
+            else:
+                position_correction = next_positions - unconstrained_positions
+                if cell is not None:
+                    position_correction = cell.minimum_image(position_correction)
+                velocity_before_final_kick = (
+                    velocity_before_final_kick + position_correction / config.dt
+                )
+            if route_profiler is None and affine_pre_force_velocities is None:
                 velocity_before_final_kick = pre_force_velocity_projector(
                     next_positions,
                     velocity_before_final_kick,
                     masses,
                     cell,
                 )
-            else:
+            elif route_profiler is not None:
                 velocity_before_final_kick = (
                     _profile_constraint_pre_force_velocities(
                         constraints,
@@ -4740,35 +4798,51 @@ def _simulate_nvt(
             and not deferred_final
         ):
             mx.async_eval(next_forces)
-        final_integration_started = (
-            None if route_profiler is None else route_profiler.start()
-        )
-        next_acceleration = config.force_to_acceleration_scale * next_forces / masses_col
-        next_velocities = velocity_before_final_kick + 0.5 * config.dt * next_acceleration
-        if final_integration_started is not None:
-            route_profiler.finish(
-                "integration_thermostat",
-                final_integration_started,
-                next_acceleration,
-                next_velocities,
+        next_velocities = None
+        if dense_affine_constraint_step:
+            next_velocities = constraints._apply_final_affine_velocities(
+                next_positions,
+                velocity_before_final_kick,
+                next_forces,
+                masses,
+                cell,
+                force_scale=config.force_to_acceleration_scale,
+                half_time_step=0.5 * config.dt,
             )
-        if constraints is not None:
-            if route_profiler is None:
-                next_velocities = constraints.apply_velocities(
-                    next_positions,
+        if next_velocities is None:
+            final_integration_started = (
+                None if route_profiler is None else route_profiler.start()
+            )
+            next_acceleration = (
+                config.force_to_acceleration_scale * next_forces / masses_col
+            )
+            next_velocities = (
+                velocity_before_final_kick + 0.5 * config.dt * next_acceleration
+            )
+            if final_integration_started is not None:
+                route_profiler.finish(
+                    "integration_thermostat",
+                    final_integration_started,
+                    next_acceleration,
                     next_velocities,
-                    masses,
-                    cell,
                 )
-            else:
-                next_velocities = _profile_constraint_velocities(
-                    constraints,
-                    next_positions,
-                    next_velocities,
-                    masses,
-                    cell,
-                    route_profiler,
-                )
+            if constraints is not None:
+                if route_profiler is None:
+                    next_velocities = constraints.apply_velocities(
+                        next_positions,
+                        next_velocities,
+                        masses,
+                        cell,
+                    )
+                else:
+                    next_velocities = _profile_constraint_velocities(
+                        constraints,
+                        next_positions,
+                        next_velocities,
+                        masses,
+                        cell,
+                        route_profiler,
+                    )
         post_integration_started = (
             None if route_profiler is None else route_profiler.start()
         )

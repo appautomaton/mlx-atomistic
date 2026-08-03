@@ -10,6 +10,7 @@ from mlx_atomistic.md import (
     LennardJonesPotential,
     NoseHooverThermostat,
     SimulationConfig,
+    _dense_affine_constraint_candidate_enabled,
     _diagnostic_cutoff_strain_pairs,
     _evaluate_force_terms,
     _ForceEvaluationRequest,
@@ -462,6 +463,72 @@ def test_cpu_constrained_nvt_never_submits_force_graph_asynchronously(monkeypatc
     )
 
     assert submissions == []
+
+
+def test_dense_affine_constraint_candidate_fails_closed_before_readiness():
+    """Profiler-style async and non-Langevin routes never query affine support."""
+
+    class ReadinessOnlyConstraints:
+        def __init__(self, ready):
+            self.ready = ready
+            self.calls = 0
+
+        def _dense_affine_velocity_step_ready(self, *args):
+            self.calls += 1
+            return self.ready
+
+    class CandidateConstraints(ReadinessOnlyConstraints):
+        def _apply_pre_force_affine_velocities(self, *args, **kwargs):
+            raise AssertionError("admission must not invoke affine hooks")
+
+        def _apply_final_affine_velocities(self, *args, **kwargs):
+            raise AssertionError("admission must not invoke affine hooks")
+
+    positions = mx.zeros((2, 3), dtype=mx.float32)
+    masses = mx.ones((2,), dtype=mx.float32)
+    langevin = LangevinThermostat(temperature=1.0, friction=0.1, seed=7)
+    readiness_only = ReadinessOnlyConstraints(ready=True)
+    common = {
+        "constraints": readiness_only,
+        "positions": positions,
+        "velocities": positions,
+        "masses": masses,
+        "cell": None,
+    }
+
+    assert not _dense_affine_constraint_candidate_enabled(
+        thermostat=langevin,
+        async_force_submission=True,
+        **common,
+    )
+    assert readiness_only.calls == 0
+
+    candidate = CandidateConstraints(ready=True)
+    common["constraints"] = candidate
+    assert not _dense_affine_constraint_candidate_enabled(
+        thermostat=langevin,
+        async_force_submission=False,
+        **common,
+    )
+    assert not _dense_affine_constraint_candidate_enabled(
+        thermostat=NoseHooverThermostat(temperature=1.0),
+        async_force_submission=True,
+        **common,
+    )
+    assert candidate.calls == 0
+    candidate.ready = False
+    assert not _dense_affine_constraint_candidate_enabled(
+        thermostat=langevin,
+        async_force_submission=True,
+        **common,
+    )
+    candidate.ready = True
+    assert _dense_affine_constraint_candidate_enabled(
+        thermostat=langevin,
+        async_force_submission=True,
+        **common,
+    )
+    assert candidate.calls == 2
 
 
 def test_nose_hoover_thermostat_validation():
