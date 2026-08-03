@@ -338,6 +338,36 @@ constraint errors remained below `1.70e-5 A`, and the hard-bounded process-tree
 peak stayed below 2.52 GB, so this was a performance rejection rather than a
 correctness or memory failure.
 
+### Rejected fused neighbor-admission producer
+
+The 2026-08-03 experiment kept exact per-step admission and its single host
+decision, but replaced the steady MLX finite/minimum-image/maximum chain with
+one custom Metal threadgroup reduction. The kernel produced the maximum squared
+displacement and a non-finite flag; the host restored the float32 distance and
+made the unchanged strict rebuild-threshold comparison after the existing
+materialization.
+
+Direct graph capture fell from 34 eager primitives to 8 with one CustomKernel.
+Both routes used one `mx.eval`, returned the same `0.30671805 A` maximum
+displacement, and made the same rebuild decision. CPU/fallback tests, real-Metal
+partial-group and non-finite oracles, exact-threshold/nextafter branches, forced
+rebuilds, and variable-cell parity all passed before timing.
+
+| 75-step 5DFR gate | C1 | A1 | A2 | C2 | Median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Exact MLX admission | 0.143159 s | -- | -- | 0.144269 s | 0.143714 s |
+| Fused Metal producer | -- | 0.144530 s | 0.144230 s | -- | 0.144380 s |
+
+The candidate was 0.46% slower by median wall time, and the paired directions
+disagreed (`-0.96%` and `+0.03%`). All four complete runs passed their finite,
+constraint, route, and workload checks; process-tree peaks were 0.97--1.10 GB
+under the 40 GB limit. The candidate therefore failed the immediate-rejection
+gate and was removed. JAC and 750-step transfer runs were not performed. The
+result shows that this primitive reduction did not pay for its custom
+reduction/output handling while the load-bearing admission sync remained; it
+does not establish which internal Metal cost dominated or rule out a different
+producer design.
+
 ### Retained 32-lane spatial direct-force schedule
 
 The 2026-08-02 follow-up replaced the spatial direct kernel's 64-thread,
