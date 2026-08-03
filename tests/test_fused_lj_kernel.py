@@ -30,6 +30,7 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.metal_kernels import (
+    _neighbor_admission_reduction,
     _prepared_parameterized_pme_direct_force_only,
     _tile_parameterized_pme_direct_force_only,
     fused_lj_forces,
@@ -73,6 +74,85 @@ def _on_gpu(monkeypatch):
     yield
     mx.set_default_device(prev_device)
     mx.set_default_stream(mx.new_stream(prev_device))
+
+
+@pytest.mark.gpu
+def test_neighbor_admission_metal_reduction_matches_mlx_oracle():
+    """The fused reduction matches MLX periodic displacement maxima."""
+
+    rng = np.random.default_rng(29)
+    for atom_count, lengths in (
+        (1, [8.0, 8.0, 8.0]),
+        (7, [8.0, 9.0, 10.0]),
+        (255, [12.0, 9.0, 7.0]),
+        (256, [12.0, 9.0, 7.0]),
+        (257, [12.0, 9.0, 7.0]),
+        (513, [15.0, 11.0, 9.0]),
+    ):
+        box = mx.array(lengths, dtype=mx.float32)
+        reference = mx.array(
+            rng.uniform(0.0, 1.0, size=(atom_count, 3))
+            * np.asarray(lengths),
+            dtype=mx.float32,
+        )
+        offsets = mx.array(
+            rng.uniform(-0.65, 0.65, size=(atom_count, 3))
+            * np.asarray(lengths),
+            dtype=mx.float32,
+        )
+        positions = reference + offsets
+        displacement = positions - reference
+        displacement -= box * mx.round(displacement / box)
+        expected = mx.max(mx.sum(displacement * displacement, axis=1))
+        actual_bits, nonfinite = _neighbor_admission_reduction(
+            positions,
+            reference,
+            box,
+        )
+        mx.eval(expected, actual_bits, nonfinite)
+        actual = np.asarray(actual_bits, dtype=np.uint32).view(np.float32)[0]
+        np.testing.assert_allclose(actual, np.asarray(expected), rtol=1.0e-6)
+        assert int(np.asarray(nonfinite)[0]) == 0
+
+
+@pytest.mark.gpu
+def test_neighbor_admission_metal_reduction_handles_partial_groups_and_nonfinite():
+    """Inactive lanes and invalid coordinates cannot corrupt the reduction."""
+
+    empty = mx.zeros((0, 3), dtype=mx.float32)
+    empty_bits, empty_nonfinite = _neighbor_admission_reduction(
+        empty,
+        empty,
+        mx.array([8.0, 9.0, 10.0], dtype=mx.float32),
+    )
+    mx.eval(empty_bits, empty_nonfinite)
+    assert int(np.asarray(empty_bits)[0]) == 0
+    assert int(np.asarray(empty_nonfinite)[0]) == 0
+
+    reference = mx.zeros((257, 3), dtype=mx.float32)
+    positions_np = np.zeros((257, 3), dtype=np.float32)
+    positions_np[256] = [0.5, -0.25, 0.125]
+    positions = mx.array(positions_np)
+    actual_bits, nonfinite = _neighbor_admission_reduction(
+        positions,
+        reference,
+        mx.array([8.0, 9.0, 10.0], dtype=mx.float32),
+    )
+    mx.eval(actual_bits, nonfinite)
+    actual = np.asarray(actual_bits, dtype=np.uint32).view(np.float32)[0]
+    np.testing.assert_allclose(actual, np.float32(0.328125), rtol=0.0, atol=0.0)
+    assert int(np.asarray(nonfinite)[0]) == 0
+
+    for invalid in (np.nan, np.inf, -np.inf):
+        invalid_positions = positions_np.copy()
+        invalid_positions[13, 1] = invalid
+        _, nonfinite = _neighbor_admission_reduction(
+            mx.array(invalid_positions),
+            reference,
+            mx.array([8.0, 9.0, 10.0], dtype=mx.float32),
+        )
+        mx.eval(nonfinite)
+        assert int(np.asarray(nonfinite)[0]) == 1
 
 
 @pytest.mark.gpu

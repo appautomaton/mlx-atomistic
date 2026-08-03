@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.metal_kernels as metal_kernels
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import LennardJonesPotential, simulate
@@ -33,6 +34,29 @@ def _neighbor_pair_set(neighbors):
     if neighbors.blocks is not None:
         return _block_pair_set(neighbors)
     return {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()}
+
+
+def test_neighbor_admission_metal_kernel_is_lazy(monkeypatch):
+    """The admission kernel is constructed once and never at import time."""
+
+    sentinel = object()
+    calls = []
+
+    def build_kernel(**kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        metal_kernels,
+        "_neighbor_admission_reduction_kernel_singleton",
+        None,
+    )
+    monkeypatch.setattr(mx.fast, "metal_kernel", build_kernel)
+
+    assert metal_kernels._neighbor_admission_reduction_kernel() is sentinel
+    assert metal_kernels._neighbor_admission_reduction_kernel() is sentinel
+    assert len(calls) == 1
+    assert calls[0]["atomic_outputs"] is True
 
 
 def test_spatial_cell_pair_template_reuses_fixed_geometry_without_stale_counts():
