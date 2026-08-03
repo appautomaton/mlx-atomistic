@@ -30,6 +30,7 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.metal_kernels import (
+    _neighbor_tile_stable_placement_sized,
     _prepared_parameterized_pme_direct_force_only,
     _tile_parameterized_pme_direct_force_only,
     fused_lj_forces,
@@ -559,6 +560,80 @@ def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
     assert first.candidate_count >= first.pair_count
     assert first.compaction_backend == "metal_spatial_prefix_scan"
     assert tiled.compaction_backend == "metal_spatial_tile_prefix_scan"
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "active_indices",
+    [
+        (),
+        (10,),
+        (0, 3, 5, 9, 10, 13),
+    ],
+)
+def test_counting_placement_preserves_stable_same_left_order(active_indices):
+    """Linear tile placement matches a stable left-block sort exactly."""
+
+    candidate_tiles_np = np.array(
+        [
+            (0, 0),
+            (0, 1),
+            (1, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 2),
+            (2, 3),
+            (2, 4),
+            (3, 3),
+            (3, 4),
+            (4, 4),
+        ],
+        dtype=np.int32,
+    )
+    candidate_mask_np = np.stack(
+        (
+            np.arange(candidate_tiles_np.shape[0], dtype=np.uint32),
+            np.arange(candidate_tiles_np.shape[0], dtype=np.uint32) + 100,
+        ),
+        axis=1,
+    )
+    member_counts_np = np.zeros((candidate_tiles_np.shape[0],), dtype=np.int32)
+    member_counts_np[list(active_indices)] = 1
+    tile_counts_np = np.bincount(
+        candidate_tiles_np[member_counts_np > 0, 0],
+        minlength=5,
+    ).astype(np.int32)
+    tile_prefix_np = np.cumsum(tile_counts_np, dtype=np.int32)
+
+    observed_tiles, observed_mask = _neighbor_tile_stable_placement_sized(
+        mx.array(candidate_tiles_np),
+        mx.array(candidate_mask_np),
+        mx.array(member_counts_np),
+        mx.array([2, 0, 3], dtype=mx.int32),
+        mx.array([[0, 0], [0, 2], [2, 2]], dtype=mx.int32),
+        mx.array([0, 3, 9], dtype=mx.int32),
+        mx.array([0, 1, 0, 1, 2], dtype=mx.int32),
+        mx.array([0, 0, 2, 2, 2], dtype=mx.int32),
+        mx.array([2, 2, 1, 1, 1], dtype=mx.int32),
+        mx.array(tile_counts_np),
+        mx.array(tile_prefix_np),
+        accepted_count=len(active_indices),
+    )
+    active = np.flatnonzero(member_counts_np)
+    expected_order = np.argsort(candidate_tiles_np[active, 0], kind="stable")
+    expected_indices = active[expected_order]
+    np.testing.assert_array_equal(
+        np.asarray(observed_tiles),
+        candidate_tiles_np[expected_indices],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(observed_mask),
+        candidate_mask_np[expected_indices],
+    )
 
 
 @pytest.mark.gpu
