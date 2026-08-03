@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.constraints as constraints_module
 from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
@@ -509,6 +510,55 @@ def test_disjoint_composite_skips_only_redundant_pre_force_settle_projection():
         rtol=1e-6,
         atol=2e-7,
     )
+
+
+def test_cpu_disjoint_settle_shake_composite_retains_sequential_fallback(
+    monkeypatch,
+):
+    """The dense composite path remains unavailable on the CPU reference route."""
+
+    settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
+    shake = _ShakeClusterConstraints(
+        [[3, 4, 5, -1]],
+        peripheral_counts=[2],
+        distances=[1.2],
+        max_iterations=8,
+    )
+    constraints = CompositeConstraints((settle, shake))
+    reference = mx.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [-0.125, 0.99215674, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.2, 0.0, 0.0],
+            [3.0, 1.2, 0.0],
+        ],
+        dtype=mx.float32,
+    )
+    predicted = reference + 0.001
+    velocities = mx.arange(reference.size, dtype=mx.float32).reshape(reference.shape) * 0.01
+    masses = mx.array([16.0, 1.0, 1.0, 12.0, 1.0, 1.0], dtype=mx.float32)
+
+    def fail_dense_apply(*args, **kwargs):
+        raise AssertionError("CPU fallback must not invoke the dense Metal kernel")
+
+    monkeypatch.setattr(
+        constraints_module,
+        "_dense_constraint_apply",
+        fail_dense_apply,
+    )
+    projected, _ = constraints.apply_position_step(reference, predicted, masses)
+    pre_force = constraints._apply_pre_force_velocities(
+        projected,
+        velocities,
+        masses,
+    )
+    final = constraints.apply_velocities(projected, pre_force, masses)
+
+    assert projected.shape == reference.shape
+    assert pre_force.shape == velocities.shape
+    assert final.shape == velocities.shape
 
 
 def test_overlapping_composite_retains_full_pre_force_projection():

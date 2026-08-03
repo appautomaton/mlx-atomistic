@@ -13,6 +13,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.constraints as constraints_module
 import mlx_atomistic.md as md_module
 from mlx_atomistic.constraints import (
     CompositeConstraints,
@@ -168,6 +169,213 @@ def test_disjoint_shake_cluster_kernel_matches_mlx_reference():
         atol=2.0e-6,
     )
     assert float(np.asarray(actual_error)) <= 1.0e-5
+
+
+@pytest.mark.gpu
+def test_dense_disjoint_composite_matches_sequential_constraint_oracle(monkeypatch):
+    """Dense SETTLE+SHAKE writes preserve every constrained and free atom."""
+
+    settle = SettleWaterConstraints(
+        [(5, 2, 9)],
+        oh_distance=1.0,
+        hh_distance=1.5,
+    )
+    shake = _ShakeClusterConstraints(
+        [[0, 4, 7, 11], [3, 8, -1, -1]],
+        peripheral_counts=[3, 1],
+        distances=[1.0, 1.2],
+        max_iterations=8,
+    )
+    constraints = CompositeConstraints((shake, settle))
+    reference = mx.array(
+        [
+            [5.0, 5.0, 5.0],
+            [8.0, 8.0, 8.0],
+            [3.0, 2.0, 2.0],
+            [8.0, 3.0, 3.0],
+            [6.0, 5.0, 5.0],
+            [2.0, 2.0, 2.0],
+            [1.0, 9.0, 4.0],
+            [5.0, 6.0, 5.0],
+            [9.2, 3.0, 3.0],
+            [1.875, 2.9921567, 2.0],
+            [10.0, 8.0, 1.0],
+            [5.0, 5.0, 6.0],
+        ],
+        dtype=mx.float32,
+    )
+    perturbation = mx.array(
+        np.random.default_rng(73).uniform(-0.01, 0.01, size=reference.shape),
+        dtype=mx.float32,
+    )
+    predicted = reference + perturbation
+    velocities = mx.array(
+        np.random.default_rng(74).uniform(-0.2, 0.2, size=reference.shape),
+        dtype=mx.float32,
+    )
+    kick = mx.array(
+        np.random.default_rng(75).uniform(-0.02, 0.02, size=reference.shape),
+        dtype=mx.float32,
+    )
+    masses = mx.array(
+        [12.0, 14.0, 1.0, 12.0, 1.0, 16.0, 10.0, 1.0, 1.0, 1.0, 9.0, 1.0],
+        dtype=mx.float32,
+    )
+    cell = Cell.cubic(12.0)
+    dense_calls = []
+    original_dense_apply = constraints_module._dense_constraint_apply
+
+    def record_dense_apply(*args, **kwargs):
+        dense_calls.append(args)
+        return original_dense_apply(*args, **kwargs)
+
+    monkeypatch.setattr(
+        constraints_module,
+        "_dense_constraint_apply",
+        record_dense_apply,
+    )
+
+    expected_positions = predicted
+    for child in constraints.constraints:
+        expected_positions, _ = child.apply_position_step(
+            reference,
+            expected_positions,
+            masses,
+            cell,
+        )
+    actual_positions, actual_error = constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    expected_pre_force = shake.apply_velocities(
+        actual_positions,
+        velocities,
+        masses,
+        cell,
+    )
+    actual_pre_force = constraints._apply_pre_force_velocities(
+        actual_positions,
+        velocities,
+        masses,
+        cell,
+    )
+    expected_final = velocities + kick
+    for child in constraints.constraints:
+        expected_final = child.apply_velocities(
+            actual_positions,
+            expected_final,
+            masses,
+            cell,
+        )
+    actual_final = constraints.apply_velocities(
+        actual_positions,
+        velocities + kick,
+        masses,
+        cell,
+    )
+    mx.eval(
+        expected_positions,
+        actual_positions,
+        expected_pre_force,
+        actual_pre_force,
+        expected_final,
+        actual_final,
+        actual_error,
+    )
+
+    assert len(dense_calls) == 3
+    for actual, expected in (
+        (actual_positions, expected_positions),
+        (actual_pre_force, expected_pre_force),
+        (actual_final, expected_final),
+    ):
+        np.testing.assert_allclose(
+            np.asarray(actual),
+            np.asarray(expected),
+            rtol=1.0e-6,
+            atol=2.0e-6,
+        )
+    np.testing.assert_array_equal(
+        np.asarray(actual_positions)[[1, 6, 10]],
+        np.asarray(predicted)[[1, 6, 10]],
+    )
+    assert float(np.asarray(actual_error)) <= 2.0e-5
+
+
+@pytest.mark.gpu
+def test_dense_composite_declines_overlap_and_runtime_profiling(monkeypatch):
+    """Overlap and synchronized profiling retain the sequential child routes."""
+
+    class ZeroForce:
+        supports_virial = True
+
+        def energy_forces(self, values, cell=None, pairs=None):
+            del cell, pairs
+            return mx.sum(values[:, 0] * 0.0), mx.zeros_like(values)
+
+    settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
+    overlapping_shake = _ShakeClusterConstraints(
+        [[0, 3, -1, -1]],
+        peripheral_counts=[1],
+        distances=[2.0],
+        max_iterations=8,
+    )
+    overlapping = CompositeConstraints((settle, overlapping_shake))
+    disjoint_shake = _ShakeClusterConstraints(
+        [[3, 4, -1, -1]],
+        peripheral_counts=[1],
+        distances=[1.2],
+        max_iterations=8,
+    )
+    disjoint = CompositeConstraints((settle, disjoint_shake))
+    positions = mx.array(
+        [
+            [2.0, 2.0, 2.0],
+            [3.0, 2.0, 2.0],
+            [1.875, 2.9921567, 2.0],
+            [4.0, 2.0, 2.0],
+            [5.2, 2.0, 2.0],
+        ],
+        dtype=mx.float32,
+    )
+    masses = mx.array([16.0, 1.0, 1.0, 12.0, 1.0], dtype=mx.float32)
+
+    def fail_dense_apply(*args, **kwargs):
+        raise AssertionError("fallback path must not invoke dense constraint apply")
+
+    monkeypatch.setattr(
+        constraints_module,
+        "_dense_constraint_apply",
+        fail_dense_apply,
+    )
+    projected, _ = overlapping.apply_position_step(
+        positions,
+        positions + 0.001,
+        masses,
+    )
+    mx.eval(projected)
+    assert bool(np.all(np.isfinite(np.asarray(projected))))
+
+    profiled = simulate_nvt(
+        positions,
+        mx.zeros_like(positions),
+        masses=masses,
+        force_terms=ZeroForce(),
+        constraints=disjoint,
+        config=SimulationConfig(
+            dt=0.0005,
+            steps=1,
+            sample_interval=1,
+            diagnostic_interval=1,
+            pressure_diagnostics=False,
+            runtime_profile=True,
+        ),
+        thermostat=LangevinThermostat(temperature=0.0, friction=0.0, seed=9),
+    )
+    assert profiled.route_profile["reconciled"] is True
+
 
 
 @pytest.mark.gpu

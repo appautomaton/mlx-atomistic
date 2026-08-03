@@ -9,6 +9,7 @@ import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _dense_constraint_apply,
     _settle_water_position_deltas,
     _settle_water_velocity_deltas,
     _shake_cluster_position_deltas,
@@ -1066,14 +1067,235 @@ class CompositeConstraints:
             "pairs",
             mx.array(np.concatenate(pairs, axis=0), dtype=mx.int32) if pairs else _empty_pairs(),
         )
-        object.__setattr__(
-            self,
-            "_requires_iteration",
-            any(
-                bool(child_atoms[left] & child_atoms[right])
-                for left in range(len(child_atoms))
-                for right in range(left + 1, len(child_atoms))
-            ),
+        requires_iteration = any(
+            bool(child_atoms[left] & child_atoms[right])
+            for left in range(len(child_atoms))
+            for right in range(left + 1, len(child_atoms))
+        )
+        object.__setattr__(self, "_requires_iteration", requires_iteration)
+
+        settle_children = [
+            child
+            for child in self.constraints
+            if type(child) is SettleWaterConstraints
+        ]
+        shake_children = [
+            child
+            for child in self.constraints
+            if type(child) is _ShakeClusterConstraints
+        ]
+        dense_children_supported = bool(
+            not requires_iteration
+            and len(self.constraints) == 2
+            and len(settle_children) == 1
+            and len(shake_children) == 1
+            and settle_children[0].waters.shape[0] > 0
+            and shake_children[0].cluster_count > 0
+        )
+        dense_settle = settle_children[0] if dense_children_supported else None
+        dense_shake = shake_children[0] if dense_children_supported else None
+        owner_maps = None
+        if dense_settle is not None and dense_shake is not None:
+            waters = np.asarray(dense_settle.waters, dtype=np.int32)
+            cluster_atoms = np.asarray(dense_shake.cluster_atoms, dtype=np.int32)
+            peripheral_counts = np.asarray(
+                dense_shake.peripheral_counts,
+                dtype=np.int32,
+            )
+            owner_count = 1 + max(
+                int(np.max(waters)),
+                int(np.max(cluster_atoms)),
+            )
+            owner_family = np.zeros((owner_count,), dtype=np.int32)
+            owner_rows = np.zeros((owner_count,), dtype=np.int32)
+            owner_slots = np.zeros((owner_count,), dtype=np.int32)
+            for row, atoms in enumerate(waters):
+                for slot, atom in enumerate(atoms):
+                    owner_family[atom] = 1
+                    owner_rows[atom] = row
+                    owner_slots[atom] = slot
+            for row, count in enumerate(peripheral_counts):
+                for slot, atom in enumerate(cluster_atoms[row, : int(count) + 1]):
+                    owner_family[atom] = 2
+                    owner_rows[atom] = row
+                    owner_slots[atom] = slot
+            owner_maps = (owner_family, owner_rows, owner_slots)
+        object.__setattr__(self, "_dense_settle", dense_settle)
+        object.__setattr__(self, "_dense_shake", dense_shake)
+        object.__setattr__(self, "_dense_owner_maps", owner_maps)
+        object.__setattr__(self, "_dense_owner_device_cache", {})
+        object.__setattr__(self, "_dense_params_cache", {})
+        object.__setattr__(self, "_dense_placeholder_cache", {})
+
+    def _dense_metal_ready(
+        self,
+        arrays: tuple[mx.array, ...],
+        cell: Cell | None,
+    ) -> bool:
+        return bool(
+            self._dense_owner_maps is not None
+            and all(values.dtype == mx.float32 for values in arrays)
+            and mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+            and (cell is None or cell.is_orthorhombic)
+        )
+
+    def _dense_device_state(
+        self,
+        atom_count: int,
+        *,
+        apply_settle: bool,
+        apply_shake: bool,
+    ) -> tuple[tuple[mx.array, mx.array, mx.array], mx.array, mx.array]:
+        device = str(mx.default_device())
+        owners = self._dense_owner_device_cache.get(device)
+        if owners is None:
+            owners = tuple(
+                mx.array(values, dtype=mx.int32)
+                for values in self._dense_owner_maps
+            )
+            self._dense_owner_device_cache[device] = owners
+        params_key = (device, atom_count, apply_settle, apply_shake)
+        params = self._dense_params_cache.get(params_key)
+        if params is None:
+            params = mx.array(
+                [
+                    atom_count,
+                    int(self._dense_owner_maps[0].shape[0]),
+                    int(apply_settle),
+                    int(apply_shake),
+                ],
+                dtype=mx.int32,
+            )
+            self._dense_params_cache[params_key] = params
+        settle_placeholder = self._dense_placeholder_cache.get(device)
+        if settle_placeholder is None:
+            settle_placeholder = mx.zeros((1, 3, 3), dtype=mx.float32)
+            self._dense_placeholder_cache[device] = settle_placeholder
+        return owners, params, settle_placeholder
+
+    def _dense_position_step(
+        self,
+        reference_positions: mx.array,
+        predicted_positions: mx.array,
+        masses: mx.array,
+        cell: Cell | None,
+    ) -> mx.array | None:
+        if not self._dense_metal_ready(
+            (reference_positions, predicted_positions, masses),
+            cell,
+        ):
+            return None
+        if reference_positions.shape != predicted_positions.shape:
+            msg = "reference_positions and predicted_positions must have matching shapes"
+            raise ValueError(msg)
+        if predicted_positions.ndim != 2 or predicted_positions.shape[1] != 3:
+            msg = "positions must have shape (n_particles, 3)"
+            raise ValueError(msg)
+        if masses.shape != (predicted_positions.shape[0],):
+            msg = "masses must have shape (n_particles,)"
+            raise ValueError(msg)
+        if self._dense_owner_maps[0].shape[0] > predicted_positions.shape[0]:
+            msg = "constraint atom index outside positions"
+            raise ValueError(msg)
+
+        settle = self._dense_settle
+        shake = self._dense_shake
+        box = settle._box(cell)
+        settle_deltas = _settle_water_position_deltas(
+            reference_positions,
+            predicted_positions,
+            masses,
+            settle.waters,
+            box,
+            oh_distance=settle.oh_distance,
+            hh_distance=settle.hh_distance,
+            periodic=cell is not None,
+        )
+        shake_deltas = _shake_cluster_position_deltas(
+            reference_positions,
+            predicted_positions,
+            masses,
+            shake.cluster_atoms,
+            shake.peripheral_counts,
+            shake.distances,
+            box,
+            max_iterations=shake.max_iterations,
+            periodic=cell is not None,
+        )
+        owners, params, _ = self._dense_device_state(
+            predicted_positions.shape[0],
+            apply_settle=True,
+            apply_shake=True,
+        )
+        return _dense_constraint_apply(
+            predicted_positions,
+            *owners,
+            settle_deltas,
+            shake_deltas,
+            params,
+        )
+
+    def _dense_velocities(
+        self,
+        positions: mx.array,
+        velocities: mx.array,
+        masses: mx.array,
+        cell: Cell | None,
+        *,
+        apply_settle: bool,
+    ) -> mx.array | None:
+        if not self._dense_metal_ready((positions, velocities, masses), cell):
+            return None
+        if positions.shape != velocities.shape:
+            msg = "positions and velocities must have matching shapes"
+            raise ValueError(msg)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_particles, 3)"
+            raise ValueError(msg)
+        if masses.shape != (positions.shape[0],):
+            msg = "masses must have shape (n_particles,)"
+            raise ValueError(msg)
+        if self._dense_owner_maps[0].shape[0] > positions.shape[0]:
+            msg = "constraint atom index outside positions"
+            raise ValueError(msg)
+
+        settle = self._dense_settle
+        shake = self._dense_shake
+        box = settle._box(cell)
+        shake_deltas = _shake_cluster_velocity_deltas(
+            positions,
+            velocities,
+            masses,
+            shake.cluster_atoms,
+            shake.peripheral_counts,
+            box,
+            max_iterations=shake.max_iterations,
+            periodic=cell is not None,
+        )
+        owners, params, settle_placeholder = self._dense_device_state(
+            positions.shape[0],
+            apply_settle=apply_settle,
+            apply_shake=True,
+        )
+        settle_deltas = (
+            _settle_water_velocity_deltas(
+                positions,
+                velocities,
+                masses,
+                settle.waters,
+                box,
+                periodic=cell is not None,
+            )
+            if apply_settle
+            else settle_placeholder
+        )
+        return _dense_constraint_apply(
+            velocities,
+            *owners,
+            settle_deltas,
+            shake_deltas,
+            params,
         )
 
     def max_error(self, positions, cell: Cell | None = None) -> mx.array:
@@ -1110,7 +1332,17 @@ class CompositeConstraints:
     ) -> tuple[mx.array, mx.array]:
         """Apply dynamics-aware child position constraints in sequence."""
 
+        reference = as_mx_array(reference_positions)
         constrained = as_mx_array(predicted_positions)
+        masses = as_mx_array(masses)
+        dense = self._dense_position_step(
+            reference,
+            constrained,
+            masses,
+            cell,
+        )
+        if dense is not None:
+            return dense, self.max_error(dense, cell)
         cycles = 8 if self._requires_iteration else 1
         for _ in range(cycles):
             for constraint in self.constraints:
@@ -1123,7 +1355,7 @@ class CompositeConstraints:
                     )
                 else:
                     constrained, _ = step_projector(
-                        reference_positions,
+                        reference,
                         constrained,
                         masses,
                         cell,
@@ -1139,7 +1371,18 @@ class CompositeConstraints:
     ) -> mx.array:
         """Apply child velocity constraints in sequence."""
 
+        positions = as_mx_array(positions)
         constrained = as_mx_array(velocities)
+        masses = as_mx_array(masses)
+        dense = self._dense_velocities(
+            positions,
+            constrained,
+            masses,
+            cell,
+            apply_settle=True,
+        )
+        if dense is not None:
+            return dense
         cycles = 8 if self._requires_iteration else 1
         for _ in range(cycles):
             for constraint in self.constraints:
@@ -1162,7 +1405,18 @@ class CompositeConstraints:
 
         if self._requires_iteration:
             return self.apply_velocities(positions, velocities, masses, cell)
+        positions = as_mx_array(positions)
         constrained = as_mx_array(velocities)
+        masses = as_mx_array(masses)
+        dense = self._dense_velocities(
+            positions,
+            constrained,
+            masses,
+            cell,
+            apply_settle=False,
+        )
+        if dense is not None:
+            return dense
         for constraint in self.constraints:
             if isinstance(constraint, SettleWaterConstraints):
                 continue
@@ -1187,6 +1441,15 @@ def _project_constraint_positions_unchecked(
 
     constrained = as_mx_array(predicted_positions)
     if isinstance(constraints, CompositeConstraints):
+        if reference_positions is not None:
+            dense = constraints._dense_position_step(
+                as_mx_array(reference_positions),
+                constrained,
+                as_mx_array(masses),
+                cell,
+            )
+            if dense is not None:
+                return dense
         cycles = 8 if constraints._requires_iteration else 1
         for _ in range(cycles):
             for child in constraints.constraints:

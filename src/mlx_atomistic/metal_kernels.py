@@ -347,6 +347,7 @@ _shake_cluster_position_kernel_singleton = None
 _shake_cluster_velocity_kernel_singleton = None
 _settle_water_position_kernel_singleton = None
 _settle_water_velocity_kernel_singleton = None
+_dense_constraint_apply_kernel_singleton = None
 _fused_bonded_force_only_kernel_singleton = None
 
 # Neighbor compaction preserves short runs of a common left atom, so one worker
@@ -1762,6 +1763,31 @@ inline float3 constraint_safe_normalize(float3 value) {
 }
 """
 
+_DENSE_CONSTRAINT_APPLY_SOURCE = r"""
+    uint atom = thread_position_in_grid.x;
+    if (atom >= (uint)params[0]) {
+        return;
+    }
+
+    float3 delta = float3(0.0f);
+    if (atom < (uint)params[1]) {
+        int family = owner_family[atom];
+        int row = owner_rows[atom];
+        int slot = owner_slots[atom];
+        if (family == 1 && params[2] != 0) {
+            delta = constraint_load3(settle_deltas, 3 * row + slot);
+        }
+        else if (family == 2 && params[3] != 0) {
+            delta = constraint_load3(shake_deltas, 4 * row + slot);
+        }
+    }
+
+    float3 value = constraint_load3(base_values, atom) + delta;
+    constrained[3 * atom + 0] = value.x;
+    constrained[3 * atom + 1] = value.y;
+    constrained[3 * atom + 2] = value.z;
+"""
+
 _SETTLE_WATER_POSITION_SOURCE = r"""
     uint water = thread_position_in_grid.x;
     if (water >= (uint)params[0]) {
@@ -2766,6 +2792,29 @@ def _settle_water_velocity_kernel():
     return _settle_water_velocity_kernel_singleton
 
 
+def _dense_constraint_apply_kernel():
+    """Return the cached dense disjoint-constraint application kernel."""
+
+    global _dense_constraint_apply_kernel_singleton
+    if _dense_constraint_apply_kernel_singleton is None:
+        _dense_constraint_apply_kernel_singleton = mx.fast.metal_kernel(
+            name="dense_constraint_apply",
+            input_names=[
+                "base_values",
+                "owner_family",
+                "owner_rows",
+                "owner_slots",
+                "settle_deltas",
+                "shake_deltas",
+                "params",
+            ],
+            output_names=["constrained"],
+            source=_DENSE_CONSTRAINT_APPLY_SOURCE,
+            header=_CONSTRAINT_HEADER,
+        )
+    return _dense_constraint_apply_kernel_singleton
+
+
 def _fused_bonded_force_only_kernel():
     """Return the cached force-only bonded-interaction Metal kernel."""
 
@@ -3323,6 +3372,65 @@ def _neighbor_pair_ordered_scatter_sized(
         init_value=0,
     )
     return accepted_i, accepted_j
+
+
+def _dense_constraint_apply(
+    base_values: mx.array,
+    owner_family: mx.array,
+    owner_rows: mx.array,
+    owner_slots: mx.array,
+    settle_deltas: mx.array,
+    shake_deltas: mx.array,
+    params: mx.array,
+) -> mx.array:
+    """Apply disjoint SETTLE/SHAKE deltas through one dense Metal write."""
+
+    base_values = as_mx_array(base_values, dtype=mx.float32)
+    owner_family = as_mx_array(owner_family, dtype=mx.int32)
+    owner_rows = as_mx_array(owner_rows, dtype=mx.int32)
+    owner_slots = as_mx_array(owner_slots, dtype=mx.int32)
+    settle_deltas = as_mx_array(settle_deltas, dtype=mx.float32)
+    shake_deltas = as_mx_array(shake_deltas, dtype=mx.float32)
+    params = as_mx_array(params, dtype=mx.int32)
+    if base_values.ndim != 2 or base_values.shape[1] != 3:
+        msg = "base_values must have shape (n_atoms, 3)"
+        raise ValueError(msg)
+    if not (
+        owner_family.ndim == 1
+        and owner_rows.shape == owner_family.shape
+        and owner_slots.shape == owner_family.shape
+    ):
+        msg = "constraint owner maps must be matching one-dimensional arrays"
+        raise ValueError(msg)
+    if settle_deltas.ndim != 3 or settle_deltas.shape[1:] != (3, 3):
+        msg = "settle_deltas must have shape (n_waters, 3, 3)"
+        raise ValueError(msg)
+    if shake_deltas.ndim != 3 or shake_deltas.shape[1:] != (4, 3):
+        msg = "shake_deltas must have shape (n_clusters, 4, 3)"
+        raise ValueError(msg)
+    if params.shape != (4,):
+        msg = "constraint apply params must have shape (4,)"
+        raise ValueError(msg)
+    atom_count = int(base_values.shape[0])
+    if atom_count == 0:
+        return base_values
+    (constrained,) = _dense_constraint_apply_kernel()(
+        inputs=[
+            base_values,
+            owner_family,
+            owner_rows,
+            owner_slots,
+            settle_deltas,
+            shake_deltas,
+            params,
+        ],
+        output_shapes=[base_values.shape],
+        output_dtypes=[mx.float32],
+        grid=(atom_count, 1, 1),
+        threadgroup=(min(256, atom_count), 1, 1),
+        init_value=0.0,
+    )
+    return constrained
 
 
 def _settle_water_position_deltas(
