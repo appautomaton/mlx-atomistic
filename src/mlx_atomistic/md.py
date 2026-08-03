@@ -23,7 +23,7 @@ from mlx_atomistic.force_runtime import (
     _ExclusiveRouteProfiler,
     _PreparedForcePipeline,
 )
-from mlx_atomistic.metal_kernels import fused_lj_forces
+from mlx_atomistic.metal_kernels import _fused_langevin_baoab_drift, fused_lj_forces
 from mlx_atomistic.neighbors import (
     NeighborBlocks,
     NeighborList,
@@ -3893,6 +3893,7 @@ def _simulate_nvt(
     velocity_decay = None
     noise_scale = None
     thermal_scale = None
+    metal_langevin_drift = None
     nh_chain_position = None
     nh_chain_velocity = None
     nh_thermal_mass = None
@@ -3913,6 +3914,27 @@ def _simulate_nvt(
             / config.kinetic_energy_scale
         )
         thermal_scale = noise_scale / mx.sqrt(masses)[:, None]
+        if (
+            mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+            and state.positions.dtype == mx.float32
+            and (cell is None or cell.is_orthorhombic)
+        ):
+            metal_langevin_drift = (
+                config.force_to_acceleration_scale / masses,
+                mx.ones((3,), dtype=mx.float32)
+                if cell is None
+                else mx.diag(cell.matrix),
+                mx.array(
+                    [
+                        0.5 * config.dt,
+                        velocity_decay,
+                        float(cell is not None and config.wrap_positions),
+                    ],
+                    dtype=mx.float32,
+                ),
+                mx.array([state.positions.shape[0]], dtype=mx.int32),
+            )
         thermostat_metadata = _thermostat_metadata(
             thermostat,
             dof=temperature_dof,
@@ -4453,18 +4475,39 @@ def _simulate_nvt(
             or local_step == config.steps
         )
         validate_constraint_step = diagnostic_step or sample_step
-        acceleration = config.force_to_acceleration_scale * state.forces / masses_col
         if isinstance(thermostat, LangevinThermostat):
-            velocities_half = state.velocities + 0.5 * config.dt * acceleration
-            next_positions = state.positions + 0.5 * config.dt * velocities_half
-
             keys = mx.random.split(key, 2)
             key = keys[0]
             noise = mx.random.normal(state.velocities.shape, key=keys[1])
-            middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
-
-            next_positions = next_positions + 0.5 * config.dt * middle_velocities
+            if metal_langevin_drift is None:
+                acceleration = (
+                    config.force_to_acceleration_scale * state.forces / masses_col
+                )
+                velocities_half = state.velocities + 0.5 * config.dt * acceleration
+                next_positions = state.positions + 0.5 * config.dt * velocities_half
+                if cell is not None and config.wrap_positions:
+                    next_positions = cell.wrap(next_positions)
+                middle_velocities = (
+                    velocity_decay * velocities_half + thermal_scale * noise
+                )
+                next_positions = next_positions + 0.5 * config.dt * middle_velocities
+            else:
+                force_scale_over_mass, metal_box, metal_params, metal_counts = (
+                    metal_langevin_drift
+                )
+                next_positions, middle_velocities = _fused_langevin_baoab_drift(
+                    state.positions,
+                    state.velocities,
+                    state.forces,
+                    force_scale_over_mass,
+                    thermal_scale[:, 0],
+                    noise,
+                    metal_box,
+                    metal_params,
+                    metal_counts,
+                )
         else:
+            acceleration = config.force_to_acceleration_scale * state.forces / masses_col
             current_kinetic = kinetic_energy(
                 state.velocities,
                 masses,
@@ -4477,7 +4520,11 @@ def _simulate_nvt(
             scaled_velocities = state.velocities * thermostat_scale
             velocities_half = scaled_velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + config.dt * velocities_half
-        if cell is not None and config.wrap_positions:
+        if (
+            cell is not None
+            and config.wrap_positions
+            and metal_langevin_drift is None
+        ):
             next_positions = cell.wrap(next_positions)
         constraint_error = zero_constraint_error
         velocity_before_final_kick = (

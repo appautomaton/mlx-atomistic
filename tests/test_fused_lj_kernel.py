@@ -440,6 +440,114 @@ def test_settle_water_kernels_match_openmm_position_oracle():
 
 
 @pytest.mark.gpu
+def test_fused_langevin_baoab_drift_matches_eager_trajectory(monkeypatch):
+    """Fused BAOAB drift preserves the seeded eager trajectory on Metal."""
+
+    class HarmonicForce:
+        def energy_forces(self, values, cell=None, pairs=None):
+            del cell, pairs
+            return 0.015 * mx.sum(values * values), -0.03 * values
+
+    positions = mx.array(
+        [
+            [0.2, 0.3, 0.4],
+            [1.1, 0.8, 0.5],
+            [2.0, 1.5, 0.9],
+            [2.8, 2.4, 1.7],
+        ],
+        dtype=mx.float32,
+    )
+    velocities = mx.array(
+        [
+            [0.10, -0.04, 0.02],
+            [-0.08, 0.03, 0.01],
+            [0.05, 0.02, -0.07],
+            [-0.03, -0.06, 0.04],
+        ],
+        dtype=mx.float32,
+    )
+    masses = mx.array([12.0, 16.0, 14.0, 10.0], dtype=mx.float32)
+    cell = Cell.orthorhombic([3.0, 3.5, 4.0])
+    config = SimulationConfig(
+        dt=0.002,
+        steps=5,
+        sample_interval=5,
+        diagnostic_interval=5,
+        pressure_diagnostics=False,
+    )
+    thermostat = LangevinThermostat(temperature=250.0, friction=1.5, seed=23)
+
+    fused = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=HarmonicForce(),
+        config=config,
+        thermostat=thermostat,
+    )
+
+    def eager_baoab(
+        current_positions,
+        current_velocities,
+        forces,
+        force_scale_over_mass,
+        thermal_scale,
+        noise,
+        box,
+        parameters,
+        counts,
+    ):
+        del counts
+        half_dt = parameters[0]
+        velocity_half = current_velocities + (
+            half_dt * force_scale_over_mass[:, None] * forces
+        )
+        next_positions = current_positions + half_dt * velocity_half
+        next_positions = next_positions - box * mx.floor(next_positions / box)
+        middle_velocities = (
+            parameters[1] * velocity_half + thermal_scale[:, None] * noise
+        )
+        next_positions = next_positions + half_dt * middle_velocities
+        return (
+            next_positions - box * mx.floor(next_positions / box),
+            middle_velocities,
+        )
+
+    monkeypatch.setattr(md_module, "_fused_langevin_baoab_drift", eager_baoab)
+    eager = simulate_nvt(
+        positions,
+        velocities,
+        masses=masses,
+        cell=cell,
+        force_terms=HarmonicForce(),
+        config=config,
+        thermostat=thermostat,
+    )
+    mx.eval(
+        fused.final_state.positions,
+        fused.final_state.velocities,
+        fused.final_state.forces,
+        eager.final_state.positions,
+        eager.final_state.velocities,
+        eager.final_state.forces,
+    )
+
+    for fused_values, eager_values in (
+        (fused.final_state.positions, eager.final_state.positions),
+        (fused.final_state.velocities, eager.final_state.velocities),
+        (fused.final_state.forces, eager.final_state.forces),
+        (fused.potential_energy, eager.potential_energy),
+    ):
+        np.testing.assert_allclose(
+            np.asarray(fused_values),
+            np.asarray(eager_values),
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+
+
+@pytest.mark.gpu
 def test_unchecked_constraint_projection_skips_error_graph_and_matches_checked_positions(
     monkeypatch,
 ):

@@ -347,6 +347,7 @@ _shake_cluster_position_kernel_singleton = None
 _shake_cluster_velocity_kernel_singleton = None
 _settle_water_position_kernel_singleton = None
 _settle_water_velocity_kernel_singleton = None
+_langevin_baoab_drift_kernel_singleton = None
 _dense_constraint_apply_kernel_singleton = None
 _fused_bonded_force_only_kernel_singleton = None
 
@@ -2196,6 +2197,39 @@ _SHAKE_CLUSTER_VELOCITY_SOURCE = r"""
     }
 """
 
+_LANGEVIN_BAOAB_DRIFT_SOURCE = r"""
+    uint atom = thread_position_in_grid.x;
+    if (atom >= (uint)counts[0]) {
+        return;
+    }
+
+    uint offset = 3u * atom;
+    float half_dt = params[0];
+    float velocity_decay = params[1];
+    bool wrap = params[2] != 0.0f;
+    float acceleration_scale = force_scale_over_mass[atom];
+    float thermal = thermal_scale[atom];
+
+    for (uint axis = 0u; axis < 3u; axis++) {
+        float velocity_half = velocities[offset + axis]
+            + half_dt * acceleration_scale * forces[offset + axis];
+        float position = positions[offset + axis] + half_dt * velocity_half;
+        if (wrap) {
+            float length = box[axis];
+            position -= length * floor(position / length);
+        }
+        float middle_velocity = velocity_decay * velocity_half
+            + thermal * noise[offset + axis];
+        position += half_dt * middle_velocity;
+        if (wrap) {
+            float length = box[axis];
+            position -= length * floor(position / length);
+        }
+        next_positions[offset + axis] = position;
+        middle_velocities[offset + axis] = middle_velocity;
+    }
+"""
+
 
 def _lj_force_kernel():
     """Return the cached fused-LJ Metal kernel, building it on first call."""
@@ -2790,6 +2824,30 @@ def _settle_water_velocity_kernel():
             header=_CONSTRAINT_HEADER,
         )
     return _settle_water_velocity_kernel_singleton
+
+
+def _langevin_baoab_drift_kernel():
+    """Return the cached fused Langevin BAOAB kick-drift-thermostat kernel."""
+
+    global _langevin_baoab_drift_kernel_singleton
+    if _langevin_baoab_drift_kernel_singleton is None:
+        _langevin_baoab_drift_kernel_singleton = mx.fast.metal_kernel(
+            name="langevin_baoab_drift",
+            input_names=[
+                "positions",
+                "velocities",
+                "forces",
+                "force_scale_over_mass",
+                "thermal_scale",
+                "noise",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["next_positions", "middle_velocities"],
+            source=_LANGEVIN_BAOAB_DRIFT_SOURCE,
+        )
+    return _langevin_baoab_drift_kernel_singleton
 
 
 def _dense_constraint_apply_kernel():
@@ -3678,6 +3736,44 @@ def _shake_cluster_velocity_deltas(
         init_value=0.0,
     )
     return deltas
+
+
+def _fused_langevin_baoab_drift(
+    positions: mx.array,
+    velocities: mx.array,
+    forces: mx.array,
+    force_scale_over_mass: mx.array,
+    thermal_scale: mx.array,
+    noise: mx.array,
+    box: mx.array,
+    parameters: mx.array,
+    counts: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Run the first BAOAB kick, both drifts, and Langevin thermostat on Metal."""
+
+    atom_count = int(positions.shape[0])
+    if atom_count == 0:
+        return positions, velocities
+    threads = min(256, atom_count)
+    next_positions, middle_velocities = _langevin_baoab_drift_kernel()(
+        inputs=[
+            positions,
+            velocities,
+            forces,
+            force_scale_over_mass,
+            thermal_scale,
+            noise,
+            box,
+            parameters,
+            counts,
+        ],
+        output_shapes=[positions.shape, velocities.shape],
+        output_dtypes=[positions.dtype, velocities.dtype],
+        grid=(atom_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0.0,
+    )
+    return next_positions, middle_velocities
 
 
 def aligned_topology_lj_scales(
