@@ -334,7 +334,6 @@ _pme_order5_spread_kernel_singleton = None
 _pme_order5_interpolate_kernel_singleton = None
 _pme_order5_force_only_kernel_singleton = None
 _aligned_topology_lj_scales_kernel_singleton = None
-_neighbor_admission_reduction_kernel_singleton = None
 _neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
@@ -1470,62 +1469,6 @@ _NEIGHBOR_PAIR_CUTOFF_MASK_SOURCE = r"""
     close[t] = dx * dx + dy * dy + dz * dz < params[0];
 """
 
-_NEIGHBOR_ADMISSION_REDUCTION_SOURCE = r"""
-    uint atom = thread_position_in_grid.x;
-    uint lane = thread_position_in_threadgroup.x;
-    threadgroup uint group_max_bits[256];
-    threadgroup uint group_nonfinite[256];
-
-    uint distance2_bits = 0u;
-    uint nonfinite = 0u;
-    if (atom < (uint)counts[0]) {
-        float px = positions[3 * atom + 0];
-        float py = positions[3 * atom + 1];
-        float pz = positions[3 * atom + 2];
-        bool finite = isfinite(px) && isfinite(py) && isfinite(pz);
-        nonfinite = finite ? 0u : 1u;
-        if (finite) {
-            float dx = px - reference[3 * atom + 0];
-            float dy = py - reference[3 * atom + 1];
-            float dz = pz - reference[3 * atom + 2];
-            float lx = cell[0];
-            float ly = cell[4];
-            float lz = cell[8];
-            dx -= lx * rint(dx / lx);
-            dy -= ly * rint(dy / ly);
-            dz -= lz * rint(dz / lz);
-            float distance2 = dx * dx + dy * dy + dz * dz;
-            distance2_bits = as_type<uint>(distance2);
-        }
-    }
-
-    group_max_bits[lane] = distance2_bits;
-    group_nonfinite[lane] = nonfinite;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            group_max_bits[lane] = max(
-                group_max_bits[lane],
-                group_max_bits[lane + stride]
-            );
-            group_nonfinite[lane] |= group_nonfinite[lane + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (lane == 0u) {
-        atomic_fetch_max_explicit(
-            &max_distance2_bits[0],
-            group_max_bits[0],
-            memory_order_relaxed
-        );
-        atomic_fetch_or_explicit(
-            &nonfinite_flag[0],
-            group_nonfinite[0],
-            memory_order_relaxed
-        );
-    }
-"""
-
 _NEIGHBOR_CELL_PAIR_CANDIDATES_SOURCE = r"""
     uint task = thread_position_in_grid.x;
     if (task >= (uint)counts[0]) {
@@ -2575,21 +2518,6 @@ def _neighbor_pair_cutoff_mask_kernel():
     return _neighbor_pair_cutoff_mask_kernel_singleton
 
 
-def _neighbor_admission_reduction_kernel():
-    """Return the cached neighbor-admission Metal reduction kernel."""
-
-    global _neighbor_admission_reduction_kernel_singleton
-    if _neighbor_admission_reduction_kernel_singleton is None:
-        _neighbor_admission_reduction_kernel_singleton = mx.fast.metal_kernel(
-            name="neighbor_admission_reduction",
-            input_names=["positions", "reference", "cell", "counts"],
-            output_names=["max_distance2_bits", "nonfinite_flag"],
-            source=_NEIGHBOR_ADMISSION_REDUCTION_SOURCE,
-            atomic_outputs=True,
-        )
-    return _neighbor_admission_reduction_kernel_singleton
-
-
 def _neighbor_cell_pair_candidates_kernel():
     """Return the cached spatial neighbor-candidate Metal kernel."""
 
@@ -2934,48 +2862,6 @@ def neighbor_pair_cutoff_mask(
         threadgroup=(threads, 1, 1),
     )
     return close
-
-
-def _neighbor_admission_reduction(
-    positions: mx.array,
-    reference_positions: mx.array,
-    cell_matrix: mx.array,
-) -> tuple[mx.array, mx.array]:
-    """Return raw maximum-distance bits and a non-finite-position flag."""
-
-    positions = as_mx_array(positions, dtype=mx.float32)
-    reference_positions = as_mx_array(reference_positions, dtype=mx.float32)
-    cell_matrix = as_mx_array(cell_matrix, dtype=mx.float32)
-    if positions.ndim != 2 or positions.shape[1] != 3:
-        msg = "positions must have shape (n_atoms, 3)"
-        raise ValueError(msg)
-    if reference_positions.shape != positions.shape:
-        msg = "reference_positions must match positions"
-        raise ValueError(msg)
-    if cell_matrix.shape != (3, 3):
-        msg = "cell_matrix must have shape (3, 3)"
-        raise ValueError(msg)
-
-    atom_count = int(positions.shape[0])
-    if atom_count == 0:
-        zero = mx.zeros((1,), dtype=mx.uint32)
-        return zero, zero
-    threads = 256
-    grid_size = ((atom_count + threads - 1) // threads) * threads
-    max_distance2_bits, nonfinite_flag = _neighbor_admission_reduction_kernel()(
-        inputs=[
-            positions,
-            reference_positions,
-            cell_matrix,
-            mx.array([atom_count], dtype=mx.uint32),
-        ],
-        output_shapes=[(1,), (1,)],
-        output_dtypes=[mx.uint32, mx.uint32],
-        grid=(grid_size, 1, 1),
-        threadgroup=(threads, 1, 1),
-        init_value=0,
-    )
-    return max_distance2_bits, nonfinite_flag
 
 
 def _neighbor_cell_pair_candidates(

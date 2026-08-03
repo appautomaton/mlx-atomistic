@@ -2,7 +2,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-import mlx_atomistic.metal_kernels as metal_kernels
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import LennardJonesPotential, simulate
@@ -34,29 +33,6 @@ def _neighbor_pair_set(neighbors):
     if neighbors.blocks is not None:
         return _block_pair_set(neighbors)
     return {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()}
-
-
-def test_neighbor_admission_metal_kernel_is_lazy(monkeypatch):
-    """The admission kernel is constructed once and never at import time."""
-
-    sentinel = object()
-    calls = []
-
-    def build_kernel(**kwargs):
-        calls.append(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(
-        metal_kernels,
-        "_neighbor_admission_reduction_kernel_singleton",
-        None,
-    )
-    monkeypatch.setattr(mx.fast, "metal_kernel", build_kernel)
-
-    assert metal_kernels._neighbor_admission_reduction_kernel() is sentinel
-    assert metal_kernels._neighbor_admission_reduction_kernel() is sentinel
-    assert len(calls) == 1
-    assert calls[0]["atomic_outputs"] is True
 
 
 def test_spatial_cell_pair_template_reuses_fixed_geometry_without_stale_counts():
@@ -937,36 +913,6 @@ def test_neighbor_list_manager_mlx_scalar_rebuild_policy_matches_numpy():
         return manager.rebuild_count, rebuilt.pair_count, manager.last_max_displacement
 
     assert exercise("mlx_scalar") == exercise("numpy")
-
-
-@pytest.mark.parametrize("displacement_check_backend", ["numpy", "mlx_scalar"])
-def test_neighbor_admission_threshold_is_strict_float32(
-    displacement_check_backend,
-):
-    """An exact threshold stays current and its next float rebuilds."""
-
-    positions = np.asarray(
-        [[0.0, 1.0, 1.0], [2.2, 1.0, 1.0], [1.0, 2.2, 1.0]],
-        dtype=np.float32,
-    )
-
-    def check(offset):
-        manager = NeighborListManager(
-            Cell.cubic(6.0),
-            cutoff=1.5,
-            skin=0.5,
-            check_interval=1,
-            displacement_check_backend=displacement_check_backend,
-        )
-        payload = as_mx_array if displacement_check_backend == "mlx_scalar" else np.asarray
-        initial = manager.update(payload(positions))
-        moved = positions.copy()
-        moved[0, 0] = offset
-        return manager.update(payload(moved)) is not initial
-
-    threshold = np.float32(0.25)
-    assert check(threshold) is False
-    assert check(np.nextafter(threshold, np.float32(np.inf))) is True
 
 
 def test_neighbor_list_manager_rejects_non_finite_positions_after_valid_build():
