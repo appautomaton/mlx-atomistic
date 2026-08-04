@@ -2762,8 +2762,7 @@ def test_projected_eigh_rejects_malformed_or_nonfinite_matrix(matrix, message):
         periodic_scf_module._projected_eigh(matrix)
 
 
-@pytest.mark.gpu
-def test_periodic_davidson_observer_counts_single_hpsi_hook_without_numerical_drift():
+def test_periodic_davidson_observer_counts_hpsi_hooks_without_numerical_drift():
     grid = RealSpaceGrid((6, 6, 6), (6.0, 6.0, 6.0))
     basis = PlaneWaveBasis.from_reduced_kpoint(grid, 3.0, (0.25, 0.0, 0.0))
     config = PeriodicDavidsonConfig(
@@ -2787,15 +2786,19 @@ def test_periodic_davidson_observer_counts_single_hpsi_hook_without_numerical_dr
     snapshot = observer.snapshot()
     work = snapshot["work_counters"]
     assert observed.iterations == 1
-    assert work["hpsi_calls"] == 1
-    assert work["hpsi_vector_equivalents"] == 3
+    # A converging lane applies the Hamiltonian twice: once to seed the paired
+    # V/HV state, and once more to the Ritz vectors so that convergence is
+    # decided by a direct-operator residual instead of the incremental subspace
+    # residual. Only the seeding application contributes new basis vectors.
+    assert work["hpsi_calls"] == 2
+    assert work["hpsi_vector_equivalents"] == 6
     assert work["davidson_hv_new_vectors"] == 3
     assert work["davidson_hv_reused_vectors"] == 0
     assert work["projected_old_old_rebuilds"] == 0
     assert work["fft_vector_equivalents"] == 2 * work["hpsi_vector_equivalents"]
-    assert len([event for event in events if event["event"] == "davidson_iteration"]) == (
-        observed.iterations
-    )
+    iteration_events = [event for event in events if event["event"] == "davidson_iteration"]
+    assert len(iteration_events) == observed.iterations
+    assert iteration_events[-1]["residual_source"] == "direct_operator"
     observed_metadata = observed.to_dict()
     for field, value in periodic_scf_module._eigensolve_provenance().items():
         assert observed_metadata[field] == value
