@@ -711,15 +711,8 @@ class NeighborListManager:
             backend=self.backend,
             max_mlx_dense_atoms=self.max_mlx_dense_atoms,
             block_size=self.block_size,
+            generation=self.rebuild_count + 1,
         )
-        if neighbor_list.tiles is not None:
-            neighbor_list = replace(
-                neighbor_list,
-                tiles=replace(
-                    neighbor_list.tiles,
-                    generation=self.rebuild_count + 1,
-                ),
-            )
         self.neighbor_list = neighbor_list
         self.rebuild_wall_seconds += perf_counter() - start
         self.reference_positions = as_mx_array(positions)
@@ -885,8 +878,32 @@ def build_neighbor_list(
     backend: NeighborBackend = "periodic_cell_list",
     max_mlx_dense_atoms: int = DEFAULT_MLX_DENSE_PAIR_LIMIT,
     block_size: int = DEFAULT_MLX_CELL_BLOCK_SIZE,
+    generation: int = 0,
 ) -> NeighborList:
-    """Build a periodic cell-list neighbor list with unique `i < j` pairs."""
+    """Build a periodic cell-list neighbor list with unique `i < j` pairs.
+
+    Args:
+        positions: Particle coordinates.
+        cell: Periodic cell owning the minimum-image convention.
+        cutoff: Interaction cutoff distance.
+        skin: Verlet-list skin added to the cutoff. Defaults to ``0.3``.
+        sort_pairs: Order the compact pairs by left then right atom. Defaults
+            to ``True``.
+        max_workers: Worker count for the threaded CPU builder. Defaults to
+            ``None``.
+        backend: Neighbor construction backend. Defaults to
+            ``"periodic_cell_list"``.
+        max_mlx_dense_atoms: Largest atom count the dense MLX pair backend
+            accepts. Defaults to `DEFAULT_MLX_DENSE_PAIR_LIMIT`.
+        block_size: Atom-block width for block-structured backends. Defaults to
+            `DEFAULT_MLX_CELL_BLOCK_SIZE`.
+        generation: Rebuild generation stamped onto tile geometry, so a caller
+            never has to rebuild the tiles through `dataclasses.replace` and
+            repeat their schedule validation. Defaults to ``0``.
+
+    Returns:
+        The constructed neighbor list.
+    """
 
     backend = validate_neighbor_backend(backend)
     if not np.isfinite(cutoff) or cutoff <= 0.0:
@@ -927,6 +944,7 @@ def build_neighbor_list(
             skin=skin,
             search_radius=search_radius,
             sort_pairs=sort_pairs,
+            generation=generation,
         )
 
     positions_np = np.asarray(positions_mx, dtype=np.float32)
@@ -969,6 +987,7 @@ def build_neighbor_list(
             skin=skin,
             search_radius=search_radius,
             sort_pairs=sort_pairs,
+            generation=generation,
         )
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, backend)
     pair_array, stats = build_periodic_pair_list(
@@ -1255,6 +1274,7 @@ def _build_mlx_spatial_cell_tile_list(
     search_radius: float,
     sort_pairs: bool,
     subdivision: int = DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION,
+    generation: int = 0,
 ) -> NeighborList:
     """Build exact spatial 8x8 tiles with Metal membership and compaction."""
 
@@ -1466,6 +1486,7 @@ def _build_mlx_spatial_cell_tile_list(
         raw_candidate_count=raw_candidate_count,
         force_group_starts=force_group_starts,
         force_group_counts=force_group_counts,
+        generation=generation,
     )
     estimated_cell_list_bytes = (
         n_atoms * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
@@ -1505,6 +1526,7 @@ def _build_mlx_cell_tiles(
     skin: float,
     search_radius: float,
     sort_pairs: bool,
+    generation: int = 0,
 ) -> NeighborList:
     """Build exact cutoff-plus-skin membership over eight-atom block tiles."""
 
@@ -1703,6 +1725,7 @@ def _build_mlx_cell_tiles(
         member_mask=mx.array(member_mask, dtype=mx.uint32),
         exact_pair_count=exact_pair_count,
         raw_candidate_count=raw_candidate_count,
+        generation=generation,
     )
     stats = PairListStats(
         pair_count=exact_pair_count,

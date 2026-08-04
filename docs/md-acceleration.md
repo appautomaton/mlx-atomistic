@@ -646,6 +646,56 @@ route at about 40% of the ordinary step, which is the most reliable estimate of
 that share in this document because it comes from a complete-wall A/B rather
 than an instrumented boundary.
 
+### The rest of the step, measured
+
+Every route below was timed at one call and at nine calls inside a single
+evaluation over distinct inputs. The marginal cost is the difference divided by
+eight, which cancels the fixed dispatch and synchronization cost instead of
+assuming a value for it. The nonbonded parts reconcile with a directly measured
+nonbonded total to within 1%.
+
+| Block | Marginal cost | Share of a 2.05 ms step |
+| --- | ---: | ---: |
+| Spatial tile direct force | 0.581 ms | 28% |
+| Neighbor rebuild, amortized | 0.49 ms | 24% |
+| SETTLE and SHAKE projections | 0.165 ms | 8% |
+| Prepared reciprocal PME | 0.144 ms | 7% |
+| Sparse corrections and fused bonded | 0.052 ms | 2.5% |
+| BAOAB, Langevin noise, centre-of-mass removal | 0.06 ms | 3% |
+
+The residual is inter-kernel serialization and the single per-step host round
+trip, not removable work: the marginal measurements let independent calls
+pipeline, while a real step is a dependency chain.
+
+Four directions were measured and closed in that pass, and they are recorded
+here so they are not rederived:
+
+- **Integration arithmetic is not a target.** The full BAOAB chain is 0.0339
+  ms, centre-of-mass removal 0.0242 ms, the thermostat with its noise 0.0225
+  ms. Hoisting the constant mass reduction out of centre-of-mass removal, which
+  looks like obvious waste, saves 0.0025 ms, or 0.12% of a step.
+- **The constraint routes hold no waste of the direct-kernel class.** SHAKE
+  runs 790 clusters at eight iterations, so its inner-loop divisions total
+  about 32,000 per step; SETTLE is analytic.
+- **Rebuild host time is algorithmic.** Of about 5.8 ms per rebuild,
+  `_spatial_cell_pair_tasks` is 1.2 ms, nine prefix-scan readbacks that size the
+  next allocation are 1.2 ms, and `cumsum` is 0.6 ms. The one true constant, the
+  cell-lengths evaluation and readback at the top of every rebuild, is 0.3% of a
+  step and would require caching inside `Cell`.
+- **The 117.6 MB exact-pair array materialized every rebuild is unused by the
+  tile force route.** It is a diagnostic oracle, and removing it is the Phase 2
+  exact-pair-oracle redesign under its existing reopening condition, not a local
+  change.
+
+One pure duplication was removed. `NeighborListManager.rebuild` rebuilt the tile
+geometry through `dataclasses.replace` only to stamp a generation counter, and
+because `NeighborTiles` is frozen that re-ran `__post_init__`, including its
+force-group schedule reduction and a blocking evaluation. The generation is now
+a `build_neighbor_list` parameter, so validation runs once per rebuild instead
+of twice. That is worth about 0.3% of a step, below what a complete-wall gate
+can resolve, so it is verified by counting validations per rebuild and by an
+interleaved four-run gate that shows no regression.
+
 The tile builder also has a known granularity limit at small search radius.
 Cells are sized at one third of the search radius, so at 5.5 A skin a cell
 holds about 11 atoms and an eight-atom block fits inside one cell, while at
