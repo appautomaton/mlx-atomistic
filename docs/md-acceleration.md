@@ -67,18 +67,42 @@ For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
 large-system route uses `mlx_cell_pairs`. The historical implementation used
 CPU-side periodic bins and candidate arrays; the current Metal route uses a
 fine device-resident grid and an AABB-pruned canonical half-stencil, then emits
-and compacts candidates on Metal for the existing MLX pair force path. A
-92,001-atom GPCRmd 729 short-range proof run under
-`/tmp/mlx-atomistic-gpcrmd-729-mlx-cell-pairs` selected
-`nonbonded_runtime.backend=mlx_cell_pairs` with no fallback. It tested
-`candidate_count=390934237` local candidates, emitted `pair_count=48933140`,
-and recorded `elapsed_wall_seconds=23.05953904206399`,
-`neighbor_rebuild_wall_seconds=1.3890800829976797`,
-`force_evaluation_wall_seconds=11.277963876025751`, `skin=2.5`, and one
-rebuild. Those figures describe the historical hybrid implementation. The
+and compacts candidates on Metal for the existing MLX pair force path. The
 under-5-second GPCRmd stretch target remains blocked by force evaluation,
 per-step synchronization, and the cost of rebuilding and consuming a global
 explicit pair array. Dynamic compaction is no longer a CPU bottleneck on Metal.
+Current GPCRmd 729 figures live in
+[`docs/benchmarks/gpcrmd-729-pme-runtime-m5max.md`](./benchmarks/gpcrmd-729-pme-runtime-m5max.md).
+
+## Measurement Noise Floor
+
+Read this before any result below. These M5 Max measurements were made in
+low-power mode, and the machine does not hold a stable clock under load.
+
+Twelve complete 5DFR runs at 23,558 atoms, 9 A cutoff, 5.5 A skin, seed 17, and
+two fixed sources span:
+
+| Measured steps | Runs | Range | Spread |
+| ---: | ---: | --- | ---: |
+| 75 | 4 | 1.6828--1.8273 ms/step | 8.6% |
+| 750 | 8 | 2.3140--2.8436 ms/step | 22.9% |
+
+Two consequences constrain how the numbers below may be read.
+
+A short gate and a production-length run measure different machine states. One
+unchanged source ran at 1.6828 ms/step over 75 steps and 2.5072 ms/step over
+750 steps, a 49% difference with no code change. Short-gate percentages
+therefore do not transfer, which is consistent with short-gate gains in this
+document shrinking on their 750-step and JAC confirmations.
+
+Single-pair wall-time differences below roughly 10% are not resolvable here.
+Several entries under [Closed directions](#closed-directions) were decided at
+0.16% to 3%. Those decisions are sound as "no measurable gain" and the
+implementations are correctly removed, but they do not establish the sign of
+the effect. Prefer exact counts, interleaved medians with rotating order, or
+ratios that cancel clock drift.
+
+## Retained Results
 
 ### Spatial Metal neighbor result
 
@@ -180,15 +204,8 @@ fixed-coordinate production-force comparison gave `1.90e-4 kJ/mol/A` RMS and
 `437.69 kJ/mol/A` maximum reference force, consistent with the existing
 float32 atomic-scatter envelope. The OpenMM process tree peaked at 0.401 GB.
 
-Two attractive-looking experiments were removed after complete-step tests:
-
-- The atom-tile direct kernel improved isolated force time from 0.005970 to
-  0.004718 seconds, but its padded representation increased the full 75-step
-  run from 1.190142 to 1.506723 seconds and raised peak memory from about 3.90
-  to 6.06 GB.
-- A constraint-aware compiled trajectory block reduced neighbor rebuilding,
-  but repeated a much larger lazy graph. Even after rebuilds fell from nine to
-  two, it took 1.87596 seconds versus the 1.190142-second control.
+Two attractive-looking experiments were removed after complete-step tests. Both
+are recorded under [Closed directions](#closed-directions).
 
 A synchronized post-constraint profile assigned 35.91% of wall time to direct
 LJ plus screened Coulomb, 14.48% to the then-unfused bonded terms, 12.12% to
@@ -197,6 +214,15 @@ neighbor update/rebuild, 8.53% to constraints, 7.36% to force aggregation,
 The fused bonded route addressed the second item. The next pass therefore
 changed the direct-space work layout instead of adding another Python-loop
 cleanup.
+
+Synchronized route shares are structural upper bounds and must not be read as
+clean wall shares. The profiler completes every route boundary with `mx.eval`,
+so a 5DFR step that runs in about 2.31 ms clean takes about 4.82 ms
+instrumented across roughly 17 evaluation boundaries. Routes with many
+boundaries and little queued work absorb the added synchronization: force
+aggregation measures 384 us/step under instrumentation, of which 4.9 us/step is
+graph and host work and the remainder is three command-buffer round trips. Use
+these shares to rank boundaries structurally, never to size a candidate.
 
 ### Retained spatial-direct increment
 
@@ -251,14 +277,11 @@ particle-energy output and reduction during force-only steps. Its synchronized
 route time fell from 0.081776 to 0.067008 seconds across 74 calls, 18.06%, while
 complete clean wall remained statistically flat at 0.560536 seconds.
 
-Two bounded direct-force experiments were rejected. Raising the same-left tile
-group width from four to eight improved the isolated tile kernel by 5.53% but
-changed complete wall from 0.558220 to 0.559019 seconds. A two-pass non-atomic
-right-block reducer produced a 264 MB temporary tile-force buffer, reduced the
-direct advantage over pairs to 8.52%, and raised complete wall to 0.734520
-seconds. Both experiments were removed. The retained tile route is now selected
-by production only inside the measured envelope above; compact pairs remain the
-fallback, and checkpoint resume preserves the originally recorded backend.
+Two bounded direct-force experiments measured in the same pass were removed and
+are recorded under [Closed directions](#closed-directions). The retained tile
+route is now selected by production only inside the measured envelope above;
+compact pairs remain the fallback, and checkpoint resume preserves the
+originally recorded backend.
 
 ### 23,558-atom 5DFR transfer result
 
@@ -312,59 +335,6 @@ orthorhombic, order-5 PME, 9 A cutoff, 5.5 A skin, and no-NBFIX gates. The gap
 between those windows continues to use compact pairs rather than extrapolating
 from unmeasured sizes.
 
-### Rejected two-step neighbor admission
-
-The 2026-08-02 experiment delayed the constrained NVT neighbor-displacement
-decision for two steps, then either committed both steps or rolled back and
-replayed them with the authoritative per-step path. The matched 5DFR runs used
-the same prepared artifact, Metal route, 5.5 A skin, and per-step
-center-of-mass motion removal on both sides.
-
-| 750-step 5DFR route | Run 1 | Run 2 | Median wall | Median throughput |
-| --- | ---: | ---: | ---: | ---: |
-| Exact per-step admission | 2.326254 s | 2.348854 s | 2.337554 s | 110.888 ns/day |
-| Two-step transaction | 2.356621 s | 2.425385 s | 2.391003 s | 108.429 ns/day |
-
-The transaction was 2.29% slower by median wall time and was therefore
-removed. It accepted 338--339 epochs but replayed 42--44 steps. Combining two
-checks reduced host decision count without reducing displacement work: the
-single materialization evaluated a two-step lazy graph, while rejected epochs
-also repeated integration and one force evaluation. Median measured neighbor
-update time consequently rose instead of falling. All runs stayed finite,
-constraint errors remained below `1.70e-5 A`, and the hard-bounded process-tree
-peak stayed below 2.52 GB, so this was a performance rejection rather than a
-correctness or memory failure.
-
-### Rejected fused neighbor-admission producer
-
-The 2026-08-03 experiment kept exact per-step admission and its single host
-decision, but replaced the steady MLX finite/minimum-image/maximum chain with
-one custom Metal threadgroup reduction. The kernel produced the maximum squared
-displacement and a non-finite flag; the host restored the float32 distance and
-made the unchanged strict rebuild-threshold comparison after the existing
-materialization.
-
-Direct graph capture fell from 34 eager primitives to 8 with one CustomKernel.
-Both routes used one `mx.eval`, returned the same `0.30671805 A` maximum
-displacement, and made the same rebuild decision. CPU/fallback tests, real-Metal
-partial-group and non-finite oracles, exact-threshold/nextafter branches, forced
-rebuilds, and variable-cell parity all passed before timing.
-
-| 75-step 5DFR gate | C1 | A1 | A2 | C2 | Median |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Exact MLX admission | 0.143159 s | -- | -- | 0.144269 s | 0.143714 s |
-| Fused Metal producer | -- | 0.144530 s | 0.144230 s | -- | 0.144380 s |
-
-The candidate was 0.46% slower by median wall time, and the paired directions
-disagreed (`-0.96%` and `+0.03%`). All four complete runs passed their finite,
-constraint, route, and workload checks; process-tree peaks were 0.97--1.10 GB
-under the 40 GB limit. The candidate therefore failed the immediate-rejection
-gate and was removed. JAC and 750-step transfer runs were not performed. The
-result shows that this primitive reduction did not pay for its custom
-reduction/output handling while the load-bearing admission sync remained; it
-does not establish which internal Metal cost dominated or rule out a different
-producer design.
-
 ### Retained 32-lane spatial direct-force schedule
 
 The 2026-08-02 follow-up replaced the spatial direct kernel's 64-thread,
@@ -389,12 +359,9 @@ tests for the fused direct, topology, constraint, and neighbor kernels passed.
 The JAC row is a back-to-back code A/B; its absolute wall time should not be
 compared with older samples collected under different machine conditions.
 
-Four adjacent ideas were measured and removed. On-demand exact-pair decoding
-made the complete 5DFR path 1.8% slower, a speculative second Metal stream was
-6.6% slower, omitting the disjoint SHAKE pre-force projection was 1.7% slower,
-and a handwritten fused BAOAB drift improved the median by only 0.5%. None met
-the 5% complete-wall retention threshold. The retained change is therefore the
-kernel work schedule only; the neighbor lifecycle, integrator sequence,
+Four adjacent ideas were measured in the same pass and removed; they appear
+under [Closed directions](#closed-directions). The retained change is therefore
+the kernel work schedule only; the neighbor lifecycle, integrator sequence,
 constraints, and scientific workload are unchanged.
 
 ### Guarded intra-step force submission
@@ -425,59 +392,27 @@ the short gate, so this is classified as a modest scheduling improvement. It
 does not change the scientific operations and does not close the remaining
 OpenMM throughput gap.
 
-A second experiment built fixed atom-owner maps for disjoint SETTLE and SHAKE
-families and replaced their recurring sparse-scatter application chains with
-one dense per-atom Metal write. Metal parity covered periodic positions,
-pre-force velocities, final velocities, unconstrained atoms, noncontiguous
-indices, and one-to-three SHAKE peripherals; CPU, overlap, and profiler
-fallbacks also passed. The complete 75-step 5DFR median changed from 0.142829
-to 0.139473 seconds, only 2.35%, with inconsistent paired gains. The specialized
-kernel, maps, and tests were therefore removed under the 5% retention rule.
+Four experiments measured against this parent were removed and are recorded
+under [Closed directions](#closed-directions): dense constraint owner maps,
+coalesced sparse constraint writes, a cached Metal force-buffer sum, and
+ordinary-step graph pruning. Two of them were later revisited under composition
+and retained; see [Cumulative interaction stack](#cumulative-interaction-stack).
 
-Two later pipeline experiments were also rejected by the same bounded 75-step
-5DFR gate. Coalescing SETTLE and SHAKE sparse constraint writes changed complete
-wall time from 0.202904 to 0.574724 seconds, a 2.83x regression, because this
-system constrains nearly every atom and the added concatenation and scatter
-work outweighed fewer full-position additions. Flattening the prepared force
-pipeline and replacing its nested MLX additions with one cached Metal
-force-buffer sum changed 0.158592 to 0.159115 seconds, 0.33% slower. Both paths
-remained finite and inside the constraint and 40 GB memory gates, but neither
-earned a repeat, JAC transfer, or 750-step run. Their implementation and tests
-were removed. The second result also narrows the remaining diagnosis:
-force-buffer addition is measurable under synchronized profiling, but it is
-not a material complete-trajectory bottleneck.
-
-An ordinary-step graph-pruning experiment then separated SETTLE/SHAKE position
-projection from its discarded error result and hoisted three invocation- or
-topology-invariant MLX values. Checked CPU and Metal parity passed, but a
-steady-step graph capture shrank only from 153 to 149 MLX primitives: two
-`ExpandDims` and two `Reshape` nodes. The error result was already absent from
-the materialized Metal graph, so this was primarily a small host-construction
-change rather than the expected compute deletion. In the real-Metal
-`C1 -> A1 -> A2 -> C2` gate, control walls were 0.144676 and 0.148414 seconds;
-candidate walls were 0.143181 and 0.143799 seconds. The candidate median was
-2.08% lower, with both paired directions favorable, while all finite-state,
-constraint, and 40 GB memory checks passed. Because that result was below the
-3% immediate-rejection line and the 5% retention threshold, the implementation
-and candidate-only tests were removed. No JAC or 750-step run was performed.
-
-A follow-up staged-compilation experiment placed separate `mx.compile` units
-around the ordinary constrained-Langevin work before and after the retained
-asynchronous force submission. Compiled/eager Metal parity passed across
-forced neighbor rebuilds, NPT and unsupported routes stayed eager, and no
-additional synchronization caller appeared. Graph capture reduced the same
-steady step from 153 primitives when eager to 112 with pre-force compilation,
-147 with post-force compilation, and 106 with both; the category signatures
-were unchanged across a rebuild. Structural fusion nevertheless did not
-improve the complete trajectory. In the real-Metal `C1 -> A1 -> A2 -> C2`
-gate, control walls were 0.143491 and 0.143358 seconds, while candidate walls
-were 0.142737 and 0.144577 seconds. The candidate median was 0.16% slower and
-the paired directions disagreed. All finite-state, constraint, route, and
-40 GB memory gates passed, but the result triggered immediate rejection. The
-compiled units, eager extraction, eligibility plumbing, and candidate-only
-tests were removed. JAC and 750-step runs were not performed. This result is
-specific to the current 23,558-atom staged route; it does not claim that
-`mx.compile` is generally ineffective elsewhere in MLX Atomistic.
+A staged-compilation experiment placed separate `mx.compile` units around the
+ordinary constrained-Langevin work before and after the retained asynchronous
+force submission. Compiled/eager Metal parity passed across forced neighbor
+rebuilds, NPT and unsupported routes stayed eager, and no additional
+synchronization caller appeared. Graph capture reduced the same steady step
+from 153 primitives when eager to 112 with pre-force compilation, 147 with
+post-force compilation, and 106 with both. The complete trajectory did not
+improve: the candidate median was 0.16% slower with disagreeing paired
+directions, so the compiled units, eager extraction, and eligibility plumbing
+were removed. This result is specific to the current 23,558-atom staged route
+and does not claim that `mx.compile` is generally ineffective elsewhere in MLX
+Atomistic. It is consistent with the step budget in [Where the time
+goes](#where-the-time-goes): the ordinary step spends most of its wall waiting
+for queued device work, which leaves little host graph construction for
+compilation to remove.
 
 ### Neighbor rebuild lifecycle experiments
 
@@ -485,18 +420,10 @@ The 2026-08-03 phase tested six independent ways to shorten the complete
 spatial-tile rebuild lifecycle. Every candidate first preserved the 23,558-atom
 5DFR inventory exactly: 14,699,933 pairs, 646,965 non-empty tiles, 163,090
 force groups, and six byte-identical array digests. Process-tree peaks remained
-between 0.85 and 1.00 GB under the 40 GB limit. The retention gate required at
-least 10% local improvement in an interleaved `C1 -> A1 -> A2 -> C2` test
-before any JAC or 750-step transfer.
-
-| Candidate | Measured boundary | 5DFR result | Decision |
-|---|---|---:|---|
-| Fused tile compaction and pair emission | Complete rebuild | 2.64% slower | Rejected |
-| Stable linear force-group placement | Complete rebuild | 8.73% slower | Rejected |
-| One-transfer prefix tails | Complete rebuild | At most about 4.2% after settling | Rejected |
-| Unified schedule-validation ownership | Complete rebuild | 0.017% faster; paired directions disagreed | Rejected |
-| Deferred topology-mask materialization | Rebuild, binding, and first force | 0.37% faster | Rejected |
-| Same-position finite certificate | Real manager-update rebuild | 5.54% slower | Rejected |
+between 0.85 and 1.00 GB under the 40 GB limit. No candidate reached the 10%
+local admission gate, so no JAC or 750-step run was performed and all candidate
+code and tests were removed. The six results appear under [Closed
+directions](#closed-directions).
 
 The structural findings still narrow future work. A race-free stable linear
 placement was possible, but scanning each left-block row cost more than MLX
@@ -506,11 +433,6 @@ after an `mx.eval` can add scalar work, but its benefit did not reproduce the
 yet complete-boundary timing showed that the waits were either too small or
 merely transferred to first force evaluation. The finite certificate removed
 one reduction but added more host bookkeeping than it saved.
-
-No candidate reached local admission, so no JAC or 750-step run was performed.
-All candidate product code and candidate-only tests were removed. The retained
-tree therefore keeps the pre-phase spatial-tile rebuild, validation, topology,
-and finite-check behavior without new runtime complexity.
 
 ### Cumulative interaction stack
 
@@ -555,84 +477,231 @@ provides about 10%. Earlier isolated results ranged from regression to a few
 percent. They mean the three changes alter the same ordinary constraint and
 integration graph and are valuable as one interaction-tested stack.
 
-The rebuild substack remained empty. Fresh prefix-tail extraction was 3.10%
-slower, adding unified schedule validation made that full lifecycle another
-1.08% slower, and topology-mask deferral was closed because it only moved the
-wait into first force. A new left-major row-compaction design then removed the
-accepted-tile `argsort`, permutation, two gathers, and pre-gather
-intermediates while preserving all six pair/tile/mask/group digests. Its
-device descriptor, count, prefix, and compaction pipeline was nevertheless
-6.60% slower, with both paired directions regressive, so all candidate code
-and tests were removed. The retained result is therefore the three-component
-ordinary-step stack plus the existing neighbor rebuild path.
+The rebuild substack remained empty. Four rebuild candidates measured in this
+phase appear under [Closed directions](#closed-directions). The retained result
+is therefore the three-component ordinary-step stack plus the existing neighbor
+rebuild path.
 
+### Earlier retained kernel and parity evidence
 
-### Rejected atom-tile result
+These predate the spatial-tile work above and remain part of the retained
+runtime. All are M5 Max, low-power mode, bounded optimization and
+one-picosecond stability evidence rather than production-length validation.
 
-The 2026-07-31 canonical-ID atom-tile experiment tested the full route instead
-of assuming that a faster kernel would make the trajectory faster. Its tiles
-were derived from the compact-pair list, unlike the retained spatially built
-route above. Its isolated 8x8 Metal
-kernel reduced median direct-force latency from 0.005548 to 0.004257 seconds,
-a 30.33% win, and matched the explicit-pair force within the established
-float32 tolerance. Initial integration lost badly because tile construction
-and CPU topology binding raised the 94,232-atom, 75-step wall time from the
-1.850210-second explicit-pair control to 34.429230 seconds.
+- **Compact neighbor parity.** A synthetic orthorhombic ladder at
+  1k/4k/16k/50k/92,001 atoms validates the compact route against the tiled
+  all-pairs MLX oracle. At 92,001 atoms the compact build took 0.545 s and the
+  explicitly synchronized pair-force evaluation 0.068 s, against 112.1 s for
+  the oracle, at `4.56e-7` relative energy delta and `8.49e-7` maximum absolute
+  force delta. This 2026-07-13 result stays diagnostic because the local
+  real-fixture cache was unavailable. A later source-backed GPCRmd 729 run
+  passes a separate bounded fixed-cell parity/NVT/restart gate using
+  `mlx_cell_blocks`/`NeighborBlocks` and does not change that classification.
+  The production runner has since moved to compact `mlx_cell_pairs`.
+- **NPT diagnostic reuse, reciprocal-PME graph compilation, and fused
+  parameterized LJ/direct-PME kernels.** A matched 75-step DHFR NPT prefix fell
+  from 142.87 s to a repeated median of 13.77 s, with process-tree peak memory
+  down from 27.33 GB to 5.18--6.11 GB and the same numerical gates passing.
+- **Order-five reciprocal PME charge-spread and potential-derivative kernels.**
+  The 2,269-atom alanine 50-step fixed-cell median fell from 0.853 to 0.537 s
+  without pressure diagnostics, and from 1.313 to 0.987 s with analytic
+  pressure diagnostics.
+- **Batched MLX rigid-water projector.** The artifact loader routes complete
+  three-site water constraint triangles to it while keeping a fail-closed
+  generic path for incomplete or mixed geometries. The same medians fell from
+  0.537 to 0.419 s and from 0.987 to 0.863 s.
+- **Complete alanine science gate.** The 100-step NVT plus 1,000-step NPT check
+  passed all 16 unchanged gates in 15.899 s, down from 23.110 s, at a
+  `3.34e-6 A` maximum constraint error and a 0.94 GB process-tree peak.
+  Fixed-coordinate OpenMM parity stayed inside the accepted energy and force
+  gates.
 
-One bounded lifecycle correction then derived tiles from the exact compact-
-pair oracle and packed topology masks on Metal. It reduced the atom-tile wall
-time from 34.821962 to 2.963867 seconds, geometry construction from 7.933098 to
-0.280091 seconds, and topology binding from 24.648279 to 0.012191 seconds. All
-finite-state, constraint, neighbor, PME-reuse, route, and no-fallback checks
-passed. The corrected route nevertheless remained 60.19% slower than explicit
-pairs and increased the short-run process-tree peak from 4.17 to 8.06 GB. Its
-9,664,362 tiles represented 60,504,316 exact pairs through 618,519,168 padded
-lanes, so the construction fix did not make the complete representation
-competitive.
-
-The conditional repeat and 750-step proof were not run because the first exact
-comparison was decisive and projected about 29.6 seconds for 750 steps, above
-both the retained complete result and the 16.8615-second stretch target. The
-candidate tile kernel, production routing, experimental selector, and metadata
-were removed. Exact compact-pair ownership remains the verified correctness
-foundation for the later spatial route.
-
-A fresh synthetic orthorhombic parity ladder now validates this route at
-1k/4k/16k/50k/92,001 atoms against the tiled all-pairs MLX oracle. At 92,001
-atoms, the compact build took 0.545 s, the explicitly synchronized pair-force
-evaluation took 0.068 s, and the tiled oracle took 112.1 s; relative energy
-delta was `4.56e-7` and maximum absolute force delta was `8.49e-7`. This
-2026-07-13 result remains diagnostic because the local real-fixture cache was
-unavailable for that measurement. A later source-backed GPCRmd 729 run now
-passes a separate bounded fixed-cell parity/NVT/restart gate using
-`mlx_cell_blocks`/`NeighborBlocks`; it does not change the classification of the
-synthetic neighbor row. The production runner has since moved to compact
-`mlx_cell_pairs`. Retained NPT diagnostic reuse, reciprocal-PME graph
-compilation, and fused parameterized LJ/direct-PME Metal kernels then reduced a
-matched 75-step DHFR NPT prefix from 142.87 to a repeated median of 13.77
-seconds. Process-tree peak memory fell from 27.33 GB to 5.18--6.11 GB across
-the retained samples, and the same numerical gates passed. Order-five
-reciprocal PME now also uses dedicated Metal charge-spread and
-potential-derivative interpolation kernels, reducing the 2,269-atom alanine
-50-step fixed-cell median from 0.853 to 0.537 seconds without pressure
-diagnostics and from 1.313 to 0.987 seconds with analytic pressure diagnostics.
-The artifact loader now also routes complete three-site water constraint
-triangles to a batched MLX rigid-water projector while preserving a fail-closed
-generic path for incomplete or mixed geometries. That reduced the same
-fixed-cell median from 0.537 to 0.419 seconds and the analytic-pressure median
-from 0.987 to 0.863 seconds. The complete 100-step NVT plus 1,000-step NPT
-alanine check then passed all 16 unchanged science gates in 15.899 seconds,
-down from 23.110 seconds, with a `3.34e-6` A maximum constraint error and a
-0.94 GB process-tree peak. Fixed-coordinate OpenMM parity remained within the
-accepted energy and force gates. These measurements were made on an M5 Max in
-low-power mode. This is bounded optimization and one-picosecond stability
-evidence, not a production-length validation. Charged fixed-cell PME also has
-a separate 94,232-atom JAC validation. See
+Charged fixed-cell PME also has a separate 94,232-atom JAC validation. See
 [`docs/benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md`](./benchmarks/scalable-neighbor-nonbonded-runtime-m5max.md)
 and
 [`docs/benchmarks/scalable-charged-pme-runtime-m5max.md`](./benchmarks/scalable-charged-pme-runtime-m5max.md),
 and
 [`docs/benchmarks/gpcrmd-729-pme-runtime-m5max.md`](./benchmarks/gpcrmd-729-pme-runtime-m5max.md).
+
+## Where The Time Goes
+
+The 5DFR ordinary step is bounded by two exact measurements. Neither is a
+single wall-time sample, so both survive the noise floor above.
+
+The step waits on the device far more than it builds graphs. Exact per-step
+admission materializes the maximum displacement once, and that is the only
+blocking evaluation in an ordinary step, so every queued device operation
+drains there. Across eight complete 750-step 5DFR runs the non-rebuild part of
+`NeighborListManager.update` accounts for 58.1% to 62.2% of clean wall,
+mean 60.4%, while the runs themselves span 2.3140 to 2.8436 ms/step. That
+fraction is a ratio and therefore stable where the absolute times are not.
+Rebuild takes a further 18.6% to 21.7%, leaving under a quarter of the step for
+host graph construction and every other boundary combined. This is the
+structural reason host-side candidates keep failing to move complete wall.
+
+The direct-force kernel schedules far more atom-pair lanes than the cutoff
+admits. One threadgroup owns four tiles and always runs all of them, so the
+scheduled count is `force_group_count * 4 * 64`. At production settings:
+
+| Lane level | Lanes per step | Share |
+| --- | ---: | ---: |
+| Scheduled by the kernel | 41,751,040 | 100.00% |
+| Force-group padding | 345,280 | 0.83% |
+| Tile padding | 26,705,827 | 63.96% |
+| Inside cutoff plus skin only | 11,191,063 | 26.80% |
+| Inside the 9 A cutoff | 3,508,870 | 8.40% |
+
+A geometric model reproduces both ends of that ladder:
+
+    scheduled ~ (N/2) (4/3) pi (cutoff + skin + 2 r_block)^3 rho
+    useful    ~ (N/2) (4/3) pi (cutoff)^3 rho
+
+At `rho = 0.09776` atoms/A^3 and `r_block = 2.693 A` for eight-atom blocks, it
+predicts 3,516,119 useful lanes against 3,508,870 measured, and a
+scheduled-to-useful ratio of `((9.0 + 5.5 + 5.39)/9.0)^3 = 10.79` against 11.90
+measured. The three terms are the physical cutoff, the skin, and the block
+extent set by `DEFAULT_MLX_CELL_TILE_BLOCK_SIZE`.
+
+Reducing that ratio does not pay proportionally. Holding atoms, cutoff, and
+in-cutoff pairs fixed and varying only the skin moves scheduled lanes by 2.211x
+while interleaved-median direct-force time moves by 1.381x:
+
+| Skin | Scheduled lanes | Direct force | Glane/s |
+| ---: | ---: | ---: | ---: |
+| 2.0 A | 26,209,280 | 0.747 ms | 35.10 |
+| 3.5 A | 33,144,832 | 0.840 ms | 39.47 |
+| 5.5 A | 41,751,040 | 0.900 ms | 46.41 |
+| 8.0 A | 57,946,368 | 1.031 ms | 56.20 |
+
+Time scales as roughly the 0.41 power of scheduled lanes and lane throughput
+rises with lane count, so the kernel is partly latency-bound rather than
+work-bound at the production skin. Extrapolating that exponent, removing every
+padded and skin-only lane would take the direct route from about 0.900 to about
+0.329 ms against a 2.31 ms step. No reachable design approaches that bound:
+the smallest scheduled count anywhere in the skin sweep is 26,209,280, worth
+0.153 ms, and it costs 143 rebuilds instead of 22. Lane occupancy is therefore
+not a viable lever on this workload, which is consistent with smaller skins
+being closed on complete wall.
+
+Those route times include a fixed cost that is not kernel work. Replacing the
+kernel body with an immediate return still costs about 0.41 ms through the same
+timing boundary, which is dispatch, output initialization, and one
+synchronization round trip. A real MD step batches its submission and pays that
+once for the whole step, not once per force route, so isolated route times
+overstate the kernel and their absolute values do not transfer between thermal
+states. Use them for ratios between arms, never as a share of the step.
+
+### Stacking the exact direct-kernel savings
+
+Ablation showed that no single part of the kernel dominates. Each arm below
+removes one cost and keeps the rest:
+
+| Removed | Share of kernel work |
+| --- | ---: |
+| Ewald erfc and exp | 16% |
+| Lennard-Jones branch | 15% |
+| Atomic force writes | 15% |
+| Per-iteration mask loads | 11% |
+
+That distribution is the finding. The engine is not slow because of one
+bottleneck, it is slow because several similar costs compose, so the productive
+response is to remove them together rather than to search for a dominant one.
+Five exact transformations were retained. Each preserves every float the kernel
+reads and every arithmetic operation it performs on a live path:
+
+| Transformation | Kernel speedup, cumulative |
+| --- | ---: |
+| Read the three per-tile mask words once per tile instead of once per left slot | 1.101x |
+| Carry `_TILE_PME_GROUPS_PER_THREADGROUP` force groups per threadgroup | 1.165x |
+| Hoist the box constants and hot `params` entries above the loop | 1.248x |
+| Skip the `unswitched_energy` chain when switching is disabled | 1.383x |
+| Return `erfc` from its own polynomial instead of one minus `erf` | 1.566x |
+
+The last two deserve a note. `unswitched_energy` reaches the force only through
+a product with `switch_derivative`, which is identically zero when switching is
+off, so the whole chain including the shift correction was dead work. And on
+the branch above 0.927734375, which dominates a 9 A cutoff, the existing `erf`
+forms `1 - exp(r)` through `expm1`; `erfc` is `exp(r)` from the same
+polynomial, so the complementary form removes one transcendental round trip and
+a cancelling subtraction.
+
+Two interleaved `C1 -> A1 -> A2 -> C2` gates at 750 steps confirm the stack end
+to end:
+
+| Round | Control medians | Candidate medians | Complete wall |
+| --- | --- | --- | ---: |
+| 1 | 2.5100, 2.3713 ms/step | 2.0707, 2.0126 ms/step | 16.3% lower |
+| 2 | 2.4748, 2.2951 ms/step | 2.0642, 2.0387 ms/step | 14.0% lower |
+
+Both rounds and all four paired directions agree, and the gap exceeds the
+control spread, so this clears the noise floor above. Pooled medians are
+2.4231 against 2.0515 ms/step, 15.3% lower, or 141 to 168 ns/day. All eight
+runs stayed finite and passed their constraint and memory gates. Direct-force
+agreement against the previous kernel was `3.95e-5 kJ/mol/A` RMS and
+`3.05e-4 kJ/mol/A` maximum against a `671.76 kJ/mol/A` maximum reference,
+inside the established tile route envelope.
+
+A 1.566x kernel speedup producing a 15.3% complete-wall gain places the direct
+route at about 40% of the ordinary step, which is the most reliable estimate of
+that share in this document because it comes from a complete-wall A/B rather
+than an instrumented boundary.
+
+The tile builder also has a known granularity limit at small search radius.
+Cells are sized at one third of the search radius, so at 5.5 A skin a cell
+holds about 11 atoms and an eight-atom block fits inside one cell, while at
+1.0 A skin a cell holds about 3.6 atoms and blocks span several cells. Tile
+count is consequently non-monotonic in skin, with a minimum at 2.0 A: 472,848
+tiles at 1.0 A against 402,910 at 2.0 A. `DEFAULT_MLX_CELL_TILE_BLOCK_SIZE` and
+`DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION` are independent constants and become
+inconsistent below about 3 A of skin.
+
+## Closed Directions
+
+Closed means do not repeat that implementation. It does not ban a future design
+that removes the named cause. Product code and candidate-only tests for every
+row below were removed; the rows exist so the work is not repeated.
+
+Rows with a structural cause:
+
+| Direction | Measured result | Cause | Reopening condition |
+| --- | --- | --- | --- |
+| Canonical-ID atom tiles derived from the compact pair list | 60.19% slower complete; peak 4.17 to 8.06 GB | 9,664,362 tiles carried 60,504,316 exact pairs through 618,519,168 padded lanes | A spatially native, occupancy-bounded design that quantifies scheduled lanes before implementation |
+| Two-pass non-atomic right-block reducer | Complete wall 0.558220 to 0.734520 s | 264 MB temporary tile-force buffer; the direct advantage over pairs fell to 8.52% | Reduce global atomics without a proportional global temporary |
+| Fused Metal neighbor-admission producer | 0.46% slower; paired directions disagreed | The direct graph fell from 34 primitives to 8, but the load-bearing admission sync remained and the custom reduction and output cost erased the saving | Eliminate or overlap a real consumer boundary, not the reduction chain alone |
+| Two-step neighbor admission transaction | 2.29% slower over 750 steps | Fewer host decisions but the same displacement work; 42--44 replayed steps repeated integration and one force evaluation | Reduce displacement work, not decision count |
+| Coalesced SETTLE/SHAKE sparse writes | 2.83x regression, 0.202904 to 0.574724 s | This system constrains nearly every atom, so added concatenation and scatter outweighed fewer full-position additions | -- |
+| Constraint-aware compiled trajectory block | 1.87596 s against a 1.190142 s control | Rebuilds fell from nine to two but a much larger lazy graph was repeated | -- |
+| Left-major rebuild row compaction | 6.60% slower, both directions regressive | The device descriptor, count, prefix, and compaction pipeline cost more than the removed argsort, permutation, and two gathers | Remove those added traversals and buffers with a unique-writer ordering proof |
+| Stable linear force-group placement | 8.73% slower | Scanning each left-block row cost more than MLX `argsort` plus gathers | -- |
+| Same-position finite certificate | 5.54% slower | Removed one reduction but added more host bookkeeping than it saved | -- |
+| Second Metal stream | 6.6% slower | Speculative concurrency on an already device-bound step | -- |
+| Smaller neighbor skins for 5DFR | Complete-wall optimum is the production 5.5 A | Rebuild cost rises faster than direct-force lanes fall; see [Where the time goes](#where-the-time-goes) | A rebuild whose fixed cost is small enough to change that balance |
+
+Rows decided inside the noise floor. These are recorded as "no measurable
+gain", not as established regressions:
+
+| Direction | Measured result |
+| --- | --- |
+| Unified schedule-validation ownership | 0.017% faster; paired directions disagreed |
+| Staged pre/post `mx.compile` reconstruction | 0.16% slower; primitives fell from 153 to 106 |
+| Flattened and cached force-buffer summation | 0.33% slower |
+| Deferred topology-mask materialization | 0.37% faster; the wait moved into first force evaluation |
+| Omitting the disjoint SHAKE pre-force projection | 1.7% slower |
+| On-demand exact-pair decoding | 1.8% slower |
+| Ordinary-step graph pruning | 2.08% faster; only two `ExpandDims` and two `Reshape` nodes were removed |
+| Fused tile compaction and pair emission | 2.64% slower |
+| Prefix tails, fresh extraction | 3.10% slower |
+| One-transfer prefix tails | At most about 4.2% after settling |
+| Eight-tile same-left grouping | Isolated kernel 5.53% faster; complete wall 0.558220 to 0.559019 s |
+| Admission intervals greater than one | No complete-wall gain |
+
+Two directions were closed in isolation and later retained under composition,
+because they alter the same ordinary constraint and integration graph: dense
+constraint owner maps, measured alone at 2.35% with inconsistent paired gains,
+and a handwritten fused BAOAB drift, measured alone at 0.5%. See [Cumulative
+interaction stack](#cumulative-interaction-stack).
+
+## Replica Batching For Small Systems
 
 For the active solvated ligand-receptor notebook system, the near-term GPU
 occupancy lever is independent replica batching. The system is only a few

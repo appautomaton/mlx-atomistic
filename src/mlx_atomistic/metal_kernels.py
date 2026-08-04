@@ -360,9 +360,22 @@ _PREPARED_PME_PAIRS_PER_WORKER = 8
 
 _TILE_PME_BLOCK_SIZE = 8
 _TILE_PME_LANES_PER_TILE = _TILE_PME_BLOCK_SIZE * _TILE_PME_BLOCK_SIZE
-_TILE_PME_THREADGROUP_SIZE = 32
+_TILE_PME_GROUPS_PER_THREADGROUP = 4
+_TILE_PME_DISPATCH_WIDTH = 32 * _TILE_PME_GROUPS_PER_THREADGROUP
 _TILE_MEMBERSHIP_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
-_TILE_PME_THREADGROUP_TEMPORARY_BYTES = _TILE_PME_BLOCK_SIZE * (1 + 3 + 1 + 1 + 1) * 4
+_TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
+    _TILE_PME_BLOCK_SIZE
+    * (1 + 3 + 1 + 1 + 1)
+    * 4
+    * _TILE_PME_GROUPS_PER_THREADGROUP
+)
+
+
+def _tile_pme_threadgroup_count(force_group_count: int) -> int:
+    """Return threadgroups needed to cover every spatial-tile force group."""
+
+    packing = _TILE_PME_GROUPS_PER_THREADGROUP
+    return (force_group_count + packing - 1) // packing
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -478,6 +491,35 @@ float mlx_atomistic_erf(float a) {
         r = metal::fma(r, a, a);
     }
     return r;
+}
+
+// Complementary error function for non-negative arguments only. On the branch
+// above 0.927734375 the erf implementation forms 1 - exp(r) from the same
+// polynomial, so erfc is exp(r) directly: one fewer transcendental round trip
+// through expm1 and no cancelling subtraction. Screened Coulomb arguments are
+// alpha times a positive distance, so the negative half is never reached.
+float mlx_atomistic_erfc_nonnegative(float a) {
+    float r, s, t, u;
+    t = metal::abs(a);
+    s = a * a;
+    if (t > 0.927734375f) {
+        r = metal::fma(-1.72853470e-5f, t, 3.83197126e-4f);
+        u = metal::fma(-3.88396438e-3f, t, 2.42546219e-2f);
+        r = metal::fma(r, s, u);
+        r = metal::fma(r, t, -1.06777877e-1f);
+        r = metal::fma(r, t, -6.34846687e-1f);
+        r = metal::fma(r, t, -1.28717512e-1f);
+        r = metal::fma(r, t, -t);
+        return metal::exp(r);
+    }
+    r = -5.96761703e-4f;
+    r = metal::fma(r, s, 4.99119423e-3f);
+    r = metal::fma(r, s, -2.67681349e-2f);
+    r = metal::fma(r, s, 1.12819925e-1f);
+    r = metal::fma(r, s, -3.76125336e-1f);
+    r = metal::fma(r, s, 1.28379166e-1f);
+    r = metal::fma(r, a, a);
+    return 1.0f - r;
 }
 """
 
@@ -860,35 +902,50 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
 # while SIMD reductions produce the eight left forces without the repeated
 # threadgroup barriers and pair-force scratch buffers used by the previous
 # tile schedule.
+#
+# A threadgroup carries `_TILE_PME_GROUPS_PER_THREADGROUP` independent SIMD
+# groups so a core has several force groups in flight against memory latency,
+# and the three per-tile mask words are read once per tile instead of once per
+# left slot. Both are exact: the same floats are read and the same arithmetic
+# runs, only the dispatch shape and the load count change. Trailing SIMD groups
+# beyond the last force group clamp their indices and are held inactive rather
+# than returning early, because every thread must reach the barrier below.
 _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
-    uint lane = thread_position_in_threadgroup.x;
-    uint group = threadgroup_position_in_grid.x;
+    uint tg_thread = thread_position_in_threadgroup.x;
+    uint lane = tg_thread & 31u;
+    uint sub = tg_thread >> 5u;
+    uint group_id = threadgroup_position_in_grid.x * GROUPS_PER_TGu + sub;
+    int total_groups = ngroups[0];
+    bool group_active = group_id < (uint)total_groups;
+    uint group = group_active ? group_id : (uint)(total_groups - 1);
     int group_start = force_group_starts[group];
     int group_count = force_group_counts[group];
 
-    threadgroup int left_atoms[8];
-    threadgroup float left_positions[24];
-    threadgroup float left_half_sigma[8];
-    threadgroup float left_sqrt_epsilon[8];
-    threadgroup float left_charges[8];
+    threadgroup int left_atoms[8 * GROUPS_PER_TG];
+    threadgroup float left_positions[24 * GROUPS_PER_TG];
+    threadgroup float left_half_sigma[8 * GROUPS_PER_TG];
+    threadgroup float left_sqrt_epsilon[8 * GROUPS_PER_TG];
+    threadgroup float left_charges[8 * GROUPS_PER_TG];
+    uint lbase = sub * 8u;
+    uint pbase = sub * 24u;
 
     int left_block = tile_blocks[2 * group_start + 0];
     if (lane < 8u) {
         int left_atom = atom_blocks[8 * left_block + lane];
-        left_atoms[lane] = left_atom;
+        left_atoms[lbase + lane] = left_atom;
         int safe_left = max(left_atom, 0);
-        left_positions[3 * lane + 0] = positions[3 * safe_left + 0];
-        left_positions[3 * lane + 1] = positions[3 * safe_left + 1];
-        left_positions[3 * lane + 2] = positions[3 * safe_left + 2];
-        left_half_sigma[lane] = half_sigma[safe_left];
-        left_sqrt_epsilon[lane] = sqrt_epsilon[safe_left];
-        left_charges[lane] = charges[safe_left];
+        left_positions[pbase + 3 * lane + 0] = positions[3 * safe_left + 0];
+        left_positions[pbase + 3 * lane + 1] = positions[3 * safe_left + 1];
+        left_positions[pbase + 3 * lane + 2] = positions[3 * safe_left + 2];
+        left_half_sigma[lbase + lane] = half_sigma[safe_left];
+        left_sqrt_epsilon[lbase + lane] = sqrt_epsilon[safe_left];
+        left_charges[lbase + lane] = charges[safe_left];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint local_tile = lane >> 3;
     uint right_slot = lane & 7u;
-    bool tile_active = local_tile < (uint)group_count;
+    bool tile_active = group_active && local_tile < (uint)group_count;
     int safe_local_tile = min((int)local_tile, group_count - 1);
     int tile = group_start + safe_local_tile;
     int right_block = tile_blocks[2 * tile + 1];
@@ -903,62 +960,87 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
     float accumulated_right_fx = 0.0f;
     float accumulated_right_fy = 0.0f;
     float accumulated_right_fz = 0.0f;
+    uint member_word_0 = member_mask[2 * tile + 0];
+    uint member_word_1 = member_mask[2 * tile + 1];
+    uint lj_word_0 = lj_enabled_mask[2 * tile + 0];
+    uint lj_word_1 = lj_enabled_mask[2 * tile + 1];
+    uint one_four_word_0 = lj_one_four_mask[2 * tile + 0];
+    uint one_four_word_1 = lj_one_four_mask[2 * tile + 1];
+    float box_lx = box[0];
+    float box_ly = box[1];
+    float box_lz = box[2];
+    float box_ix = box[3];
+    float box_iy = box[4];
+    float box_iz = box[5];
+    float cutoff2 = params[0];
+    float shift_flag = params[1];
+    float switch_flag = params[2];
+    float switch_start = params[3];
+    float switch_end = params[5];
+    float coulomb = params[6];
+    float ewald_alpha = params[7];
+    float ewald_self = params[8];
+    float inv_switch_width = params[9];
+    float one_four_scale = params[10];
 
     for (uint left_slot = 0u; left_slot < 8u; left_slot++) {
         uint pair_lane = 8u * left_slot + right_slot;
         uint word = pair_lane >> 5;
         uint bit = pair_lane & 31u;
-        bool member = tile_active
-            && ((member_mask[2 * tile + word] >> bit) & 1u) != 0u;
-        int left_atom = left_atoms[left_slot];
+        uint member_word = word == 0u ? member_word_0 : member_word_1;
+        bool member = tile_active && ((member_word >> bit) & 1u) != 0u;
+        int left_atom = left_atoms[lbase + left_slot];
         float fx = 0.0f;
         float fy = 0.0f;
         float fz = 0.0f;
         if (member && left_atom >= 0 && right_atom >= 0) {
-            float dx = left_positions[3 * left_slot + 0] - right_x;
-            float dy = left_positions[3 * left_slot + 1] - right_y;
-            float dz = left_positions[3 * left_slot + 2] - right_z;
-            float lx = box[0];
-            float ly = box[1];
-            float lz = box[2];
-            dx -= lx * rint(dx * box[3]);
-            dy -= ly * rint(dy * box[4]);
-            dz -= lz * rint(dz * box[5]);
+            float dx = left_positions[pbase + 3 * left_slot + 0] - right_x;
+            float dy = left_positions[pbase + 3 * left_slot + 1] - right_y;
+            float dz = left_positions[pbase + 3 * left_slot + 2] - right_z;
+            dx -= box_lx * rint(dx * box_ix);
+            dy -= box_ly * rint(dy * box_iy);
+            dz -= box_lz * rint(dz * box_iz);
             float r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 > 0.0f && r2 < params[0]) {
+            if (r2 > 0.0f && r2 < cutoff2) {
                 float inv_distance = rsqrt(r2);
                 float inv_r2 = inv_distance * inv_distance;
                 float distance = r2 * inv_distance;
                 float scalar = 0.0f;
-                bool lj_enabled =
-                    ((lj_enabled_mask[2 * tile + word] >> bit) & 1u) != 0u;
+                uint lj_word = word == 0u ? lj_word_0 : lj_word_1;
+                bool lj_enabled = ((lj_word >> bit) & 1u) != 0u;
                 if (lj_enabled) {
-                    bool one_four =
-                        ((lj_one_four_mask[2 * tile + word] >> bit) & 1u) != 0u;
-                    float lj_scale = one_four ? params[10] : 1.0f;
-                    float sigma_ij = left_half_sigma[left_slot]
+                    uint one_four_word =
+                        word == 0u ? one_four_word_0 : one_four_word_1;
+                    bool one_four = ((one_four_word >> bit) & 1u) != 0u;
+                    float lj_scale = one_four ? one_four_scale : 1.0f;
+                    float sigma_ij = left_half_sigma[lbase + left_slot]
                         + right_half_sigma_value;
-                    float epsilon_ij = left_sqrt_epsilon[left_slot]
+                    float epsilon_ij = left_sqrt_epsilon[lbase + left_slot]
                         * right_sqrt_epsilon_value;
                     float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
                     float inv_r6 =
                         sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
                     float inv_r12 = inv_r6 * inv_r6;
-                    float unswitched_energy =
-                        4.0f * epsilon_ij * (inv_r12 - inv_r6);
-                    if (params[1] > 0.5f) {
-                        float sigma2_over_rc2 = sigma_ij * sigma_ij / params[0];
-                        float inv_rc6 = sigma2_over_rc2
-                            * sigma2_over_rc2 * sigma2_over_rc2;
-                        unswitched_energy -= 4.0f * epsilon_ij
-                            * (inv_rc6 * inv_rc6 - inv_rc6);
-                    }
-
+                    // The unswitched energy reaches the force only through a
+                    // product with switch_derivative, which is identically zero
+                    // when switching is disabled, so the whole chain including
+                    // the shift correction is dead work in that case.
+                    float unswitched_energy = 0.0f;
                     float switch_value = 1.0f;
                     float switch_derivative = 0.0f;
-                    if (params[2] > 0.5f) {
+                    if (switch_flag > 0.5f) {
+                        unswitched_energy =
+                            4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                        if (shift_flag > 0.5f) {
+                            float sigma2_over_rc2 =
+                                sigma_ij * sigma_ij / cutoff2;
+                            float inv_rc6 = sigma2_over_rc2
+                                * sigma2_over_rc2 * sigma2_over_rc2;
+                            unswitched_energy -= 4.0f * epsilon_ij
+                                * (inv_rc6 * inv_rc6 - inv_rc6);
+                        }
                         float x = clamp(
-                            (distance - params[3]) * params[9],
+                            (distance - switch_start) * inv_switch_width,
                             0.0f,
                             1.0f
                         );
@@ -968,10 +1050,10 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                         float x5 = x4 * x;
                         switch_value = 1.0f
                             - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
-                        if (distance > params[3] && distance < params[5]) {
+                        if (distance > switch_start && distance < switch_end) {
                             switch_derivative = -(
                                 30.0f * x2 - 60.0f * x3 + 30.0f * x4
-                            ) * params[9];
+                            ) * inv_switch_width;
                         }
                     }
                     scalar += (
@@ -981,12 +1063,12 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                     ) * lj_scale;
                 }
 
-                float qij = left_charges[left_slot] * right_charge;
+                float qij = left_charges[lbase + left_slot] * right_charge;
                 float erfc_term =
-                    1.0f - mlx_atomistic_erf(params[7] * distance);
-                scalar += params[6] * qij * (
+                    mlx_atomistic_erfc_nonnegative(ewald_alpha * distance);
+                scalar += coulomb * qij * (
                     erfc_term * inv_r2 * inv_distance
-                    + params[8] * exp(-params[7] * params[7] * r2) * inv_r2
+                    + ewald_self * exp(-ewald_alpha * ewald_alpha * r2) * inv_r2
                 );
                 fx = scalar * dx;
                 fy = scalar * dy;
@@ -1001,7 +1083,8 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
         float reduced_left_fy = simd_sum(fy);
         float reduced_left_fz = simd_sum(fz);
         if (
-            lane == left_slot
+            group_active
+            && lane == left_slot
             && left_atom >= 0
             && (
                 reduced_left_fx != 0.0f
@@ -1040,7 +1123,7 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
             &forces[3 * right_atom + 2], accumulated_right_fz, memory_order_relaxed
         );
     }
-"""
+""".replace("GROUPS_PER_TG", str(_TILE_PME_GROUPS_PER_THREADGROUP))
 
 _SPARSE_PME_CORRECTION_FORCE_ONLY_SOURCE = r"""
     uint t = thread_position_in_grid.x;
@@ -2472,6 +2555,7 @@ def _tile_pme_direct_force_only_kernel():
                 "sqrt_epsilon",
                 "charges",
                 "params",
+                "ngroups",
             ],
             output_names=["forces"],
             source=_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE,
@@ -5311,11 +5395,12 @@ def _tile_parameterized_pme_direct_force_only(
             sqrt_epsilon,
             charges,
             params,
+            mx.array([group_count], dtype=mx.int32),
         ],
         output_shapes=[(n_atoms, 3)],
         output_dtypes=[mx.float32],
-        grid=(group_count * _TILE_PME_THREADGROUP_SIZE, 1, 1),
-        threadgroup=(_TILE_PME_THREADGROUP_SIZE, 1, 1),
+        grid=(_tile_pme_threadgroup_count(group_count) * _TILE_PME_DISPATCH_WIDTH, 1, 1),
+        threadgroup=(_TILE_PME_DISPATCH_WIDTH, 1, 1),
         init_value=0.0,
     )
     return forces
