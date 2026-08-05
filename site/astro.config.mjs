@@ -5,7 +5,7 @@ import starlightLlmsTxt from "starlight-llms-txt";
 import { socialHead } from "./src/seo.mjs";
 
 export default defineConfig({
-  site: "https://appautomaton.github.io",
+  site: "https://appautomaton.renocrypt.com",
   base: "/mlx-atomistic",
   trailingSlash: "ignore",
   integrations: [
