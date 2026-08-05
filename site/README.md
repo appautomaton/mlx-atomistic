@@ -1,6 +1,6 @@
 # mlx-atomistic site
 
-Astro + Starlight site for https://appautomaton.github.io/mlx-atomistic.
+Astro + Starlight site for https://appautomaton.renocrypt.com/mlx-atomistic.
 
 ## Local dev
 

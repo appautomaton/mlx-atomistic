@@ -2,7 +2,7 @@
 // and src/pages/index.astro (the standalone landing page) so the structured-data
 // entity graph is defined exactly once and never drifts between pages.
 
-export const ORIGIN = "https://appautomaton.github.io";
+export const ORIGIN = "https://appautomaton.renocrypt.com";
 export const SITE = `${ORIGIN}/mlx-atomistic`;
 export const REPO = "https://github.com/appautomaton/mlx-atomistic";
 export const OG_IMAGE = `${SITE}/og.png`;
