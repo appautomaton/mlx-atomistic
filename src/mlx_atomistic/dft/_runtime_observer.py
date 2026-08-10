@@ -16,10 +16,6 @@ WORK_COUNTER_NAMES = (
     "hpsi_submitted_vector_equivalents",
     "hpsi_lane_padding_vector_equivalents",
     "hpsi_vector_padding_equivalents",
-    "hpsi_mlx_boundary_calls",
-    "hpsi_metal_scatter_calls",
-    "hpsi_metal_gather_combine_calls",
-    "hpsi_boundary_intermediate_arrays",
     "fft_submissions",
     "fft_vector_equivalents",
     "projector_elements_generated",
@@ -100,16 +96,6 @@ class RuntimeObserver:
         repr=False,
     )
     _phase_stack: list[list[object]] = field(default_factory=list, init=False, repr=False)
-    _hpsi_requested_routes: dict[str, int] = field(
-        default_factory=dict,
-        init=False,
-        repr=False,
-    )
-    _hpsi_selected_routes: dict[str, int] = field(
-        default_factory=dict,
-        init=False,
-        repr=False,
-    )
 
     def __post_init__(self) -> None:
         if type(self.detail_events) is not bool:
@@ -217,27 +203,6 @@ class RuntimeObserver:
         shape = (lane_capacity, vector_capacity)
         self._hpsi_shapes[shape] = self._hpsi_shapes.get(shape, 0) + 1
 
-    def record_hpsi_route(self, requested: str, selected: str) -> None:
-        """Count one private Hpsi route selection.
-
-        Args:
-            requested: Context-requested route: ``auto``, ``mlx``, or ``metal``.
-            selected: Executed boundary route: ``mlx`` or ``metal``.
-        """
-
-        if requested not in {"auto", "mlx", "metal"} or selected not in {
-            "mlx",
-            "metal",
-        }:
-            msg = "invalid Hpsi route identity"
-            raise ValueError(msg)
-        self._hpsi_requested_routes[requested] = (
-            self._hpsi_requested_routes.get(requested, 0) + 1
-        )
-        self._hpsi_selected_routes[selected] = (
-            self._hpsi_selected_routes.get(selected, 0) + 1
-        )
-
     @contextmanager
     def phase(self, name: str, *, synchronize: bool = True) -> Iterator[None]:
         """Measure one exclusive synchronized named phase.
@@ -301,10 +266,6 @@ class RuntimeObserver:
                 }
                 for (lanes, vectors), calls in sorted(self._hpsi_shapes.items())
             ],
-            "hpsi_route": {
-                "requested_counts": dict(sorted(self._hpsi_requested_routes.items())),
-                "selected_counts": dict(sorted(self._hpsi_selected_routes.items())),
-            },
             "events": [dict(event) for event in self._events],
         }
 

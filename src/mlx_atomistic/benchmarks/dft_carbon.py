@@ -193,11 +193,6 @@ def main(argv: list[str] | None = None) -> None:
     point.add_argument("--volume-index", type=int, required=True)
     point.add_argument("--out", type=Path, required=True)
     point.add_argument("--initial-density", type=Path)
-    point.add_argument(
-        "--hpsi-route",
-        choices=("auto", "mlx", "metal"),
-        default="auto",
-    )
     point.add_argument("--json", action="store_true")
 
     validate = subparsers.add_parser("validate-eos")
@@ -219,7 +214,6 @@ def main(argv: list[str] | None = None) -> None:
             volume_index=args.volume_index,
             out=args.out,
             initial_density_path=args.initial_density,
-            hpsi_route=args.hpsi_route,
         )
     else:
         from mlx_atomistic.benchmarks.dft_carbon_eos_runner import (

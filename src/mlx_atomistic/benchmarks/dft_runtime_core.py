@@ -607,7 +607,6 @@ def _fixed_density_sample(
     cutoff_hartree: float | None = None,
     reduced_kpoint: Sequence[float] | None = None,
     band_count: int | None = None,
-    hpsi_route: str = "auto",
 ) -> tuple[dict[str, object], object]:
     import mlx.core as mx
 
@@ -622,7 +621,6 @@ def _fixed_density_sample(
         read_gth,
         solve_periodic_eigenproblem,
     )
-    from mlx_atomistic.dft._hpsi_metal import _use_hpsi_route
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
     from mlx_atomistic.dft.periodic_scf import _eigensolve_provenance
     from mlx_atomistic.dft.runtime_state import fixed_density_state_metrics
@@ -694,13 +692,12 @@ def _fixed_density_sample(
             stage="fixed_density",
             active_count=basis.active_count,
         )
-        with _use_hpsi_route(hpsi_route):
-            result = solve_periodic_eigenproblem(
-                operator,
-                n_bands=bands,
-                config=_davidson_config(manifest),
-                observer=observer,
-            )
+        result = solve_periodic_eigenproblem(
+            operator,
+            n_bands=bands,
+            config=_davidson_config(manifest),
+            observer=observer,
+        )
         mx.synchronize()
         state_metrics = fixed_density_state_metrics(result=result, basis=basis)
         coefficient_bytes = int(state_metrics["coefficient_payload_bytes"])
@@ -937,40 +934,6 @@ def _representative_observation(samples: Sequence[Mapping[str, object]]) -> dict
     return {"work_counters": dict(work), "memory": dict(memory)}
 
 
-def _hpsi_boundary_evidence(
-    samples: Sequence[Mapping[str, object]],
-) -> dict[str, object]:
-    """Summarize route identity and structural Hpsi counters across samples."""
-
-    requested: dict[str, int] = {}
-    selected: dict[str, int] = {}
-    counter_names = (
-        "hpsi_calls",
-        "hpsi_mlx_boundary_calls",
-        "hpsi_metal_scatter_calls",
-        "hpsi_metal_gather_combine_calls",
-        "hpsi_boundary_intermediate_arrays",
-    )
-    counters = dict.fromkeys(counter_names, 0)
-    for sample in samples:
-        observation = sample.get("observation", {})
-        route = observation.get("hpsi_route", {})
-        for name, amount in route.get("requested_counts", {}).items():
-            requested[str(name)] = requested.get(str(name), 0) + int(amount)
-        for name, amount in route.get("selected_counts", {}).items():
-            selected[str(name)] = selected.get(str(name), 0) + int(amount)
-        work = observation.get("work_counters", {})
-        for name in counter_names:
-            counters[name] += int(work.get(name, 0))
-    return {
-        "sample_count": len(samples),
-        "requested_route_counts": dict(sorted(requested.items())),
-        "selected_route_counts": dict(sorted(selected.items())),
-        "work_counters": counters,
-        "unmixed": len(requested) == 1 and len(selected) == 1,
-    }
-
-
 def _fixed_density_eigenvalue_evidence(
     samples: Sequence[Mapping[str, object]],
     *,
@@ -1174,7 +1137,6 @@ def run_fixed_density(
     require_projector_traffic_reduction: float | None = None,
     progress: ProgressCallback | None = None,
     repo_root: str | Path | None = None,
-    hpsi_route: str = "auto",
 ) -> dict[str, object]:
     """Run and atomically publish the synchronized one-k fixed-density protocol."""
 
@@ -1192,11 +1154,7 @@ def run_fixed_density(
         command_kind="fixed-density",
         host=host,
         repo_root=repo_root,
-        settings_override={
-            "warmups": warmups,
-            "samples": samples,
-            "hpsi_route": hpsi_route,
-        },
+        settings_override={"warmups": warmups, "samples": samples},
     )
     blockers: list[str] = []
     requested_host = require_chip is not None or require_low_power
@@ -1232,7 +1190,6 @@ def run_fixed_density(
                         sample_kind="warmup",
                         sample_index=index,
                     ),
-                    hpsi_route=hpsi_route,
                 )
                 warmup_results.append(sample)
                 del sample_state
@@ -1257,7 +1214,6 @@ def run_fixed_density(
                             sample_kind="measured",
                             sample_index=index,
                         ),
-                        hpsi_route=hpsi_route,
                     )
                     measured.append(sample)
                     del sample_state
@@ -1403,7 +1359,6 @@ def run_fixed_density(
                 "metrics_against_seal": metrics,
                 "baseline_structure_audit": baseline_audit,
                 "baseline_diff_audit": baseline_diff_audit,
-                "hpsi_boundary": _hpsi_boundary_evidence(produced_samples),
             },
             "statuses": statuses,
             "admission": command_admission,
@@ -2115,7 +2070,6 @@ def inspect_artifact(
         msg = "artifact has no recognized inspectable payload"
         raise ValueError(msg)
     blockers: list[str] = []
-    blockers.extend(_hpsi_route_evidence_blockers(payload))
     identity = payload.get("identity", generation.get("identity", {}))
     if require_current_protocol_match or require_current_runtime_match:
         current = build_source_fingerprints(repo_root)
@@ -2160,67 +2114,6 @@ def inspect_artifact(
         "identity": identity,
         "blockers": unique,
     }
-
-
-def _hpsi_route_evidence_blockers(payload: Mapping[str, object]) -> list[str]:
-    """Reject missing or mixed route identity in route-aware reports."""
-
-    context = payload.get("context")
-    if not isinstance(context, Mapping):
-        return []
-    execution = context.get("execution_contract")
-    if not isinstance(execution, Mapping):
-        return []
-    settings = execution.get("settings_override")
-    if not isinstance(settings, Mapping) or "hpsi_route" not in settings:
-        return []
-    requested = settings.get("hpsi_route")
-    evidence = payload.get("summary", {}).get("hpsi_boundary")
-    if requested not in {"auto", "mlx", "metal"} or not isinstance(
-        evidence,
-        Mapping,
-    ):
-        return ["hpsi_route_evidence_missing"]
-    requested_counts = evidence.get("requested_route_counts")
-    selected_counts = evidence.get("selected_route_counts")
-    work = evidence.get("work_counters")
-    if (
-        evidence.get("unmixed") is not True
-        or not isinstance(requested_counts, Mapping)
-        or set(requested_counts) != {requested}
-        or not isinstance(selected_counts, Mapping)
-        or len(selected_counts) != 1
-        or not isinstance(work, Mapping)
-    ):
-        return ["hpsi_route_evidence_mixed_or_incomplete"]
-    hpsi_calls = work.get("hpsi_calls")
-    selected = next(iter(selected_counts))
-    if type(hpsi_calls) is not int or hpsi_calls <= 0:
-        return ["hpsi_route_evidence_has_no_work"]
-    if sum(int(value) for value in requested_counts.values()) != hpsi_calls or sum(
-        int(value) for value in selected_counts.values()
-    ) != hpsi_calls:
-        return ["hpsi_route_evidence_count_mismatch"]
-    environment = execution.get("environment", {})
-    selected_device = str(environment.get("selected_device", "")).lower()
-    if requested == "mlx" and selected != "mlx":
-        return ["hpsi_forced_mlx_route_mismatch"]
-    if requested == "metal" and "gpu" in selected_device and selected != "metal":
-        return ["hpsi_forced_metal_route_mismatch"]
-    metal_scatter = work.get("hpsi_metal_scatter_calls")
-    metal_combine = work.get("hpsi_metal_gather_combine_calls")
-    mlx_calls = work.get("hpsi_mlx_boundary_calls")
-    if selected == "metal" and (
-        metal_scatter != hpsi_calls
-        or metal_combine != hpsi_calls
-        or mlx_calls != 0
-    ):
-        return ["hpsi_metal_kernel_counter_mismatch"]
-    if selected == "mlx" and (
-        metal_scatter != 0 or metal_combine != 0 or mlx_calls != hpsi_calls
-    ):
-        return ["hpsi_mlx_boundary_counter_mismatch"]
-    return []
 
 
 def run_ladder(
@@ -2460,7 +2353,6 @@ def _full_scf_science(
     gth_source: str,
     state_root: str,
     progress: ProgressCallback | None,
-    hpsi_route: str,
 ) -> dict[str, object]:
     import mlx.core as mx
 
@@ -2472,7 +2364,6 @@ def _full_scf_science(
         read_gth,
         run_periodic_scf,
     )
-    from mlx_atomistic.dft._hpsi_metal import _use_hpsi_route
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
     from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
 
@@ -2533,15 +2424,14 @@ def _full_scf_science(
                 davidson=_davidson_config(manifest),
             )
         observer.emit("setup", status="completed", stage="full_scf_worker")
-        with _use_hpsi_route(hpsi_route):
-            result = run_periodic_scf(
-                system,
-                cutoff_hartree=float(physics["kinetic_cutoff_hartree"]),
-                kpoint_mesh=mesh,
-                n_bands=int(system_values["occupied_band_count"]),
-                config=config,
-                observer=observer,
-            )
+        result = run_periodic_scf(
+            system,
+            cutoff_hartree=float(physics["kinetic_cutoff_hartree"]),
+            kpoint_mesh=mesh,
+            n_bands=int(system_values["occupied_band_count"]),
+            config=config,
+            observer=observer,
+        )
         mx.synchronize()
         electron_error = abs(result.electron_count - float(system_values["electron_count"]))
         maximum_orthonormality = max(
@@ -2589,7 +2479,6 @@ def _full_scf_worker(
     manifest_path: str,
     gth_source: str,
     state_root: str,
-    hpsi_route: str,
 ) -> None:
     isolated = False
     try:
@@ -2606,7 +2495,6 @@ def _full_scf_worker(
             gth_source=gth_source,
             state_root=state_root,
             progress=progress,
-            hpsi_route=hpsi_route,
         )
         queue.put({"type": "result", "result": result})
     except BaseException as error:
@@ -2653,7 +2541,6 @@ def supervise_full_scf_worker(
     deadline_monotonic: float | None = None,
     progress: ProgressCallback | None = None,
     worker: Callable[..., None] = _full_scf_worker,
-    hpsi_route: str = "auto",
 ) -> dict[str, object]:
     """Run a full-SCF worker in an isolated process group with hard cleanup."""
 
@@ -2665,12 +2552,9 @@ def supervise_full_scf_worker(
         raise ValueError(msg)
     context = mp.get_context("spawn")
     queue = context.Queue()
-    worker_args = (queue, str(manifest_path), str(gth_source), str(state_root))
-    if worker is _full_scf_worker:
-        worker_args = (*worker_args, hpsi_route)
     process = context.Process(
         target=worker,
-        args=worker_args,
+        args=(queue, str(manifest_path), str(gth_source), str(state_root)),
         daemon=False,
     )
     deadline = (
@@ -2768,7 +2652,6 @@ def run_full_scf(
     require_success: bool = False,
     progress: ProgressCallback | None = None,
     repo_root: str | Path | None = None,
-    hpsi_route: str = "auto",
 ) -> dict[str, object]:
     """Run fresh full SCF in a supervised process and atomically publish evidence."""
 
@@ -2790,10 +2673,7 @@ def run_full_scf(
         command_kind="full-scf",
         host=host,
         repo_root=repo_root,
-        settings_override={
-            "timeout_seconds": timeout_seconds,
-            "hpsi_route": hpsi_route,
-        },
+        settings_override={"timeout_seconds": timeout_seconds},
     )
     blockers: list[str] = []
     if require_chip is not None or require_low_power:
@@ -2841,7 +2721,6 @@ def run_full_scf(
                     timeout_seconds=remaining,
                     deadline_monotonic=publication_deadline,
                     progress=progress,
-                    hpsi_route=hpsi_route,
                 )
         result = supervision.get("result")
         numerical_passed = bool(
@@ -2875,7 +2754,6 @@ def run_full_scf(
             "new_process": True,
             "timeout_seconds": timeout_seconds,
             "diagnostic": diagnostic,
-            "hpsi_route": hpsi_route,
             "timing_boundary": (
                 "command-entry-through-atomic-report-generation-publication-"
                 "and-parent-sync"
@@ -2902,11 +2780,6 @@ def run_full_scf(
                 "elapsed_seconds_to_report_write": None,
                 "numerical_passed": numerical_passed,
                 "success": success,
-                "hpsi_boundary": (
-                    _hpsi_boundary_evidence([result])
-                    if isinstance(result, Mapping)
-                    else _hpsi_boundary_evidence([])
-                ),
             },
             "publication_attestation_name": publication_destination.name,
             "statuses": candidate_statuses,
@@ -2989,7 +2862,6 @@ def run_full_scf(
                     "elapsed_seconds": elapsed,
                     "numerical_passed": numerical_passed,
                     "success": success,
-                    "hpsi_boundary": report["summary"]["hpsi_boundary"],
                 },
                 "statuses": statuses,
                 "admission": command_admission,

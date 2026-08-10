@@ -102,7 +102,6 @@ def _point_spec(
     volume_index: int,
     lattice_angstrom: float,
     initial_density_sha256: str | None = None,
-    hpsi_route: str = "auto",
 ) -> dict[str, Any]:
     settings = PROFILE_SPECS[profile]
     values = {
@@ -114,7 +113,6 @@ def _point_spec(
         "lattice_constant_angstrom": lattice_angstrom,
         "initial_density_sha256": initial_density_sha256,
         "timeout_seconds": POINT_TIMEOUT_SECONDS,
-        "hpsi_route": hpsi_route,
         **settings,
     }
     return {**values, "point_fingerprint": sha256_bytes(canonical_json_bytes(values))}
@@ -157,7 +155,6 @@ def run_carbon_eos_point(
     volume_index: int,
     out: str | Path,
     initial_density_path: str | Path | None = None,
-    hpsi_route: str = "auto",
 ) -> dict[str, Any]:
     """Run one isolated diamond-carbon EOS point and persist compact evidence."""
 
@@ -169,7 +166,6 @@ def run_carbon_eos_point(
         read_gth,
         run_periodic_scf,
     )
-    from mlx_atomistic.dft._hpsi_metal import _use_hpsi_route
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
     if profile not in PROFILE_SPECS:
@@ -193,7 +189,6 @@ def run_carbon_eos_point(
         volume_index=volume_index,
         lattice_angstrom=lattice_angstrom,
         initial_density_sha256=initial_density_sha256,
-        hpsi_route=hpsi_route,
     )
     settings = PROFILE_SPECS[profile]
     system_values = manifest["system"]
@@ -208,19 +203,18 @@ def run_carbon_eos_point(
     )
     observer = RuntimeObserver(detail_events=False)
     started = perf_counter()
-    with _use_hpsi_route(hpsi_route):
-        result = run_periodic_scf(
-            system,
-            cutoff_hartree=float(settings["cutoff_hartree"]),
-            kpoint_mesh=MonkhorstPackGrid(tuple(settings["kpoint_mesh"])),
-            n_bands=int(system_values["occupied_band_count"]),
-            config=_scf_config(
-                manifest,
-                max_batch_transient_bytes=int(settings["max_batch_transient_bytes"]),
-            ),
-            observer=observer,
-            initial_density=initial_density,
-        )
+    result = run_periodic_scf(
+        system,
+        cutoff_hartree=float(settings["cutoff_hartree"]),
+        kpoint_mesh=MonkhorstPackGrid(tuple(settings["kpoint_mesh"])),
+        n_bands=int(system_values["occupied_band_count"]),
+        config=_scf_config(
+            manifest,
+            max_batch_transient_bytes=int(settings["max_batch_transient_bytes"]),
+        ),
+        observer=observer,
+        initial_density=initial_density,
+    )
     mx.synchronize()
     elapsed = perf_counter() - started
     electron_error = abs(float(result.electron_count) - float(system_values["electron_count"]))

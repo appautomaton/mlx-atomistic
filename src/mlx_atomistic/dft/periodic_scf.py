@@ -18,11 +18,6 @@ from mlx_atomistic.dft._compact import (
     _remap_initial_coefficients,
     _require_layout,
 )
-from mlx_atomistic.dft._hpsi_metal import (
-    _gather_combine_metal,
-    _hpsi_route_identity,
-    _scatter_complex_zeros_metal,
-)
 from mlx_atomistic.dft._memory import _bounded_dft_allocator
 from mlx_atomistic.dft._runtime_observer import (
     RuntimeObserver,
@@ -893,8 +888,6 @@ class PeriodicKohnShamOperator:
         projector_metrics: dict[int, dict[str, int]] = {}
         estimated_transient_bytes = 0
         executed_fft = False
-        requested_hpsi_route = "auto"
-        selected_hpsi_route = "mlx"
         with observed_phase(runtime_observer, "hpsi"):
             for lane_index, (operator, state) in enumerate(
                 zip(operators, coefficients, strict=True)
@@ -1024,29 +1017,7 @@ class PeriodicKohnShamOperator:
                                 projector_actions[lane_index] = action
                                 projector_metrics[lane_index] = metrics
 
-                    requested_hpsi_route, selected_hpsi_route = (
-                        _hpsi_route_identity()
-                    )
-                    if selected_hpsi_route == "metal":
-                        scattered_flat = _scatter_complex_zeros_metal(
-                            batch.values,
-                            batch.fft_indices,
-                            batch.valid_mask,
-                            grid_size=batch.grid_size,
-                        )
-                        if scattered_flat is None:
-                            msg = "selected Metal Hpsi scatter is not eligible"
-                            raise RuntimeError(msg)
-                        scattered = mx.reshape(
-                            scattered_flat,
-                            (
-                                batch.lane_capacity,
-                                batch.vector_count,
-                                *batch.grid_shape,
-                            ),
-                        )
-                    else:
-                        scattered = batch.scatter()
+                    scattered = batch.scatter()
                     kinetic_rows = []
                     nonlocal_rows = []
                     for lane_index, state in zip(
@@ -1117,6 +1088,7 @@ class PeriodicKohnShamOperator:
                             ],
                             axis=0,
                         )
+                    kinetic_action = batch.values * kinetic_values[:, None, :]
                     first_potential = operators[ready_indices[0]]._effective_local_potential
                     if all(
                         operators[index]._effective_local_potential is first_potential
@@ -1131,38 +1103,12 @@ class PeriodicKohnShamOperator:
                             ],
                             axis=0,
                         )
-                    if selected_hpsi_route == "metal":
-                        local_reciprocal = batch.local_reciprocal(
-                            potentials,
-                            scattered=scattered,
-                        )
-                        reciprocal_flat = mx.reshape(
-                            local_reciprocal,
-                            (
-                                batch.lane_capacity,
-                                batch.vector_count,
-                                batch.grid_size,
-                            ),
-                        )
-                        applied_values = _gather_combine_metal(
-                            reciprocal_flat,
-                            batch.values,
-                            batch.fft_indices,
-                            batch.valid_mask,
-                            kinetic_values,
-                            nonlocal_values,
-                        )
-                        if applied_values is None:
-                            msg = "selected Metal Hpsi gather/combine is not eligible"
-                            raise RuntimeError(msg)
-                    else:
-                        kinetic_action = batch.values * kinetic_values[:, None, :]
-                        local_action = batch.apply_local(
-                            potentials,
-                            scattered=scattered,
-                        )
-                        applied_values = kinetic_action + local_action + nonlocal_values
+                    local_action = batch.apply_local(
+                        potentials,
+                        scattered=scattered,
+                    )
                     executed_fft = True
+                    applied_values = kinetic_action + local_action + nonlocal_values
                     states = batch.unpad(
                         applied_values,
                         kind="hamiltonian_action",
@@ -1238,14 +1184,6 @@ class PeriodicKohnShamOperator:
                         lane_padding_vector_count
                     ),
                     "hpsi_vector_padding_equivalents": vector_padding_count,
-                    "hpsi_mlx_boundary_calls": int(selected_hpsi_route == "mlx"),
-                    "hpsi_metal_scatter_calls": int(selected_hpsi_route == "metal"),
-                    "hpsi_metal_gather_combine_calls": int(
-                        selected_hpsi_route == "metal"
-                    ),
-                    "hpsi_boundary_intermediate_arrays": (
-                        0 if selected_hpsi_route == "metal" else 3
-                    ),
                     "fft_submissions": 2,
                     "fft_vector_equivalents": 2 * logical_vector_count,
                     "projector_elements_generated": generated,
@@ -1257,10 +1195,6 @@ class PeriodicKohnShamOperator:
                 },
             )
             if runtime_observer is not None:
-                runtime_observer.record_hpsi_route(
-                    requested_hpsi_route,
-                    selected_hpsi_route,
-                )
                 runtime_observer.record_hpsi_shape(
                     batch.lane_capacity,
                     batch.vector_count,

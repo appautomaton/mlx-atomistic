@@ -80,11 +80,6 @@ def _parser() -> argparse.ArgumentParser:
     fixed.add_argument("--require-coefficient-reduction", type=float)
     fixed.add_argument("--require-projector-payload-reduction", type=float)
     fixed.add_argument("--require-projector-traffic-reduction", type=float)
-    fixed.add_argument(
-        "--hpsi-route",
-        choices=("auto", "mlx", "metal"),
-        default="auto",
-    )
 
     ladder = subparsers.add_parser("ladder", help="run progressive scale evidence")
     _add_numerical_paths(ladder)
@@ -118,11 +113,6 @@ def _parser() -> argparse.ArgumentParser:
     full.add_argument("--require-low-power", action="store_true")
     full.add_argument("--require-numerical", action="store_true")
     full.add_argument("--require-success", action="store_true")
-    full.add_argument(
-        "--hpsi-route",
-        choices=("auto", "mlx", "metal"),
-        default="auto",
-    )
     return parser
 
 
@@ -169,7 +159,6 @@ def _dispatch(args: argparse.Namespace) -> dict[str, object]:
             require_projector_payload_reduction=args.require_projector_payload_reduction,
             require_projector_traffic_reduction=args.require_projector_traffic_reduction,
             progress=_progress,
-            hpsi_route=args.hpsi_route,
         )
     elif args.command == "ladder":
         result = run_ladder(
@@ -211,7 +200,6 @@ def _dispatch(args: argparse.Namespace) -> dict[str, object]:
             require_numerical=args.require_numerical,
             require_success=args.require_success,
             progress=_progress,
-            hpsi_route=args.hpsi_route,
         )
     return result
 
