@@ -2,7 +2,7 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import sitemap from "@astrojs/sitemap";
 import starlightLlmsTxt from "starlight-llms-txt";
-import { socialHead } from "./src/seo.mjs";
+import { SITE, socialHead } from "./src/seo.mjs";
 
 export default defineConfig({
   site: "https://appautomaton.renocrypt.com",
@@ -67,6 +67,11 @@ export default defineConfig({
         },
       ],
     }),
-    sitemap(),
+    // Under trailingSlash: "ignore" the base index is emitted twice, once as
+    // /mlx-atomistic/ and once without the slash. Pages answers the slashless
+    // form with a 301 to the other, so listing it spends a crawl on an address
+    // that was never the destination. The page's own canonical has always been
+    // the slashed form; this makes the sitemap say the same thing.
+    sitemap({ filter: (page) => page !== SITE }),
   ],
 });
