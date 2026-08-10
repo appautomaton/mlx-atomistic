@@ -29,6 +29,12 @@ from mlx_atomistic.dft._compact import (
     _CompactLaneState,
     _remap_initial_coefficients,
 )
+from mlx_atomistic.dft._hpsi_metal import (
+    _gather_combine_metal,
+    _hpsi_metal_counters,
+    _reset_hpsi_metal_counters,
+    _scatter_complex_zeros_metal,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import KPoint, KPointMesh
 from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
@@ -76,6 +82,61 @@ def _hydrogen_gth() -> PseudopotentialData:
         gth_rloc=0.25,
         gth_coefficients=(-1.0,),
         gth_channels=(GTHProjectorChannel(0, 0.3, ((0.5,),)),),
+    )
+
+
+def test_hpsi_metal_primitives_fail_closed_on_cpu():
+    previous_device = mx.default_device()
+    previous_stream = mx.default_stream(previous_device)
+    cpu = mx.Device(mx.cpu, 0)
+    try:
+        mx.set_default_device(cpu)
+        mx.set_default_stream(mx.new_stream(cpu))
+        values = mx.ones((2, 3, 4), dtype=mx.complex64)
+        indices = mx.broadcast_to(mx.arange(4, dtype=mx.int32), (2, 4))
+        valid = mx.ones((2, 4), dtype=mx.bool_)
+        reciprocal = mx.ones((2, 3, 8), dtype=mx.complex64)
+        kinetic = mx.ones((2, 4), dtype=mx.float32)
+        nonlocal_values = mx.zeros_like(values)
+        _reset_hpsi_metal_counters()
+
+        assert (
+            _scatter_complex_zeros_metal(values, indices, valid, grid_size=8)
+            is None
+        )
+        assert (
+            _gather_combine_metal(
+                reciprocal,
+                values,
+                indices,
+                valid,
+                kinetic,
+                nonlocal_values,
+            )
+            is None
+        )
+        assert _hpsi_metal_counters().scatter_calls == 0
+        assert _hpsi_metal_counters().gather_combine_calls == 0
+    finally:
+        mx.set_default_stream(previous_stream)
+        mx.set_default_device(previous_device)
+
+
+def test_hpsi_metal_primitives_reject_invalid_shapes_without_constructing_kernel():
+    values = mx.ones((1, 2, 3), dtype=mx.complex64)
+    indices = mx.arange(3, dtype=mx.int32)[None, :]
+    valid = mx.ones((1, 3), dtype=mx.bool_)
+
+    with pytest.raises(ValueError, match="grid_size"):
+        _scatter_complex_zeros_metal(values, indices, valid, grid_size=0)
+    assert (
+        _scatter_complex_zeros_metal(
+            values,
+            mx.arange(2, dtype=mx.int32)[None, :],
+            valid,
+            grid_size=8,
+        )
+        is None
     )
 
 

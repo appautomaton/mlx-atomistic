@@ -21,12 +21,135 @@ from mlx_atomistic.dft import (
     solve_periodic_eigenproblem,
 )
 from mlx_atomistic.dft._compact import _CompactBatch
+from mlx_atomistic.dft._hpsi_metal import (
+    _gather_combine_metal,
+    _hpsi_metal_counters,
+    _reset_hpsi_metal_counters,
+    _scatter_complex_zeros_metal,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
 
 def _restore_runtime(device: mx.Device, stream: mx.Stream) -> None:
     mx.set_default_stream(stream)
     mx.set_default_device(device)
+
+
+@pytest.mark.gpu
+def test_hpsi_metal_primitives_match_mlx_for_ragged_padding(monkeypatch):
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    previous_device = mx.default_device()
+    previous_stream = mx.default_stream(previous_device)
+    try:
+        metal_device = mx.Device(mx.gpu, 0)
+        mx.set_default_device(metal_device)
+        mx.set_default_stream(mx.new_stream(metal_device))
+        grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+        first = PlaneWaveBasis.from_reduced_kpoint(
+            grid,
+            2.0,
+            (0.0, 0.0, 0.0),
+            lane_label="metal:primitive-first",
+        )
+        second = PlaneWaveBasis.from_reduced_kpoint(
+            grid,
+            3.0,
+            (0.25, 0.0, 0.0),
+            reciprocal_grid=first.reciprocal_grid,
+            lane_label="metal:primitive-second",
+        )
+        states = []
+        for basis, vectors, seed in ((first, 1, 51), (second, 2, 52)):
+            rng = np.random.default_rng(seed)
+            values = rng.normal(size=(vectors, basis.active_count)) + 1j * rng.normal(
+                size=(vectors, basis.active_count)
+            )
+            states.append(basis._state_from_compact(mx.array(values.astype(np.complex64))))
+        batch = _CompactBatch.from_states(
+            states,
+            max_padding_fraction=0.75,
+            lane_capacity=3,
+            vector_capacity=2,
+            active_capacity=second.active_count,
+        )
+        _reset_hpsi_metal_counters()
+
+        scattered = _scatter_complex_zeros_metal(
+            batch.values,
+            batch.fft_indices,
+            batch.valid_mask,
+            grid_size=batch.grid_size,
+        )
+        assert scattered is not None
+        expected_scattered = mx.reshape(
+            batch.scatter(),
+            (batch.lane_capacity, batch.vector_count, batch.grid_size),
+        )
+        rng = np.random.default_rng(53)
+        reciprocal = mx.array(
+            (
+                rng.normal(
+                    size=(batch.lane_capacity, batch.vector_count, batch.grid_size)
+                )
+                + 1j
+                * rng.normal(
+                    size=(batch.lane_capacity, batch.vector_count, batch.grid_size)
+                )
+            ).astype(np.complex64)
+        )
+        kinetic = mx.array(
+            rng.normal(size=(batch.lane_capacity, batch.bucket_size)).astype(np.float32)
+        )
+        nonlocal_values = mx.array(
+            (
+                rng.normal(size=batch.values.shape)
+                + 1j * rng.normal(size=batch.values.shape)
+            ).astype(np.complex64)
+        )
+        combined = _gather_combine_metal(
+            reciprocal,
+            batch.values,
+            batch.fft_indices,
+            batch.valid_mask,
+            kinetic,
+            nonlocal_values,
+        )
+        assert combined is not None
+        expected_combined = (
+            batch.values * kinetic[:, None, :]
+            + batch.gather(
+                mx.reshape(
+                    reciprocal,
+                    (batch.lane_capacity, batch.vector_count, *batch.grid_shape),
+                )
+            )
+            + nonlocal_values
+        )
+        expected_combined = mx.where(
+            batch.valid_mask[:, None, :],
+            expected_combined,
+            mx.zeros_like(expected_combined),
+        )
+        mx.eval(scattered, expected_scattered, combined, expected_combined)
+        mx.synchronize()
+
+        np.testing.assert_array_equal(
+            np.asarray(scattered),
+            np.asarray(expected_scattered),
+        )
+        np.testing.assert_allclose(
+            np.asarray(combined),
+            np.asarray(expected_combined),
+            atol=3e-6,
+        )
+        counters = _hpsi_metal_counters()
+        assert counters.scatter_calls == 1
+        assert counters.gather_combine_calls == 1
+    finally:
+        _restore_runtime(previous_device, previous_stream)
+
+    assert mx.default_device() == previous_device
+    assert mx.default_stream(previous_device) == previous_stream
 
 
 @pytest.mark.gpu
