@@ -26,6 +26,7 @@ from mlx_atomistic.dft._hpsi_metal import (
     _hpsi_metal_counters,
     _reset_hpsi_metal_counters,
     _scatter_complex_zeros_metal,
+    _use_hpsi_route,
 )
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
@@ -145,6 +146,92 @@ def test_hpsi_metal_primitives_match_mlx_for_ragged_padding(monkeypatch):
         counters = _hpsi_metal_counters()
         assert counters.scatter_calls == 1
         assert counters.gather_combine_calls == 1
+    finally:
+        _restore_runtime(previous_device, previous_stream)
+
+    assert mx.default_device() == previous_device
+    assert mx.default_stream(previous_device) == previous_stream
+
+
+@pytest.mark.gpu
+def test_hpsi_route_forces_mlx_and_metal_with_end_to_end_parity(monkeypatch):
+    monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
+    previous_device = mx.default_device()
+    previous_stream = mx.default_stream(previous_device)
+    try:
+        metal_device = mx.Device(mx.gpu, 0)
+        mx.set_default_device(metal_device)
+        mx.set_default_stream(mx.new_stream(metal_device))
+        grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+        basis = PlaneWaveBasis.from_reduced_kpoint(
+            grid,
+            4.0,
+            (0.25, 0.0, 0.0),
+            lane_label="metal:hpsi-route",
+        )
+        rng = np.random.default_rng(61)
+        values = rng.normal(size=(3, basis.active_count)) + 1j * rng.normal(
+            size=(3, basis.active_count)
+        )
+        state = basis._state_from_compact(mx.array(values.astype(np.complex64)))
+        operator = PeriodicKohnShamOperator(
+            basis,
+            mx.full(grid.shape, 0.2),
+        )
+        prepared = _CompactBatch.from_states((state,))
+
+        mlx_observer = RuntimeObserver(synchronize=mx.synchronize)
+        with _use_hpsi_route("mlx"):
+            mlx_outcome = PeriodicKohnShamOperator._apply_compact_batch(
+                (operator,),
+                (state,),
+                observer=mlx_observer,
+                prepared_batch=prepared,
+            )
+        metal_observer = RuntimeObserver(synchronize=mx.synchronize)
+        with _use_hpsi_route("metal"):
+            metal_outcome = PeriodicKohnShamOperator._apply_compact_batch(
+                (operator,),
+                (state,),
+                observer=metal_observer,
+                prepared_batch=prepared,
+            )
+        auto_observer = RuntimeObserver(synchronize=mx.synchronize)
+        with _use_hpsi_route("auto"):
+            auto_outcome = PeriodicKohnShamOperator._apply_compact_batch(
+                (operator,),
+                (state,),
+                observer=auto_observer,
+                prepared_batch=prepared,
+            )
+        mx.eval(
+            mlx_outcome.action_for(0).values,
+            metal_outcome.action_for(0).values,
+            auto_outcome.action_for(0).values,
+        )
+        mx.synchronize()
+
+        np.testing.assert_allclose(
+            np.asarray(metal_outcome.action_for(0).values),
+            np.asarray(mlx_outcome.action_for(0).values),
+            atol=3e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(auto_outcome.action_for(0).values),
+            np.asarray(mlx_outcome.action_for(0).values),
+            atol=3e-6,
+        )
+        mlx_work = mlx_observer.snapshot()["work_counters"]
+        metal_work = metal_observer.snapshot()["work_counters"]
+        auto_snapshot = auto_observer.snapshot()
+        assert mlx_work["hpsi_mlx_boundary_calls"] == 1
+        assert metal_work["hpsi_metal_scatter_calls"] == 1
+        assert metal_work["hpsi_metal_gather_combine_calls"] == 1
+        assert metal_work["hpsi_boundary_intermediate_arrays"] == 0
+        assert auto_snapshot["hpsi_route"] == {
+            "requested_counts": {"auto": 1},
+            "selected_counts": {"mlx": 1},
+        }
     finally:
         _restore_runtime(previous_device, previous_stream)
 

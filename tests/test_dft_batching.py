@@ -25,6 +25,10 @@ from mlx_atomistic.dft import (
     run_periodic_scf,
 )
 from mlx_atomistic.dft._compact import _CompactBatch
+from mlx_atomistic.dft._hpsi_metal import (
+    _hpsi_route_identity,
+    _use_hpsi_route,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.mixing import PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
@@ -394,6 +398,40 @@ def test_compact_hpsi_stable_capacity_masks_lane_vector_and_active_padding():
     memory = observer.snapshot()["memory"]
     assert memory["hpsi_fft_workspace_bytes"] == memory["fft_workspace_bytes"]
     assert memory["hpsi_peak_temporary_bytes"] == memory["peak_temporary_bytes"]
+
+
+def test_forced_metal_hpsi_route_falls_back_to_mlx_on_cpu_and_context_restores():
+    first, second = _bases()
+    states = (_state(first, seed=401), _state(second, seed=402))
+    potential = mx.full(first.grid.shape, 0.35, dtype=mx.float32)
+    operators = tuple(
+        PeriodicKohnShamOperator._from_shared_potential(basis, potential)
+        for basis in (first, second)
+    )
+    observer = RuntimeObserver()
+
+    with _use_hpsi_route("metal"):
+        assert _hpsi_route_identity() == ("metal", "mlx")
+        outcome = PeriodicKohnShamOperator._apply_compact_batch(
+            operators,
+            states,
+            observer=observer,
+        )
+
+    assert not outcome.failures
+    assert _hpsi_route_identity() == ("auto", "mlx")
+    snapshot = observer.snapshot()
+    assert snapshot["hpsi_route"] == {
+        "requested_counts": {"metal": 1},
+        "selected_counts": {"mlx": 1},
+    }
+    assert snapshot["work_counters"]["hpsi_mlx_boundary_calls"] == 1
+    assert snapshot["work_counters"]["hpsi_metal_scatter_calls"] == 0
+    assert snapshot["work_counters"]["hpsi_metal_gather_combine_calls"] == 0
+
+    with pytest.raises(RuntimeError, match="route context probe"), _use_hpsi_route("mlx"):
+        raise RuntimeError("route context probe")
+    assert _hpsi_route_identity() == ("auto", "mlx")
 
 
 def test_compact_submission_planner_respects_byte_and_padding_bounds():

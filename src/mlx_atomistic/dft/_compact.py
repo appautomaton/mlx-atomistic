@@ -715,13 +715,18 @@ class _CompactBatch:
     def from_real(self, orbitals: mx.array) -> mx.array:
         """Run one forward FFT and gather the canonical compact slots."""
 
+        return self.gather(self.reciprocal_from_real(orbitals))
+
+    def reciprocal_from_real(self, orbitals: mx.array) -> mx.array:
+        """Run one forward FFT while preserving the batch-first full grid."""
+
         values = mx.array(orbitals).astype(mx.complex64)
         expected = (self.lane_capacity, self.vector_count, *self.grid_shape)
         if values.shape != expected:
             msg = "real-space orbital batch has the wrong shape"
             raise ValueError(msg)
         scale = sqrt(self.volume) / self.grid_size
-        reciprocal = (
+        return (
             mx.fft.fftn(
                 values,
                 s=self.grid_shape,
@@ -729,15 +734,14 @@ class _CompactBatch:
             )
             * scale
         )
-        return self.gather(reciprocal)
 
-    def apply_local(
+    def local_reciprocal(
         self,
         potential: mx.array,
         *,
         scattered: mx.array | None = None,
     ) -> mx.array:
-        """Apply lane-local or shared potentials with one FFT pair."""
+        """Apply a local potential and preserve the reciprocal full grid."""
 
         field = mx.array(potential)
         if field.shape == self.grid_shape:
@@ -762,7 +766,22 @@ class _CompactBatch:
             msg = "local potential must be shared grid-shaped or lane-batched"
             raise ValueError(msg)
         real = self.to_real(scattered=scattered)
-        return self.from_real(real * batched_field)
+        return self.reciprocal_from_real(real * batched_field)
+
+    def apply_local(
+        self,
+        potential: mx.array,
+        *,
+        scattered: mx.array | None = None,
+    ) -> mx.array:
+        """Apply lane-local or shared potentials with one FFT pair."""
+
+        return self.gather(
+            self.local_reciprocal(
+                potential,
+                scattered=scattered,
+            )
+        )
 
     def unpad(self, values: mx.array, *, kind: str | None = None) -> tuple[_CompactLaneState, ...]:
         """Return unpadded persistent states from a padded operator payload."""

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
+from typing import Literal
 
 import mlx.core as mx
 
@@ -56,6 +60,12 @@ _gather_combine_kernel = None
 _counter_lock = Lock()
 _scatter_calls = 0
 _gather_combine_calls = 0
+_AUTO_METAL_ADMITTED = False
+_HpsiRoute = Literal["auto", "mlx", "metal"]
+_requested_route: ContextVar[_HpsiRoute] = ContextVar(
+    "mlx_atomistic_hpsi_route",
+    default="auto",
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,39 @@ def _metal_device_selected() -> bool:
     """Return whether the current default MLX device is a GPU."""
 
     return "gpu" in str(mx.default_device()).lower()
+
+
+def _validate_hpsi_route(route: str) -> _HpsiRoute:
+    """Validate and normalize one private Hpsi route name."""
+
+    if route not in {"auto", "mlx", "metal"}:
+        msg = "Hpsi route must be 'auto', 'mlx', or 'metal'"
+        raise ValueError(msg)
+    return route
+
+
+@contextmanager
+def _use_hpsi_route(route: str) -> Iterator[None]:
+    """Select a private Hpsi route for one exception-safe execution context."""
+
+    token = _requested_route.set(_validate_hpsi_route(route))
+    try:
+        yield
+    finally:
+        _requested_route.reset(token)
+
+
+def _hpsi_route_identity() -> tuple[_HpsiRoute, Literal["mlx", "metal"]]:
+    """Return the requested and currently selected private Hpsi routes."""
+
+    requested = _requested_route.get()
+    candidate_requested = requested == "metal" or (
+        requested == "auto" and _AUTO_METAL_ADMITTED
+    )
+    selected: Literal["mlx", "metal"] = (
+        "metal" if candidate_requested and _metal_device_selected() else "mlx"
+    )
+    return requested, selected
 
 
 def _hpsi_metal_counters() -> _HpsiMetalCounters:
