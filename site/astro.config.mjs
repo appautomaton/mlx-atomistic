@@ -67,11 +67,23 @@ export default defineConfig({
         },
       ],
     }),
-    // Under trailingSlash: "ignore" the base index is emitted twice, once as
-    // /mlx-atomistic/ and once without the slash. Pages answers the slashless
-    // form with a 301 to the other, so listing it spends a crawl on an address
-    // that was never the destination. The page's own canonical has always been
-    // the slashed form; this makes the sitemap say the same thing.
-    sitemap({ filter: (page) => page !== SITE }),
+    // A sitemap is a list of addresses worth indexing, so two kinds of page
+    // are kept out of it.
+    //
+    // The first is the slashless base. Under trailingSlash: "ignore" the base
+    // index is emitted twice, as /mlx-atomistic/ and again without the slash,
+    // and Pages answers the slashless form with a 301 to the other. Listing it
+    // spends a crawl on an address that was never the destination, while the
+    // page's own canonical has named the slashed form all along.
+    //
+    // The second is the generated API reference under /api/. Those pages carry
+    // noindex, and asking a crawler to fetch a page in order to be told not to
+    // index it is the whole cost with none of the benefit. They stay reachable
+    // through the sidebar and the /api/ index, which is hand-written and stays
+    // listed here.
+    sitemap({
+      filter: (page) =>
+        page !== SITE && (!page.startsWith(`${SITE}/api/`) || page === `${SITE}/api/`),
+    }),
   ],
 });

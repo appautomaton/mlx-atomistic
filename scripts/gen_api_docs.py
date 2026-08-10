@@ -282,6 +282,17 @@ def render_module(mod, order: int) -> str | None:
         f"description: API reference for {mod.path}.",
         "sidebar:",
         f"  order: {order}",
+        # These pages are signatures lifted from the source, so one reads much
+        # like the next and a search engine has already declined to index them.
+        # "follow" keeps them a normal part of the site: still crawled, still
+        # passing their links on, just not offered as search results. The hand-
+        # written index at /api/ carries no such tag and remains the one address
+        # for the reference as a whole.
+        "head:",
+        "  - tag: meta",
+        "    attrs:",
+        "      name: robots",
+        '      content: "noindex, follow"',
         "---",
         "",
     ]
