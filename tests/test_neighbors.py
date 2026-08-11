@@ -121,9 +121,9 @@ def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():
     assert neighbors.candidate_count >= neighbors.compact_pair_count
     assert neighbors.estimated_pair_bytes == tiles.estimated_bytes + oracle.pair_count * 8
     assert neighbors.compaction_backend == "cpu_vectorized_tile_membership_mask"
-    assert tiles.block_size == 8
+    assert tiles.block_size == 4
     assert tiles.exact_pair_count == oracle.pair_count
-    assert tiles.padded_lane_count == tiles.tile_count * 64
+    assert tiles.padded_lane_count == tiles.tile_count * 16
     assert tiles.padding_waste_count == tiles.padded_lane_count - oracle.pair_count
     assert 0.0 <= tiles.padding_waste_fraction < 1.0
     assert tiles.generation == 0
@@ -156,13 +156,16 @@ def test_neighbor_tiles_same_cell_blocks_use_exact_unique_upper_triangle():
     np.testing.assert_array_equal(np.asarray(tiles.materialize_pairs()), expected)
     np.testing.assert_array_equal(
         np.asarray(tiles.tile_blocks),
-        np.asarray([[0, 0], [0, 1], [1, 1]], dtype=np.int32),
+        np.asarray(
+            [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]],
+            dtype=np.int32,
+        ),
     )
-    assert tiles.atom_blocks.shape == (2, 8)
-    assert tiles.tile_count == 3
+    assert tiles.atom_blocks.shape == (3, 4)
+    assert tiles.tile_count == 6
     assert tiles.exact_pair_count == 45
     assert tiles.raw_candidate_count == 45
-    assert tiles.padded_lane_count == 192
+    assert tiles.padded_lane_count == 96
 
 
 def test_neighbor_tiles_membership_uses_cutoff_plus_skin_not_force_cutoff():

@@ -99,6 +99,47 @@ def _assert_reference_payload(payload, *, engine, benchmark_name, timing_metric)
     assert "commit" in payload
 
 
+def test_charged_pme_tile_mask_occupancy_counts_empty_rows_and_columns():
+    occupancy = charged_pme._tile_mask_occupancy(
+        [
+            [524545, 0],
+            [255, 0],
+        ],
+        [
+            [0, 1],
+            [0, 2],
+        ],
+        block_size=8,
+    )
+
+    assert occupancy == {
+        "right_column_count": 16,
+        "empty_right_column_count": 6,
+        "empty_right_column_fraction": 0.375,
+        "left_row_count": 16,
+        "empty_left_row_count": 12,
+        "empty_left_row_fraction": 0.75,
+        "subdivision_4x4_tile_count": 3,
+        "subdivision_4x4_padded_lane_count": 48,
+        "subdivision_4x4_active_lane_fraction": 11 / 48,
+        "subdivision_4x4_force_group_count": 1,
+    }
+
+    execution_occupancy = charged_pme._tile_mask_occupancy(
+        [[33]],
+        [[0, 1]],
+        block_size=4,
+    )
+    assert execution_occupancy == {
+        "right_column_count": 4,
+        "empty_right_column_count": 2,
+        "empty_right_column_fraction": 0.5,
+        "left_row_count": 4,
+        "empty_left_row_count": 2,
+        "empty_left_row_fraction": 0.5,
+    }
+
+
 def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     assert row["comparison_pair_id"] == pair_id
     assert row["comparison_role"] == "mlx"

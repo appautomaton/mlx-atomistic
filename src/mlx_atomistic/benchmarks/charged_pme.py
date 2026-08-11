@@ -738,6 +738,88 @@ def _default_openmm_artifact_paths(
     )
 
 
+def _tile_mask_occupancy(
+    member_mask: object,
+    tile_blocks: object,
+    *,
+    block_size: int,
+) -> dict[str, int | float]:
+    """Summarize row and column occupancy in fixed-width spatial tiles."""
+
+    words = np.asarray(member_mask, dtype=np.uint32)
+    if block_size <= 0:
+        msg = "tile block size must be positive"
+        raise ValueError(msg)
+    lanes_per_tile = block_size * block_size
+    word_count = (lanes_per_tile + 31) // 32
+    if words.ndim != 2 or words.shape[1] != word_count:
+        msg = f"tile member masks must have shape (n_tiles, {word_count})"
+        raise ValueError(msg)
+    blocks = np.asarray(tile_blocks, dtype=np.int32)
+    if blocks.shape != (words.shape[0], 2):
+        msg = "tile blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    bit_indices = np.arange(32, dtype=np.uint32)
+    active = np.concatenate(
+        [
+            ((words[:, index : index + 1] >> bit_indices) & np.uint32(1)).astype(bool)
+            for index in range(word_count)
+        ],
+        axis=1,
+    )[:, :lanes_per_tile]
+    tile_active = active.reshape((-1, block_size, block_size))
+    nonempty_columns = np.any(tile_active, axis=1)
+    nonempty_rows = np.any(tile_active, axis=2)
+    column_count = int(nonempty_columns.size)
+    row_count = int(nonempty_rows.size)
+    empty_columns = column_count - int(np.count_nonzero(nonempty_columns))
+    empty_rows = row_count - int(np.count_nonzero(nonempty_rows))
+    summary: dict[str, int | float] = {
+        "right_column_count": column_count,
+        "empty_right_column_count": empty_columns,
+        "empty_right_column_fraction": (
+            0.0 if column_count == 0 else empty_columns / column_count
+        ),
+        "left_row_count": row_count,
+        "empty_left_row_count": empty_rows,
+        "empty_left_row_fraction": 0.0 if row_count == 0 else empty_rows / row_count,
+    }
+    if block_size == 8:
+        active_quadrants = np.stack(
+            [
+                np.any(tile_active[:, row : row + 4, column : column + 4], axis=(1, 2))
+                for row in (0, 4)
+                for column in (0, 4)
+            ],
+            axis=1,
+        )
+        subtile_count = int(np.count_nonzero(active_quadrants))
+        exact_pair_count = int(np.count_nonzero(active))
+        subtile_padded_lane_count = subtile_count * 16
+        active_indices = np.argwhere(active_quadrants)
+        if active_indices.size:
+            tile_indices = active_indices[:, 0]
+            left_halves = active_indices[:, 1] // 2
+            left_subblocks = 2 * blocks[tile_indices, 0] + left_halves
+            subtiles_by_left = np.bincount(left_subblocks)
+            subtile_force_group_count = int(np.sum((subtiles_by_left + 7) // 8))
+        else:
+            subtile_force_group_count = 0
+        summary.update(
+            {
+                "subdivision_4x4_tile_count": subtile_count,
+                "subdivision_4x4_padded_lane_count": subtile_padded_lane_count,
+                "subdivision_4x4_active_lane_fraction": (
+                    0.0
+                    if subtile_padded_lane_count == 0
+                    else exact_pair_count / subtile_padded_lane_count
+                ),
+                "subdivision_4x4_force_group_count": subtile_force_group_count,
+            }
+        )
+    return summary
+
+
 def _profile_tile_inventory(
     prepared: Path,
     *,
@@ -893,6 +975,11 @@ def _profile_tile_inventory(
         "tile_topology_mask_bytes": tile_topology_bytes,
         "pair_scale_bytes": pair_scale_bytes,
     }
+    mask_occupancy = _tile_mask_occupancy(
+        tiles.member_mask,
+        tiles.tile_blocks,
+        block_size=tiles.block_size,
+    )
     return {
         "backend": tile_manager.backend,
         "block_size": tiles.block_size,
@@ -913,6 +1000,7 @@ def _profile_tile_inventory(
             if tiles.padded_lane_count == 0
             else tiles.exact_pair_count / tiles.padded_lane_count
         ),
+        **mask_occupancy,
         "force_rms_delta_kj_mol_angstrom": force_rms_delta,
         "force_max_delta_kj_mol_angstrom": force_max_delta,
         "force_max_reference_kj_mol_angstrom": force_max_reference,

@@ -2147,22 +2147,29 @@ class NonbondedPotential:
         one_four_words = np.zeros_like(member_words)
         bit_indices = np.arange(32, dtype=np.uint32)
         bit_weights = np.left_shift(np.uint32(1), bit_indices)
+        block_size = tiles.block_size
+        lanes_per_tile = tiles.lanes_per_tile
         n_atoms = int(self.sigma.shape[0])
         for start in range(0, tiles.tile_count, 65_536):
             stop = min(start + 65_536, tiles.tile_count)
             words = member_words[start:stop]
-            active = np.concatenate(
-                (
-                    ((words[:, :1] >> bit_indices) & np.uint32(1)).astype(bool),
-                    ((words[:, 1:] >> bit_indices) & np.uint32(1)).astype(bool),
-                ),
-                axis=1,
-            )
+            active = np.zeros((stop - start, lanes_per_tile), dtype=bool)
+            for word_index in range(tiles.mask_word_count):
+                lane_start = 32 * word_index
+                lane_stop = min(lane_start + 32, lanes_per_tile)
+                active[:, lane_start:lane_stop] = (
+                    (
+                        words[:, word_index, None]
+                        >> bit_indices[None, : lane_stop - lane_start]
+                    )
+                    & np.uint32(1)
+                ).astype(bool)
             block_pairs = tile_blocks[start:stop]
             left = atom_blocks[block_pairs[:, 0]][:, :, None]
             right = atom_blocks[block_pairs[:, 1]][:, None, :]
-            left = np.broadcast_to(left, (stop - start, 8, 8)).reshape((-1, 64))
-            right = np.broadcast_to(right, (stop - start, 8, 8)).reshape((-1, 64))
+            tile_shape = (stop - start, block_size, block_size)
+            left = np.broadcast_to(left, tile_shape).reshape((-1, lanes_per_tile))
+            right = np.broadcast_to(right, tile_shape).reshape((-1, lanes_per_tile))
             safe_left = np.maximum(left, 0).astype(np.int64, copy=False)
             safe_right = np.maximum(right, 0).astype(np.int64, copy=False)
             codes = np.minimum(safe_left, safe_right) * np.int64(n_atoms) + np.maximum(
@@ -2183,26 +2190,20 @@ class NonbondedPotential:
                     else self.topology._one_four_codes
                 ),
             )
-            enabled_words[start:stop, 0] = np.sum(
-                enabled[:, :32].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
-            enabled_words[start:stop, 1] = np.sum(
-                enabled[:, 32:].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
-            one_four_words[start:stop, 0] = np.sum(
-                one_four[:, :32].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
-            one_four_words[start:stop, 1] = np.sum(
-                one_four[:, 32:].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
+            for word_index in range(tiles.mask_word_count):
+                lane_start = 32 * word_index
+                lane_stop = min(lane_start + 32, lanes_per_tile)
+                weights = bit_weights[: lane_stop - lane_start]
+                enabled_words[start:stop, word_index] = np.sum(
+                    enabled[:, lane_start:lane_stop].astype(np.uint32) * weights,
+                    axis=1,
+                    dtype=np.uint32,
+                )
+                one_four_words[start:stop, word_index] = np.sum(
+                    one_four[:, lane_start:lane_stop].astype(np.uint32) * weights,
+                    axis=1,
+                    dtype=np.uint32,
+                )
         return (
             mx.array(enabled_words, dtype=mx.uint32),
             mx.array(one_four_words, dtype=mx.uint32),

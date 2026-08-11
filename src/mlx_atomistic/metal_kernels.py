@@ -357,11 +357,18 @@ _fused_bonded_force_only_kernel_singleton = None
 # can sum those contributions locally before issuing global atomics.
 _PREPARED_PME_PAIRS_PER_WORKER = 8
 
-_TILE_PME_BLOCK_SIZE = 8
+_TILE_PME_BLOCK_SIZE = 4
 _TILE_PME_LANES_PER_TILE = _TILE_PME_BLOCK_SIZE * _TILE_PME_BLOCK_SIZE
+_TILE_PME_MASK_WORD_COUNT = (_TILE_PME_LANES_PER_TILE + 31) // 32
+_TILE_BUILD_BLOCK_SIZE = 8
+_TILE_BUILD_LANES_PER_TILE = _TILE_BUILD_BLOCK_SIZE * _TILE_BUILD_BLOCK_SIZE
+_TILE_BUILD_SUBTILES_PER_TILE = (
+    _TILE_BUILD_BLOCK_SIZE // _TILE_PME_BLOCK_SIZE
+) ** 2
 _TILE_PME_GROUPS_PER_THREADGROUP = 4
 _TILE_PME_DISPATCH_WIDTH = 32 * _TILE_PME_GROUPS_PER_THREADGROUP
 _TILE_MEMBERSHIP_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
+_TILE_BUILD_MEMBERSHIP_THREADGROUP_SIZE = _TILE_BUILD_LANES_PER_TILE
 _TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
     _TILE_PME_BLOCK_SIZE * (1 + 3 + 1 + 1 + 1) * 4 * _TILE_PME_GROUPS_PER_THREADGROUP
 )
@@ -894,9 +901,9 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
 
-# One 32-lane SIMD group owns up to four right tiles for a shared eight-atom
-# left block. Each lane accumulates one right atom across all eight left atoms,
-# while SIMD reductions produce the eight left forces without the repeated
+# One 32-lane SIMD group owns up to eight right tiles for a shared four-atom
+# left block. Each lane accumulates one right atom across all four left atoms,
+# while SIMD reductions produce the four left forces without the repeated
 # threadgroup barriers and pair-force scratch buffers used by the previous
 # tile schedule.
 #
@@ -918,17 +925,17 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     int group_start = force_group_starts[group];
     int group_count = force_group_counts[group];
 
-    threadgroup int left_atoms[8 * GROUPS_PER_TG];
-    threadgroup float left_positions[24 * GROUPS_PER_TG];
-    threadgroup float left_half_sigma[8 * GROUPS_PER_TG];
-    threadgroup float left_sqrt_epsilon[8 * GROUPS_PER_TG];
-    threadgroup float left_charges[8 * GROUPS_PER_TG];
-    uint lbase = sub * 8u;
-    uint pbase = sub * 24u;
+    threadgroup int left_atoms[4 * GROUPS_PER_TG];
+    threadgroup float left_positions[12 * GROUPS_PER_TG];
+    threadgroup float left_half_sigma[4 * GROUPS_PER_TG];
+    threadgroup float left_sqrt_epsilon[4 * GROUPS_PER_TG];
+    threadgroup float left_charges[4 * GROUPS_PER_TG];
+    uint lbase = sub * 4u;
+    uint pbase = sub * 12u;
 
     int left_block = tile_blocks[2 * group_start + 0];
-    if (lane < 8u) {
-        int left_atom = atom_blocks[8 * left_block + lane];
+    if (lane < 4u) {
+        int left_atom = atom_blocks[4 * left_block + lane];
         left_atoms[lbase + lane] = left_atom;
         int safe_left = max(left_atom, 0);
         left_positions[pbase + 3 * lane + 0] = positions[3 * safe_left + 0];
@@ -940,13 +947,13 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint local_tile = lane >> 3;
-    uint right_slot = lane & 7u;
+    uint local_tile = lane >> 2;
+    uint right_slot = lane & 3u;
     bool tile_active = group_active && local_tile < (uint)group_count;
     int safe_local_tile = min((int)local_tile, group_count - 1);
     int tile = group_start + safe_local_tile;
     int right_block = tile_blocks[2 * tile + 1];
-    int right_atom = atom_blocks[8 * right_block + right_slot];
+    int right_atom = atom_blocks[4 * right_block + right_slot];
     int safe_right = max(right_atom, 0);
     float right_x = positions[3 * safe_right + 0];
     float right_y = positions[3 * safe_right + 1];
@@ -961,12 +968,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     float accumulated_lj_energy = 0.0f;
     float accumulated_coulomb_energy = 0.0f;
 #endif
-    uint member_word_0 = member_mask[2 * tile + 0];
-    uint member_word_1 = member_mask[2 * tile + 1];
-    uint lj_word_0 = lj_enabled_mask[2 * tile + 0];
-    uint lj_word_1 = lj_enabled_mask[2 * tile + 1];
-    uint one_four_word_0 = lj_one_four_mask[2 * tile + 0];
-    uint one_four_word_1 = lj_one_four_mask[2 * tile + 1];
+    uint member_word = member_mask[tile];
+    uint lj_word = lj_enabled_mask[tile];
+    uint one_four_word = lj_one_four_mask[tile];
     float box_lx = box[0];
     float box_ly = box[1];
     float box_lz = box[2];
@@ -984,11 +988,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     float inv_switch_width = params[9];
     float one_four_scale = params[10];
 
-    for (uint left_slot = 0u; left_slot < 8u; left_slot++) {
-        uint pair_lane = 8u * left_slot + right_slot;
-        uint word = pair_lane >> 5;
-        uint bit = pair_lane & 31u;
-        uint member_word = word == 0u ? member_word_0 : member_word_1;
+    for (uint left_slot = 0u; left_slot < 4u; left_slot++) {
+        uint pair_lane = 4u * left_slot + right_slot;
+        uint bit = pair_lane;
         bool member = tile_active && ((member_word >> bit) & 1u) != 0u;
         int left_atom = left_atoms[lbase + left_slot];
         float fx = 0.0f;
@@ -1011,11 +1013,8 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
                 float inv_r2 = inv_distance * inv_distance;
                 float distance = r2 * inv_distance;
                 float scalar = 0.0f;
-                uint lj_word = word == 0u ? lj_word_0 : lj_word_1;
                 bool lj_enabled = ((lj_word >> bit) & 1u) != 0u;
                 if (lj_enabled) {
-                    uint one_four_word =
-                        word == 0u ? one_four_word_0 : one_four_word_1;
                     bool one_four = ((one_four_word >> bit) & 1u) != 0u;
                     float lj_scale = one_four ? one_four_scale : 1.0f;
                     float sigma_ij = left_half_sigma[lbase + left_slot]
@@ -1714,33 +1713,50 @@ _NEIGHBOR_TILE_MEMBERSHIP_SOURCE = r"""
     active[lane] = close ? 1u : 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (lane < 2u) {
-        uint word = 0u;
-        uint base = 32u * lane;
-        for (uint bit = 0u; bit < 32u; bit++) {
-            word |= active[base + bit] << bit;
-        }
-        member_mask[2 * tile + lane] = word;
-    }
     if (lane == 0u) {
-        int total = 0;
-        for (uint index = 0u; index < 64u; index++) {
-            total += (int)active[index];
+        int exact_total = 0;
+        int subtile_total = 0;
+        for (uint quadrant = 0u; quadrant < 4u; quadrant++) {
+            uint row_base = 4u * (quadrant >> 1);
+            uint column_base = 4u * (quadrant & 1u);
+            uint word = 0u;
+            for (uint row = 0u; row < 4u; row++) {
+                for (uint column = 0u; column < 4u; column++) {
+                    uint value = active[
+                        8u * (row_base + row) + column_base + column
+                    ];
+                    word |= value << (4u * row + column);
+                    exact_total += (int)value;
+                }
+            }
+            subtile_mask[4 * tile + quadrant] = word;
+            subtile_total += word != 0u ? 1 : 0;
         }
-        member_counts[tile] = total;
+        member_counts[tile] = exact_total;
+        subtile_counts[tile] = subtile_total;
     }
 """
 
 _NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE = r"""
     uint tile = thread_position_in_grid.x;
-    if (tile >= (uint)counts[0] || member_counts[tile] == 0) {
+    if (tile >= (uint)counts[0] || subtile_counts[tile] == 0) {
         return;
     }
-    uint output = (uint)(prefix[tile] - 1);
-    accepted_tile_blocks[2 * output + 0] = tile_blocks[2 * tile + 0];
-    accepted_tile_blocks[2 * output + 1] = tile_blocks[2 * tile + 1];
-    accepted_member_mask[2 * output + 0] = member_mask[2 * tile + 0];
-    accepted_member_mask[2 * output + 1] = member_mask[2 * tile + 1];
+    uint output = (uint)(prefix[tile] - subtile_counts[tile]);
+    int coarse_left = tile_blocks[2 * tile + 0];
+    int coarse_right = tile_blocks[2 * tile + 1];
+    for (uint quadrant = 0u; quadrant < 4u; quadrant++) {
+        uint word = subtile_mask[4 * tile + quadrant];
+        if (word == 0u) {
+            continue;
+        }
+        accepted_tile_blocks[2 * output + 0] =
+            2 * coarse_left + (int)(quadrant >> 1);
+        accepted_tile_blocks[2 * output + 1] =
+            2 * coarse_right + (int)(quadrant & 1u);
+        accepted_member_mask[output] = word;
+        output++;
+    }
 """
 
 _NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
@@ -1768,11 +1784,9 @@ _NEIGHBOR_TILE_MEMBER_COUNTS_SOURCE = r"""
         return;
     }
     uint total = 0u;
-    for (uint word_index = 0u; word_index < 2u; word_index++) {
-        uint word = member_mask[2 * tile + word_index];
-        for (uint bit = 0u; bit < 32u; bit++) {
-            total += (word >> bit) & 1u;
-        }
+    uint word = member_mask[tile];
+    for (uint bit = 0u; bit < 16u; bit++) {
+        total += (word >> bit) & 1u;
     }
     member_counts[tile] = (int)total;
 """
@@ -1780,15 +1794,14 @@ _NEIGHBOR_TILE_MEMBER_COUNTS_SOURCE = r"""
 _NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
     uint lane = thread_position_in_threadgroup.x;
     uint tile = threadgroup_position_in_grid.x;
-    uint word_index = lane >> 5;
-    uint bit_index = lane & 31u;
-    threadgroup uint scan[64];
+    uint bit_index = lane;
+    threadgroup uint scan[16];
 
-    uint word = member_mask[2 * tile + word_index];
+    uint word = member_mask[tile];
     uint active = (word >> bit_index) & 1u;
     scan[lane] = active;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = 1u; offset < 64u; offset <<= 1u) {
+    for (uint offset = 1u; offset < 16u; offset <<= 1u) {
         uint addend = lane >= offset ? scan[lane - offset] : 0u;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         scan[lane] += addend;
@@ -1802,8 +1815,8 @@ _NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
     uint output = base + scan[lane] - 1u;
     int left_block = tile_blocks[2 * tile + 0];
     int right_block = tile_blocks[2 * tile + 1];
-    int atom_i = atom_blocks[8 * left_block + (lane >> 3)];
-    int atom_j = atom_blocks[8 * right_block + (lane & 7u)];
+    int atom_i = atom_blocks[4 * left_block + (lane >> 2)];
+    int atom_j = atom_blocks[4 * right_block + (lane & 3u)];
     accepted_i[output] = min(atom_i, atom_j);
     accepted_j[output] = max(atom_i, atom_j);
 """
@@ -1811,17 +1824,16 @@ _NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
 _TILE_TOPOLOGY_LJ_MASKS_SOURCE = r"""
     uint lane = thread_position_in_threadgroup.x;
     uint tile = threadgroup_position_in_grid.x;
-    uint word_index = lane >> 5;
-    uint bit_index = lane & 31u;
-    threadgroup uint enabled[64];
-    threadgroup uint one_four[64];
+    uint bit_index = lane;
+    threadgroup uint enabled[16];
+    threadgroup uint one_four[16];
 
-    uint member_word = member_mask[2 * tile + word_index];
+    uint member_word = member_mask[tile];
     bool member = ((member_word >> bit_index) & 1u) != 0u;
     int left_block = tile_blocks[2 * tile + 0];
     int right_block = tile_blocks[2 * tile + 1];
-    int atom_i = atom_blocks[8 * left_block + (lane >> 3)];
-    int atom_j = atom_blocks[8 * right_block + (lane & 7u)];
+    int atom_i = atom_blocks[4 * left_block + (lane >> 2)];
+    int atom_j = atom_blocks[4 * right_block + (lane & 3u)];
     int left = min(atom_i, atom_j);
     int right = max(atom_i, atom_j);
 
@@ -1872,16 +1884,15 @@ _TILE_TOPOLOGY_LJ_MASKS_SOURCE = r"""
     one_four[lane] = scaled ? 1u : 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (lane < 2u) {
+    if (lane == 0u) {
         uint enabled_word = 0u;
         uint one_four_word = 0u;
-        uint base = 32u * lane;
-        for (uint bit = 0u; bit < 32u; bit++) {
-            enabled_word |= enabled[base + bit] << bit;
-            one_four_word |= one_four[base + bit] << bit;
+        for (uint bit = 0u; bit < 16u; bit++) {
+            enabled_word |= enabled[bit] << bit;
+            one_four_word |= one_four[bit] << bit;
         }
-        lj_enabled_mask[2 * tile + lane] = enabled_word;
-        lj_one_four_mask[2 * tile + lane] = one_four_word;
+        lj_enabled_mask[tile] = enabled_word;
+        lj_one_four_mask[tile] = one_four_word;
     }
 """
 
@@ -2505,7 +2516,7 @@ def _prepared_pme_direct_force_only_kernel():
 
 
 def _tile_pme_direct_force_only_kernel():
-    """Return the cached spatial 8x8 tile direct-force kernel."""
+    """Return the cached spatial 4x4 tile direct-force kernel."""
 
     global _tile_pme_direct_force_only_kernel_singleton
     if _tile_pme_direct_force_only_kernel_singleton is None:
@@ -2536,7 +2547,7 @@ def _tile_pme_direct_force_only_kernel():
 
 
 def _tile_pme_direct_kernel():
-    """Return the cached spatial 8x8 tile direct energy/force kernel."""
+    """Return the cached spatial 4x4 tile direct energy/force kernel."""
 
     global _tile_pme_direct_kernel_singleton
     if _tile_pme_direct_kernel_singleton is None:
@@ -2817,21 +2828,21 @@ def _neighbor_cell_tile_candidates_kernel():
 
 
 def _neighbor_tile_membership_kernel():
-    """Return the cached exact spatial-tile membership kernel."""
+    """Return the cached coarse-tile membership and subdivision kernel."""
 
     global _neighbor_tile_membership_kernel_singleton
     if _neighbor_tile_membership_kernel_singleton is None:
         _neighbor_tile_membership_kernel_singleton = mx.fast.metal_kernel(
             name="neighbor_tile_membership",
             input_names=["positions", "atom_blocks", "tile_blocks", "box", "params"],
-            output_names=["member_mask", "member_counts"],
+            output_names=["subtile_mask", "member_counts", "subtile_counts"],
             source=_NEIGHBOR_TILE_MEMBERSHIP_SOURCE,
         )
     return _neighbor_tile_membership_kernel_singleton
 
 
 def _neighbor_tile_ordered_scatter_kernel():
-    """Return the cached non-empty spatial-tile compaction kernel."""
+    """Return the cached non-empty subtile compaction kernel."""
 
     global _neighbor_tile_ordered_scatter_kernel_singleton
     if _neighbor_tile_ordered_scatter_kernel_singleton is None:
@@ -2839,8 +2850,8 @@ def _neighbor_tile_ordered_scatter_kernel():
             name="neighbor_tile_ordered_scatter",
             input_names=[
                 "tile_blocks",
-                "member_mask",
-                "member_counts",
+                "subtile_mask",
+                "subtile_counts",
                 "prefix",
                 "counts",
             ],
@@ -3285,8 +3296,8 @@ def _neighbor_tile_membership(
     box_lengths: mx.array,
     *,
     search_radius: float,
-) -> tuple[mx.array, mx.array]:
-    """Encode exact cutoff-plus-skin membership for spatial 8x8 tiles."""
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Encode 8x8 membership as four packed 4x4 subtile masks."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
@@ -3295,8 +3306,8 @@ def _neighbor_tile_membership(
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
         raise ValueError(msg)
-    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
-        msg = "atom_blocks must have shape (n_blocks, 8)"
+    if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_BUILD_BLOCK_SIZE:
+        msg = f"atom_blocks must have shape (n_blocks, {_TILE_BUILD_BLOCK_SIZE})"
         raise ValueError(msg)
     if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
         msg = "tile_blocks must have shape (n_tiles, 2)"
@@ -3310,10 +3321,11 @@ def _neighbor_tile_membership(
     tile_count = int(tile_blocks.shape[0])
     if tile_count == 0:
         return (
-            mx.zeros((0, 2), dtype=mx.uint32),
+            mx.zeros((0, _TILE_BUILD_SUBTILES_PER_TILE), dtype=mx.uint32),
+            mx.zeros((0,), dtype=mx.int32),
             mx.zeros((0,), dtype=mx.int32),
         )
-    member_mask, member_counts = _neighbor_tile_membership_kernel()(
+    subtile_mask, member_counts, subtile_counts = _neighbor_tile_membership_kernel()(
         inputs=[
             positions,
             atom_blocks,
@@ -3321,56 +3333,67 @@ def _neighbor_tile_membership(
             box_lengths,
             mx.array([float(search_radius) ** 2], dtype=mx.float32),
         ],
-        output_shapes=[(tile_count, 2), (tile_count,)],
-        output_dtypes=[mx.uint32, mx.int32],
-        grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
-        threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
+        output_shapes=[
+            (tile_count, _TILE_BUILD_SUBTILES_PER_TILE),
+            (tile_count,),
+            (tile_count,),
+        ],
+        output_dtypes=[mx.uint32, mx.int32, mx.int32],
+        grid=(tile_count * _TILE_BUILD_LANES_PER_TILE, 1, 1),
+        threadgroup=(_TILE_BUILD_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
         init_value=0,
     )
-    return member_mask, member_counts
+    return subtile_mask, member_counts, subtile_counts
 
 
 def _neighbor_tile_ordered_scatter_sized(
     tile_blocks: mx.array,
-    member_mask: mx.array,
-    member_counts: mx.array,
+    subtile_mask: mx.array,
+    subtile_counts: mx.array,
     prefix: mx.array,
     *,
     accepted_count: int,
 ) -> tuple[mx.array, mx.array]:
-    """Compact non-empty spatial tiles into explicitly sized outputs."""
+    """Compact non-empty 4x4 subtiles from coarse 8x8 candidates."""
 
     tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
-    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
-    member_counts = as_mx_array(member_counts, dtype=mx.int32)
+    subtile_mask = as_mx_array(subtile_mask, dtype=mx.uint32)
+    subtile_counts = as_mx_array(subtile_counts, dtype=mx.int32)
     prefix = as_mx_array(prefix, dtype=mx.int32)
     tile_count = int(tile_blocks.shape[0])
     if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
         msg = "tile_blocks must have shape (n_tiles, 2)"
         raise ValueError(msg)
-    if member_mask.shape != (tile_count, 2):
-        msg = "member_mask must have shape (n_tiles, 2)"
+    mask_shape = (tile_count, _TILE_BUILD_SUBTILES_PER_TILE)
+    if subtile_mask.shape != mask_shape:
+        msg = (
+            "subtile_mask must have shape "
+            f"(n_tiles, {_TILE_BUILD_SUBTILES_PER_TILE})"
+        )
         raise ValueError(msg)
-    if member_counts.shape != (tile_count,) or prefix.shape != (tile_count,):
-        msg = "member_counts and prefix must contain one value per tile"
+    if subtile_counts.shape != (tile_count,) or prefix.shape != (tile_count,):
+        msg = "subtile_counts and prefix must contain one value per coarse tile"
         raise ValueError(msg)
-    if accepted_count < 0 or accepted_count > tile_count:
-        msg = "accepted_count must fit within the candidate tile count"
+    if accepted_count < 0 or accepted_count > tile_count * _TILE_BUILD_SUBTILES_PER_TILE:
+        msg = "accepted_count must fit within the subdivided candidate tile count"
         raise ValueError(msg)
     if accepted_count == 0:
         return (
             mx.zeros((0, 2), dtype=mx.int32),
-            mx.zeros((0, 2), dtype=mx.uint32),
+            mx.zeros((0, _TILE_PME_MASK_WORD_COUNT), dtype=mx.uint32),
         )
     accepted_tiles, accepted_mask = _neighbor_tile_ordered_scatter_kernel()(
         inputs=[
             tile_blocks,
-            member_mask,
-            member_counts,
+            subtile_mask,
+            subtile_counts,
             prefix,
             mx.array([tile_count], dtype=mx.int32),
         ],
-        output_shapes=[(accepted_count, 2), (accepted_count, 2)],
+        output_shapes=[
+            (accepted_count, 2),
+            (accepted_count, _TILE_PME_MASK_WORD_COUNT),
+        ],
         output_dtypes=[mx.int32, mx.uint32],
         grid=(tile_count, 1, 1),
         threadgroup=(min(256, tile_count), 1, 1),
@@ -3442,13 +3465,13 @@ def _neighbor_tile_member_pairs_sized(
     member_prefix = as_mx_array(member_prefix, dtype=mx.int32)
     tile_count = int(tile_blocks.shape[0])
     if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
-        msg = "atom_blocks must have shape (n_blocks, 8)"
+        msg = f"atom_blocks must have shape (n_blocks, {_TILE_PME_BLOCK_SIZE})"
         raise ValueError(msg)
     if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
         msg = "tile_blocks must have shape (n_tiles, 2)"
         raise ValueError(msg)
-    if member_mask.shape != (tile_count, 2):
-        msg = "member_mask must have shape (n_tiles, 2)"
+    if member_mask.shape != (tile_count, _TILE_PME_MASK_WORD_COUNT):
+        msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
     if member_counts.shape != (tile_count,) or member_prefix.shape != (tile_count,):
         msg = "member counts and prefix must contain one value per tile"
@@ -3479,8 +3502,8 @@ def _neighbor_tile_member_counts(member_mask: mx.array) -> mx.array:
     """Count active lanes in already-compacted spatial-tile masks."""
 
     member_mask = as_mx_array(member_mask, dtype=mx.uint32)
-    if member_mask.ndim != 2 or member_mask.shape[1] != 2:
-        msg = "member_mask must have shape (n_tiles, 2)"
+    if member_mask.ndim != 2 or member_mask.shape[1] != _TILE_PME_MASK_WORD_COUNT:
+        msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
     tile_count = int(member_mask.shape[0])
     if tile_count == 0:
@@ -3513,14 +3536,14 @@ def tile_topology_lj_masks(
     excluded_pairs = as_mx_array(excluded_pairs, dtype=mx.int32)
     one_four_pairs = as_mx_array(one_four_pairs, dtype=mx.int32)
     if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
-        msg = "atom_blocks must have shape (n_blocks, 8)"
+        msg = f"atom_blocks must have shape (n_blocks, {_TILE_PME_BLOCK_SIZE})"
         raise ValueError(msg)
     if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
         msg = "tile_blocks must have shape (n_tiles, 2)"
         raise ValueError(msg)
     tile_count = int(tile_blocks.shape[0])
-    if member_mask.shape != (tile_count, 2):
-        msg = "member_mask must have shape (n_tiles, 2)"
+    if member_mask.shape != (tile_count, _TILE_PME_MASK_WORD_COUNT):
+        msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
     for name, values in (
         ("excluded_pairs", excluded_pairs),
@@ -3530,7 +3553,7 @@ def tile_topology_lj_masks(
             msg = f"{name} must have shape (n, 2)"
             raise ValueError(msg)
     if tile_count == 0:
-        empty = mx.zeros((0, 2), dtype=mx.uint32)
+        empty = mx.zeros((0, _TILE_PME_MASK_WORD_COUNT), dtype=mx.uint32)
         return empty, empty
     enabled_mask, one_four_mask = _tile_topology_lj_masks_kernel()(
         inputs=[
@@ -3546,7 +3569,10 @@ def tile_topology_lj_masks(
                 dtype=mx.int32,
             ),
         ],
-        output_shapes=[(tile_count, 2), (tile_count, 2)],
+        output_shapes=[
+            (tile_count, _TILE_PME_MASK_WORD_COUNT),
+            (tile_count, _TILE_PME_MASK_WORD_COUNT),
+        ],
         output_dtypes=[mx.uint32, mx.uint32],
         grid=(tile_count * _TILE_PME_LANES_PER_TILE, 1, 1),
         threadgroup=(_TILE_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
@@ -5114,7 +5140,7 @@ def _tile_parameterized_pme_direct_force_only(
     alpha: float,
     _return_energy: bool = False,
 ) -> mx.array | tuple[mx.array, mx.array, mx.array]:
-    """Evaluate prepared direct forces from exact spatial 8x8 tiles."""
+    """Evaluate prepared direct forces from exact spatial 4x4 tiles."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
@@ -5133,18 +5159,18 @@ def _tile_parameterized_pme_direct_force_only(
         raise ValueError(msg)
     n_atoms = int(positions.shape[0])
     if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
-        msg = "atom_blocks must have shape (n_blocks, 8)"
+        msg = f"atom_blocks must have shape (n_blocks, {_TILE_PME_BLOCK_SIZE})"
         raise ValueError(msg)
     if tile_blocks.ndim != 2 or tile_blocks.shape[1] != 2:
         msg = "tile_blocks must have shape (n_tiles, 2)"
         raise ValueError(msg)
     tile_count = int(tile_blocks.shape[0])
-    mask_shape = (tile_count, 2)
+    mask_shape = (tile_count, _TILE_PME_MASK_WORD_COUNT)
     if member_mask.shape != mask_shape:
-        msg = "member_mask must have shape (n_tiles, 2)"
+        msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
     if lj_enabled_mask.shape != mask_shape or lj_one_four_mask.shape != mask_shape:
-        msg = "tile LJ masks must have shape (n_tiles, 2)"
+        msg = f"tile LJ masks must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
     group_count = int(force_group_starts.shape[0])
     if force_group_starts.ndim != 1 or force_group_counts.shape != (group_count,):

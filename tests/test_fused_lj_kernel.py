@@ -44,6 +44,7 @@ from mlx_atomistic.metal_kernels import (
 )
 from mlx_atomistic.neighbors import (
     _MLX_MD_CACHE_LIMIT_BYTES,
+    DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE,
     NeighborListManager,
     NeighborTiles,
     _bounded_metal_md_cache,
@@ -1002,7 +1003,7 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
     assert np.all(group_starts[1:] == group_ends[:-1])
     assert group_ends[-1] == tile_neighbors.tiles.tile_count
     assert np.all(group_counts >= 1)
-    assert np.all(group_counts <= 4)
+    assert np.all(group_counts <= DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE)
     assert np.all(tile_blocks[group_starts, 0] == tile_blocks[group_ends - 1, 0])
     np.testing.assert_array_equal(
         np.asarray(tile_neighbors.diagnostic_pairs),
@@ -1236,11 +1237,11 @@ def test_direct_plus_sparse_correction_matches_reference_at_half_box():
     )
     tile_direct = _tile_parameterized_pme_direct_force_only(
         positions,
-        mx.array([[0, 1, -1, -1, -1, -1, -1, -1]], dtype=mx.int32),
+        mx.array([[0, 1, -1, -1]], dtype=mx.int32),
         mx.array([[0, 0]], dtype=mx.int32),
-        mx.array([[2, 0]], dtype=mx.uint32),
-        mx.zeros((1, 2), dtype=mx.uint32),
-        mx.zeros((1, 2), dtype=mx.uint32),
+        mx.array([[2]], dtype=mx.uint32),
+        mx.zeros((1, 1), dtype=mx.uint32),
+        mx.zeros((1, 1), dtype=mx.uint32),
         mx.array([0], dtype=mx.int32),
         mx.array([1], dtype=mx.int32),
         box,
@@ -1288,11 +1289,11 @@ def test_neighbor_tiles_reject_invalid_force_group_schedule():
     with pytest.raises(ValueError, match="same-left"):
         NeighborTiles(
             atom_blocks=mx.array(
-                [[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]],
+                [[0, 1, 2, 3], [4, 5, 6, 7]],
                 dtype=mx.int32,
             ),
             tile_blocks=mx.array([[0, 0], [1, 1]], dtype=mx.int32),
-            member_mask=mx.array([[1, 0], [1, 0]], dtype=mx.uint32),
+            member_mask=mx.array([[1], [1]], dtype=mx.uint32),
             exact_pair_count=2,
             raw_candidate_count=2,
             force_group_starts=mx.array([0], dtype=mx.int32),

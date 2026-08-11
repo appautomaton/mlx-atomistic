@@ -727,6 +727,26 @@ tiles at 1.0 A against 402,910 at 2.0 A. `DEFAULT_MLX_CELL_TILE_BLOCK_SIZE` and
 `DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION` are independent constants and become
 inconsistent below about 3 A of skin.
 
+### Hybrid search and execution tiles
+
+The direct-force path now separates neighbor-search granularity from execution
+granularity. One 64-lane Metal threadgroup evaluates an 8-by-8 coarse tile and
+packs its four non-empty 4-by-4 masks. A single prefix-scan compaction then
+emits 4-by-4 execution tiles, with up to eight same-left tiles assigned to one
+Single Instruction Multiple Data (SIMD) group. This reduces the 5DFR
+padded-lane inventory from 41.41 million to
+27.70 million while avoiding the candidate explosion of a native 4-by-4
+search.
+
+Four independent 75-step 5DFR samples per arm reduced the complete-wall median
+from 0.106646 to 0.101136 seconds, or 5.17%. Paired 750-step confirmations were
+6.84% faster on 5DFR and 3.31% faster on the 94,232-atom JAC transfer. Metal
+peak allocation increased from 116.0 to 199.6 MB on 5DFR and from 493.8 to
+839.2 MB on JAC, but a 1,500-step, 47-rebuild JAC run showed no peak or
+rebuild-proportional growth. See
+[`md-hybrid-tile-kernel-verdict-m5max.md`](./benchmarks/md-hybrid-tile-kernel-verdict-m5max.md)
+for the complete decision record.
+
 ## Closed Directions
 
 Closed means do not repeat that implementation. It does not ban a future design

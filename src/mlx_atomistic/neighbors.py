@@ -58,8 +58,9 @@ DEFAULT_MLX_SPATIAL_CANDIDATE_BATCH = 16_000_000
 DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION = 3
 DEFAULT_MLX_SPATIAL_MAX_CELLS_PER_ATOM = 4
 DEFAULT_MLX_CELL_BLOCK_SIZE = 256
-DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 8
-DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE = 4
+DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 4
+DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE = 8
+DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE = 8
 DEFAULT_MLX_CELL_TILE_BATCH = 65_536
 _MLX_MD_CACHE_LIMIT_BYTES = 4_000_000_000
 # Default neighbor backend for systems above the dense-pair limit. Measured on
@@ -180,7 +181,7 @@ class NeighborBlocks:
 
 @dataclass(frozen=True)
 class NeighborTiles:
-    """Exact Verlet membership encoded over fixed eight-atom block tiles.
+    """Exact Verlet membership encoded over fixed four-atom block tiles.
 
     The representation is geometry-only. Each bit in ``member_mask`` records
     one pair that was inside ``cutoff + skin`` at rebuild time. Empty tiles are
@@ -265,7 +266,7 @@ class NeighborTiles:
                 if not bool(np.asarray(schedule_valid)):
                     msg = (
                         "force groups must cover tiles contiguously in same-left "
-                        "groups of at most four"
+                        f"groups of at most {DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE}"
                     )
                     raise ValueError(msg)
         if self.exact_pair_count < 0 or self.exact_pair_count > self.padded_lane_count:
@@ -1341,7 +1342,7 @@ def _build_mlx_spatial_cell_tile_list(
     subdivision: int = DEFAULT_MLX_SPATIAL_CELL_SUBDIVISION,
     generation: int = 0,
 ) -> NeighborList:
-    """Build exact spatial 8x8 tiles with Metal membership and compaction."""
+    """Build exact 4x4 tiles from coarse 8x8 Metal membership."""
 
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_tiles")
     lengths_mx = as_mx_array(cell.lengths, dtype=mx.float32)
@@ -1393,8 +1394,8 @@ def _build_mlx_spatial_cell_tile_list(
         np.cumsum(cell_counts[:-1], dtype=np.int64, out=cell_starts[1:])
 
     cell_block_counts = (
-        cell_counts + DEFAULT_MLX_CELL_TILE_BLOCK_SIZE - 1
-    ) // DEFAULT_MLX_CELL_TILE_BLOCK_SIZE
+        cell_counts + DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE - 1
+    ) // DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE
     cell_block_starts = np.empty_like(cell_block_counts)
     if cell_count:
         cell_block_starts[0] = 0
@@ -1415,8 +1416,11 @@ def _build_mlx_spatial_cell_tile_list(
         )
         block_cells_mx = mx.array(block_cells, dtype=mx.int32)
         within_cell = (
-            mx.array(block_local * DEFAULT_MLX_CELL_TILE_BLOCK_SIZE, dtype=mx.int32)[:, None]
-            + mx.arange(DEFAULT_MLX_CELL_TILE_BLOCK_SIZE, dtype=mx.int32)[None, :]
+            mx.array(
+                block_local * DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE,
+                dtype=mx.int32,
+            )[:, None]
+            + mx.arange(DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE, dtype=mx.int32)[None, :]
         )
         sorted_offsets = (
             mx.array(cell_starts, dtype=mx.int32)[block_cells_mx][:, None] + within_cell
@@ -1430,7 +1434,7 @@ def _build_mlx_spatial_cell_tile_list(
         ).astype(mx.int32)
     else:
         atom_blocks = mx.zeros(
-            (0, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE),
+            (0, DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE),
             dtype=mx.int32,
         )
 
@@ -1465,7 +1469,7 @@ def _build_mlx_spatial_cell_tile_list(
         mx.array(task_offsets, dtype=mx.int32),
         candidate_count=candidate_tile_count,
     )
-    candidate_mask, member_counts = _neighbor_tile_membership(
+    candidate_subtile_mask, member_counts, subtile_counts = _neighbor_tile_membership(
         positions_mx,
         atom_blocks,
         candidate_tiles,
@@ -1474,20 +1478,22 @@ def _build_mlx_spatial_cell_tile_list(
     )
 
     if candidate_tile_count:
-        nonempty_prefix = mx.cumsum((member_counts > 0).astype(mx.int32))
+        subtile_prefix = mx.cumsum(subtile_counts)
         member_prefix = mx.cumsum(member_counts)
         inventory_counts = mx.stack(
-            (nonempty_prefix[-1], member_prefix[-1]),
+            (subtile_prefix[-1], member_prefix[-1]),
         )
-        mx.eval(nonempty_prefix, member_prefix, inventory_counts)
+        mx.eval(subtile_prefix, member_prefix, inventory_counts)
         tile_count, exact_pair_count = (int(value) for value in np.asarray(inventory_counts))
         tile_blocks, member_mask = _neighbor_tile_ordered_scatter_sized(
             candidate_tiles,
-            candidate_mask,
-            member_counts,
-            nonempty_prefix,
+            candidate_subtile_mask,
+            subtile_counts,
+            subtile_prefix,
             accepted_count=tile_count,
         )
+        atom_blocks = atom_blocks.reshape((-1, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE))
+        block_count = int(atom_blocks.shape[0])
         # Cell-pair tasks are spatially coherent but periodic canonicalization
         # does not guarantee monotonic block IDs. Group only the much smaller
         # non-empty tile inventory so every force group owns one left block.
@@ -1515,10 +1521,11 @@ def _build_mlx_spatial_cell_tile_list(
             tiles_per_group=DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE,
         )
     else:
+        atom_blocks = atom_blocks.reshape((-1, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE))
         tile_count = 0
         exact_pair_count = 0
         tile_blocks = mx.zeros((0, 2), dtype=mx.int32)
-        member_mask = mx.zeros((0, 2), dtype=mx.uint32)
+        member_mask = mx.zeros((0, 1), dtype=mx.uint32)
         force_group_starts = mx.zeros((0,), dtype=mx.int32)
         force_group_counts = mx.zeros((0,), dtype=mx.int32)
     mx.eval(
@@ -1554,7 +1561,7 @@ def _build_mlx_spatial_cell_tile_list(
         backend="mlx_cell_tiles",
         representation_kind="tiles",
         candidate_count=raw_candidate_count,
-        estimated_candidate_bytes=candidate_tile_count * (5 * _INT_BYTES),
+        estimated_candidate_bytes=candidate_tile_count * (10 * _INT_BYTES),
         compaction_backend="metal_spatial_tile_prefix_scan",
         fallback_reason=None,
     )
@@ -1578,7 +1585,7 @@ def _build_mlx_cell_tiles(
     sort_pairs: bool,
     generation: int = 0,
 ) -> NeighborList:
-    """Build exact cutoff-plus-skin membership over eight-atom block tiles."""
+    """Build exact cutoff-plus-skin membership over four-atom block tiles."""
 
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_tiles")
     lengths = np.asarray(cell.lengths, dtype=np.float32)
@@ -1718,14 +1725,16 @@ def _build_mlx_cell_tiles(
             mx.eval(close_mx)
             close = np.asarray(close_mx).reshape(valid.shape)
         member = valid & close
-        flat_member = member.reshape((-1, 64)).astype(np.uint32, copy=False)
-        mask_words = np.stack(
-            (
-                np.sum(flat_member[:, :32] * bit_weights, axis=1, dtype=np.uint32),
-                np.sum(flat_member[:, 32:] * bit_weights, axis=1, dtype=np.uint32),
-            ),
-            axis=1,
+        lanes_per_tile = DEFAULT_MLX_CELL_TILE_BLOCK_SIZE**2
+        flat_member = member.reshape((-1, lanes_per_tile)).astype(
+            np.uint32,
+            copy=False,
         )
+        mask_words = np.sum(
+            flat_member * bit_weights[:lanes_per_tile],
+            axis=1,
+            dtype=np.uint32,
+        )[:, None]
         nonempty = np.any(mask_words != 0, axis=1)
         if np.any(nonempty):
             tile_rows.append(tile_batch[nonempty])
@@ -1737,7 +1746,7 @@ def _build_mlx_cell_tiles(
         member_mask = np.concatenate(membership_rows, axis=0)
     else:
         tile_blocks = np.empty((0, 2), dtype=np.int32)
-        member_mask = np.empty((0, 2), dtype=np.uint32)
+        member_mask = np.empty((0, 1), dtype=np.uint32)
     tiles = NeighborTiles(
         atom_blocks=mx.array(atom_blocks, dtype=mx.int32),
         tile_blocks=mx.array(tile_blocks, dtype=mx.int32),
