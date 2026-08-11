@@ -191,14 +191,20 @@ ten warmup steps, and 75 measured steps throughout. It retained two changes:
 | Constraints plus fused bonded forces, two-run median | 1.003149 s | 36.9% lower |
 | Matched OpenMM/OpenCL, single precision | 0.102947 s | reference |
 
-The final MLX/OpenMM ratio is `9.7586x`, so this named workload now meets the
-one-order-of-magnitude stretch target, narrowly. The manifest-bound comparison
+The then-current MLX/OpenMM ratio was `9.7586x`, so this named workload met the
+one-order-of-magnitude stretch target narrowly at that source state. The
+manifest-bound comparison
 matches atom and force-term inventory, cell, PME method/cutoff/alpha/mesh,
 constraints, fixed-cell Langevin-middle protocol, timestep, warmups, measured
 steps, and timing boundary. Both engines include explicit final-device
 completion in the timer and exclude initialization and I/O. Their random-number
 implementations differ, so this is matched protocol throughput rather than
 trajectory identity.
+
+The 2026-08-11 Phase 5 refresh after the retained tile and exact-pair lifetime
+work measured a two-run ratio-of-medians of `5.2701x` under AC Low Power Mode.
+See
+[`retained-stack-phase5-m5max.md`](../benchmarks/retained-stack-phase5-m5max.md).
 
 The two fused MLX samples were 1.001684 and 1.004613 seconds. The latter had a
 `3.21e-5 A` maximum constraint residual and a 3.86 GB process-tree peak. A

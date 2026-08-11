@@ -33,6 +33,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [retained-stack-phase5-m5max.md](./retained-stack-phase5-m5max.md) | mlx_atomistic/openmm-reference | Phase 5 DFT/MD retained-stack rollup and refreshed JAC ratio | Metal/OpenCL | Apple M5 Max |
 | [md-neighbor-roundtrip-verdict-m5max.md](./md-neighbor-roundtrip-verdict-m5max.md) | mlx_atomistic | 5DFR neighbor rebuild and deferred exact-pair verdict, with JAC transfer | Metal | Apple M5 Max |
 | [md-dense-affine-verdict-m5max.md](./md-dense-affine-verdict-m5max.md) | mlx_atomistic | 5DFR dense affine constraint leave-one-out verdict | Metal | Apple M5 Max |
 | [dft-hpsi-metal-boundary-m5max.md](./dft-hpsi-metal-boundary-m5max.md) | mlx_atomistic | Silicon fixed-density Hpsi boundary profiling and rejected Metal candidates | Metal | Apple M5 Max |

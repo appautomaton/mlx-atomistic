@@ -36,6 +36,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [retained-stack-phase5-m5max.md](./retained-stack-phase5-m5max.md) | mlx_atomistic/openmm-reference | Phase 5 DFT/MD retained-stack rollup and refreshed JAC ratio | Metal/OpenCL | Apple M5 Max |
 | [md-neighbor-roundtrip-verdict-m5max.md](./md-neighbor-roundtrip-verdict-m5max.md) | mlx_atomistic | 5DFR neighbor rebuild and deferred exact-pair verdict, with JAC transfer | Metal | Apple M5 Max |
 | [mlx-dft-silicon-m5max.md](./mlx-dft-silicon-m5max.md) | mlx_atomistic | 8-atom periodic silicon DFT, 6³ k-point mesh | Metal | Apple M5 Max |
 | [dft-material-validation.md](./dft-material-validation.md) | mlx_atomistic | accepted Si, C, and MgO periodic DFT workloads | Metal | Apple M5 Max |
