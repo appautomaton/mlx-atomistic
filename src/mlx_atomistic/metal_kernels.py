@@ -347,11 +347,8 @@ _shake_cluster_position_kernel_singleton = None
 _shake_cluster_velocity_kernel_singleton = None
 _settle_water_position_kernel_singleton = None
 _settle_water_velocity_kernel_singleton = None
-_settle_water_affine_velocity_kernel_singleton = None
 _langevin_baoab_drift_kernel_singleton = None
 _dense_constraint_apply_kernel_singleton = None
-_dense_affine_constraint_apply_kernel_singleton = None
-_shake_cluster_affine_velocity_kernel_singleton = None
 _fused_bonded_force_only_kernel_singleton = None
 
 # Neighbor compaction preserves short runs of a common left atom, so one worker
@@ -1850,36 +1847,6 @@ inline float3 constraint_safe_normalize(float3 value) {
 }
 """
 
-_AFFINE_CONSTRAINT_HEADER = _CONSTRAINT_HEADER + r"""
-#define CONSTRAINT_AFFINE_VELOCITY 1
-
-inline float3 constraint_affine_velocity(
-    int atom,
-    device const float* positions,
-    device const float* velocities,
-    device const float* affine_values,
-    device const float* masses,
-    constant const float* box,
-    constant const float* affine_params,
-    int periodic
-) {
-    float3 velocity = constraint_load3(velocities, atom);
-    int affine_mode = int(affine_params[0]);
-    if (affine_mode == 1) {
-        float3 correction = constraint_load3(positions, atom)
-            - constraint_load3(affine_values, atom);
-        correction = constraint_minimum_image(correction, box, periodic);
-        velocity += correction / affine_params[1];
-    }
-    else if (affine_mode == 2) {
-        float3 acceleration = affine_params[2]
-            * constraint_load3(affine_values, atom) / masses[atom];
-        velocity += affine_params[3] * acceleration;
-    }
-    return velocity;
-}
-"""
-
 _DENSE_CONSTRAINT_APPLY_SOURCE = r"""
     uint atom = thread_position_in_grid.x;
     if (atom >= (uint)params[0]) {
@@ -1899,20 +1866,7 @@ _DENSE_CONSTRAINT_APPLY_SOURCE = r"""
         }
     }
 
-#if defined(CONSTRAINT_AFFINE_VELOCITY)
-    float3 value = constraint_affine_velocity(
-        atom,
-        positions,
-        base_values,
-        affine_values,
-        masses,
-        box,
-        affine_params,
-        params[4]
-    ) + delta;
-#else
     float3 value = constraint_load3(base_values, atom) + delta;
-#endif
     constrained[3 * atom + 0] = value.x;
     constrained[3 * atom + 1] = value.y;
     constrained[3 * atom + 2] = value.z;
@@ -2049,42 +2003,9 @@ _SETTLE_WATER_VELOCITY_SOURCE = r"""
     float3 position_o = constraint_load3(positions, oxygen);
     float3 position_a = constraint_load3(positions, hydrogen_a);
     float3 position_b = constraint_load3(positions, hydrogen_b);
-#if defined(CONSTRAINT_AFFINE_VELOCITY)
-    float3 velocity_o = constraint_affine_velocity(
-        oxygen,
-        positions,
-        velocities,
-        affine_values,
-        masses,
-        box,
-        affine_params,
-        periodic
-    );
-    float3 velocity_a = constraint_affine_velocity(
-        hydrogen_a,
-        positions,
-        velocities,
-        affine_values,
-        masses,
-        box,
-        affine_params,
-        periodic
-    );
-    float3 velocity_b = constraint_affine_velocity(
-        hydrogen_b,
-        positions,
-        velocities,
-        affine_values,
-        masses,
-        box,
-        affine_params,
-        periodic
-    );
-#else
     float3 velocity_o = constraint_load3(velocities, oxygen);
     float3 velocity_a = constraint_load3(velocities, hydrogen_a);
     float3 velocity_b = constraint_load3(velocities, hydrogen_b);
-#endif
     float3 q_oh_a = constraint_minimum_image(position_o - position_a, box, periodic);
     float3 q_oh_b = constraint_minimum_image(position_o - position_b, box, periodic);
     float3 q_hh = constraint_minimum_image(position_a - position_b, box, periodic);
@@ -2281,25 +2202,9 @@ _SHAKE_CLUSTER_VELOCITY_SOURCE = r"""
         atom[slot] = cluster_atoms[4 * cluster + slot];
         if (slot <= peripheral_count) {
             int index = atom[slot];
-#if defined(CONSTRAINT_AFFINE_VELOCITY)
-            float3 velocity = constraint_affine_velocity(
-                index,
-                positions,
-                velocities,
-                affine_values,
-                masses,
-                box,
-                affine_params,
-                params[2]
-            );
-            vx[slot] = velocity.x;
-            vy[slot] = velocity.y;
-            vz[slot] = velocity.z;
-#else
             vx[slot] = velocities[3 * index + 0];
             vy[slot] = velocities[3 * index + 1];
             vz[slot] = velocities[3 * index + 2];
-#endif
             base_vx[slot] = vx[slot];
             base_vy[slot] = vy[slot];
             base_vz[slot] = vz[slot];
@@ -2960,31 +2865,6 @@ def _shake_cluster_velocity_kernel():
     return _shake_cluster_velocity_kernel_singleton
 
 
-def _shake_cluster_affine_velocity_kernel():
-    """Return the cached affine-input SHAKE-cluster velocity kernel."""
-
-    global _shake_cluster_affine_velocity_kernel_singleton
-    if _shake_cluster_affine_velocity_kernel_singleton is None:
-        _shake_cluster_affine_velocity_kernel_singleton = mx.fast.metal_kernel(
-            name="shake_cluster_affine_velocities",
-            input_names=[
-                "positions",
-                "velocities",
-                "affine_values",
-                "masses",
-                "cluster_atoms",
-                "peripheral_counts",
-                "box",
-                "affine_params",
-                "params",
-            ],
-            output_names=["deltas"],
-            source=_SHAKE_CLUSTER_VELOCITY_SOURCE,
-            header=_AFFINE_CONSTRAINT_HEADER,
-        )
-    return _shake_cluster_affine_velocity_kernel_singleton
-
-
 def _settle_water_position_kernel():
     """Return the cached analytical SETTLE position kernel."""
 
@@ -3028,30 +2908,6 @@ def _settle_water_velocity_kernel():
             header=_CONSTRAINT_HEADER,
         )
     return _settle_water_velocity_kernel_singleton
-
-
-def _settle_water_affine_velocity_kernel():
-    """Return the cached affine-input analytical SETTLE velocity kernel."""
-
-    global _settle_water_affine_velocity_kernel_singleton
-    if _settle_water_affine_velocity_kernel_singleton is None:
-        _settle_water_affine_velocity_kernel_singleton = mx.fast.metal_kernel(
-            name="settle_water_affine_velocities",
-            input_names=[
-                "positions",
-                "velocities",
-                "affine_values",
-                "masses",
-                "waters",
-                "box",
-                "affine_params",
-                "params",
-            ],
-            output_names=["deltas"],
-            source=_SETTLE_WATER_VELOCITY_SOURCE,
-            header=_AFFINE_CONSTRAINT_HEADER,
-        )
-    return _settle_water_affine_velocity_kernel_singleton
 
 
 def _langevin_baoab_drift_kernel():
@@ -3099,34 +2955,6 @@ def _dense_constraint_apply_kernel():
             header=_CONSTRAINT_HEADER,
         )
     return _dense_constraint_apply_kernel_singleton
-
-
-def _dense_affine_constraint_apply_kernel():
-    """Return the cached dense affine disjoint-constraint writer."""
-
-    global _dense_affine_constraint_apply_kernel_singleton
-    if _dense_affine_constraint_apply_kernel_singleton is None:
-        _dense_affine_constraint_apply_kernel_singleton = mx.fast.metal_kernel(
-            name="dense_affine_constraint_apply",
-            input_names=[
-                "base_values",
-                "positions",
-                "affine_values",
-                "masses",
-                "box",
-                "affine_params",
-                "owner_family",
-                "owner_rows",
-                "owner_slots",
-                "settle_deltas",
-                "shake_deltas",
-                "params",
-            ],
-            output_names=["constrained"],
-            source=_DENSE_CONSTRAINT_APPLY_SOURCE,
-            header=_AFFINE_CONSTRAINT_HEADER,
-        )
-    return _dense_affine_constraint_apply_kernel_singleton
 
 
 def _fused_bonded_force_only_kernel():
@@ -3696,33 +3524,10 @@ def _dense_constraint_apply(
     settle_deltas: mx.array,
     shake_deltas: mx.array,
     params: mx.array,
-    *,
-    positions: mx.array | None = None,
-    affine_values: mx.array | None = None,
-    masses: mx.array | None = None,
-    box_lengths: mx.array | None = None,
-    affine_parameters: mx.array | None = None,
 ) -> mx.array:
-    """Apply disjoint deltas, optionally folding one private affine velocity."""
+    """Apply disjoint SETTLE/SHAKE deltas through one dense Metal write."""
 
     base_values = as_mx_array(base_values, dtype=mx.float32)
-    affine_inputs = (
-        positions,
-        affine_values,
-        masses,
-        box_lengths,
-        affine_parameters,
-    )
-    affine = all(value is not None for value in affine_inputs)
-    if not affine and any(value is not None for value in affine_inputs):
-        msg = "affine constraint inputs must be provided together"
-        raise ValueError(msg)
-    if affine:
-        positions = as_mx_array(positions, dtype=mx.float32)
-        affine_values = as_mx_array(affine_values, dtype=mx.float32)
-        masses = as_mx_array(masses, dtype=mx.float32)
-        box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
-        affine_parameters = as_mx_array(affine_parameters, dtype=mx.float32)
     owner_family = as_mx_array(owner_family, dtype=mx.int32)
     owner_rows = as_mx_array(owner_rows, dtype=mx.int32)
     owner_slots = as_mx_array(owner_slots, dtype=mx.int32)
@@ -3745,57 +3550,22 @@ def _dense_constraint_apply(
     if shake_deltas.ndim != 3 or shake_deltas.shape[1:] != (4, 3):
         msg = "shake_deltas must have shape (n_clusters, 4, 3)"
         raise ValueError(msg)
-    expected_params_shape = (5,) if affine else (4,)
-    if params.shape != expected_params_shape:
-        msg = f"constraint apply params must have shape {expected_params_shape}"
+    if params.shape != (4,):
+        msg = "constraint apply params must have shape (4,)"
         raise ValueError(msg)
-    if affine:
-        if positions.shape != base_values.shape or affine_values.shape != base_values.shape:
-            msg = "positions, base_values, and affine_values must have matching shapes"
-            raise ValueError(msg)
-        if masses.shape != (base_values.shape[0],):
-            msg = "masses must have shape (n_atoms,)"
-            raise ValueError(msg)
-        if box_lengths.shape != (3,):
-            msg = "box_lengths must have shape (3,)"
-            raise ValueError(msg)
-        if affine_parameters.shape != (4,):
-            msg = "affine_parameters must have shape (4,)"
-            raise ValueError(msg)
     atom_count = int(base_values.shape[0])
     if atom_count == 0:
         return base_values
-    kernel = (
-        _dense_affine_constraint_apply_kernel()
-        if affine
-        else _dense_constraint_apply_kernel()
-    )
-    inputs = [
-        base_values,
-        owner_family,
-        owner_rows,
-        owner_slots,
-        settle_deltas,
-        shake_deltas,
-        params,
-    ]
-    if affine:
-        inputs = [
+    (constrained,) = _dense_constraint_apply_kernel()(
+        inputs=[
             base_values,
-            positions,
-            affine_values,
-            masses,
-            box_lengths,
-            affine_parameters,
             owner_family,
             owner_rows,
             owner_slots,
             settle_deltas,
             shake_deltas,
             params,
-        ]
-    (constrained,) = kernel(
-        inputs=inputs,
+        ],
         output_shapes=[base_values.shape],
         output_dtypes=[mx.float32],
         grid=(atom_count, 1, 1),
@@ -3869,32 +3639,17 @@ def _settle_water_velocity_deltas(
     box_lengths: mx.array,
     *,
     periodic: bool,
-    affine_values: mx.array | None = None,
-    affine_parameters: mx.array | None = None,
 ) -> mx.array:
-    """Return SETTLE velocity deltas, optionally from one affine input."""
+    """Return analytical SETTLE velocity deltas from one Metal dispatch."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     velocities = as_mx_array(velocities, dtype=mx.float32)
-    affine = affine_values is not None and affine_parameters is not None
-    if (affine_values is None) != (affine_parameters is None):
-        msg = "affine velocity inputs must be provided together"
-        raise ValueError(msg)
-    if affine:
-        affine_values = as_mx_array(affine_values, dtype=mx.float32)
-        affine_parameters = as_mx_array(affine_parameters, dtype=mx.float32)
     masses = as_mx_array(masses, dtype=mx.float32)
     waters = as_mx_array(waters, dtype=mx.int32)
     box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
     water_count = int(waters.shape[0])
     if positions.shape != velocities.shape:
         msg = "positions and velocities must have matching shapes"
-        raise ValueError(msg)
-    if affine and affine_values.shape != velocities.shape:
-        msg = "affine_values and velocities must have matching shapes"
-        raise ValueError(msg)
-    if affine and affine_parameters.shape != (4,):
-        msg = "affine_parameters must have shape (4,)"
         raise ValueError(msg)
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
@@ -3911,32 +3666,15 @@ def _settle_water_velocity_deltas(
     if water_count == 0:
         return mx.zeros((0, 3, 3), dtype=mx.float32)
     threads = min(256, water_count)
-    kernel = (
-        _settle_water_affine_velocity_kernel()
-        if affine
-        else _settle_water_velocity_kernel()
-    )
-    inputs = [
-        positions,
-        velocities,
-        masses,
-        waters,
-        box_lengths,
-        mx.array([water_count, int(periodic)], dtype=mx.int32),
-    ]
-    if affine:
-        inputs = [
+    (deltas,) = _settle_water_velocity_kernel()(
+        inputs=[
             positions,
             velocities,
-            affine_values,
             masses,
             waters,
             box_lengths,
-            affine_parameters,
             mx.array([water_count, int(periodic)], dtype=mx.int32),
-        ]
-    (deltas,) = kernel(
-        inputs=inputs,
+        ],
         output_shapes=[(water_count, 3, 3)],
         output_dtypes=[mx.float32],
         grid=(water_count, 1, 1),
@@ -4028,20 +3766,11 @@ def _shake_cluster_velocity_deltas(
     *,
     max_iterations: int,
     periodic: bool,
-    affine_values: mx.array | None = None,
-    affine_parameters: mx.array | None = None,
 ) -> mx.array:
-    """Return RATTLE velocity deltas, optionally from one affine input."""
+    """Return per-cluster RATTLE velocity deltas from one Metal dispatch."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     velocities = as_mx_array(velocities, dtype=mx.float32)
-    affine = affine_values is not None and affine_parameters is not None
-    if (affine_values is None) != (affine_parameters is None):
-        msg = "affine velocity inputs must be provided together"
-        raise ValueError(msg)
-    if affine:
-        affine_values = as_mx_array(affine_values, dtype=mx.float32)
-        affine_parameters = as_mx_array(affine_parameters, dtype=mx.float32)
     masses = as_mx_array(masses, dtype=mx.float32)
     cluster_atoms = as_mx_array(cluster_atoms, dtype=mx.int32)
     peripheral_counts = as_mx_array(peripheral_counts, dtype=mx.int32)
@@ -4049,12 +3778,6 @@ def _shake_cluster_velocity_deltas(
     cluster_count = int(cluster_atoms.shape[0])
     if positions.shape != velocities.shape:
         msg = "positions and velocities must have matching shapes"
-        raise ValueError(msg)
-    if affine and affine_values.shape != velocities.shape:
-        msg = "affine_values and velocities must have matching shapes"
-        raise ValueError(msg)
-    if affine and affine_parameters.shape != (4,):
-        msg = "affine_parameters must have shape (4,)"
         raise ValueError(msg)
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
@@ -4077,40 +3800,19 @@ def _shake_cluster_velocity_deltas(
     if cluster_count == 0:
         return mx.zeros((0, 4, 3), dtype=mx.float32)
     threads = min(256, cluster_count)
-    kernel = (
-        _shake_cluster_affine_velocity_kernel()
-        if affine
-        else _shake_cluster_velocity_kernel()
-    )
-    inputs = [
-        positions,
-        velocities,
-        masses,
-        cluster_atoms,
-        peripheral_counts,
-        box_lengths,
-        mx.array(
-            [cluster_count, max_iterations, int(periodic)],
-            dtype=mx.int32,
-        ),
-    ]
-    if affine:
-        inputs = [
+    (deltas,) = _shake_cluster_velocity_kernel()(
+        inputs=[
             positions,
             velocities,
-            affine_values,
             masses,
             cluster_atoms,
             peripheral_counts,
             box_lengths,
-            affine_parameters,
             mx.array(
                 [cluster_count, max_iterations, int(periodic)],
                 dtype=mx.int32,
             ),
-        ]
-    (deltas,) = kernel(
-        inputs=inputs,
+        ],
         output_shapes=[(cluster_count, 4, 3)],
         output_dtypes=[mx.float32],
         grid=(cluster_count, 1, 1),

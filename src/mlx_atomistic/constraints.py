@@ -16,10 +16,6 @@ from mlx_atomistic.metal_kernels import (
     _shake_cluster_velocity_deltas,
 )
 
-_VELOCITY_AFFINE_NONE = 0
-_VELOCITY_AFFINE_POSITION_CORRECTION = 1
-_VELOCITY_AFFINE_FORCE_KICK = 2
-
 
 def _empty_pairs() -> mx.array:
     return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
@@ -1129,7 +1125,6 @@ class CompositeConstraints:
         object.__setattr__(self, "_dense_owner_maps", owner_maps)
         object.__setattr__(self, "_dense_owner_device_cache", {})
         object.__setattr__(self, "_dense_params_cache", {})
-        object.__setattr__(self, "_dense_affine_params_cache", {})
         object.__setattr__(self, "_dense_placeholder_cache", {})
 
     def _dense_metal_ready(
@@ -1178,86 +1173,6 @@ class CompositeConstraints:
             settle_placeholder = mx.zeros((1, 3, 3), dtype=mx.float32)
             self._dense_placeholder_cache[device] = settle_placeholder
         return owners, params, settle_placeholder
-
-    def _dense_affine_device_state(
-        self,
-        atom_count: int,
-        *,
-        apply_settle: bool,
-        apply_shake: bool,
-        periodic: bool,
-    ) -> tuple[tuple[mx.array, mx.array, mx.array], mx.array, mx.array]:
-        owners, _, settle_placeholder = self._dense_device_state(
-            atom_count,
-            apply_settle=apply_settle,
-            apply_shake=apply_shake,
-        )
-        device = str(mx.default_device())
-        params_key = (
-            "affine",
-            device,
-            atom_count,
-            apply_settle,
-            apply_shake,
-            periodic,
-        )
-        params = self._dense_params_cache.get(params_key)
-        if params is None:
-            params = mx.array(
-                [
-                    atom_count,
-                    int(self._dense_owner_maps[0].shape[0]),
-                    int(apply_settle),
-                    int(apply_shake),
-                    int(periodic),
-                ],
-                dtype=mx.int32,
-            )
-            self._dense_params_cache[params_key] = params
-        return owners, params, settle_placeholder
-
-    def _dense_affine_parameters(
-        self,
-        affine_mode: int,
-        *,
-        time_step: float,
-        force_scale: float,
-        half_time_step: float,
-    ) -> mx.array:
-        device = str(mx.default_device())
-        key = (
-            device,
-            affine_mode,
-            float(time_step),
-            float(force_scale),
-            float(half_time_step),
-        )
-        parameters = self._dense_affine_params_cache.get(key)
-        if parameters is None:
-            parameters = mx.array(
-                [affine_mode, time_step, force_scale, half_time_step],
-                dtype=mx.float32,
-            )
-            self._dense_affine_params_cache[key] = parameters
-        return parameters
-
-    def _dense_affine_velocity_step_ready(
-        self,
-        positions: mx.array,
-        velocities: mx.array,
-        masses: mx.array,
-        cell: Cell | None,
-    ) -> bool:
-        """Return whether the private dense affine velocity route is supported."""
-
-        return bool(
-            self._dense_metal_ready((positions, velocities, masses), cell)
-            and positions.ndim == 2
-            and positions.shape[1] == 3
-            and velocities.shape == positions.shape
-            and masses.shape == (positions.shape[0],)
-            and self._dense_owner_maps[0].shape[0] <= positions.shape[0]
-        )
 
     def _dense_position_step(
         self,
@@ -1329,28 +1244,11 @@ class CompositeConstraints:
         cell: Cell | None,
         *,
         apply_settle: bool,
-        affine_values: mx.array | None = None,
-        affine_mode: int = _VELOCITY_AFFINE_NONE,
-        time_step: float = 1.0,
-        force_scale: float = 0.0,
-        half_time_step: float = 0.0,
     ) -> mx.array | None:
-        affine_values = velocities if affine_values is None else affine_values
-        readiness_arrays = (
-            (positions, velocities, masses)
-            if affine_mode == _VELOCITY_AFFINE_NONE
-            else (positions, velocities, affine_values, masses)
-        )
-        if not self._dense_metal_ready(readiness_arrays, cell):
+        if not self._dense_metal_ready((positions, velocities, masses), cell):
             return None
         if positions.shape != velocities.shape:
             msg = "positions and velocities must have matching shapes"
-            raise ValueError(msg)
-        if (
-            affine_mode != _VELOCITY_AFFINE_NONE
-            and affine_values.shape != velocities.shape
-        ):
-            msg = "affine_values and velocities must have matching shapes"
             raise ValueError(msg)
         if positions.ndim != 2 or positions.shape[1] != 3:
             msg = "positions must have shape (n_particles, 3)"
@@ -1365,48 +1263,6 @@ class CompositeConstraints:
         settle = self._dense_settle
         shake = self._dense_shake
         box = settle._box(cell)
-        if affine_mode == _VELOCITY_AFFINE_NONE:
-            shake_deltas = _shake_cluster_velocity_deltas(
-                positions,
-                velocities,
-                masses,
-                shake.cluster_atoms,
-                shake.peripheral_counts,
-                box,
-                max_iterations=shake.max_iterations,
-                periodic=cell is not None,
-            )
-            owners, params, settle_placeholder = self._dense_device_state(
-                positions.shape[0],
-                apply_settle=apply_settle,
-                apply_shake=True,
-            )
-            settle_deltas = (
-                _settle_water_velocity_deltas(
-                    positions,
-                    velocities,
-                    masses,
-                    settle.waters,
-                    box,
-                    periodic=cell is not None,
-                )
-                if apply_settle
-                else settle_placeholder
-            )
-            return _dense_constraint_apply(
-                velocities,
-                *owners,
-                settle_deltas,
-                shake_deltas,
-                params,
-            )
-
-        affine_parameters = self._dense_affine_parameters(
-            affine_mode,
-            time_step=time_step,
-            force_scale=force_scale,
-            half_time_step=half_time_step,
-        )
         shake_deltas = _shake_cluster_velocity_deltas(
             positions,
             velocities,
@@ -1416,14 +1272,11 @@ class CompositeConstraints:
             box,
             max_iterations=shake.max_iterations,
             periodic=cell is not None,
-            affine_values=affine_values,
-            affine_parameters=affine_parameters,
         )
-        owners, params, settle_placeholder = self._dense_affine_device_state(
+        owners, params, settle_placeholder = self._dense_device_state(
             positions.shape[0],
             apply_settle=apply_settle,
             apply_shake=True,
-            periodic=cell is not None,
         )
         settle_deltas = (
             _settle_water_velocity_deltas(
@@ -1433,8 +1286,6 @@ class CompositeConstraints:
                 settle.waters,
                 box,
                 periodic=cell is not None,
-                affine_values=affine_values,
-                affine_parameters=affine_parameters,
             )
             if apply_settle
             else settle_placeholder
@@ -1445,59 +1296,6 @@ class CompositeConstraints:
             settle_deltas,
             shake_deltas,
             params,
-            positions=positions,
-            affine_values=affine_values,
-            masses=masses,
-            box_lengths=box,
-            affine_parameters=affine_parameters,
-        )
-
-    def _apply_pre_force_affine_velocities(
-        self,
-        positions,
-        predicted_positions,
-        velocities,
-        masses,
-        cell: Cell | None = None,
-        *,
-        time_step: float,
-    ) -> mx.array | None:
-        """Fold the constrained-position drift correction into dense RATTLE."""
-
-        return self._dense_velocities(
-            as_mx_array(positions),
-            as_mx_array(velocities),
-            as_mx_array(masses),
-            cell,
-            apply_settle=False,
-            affine_values=as_mx_array(predicted_positions),
-            affine_mode=_VELOCITY_AFFINE_POSITION_CORRECTION,
-            time_step=time_step,
-        )
-
-    def _apply_final_affine_velocities(
-        self,
-        positions,
-        velocities,
-        forces,
-        masses,
-        cell: Cell | None = None,
-        *,
-        force_scale: float,
-        half_time_step: float,
-    ) -> mx.array | None:
-        """Fold the final force half-kick into dense SETTLE and RATTLE."""
-
-        return self._dense_velocities(
-            as_mx_array(positions),
-            as_mx_array(velocities),
-            as_mx_array(masses),
-            cell,
-            apply_settle=True,
-            affine_values=as_mx_array(forces),
-            affine_mode=_VELOCITY_AFFINE_FORCE_KICK,
-            force_scale=force_scale,
-            half_time_step=half_time_step,
         )
 
     def max_error(self, positions, cell: Cell | None = None) -> mx.array:

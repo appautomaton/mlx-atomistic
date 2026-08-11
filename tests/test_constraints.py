@@ -561,44 +561,6 @@ def test_cpu_disjoint_settle_shake_composite_retains_sequential_fallback(
     assert final.shape == velocities.shape
 
 
-def test_dense_affine_disjoint_composite_declines_private_calls_on_cpu():
-    """An otherwise eligible disjoint composite declines both affine CPU calls."""
-
-    settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
-    shake = _ShakeClusterConstraints(
-        [[3, 4, 5, -1]],
-        peripheral_counts=[2],
-        distances=[1.2],
-        max_iterations=8,
-    )
-    disjoint = CompositeConstraints((settle, shake))
-    positions = mx.zeros((6, 3), dtype=mx.float32)
-    velocities = mx.zeros_like(positions)
-    forces = mx.ones_like(positions)
-    masses = mx.ones((6,), dtype=mx.float32)
-    assert (
-        disjoint._apply_pre_force_affine_velocities(
-            positions,
-            positions,
-            velocities,
-            masses,
-            time_step=0.001,
-        )
-        is None
-    )
-    assert (
-        disjoint._apply_final_affine_velocities(
-            positions,
-            velocities,
-            forces,
-            masses,
-            force_scale=1.0,
-            half_time_step=0.0005,
-        )
-        is None
-    )
-
-
 def test_overlapping_composite_retains_full_pre_force_projection():
     settle = SettleWaterConstraints([(0, 1, 2)], oh_distance=1.0, hh_distance=1.5)
     tether = DistanceConstraints([(0, 3)], distances=[2.0], max_iterations=4)

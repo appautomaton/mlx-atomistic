@@ -33,6 +33,8 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [md-dense-affine-verdict-m5max.md](./md-dense-affine-verdict-m5max.md) | mlx_atomistic | 5DFR dense affine constraint leave-one-out verdict | Metal | Apple M5 Max |
+| [dft-hpsi-metal-boundary-m5max.md](./dft-hpsi-metal-boundary-m5max.md) | mlx_atomistic | Silicon fixed-density Hpsi boundary profiling and rejected Metal candidates | Metal | Apple M5 Max |
 | [dft-material-validation.md](./dft-material-validation.md) | mlx_atomistic | accepted Si, C, and MgO periodic DFT workloads | Metal | Apple M5 Max |
 | [inventory-gap-matrix.md](./inventory-gap-matrix.md) | mlx_atomistic | benchmark inventory and Phase 3 gaps | N/A | N/A |
 | [benchmark-ladder.md](./benchmark-ladder.md) | mlx_atomistic/openmm-reference/lammps-reference | benchmark ladder and row decision value | Metal/OpenCL where available | local |
@@ -73,6 +75,7 @@ Markdown summaries should cite those raw paths and reproduction commands.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
+| `uv run python -m mlx_atomistic.benchmarks.dft_hpsi_profile --manifest results/dft-workload/manifest.json --gth-source results/dft-workload/resources/Si-GTH-PBE-q4.gth --out results/dft-hpsi-stage-profile/control --warmups 3 --samples 7 --json` | mlx_atomistic | opt-in performance | atomic stage profile under `results/dft-hpsi-stage-profile/`; optional Metal capture is non-CI |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --include-large --steps 100 --json > results/mlx-md-performance.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --include-large --evaluations 10 --json > results/mlx-md-acceleration.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.neighbor_nonbonded_parity --sizes 1000,4000,16000,50000,92001 --out results/scalable-neighbor-nonbonded-runtime/parity.json` | mlx_atomistic | opt-in correctness/performance | parity and timing JSON under `results/` |
