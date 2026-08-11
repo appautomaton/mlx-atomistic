@@ -26,10 +26,7 @@ def _block_pair_set(neighbors):
 
 def _neighbor_pair_set(neighbors):
     if neighbors.tiles is not None:
-        return {
-            tuple(pair)
-            for pair in np.asarray(neighbors.tiles.materialize_pairs()).tolist()
-        }
+        return {tuple(pair) for pair in np.asarray(neighbors.tiles.materialize_pairs()).tolist()}
     if neighbors.blocks is not None:
         return _block_pair_set(neighbors)
     return {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()}
@@ -96,6 +93,10 @@ def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():
 
     tiles = neighbors.tiles
     assert isinstance(tiles, NeighborTiles)
+    assert not neighbors.diagnostic_pairs_materialized
+    assert neighbors.materialized_diagnostic_pairs is None
+    assert neighbors.estimated_pair_bytes == tiles.estimated_bytes
+    assert neighbors.estimated_compact_pair_bytes == 0
     np.testing.assert_array_equal(
         np.asarray(tiles.materialize_pairs()),
         np.asarray(oracle.pairs),
@@ -107,6 +108,8 @@ def test_neighbor_tiles_materialize_exact_cutoff_plus_skin_membership():
         np.asarray(neighbors.diagnostic_pairs),
         np.asarray(oracle.pairs),
     )
+    assert neighbors.diagnostic_pairs_materialized
+    assert neighbors.diagnostic_pairs is neighbors.materialized_diagnostic_pairs
     assert neighbors.interactions is neighbors.diagnostic_pairs
     assert neighbors.force_candidates(prefer_tiles=False) is neighbors.diagnostic_pairs
     assert neighbors.force_candidates(prefer_tiles=True) is tiles
@@ -434,9 +437,7 @@ def test_mlx_cell_blocks_cover_periodic_cell_list_pairs_without_compaction():
         block_size=32,
     )
 
-    assert {tuple(pair) for pair in np.asarray(oracle.pairs).tolist()} <= _block_pair_set(
-        candidate
-    )
+    assert {tuple(pair) for pair in np.asarray(oracle.pairs).tolist()} <= _block_pair_set(candidate)
     assert candidate.backend == "mlx_cell_blocks"
     assert candidate.representation_kind == "blocks"
     assert candidate.blocks is not None
@@ -542,14 +543,17 @@ def test_triclinic_dense_neighbor_pairs_use_minimum_image():
         dtype=np.float32,
     )
     cell = Cell.triclinic(matrix)
-    positions = np.array(
-        [
-            [0.95, 0.5, 0.5],
-            [0.05, 0.5, 0.5],
-            [0.5, 0.5, 0.5],
-        ],
-        dtype=np.float32,
-    ) @ matrix
+    positions = (
+        np.array(
+            [
+                [0.95, 0.5, 0.5],
+                [0.05, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        @ matrix
+    )
 
     neighbors = build_neighbor_list(
         positions,
@@ -602,10 +606,13 @@ def test_triclinic_numpy_rebuild_check_uses_minimum_image():
     )
     cell = Cell.triclinic(matrix)
     start = np.array([[0.95, 0.5, 0.5], [0.5, 0.5, 0.5]], dtype=np.float32) @ matrix
-    wrapped_small_move = np.array(
-        [[0.05, 0.5, 0.5], [0.5, 0.5, 0.5]],
-        dtype=np.float32,
-    ) @ matrix
+    wrapped_small_move = (
+        np.array(
+            [[0.05, 0.5, 0.5], [0.5, 0.5, 0.5]],
+            dtype=np.float32,
+        )
+        @ matrix
+    )
     manager = NeighborListManager(
         cell,
         cutoff=0.6,
@@ -690,12 +697,8 @@ def test_default_backend_switch_preserves_lj_physics():
     pos = mx.array(pos_np)
     lj = LennardJonesPotential(cutoff=2.5)
 
-    nl_pairs = build_neighbor_list(
-        pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_pairs"
-    )
-    nl_blocks = build_neighbor_list(
-        pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_blocks"
-    )
+    nl_pairs = build_neighbor_list(pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_pairs")
+    nl_blocks = build_neighbor_list(pos_np, cell, cutoff=2.5, skin=0.4, backend="mlx_cell_blocks")
     assert nl_pairs.backend == "mlx_cell_pairs"
     assert nl_blocks.backend == "mlx_cell_blocks"
 

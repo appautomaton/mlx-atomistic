@@ -377,7 +377,6 @@ def test_dense_composite_declines_overlap_and_runtime_profiling(monkeypatch):
     assert profiled.route_profile["reconciled"] is True
 
 
-
 @pytest.mark.gpu
 def test_settle_water_kernels_match_openmm_position_oracle():
     """Fused SETTLE position and velocity kernels preserve the reference step."""
@@ -500,14 +499,10 @@ def test_fused_langevin_baoab_drift_matches_eager_trajectory(monkeypatch):
     ):
         del counts
         half_dt = parameters[0]
-        velocity_half = current_velocities + (
-            half_dt * force_scale_over_mass[:, None] * forces
-        )
+        velocity_half = current_velocities + (half_dt * force_scale_over_mass[:, None] * forces)
         next_positions = current_positions + half_dt * velocity_half
         next_positions = next_positions - box * mx.floor(next_positions / box)
-        middle_velocities = (
-            parameters[1] * velocity_half + thermal_scale[:, None] * noise
-        )
+        middle_velocities = parameters[1] * velocity_half + thermal_scale[:, None] * noise
         next_positions = next_positions + half_dt * middle_velocities
         return (
             next_positions - box * mx.floor(next_positions / box),
@@ -794,9 +789,7 @@ def test_neighbor_cutoff_mask_matches_mlx_and_preserves_compact_pair_order():
     search_radius = 2.0
 
     displacement = cell.minimum_image(positions[pairs_i] - positions[pairs_j])
-    expected_mask = (
-        mx.sum(displacement * displacement, axis=1) < search_radius * search_radius
-    )
+    expected_mask = mx.sum(displacement * displacement, axis=1) < search_radius * search_radius
     fused_mask = neighbor_pair_cutoff_mask(
         positions,
         pairs_i,
@@ -857,9 +850,7 @@ def test_neighbor_cutoff_mask_matches_mlx_and_preserves_compact_pair_order():
         backend="periodic_cell_list",
     )
     assert np.array_equal(np.asarray(first.pairs), np.asarray(second.pairs))
-    assert {
-        tuple(pair) for pair in np.asarray(first.pairs).tolist()
-    } == {
+    assert {tuple(pair) for pair in np.asarray(first.pairs).tolist()} == {
         tuple(pair) for pair in np.asarray(oracle.pairs).tolist()
     }
     assert first.compaction_backend == "metal_spatial_prefix_scan"
@@ -999,6 +990,8 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
         backend="mlx_cell_tiles",
     )
     assert tile_neighbors.tiles is not None
+    assert not tile_neighbors.diagnostic_pairs_materialized
+    assert tile_neighbors.estimated_pair_bytes == tile_neighbors.tiles.estimated_bytes
     assert tile_neighbors.compaction_backend == "metal_spatial_tile_prefix_scan"
     tile_blocks = np.asarray(tile_neighbors.tiles.tile_blocks)
     group_starts = np.asarray(tile_neighbors.tiles.force_group_starts)
@@ -1051,6 +1044,66 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
         exception_sigma=[1.05],
         exception_epsilon=[0.08],
     ).bind_pme_plan(cell)
+    deferred_neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=2.6,
+        skin=0.35,
+        sort_pairs=False,
+        backend="mlx_cell_tiles",
+    )
+    deferred_tiles = deferred_neighbors.tiles
+    assert deferred_tiles is not None
+    pipeline = _PreparedForcePipeline.prepare((potential,), cell=cell)
+    prepared = pipeline.bind(deferred_neighbors)
+    assert prepared.interactions is None
+    assert not deferred_neighbors.diagnostic_pairs_materialized
+    deferred_forces = prepared.forces(positions, evaluation_positions=positions)
+    mx.eval(deferred_forces)
+    assert np.all(np.isfinite(np.asarray(deferred_forces)))
+    assert not deferred_neighbors.diagnostic_pairs_materialized
+    tile_energy, tile_diagnostic_forces, tile_components = (
+        potential._runtime_energy_forces_with_components(
+            positions,
+            cell,
+            deferred_tiles,
+        )
+    )
+    pair_energy, pair_diagnostic_forces, pair_components = (
+        potential._runtime_energy_forces_with_components(
+            positions,
+            cell,
+            pair_neighbors.diagnostic_pairs,
+        )
+    )
+    mx.eval(
+        tile_energy,
+        tile_diagnostic_forces,
+        pair_energy,
+        pair_diagnostic_forces,
+        *tile_components.values(),
+        *pair_components.values(),
+    )
+    np.testing.assert_allclose(
+        np.asarray(tile_energy),
+        np.asarray(pair_energy),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(tile_diagnostic_forces),
+        np.asarray(pair_diagnostic_forces),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    for name in pair_components:
+        np.testing.assert_allclose(
+            np.asarray(tile_components[name]),
+            np.asarray(pair_components[name]),
+            rtol=2.0e-5,
+            atol=2.0e-3,
+        )
+    assert not deferred_neighbors.diagnostic_pairs_materialized
     tile_binding = potential._prepare_tile_force_binding(
         cell,
         tile_neighbors.diagnostic_pairs,
@@ -1650,21 +1703,16 @@ def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
     )
     assert fused is not NotImplemented
     energy, forces, components, virial = fused
-    reused = (
-        potential
-        ._runtime_energy_forces_with_components_virial_reusing_pairs(
-            positions,
-            cell,
-            pairs,
-            masses=masses,
-            molecule_ids=molecule_ids,
-            cutoff_strain_pairs=pairs,
-        )
+    reused = potential._runtime_energy_forces_with_components_virial_reusing_pairs(
+        positions,
+        cell,
+        pairs,
+        masses=masses,
+        molecule_ids=molecule_ids,
+        cutoff_strain_pairs=pairs,
     )
     assert reused is not NotImplemented
-    reused_energy, reused_forces, reused_components, reused_virial = (
-        reused
-    )
+    reused_energy, reused_forces, reused_components, reused_virial = reused
     mx.eval(
         reference_energy,
         reference_forces,
@@ -1749,14 +1797,12 @@ def test_fused_pme_diagnostic_virial_matches_existing_analytic_route():
         masses=masses,
         molecule_ids=None,
     )
-    translated_fused = (
-        potential._runtime_energy_forces_with_components_virial(
-            translated_positions,
-            cell,
-            translated_pairs,
-            masses=masses,
-            molecule_ids=None,
-        )
+    translated_fused = potential._runtime_energy_forces_with_components_virial(
+        translated_positions,
+        cell,
+        translated_pairs,
+        masses=masses,
+        molecule_ids=None,
     )
     assert translated_fused is not NotImplemented
     translated_virial = translated_fused[3]

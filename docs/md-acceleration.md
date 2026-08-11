@@ -29,8 +29,9 @@ existing force, constraint, and restart validation gates.
   consumers and historical benchmark reproduction.
 - `mlx_cell_tiles` spatially sorts atoms into eight-atom blocks, retains exact
   cutoff-plus-skin membership masks over non-empty 8x8 tiles, and groups tiles
-  sharing a left block for the prepared orthorhombic PME force route. It keeps
-  compact pairs as a diagnostic oracle during this development stage.
+  sharing a left block for the prepared orthorhombic PME force route. Compact
+  diagnostic pairs are deferred and materialized only when an explicit pair
+  consumer requests them.
 - `python_neighbor` means the Python/NumPy cell-list builder is included in the
   benchmark before MLX pair evaluation.
 - `auto` uses dense MLX when no pair list is supplied and the dense memory
@@ -682,10 +683,25 @@ here so they are not rederived:
   next allocation are 1.2 ms, and `cumsum` is 0.6 ms. The one true constant, the
   cell-lengths evaluation and readback at the top of every rebuild, is 0.3% of a
   step and would require caching inside `Cell`.
-- **The 117.6 MB exact-pair array materialized every rebuild is unused by the
-  tile force route.** It is a diagnostic oracle, and removing it is the Phase 2
-  exact-pair-oracle redesign under its existing reopening condition, not a local
-  change.
+- **The former 117.6 MB exact-pair array was unused by the tile force route.**
+  The first on-demand experiment still decoded it through force binding and MD
+  diagnostics and was 1.8% slower. The retained design removes those eager
+  consumers: tile-aware force terms declare whether they consume or ignore the
+  tile schedule, and the non-pressure energy diagnostic uses the same tile
+  membership directly. Exact pairs now remain absent unless an explicit pair
+  API or an unsupported custom force requests them.
+
+That redesign reduced the independent 23,558-atom 5DFR complete-wall median
+from 0.124154 to 0.103989 seconds, a 16.24% improvement. Median rebuild time
+fell 45.39%, estimated resident neighbor storage fell from 129.37 to 11.77 MB,
+and Metal peak allocation fell from 962.3 to 102.8 MB. Four control and four
+candidate runs all passed the science and route checks. A 94,232-atom JAC
+transfer also passed all checks; its candidate was stable at a 0.303246-second
+median and remained 14.42% faster even against the fastest control sample.
+See
+[`md-neighbor-roundtrip-verdict-m5max.md`](./benchmarks/md-neighbor-roundtrip-verdict-m5max.md)
+for the complete protocol and the deliberately conservative interpretation of
+the noisier JAC control.
 
 One pure duplication was removed. `NeighborListManager.rebuild` rebuilt the tile
 geometry through `dataclasses.replace` only to stamp a generation counter, and
@@ -737,13 +753,21 @@ gain", not as established regressions:
 | Flattened and cached force-buffer summation | 0.33% slower |
 | Deferred topology-mask materialization | 0.37% faster; the wait moved into first force evaluation |
 | Omitting the disjoint SHAKE pre-force projection | 1.7% slower |
-| On-demand exact-pair decoding | 1.8% slower |
+| Partial on-demand exact-pair decoding with eager downstream consumers | 1.8% slower |
 | Ordinary-step graph pruning | 2.08% faster; only two `ExpandDims` and two `Reshape` nodes were removed |
 | Fused tile compaction and pair emission | 2.64% slower |
 | Prefix tails, fresh extraction | 3.10% slower |
 | One-transfer prefix tails | At most about 4.2% after settling |
 | Eight-tile same-left grouping | Isolated kernel 5.53% faster; complete wall 0.558220 to 0.559019 s |
 | Admission intervals greater than one | No complete-wall gain |
+
+The retained deferred exact-pair route does not repeat the closed partial
+experiment. It removes the force-binding and diagnostic consumers that caused
+the delayed decode to re-enter the recurring path. The small prefix-tail
+inventory values are also transferred together, but capacity-sized tile
+buffers were not added: historical capacity and fused-output candidates
+regressed, while removing the unnecessary exact-pair allocation already
+eliminated the dominant storage and synchronization cost.
 
 Two directions were closed in isolation and later retained under composition,
 because they alter the same ordinary constraint and integration graph: dense

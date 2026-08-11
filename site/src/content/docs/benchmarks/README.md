@@ -36,6 +36,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [md-neighbor-roundtrip-verdict-m5max.md](./md-neighbor-roundtrip-verdict-m5max.md) | mlx_atomistic | 5DFR neighbor rebuild and deferred exact-pair verdict, with JAC transfer | Metal | Apple M5 Max |
 | [mlx-dft-silicon-m5max.md](./mlx-dft-silicon-m5max.md) | mlx_atomistic | 8-atom periodic silicon DFT, 6³ k-point mesh | Metal | Apple M5 Max |
 | [dft-material-validation.md](./dft-material-validation.md) | mlx_atomistic | accepted Si, C, and MgO periodic DFT workloads | Metal | Apple M5 Max |
 | [inventory-gap-matrix.md](./inventory-gap-matrix.md) | mlx_atomistic | benchmark inventory and Phase 3 gaps | N/A | N/A |

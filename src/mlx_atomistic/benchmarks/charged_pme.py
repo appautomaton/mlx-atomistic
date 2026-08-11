@@ -491,6 +491,10 @@ def runtime_payload(
                 and neighbor_report["representation"] == expected_representation
             ),
             "no_neighbor_fallback": neighbor_report["fallback_reason"] is None,
+            "tile_diagnostic_pairs_unmaterialized": (
+                neighbor_backend != "mlx_cell_tiles"
+                or neighbor_report.get("diagnostic_pairs_materialized") is False
+            ),
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
             "process_memory_within_limit": (
                 process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES

@@ -327,6 +327,7 @@ _pme_direct_kernel_singleton = None
 _pme_direct_virial_kernel_singleton = None
 _pme_direct_force_only_kernel_singleton = None
 _prepared_pme_direct_force_only_kernel_singleton = None
+_tile_pme_direct_kernel_singleton = None
 _tile_pme_direct_force_only_kernel_singleton = None
 _sparse_pme_correction_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
@@ -341,6 +342,7 @@ _neighbor_cell_tile_candidates_kernel_singleton = None
 _neighbor_tile_membership_kernel_singleton = None
 _neighbor_tile_ordered_scatter_kernel_singleton = None
 _neighbor_tile_force_groups_kernel_singleton = None
+_neighbor_tile_member_counts_kernel_singleton = None
 _neighbor_tile_pair_scatter_kernel_singleton = None
 _tile_topology_lj_masks_kernel_singleton = None
 _shake_cluster_position_kernel_singleton = None
@@ -361,10 +363,7 @@ _TILE_PME_GROUPS_PER_THREADGROUP = 4
 _TILE_PME_DISPATCH_WIDTH = 32 * _TILE_PME_GROUPS_PER_THREADGROUP
 _TILE_MEMBERSHIP_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
 _TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
-    _TILE_PME_BLOCK_SIZE
-    * (1 + 3 + 1 + 1 + 1)
-    * 4
-    * _TILE_PME_GROUPS_PER_THREADGROUP
+    _TILE_PME_BLOCK_SIZE * (1 + 3 + 1 + 1 + 1) * 4 * _TILE_PME_GROUPS_PER_THREADGROUP
 )
 
 
@@ -373,6 +372,7 @@ def _tile_pme_threadgroup_count(force_group_count: int) -> int:
 
     packing = _TILE_PME_GROUPS_PER_THREADGROUP
     return (force_group_count + packing - 1) // packing
+
 
 # The float32 erf/expm1 implementation below is adapted from MLX's Metal
 # kernels:
@@ -907,7 +907,7 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
 # runs, only the dispatch shape and the load count change. Trailing SIMD groups
 # beyond the last force group clamp their indices and are held inactive rather
 # than returning early, because every thread must reach the barrier below.
-_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
+_TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     uint tg_thread = thread_position_in_threadgroup.x;
     uint lane = tg_thread & 31u;
     uint sub = tg_thread >> 5u;
@@ -957,6 +957,10 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
     float accumulated_right_fx = 0.0f;
     float accumulated_right_fy = 0.0f;
     float accumulated_right_fz = 0.0f;
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
+    float accumulated_lj_energy = 0.0f;
+    float accumulated_coulomb_energy = 0.0f;
+#endif
     uint member_word_0 = member_mask[2 * tile + 0];
     uint member_word_1 = member_mask[2 * tile + 1];
     uint lj_word_0 = lj_enabled_mask[2 * tile + 0];
@@ -990,6 +994,10 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
         float fx = 0.0f;
         float fy = 0.0f;
         float fz = 0.0f;
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
+        float pair_lj_energy = 0.0f;
+        float pair_coulomb_energy = 0.0f;
+#endif
         if (member && left_atom >= 0 && right_atom >= 0) {
             float dx = left_positions[pbase + 3 * left_slot + 0] - right_x;
             float dy = left_positions[pbase + 3 * left_slot + 1] - right_y;
@@ -1053,6 +1061,22 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                             ) * inv_switch_width;
                         }
                     }
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
+                    if (switch_flag <= 0.5f) {
+                        unswitched_energy =
+                            4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                        if (shift_flag > 0.5f) {
+                            float sigma2_over_rc2 =
+                                sigma_ij * sigma_ij / cutoff2;
+                            float inv_rc6 = sigma2_over_rc2
+                                * sigma2_over_rc2 * sigma2_over_rc2;
+                            unswitched_energy -= 4.0f * epsilon_ij
+                                * (inv_rc6 * inv_rc6 - inv_rc6);
+                        }
+                    }
+                    pair_lj_energy =
+                        unswitched_energy * switch_value * lj_scale;
+#endif
                     scalar += (
                         24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
                         * inv_r2 * switch_value
@@ -1063,6 +1087,10 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
                 float qij = left_charges[lbase + left_slot] * right_charge;
                 float erfc_term =
                     mlx_atomistic_erfc_nonnegative(ewald_alpha * distance);
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
+                pair_coulomb_energy =
+                    coulomb * qij * erfc_term * inv_distance;
+#endif
                 scalar += coulomb * qij * (
                     erfc_term * inv_r2 * inv_distance
                     + ewald_self * exp(-ewald_alpha * ewald_alpha * r2) * inv_r2
@@ -1076,6 +1104,10 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
         accumulated_right_fx -= fx;
         accumulated_right_fy -= fy;
         accumulated_right_fz -= fz;
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
+        accumulated_lj_energy += pair_lj_energy;
+        accumulated_coulomb_energy += pair_coulomb_energy;
+#endif
         float reduced_left_fx = simd_sum(fx);
         float reduced_left_fy = simd_sum(fy);
         float reduced_left_fz = simd_sum(fz);
@@ -1120,7 +1152,25 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = r"""
             &forces[3 * right_atom + 2], accumulated_right_fz, memory_order_relaxed
         );
     }
+#ifndef MLX_ATOMISTIC_FORCE_ONLY
+    float reduced_lj_energy = simd_sum(accumulated_lj_energy);
+    float reduced_coulomb_energy = simd_sum(accumulated_coulomb_energy);
+    if (group_active && lane == 0u) {
+        atomic_store_explicit(
+            &group_lj_energy[group], reduced_lj_energy, memory_order_relaxed
+        );
+        atomic_store_explicit(
+            &group_coulomb_energy[group],
+            reduced_coulomb_energy,
+            memory_order_relaxed
+        );
+    }
+#endif
 """.replace("GROUPS_PER_TG", str(_TILE_PME_GROUPS_PER_THREADGROUP))
+
+_TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
+    "#define MLX_ATOMISTIC_FORCE_ONLY 1\n" + _TILE_PREPARED_PME_DIRECT_SOURCE
+)
 
 _SPARSE_PME_CORRECTION_FORCE_ONLY_SOURCE = r"""
     uint t = thread_position_in_grid.x;
@@ -1710,6 +1760,21 @@ _NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
         force_group_starts[output] = tile_start + consumed;
         force_group_counts[output] = min(tiles_per_group, tile_count - consumed);
     }
+"""
+
+_NEIGHBOR_TILE_MEMBER_COUNTS_SOURCE = r"""
+    uint tile = thread_position_in_grid.x;
+    if (tile >= (uint)counts[0]) {
+        return;
+    }
+    uint total = 0u;
+    for (uint word_index = 0u; word_index < 2u; word_index++) {
+        uint word = member_mask[2 * tile + word_index];
+        for (uint bit = 0u; bit < 32u; bit++) {
+            total += (word >> bit) & 1u;
+        }
+    }
+    member_counts[tile] = (int)total;
 """
 
 _NEIGHBOR_TILE_PAIR_SCATTER_SOURCE = r"""
@@ -2470,6 +2535,37 @@ def _tile_pme_direct_force_only_kernel():
     return _tile_pme_direct_force_only_kernel_singleton
 
 
+def _tile_pme_direct_kernel():
+    """Return the cached spatial 8x8 tile direct energy/force kernel."""
+
+    global _tile_pme_direct_kernel_singleton
+    if _tile_pme_direct_kernel_singleton is None:
+        _tile_pme_direct_kernel_singleton = mx.fast.metal_kernel(
+            name="spatial_tile_prepared_parameterized_pme_direct",
+            input_names=[
+                "positions",
+                "atom_blocks",
+                "tile_blocks",
+                "member_mask",
+                "lj_enabled_mask",
+                "lj_one_four_mask",
+                "force_group_starts",
+                "force_group_counts",
+                "box",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "params",
+                "ngroups",
+            ],
+            output_names=["forces", "group_lj_energy", "group_coulomb_energy"],
+            source=_TILE_PREPARED_PME_DIRECT_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _tile_pme_direct_kernel_singleton
+
+
 def _sparse_pme_correction_force_only_kernel():
     """Return the cached fused sparse PME-correction force kernel."""
 
@@ -2588,10 +2684,7 @@ def _pme_order5_interpolate_kernel():
             ],
             output_names=["atom_energy", "forces"],
             source=_PME_ORDER5_INTERPOLATE_SOURCE,
-            header=(
-                _PME_ORDER5_HEADER
-                + "\n#define MLX_ATOMISTIC_PME_WRITE_ENERGY 1\n"
-            ),
+            header=(_PME_ORDER5_HEADER + "\n#define MLX_ATOMISTIC_PME_WRITE_ENERGY 1\n"),
         )
     return _pme_order5_interpolate_kernel_singleton
 
@@ -2775,6 +2868,20 @@ def _neighbor_tile_force_groups_kernel():
             source=_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE,
         )
     return _neighbor_tile_force_groups_kernel_singleton
+
+
+def _neighbor_tile_member_counts_kernel():
+    """Return the cached compact-tile membership counter."""
+
+    global _neighbor_tile_member_counts_kernel_singleton
+    if _neighbor_tile_member_counts_kernel_singleton is None:
+        _neighbor_tile_member_counts_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_member_counts",
+            input_names=["member_mask", "counts"],
+            output_names=["member_counts"],
+            source=_NEIGHBOR_TILE_MEMBER_COUNTS_SOURCE,
+        )
+    return _neighbor_tile_member_counts_kernel_singleton
 
 
 def _neighbor_tile_pair_scatter_kernel():
@@ -3139,10 +3246,7 @@ def _neighbor_cell_tile_candidates(
     cell_block_counts = as_mx_array(cell_block_counts, dtype=mx.int32)
     cell_pairs = as_mx_array(cell_pairs, dtype=mx.int32)
     task_offsets = as_mx_array(task_offsets, dtype=mx.int32)
-    if (
-        cell_block_starts.ndim != 1
-        or cell_block_counts.shape != cell_block_starts.shape
-    ):
+    if cell_block_starts.ndim != 1 or cell_block_counts.shape != cell_block_starts.shape:
         msg = "cell block starts and counts must have matching one-dimensional shapes"
         raise ValueError(msg)
     if cell_pairs.ndim != 2 or cell_pairs.shape[1] != 2:
@@ -3291,10 +3395,7 @@ def _neighbor_tile_force_groups_sized(
     group_counts = as_mx_array(group_counts, dtype=mx.int32)
     group_prefix = as_mx_array(group_prefix, dtype=mx.int32)
     block_count = int(tile_counts.shape[0])
-    if any(
-        values.shape != (block_count,)
-        for values in (tile_prefix, group_counts, group_prefix)
-    ):
+    if any(values.shape != (block_count,) for values in (tile_prefix, group_counts, group_prefix)):
         msg = "tile and group counts/prefixes must have matching one-dimensional shapes"
         raise ValueError(msg)
     if tiles_per_group <= 0:
@@ -3372,6 +3473,29 @@ def _neighbor_tile_member_pairs_sized(
         init_value=0,
     )
     return mx.stack((accepted_i, accepted_j), axis=1)
+
+
+def _neighbor_tile_member_counts(member_mask: mx.array) -> mx.array:
+    """Count active lanes in already-compacted spatial-tile masks."""
+
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    if member_mask.ndim != 2 or member_mask.shape[1] != 2:
+        msg = "member_mask must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    tile_count = int(member_mask.shape[0])
+    if tile_count == 0:
+        return mx.zeros((0,), dtype=mx.int32)
+    return _neighbor_tile_member_counts_kernel()(
+        inputs=[
+            member_mask,
+            mx.array([tile_count], dtype=mx.int32),
+        ],
+        output_shapes=[(tile_count,)],
+        output_dtypes=[mx.int32],
+        grid=(tile_count, 1, 1),
+        threadgroup=(min(256, tile_count), 1, 1),
+        init_value=0,
+    )[0]
 
 
 def tile_topology_lj_masks(
@@ -4944,9 +5068,7 @@ def _prepared_parameterized_pme_direct_force_only(
         dtype=mx.float32,
     )
     npair = mx.array([n_pairs], dtype=mx.int32)
-    worker_count = (
-        n_pairs + _PREPARED_PME_PAIRS_PER_WORKER - 1
-    ) // _PREPARED_PME_PAIRS_PER_WORKER
+    worker_count = (n_pairs + _PREPARED_PME_PAIRS_PER_WORKER - 1) // _PREPARED_PME_PAIRS_PER_WORKER
     threads = min(64, worker_count)
     (forces,) = _prepared_pme_direct_force_only_kernel()(
         inputs=[
@@ -4990,7 +5112,8 @@ def _tile_parameterized_pme_direct_force_only(
     one_four_scale: float,
     coulomb_constant: float,
     alpha: float,
-) -> mx.array:
+    _return_energy: bool = False,
+) -> mx.array | tuple[mx.array, mx.array, mx.array]:
     """Evaluate prepared direct forces from exact spatial 8x8 tiles."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
@@ -5057,7 +5180,11 @@ def _tile_parameterized_pme_direct_force_only(
         msg = "switch_distance must be finite, non-negative, and below cutoff"
         raise ValueError(msg)
     if tile_count == 0:
-        return mx.zeros_like(positions)
+        forces = mx.zeros_like(positions)
+        if _return_energy:
+            zero = mx.array(0.0, dtype=mx.float32)
+            return zero, zero, forces
+        return forces
     if group_count == 0:
         msg = "non-empty tile geometry requires at least one force group"
         raise ValueError(msg)
@@ -5082,28 +5209,46 @@ def _tile_parameterized_pme_direct_force_only(
         ],
         dtype=mx.float32,
     )
+    inputs = [
+        positions,
+        atom_blocks,
+        tile_blocks,
+        member_mask,
+        lj_enabled_mask,
+        lj_one_four_mask,
+        force_group_starts,
+        force_group_counts,
+        box,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+        params,
+        mx.array([group_count], dtype=mx.int32),
+    ]
+    dispatch = {
+        "grid": (
+            _tile_pme_threadgroup_count(group_count) * _TILE_PME_DISPATCH_WIDTH,
+            1,
+            1,
+        ),
+        "threadgroup": (_TILE_PME_DISPATCH_WIDTH, 1, 1),
+        "init_value": 0.0,
+    }
+    if _return_energy:
+        forces, group_lj_energy, group_coulomb_energy = _tile_pme_direct_kernel()(
+            inputs=inputs,
+            output_shapes=[(n_atoms, 3), (group_count,), (group_count,)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+            **dispatch,
+        )
+        return mx.sum(group_lj_energy), mx.sum(group_coulomb_energy), forces
     (forces,) = _tile_pme_direct_force_only_kernel()(
         inputs=[
-            positions,
-            atom_blocks,
-            tile_blocks,
-            member_mask,
-            lj_enabled_mask,
-            lj_one_four_mask,
-            force_group_starts,
-            force_group_counts,
-            box,
-            half_sigma,
-            sqrt_epsilon,
-            charges,
-            params,
-            mx.array([group_count], dtype=mx.int32),
+            *inputs,
         ],
         output_shapes=[(n_atoms, 3)],
         output_dtypes=[mx.float32],
-        grid=(_tile_pme_threadgroup_count(group_count) * _TILE_PME_DISPATCH_WIDTH, 1, 1),
-        threadgroup=(_TILE_PME_DISPATCH_WIDTH, 1, 1),
-        init_value=0.0,
+        **dispatch,
     )
     return forces
 
