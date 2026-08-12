@@ -86,3 +86,24 @@ did not grow relative to the 750-step samples.
 
 Raw generated evidence is under `results/md-active-columns/` and remains
 gitignored. The detached control source is commit `999a632`.
+
+## Follow-up threadgroup sweep
+
+A follow-up sweep on 2026-08-12 compared one, two, four, and eight SIMD groups
+per Metal threadgroup without changing the active-column geometry or force
+arithmetic. Isolated direct-kernel measurements eliminated one and eight
+groups because neither produced a repeatable advantage across 5DFR and JAC.
+Two groups showed the best isolated JAC result and advanced to complete-wall
+testing against the retained four-group configuration.
+
+Four independent 75-step samples per arm used the same 10 warmups, timestep,
+temperature, seed, neighbor skin, and check interval as the sustained tests
+above. On 5DFR, two groups had a 98.079 ms median against 98.933 ms for four
+groups, a 0.86% reduction. On JAC, two groups had a 379.187 ms median against
+376.750 ms for four groups, a 0.65% regression. Every run passed its runtime
+checks, and peak Metal memory was unchanged within allocator noise.
+
+The two-group candidate was rejected because its small 5DFR result did not
+transfer to JAC and both differences were below the observed host-mode
+variation. Four SIMD groups per threadgroup remains the runtime configuration.
+The raw sweep is under `results/md-threadgroup-tuning/` and remains gitignored.
