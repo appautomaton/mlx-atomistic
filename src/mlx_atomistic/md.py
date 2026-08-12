@@ -2658,9 +2658,10 @@ def _neighbor_profile_values(neighbor_list: NeighborList | None) -> tuple[mx.arr
                 neighbor_list.tiles.member_mask,
             )
         )
-        if neighbor_list.tiles.force_group_starts is not None:
+        if neighbor_list.tiles.force_columns is not None:
             values.extend(
                 (
+                    neighbor_list.tiles.force_columns,
                     neighbor_list.tiles.force_group_starts,
                     neighbor_list.tiles.force_group_counts,
                 )

@@ -950,6 +950,7 @@ def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
     assert np.array_equal(np.asarray(tiled.pairs), expected)
     assert tiled.tiles is not None
     assert np.array_equal(np.asarray(tiled.tiles.materialize_pairs()), expected)
+    assert tiled.tiles.force_columns is not None
     assert tiled.tiles.force_group_starts is not None
     assert tiled.tiles.force_group_counts is not None
     assert first.candidate_count is not None
@@ -995,16 +996,28 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
     assert tile_neighbors.estimated_pair_bytes == tile_neighbors.tiles.estimated_bytes
     assert tile_neighbors.compaction_backend == "metal_spatial_tile_prefix_scan"
     tile_blocks = np.asarray(tile_neighbors.tiles.tile_blocks)
+    force_columns = np.asarray(tile_neighbors.tiles.force_columns)
     group_starts = np.asarray(tile_neighbors.tiles.force_group_starts)
     group_counts = np.asarray(tile_neighbors.tiles.force_group_counts)
     group_ends = group_starts + group_counts
+    scheduled_tiles = force_columns // tile_neighbors.tiles.block_size
+    scheduled_columns = force_columns % tile_neighbors.tiles.block_size
     assert np.all(tile_blocks[1:, 0] >= tile_blocks[:-1, 0])
     assert group_starts[0] == 0
     assert np.all(group_starts[1:] == group_ends[:-1])
-    assert group_ends[-1] == tile_neighbors.tiles.tile_count
+    assert group_ends[-1] == tile_neighbors.tiles.active_column_count
     assert np.all(group_counts >= 1)
     assert np.all(group_counts <= DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE)
-    assert np.all(tile_blocks[group_starts, 0] == tile_blocks[group_ends - 1, 0])
+    assert np.all(
+        tile_blocks[scheduled_tiles[group_starts], 0]
+        == tile_blocks[scheduled_tiles[group_ends - 1], 0]
+    )
+    member_words = np.asarray(tile_neighbors.tiles.member_mask)[:, 0]
+    column_patterns = np.array([0x1111, 0x2222, 0x4444, 0x8888], dtype=np.uint32)
+    assert np.all(member_words[scheduled_tiles] & column_patterns[scheduled_columns])
+    assert len(force_columns) == sum(
+        np.count_nonzero(word & column_patterns) for word in member_words
+    )
     np.testing.assert_array_equal(
         np.asarray(tile_neighbors.diagnostic_pairs),
         np.asarray(pair_neighbors.diagnostic_pairs),
@@ -1242,6 +1255,7 @@ def test_direct_plus_sparse_correction_matches_reference_at_half_box():
         mx.array([[2]], dtype=mx.uint32),
         mx.zeros((1, 1), dtype=mx.uint32),
         mx.zeros((1, 1), dtype=mx.uint32),
+        mx.array([1], dtype=mx.int32),
         mx.array([0], dtype=mx.int32),
         mx.array([1], dtype=mx.int32),
         box,
@@ -1296,6 +1310,7 @@ def test_neighbor_tiles_reject_invalid_force_group_schedule():
             member_mask=mx.array([[1], [1]], dtype=mx.uint32),
             exact_pair_count=2,
             raw_candidate_count=2,
+            force_columns=mx.array([0, 4], dtype=mx.int32),
             force_group_starts=mx.array([0], dtype=mx.int32),
             force_group_counts=mx.array([2], dtype=mx.int32),
         )

@@ -799,10 +799,27 @@ def _tile_mask_occupancy(
         active_indices = np.argwhere(active_quadrants)
         if active_indices.size:
             tile_indices = active_indices[:, 0]
-            left_halves = active_indices[:, 1] // 2
+            quadrants = active_indices[:, 1]
+            left_halves = quadrants // 2
+            right_halves = quadrants % 2
             left_subblocks = 2 * blocks[tile_indices, 0] + left_halves
-            subtiles_by_left = np.bincount(left_subblocks)
-            subtile_force_group_count = int(np.sum((subtiles_by_left + 7) // 8))
+            quadrant_columns = np.count_nonzero(
+                np.any(
+                    tile_active.reshape((-1, 2, 4, 2, 4)),
+                    axis=2,
+                ),
+                axis=3,
+            )
+            active_columns = quadrant_columns[
+                tile_indices,
+                left_halves,
+                right_halves,
+            ]
+            columns_by_left = np.bincount(
+                left_subblocks,
+                weights=active_columns,
+            ).astype(np.int64)
+            subtile_force_group_count = int(np.sum((columns_by_left + 31) // 32))
         else:
             subtile_force_group_count = 0
         summary.update(
@@ -852,6 +869,7 @@ def _profile_tile_inventory(
         tiles.atom_blocks,
         tiles.tile_blocks,
         tiles.member_mask,
+        tiles.force_columns,
         tiles.force_group_starts,
         tiles.force_group_counts,
     )
@@ -985,6 +1003,8 @@ def _profile_tile_inventory(
         "block_size": tiles.block_size,
         "block_count": tiles.block_count,
         "tile_count": tiles.tile_count,
+        "active_column_count": tiles.active_column_count,
+        "scheduled_column_count": tiles.scheduled_column_count,
         "force_group_count": tiles.force_group_count,
         "exact_pair_count": tiles.exact_pair_count,
         "reference_pair_count": reference_pair_count,

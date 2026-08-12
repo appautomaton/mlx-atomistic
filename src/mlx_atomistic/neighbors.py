@@ -25,6 +25,7 @@ from mlx_atomistic.metal_kernels import (
     _neighbor_cell_pair_candidates,
     _neighbor_cell_tile_candidates,
     _neighbor_pair_ordered_scatter_sized,
+    _neighbor_tile_column_scatter_sized,
     _neighbor_tile_force_groups_sized,
     _neighbor_tile_member_counts,
     _neighbor_tile_member_pairs_sized,
@@ -60,7 +61,7 @@ DEFAULT_MLX_SPATIAL_MAX_CELLS_PER_ATOM = 4
 DEFAULT_MLX_CELL_BLOCK_SIZE = 256
 DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 4
 DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE = 8
-DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE = 8
+DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE = 32
 DEFAULT_MLX_CELL_TILE_BATCH = 65_536
 _MLX_MD_CACHE_LIMIT_BYTES = 4_000_000_000
 # Default neighbor backend for systems above the dense-pair limit. Measured on
@@ -193,6 +194,7 @@ class NeighborTiles:
     member_mask: mx.array
     exact_pair_count: int
     raw_candidate_count: int
+    force_columns: mx.array | None = None
     force_group_starts: mx.array | None = None
     force_group_counts: mx.array | None = None
     generation: int = 0
@@ -220,10 +222,27 @@ class NeighborTiles:
         if self.member_mask.dtype != mx.uint32:
             msg = "member_mask must use uint32 words"
             raise ValueError(msg)
-        if (self.force_group_starts is None) != (self.force_group_counts is None):
-            msg = "force group starts and counts must either both be present or absent"
+        schedule = (
+            self.force_columns,
+            self.force_group_starts,
+            self.force_group_counts,
+        )
+        if any(value is None for value in schedule) and not all(
+            value is None for value in schedule
+        ):
+            msg = (
+                "force columns, group starts, and group counts must all be present or "
+                "absent"
+            )
             raise ValueError(msg)
-        if self.force_group_starts is not None and self.force_group_counts is not None:
+        if (
+            self.force_columns is not None
+            and self.force_group_starts is not None
+            and self.force_group_counts is not None
+        ):
+            if self.force_columns.ndim != 1 or self.force_columns.dtype != mx.int32:
+                msg = "force columns must be an int32 vector"
+                raise ValueError(msg)
             if self.force_group_starts.ndim != 1 or (
                 self.force_group_counts.shape != self.force_group_starts.shape
             ):
@@ -235,37 +254,49 @@ class NeighborTiles:
             ):
                 msg = "force group starts and counts must use int32"
                 raise ValueError(msg)
+            column_count = int(self.force_columns.shape[0])
             group_count = int(self.force_group_starts.shape[0])
             if self.tile_count == 0:
-                if group_count:
-                    msg = "empty tile geometry cannot contain force groups"
+                if column_count or group_count:
+                    msg = "empty tile geometry cannot contain force columns or groups"
                     raise ValueError(msg)
-            elif group_count == 0:
-                msg = "non-empty tile geometry requires force groups"
+            elif column_count == 0 or group_count == 0:
+                msg = "non-empty tile geometry requires force columns and groups"
                 raise ValueError(msg)
             else:
                 starts = self.force_group_starts
                 counts = self.force_group_counts
                 ends = starts + counts
-                safe_starts = mx.clip(starts, 0, self.tile_count - 1)
-                safe_ends = mx.clip(ends - 1, 0, self.tile_count - 1)
+                safe_starts = mx.clip(starts, 0, column_count - 1)
+                safe_ends = mx.clip(ends - 1, 0, column_count - 1)
+                first_columns = self.force_columns[safe_starts]
+                last_columns = self.force_columns[safe_ends]
+                first_tiles = first_columns // self.block_size
+                last_tiles = last_columns // self.block_size
+                safe_first_tiles = mx.clip(first_tiles, 0, self.tile_count - 1)
+                safe_last_tiles = mx.clip(last_tiles, 0, self.tile_count - 1)
                 valid = (
                     (starts >= 0)
                     & (counts >= 1)
                     & (counts <= DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE)
-                    & (ends <= self.tile_count)
-                    & (self.tile_blocks[safe_starts, 0] == self.tile_blocks[safe_ends, 0])
+                    & (ends <= column_count)
+                    & (first_columns >= 0)
+                    & (last_columns < self.tile_count * self.block_size)
+                    & (
+                        self.tile_blocks[safe_first_tiles, 0]
+                        == self.tile_blocks[safe_last_tiles, 0]
+                    )
                 )
                 schedule_valid = (
                     mx.all(valid)
                     & (starts[0] == 0)
-                    & (ends[-1] == self.tile_count)
+                    & (ends[-1] == column_count)
                     & mx.all(starts[1:] == ends[:-1])
                 )
                 mx.eval(schedule_valid)
                 if not bool(np.asarray(schedule_valid)):
                     msg = (
-                        "force groups must cover tiles contiguously in same-left "
+                        "force groups must cover active columns contiguously in same-left "
                         f"groups of at most {DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE}"
                     )
                     raise ValueError(msg)
@@ -311,11 +342,25 @@ class NeighborTiles:
 
     @property
     def force_group_count(self) -> int:
-        """Number of same-left-block tile groups in the direct-force schedule."""
+        """Number of same-left-block column groups in the direct-force schedule."""
 
         if self.force_group_starts is None:
             return 0
         return int(self.force_group_starts.shape[0])
+
+    @property
+    def active_column_count(self) -> int:
+        """Number of non-empty right-atom columns in the direct-force schedule."""
+
+        if self.force_columns is None:
+            return 0
+        return int(self.force_columns.shape[0])
+
+    @property
+    def scheduled_column_count(self) -> int:
+        """Number of dispatched SIMD column lanes including group-tail padding."""
+
+        return self.force_group_count * DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE
 
     @property
     def padding_waste_count(self) -> int:
@@ -336,8 +381,16 @@ class NeighborTiles:
         """Estimated persistent bytes for block, tile, and membership arrays."""
 
         schedule_size = 0
-        if self.force_group_starts is not None and self.force_group_counts is not None:
-            schedule_size = self.force_group_starts.size + self.force_group_counts.size
+        if (
+            self.force_columns is not None
+            and self.force_group_starts is not None
+            and self.force_group_counts is not None
+        ):
+            schedule_size = (
+                self.force_columns.size
+                + self.force_group_starts.size
+                + self.force_group_counts.size
+            )
         return int(
             (self.atom_blocks.size + self.tile_blocks.size + self.member_mask.size + schedule_size)
             * _INT_BYTES
@@ -1500,25 +1553,42 @@ def _build_mlx_spatial_cell_tile_list(
         force_order = mx.argsort(tile_blocks[:, 0])
         tile_blocks = tile_blocks[force_order]
         member_mask = member_mask[force_order]
-        tile_counts_by_left = (
+        column_patterns = mx.array(
+            [0x1111, 0x2222, 0x4444, 0x8888],
+            dtype=mx.uint32,
+        )
+        active_column_counts = mx.sum(
+            (member_mask[:, :, None] & column_patterns[None, None, :]) != 0,
+            axis=(1, 2),
+        ).astype(mx.int32)
+        active_column_prefix = mx.cumsum(active_column_counts)
+        mx.eval(active_column_prefix)
+        active_column_count = int(np.asarray(active_column_prefix[-1]))
+        force_columns = _neighbor_tile_column_scatter_sized(
+            member_mask,
+            active_column_counts,
+            active_column_prefix,
+            accepted_count=active_column_count,
+        )
+        column_counts_by_left = (
             mx.zeros((block_count,), dtype=mx.int32)
             .at[tile_blocks[:, 0]]
-            .add(mx.ones((tile_count,), dtype=mx.int32))
+            .add(active_column_counts)
         )
-        tile_prefix_by_left = mx.cumsum(tile_counts_by_left)
+        column_prefix_by_left = mx.cumsum(column_counts_by_left)
         force_groups_by_left = (
-            tile_counts_by_left + DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE - 1
+            column_counts_by_left + DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE - 1
         ) // DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE
         force_group_prefix = mx.cumsum(force_groups_by_left)
-        mx.eval(tile_prefix_by_left, force_group_prefix)
+        mx.eval(column_prefix_by_left, force_group_prefix)
         force_group_count = int(np.asarray(force_group_prefix[-1]))
         force_group_starts, force_group_counts = _neighbor_tile_force_groups_sized(
-            tile_counts_by_left,
-            tile_prefix_by_left,
+            column_counts_by_left,
+            column_prefix_by_left,
             force_groups_by_left,
             force_group_prefix,
             accepted_count=force_group_count,
-            tiles_per_group=DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE,
+            items_per_group=DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE,
         )
     else:
         atom_blocks = atom_blocks.reshape((-1, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE))
@@ -1526,12 +1596,14 @@ def _build_mlx_spatial_cell_tile_list(
         exact_pair_count = 0
         tile_blocks = mx.zeros((0, 2), dtype=mx.int32)
         member_mask = mx.zeros((0, 1), dtype=mx.uint32)
+        force_columns = mx.zeros((0,), dtype=mx.int32)
         force_group_starts = mx.zeros((0,), dtype=mx.int32)
         force_group_counts = mx.zeros((0,), dtype=mx.int32)
     mx.eval(
         atom_blocks,
         tile_blocks,
         member_mask,
+        force_columns,
         force_group_starts,
         force_group_counts,
     )
@@ -1543,6 +1615,7 @@ def _build_mlx_spatial_cell_tile_list(
         member_mask=member_mask,
         exact_pair_count=exact_pair_count,
         raw_candidate_count=raw_candidate_count,
+        force_columns=force_columns,
         force_group_starts=force_group_starts,
         force_group_counts=force_group_counts,
         generation=generation,

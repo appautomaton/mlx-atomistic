@@ -341,6 +341,7 @@ _neighbor_pair_ordered_scatter_kernel_singleton = None
 _neighbor_cell_tile_candidates_kernel_singleton = None
 _neighbor_tile_membership_kernel_singleton = None
 _neighbor_tile_ordered_scatter_kernel_singleton = None
+_neighbor_tile_column_scatter_kernel_singleton = None
 _neighbor_tile_force_groups_kernel_singleton = None
 _neighbor_tile_member_counts_kernel_singleton = None
 _neighbor_tile_pair_scatter_kernel_singleton = None
@@ -901,19 +902,20 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     + _PARAMETERIZED_PME_DIRECT_SOURCE
 )
 
-# One 32-lane SIMD group owns up to eight right tiles for a shared four-atom
-# left block. Each lane accumulates one right atom across all four left atoms,
-# while SIMD reductions produce the four left forces without the repeated
-# threadgroup barriers and pair-force scratch buffers used by the previous
-# tile schedule.
+# One 32-lane SIMD group owns up to 32 non-empty right-atom columns for a shared
+# four-atom left block. Each lane accumulates its right atom across all four
+# left atoms, while SIMD reductions produce the four left forces without the
+# repeated threadgroup barriers and pair-force scratch buffers used by the
+# previous tile schedule. Compact column descriptors prevent lanes from being
+# assigned to tile columns whose four membership bits are all zero.
 #
 # A threadgroup carries `_TILE_PME_GROUPS_PER_THREADGROUP` independent SIMD
 # groups so a core has several force groups in flight against memory latency,
-# and the three per-tile mask words are read once per tile instead of once per
-# left slot. Both are exact: the same floats are read and the same arithmetic
-# runs, only the dispatch shape and the load count change. Trailing SIMD groups
-# beyond the last force group clamp their indices and are held inactive rather
-# than returning early, because every thread must reach the barrier below.
+# and each lane reuses its three mask words across all four left slots. Both are
+# exact: the same floats are read and the same arithmetic runs, only the
+# dispatch shape and the load count change. Trailing SIMD groups beyond the
+# last force group clamp their indices and are held inactive rather than
+# returning early, because every thread must reach the barrier below.
 _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     uint tg_thread = thread_position_in_threadgroup.x;
     uint lane = tg_thread & 31u;
@@ -924,6 +926,7 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     uint group = group_active ? group_id : (uint)(total_groups - 1);
     int group_start = force_group_starts[group];
     int group_count = force_group_counts[group];
+    int first_column = force_columns[group_start];
 
     threadgroup int left_atoms[4 * GROUPS_PER_TG];
     threadgroup float left_positions[12 * GROUPS_PER_TG];
@@ -933,7 +936,7 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     uint lbase = sub * 4u;
     uint pbase = sub * 12u;
 
-    int left_block = tile_blocks[2 * group_start + 0];
+    int left_block = tile_blocks[2 * (first_column >> 2) + 0];
     if (lane < 4u) {
         int left_atom = atom_blocks[4 * left_block + lane];
         left_atoms[lbase + lane] = left_atom;
@@ -947,11 +950,11 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint local_tile = lane >> 2;
-    uint right_slot = lane & 3u;
-    bool tile_active = group_active && local_tile < (uint)group_count;
-    int safe_local_tile = min((int)local_tile, group_count - 1);
-    int tile = group_start + safe_local_tile;
+    bool tile_active = group_active && lane < (uint)group_count;
+    int safe_local_column = min((int)lane, group_count - 1);
+    int encoded_column = force_columns[group_start + safe_local_column];
+    int tile = encoded_column >> 2;
+    uint right_slot = (uint)(encoded_column & 3);
     int right_block = tile_blocks[2 * tile + 1];
     int right_atom = atom_blocks[4 * right_block + right_slot];
     int safe_right = max(right_atom, 0);
@@ -1759,22 +1762,39 @@ _NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE = r"""
     }
 """
 
-_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
-    uint block = thread_position_in_grid.x;
-    if (block >= (uint)counts[0] || tile_counts[block] == 0) {
+_NEIGHBOR_TILE_COLUMN_SCATTER_SOURCE = r"""
+    uint tile = thread_position_in_grid.x;
+    if (tile >= (uint)counts[0] || active_column_counts[tile] == 0) {
         return;
     }
 
-    int tile_count = tile_counts[block];
-    int tile_start = tile_prefix[block] - tile_count;
+    uint output = (uint)(prefix[tile] - active_column_counts[tile]);
+    uint word = member_mask[tile];
+    for (uint column = 0u; column < 4u; column++) {
+        uint column_pattern = 0x1111u << column;
+        if ((word & column_pattern) != 0u) {
+            force_columns[output] = 4 * (int)tile + (int)column;
+            output++;
+        }
+    }
+"""
+
+_NEIGHBOR_TILE_FORCE_GROUPS_SOURCE = r"""
+    uint block = thread_position_in_grid.x;
+    if (block >= (uint)counts[0] || work_counts[block] == 0) {
+        return;
+    }
+
+    int work_count = work_counts[block];
+    int work_start = work_prefix[block] - work_count;
     int group_count = group_counts[block];
     int group_start = group_prefix[block] - group_count;
-    int tiles_per_group = counts[1];
+    int items_per_group = counts[1];
     for (int local = 0; local < group_count; local++) {
-        int consumed = local * tiles_per_group;
+        int consumed = local * items_per_group;
         int output = group_start + local;
-        force_group_starts[output] = tile_start + consumed;
-        force_group_counts[output] = min(tiles_per_group, tile_count - consumed);
+        force_group_starts[output] = work_start + consumed;
+        force_group_counts[output] = min(items_per_group, work_count - consumed);
     }
 """
 
@@ -2529,6 +2549,7 @@ def _tile_pme_direct_force_only_kernel():
                 "member_mask",
                 "lj_enabled_mask",
                 "lj_one_four_mask",
+                "force_columns",
                 "force_group_starts",
                 "force_group_counts",
                 "box",
@@ -2560,6 +2581,7 @@ def _tile_pme_direct_kernel():
                 "member_mask",
                 "lj_enabled_mask",
                 "lj_one_four_mask",
+                "force_columns",
                 "force_group_starts",
                 "force_group_counts",
                 "box",
@@ -2861,6 +2883,20 @@ def _neighbor_tile_ordered_scatter_kernel():
     return _neighbor_tile_ordered_scatter_kernel_singleton
 
 
+def _neighbor_tile_column_scatter_kernel():
+    """Return the cached non-empty tile-column compaction kernel."""
+
+    global _neighbor_tile_column_scatter_kernel_singleton
+    if _neighbor_tile_column_scatter_kernel_singleton is None:
+        _neighbor_tile_column_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_column_scatter",
+            input_names=["member_mask", "active_column_counts", "prefix", "counts"],
+            output_names=["force_columns"],
+            source=_NEIGHBOR_TILE_COLUMN_SCATTER_SOURCE,
+        )
+    return _neighbor_tile_column_scatter_kernel_singleton
+
+
 def _neighbor_tile_force_groups_kernel():
     """Return the cached spatial-tile force-group schedule kernel."""
 
@@ -2869,8 +2905,8 @@ def _neighbor_tile_force_groups_kernel():
         _neighbor_tile_force_groups_kernel_singleton = mx.fast.metal_kernel(
             name="neighbor_tile_force_groups",
             input_names=[
-                "tile_counts",
-                "tile_prefix",
+                "work_counts",
+                "work_prefix",
                 "group_counts",
                 "group_prefix",
                 "counts",
@@ -3402,27 +3438,70 @@ def _neighbor_tile_ordered_scatter_sized(
     return accepted_tiles, accepted_mask
 
 
+def _neighbor_tile_column_scatter_sized(
+    member_mask: mx.array,
+    active_column_counts: mx.array,
+    prefix: mx.array,
+    *,
+    accepted_count: int,
+) -> mx.array:
+    """Compact non-empty right-atom columns from ordered 4x4 tiles."""
+
+    member_mask = as_mx_array(member_mask, dtype=mx.uint32)
+    active_column_counts = as_mx_array(active_column_counts, dtype=mx.int32)
+    prefix = as_mx_array(prefix, dtype=mx.int32)
+    tile_count = int(member_mask.shape[0])
+    if member_mask.shape != (tile_count, _TILE_PME_MASK_WORD_COUNT):
+        msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
+        raise ValueError(msg)
+    if active_column_counts.shape != (tile_count,) or prefix.shape != (tile_count,):
+        msg = "active_column_counts and prefix must contain one value per tile"
+        raise ValueError(msg)
+    if accepted_count < 0 or accepted_count > tile_count * _TILE_PME_BLOCK_SIZE:
+        msg = "accepted_count must fit within the tile-column inventory"
+        raise ValueError(msg)
+    if accepted_count == 0:
+        return mx.zeros((0,), dtype=mx.int32)
+    (force_columns,) = _neighbor_tile_column_scatter_kernel()(
+        inputs=[
+            member_mask,
+            active_column_counts,
+            prefix,
+            mx.array([tile_count], dtype=mx.int32),
+        ],
+        output_shapes=[(accepted_count,)],
+        output_dtypes=[mx.int32],
+        grid=(tile_count, 1, 1),
+        threadgroup=(min(256, tile_count), 1, 1),
+        init_value=0,
+    )
+    return force_columns
+
+
 def _neighbor_tile_force_groups_sized(
-    tile_counts: mx.array,
-    tile_prefix: mx.array,
+    work_counts: mx.array,
+    work_prefix: mx.array,
     group_counts: mx.array,
     group_prefix: mx.array,
     *,
     accepted_count: int,
-    tiles_per_group: int,
+    items_per_group: int,
 ) -> tuple[mx.array, mx.array]:
-    """Build contiguous same-left-block force groups from tile row counts."""
+    """Build contiguous same-left-block force groups from work-item counts."""
 
-    tile_counts = as_mx_array(tile_counts, dtype=mx.int32)
-    tile_prefix = as_mx_array(tile_prefix, dtype=mx.int32)
+    work_counts = as_mx_array(work_counts, dtype=mx.int32)
+    work_prefix = as_mx_array(work_prefix, dtype=mx.int32)
     group_counts = as_mx_array(group_counts, dtype=mx.int32)
     group_prefix = as_mx_array(group_prefix, dtype=mx.int32)
-    block_count = int(tile_counts.shape[0])
-    if any(values.shape != (block_count,) for values in (tile_prefix, group_counts, group_prefix)):
-        msg = "tile and group counts/prefixes must have matching one-dimensional shapes"
+    block_count = int(work_counts.shape[0])
+    if any(
+        values.shape != (block_count,)
+        for values in (work_prefix, group_counts, group_prefix)
+    ):
+        msg = "work and group counts/prefixes must have matching one-dimensional shapes"
         raise ValueError(msg)
-    if tiles_per_group <= 0:
-        msg = "tiles_per_group must be positive"
+    if items_per_group <= 0:
+        msg = "items_per_group must be positive"
         raise ValueError(msg)
     if accepted_count < 0:
         msg = "accepted_count must be non-negative"
@@ -3432,11 +3511,11 @@ def _neighbor_tile_force_groups_sized(
         return empty, empty
     force_group_starts, force_group_sizes = _neighbor_tile_force_groups_kernel()(
         inputs=[
-            tile_counts,
-            tile_prefix,
+            work_counts,
+            work_prefix,
             group_counts,
             group_prefix,
-            mx.array([block_count, tiles_per_group], dtype=mx.int32),
+            mx.array([block_count, items_per_group], dtype=mx.int32),
         ],
         output_shapes=[(accepted_count,), (accepted_count,)],
         output_dtypes=[mx.int32, mx.int32],
@@ -5125,6 +5204,7 @@ def _tile_parameterized_pme_direct_force_only(
     member_mask: mx.array,
     lj_enabled_mask: mx.array,
     lj_one_four_mask: mx.array,
+    force_columns: mx.array,
     force_group_starts: mx.array,
     force_group_counts: mx.array,
     box_lengths_and_inverses: mx.array,
@@ -5148,6 +5228,7 @@ def _tile_parameterized_pme_direct_force_only(
     member_mask = as_mx_array(member_mask, dtype=mx.uint32)
     lj_enabled_mask = as_mx_array(lj_enabled_mask, dtype=mx.uint32)
     lj_one_four_mask = as_mx_array(lj_one_four_mask, dtype=mx.uint32)
+    force_columns = as_mx_array(force_columns, dtype=mx.int32)
     force_group_starts = as_mx_array(force_group_starts, dtype=mx.int32)
     force_group_counts = as_mx_array(force_group_counts, dtype=mx.int32)
     box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
@@ -5172,6 +5253,10 @@ def _tile_parameterized_pme_direct_force_only(
     if lj_enabled_mask.shape != mask_shape or lj_one_four_mask.shape != mask_shape:
         msg = f"tile LJ masks must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
+    if force_columns.ndim != 1:
+        msg = "force_columns must be a vector"
+        raise ValueError(msg)
+    column_count = int(force_columns.shape[0])
     group_count = int(force_group_starts.shape[0])
     if force_group_starts.ndim != 1 or force_group_counts.shape != (group_count,):
         msg = "tile force group starts and counts must have matching vector shapes"
@@ -5211,8 +5296,8 @@ def _tile_parameterized_pme_direct_force_only(
             zero = mx.array(0.0, dtype=mx.float32)
             return zero, zero, forces
         return forces
-    if group_count == 0:
-        msg = "non-empty tile geometry requires at least one force group"
+    if column_count == 0 or group_count == 0:
+        msg = "non-empty tile geometry requires force columns and groups"
         raise ValueError(msg)
 
     has_switch = switch_distance is not None
@@ -5242,6 +5327,7 @@ def _tile_parameterized_pme_direct_force_only(
         member_mask,
         lj_enabled_mask,
         lj_one_four_mask,
+        force_columns,
         force_group_starts,
         force_group_counts,
         box,

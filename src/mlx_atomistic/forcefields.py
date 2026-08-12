@@ -2250,6 +2250,7 @@ class NonbondedPotential:
                 atol=1e-7,
             )
             and not self.has_nbfix
+            and tiles.force_columns is not None
             and tiles.force_group_starts is not None
             and tiles.force_group_counts is not None
         )
@@ -3277,6 +3278,7 @@ class NonbondedPotential:
             tiles.member_mask,
             binding.tile_lj_enabled_mask,
             binding.tile_lj_one_four_mask,
+            tiles.force_columns,
             tiles.force_group_starts,
             tiles.force_group_counts,
             binding.box_lengths_and_inverses,
@@ -3906,6 +3908,7 @@ class NonbondedPotential:
                 tiles.member_mask,
                 binding.tile_lj_enabled_mask,
                 binding.tile_lj_one_four_mask,
+                tiles.force_columns,
                 tiles.force_group_starts,
                 tiles.force_group_counts,
                 binding.box_lengths_and_inverses,
