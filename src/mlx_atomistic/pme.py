@@ -14,7 +14,7 @@ import numpy as np
 
 from mlx_atomistic.core import Cell
 from mlx_atomistic.metal_kernels import (
-    _pme_order5_forces,
+    _pme_order5_forces_from_complex_grid,
     pme_order5_charge_grid,
     pme_order5_energy_forces,
 )
@@ -1524,12 +1524,10 @@ def _prepared_reciprocal_inputs(
         msg = "charges must have shape (n_atoms,)"
         raise ValueError(msg)
 
-    cell_lengths_mx = plan._cell_lengths_mx
-    wrapped_positions = (
-        positions_mx
-        - mx.floor(positions_mx / cell_lengths_mx) * cell_lengths_mx
-    )
-    return wrapped_positions, charges_mx
+    # Charge assignment and interpolation both apply periodic wrapping. Passing
+    # the normalized array directly avoids materializing the same wrapped
+    # coordinates once more ahead of those recurring stages.
+    return positions_mx, charges_mx
 
 
 def _prepared_pme_reciprocal_space_energy_forces(
@@ -2514,8 +2512,8 @@ def _mesh_reciprocal_energy_forces_core_mx(
     rho_hat = mx.fft.fftn(charge_grid)
     phi_hat = influence * rho_hat
     if use_order5_metal:
-        potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
         if include_energy:
+            potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
             energy, forces = pme_order5_energy_forces(
                 positions,
                 charges,
@@ -2524,7 +2522,8 @@ def _mesh_reciprocal_energy_forces_core_mx(
             )
         else:
             energy = mx.array(0.0, dtype=mx.float32)
-            forces = _pme_order5_forces(
+            potential_grid = mx.fft.ifftn(phi_hat)
+            forces = _pme_order5_forces_from_complex_grid(
                 positions,
                 charges,
                 potential_grid,

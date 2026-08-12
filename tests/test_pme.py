@@ -7,6 +7,7 @@ from mlx_atomistic.benchmarks import ewald_reference
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
     _pme_order5_forces,
+    _pme_order5_forces_from_complex_grid,
     pme_order5_charge_grid,
     pme_order5_energy_forces,
 )
@@ -1003,6 +1004,12 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             potential_grid,
             lengths,
         )
+        complex_force_only = _pme_order5_forces_from_complex_grid(
+            positions,
+            charges,
+            potential_grid.astype(mx.complex64) / float(np.prod(mesh_shape)),
+            lengths,
+        )
 
         def fixed_grid_energy(coordinates):
             values = _interpolate_bspline_mx(
@@ -1024,6 +1031,7 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             metal_energy,
             metal_forces,
             force_only,
+            complex_force_only,
         )
 
         np.testing.assert_allclose(
@@ -1046,6 +1054,12 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
         )
         np.testing.assert_allclose(
             np.asarray(force_only),
+            np.asarray(metal_forces),
+            rtol=2e-6,
+            atol=2e-7,
+        )
+        np.testing.assert_allclose(
+            np.asarray(complex_force_only),
             np.asarray(metal_forces),
             rtol=2e-6,
             atol=2e-7,
@@ -1108,7 +1122,12 @@ def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
             charges,
             plan,
         )
-        mx.eval(force_only)
+        shifted_force_only = _prepared_pme_reciprocal_space_forces(
+            positions + mx.array([12.0, -24.0, 36.0], dtype=mx.float32),
+            charges,
+            plan,
+        )
+        mx.eval(force_only, shifted_force_only)
 
         assert cache_key in pme_module._COMPILED_RECIPROCAL_EVALUATORS
         assert cache_key in pme_module._COMPILED_RECIPROCAL_FORCE_EVALUATORS
@@ -1127,6 +1146,12 @@ def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
         np.testing.assert_allclose(
             np.asarray(force_only),
             np.asarray(reference_forces),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(shifted_force_only),
+            np.asarray(force_only),
             rtol=1e-6,
             atol=1e-6,
         )
