@@ -19,7 +19,13 @@ from mlx_atomistic.artifacts import (
 from mlx_atomistic.benchmarks.charged_pme import _bind_pme_plans, _find_pme_term
 from mlx_atomistic.interaction_engine import (
     _build_interaction_schedule32,
+    _build_owner_compute_schedule32,
+    _fuse_interaction_halves32,
+    _fused_half32_direct_force_only,
+    _fused_half_schedule_to_device32,
     _interaction32_direct_force_only,
+    _owner_compute32_direct_force_only,
+    _owner_schedule_to_device32,
     _schedule_to_device32,
 )
 from mlx_atomistic.neighbors import _MLX_MD_CACHE_LIMIT_BYTES, NeighborListManager
@@ -188,6 +194,7 @@ def _stage_samples(stage_call, *, warmups: int, samples: int) -> dict[str, objec
 def benchmark(
     prepared: Path,
     *,
+    architecture: str,
     skin: float,
     warmups: int,
     samples: int,
@@ -270,71 +277,212 @@ def benchmark(
     exclusion_pairs = np.asarray(nonbonded._aligned_lj_exclusion_pairs)
     one_four_pairs = np.asarray(nonbonded._aligned_lj_one_four_pairs)
     schedule_started = time.perf_counter()
-    schedule = _build_interaction_schedule32(
-        positions_np,
-        box_lengths,
-        search_radius=cutoff + skin,
-        lj_exclusion_pairs=exclusion_pairs,
-        lj_one_four_pairs=one_four_pairs,
-        ordinary_tiles_per_group=ordinary_tiles_per_group,
-        left_slice_size=left_slice_size,
-    )
-    schedule_build_seconds = time.perf_counter() - schedule_started
-    device_schedule = _schedule_to_device32(schedule)
-    mx.eval(
-        device_schedule.atom_order,
-        device_schedule.ordinary_left_blocks,
-        device_schedule.ordinary_left_slices,
-        device_schedule.ordinary_right_atoms,
-        device_schedule.ordinary_group_starts,
-        device_schedule.ordinary_group_counts,
-        device_schedule.special_work_left_blocks,
-        device_schedule.special_work_left_slices,
-        device_schedule.special_work_right_atoms,
-        device_schedule.special_work_lj_enabled,
-        device_schedule.special_work_lj_one_four,
-        device_schedule.special_work_diagonal,
-    )
+    if architecture == "interaction32":
+        schedule = _build_interaction_schedule32(
+            positions_np,
+            box_lengths,
+            search_radius=cutoff + skin,
+            lj_exclusion_pairs=exclusion_pairs,
+            lj_one_four_pairs=one_four_pairs,
+            ordinary_tiles_per_group=ordinary_tiles_per_group,
+            left_slice_size=left_slice_size,
+        )
+        schedule_build_seconds = time.perf_counter() - schedule_started
+        device_schedule = _schedule_to_device32(schedule)
+        mx.eval(
+            device_schedule.atom_order,
+            device_schedule.ordinary_left_blocks,
+            device_schedule.ordinary_left_slices,
+            device_schedule.ordinary_right_atoms,
+            device_schedule.ordinary_group_starts,
+            device_schedule.ordinary_group_counts,
+            device_schedule.special_work_left_blocks,
+            device_schedule.special_work_left_slices,
+            device_schedule.special_work_right_atoms,
+            device_schedule.special_work_lj_enabled,
+            device_schedule.special_work_lj_one_four,
+            device_schedule.special_work_diagonal,
+        )
+        candidate_inventory = {
+            "block_count": schedule.block_count,
+            "ordinary_tile_count": schedule.ordinary_tile_count,
+            "ordinary_group_count": schedule.ordinary_group_count,
+            "ordinary_tiles_per_group_limit": ordinary_tiles_per_group,
+            "canonical_records": canonical_records,
+            "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
+            "left_slice_size": left_slice_size,
+            "special_tile_count": schedule.special_tile_count,
+            "special_work_count": schedule.special_work_count,
+            "scheduled_pair_lanes": (
+                schedule.ordinary_tile_count * left_slice_size * 32
+                + schedule.special_work_count * left_slice_size * 32
+            ),
+            "oracle_build_seconds": schedule_build_seconds,
+        }
+    elif architecture == "fused_half32":
+        base_schedule = _build_interaction_schedule32(
+            positions_np,
+            box_lengths,
+            search_radius=cutoff + skin,
+            lj_exclusion_pairs=exclusion_pairs,
+            lj_one_four_pairs=one_four_pairs,
+            ordinary_tiles_per_group=ordinary_tiles_per_group,
+            left_slice_size=16,
+        )
+        schedule = _fuse_interaction_halves32(
+            base_schedule,
+            ordinary_tiles_per_group=ordinary_tiles_per_group,
+        )
+        schedule_build_seconds = time.perf_counter() - schedule_started
+        device_schedule = _fused_half_schedule_to_device32(schedule)
+        mx.eval(
+            device_schedule.atom_order,
+            device_schedule.ordinary_left_blocks,
+            device_schedule.ordinary_right_atoms,
+            device_schedule.ordinary_half_modes,
+            device_schedule.ordinary_group_starts,
+            device_schedule.ordinary_group_counts,
+            device_schedule.special_work_left_blocks,
+            device_schedule.special_work_left_slices,
+            device_schedule.special_work_right_atoms,
+            device_schedule.special_work_lj_enabled,
+            device_schedule.special_work_lj_one_four,
+            device_schedule.special_work_diagonal,
+        )
+        base_right_entries = int(
+            np.count_nonzero(
+                base_schedule.ordinary_right_atoms < base_schedule.padded_atom_count
+            )
+        )
+        candidate_inventory = {
+            "block_count": schedule.block_count,
+            "ordinary_tile_count": schedule.ordinary_tile_count,
+            "ordinary_group_count": schedule.ordinary_group_count,
+            "ordinary_tiles_per_group_limit": ordinary_tiles_per_group,
+            "base_half_right_atom_entries": base_right_entries,
+            "fused_right_atom_entries": schedule.ordinary_right_entry_count,
+            "right_atomic_candidate_reduction_fraction": (
+                0.0
+                if base_right_entries == 0
+                else 1.0 - schedule.ordinary_right_entry_count / base_right_entries
+            ),
+            "ordinary_logical_pair_lanes": schedule.ordinary_logical_pair_lanes,
+            "special_work_count": schedule.special_work_count,
+            "scheduled_pair_lanes": (
+                schedule.ordinary_logical_pair_lanes
+                + schedule.special_work_count * 16 * 32
+            ),
+            "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
+            "oracle_build_seconds": schedule_build_seconds,
+        }
+    elif architecture == "owner_compute32":
+        schedule = _build_owner_compute_schedule32(
+            positions_np,
+            box_lengths,
+            search_radius=cutoff + skin,
+            lj_exclusion_pairs=exclusion_pairs,
+            lj_one_four_pairs=one_four_pairs,
+        )
+        schedule_build_seconds = time.perf_counter() - schedule_started
+        device_schedule = _owner_schedule_to_device32(schedule)
+        mx.eval(
+            device_schedule.atom_order,
+            device_schedule.owner_offsets,
+            device_schedule.right_atoms,
+            device_schedule.topology_offsets,
+            device_schedule.topology_neighbors,
+            device_schedule.topology_classes,
+        )
+        candidate_inventory = {
+            "block_count": schedule.block_count,
+            "right_atom_entries": int(schedule.right_atoms.shape[0]),
+            "scheduled_pair_lanes": schedule.scheduled_pair_lanes,
+            "topology_directed_entries": int(schedule.topology_neighbors.shape[0]),
+            "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
+            "oracle_build_seconds": schedule_build_seconds,
+        }
+    else:
+        raise ValueError(f"unsupported interaction architecture: {architecture}")
 
     def control_call():
         return nonbonded._direct_forces_from_binding(system.positions, tile_binding)
 
-    def candidate_call():
-        return _interaction32_direct_force_only(
-            system.positions,
-            device_schedule,
-            tile_binding.box_lengths_and_inverses,
-            tile_binding.half_sigma,
-            tile_binding.sqrt_epsilon,
-            nonbonded.charges,
-            cutoff=cutoff,
-            shift=nonbonded.lj_shift,
-            switch_distance=nonbonded.switch_distance,
-            one_four_scale=nonbonded.lj_one_four_scale,
-            coulomb_constant=nonbonded.coulomb_constant,
-            alpha=nonbonded.pme_config.alpha,
-            _canonical_records=canonical_records,
-            _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
-        )
+    if architecture == "interaction32":
 
-    def stage_call():
-        return _interaction32_direct_force_only(
-            system.positions,
-            device_schedule,
-            tile_binding.box_lengths_and_inverses,
-            tile_binding.half_sigma,
-            tile_binding.sqrt_epsilon,
-            nonbonded.charges,
-            cutoff=cutoff,
-            shift=nonbonded.lj_shift,
-            switch_distance=nonbonded.switch_distance,
-            one_four_scale=nonbonded.lj_one_four_scale,
-            coulomb_constant=nonbonded.coulomb_constant,
-            alpha=nonbonded.pme_config.alpha,
-            _return_stages=True,
-            _canonical_records=canonical_records,
-            _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
-        )
+        def candidate_call():
+            return _interaction32_direct_force_only(
+                system.positions,
+                device_schedule,
+                tile_binding.box_lengths_and_inverses,
+                tile_binding.half_sigma,
+                tile_binding.sqrt_epsilon,
+                nonbonded.charges,
+                cutoff=cutoff,
+                shift=nonbonded.lj_shift,
+                switch_distance=nonbonded.switch_distance,
+                one_four_scale=nonbonded.lj_one_four_scale,
+                coulomb_constant=nonbonded.coulomb_constant,
+                alpha=nonbonded.pme_config.alpha,
+                _canonical_records=canonical_records,
+                _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+            )
+
+        def stage_call():
+            return _interaction32_direct_force_only(
+                system.positions,
+                device_schedule,
+                tile_binding.box_lengths_and_inverses,
+                tile_binding.half_sigma,
+                tile_binding.sqrt_epsilon,
+                nonbonded.charges,
+                cutoff=cutoff,
+                shift=nonbonded.lj_shift,
+                switch_distance=nonbonded.switch_distance,
+                one_four_scale=nonbonded.lj_one_four_scale,
+                coulomb_constant=nonbonded.coulomb_constant,
+                alpha=nonbonded.pme_config.alpha,
+                _return_stages=True,
+                _canonical_records=canonical_records,
+                _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+            )
+
+    elif architecture == "owner_compute32":
+
+        def candidate_call():
+            return _owner_compute32_direct_force_only(
+                system.positions,
+                device_schedule,
+                tile_binding.box_lengths_and_inverses,
+                tile_binding.half_sigma,
+                tile_binding.sqrt_epsilon,
+                nonbonded.charges,
+                cutoff=cutoff,
+                shift=nonbonded.lj_shift,
+                switch_distance=nonbonded.switch_distance,
+                one_four_scale=nonbonded.lj_one_four_scale,
+                coulomb_constant=nonbonded.coulomb_constant,
+                alpha=nonbonded.pme_config.alpha,
+                _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+            )
+
+    else:
+
+        def candidate_call():
+            return _fused_half32_direct_force_only(
+                system.positions,
+                device_schedule,
+                tile_binding.box_lengths_and_inverses,
+                tile_binding.half_sigma,
+                tile_binding.sqrt_epsilon,
+                nonbonded.charges,
+                cutoff=cutoff,
+                shift=nonbonded.lj_shift,
+                switch_distance=nonbonded.switch_distance,
+                one_four_scale=nonbonded.lj_one_four_scale,
+                coulomb_constant=nonbonded.coulomb_constant,
+                alpha=nonbonded.pme_config.alpha,
+                _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+            )
 
     control = control_call()
     candidate = candidate_call()
@@ -362,16 +510,19 @@ def benchmark(
         warmups=max(1, warmups // 2),
         samples=samples,
     )
-    stage_timing = _stage_samples(
-        stage_call,
-        warmups=max(1, warmups // 2),
-        samples=samples,
-    )
+    stage_timing = None
+    if architecture == "interaction32":
+        stage_timing = _stage_samples(
+            stage_call,
+            warmups=max(1, warmups // 2),
+            samples=samples,
+        )
     control_median = float(np.median(timings["control"]))
     candidate_median = float(np.median(timings["candidate"]))
     return {
-        "schema": "mlx_atomistic.interaction32_force_benchmark.v2",
+        "schema": "mlx_atomistic.interaction32_force_benchmark.v3",
         "prepared": str(prepared),
+        "architecture": architecture,
         "atom_count": schedule.atom_count,
         "cutoff_angstrom": cutoff,
         "skin_angstrom": skin,
@@ -382,22 +533,7 @@ def benchmark(
             "force_group_count": tiles.force_group_count,
             "build_seconds": tile_build_seconds,
         },
-        "interaction32": {
-            "block_count": schedule.block_count,
-            "ordinary_tile_count": schedule.ordinary_tile_count,
-            "ordinary_group_count": schedule.ordinary_group_count,
-            "ordinary_tiles_per_group_limit": ordinary_tiles_per_group,
-            "canonical_records": canonical_records,
-            "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
-            "left_slice_size": left_slice_size,
-            "special_tile_count": schedule.special_tile_count,
-            "special_work_count": schedule.special_work_count,
-            "scheduled_pair_lanes": (
-                schedule.ordinary_tile_count * left_slice_size * 32
-                + schedule.special_work_count * left_slice_size * 32
-            ),
-            "oracle_build_seconds": schedule_build_seconds,
-        },
+        architecture: candidate_inventory,
         "force_parity": {
             "rms_delta_kj_mol_angstrom": force_rms_delta,
             "max_delta_kj_mol_angstrom": force_max_delta,
@@ -422,6 +558,11 @@ def benchmark(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prepared", type=Path)
+    parser.add_argument(
+        "--architecture",
+        choices=("interaction32", "fused_half32", "owner_compute32"),
+        default="interaction32",
+    )
     parser.add_argument("--skin", type=float, default=5.5)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--samples", type=int, default=8)
@@ -438,6 +579,7 @@ def main() -> None:
     args = parser.parse_args()
     report = benchmark(
         args.prepared,
+        architecture=args.architecture,
         skin=args.skin,
         warmups=args.warmups,
         samples=args.samples,

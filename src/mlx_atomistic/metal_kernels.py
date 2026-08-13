@@ -333,7 +333,9 @@ _tile_pme_direct_force_only_kernel_singleton = None
 _interaction32_pack_kernel_singleton = None
 _interaction32_force_kernel_singleton = None
 _interaction32_canonical_force_kernel_singleton = None
+_interaction32_fused_half_canonical_force_kernel_singleton = None
 _interaction32_scatter_kernel_singleton = None
+_owner_compute32_force_kernel_singleton = None
 _sparse_pme_correction_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
 _pme_order5_spread_kernel_singleton = None
@@ -529,6 +531,19 @@ float mlx_atomistic_erfc_nonnegative(float a) {
     r = metal::fma(r, s, 1.28379166e-1f);
     r = metal::fma(r, a, a);
     return 1.0f - r;
+}
+
+// Return erfc(a) and exp(-a*a) for a non-negative Ewald argument while
+// evaluating the exponential once.  The erfc approximation is the
+// Abramowitz-Stegun 7.1.26 form used by OpenMM's single-precision kernels.
+float2 mlx_atomistic_ewald_erfc_exp(float a) {
+    float exponential = metal::exp(-a * a);
+    float t = 1.0f / (1.0f + 0.3275911f * a);
+    float polynomial = metal::fma(1.061405429f, t, -1.453152027f);
+    polynomial = metal::fma(polynomial, t, 1.421413741f);
+    polynomial = metal::fma(polynomial, t, -0.284496736f);
+    polynomial = metal::fma(polynomial, t, 0.254829592f);
+    return float2(polynomial * t * exponential, exponential);
 }
 """
 
@@ -1227,16 +1242,36 @@ _INTERACTION32_FORCE_SOURCE = r"""
     uint group = safe_work;
 
     int ordinary_start = special ? 0 : ordinary_group_starts[group];
+#ifdef MLX_ATOMISTIC_INTERACTION32_FUSED_HALF
+    int ordinary_half_mode = special ? 0 : ordinary_half_modes[ordinary_start];
+    uint left_slice_size = special
+        ? (uint)counts[5]
+        : (ordinary_half_mode == 3 ? 32u : 16u);
+    uint left_slice = special
+        ? (uint)special_left_slices[group]
+        : (ordinary_half_mode == 2 ? 1u : 0u);
+#else
     uint left_slice_size = (uint)counts[5];
     uint left_slice = special
         ? (uint)special_left_slices[group]
         : (uint)ordinary_left_slices[ordinary_start];
+#endif
     uint interaction_count = special
         ? 1u
         : (uint)ordinary_group_counts[group];
     int left_block = special
         ? special_left_blocks[group]
         : ordinary_left_blocks[ordinary_start];
+#ifdef MLX_ATOMISTIC_INTERACTION32_FUSED_HALF
+    threadgroup int left_ordered_buffer[32 * GROUPS_PER_TG];
+    threadgroup int left_atom_buffer[32 * GROUPS_PER_TG];
+    threadgroup uint left_valid_buffer[32 * GROUPS_PER_TG];
+    threadgroup float left_posq_buffer[128 * GROUPS_PER_TG];
+    threadgroup float left_lj_buffer[64 * GROUPS_PER_TG];
+    uint left_base = 32u * sub;
+    uint posq_base = 128u * sub;
+    uint lj_base = 64u * sub;
+#else
     threadgroup int left_ordered_buffer[16 * GROUPS_PER_TG];
     threadgroup int left_atom_buffer[16 * GROUPS_PER_TG];
     threadgroup uint left_valid_buffer[16 * GROUPS_PER_TG];
@@ -1245,6 +1280,7 @@ _INTERACTION32_FORCE_SOURCE = r"""
     uint left_base = 16u * sub;
     uint posq_base = 64u * sub;
     uint lj_base = 32u * sub;
+#endif
     if (lane < left_slice_size) {
         int left_ordered = 32 * left_block
             + (int)left_slice_size * (int)left_slice + (int)lane;
@@ -1423,12 +1459,21 @@ _INTERACTION32_FORCE_SOURCE = r"""
 
                     float qij = left_posq.w * right_posq.w;
                     float alpha_distance = ewald_alpha * distance;
-                    float erfc_term =
+                    float erfc_term;
+                    float gaussian_term;
+#ifdef MLX_ATOMISTIC_INTERACTION32_SHARED_EWALD_EXP
+                    float2 ewald_terms =
+                        mlx_atomistic_ewald_erfc_exp(alpha_distance);
+                    erfc_term = ewald_terms.x;
+                    gaussian_term = ewald_terms.y;
+#else
+                    erfc_term =
                         mlx_atomistic_erfc_nonnegative(alpha_distance);
+                    gaussian_term = exp(-ewald_alpha * ewald_alpha * r2);
+#endif
                     scalar += coulomb * qij * (
                         erfc_term * inv_r2 * inv_distance
-                        + ewald_self * exp(-ewald_alpha * ewald_alpha * r2)
-                            * inv_r2
+                        + ewald_self * gaussian_term * inv_r2
                     );
                     pair_force = float3(scalar * dx, scalar * dy, scalar * dz);
                 }
@@ -1505,6 +1550,243 @@ _INTERACTION32_SCATTER_SOURCE = r"""
     forces[3 * atom + 0] = ordered_forces[3 * ordered + 0];
     forces[3 * atom + 1] = ordered_forces[3 * ordered + 1];
     forces[3 * atom + 2] = ordered_forces[3 * ordered + 2];
+"""
+
+_OWNER_COMPUTE32_FORCE_SOURCE = r"""
+    uint tg_thread = thread_position_in_threadgroup.x;
+    uint lane = tg_thread & 31u;
+    uint sub = tg_thread >> 5u;
+    uint dispatch_groups = (uint)counts[3];
+    uint candidate_block =
+        threadgroup_position_in_grid.x * dispatch_groups + sub;
+    bool block_active = threads_per_simdgroup == 32u
+        && candidate_block < (uint)counts[0];
+    uint block = block_active ? candidate_block : 0u;
+    int owner_ordered = 32 * (int)block + (int)lane;
+    bool owner_valid = block_active
+        && owner_ordered < counts[1]
+        && atom_order[owner_ordered] >= 0;
+    int owner_atom = owner_valid ? atom_order[owner_ordered] : 0;
+    float4 owner_posq = float4(
+        positions[3 * owner_atom + 0],
+        positions[3 * owner_atom + 1],
+        positions[3 * owner_atom + 2],
+        charges[owner_atom]
+    );
+    float2 owner_lj = float2(
+        half_sigma[owner_atom],
+        sqrt_epsilon[owner_atom]
+    );
+
+    float box_lx = box[0];
+    float box_ly = box[1];
+    float box_lz = box[2];
+    float box_ix = box[3];
+    float box_iy = box[4];
+    float box_iz = box[5];
+    float cutoff2 = params[0];
+    float shift_flag = params[1];
+    float switch_flag = params[2];
+    float switch_start = params[3];
+    float switch_end = params[5];
+    float coulomb = params[6];
+    float ewald_alpha = params[7];
+    float ewald_self = params[8];
+    float inv_switch_width = params[9];
+    float one_four_scale = params[10];
+    float3 owner_force = float3(0.0f);
+    float3 owner_force_compensation = float3(0.0f);
+
+    int right_start = owner_offsets[block];
+    int right_stop = owner_offsets[block + 1u];
+    for (int tile_start = right_start; tile_start < right_stop; tile_start += 32) {
+        int owned_right_ordered = right_atoms[tile_start + (int)lane];
+        bool owned_right_valid = owned_right_ordered >= 0
+            && owned_right_ordered < counts[1]
+            && atom_order[owned_right_ordered] >= 0;
+        int owned_right_atom = owned_right_valid
+            ? atom_order[owned_right_ordered]
+            : 0;
+        float4 owned_right_posq = float4(
+            positions[3 * owned_right_atom + 0],
+            positions[3 * owned_right_atom + 1],
+            positions[3 * owned_right_atom + 2],
+            charges[owned_right_atom]
+        );
+        float2 owned_right_lj = float2(
+            half_sigma[owned_right_atom],
+            sqrt_epsilon[owned_right_atom]
+        );
+
+        for (uint rotation = 0u; rotation < 32u; rotation++) {
+            ushort source_lane = (ushort)((lane + rotation) & 31u);
+            bool right_valid = simd_shuffle(
+                owned_right_valid ? 1u : 0u,
+                source_lane
+            ) != 0u;
+            float4 right_posq = float4(
+                simd_shuffle(owned_right_posq.x, source_lane),
+                simd_shuffle(owned_right_posq.y, source_lane),
+                simd_shuffle(owned_right_posq.z, source_lane),
+                simd_shuffle(owned_right_posq.w, source_lane)
+            );
+            float2 right_lj = float2(
+                simd_shuffle(owned_right_lj.x, source_lane),
+                simd_shuffle(owned_right_lj.y, source_lane)
+            );
+            if (owner_valid && right_valid) {
+                float dx = owner_posq.x - right_posq.x;
+                float dy = owner_posq.y - right_posq.y;
+                float dz = owner_posq.z - right_posq.z;
+                dx -= box_lx * rint(dx * box_ix);
+                dy -= box_ly * rint(dy * box_iy);
+                dz -= box_lz * rint(dz * box_iz);
+                float r2 = dx * dx + dy * dy + dz * dz;
+                if (r2 > 0.0f && r2 < cutoff2) {
+                    float inv_distance = rsqrt(r2);
+                    float inv_r2 = inv_distance * inv_distance;
+                    float distance = r2 * inv_distance;
+                    float sigma_ij = owner_lj.x + right_lj.x;
+                    float epsilon_ij = owner_lj.y * right_lj.y;
+                    float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+                    float inv_r6 = sigma2_over_r2
+                        * sigma2_over_r2 * sigma2_over_r2;
+                    float inv_r12 = inv_r6 * inv_r6;
+                    float unswitched_energy = 0.0f;
+                    float switch_value = 1.0f;
+                    float switch_derivative = 0.0f;
+                    if (switch_flag > 0.5f) {
+                        unswitched_energy =
+                            4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                        if (shift_flag > 0.5f) {
+                            float sigma2_over_rc2 =
+                                sigma_ij * sigma_ij / cutoff2;
+                            float inv_rc6 = sigma2_over_rc2
+                                * sigma2_over_rc2 * sigma2_over_rc2;
+                            unswitched_energy -= 4.0f * epsilon_ij
+                                * (inv_rc6 * inv_rc6 - inv_rc6);
+                        }
+                        float x = clamp(
+                            (distance - switch_start) * inv_switch_width,
+                            0.0f,
+                            1.0f
+                        );
+                        float x2 = x * x;
+                        float x3 = x2 * x;
+                        float x4 = x3 * x;
+                        float x5 = x4 * x;
+                        switch_value = 1.0f
+                            - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
+                        if (distance > switch_start && distance < switch_end) {
+                            switch_derivative = -(
+                                30.0f * x2 - 60.0f * x3 + 30.0f * x4
+                            ) * inv_switch_width;
+                        }
+                    }
+                    float scalar =
+                        24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
+                            * inv_r2 * switch_value
+                        - unswitched_energy * switch_derivative * inv_distance;
+                    float qij = owner_posq.w * right_posq.w;
+                    float erfc_term = mlx_atomistic_erfc_nonnegative(
+                        ewald_alpha * distance
+                    );
+                    scalar += coulomb * qij * (
+                        erfc_term * inv_r2 * inv_distance
+                        + ewald_self * exp(-ewald_alpha * ewald_alpha * r2)
+                            * inv_r2
+                    );
+                    float3 contribution = float3(
+                        scalar * dx,
+                        scalar * dy,
+                        scalar * dz
+                    );
+                    float3 corrected = contribution - owner_force_compensation;
+                    float3 next_force = owner_force + corrected;
+                    owner_force_compensation =
+                        (next_force - owner_force) - corrected;
+                    owner_force = next_force;
+                }
+            }
+        }
+    }
+
+    if (owner_valid) {
+        int topology_start = topology_offsets[owner_atom];
+        int topology_stop = topology_offsets[owner_atom + 1];
+        for (int t = topology_start; t < topology_stop; t++) {
+            int neighbor = topology_neighbors[t];
+            float dx = owner_posq.x - positions[3 * neighbor + 0];
+            float dy = owner_posq.y - positions[3 * neighbor + 1];
+            float dz = owner_posq.z - positions[3 * neighbor + 2];
+            dx -= box_lx * rint(dx * box_ix);
+            dy -= box_ly * rint(dy * box_iy);
+            dz -= box_lz * rint(dz * box_iz);
+            float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 > 0.0f && r2 < cutoff2) {
+                float inv_distance = rsqrt(r2);
+                float inv_r2 = inv_distance * inv_distance;
+                float distance = r2 * inv_distance;
+                float sigma_ij = owner_lj.x + half_sigma[neighbor];
+                float epsilon_ij = owner_lj.y * sqrt_epsilon[neighbor];
+                float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+                float inv_r6 = sigma2_over_r2
+                    * sigma2_over_r2 * sigma2_over_r2;
+                float inv_r12 = inv_r6 * inv_r6;
+                float unswitched_energy = 0.0f;
+                float switch_value = 1.0f;
+                float switch_derivative = 0.0f;
+                if (switch_flag > 0.5f) {
+                    unswitched_energy =
+                        4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                    if (shift_flag > 0.5f) {
+                        float sigma2_over_rc2 = sigma_ij * sigma_ij / cutoff2;
+                        float inv_rc6 = sigma2_over_rc2
+                            * sigma2_over_rc2 * sigma2_over_rc2;
+                        unswitched_energy -= 4.0f * epsilon_ij
+                            * (inv_rc6 * inv_rc6 - inv_rc6);
+                    }
+                    float x = clamp(
+                        (distance - switch_start) * inv_switch_width,
+                        0.0f,
+                        1.0f
+                    );
+                    float x2 = x * x;
+                    float x3 = x2 * x;
+                    float x4 = x3 * x;
+                    float x5 = x4 * x;
+                    switch_value = 1.0f
+                        - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
+                    if (distance > switch_start && distance < switch_end) {
+                        switch_derivative = -(
+                            30.0f * x2 - 60.0f * x3 + 30.0f * x4
+                        ) * inv_switch_width;
+                    }
+                }
+                float correction_scale = topology_classes[t] == 0
+                    ? -1.0f
+                    : one_four_scale - 1.0f;
+                float scalar = correction_scale * (
+                    24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
+                        * inv_r2 * switch_value
+                    - unswitched_energy * switch_derivative * inv_distance
+                );
+                float3 contribution = float3(
+                    scalar * dx,
+                    scalar * dy,
+                    scalar * dz
+                );
+                float3 corrected = contribution - owner_force_compensation;
+                float3 next_force = owner_force + corrected;
+                owner_force_compensation =
+                    (next_force - owner_force) - corrected;
+                owner_force = next_force;
+            }
+        }
+        forces[3 * owner_atom + 0] = owner_force.x;
+        forces[3 * owner_atom + 1] = owner_force.y;
+        forces[3 * owner_atom + 2] = owner_force.z;
+    }
 """
 
 _SPARSE_PME_CORRECTION_FORCE_ONLY_SOURCE = r"""
@@ -3036,6 +3318,47 @@ def _interaction32_canonical_force_kernel():
     return _interaction32_canonical_force_kernel_singleton
 
 
+def _interaction32_fused_half_canonical_force_kernel():
+    """Return the cached half-membership-aware canonical force Metal kernel."""
+
+    global _interaction32_fused_half_canonical_force_kernel_singleton
+    if _interaction32_fused_half_canonical_force_kernel_singleton is None:
+        _interaction32_fused_half_canonical_force_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_fused_half_pme_direct_canonical_force",
+            input_names=[
+                "positions",
+                "atom_order",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "ordinary_left_blocks",
+                "ordinary_right_atoms",
+                "ordinary_half_modes",
+                "ordinary_group_starts",
+                "ordinary_group_counts",
+                "special_left_blocks",
+                "special_left_slices",
+                "special_right_atoms",
+                "special_work_lj_enabled",
+                "special_work_lj_one_four",
+                "special_diagonal",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["ordered_forces"],
+            source=(
+                "#define MLX_ATOMISTIC_INTERACTION32_CANONICAL 1\n"
+                "#define MLX_ATOMISTIC_INTERACTION32_FUSED_HALF 1\n"
+                "#define MLX_ATOMISTIC_INTERACTION32_SHARED_EWALD_EXP 1\n"
+                + _INTERACTION32_FORCE_SOURCE
+            ),
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _interaction32_fused_half_canonical_force_kernel_singleton
+
+
 def _interaction32_scatter_kernel():
     """Return the cached unique-writer ordered-force scatter kernel."""
 
@@ -3048,6 +3371,35 @@ def _interaction32_scatter_kernel():
             source=_INTERACTION32_SCATTER_SOURCE,
         )
     return _interaction32_scatter_kernel_singleton
+
+
+def _owner_compute32_force_kernel():
+    """Return the cached no-atomic owner-computes direct-force Metal kernel."""
+
+    global _owner_compute32_force_kernel_singleton
+    if _owner_compute32_force_kernel_singleton is None:
+        _owner_compute32_force_kernel_singleton = mx.fast.metal_kernel(
+            name="owner_compute32_pme_direct_force",
+            input_names=[
+                "positions",
+                "atom_order",
+                "owner_offsets",
+                "right_atoms",
+                "topology_offsets",
+                "topology_neighbors",
+                "topology_classes",
+                "box",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "params",
+                "counts",
+            ],
+            output_names=["forces"],
+            source=_OWNER_COMPUTE32_FORCE_SOURCE,
+            header=_ERF_HEADER,
+        )
+    return _owner_compute32_force_kernel_singleton
 
 
 def _sparse_pme_correction_force_only_kernel():
@@ -6098,6 +6450,306 @@ def _interaction32_pme_direct_force_only(
             ordered_forces=ordered_forces,
             forces=forces,
         )
+    return forces
+
+
+def _interaction32_fused_half_pme_direct_force_only(
+    positions: mx.array,
+    atom_order: mx.array,
+    ordinary_left_blocks: mx.array,
+    ordinary_right_atoms: mx.array,
+    ordinary_half_modes: mx.array,
+    ordinary_group_starts: mx.array,
+    ordinary_group_counts: mx.array,
+    special_left_blocks: mx.array,
+    special_left_slices: mx.array,
+    special_right_atoms: mx.array,
+    special_work_lj_enabled: mx.array,
+    special_work_lj_one_four: mx.array,
+    special_diagonal: mx.array,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    one_four_scale: float,
+    coulomb_constant: float,
+    alpha: float,
+    _simdgroups_per_threadgroup: int = _INTERACTION32_GROUPS_PER_THREADGROUP,
+) -> mx.array:
+    """Evaluate fused 16-atom memberships with one right-force write."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    ordinary_left_blocks = as_mx_array(ordinary_left_blocks, dtype=mx.int32)
+    ordinary_right_atoms = as_mx_array(ordinary_right_atoms, dtype=mx.int32)
+    ordinary_half_modes = as_mx_array(ordinary_half_modes, dtype=mx.int32)
+    ordinary_group_starts = as_mx_array(ordinary_group_starts, dtype=mx.int32)
+    ordinary_group_counts = as_mx_array(ordinary_group_counts, dtype=mx.int32)
+    special_left_blocks = as_mx_array(special_left_blocks, dtype=mx.int32)
+    special_left_slices = as_mx_array(special_left_slices, dtype=mx.int32)
+    special_right_atoms = as_mx_array(special_right_atoms, dtype=mx.int32)
+    special_work_lj_enabled = as_mx_array(special_work_lj_enabled, dtype=mx.uint32)
+    special_work_lj_one_four = as_mx_array(special_work_lj_one_four, dtype=mx.uint32)
+    special_diagonal = as_mx_array(special_diagonal, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
+    sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    atom_count = int(positions.shape[0])
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    padded_count = int(atom_order.shape[0])
+    ordinary_count = int(ordinary_left_blocks.shape[0])
+    ordinary_shape = (ordinary_count, 32)
+    if (
+        ordinary_left_blocks.ndim != 1
+        or ordinary_right_atoms.shape != ordinary_shape
+        or ordinary_half_modes.shape != (ordinary_count,)
+    ):
+        raise ValueError("fused ordinary arrays must have shapes (n,) and (n, 32)")
+    ordinary_group_count = int(ordinary_group_starts.shape[0])
+    if ordinary_group_starts.ndim != 1 or ordinary_group_counts.shape != (
+        ordinary_group_count,
+    ):
+        raise ValueError("ordinary interaction groups must have matching vector shapes")
+    special_count = int(special_left_blocks.shape[0])
+    if special_left_slices.shape != (special_count,) or special_diagonal.shape != (
+        special_count,
+    ):
+        raise ValueError("special work metadata must have matching vector shapes")
+    special_shape = (special_count, 32)
+    if (
+        special_right_atoms.shape != special_shape
+        or special_work_lj_enabled.shape != special_shape
+        or special_work_lj_one_four.shape != special_shape
+    ):
+        raise ValueError("special work arrays must have shape (n_special_work, 32)")
+    if box.shape != (6,):
+        raise ValueError("box_lengths_and_inverses must have shape (6,)")
+    parameter_shape = (atom_count,)
+    if (
+        half_sigma.shape != parameter_shape
+        or sqrt_epsilon.shape != parameter_shape
+        or charges.shape != parameter_shape
+    ):
+        raise ValueError("prepared nonbonded parameters must match the atom count")
+    if not isfinite(float(cutoff)) or cutoff <= 0.0:
+        raise ValueError("cutoff must be finite and positive")
+    if not isfinite(float(alpha)) or alpha <= 0.0:
+        raise ValueError("alpha must be finite and positive")
+    if not isfinite(float(coulomb_constant)):
+        raise ValueError("coulomb_constant must be finite")
+    if not isfinite(float(one_four_scale)) or one_four_scale < 0.0:
+        raise ValueError("one_four_scale must be finite and non-negative")
+    if not 1 <= _simdgroups_per_threadgroup <= _INTERACTION32_GROUPS_PER_THREADGROUP:
+        raise ValueError("SIMD groups per threadgroup must be between one and four")
+    cutoff_value = float(cutoff)
+    if switch_distance is not None and (
+        not isfinite(float(switch_distance))
+        or float(switch_distance) < 0.0
+        or float(switch_distance) >= cutoff_value
+    ):
+        raise ValueError("switch_distance must be finite, non-negative, and below cutoff")
+
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(switch_distance is not None),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+            1.0 / switch_width,
+            float(one_four_scale),
+        ],
+        dtype=mx.float32,
+    )
+    counts = mx.array(
+        [
+            ordinary_group_count,
+            special_count,
+            padded_count,
+            atom_count,
+            _simdgroups_per_threadgroup,
+            16,
+        ],
+        dtype=mx.int32,
+    )
+    work_count = ordinary_group_count + special_count
+    if work_count == 0:
+        return mx.zeros(positions.shape, dtype=mx.float32)
+    threadgroups = (
+        work_count + _simdgroups_per_threadgroup - 1
+    ) // _simdgroups_per_threadgroup
+    dispatch_width = 32 * _simdgroups_per_threadgroup
+    (forces,) = _interaction32_fused_half_canonical_force_kernel()(
+        inputs=[
+            positions,
+            atom_order,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            ordinary_left_blocks,
+            ordinary_right_atoms,
+            ordinary_half_modes,
+            ordinary_group_starts,
+            ordinary_group_counts,
+            special_left_blocks,
+            special_left_slices,
+            special_right_atoms,
+            special_work_lj_enabled,
+            special_work_lj_one_four,
+            special_diagonal,
+            box,
+            params,
+            counts,
+        ],
+        output_shapes=[positions.shape],
+        output_dtypes=[mx.float32],
+        grid=(threadgroups * dispatch_width, 1, 1),
+        threadgroup=(dispatch_width, 1, 1),
+        init_value=0.0,
+    )
+    return forces
+
+
+def _owner_compute32_pme_direct_force_only(
+    positions: mx.array,
+    atom_order: mx.array,
+    owner_offsets: mx.array,
+    right_atoms: mx.array,
+    topology_offsets: mx.array,
+    topology_neighbors: mx.array,
+    topology_classes: mx.array,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    one_four_scale: float,
+    coulomb_constant: float,
+    alpha: float,
+    _simdgroups_per_threadgroup: int = 4,
+) -> mx.array:
+    """Evaluate the no-atomic owner-computes direct-force schedule."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    owner_offsets = as_mx_array(owner_offsets, dtype=mx.int32)
+    right_atoms = as_mx_array(right_atoms, dtype=mx.int32)
+    topology_offsets = as_mx_array(topology_offsets, dtype=mx.int32)
+    topology_neighbors = as_mx_array(topology_neighbors, dtype=mx.int32)
+    topology_classes = as_mx_array(topology_classes, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
+    sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
+    charges = as_mx_array(charges, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    atom_count = int(positions.shape[0])
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    padded_count = int(atom_order.shape[0])
+    block_count = padded_count // 32
+    if owner_offsets.shape != (block_count + 1,):
+        raise ValueError("owner_offsets must have one boundary per owner block")
+    if right_atoms.ndim != 1 or right_atoms.shape[0] % 32 != 0:
+        raise ValueError("right_atoms must be a padded vector divisible by 32")
+    if topology_offsets.shape != (atom_count + 1,):
+        raise ValueError("topology_offsets must have one boundary per atom")
+    topology_count = int(topology_neighbors.shape[0])
+    if topology_neighbors.ndim != 1 or topology_classes.shape != (topology_count,):
+        raise ValueError("topology neighbors and classes must have matching vector shapes")
+    if box.shape != (6,):
+        raise ValueError("box_lengths_and_inverses must have shape (6,)")
+    parameter_shape = (atom_count,)
+    if (
+        half_sigma.shape != parameter_shape
+        or sqrt_epsilon.shape != parameter_shape
+        or charges.shape != parameter_shape
+    ):
+        raise ValueError("prepared nonbonded parameters must match the atom count")
+    if not isfinite(float(cutoff)) or cutoff <= 0.0:
+        raise ValueError("cutoff must be finite and positive")
+    if not isfinite(float(alpha)) or alpha <= 0.0:
+        raise ValueError("alpha must be finite and positive")
+    if not isfinite(float(coulomb_constant)):
+        raise ValueError("coulomb_constant must be finite")
+    if not isfinite(float(one_four_scale)) or one_four_scale < 0.0:
+        raise ValueError("one_four_scale must be finite and non-negative")
+    if not 1 <= _simdgroups_per_threadgroup <= 4:
+        raise ValueError("SIMD groups per threadgroup must be between one and four")
+    cutoff_value = float(cutoff)
+    if switch_distance is not None and (
+        not isfinite(float(switch_distance))
+        or float(switch_distance) < 0.0
+        or float(switch_distance) >= cutoff_value
+    ):
+        raise ValueError("switch_distance must be finite, non-negative, and below cutoff")
+
+    switch_value = 0.0 if switch_distance is None else float(switch_distance)
+    switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
+    alpha_value = float(alpha)
+    params = mx.array(
+        [
+            cutoff_value * cutoff_value,
+            float(bool(shift)),
+            float(switch_distance is not None),
+            switch_value,
+            switch_width,
+            cutoff_value,
+            float(coulomb_constant),
+            alpha_value,
+            2.0 * alpha_value / sqrt(pi),
+            1.0 / switch_width,
+            float(one_four_scale),
+        ],
+        dtype=mx.float32,
+    )
+    counts = mx.array(
+        [block_count, padded_count, atom_count, _simdgroups_per_threadgroup],
+        dtype=mx.int32,
+    )
+    threadgroups = (
+        block_count + _simdgroups_per_threadgroup - 1
+    ) // _simdgroups_per_threadgroup
+    dispatch_width = 32 * _simdgroups_per_threadgroup
+    (forces,) = _owner_compute32_force_kernel()(
+        inputs=[
+            positions,
+            atom_order,
+            owner_offsets,
+            right_atoms,
+            topology_offsets,
+            topology_neighbors,
+            topology_classes,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            params,
+            counts,
+        ],
+        output_shapes=[positions.shape],
+        output_dtypes=[mx.float32],
+        grid=(threadgroups * dispatch_width, 1, 1),
+        threadgroup=(dispatch_width, 1, 1),
+    )
     return forces
 
 

@@ -7,11 +7,14 @@ from math import isfinite
 
 import mlx.core as mx
 import numpy as np
+from scipy.spatial import cKDTree
 
 from mlx_atomistic.core import as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _interaction32_fused_half_pme_direct_force_only,
     _interaction32_pme_direct_force_only,
     _Interaction32ForceStages,
+    _owner_compute32_pme_direct_force_only,
 )
 
 _INTERACTION_TILE_SIZE = 32
@@ -320,6 +323,116 @@ class _DeviceInteractionSchedule32:
     special_work_diagonal: mx.array
 
 
+@dataclass(frozen=True)
+class _FusedHalfSchedule32:
+    atom_count: int
+    search_radius: float
+    atom_order: np.ndarray
+    ordinary_left_blocks: np.ndarray
+    ordinary_right_atoms: np.ndarray
+    ordinary_half_modes: np.ndarray
+    ordinary_group_starts: np.ndarray
+    ordinary_group_counts: np.ndarray
+    special_work_left_blocks: np.ndarray
+    special_work_left_slices: np.ndarray
+    special_work_right_atoms: np.ndarray
+    special_work_lj_enabled: np.ndarray
+    special_work_lj_one_four: np.ndarray
+    special_work_diagonal: np.ndarray
+
+    @property
+    def padded_atom_count(self) -> int:
+        return int(self.atom_order.shape[0])
+
+    @property
+    def block_count(self) -> int:
+        return self.padded_atom_count // _INTERACTION_TILE_SIZE
+
+    @property
+    def ordinary_tile_count(self) -> int:
+        return int(self.ordinary_left_blocks.shape[0])
+
+    @property
+    def ordinary_group_count(self) -> int:
+        return int(self.ordinary_group_starts.shape[0])
+
+    @property
+    def ordinary_right_entry_count(self) -> int:
+        return int(np.count_nonzero(self.ordinary_right_atoms < self.padded_atom_count))
+
+    @property
+    def ordinary_logical_pair_lanes(self) -> int:
+        valid_per_tile = np.count_nonzero(
+            self.ordinary_right_atoms < self.padded_atom_count,
+            axis=1,
+        )
+        left_widths = np.where(self.ordinary_half_modes == 3, 32, 16)
+        return int(np.sum(valid_per_tile * left_widths))
+
+    @property
+    def special_work_count(self) -> int:
+        return int(self.special_work_left_blocks.shape[0])
+
+
+@dataclass(frozen=True)
+class _DeviceFusedHalfSchedule32:
+    atom_count: int
+    search_radius: float
+    padded_atom_count: int
+    ordinary_tile_count: int
+    ordinary_group_count: int
+    atom_order: mx.array
+    ordinary_left_blocks: mx.array
+    ordinary_right_atoms: mx.array
+    ordinary_half_modes: mx.array
+    ordinary_group_starts: mx.array
+    ordinary_group_counts: mx.array
+    special_work_left_blocks: mx.array
+    special_work_left_slices: mx.array
+    special_work_right_atoms: mx.array
+    special_work_lj_enabled: mx.array
+    special_work_lj_one_four: mx.array
+    special_work_diagonal: mx.array
+
+
+@dataclass(frozen=True)
+class _OwnerComputeSchedule32:
+    atom_count: int
+    search_radius: float
+    atom_order: np.ndarray
+    owner_offsets: np.ndarray
+    right_atoms: np.ndarray
+    topology_offsets: np.ndarray
+    topology_neighbors: np.ndarray
+    topology_classes: np.ndarray
+
+    @property
+    def padded_atom_count(self) -> int:
+        return int(self.atom_order.shape[0])
+
+    @property
+    def block_count(self) -> int:
+        return self.padded_atom_count // _INTERACTION_TILE_SIZE
+
+    @property
+    def scheduled_pair_lanes(self) -> int:
+        return int(self.right_atoms.shape[0]) * _INTERACTION_TILE_SIZE
+
+
+@dataclass(frozen=True)
+class _DeviceOwnerComputeSchedule32:
+    atom_count: int
+    search_radius: float
+    padded_atom_count: int
+    block_count: int
+    atom_order: mx.array
+    owner_offsets: mx.array
+    right_atoms: mx.array
+    topology_offsets: mx.array
+    topology_neighbors: mx.array
+    topology_classes: mx.array
+
+
 def _schedule_to_device32(
     schedule: _InteractionSchedule32,
 ) -> _DeviceInteractionSchedule32:
@@ -349,6 +462,244 @@ def _schedule_to_device32(
             dtype=mx.uint32,
         ),
         special_work_diagonal=mx.array(schedule.special_work_diagonal, dtype=mx.int32),
+    )
+
+
+def _owner_schedule_to_device32(
+    schedule: _OwnerComputeSchedule32,
+) -> _DeviceOwnerComputeSchedule32:
+    return _DeviceOwnerComputeSchedule32(
+        atom_count=schedule.atom_count,
+        search_radius=schedule.search_radius,
+        padded_atom_count=schedule.padded_atom_count,
+        block_count=schedule.block_count,
+        atom_order=mx.array(schedule.atom_order, dtype=mx.int32),
+        owner_offsets=mx.array(schedule.owner_offsets, dtype=mx.int32),
+        right_atoms=mx.array(schedule.right_atoms, dtype=mx.int32),
+        topology_offsets=mx.array(schedule.topology_offsets, dtype=mx.int32),
+        topology_neighbors=mx.array(schedule.topology_neighbors, dtype=mx.int32),
+        topology_classes=mx.array(schedule.topology_classes, dtype=mx.int32),
+    )
+
+
+def _fused_half_schedule_to_device32(
+    schedule: _FusedHalfSchedule32,
+) -> _DeviceFusedHalfSchedule32:
+    return _DeviceFusedHalfSchedule32(
+        atom_count=schedule.atom_count,
+        search_radius=schedule.search_radius,
+        padded_atom_count=schedule.padded_atom_count,
+        ordinary_tile_count=schedule.ordinary_tile_count,
+        ordinary_group_count=schedule.ordinary_group_count,
+        atom_order=mx.array(schedule.atom_order, dtype=mx.int32),
+        ordinary_left_blocks=mx.array(schedule.ordinary_left_blocks, dtype=mx.int32),
+        ordinary_right_atoms=mx.array(schedule.ordinary_right_atoms, dtype=mx.int32),
+        ordinary_half_modes=mx.array(schedule.ordinary_half_modes, dtype=mx.int32),
+        ordinary_group_starts=mx.array(schedule.ordinary_group_starts, dtype=mx.int32),
+        ordinary_group_counts=mx.array(schedule.ordinary_group_counts, dtype=mx.int32),
+        special_work_left_blocks=mx.array(schedule.special_work_left_blocks, dtype=mx.int32),
+        special_work_left_slices=mx.array(schedule.special_work_left_slices, dtype=mx.int32),
+        special_work_right_atoms=mx.array(schedule.special_work_right_atoms, dtype=mx.int32),
+        special_work_lj_enabled=mx.array(schedule.special_work_lj_enabled, dtype=mx.uint32),
+        special_work_lj_one_four=mx.array(
+            schedule.special_work_lj_one_four,
+            dtype=mx.uint32,
+        ),
+        special_work_diagonal=mx.array(schedule.special_work_diagonal, dtype=mx.int32),
+    )
+
+
+def _fuse_interaction_halves32(
+    schedule: _InteractionSchedule32,
+    *,
+    ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+) -> _FusedHalfSchedule32:
+    if schedule.left_slice_size != 16:
+        raise ValueError("fused-half scheduling requires a 16-atom base schedule")
+    if ordinary_tiles_per_group < 1:
+        raise ValueError("ordinary_tiles_per_group must be positive")
+
+    sentinel = schedule.padded_atom_count
+    fused_left: list[int] = []
+    fused_right: list[np.ndarray] = []
+    fused_modes: list[int] = []
+    run_start = 0
+    while run_start < schedule.ordinary_tile_count:
+        left_block = int(schedule.ordinary_left_blocks[run_start])
+        run_stop = run_start + 1
+        while (
+            run_stop < schedule.ordinary_tile_count
+            and schedule.ordinary_left_blocks[run_stop] == left_block
+        ):
+            run_stop += 1
+        rights = schedule.ordinary_right_atoms[run_start:run_stop].reshape(-1)
+        slices = np.repeat(
+            schedule.ordinary_left_slices[run_start:run_stop],
+            _INTERACTION_TILE_SIZE,
+        )
+        valid = rights < sentinel
+        rights = rights[valid]
+        slices = slices[valid]
+        unique_rights, inverse = np.unique(rights, return_inverse=True)
+        half_masks = np.zeros((unique_rights.shape[0],), dtype=np.uint32)
+        np.bitwise_or.at(half_masks, inverse, np.left_shift(np.uint32(1), slices))
+        for mode in (1, 2, 3):
+            selected = unique_rights[half_masks == mode]
+            if selected.size == 0:
+                continue
+            padded_size = (
+                (selected.size + _INTERACTION_TILE_SIZE - 1)
+                // _INTERACTION_TILE_SIZE
+            ) * _INTERACTION_TILE_SIZE
+            padded_rights = np.full((padded_size,), sentinel, dtype=np.int32)
+            padded_rights[: selected.size] = selected
+            tile_count = padded_size // _INTERACTION_TILE_SIZE
+            fused_left.extend([left_block] * tile_count)
+            fused_modes.extend([mode] * tile_count)
+            fused_right.append(padded_rights.reshape((-1, _INTERACTION_TILE_SIZE)))
+        run_start = run_stop
+
+    ordinary_left_blocks = np.asarray(fused_left, dtype=np.int32)
+    empty_shape = (0, _INTERACTION_TILE_SIZE)
+    ordinary_right_atoms = (
+        np.concatenate(fused_right, axis=0)
+        if fused_right
+        else np.empty(empty_shape, dtype=np.int32)
+    )
+    ordinary_half_modes = np.asarray(fused_modes, dtype=np.int32)
+    ordinary_group_starts, ordinary_group_counts = _group_ordinary_tiles(
+        ordinary_left_blocks,
+        ordinary_half_modes,
+        ordinary_tiles_per_group,
+    )
+    return _FusedHalfSchedule32(
+        atom_count=schedule.atom_count,
+        search_radius=schedule.search_radius,
+        atom_order=schedule.atom_order,
+        ordinary_left_blocks=ordinary_left_blocks,
+        ordinary_right_atoms=ordinary_right_atoms,
+        ordinary_half_modes=ordinary_half_modes,
+        ordinary_group_starts=ordinary_group_starts,
+        ordinary_group_counts=ordinary_group_counts,
+        special_work_left_blocks=schedule.special_work_left_blocks,
+        special_work_left_slices=schedule.special_work_left_slices,
+        special_work_right_atoms=schedule.special_work_right_atoms,
+        special_work_lj_enabled=schedule.special_work_lj_enabled,
+        special_work_lj_one_four=schedule.special_work_lj_one_four,
+        special_work_diagonal=schedule.special_work_diagonal,
+    )
+
+
+def _build_owner_topology(
+    atom_count: int,
+    exclusions: np.ndarray,
+    one_four: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    owners: list[np.ndarray] = []
+    neighbors: list[np.ndarray] = []
+    classes: list[np.ndarray] = []
+    for pairs, topology_class in ((exclusions, 0), (one_four, 1)):
+        if pairs.shape[0] == 0:
+            continue
+        owners.append(np.concatenate((pairs[:, 0], pairs[:, 1])))
+        neighbors.append(np.concatenate((pairs[:, 1], pairs[:, 0])))
+        classes.append(np.full((2 * pairs.shape[0],), topology_class, dtype=np.int32))
+    if not owners:
+        return (
+            np.zeros((atom_count + 1,), dtype=np.int32),
+            np.empty((0,), dtype=np.int32),
+            np.empty((0,), dtype=np.int32),
+        )
+    owner_array = np.concatenate(owners).astype(np.int32, copy=False)
+    neighbor_array = np.concatenate(neighbors).astype(np.int32, copy=False)
+    class_array = np.concatenate(classes)
+    order = np.argsort(owner_array, kind="stable")
+    owner_array = owner_array[order]
+    neighbor_array = neighbor_array[order]
+    class_array = class_array[order]
+    offsets = np.empty((atom_count + 1,), dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(np.bincount(owner_array, minlength=atom_count), out=offsets[1:])
+    return offsets, neighbor_array, class_array
+
+
+def _build_owner_compute_schedule32(
+    positions: object,
+    box_lengths: object,
+    *,
+    search_radius: float,
+    lj_exclusion_pairs: object = (),
+    lj_one_four_pairs: object = (),
+) -> _OwnerComputeSchedule32:
+    positions_np = np.asarray(positions, dtype=np.float64)
+    box = np.asarray(box_lengths, dtype=np.float64)
+    if positions_np.ndim != 2 or positions_np.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    atom_count = int(positions_np.shape[0])
+    if atom_count == 0:
+        raise ValueError("the owner-computes schedule requires atoms")
+    if box.shape != (3,) or np.any(~np.isfinite(box)) or np.any(box <= 0.0):
+        raise ValueError("box_lengths must be a finite positive vector with shape (3,)")
+    if not isfinite(float(search_radius)) or search_radius <= 0.0:
+        raise ValueError("search_radius must be finite and positive")
+    if 2.0 * float(search_radius) >= float(np.min(box)):
+        raise ValueError("search_radius must be smaller than half the shortest box length")
+
+    exclusions = _normalize_pairs(lj_exclusion_pairs, atom_count, "lj_exclusion_pairs")
+    one_four = _normalize_pairs(lj_one_four_pairs, atom_count, "lj_one_four_pairs")
+    if np.any(
+        _contains_sorted(
+            _pair_codes(exclusions, atom_count),
+            _pair_codes(one_four, atom_count),
+        )
+    ):
+        raise ValueError("LJ exclusion and one-four pair sets must be disjoint")
+
+    atom_order = _cell_atom_order(positions_np, box, float(search_radius))
+    padded_count = (
+        (atom_count + _INTERACTION_TILE_SIZE - 1) // _INTERACTION_TILE_SIZE
+    ) * _INTERACTION_TILE_SIZE
+    padded_order = np.full((padded_count,), -1, dtype=np.int32)
+    padded_order[:atom_count] = atom_order
+    blocks = padded_order.reshape((-1, _INTERACTION_TILE_SIZE))
+    inverse_order = np.empty((atom_count,), dtype=np.int32)
+    inverse_order[atom_order] = np.arange(atom_count, dtype=np.int32)
+    wrapped = positions_np - box * np.floor(positions_np / box)
+    tree = cKDTree(wrapped, boxsize=box)
+    sentinel = padded_count
+    owner_offsets = [0]
+    right_rows: list[np.ndarray] = []
+    for owners in blocks:
+        owners = owners[owners >= 0]
+        neighborhoods = tree.query_ball_point(
+            wrapped[owners],
+            float(search_radius),
+            return_sorted=False,
+        )
+        canonical_neighbors = np.unique(np.concatenate(neighborhoods))
+        ordered_neighbors = np.sort(inverse_order[canonical_neighbors])
+        padded_size = (
+            (ordered_neighbors.size + _INTERACTION_TILE_SIZE - 1)
+            // _INTERACTION_TILE_SIZE
+        ) * _INTERACTION_TILE_SIZE
+        row = np.full((padded_size,), sentinel, dtype=np.int32)
+        row[: ordered_neighbors.size] = ordered_neighbors
+        right_rows.append(row)
+        owner_offsets.append(owner_offsets[-1] + padded_size)
+    topology_offsets, topology_neighbors, topology_classes = _build_owner_topology(
+        atom_count,
+        exclusions,
+        one_four,
+    )
+    return _OwnerComputeSchedule32(
+        atom_count=atom_count,
+        search_radius=float(search_radius),
+        atom_order=padded_order,
+        owner_offsets=np.asarray(owner_offsets, dtype=np.int32),
+        right_atoms=np.concatenate(right_rows),
+        topology_offsets=topology_offsets,
+        topology_neighbors=topology_neighbors,
+        topology_classes=topology_classes,
     )
 
 
@@ -598,4 +949,104 @@ def _interaction32_direct_force_only(
         _canonical_records=_canonical_records,
         _simdgroups_per_threadgroup=_simdgroups_per_threadgroup,
         _left_slice_size=schedule.left_slice_size,
+    )
+
+
+def _fused_half32_direct_force_only(
+    positions: mx.array,
+    schedule: _FusedHalfSchedule32 | _DeviceFusedHalfSchedule32,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    one_four_scale: float,
+    coulomb_constant: float,
+    alpha: float,
+    _simdgroups_per_threadgroup: int = 4,
+) -> mx.array:
+    if isinstance(schedule, _FusedHalfSchedule32):
+        schedule = _fused_half_schedule_to_device32(schedule)
+    positions = as_mx_array(positions, dtype=mx.float32)
+    if positions.shape != (schedule.atom_count, 3):
+        raise ValueError(f"positions must have shape ({schedule.atom_count}, 3) for the schedule")
+    if not isfinite(float(cutoff)) or cutoff <= 0.0:
+        raise ValueError("cutoff must be finite and positive")
+    if cutoff > schedule.search_radius:
+        raise ValueError("cutoff cannot exceed the schedule search radius")
+    return _interaction32_fused_half_pme_direct_force_only(
+        positions,
+        schedule.atom_order,
+        schedule.ordinary_left_blocks,
+        schedule.ordinary_right_atoms,
+        schedule.ordinary_half_modes,
+        schedule.ordinary_group_starts,
+        schedule.ordinary_group_counts,
+        schedule.special_work_left_blocks,
+        schedule.special_work_left_slices,
+        schedule.special_work_right_atoms,
+        schedule.special_work_lj_enabled,
+        schedule.special_work_lj_one_four,
+        schedule.special_work_diagonal,
+        box_lengths_and_inverses,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+        cutoff=cutoff,
+        shift=shift,
+        switch_distance=switch_distance,
+        one_four_scale=one_four_scale,
+        coulomb_constant=coulomb_constant,
+        alpha=alpha,
+        _simdgroups_per_threadgroup=_simdgroups_per_threadgroup,
+    )
+
+
+def _owner_compute32_direct_force_only(
+    positions: mx.array,
+    schedule: _OwnerComputeSchedule32 | _DeviceOwnerComputeSchedule32,
+    box_lengths_and_inverses: mx.array,
+    half_sigma: mx.array,
+    sqrt_epsilon: mx.array,
+    charges: mx.array,
+    *,
+    cutoff: float,
+    shift: bool,
+    switch_distance: float | None,
+    one_four_scale: float,
+    coulomb_constant: float,
+    alpha: float,
+    _simdgroups_per_threadgroup: int = 4,
+) -> mx.array:
+    if isinstance(schedule, _OwnerComputeSchedule32):
+        schedule = _owner_schedule_to_device32(schedule)
+    positions = as_mx_array(positions, dtype=mx.float32)
+    if positions.shape != (schedule.atom_count, 3):
+        raise ValueError(f"positions must have shape ({schedule.atom_count}, 3) for the schedule")
+    if not isfinite(float(cutoff)) or cutoff <= 0.0:
+        raise ValueError("cutoff must be finite and positive")
+    if cutoff > schedule.search_radius:
+        raise ValueError("cutoff cannot exceed the schedule search radius")
+    return _owner_compute32_pme_direct_force_only(
+        positions,
+        schedule.atom_order,
+        schedule.owner_offsets,
+        schedule.right_atoms,
+        schedule.topology_offsets,
+        schedule.topology_neighbors,
+        schedule.topology_classes,
+        box_lengths_and_inverses,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+        cutoff=cutoff,
+        shift=shift,
+        switch_distance=switch_distance,
+        one_four_scale=one_four_scale,
+        coulomb_constant=coulomb_constant,
+        alpha=alpha,
+        _simdgroups_per_threadgroup=_simdgroups_per_threadgroup,
     )

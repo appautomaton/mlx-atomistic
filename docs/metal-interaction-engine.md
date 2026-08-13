@@ -433,6 +433,77 @@ MLX C++ primitive are not authorized for this design.  A future attempt needs
 a materially different force-accumulation algorithm, not another scheduling
 constant sweep.
 
+### Post-gate force-accumulation experiments
+
+Status: researched and rejected.  These experiments do not reopen Gate B or
+authorize the native primitive.
+
+The first follow-up tested a directed owner-computes algorithm.  One SIMD group
+owned a 32-atom block, each lane accumulated one atom's complete force in
+registers, and every force was written exactly once without atomics.  Sparse
+owner-local topology adjacency applied exclusion and 1-4 Lennard-Jones
+corrections after the ordinary loop.  The schedule required `65.73 M` directed
+lanes on 5DFR and `269.73 M` on JAC because every geometric pair was evaluated
+once in each direction.
+
+The no-atomic design was approximately 2.5 times slower than the retained route
+on 5DFR and 2.2 times slower on JAC.  Its long single-precision accumulation
+chain also failed force parity: root-mean-square deltas were `6.68e-2` and
+`6.00e-2 kJ/mol/A`.  Compensated summation reduced the 5DFR delta to
+`1.65e-2 kJ/mol/A` but did not approach the `1.0e-4` gate.  Removing atomics
+therefore did not pay for duplicate screened-Coulomb evaluation, and the
+owner-computes route was closed before a parameter sweep.
+
+The second follow-up preserved one evaluation per pair.  It merged the ordinary
+right-atom lists from the two 16-atom left halves, partitioned right atoms into
+`half 0`, `half 1`, and `both` buckets, and wrote each shared right force once.
+The bucketed schedule preserves every base `(left block, left slot, right atom)`
+membership exactly.  It reduced ordinary right-force atomic candidates by
+`37.10%` on 5DFR and `36.97%` on JAC without changing logical pair lanes.
+
+Atomic reduction alone produced only a `1.44%` stable JAC speedup.  This showed
+that force atomics were not the dominant residual cost.  The final combined
+candidate also reused one `exp(-alpha^2 r^2)` evaluation for both the Ewald
+force term and an Abramowitz-Stegun `erfc` approximation, following OpenMM's
+single-precision `coulombLennardJones` kernel.  This removed a second exponential
+on the high-argument branch while remaining inside the declared force gate.
+
+Formal 16-call-block, 20-sample results for the combined candidate were:
+
+| Workload | Retained route | Candidate | Candidate speedup | Directions | RMS / maximum force delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5DFR | 0.8377 ms | 0.8395 ms | -0.21% | 4.63%, -2.29% | `6.84e-5` / `5.19e-4` |
+| JAC | 4.3441 ms | 4.0650 ms | 6.42% | 5.36%, 6.50% | `5.18e-5` / `5.19e-4` |
+
+The JAC directions agree, but the result remains far below the 15% gate.  The
+5DFR aggregate is effectively flat, while its order-conditioned directions do
+not agree under the host's low-power GPU frequency transitions.  Six ordinary
+tiles per work item improved short JAC samples but regressed the formal 5DFR
+steady median by `5.85%`; twelve tiles also lost JAC parallelism.  Three tiles
+remains the bounded-sweep selection.
+
+Reproduce the combined runs with:
+
+```bash
+uv run python scripts/benchmark_interaction32.py \
+  results/dhfr-npt-closure/prepared \
+  --architecture fused_half32 \
+  --ordinary-tiles-per-group 3 \
+  --warmups 8 --samples 20 --timing-block-count 16
+
+uv run python scripts/benchmark_interaction32.py \
+  results/scalable-charged-pme-runtime/jac-2x2x1/prepared \
+  --architecture fused_half32 \
+  --ordinary-tiles-per-group 3 \
+  --warmups 8 --samples 20 --timing-block-count 16
+```
+
+The force-only architecture is still a no-go.  No C++ extension, device-resident
+builder, or production route change follows from these prototypes.  The next
+performance investigation should target screened-Coulomb pair math or the
+retained production kernel directly, with whole-step evidence, rather than
+another force-accumulation schedule.
+
 ### Gate C: device builder
 
 Status: not run because Gate B failed.

@@ -8,7 +8,11 @@ import pytest
 
 from mlx_atomistic.interaction_engine import (
     _build_interaction_schedule32,
+    _build_owner_compute_schedule32,
+    _fuse_interaction_halves32,
+    _fused_half32_direct_force_only,
     _interaction32_direct_force_only,
+    _owner_compute32_direct_force_only,
 )
 from mlx_atomistic.metal_kernels import _prepared_parameterized_pme_direct_force_only
 
@@ -118,6 +122,59 @@ def test_interaction32_force_matches_prepared_pair_oracle(left_slice_size):
         mx.eval(reference, observed)
         np.testing.assert_allclose(
             np.asarray(observed),
+            np.asarray(reference),
+            rtol=2.0e-5,
+            atol=2.0e-3,
+        )
+
+    if left_slice_size == 16:
+        fused_schedule = _fuse_interaction_halves32(schedule)
+        fused_observed = _fused_half32_direct_force_only(
+            positions,
+            fused_schedule,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            cutoff=cutoff,
+            shift=False,
+            switch_distance=None,
+            one_four_scale=one_four_scale,
+            coulomb_constant=1389.35457644382,
+            alpha=0.35,
+        )
+        mx.eval(fused_observed)
+        np.testing.assert_allclose(
+            np.asarray(fused_observed),
+            np.asarray(reference),
+            rtol=2.0e-5,
+            atol=2.0e-3,
+        )
+
+        owner_schedule = _build_owner_compute_schedule32(
+            positions_np,
+            box_lengths,
+            search_radius=4.5,
+            lj_exclusion_pairs=excluded,
+            lj_one_four_pairs=one_four,
+        )
+        owner_observed = _owner_compute32_direct_force_only(
+            positions,
+            owner_schedule,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            cutoff=cutoff,
+            shift=False,
+            switch_distance=None,
+            one_four_scale=one_four_scale,
+            coulomb_constant=1389.35457644382,
+            alpha=0.35,
+        )
+        mx.eval(owner_observed)
+        np.testing.assert_allclose(
+            np.asarray(owner_observed),
             np.asarray(reference),
             rtol=2.0e-5,
             atol=2.0e-3,
