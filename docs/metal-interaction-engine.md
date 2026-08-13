@@ -1,13 +1,14 @@
 # Device-Resident 32-Atom Metal Interaction Engine
 
-Status: research complete; bounded prototype approved; production integration
-not yet approved.
+Status: research complete; bounded force prototype implemented; production
+integration not yet approved.  Metal correctness passes.  The formal
+performance gate requires an uncontended GPU rerun.
 
 ## Decision
 
 Build the engine in two gates.
 
-1. Implement a fixed-coordinate, fixed-cell `32 x 32` force prototype with
+1. Implement a fixed-coordinate, fixed-cell 32-atom force prototype with
    `mx.fast.metal_kernel`.  Include atom packing and force scattering in every
    performance result.  This gate requires no new package and answers the most
    important question first: does the interaction algorithm beat the retained
@@ -238,26 +239,29 @@ later allocation.  `ordinary_capacity` is fixed for the state generation.
 
 ### 4. `compute_ordinary_interactions_32`
 
-One SIMD group owns one ordinary tile.  Lane `l` owns left atom `l` and the
-right atom stored in slot `l`.  During rotation `k`, it evaluates left atom `l`
-against right slot `(l+k) mod 32`.
+The first implementation tested one SIMD group per `32 x 32` tile with a full
+right-atom rotation.  It was correct but slow because returning every right
+force to its owner required repeated cross-lane shuffles.
 
-The force on the left atom remains in a register.  The contribution for a
-lane's original right atom is returned with a SIMD shuffle from source lane
-`(l-k) mod 32`.  After 32 rotations each lane performs one three-component
-atomic addition for its left atom and one for its original right atom.
+The retained prototype composes each 32-atom interaction block from two
+`16 x 32` SIMD work units.  Each lane owns one right atom for the whole kernel.
+The SIMD group walks 16 left atoms from threadgroup memory, accumulates the
+right force in the owning lane, and uses `simd_sum` for each left force.  The
+engine still stores and schedules 32-atom blocks; execution granularity is an
+independent kernel choice.
 
 Conceptually:
 
 ```text
-for k in 0..31:
-    right = simd_shuffle(owned_right, (lane + k) & 31)
-    pair_force = direct_pair(left, right)
-    left_force += pair_force
-    right_force -= simd_shuffle(pair_force, (lane - k) & 31)
+for left in owned_left_half:
+    pair_force = direct_pair(left, owned_right)
+    right_force -= pair_force
+    left_force = simd_sum(pair_force)
 ```
 
-The actual Metal source must guard invalid atoms, zero distance, the force
+After 16 iterations each right lane performs one three-component atomic add;
+one selected lane writes each reduced left force.  The Metal source guards
+invalid atoms, zero distance, the force
 cutoff, and a runtime `threads_per_simdgroup == 32` certificate.
 
 ### 5. `compute_special_interactions_32`
@@ -331,6 +335,8 @@ Cell ordering reaches 44.90% on 5DFR and 45.15% on JAC with approximately
 
 ### Gate B: force algorithm
 
+Status: correctness passed; formal performance pending an uncontended GPU.
+
 Build only the pack, ordinary force, special force, and scatter kernels.  The
 schedule may be built by the research harness for this gate.
 
@@ -352,6 +358,20 @@ Performance, including pack and scatter:
   arms.
 
 Failure closes the 32-atom force design.  Do not build the native primitive.
+
+The implemented prototype is under `src/mlx_atomistic/interaction_engine.py`
+and the Metal kernels are in `src/mlx_atomistic/metal_kernels.py`.  The reusable
+Gate B runner is `scripts/benchmark_interaction32.py`.  Both 5DFR and JAC passed
+the declared force gates: the largest observed root-mean-square delta was
+`3.50e-5 kJ/mol/A` and the largest maximum delta was
+`4.58e-4 kJ/mol/A`.
+
+The first performance session was invalidated by a concurrent independent MLX
+video-generation workload on the same unified GPU.  Single-call samples moved
+between frequency bands by more than an order of magnitude, and one-versus-nine
+graph samples even produced negative marginal values.  No performance verdict
+is drawn from those values.  Rerun the harness after the other Metal workload
+has exited.
 
 ### Gate C: device builder
 
