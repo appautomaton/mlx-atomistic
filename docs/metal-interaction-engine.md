@@ -499,10 +499,13 @@ uv run python scripts/benchmark_interaction32.py \
 ```
 
 The force-only architecture is still a no-go.  No C++ extension, device-resident
-builder, or production route change follows from these prototypes.  The next
-performance investigation should target screened-Coulomb pair math or the
-retained production kernel directly, with whole-step evidence, rather than
-another force-accumulation schedule.
+builder, or production route change follows from these prototypes.  The
+separate production-path
+[shared-exponential verdict](./benchmarks/md-erfcx-shared-exponential-verdict-m5max.md)
+already showed that a direct-kernel win is hidden by the asynchronous complete
+wall, so this result does not reopen that route.  The next MD target remains the
+independently synchronized reciprocal PME path, not another direct-space or
+force-accumulation variant.
 
 ### Gate C: device builder
 
