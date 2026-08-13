@@ -1,22 +1,23 @@
 # Device-Resident 32-Atom Metal Interaction Engine
 
-Status: research complete; bounded force prototype implemented; production
-integration not yet approved.  Metal correctness passes.  The formal
-performance gate requires an uncontended GPU rerun.
+Status: research complete; bounded force prototype implemented; Gate B failed.
+Metal correctness passes, but the measured force speedup is insufficient for
+production integration or a native extension.
 
 ## Decision
 
-Build the engine in two gates.
+The experiment was bounded by two gates.
 
 1. Implement a fixed-coordinate, fixed-cell 32-atom force prototype with
-   `mx.fast.metal_kernel`.  Include atom packing and force scattering in every
-   performance result.  This gate requires no new package and answers the most
-   important question first: does the interaction algorithm beat the retained
-   `4 x 4` production route on Apple Silicon?
+   `mx.fast.metal_kernel`.  Include all record preparation and force output
+   work in every performance result.  This gate requires no new package and
+   answers the most important question first: does the interaction algorithm
+   beat the retained `4 x 4` production route on Apple Silicon?
 2. Only after that gate passes, implement a small MLX C++ `Primitive` that owns
    the persistent interaction state and encodes the rebuild and force kernels
    on the MLX Metal stream.  The native extension is not justified before the
-   force algorithm has measured headroom.
+   force algorithm has measured headroom.  Gate B did not pass, so this stage
+   was not started.
 
 This is not a port of OpenMM.  OpenMM supplies validated algorithmic ideas.  The
 product remains the MLX/Metal runtime, with canonical MLX positions and forces
@@ -34,7 +35,7 @@ The proposed engine changes all three together:
 
 - atoms are packed into spatially coherent 32-atom blocks;
 - the neighbor list stores a left block plus 32 packed right atoms;
-- one SIMD group evaluates the resulting `32 x 32` interaction block;
+- SIMD-native execution slices compose each resulting 32-atom block;
 - topology-bearing block pairs use a separate, small special-tile route;
 - rebuild decisions and fixed-capacity state remain on the device.
 
@@ -87,9 +88,9 @@ capacity buffers, and a device rebuild flag.
 OpenMM's exact implementation is not copied for three reasons:
 
 1. Reordering the complete MLX state would disturb bonded, reciprocal Particle
-   Mesh Ewald (PME), constraint, and integration graphs.  The first engine will
-   instead pack a private direct-force view and scatter its result back to
-   canonical atom order.
+   Mesh Ewald (PME), constraint, and integration graphs.  The prototype tested
+   a private packed view, then selected direct canonical gathers and force
+   accumulation when those extra linear dispatches lost end to end.
 2. The MLX runtime already represents Coulomb exclusions and exceptions as a
    sparse correction after the ordinary direct term.  The new ordinary and
    special kernels preserve that convention.  Only Lennard-Jones enable and
@@ -160,11 +161,19 @@ InteractionState32
   block_center_radius        float32 [blocks, 4]
   block_half_extent          float32 [blocks, 4]
   ordinary_left_block        int32 [ordinary_capacity]
+  ordinary_left_slice        int32 [ordinary_capacity]
   ordinary_right_atoms       int32 [ordinary_capacity, 32]
+  ordinary_group_start       int32 [ordinary_group_capacity]
+  ordinary_group_count       int32 [ordinary_group_capacity]
   ordinary_count             uint32 [1]
   special_block_pair         int32 [special_count, 2]
   special_lj_enabled         uint32 [special_count, 32]
   special_lj_one_four        uint32 [special_count, 32]
+  special_work_left_block    int32 [special_work_count]
+  special_work_left_slice    int32 [special_work_count]
+  special_work_right_atoms   int32 [special_work_count, 32]
+  special_work_lj_enabled    uint32 [special_work_count, 32]
+  special_work_lj_one_four   uint32 [special_work_count, 32]
   old_positions              float32 [atoms, 4]
   old_box                     float32 [6]
   rebuild_flag               uint32 [1]
@@ -172,15 +181,21 @@ InteractionState32
   generation                 uint32 [1]
 ```
 
-`ordinary_right_atoms[tile, lane]` is either a canonical atom identifier or a
-sentinel equal to `atom_count`.  The left block identifies 32 atoms through
-`atom_order`.  Ordinary tiles contain no topology masks.
+`ordinary_right_atoms[tile, lane]` is either an ordered atom identifier or a
+padding sentinel.  The left block identifies 32 atoms through `atom_order`,
+while `ordinary_left_slice` selects one 16-atom execution slice.  Right columns
+are admitted separately for each slice, so a column near only the first half of
+a block is not redundantly evaluated against the second half.  Consecutive
+tiles sharing a left slice are grouped in threes; one SIMD work item loads that
+slice once, walks the three right tiles, and writes each left force once.
 
 Every diagonal block and every block pair containing at least one excluded,
 exception, or 1-4 Lennard-Jones pair is a special tile.  Its two 32-word masks
-describe the 32 left interactions for each right atom.  Coulomb remains enabled
-for all valid geometric pairs because the existing sparse PME correction route
-removes exclusions and installs exception values afterward.
+describe the 32 left interactions for each right atom.  The execution schedule
+also compacts these tiles into 16-by-32 work descriptors with their mask words
+aligned to the packed right columns.  Coulomb remains enabled for all valid
+geometric pairs because the existing sparse PME correction route removes
+exclusions and installs exception values afterward.
 
 ## Atom ordering and packed views
 
@@ -196,10 +211,14 @@ At initialization or an explicit order refresh:
 4. group consecutive identifiers into 32-atom blocks;
 5. build the inverse order and topology-bearing special tiles.
 
-At every force evaluation, a linear kernel packs canonical positions and
-static charge/Lennard-Jones parameters into aligned block-order records.  A
-linear unique-writer kernel scatters the accumulated direct force back to
-canonical order.  Both costs must be included in every force benchmark.
+The first force prototype packed canonical positions and parameters into
+block-order records and scattered the ordered force back afterward.  Stage
+profiling showed that the extra dispatches mattered on 5DFR.  The final Gate B
+candidate instead gathers canonical records through `atom_order` inside the
+interaction kernel and atomically accumulates directly into canonical force
+slots.  This makes the candidate one Metal dispatch.  The packed route remains
+available in the research harness for A/B diagnosis, but it is not the final
+candidate.
 
 The ordering is not refreshed at every neighbor rebuild.  The bounded prototype
 keeps it fixed for a trajectory sample and records occupancy drift.  A retained
@@ -209,11 +228,11 @@ that the refresh pays for itself.
 
 ## Kernel family
 
-### 1. `pack_atom_records_32`
+### 1. `pack_atom_records_32` (diagnostic route)
 
 Gather canonical `positions`, `charges`, `half_sigma`, and `sqrt_epsilon` into
-block-order float records.  Static parameters are repacked only when atom order
-changes; positions are packed each force evaluation.
+block-order float records.  The Gate B sweep retained this only to measure the
+coalescing-versus-dispatch tradeoff; direct canonical access won end to end.
 
 ### 2. `check_rebuild_and_bounds_32`
 
@@ -243,12 +262,14 @@ The first implementation tested one SIMD group per `32 x 32` tile with a full
 right-atom rotation.  It was correct but slow because returning every right
 force to its owner required repeated cross-lane shuffles.
 
-The retained prototype composes each 32-atom interaction block from two
+The retained prototype composes each 32-atom interaction block from
 `16 x 32` SIMD work units.  Each lane owns one right atom for the whole kernel.
 The SIMD group walks 16 left atoms from threadgroup memory, accumulates the
-right force in the owning lane, and uses `simd_sum` for each left force.  The
-engine still stores and schedules 32-atom blocks; execution granularity is an
-independent kernel choice.
+right force in the owning lane, and uses `simd_sum` for each left force.  Right
+columns are compacted independently for each 16-atom slice.  Up to three
+ordinary right tiles sharing that slice execute in one work item, amortizing
+left loads and left-force atomics.  The engine still stores and bounds 32-atom
+blocks; execution granularity is an independent kernel choice.
 
 Conceptually:
 
@@ -259,22 +280,25 @@ for left in owned_left_half:
     left_force = simd_sum(pair_force)
 ```
 
-After 16 iterations each right lane performs one three-component atomic add;
-one selected lane writes each reduced left force.  The Metal source guards
-invalid atoms, zero distance, the force
-cutoff, and a runtime `threads_per_simdgroup == 32` certificate.
+After each right tile every valid right lane performs one three-component
+atomic add.  A selected lane accumulates its reduced left force across the
+group and writes it once at the end.  The Metal source guards invalid atoms,
+zero distance, the force cutoff, and a runtime
+`threads_per_simdgroup == 32` certificate.
 
 ### 5. `compute_special_interactions_32`
 
-This uses the same rotation and accumulation pattern but reads one
-Lennard-Jones enable word and one 1-4 word per right lane.  Diagonal tiles also
-mask self pairs and one triangle.  Keeping this route separate prevents mask
-bandwidth and branches from entering ordinary tiles.
+This uses the same ownership and accumulation pattern but reads one
+Lennard-Jones enable word and one 1-4 word per compacted right lane.  Diagonal
+tiles also mask self pairs and one triangle.  Ordinary and special descriptors
+share one dispatch and one force output; work-item-uniform branches select the
+mask path.
 
-### 6. `scatter_ordered_force_32`
+### 6. `scatter_ordered_force_32` (diagnostic route)
 
 One thread per valid ordered atom writes its direct force to the unique
-canonical atom slot.  This scatter needs no atomic operation.
+canonical atom slot.  The final candidate removes this dispatch by accumulating
+canonical force directly.
 
 ## Device residence and the MLX boundary
 
@@ -335,10 +359,10 @@ Cell ordering reaches 44.90% on 5DFR and 45.15% on JAC with approximately
 
 ### Gate B: force algorithm
 
-Status: correctness passed; formal performance pending an uncontended GPU.
+Status: failed.  Correctness passed; the force performance threshold did not.
 
-Build only the pack, ordinary force, special force, and scatter kernels.  The
-schedule may be built by the research harness for this gate.
+Build only the record-access, ordinary-force, special-force, and force-output
+paths.  The schedule may be built by the research harness for this gate.
 
 Correctness against the retained direct route on both prepared systems:
 
@@ -349,7 +373,7 @@ Correctness against the retained direct route on both prepared systems:
 - a non-32 SIMD width produces an explicit unsupported result and takes the
   retained route.
 
-Performance, including pack and scatter:
+Performance, including every required preparation and output operation:
 
 - at least 15% lower synchronized force-only median on JAC;
 - no regression larger than 2% on 5DFR;
@@ -362,18 +386,56 @@ Failure closes the 32-atom force design.  Do not build the native primitive.
 The implemented prototype is under `src/mlx_atomistic/interaction_engine.py`
 and the Metal kernels are in `src/mlx_atomistic/metal_kernels.py`.  The reusable
 Gate B runner is `scripts/benchmark_interaction32.py`.  Both 5DFR and JAC passed
-the declared force gates: the largest observed root-mean-square delta was
-`3.50e-5 kJ/mol/A` and the largest maximum delta was
-`4.58e-4 kJ/mol/A`.
+the declared force-correctness limits throughout the sweep.  In the final run,
+the root-mean-square deltas were `3.36e-5` and `3.29e-5 kJ/mol/A`; maximum
+deltas were `4.58e-4` and `3.66e-4 kJ/mol/A`.
 
 The first performance session was invalidated by a concurrent independent MLX
-video-generation workload on the same unified GPU.  Single-call samples moved
-between frequency bands by more than an order of magnitude, and one-versus-nine
-graph samples even produced negative marginal values.  No performance verdict
-is drawn from those values.  Rerun the harness after the other Metal workload
-has exited.
+video-generation workload on the same unified GPU.  Later single-call samples
+also exposed Apple GPU frequency-band transitions.  The final verdict therefore
+uses sequential blocks of 16 individually synchronized force calls, 20
+alternating samples, and reports both control-first and candidate-first
+directions.  This preserves per-step launch and synchronization while keeping
+the GPU in a steady power state; the one-versus-nine simultaneous-graph result
+is retained only as a diagnostic.
+
+The final candidate uses 32-atom storage, 16-by-32 execution slices, three
+ordinary right tiles per work item, four SIMD groups per threadgroup, direct
+canonical record access, and direct canonical force accumulation.  Results:
+
+| Workload | Retained route | Candidate | Candidate speedup | Directions |
+| --- | ---: | ---: | ---: | ---: |
+| 5DFR | 0.8603 ms | 0.8432 ms | 1.99% | 1.00%, 2.12% |
+| JAC | 3.2851 ms | 3.2354 ms | 1.51% | 1.56%, 1.76% |
+
+Reproduce the final force runs with:
+
+```bash
+uv run python scripts/benchmark_interaction32.py \
+  results/dhfr-npt-closure/prepared \
+  --warmups 8 --samples 20 --timing-block-count 16
+
+uv run python scripts/benchmark_interaction32.py \
+  results/scalable-charged-pme-runtime/jac-2x2x1/prepared \
+  --warmups 8 --samples 20 --timing-block-count 16
+```
+
+Half-specific column compaction reduced scheduled pair lanes from `134.01 M`
+to `109.72 M` on JAC and moved the candidate from the first uncontended
+single-call result of roughly 27.5% slower to slightly faster.  Sweeps of
+8-atom and 4-atom execution slices reduced pair lanes further to `94.88 M` and
+`83.31 M`, but increased descriptor traffic and repeated right-force atomics;
+neither improved the stable end-to-end result.
+
+The 5DFR non-regression condition passed, but JAC missed the required 15%
+speedup by a wide margin.  Gate B is therefore a no-go.  Gate C and the native
+MLX C++ primitive are not authorized for this design.  A future attempt needs
+a materially different force-accumulation algorithm, not another scheduling
+constant sweep.
 
 ### Gate C: device builder
+
+Status: not run because Gate B failed.
 
 - randomized periodic small systems exactly match a brute-force search list;
 - 5DFR and JAC exactly match the retained Verlet membership, allowing only a
@@ -385,6 +447,8 @@ has exited.
 - the no-rebuild path does not rewrite or copy the capacity arrays.
 
 ### Gate D: native state and full trajectory
+
+Status: not run because Gate B failed.
 
 - buffer donation and non-donatable copy behavior pass targeted unit tests;
 - overflow executes the correct fallback and is reported;

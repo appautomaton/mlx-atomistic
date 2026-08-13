@@ -56,6 +56,56 @@ def _interleaved_samples(
     return timings
 
 
+def _sequential_block_samples(
+    control_call,
+    candidate_call,
+    *,
+    warmups: int,
+    samples: int,
+    block_count: int,
+) -> dict[str, object]:
+    if block_count < 1:
+        raise ValueError("timing block count must be positive")
+    calls = {"control": control_call, "candidate": candidate_call}
+
+    def evaluate(call) -> float:
+        started = time.perf_counter()
+        for _ in range(block_count):
+            mx.eval(call())
+        return (time.perf_counter() - started) / block_count
+
+    for _ in range(warmups):
+        for call in calls.values():
+            evaluate(call)
+    raw = {"control": [], "candidate": []}
+    for sample in range(samples):
+        order = ("control", "candidate") if sample % 2 == 0 else ("candidate", "control")
+        for name in order:
+            raw[name].append(evaluate(calls[name]))
+
+    def direction(parity: int) -> dict[str, float]:
+        control = float(np.median(raw["control"][parity::2]))
+        candidate = float(np.median(raw["candidate"][parity::2]))
+        return {
+            "control_median_seconds": control,
+            "candidate_median_seconds": candidate,
+            "candidate_speedup_fraction": 1.0 - candidate / control,
+        }
+
+    control = float(np.median(raw["control"]))
+    candidate = float(np.median(raw["candidate"]))
+    return {
+        "method": "sequential synchronized calls per timing block",
+        "block_count": block_count,
+        "samples": raw,
+        "control_median_seconds": control,
+        "candidate_median_seconds": candidate,
+        "candidate_speedup_fraction": 1.0 - candidate / control,
+        "control_first": direction(0),
+        "candidate_first": direction(1),
+    }
+
+
 def _marginal_samples(
     control_call,
     candidate_call,
@@ -102,12 +152,50 @@ def _marginal_samples(
     }
 
 
+def _stage_samples(stage_call, *, warmups: int, samples: int) -> dict[str, object]:
+    stage_names = ("pack", "interaction", "scatter")
+
+    def evaluate() -> dict[str, float]:
+        stages = stage_call()
+        arrays = (
+            (stages.packed_posq, stages.packed_lj),
+            (stages.ordered_forces,),
+            (stages.forces,),
+        )
+        observed = {}
+        for name, values in zip(stage_names, arrays, strict=True):
+            started = time.perf_counter()
+            mx.eval(*values)
+            observed[name] = time.perf_counter() - started
+        return observed
+
+    for _ in range(warmups):
+        evaluate()
+    raw = {name: [] for name in stage_names}
+    for _ in range(samples):
+        observed = evaluate()
+        for name in stage_names:
+            raw[name].append(observed[name])
+    medians = {name: float(np.median(values)) for name, values in raw.items()}
+    return {
+        "method": "sequential synchronized lazy-graph stages",
+        "samples": raw,
+        "median_seconds": medians,
+        "median_sum_seconds": float(sum(medians.values())),
+    }
+
+
 def benchmark(
     prepared: Path,
     *,
     skin: float,
     warmups: int,
     samples: int,
+    ordinary_tiles_per_group: int,
+    timing_block_count: int,
+    canonical_records: bool,
+    simdgroups_per_threadgroup: int,
+    left_slice_size: int,
 ) -> dict[str, object]:
     _activate_metal()
     artifact = load_prepared_mlx_artifact(prepared, require_production=True)
@@ -188,16 +276,24 @@ def benchmark(
         search_radius=cutoff + skin,
         lj_exclusion_pairs=exclusion_pairs,
         lj_one_four_pairs=one_four_pairs,
+        ordinary_tiles_per_group=ordinary_tiles_per_group,
+        left_slice_size=left_slice_size,
     )
     schedule_build_seconds = time.perf_counter() - schedule_started
     device_schedule = _schedule_to_device32(schedule)
     mx.eval(
         device_schedule.atom_order,
         device_schedule.ordinary_left_blocks,
+        device_schedule.ordinary_left_slices,
         device_schedule.ordinary_right_atoms,
-        device_schedule.special_blocks,
-        device_schedule.special_lj_enabled,
-        device_schedule.special_lj_one_four,
+        device_schedule.ordinary_group_starts,
+        device_schedule.ordinary_group_counts,
+        device_schedule.special_work_left_blocks,
+        device_schedule.special_work_left_slices,
+        device_schedule.special_work_right_atoms,
+        device_schedule.special_work_lj_enabled,
+        device_schedule.special_work_lj_one_four,
+        device_schedule.special_work_diagonal,
     )
 
     def control_call():
@@ -217,6 +313,27 @@ def benchmark(
             one_four_scale=nonbonded.lj_one_four_scale,
             coulomb_constant=nonbonded.coulomb_constant,
             alpha=nonbonded.pme_config.alpha,
+            _canonical_records=canonical_records,
+            _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+        )
+
+    def stage_call():
+        return _interaction32_direct_force_only(
+            system.positions,
+            device_schedule,
+            tile_binding.box_lengths_and_inverses,
+            tile_binding.half_sigma,
+            tile_binding.sqrt_epsilon,
+            nonbonded.charges,
+            cutoff=cutoff,
+            shift=nonbonded.lj_shift,
+            switch_distance=nonbonded.switch_distance,
+            one_four_scale=nonbonded.lj_one_four_scale,
+            coulomb_constant=nonbonded.coulomb_constant,
+            alpha=nonbonded.pme_config.alpha,
+            _return_stages=True,
+            _canonical_records=canonical_records,
+            _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
         )
 
     control = control_call()
@@ -232,16 +349,28 @@ def benchmark(
         warmups=warmups,
         samples=samples,
     )
+    steady_state = _sequential_block_samples(
+        control_call,
+        candidate_call,
+        warmups=max(1, warmups // 2),
+        samples=samples,
+        block_count=timing_block_count,
+    )
     marginal = _marginal_samples(
         control_call,
         candidate_call,
         warmups=max(1, warmups // 2),
         samples=samples,
     )
+    stage_timing = _stage_samples(
+        stage_call,
+        warmups=max(1, warmups // 2),
+        samples=samples,
+    )
     control_median = float(np.median(timings["control"]))
     candidate_median = float(np.median(timings["candidate"]))
     return {
-        "schema": "mlx_atomistic.interaction32_force_benchmark.v1",
+        "schema": "mlx_atomistic.interaction32_force_benchmark.v2",
         "prepared": str(prepared),
         "atom_count": schedule.atom_count,
         "cutoff_angstrom": cutoff,
@@ -256,10 +385,17 @@ def benchmark(
         "interaction32": {
             "block_count": schedule.block_count,
             "ordinary_tile_count": schedule.ordinary_tile_count,
+            "ordinary_group_count": schedule.ordinary_group_count,
+            "ordinary_tiles_per_group_limit": ordinary_tiles_per_group,
+            "canonical_records": canonical_records,
+            "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
+            "left_slice_size": left_slice_size,
             "special_tile_count": schedule.special_tile_count,
-            "scheduled_pair_lanes": (schedule.ordinary_tile_count + schedule.special_tile_count)
-            * 32
-            * 32,
+            "special_work_count": schedule.special_work_count,
+            "scheduled_pair_lanes": (
+                schedule.ordinary_tile_count * left_slice_size * 32
+                + schedule.special_work_count * left_slice_size * 32
+            ),
             "oracle_build_seconds": schedule_build_seconds,
         },
         "force_parity": {
@@ -277,7 +413,9 @@ def benchmark(
             "candidate_median_seconds": candidate_median,
             "candidate_speedup_fraction": 1.0 - candidate_median / control_median,
         },
+        "steady_state_timing": steady_state,
         "marginal_timing": marginal,
+        "stage_timing": stage_timing,
     }
 
 
@@ -287,6 +425,15 @@ def main() -> None:
     parser.add_argument("--skin", type=float, default=5.5)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--samples", type=int, default=8)
+    parser.add_argument("--ordinary-tiles-per-group", type=int, default=3)
+    parser.add_argument("--timing-block-count", type=int, default=8)
+    parser.add_argument(
+        "--canonical-records",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--simdgroups-per-threadgroup", type=int, default=4)
+    parser.add_argument("--left-slice-size", type=int, default=16)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     report = benchmark(
@@ -294,6 +441,11 @@ def main() -> None:
         skin=args.skin,
         warmups=args.warmups,
         samples=args.samples,
+        ordinary_tiles_per_group=args.ordinary_tiles_per_group,
+        timing_block_count=args.timing_block_count,
+        canonical_records=args.canonical_records,
+        simdgroups_per_threadgroup=args.simdgroups_per_threadgroup,
+        left_slice_size=args.left_slice_size,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.out is None:

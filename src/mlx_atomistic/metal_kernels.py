@@ -19,6 +19,7 @@ device load.
 from __future__ import annotations
 
 from math import isfinite, pi, sqrt
+from typing import NamedTuple
 
 import mlx.core as mx
 
@@ -331,6 +332,7 @@ _tile_pme_direct_kernel_singleton = None
 _tile_pme_direct_force_only_kernel_singleton = None
 _interaction32_pack_kernel_singleton = None
 _interaction32_force_kernel_singleton = None
+_interaction32_canonical_force_kernel_singleton = None
 _interaction32_scatter_kernel_singleton = None
 _sparse_pme_correction_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
@@ -1177,85 +1179,16 @@ _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
 )
 
 _INTERACTION32_GROUPS_PER_THREADGROUP = 4
-_INTERACTION32_DISPATCH_WIDTH = 32 * _INTERACTION32_GROUPS_PER_THREADGROUP
 
-_INTERACTION32_PAIR_HEADER = r"""
-float3 mlx_atomistic_interaction32_pair_force(
-    float4 left_posq,
-    float2 left_lj,
-    float4 right_posq,
-    float2 right_lj,
-    constant const float* box,
-    device const float* params,
-    bool lj_enabled,
-    bool one_four
-) {
-    float dx = left_posq.x - right_posq.x;
-    float dy = left_posq.y - right_posq.y;
-    float dz = left_posq.z - right_posq.z;
-    dx -= box[0] * rint(dx * box[3]);
-    dy -= box[1] * rint(dy * box[4]);
-    dz -= box[2] * rint(dz * box[5]);
-    float r2 = dx * dx + dy * dy + dz * dz;
-    if (!(r2 > 0.0f && r2 < params[0])) {
-        return float3(0.0f);
-    }
 
-    float inv_distance = rsqrt(r2);
-    float inv_r2 = inv_distance * inv_distance;
-    float distance = r2 * inv_distance;
-    float scalar = 0.0f;
-    if (lj_enabled) {
-        float sigma_ij = left_lj.x + right_lj.x;
-        float epsilon_ij = left_lj.y * right_lj.y;
-        float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
-        float inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
-        float inv_r12 = inv_r6 * inv_r6;
-        float unswitched_energy = 0.0f;
-        float switch_value = 1.0f;
-        float switch_derivative = 0.0f;
-        if (params[2] > 0.5f) {
-            unswitched_energy = 4.0f * epsilon_ij * (inv_r12 - inv_r6);
-            if (params[1] > 0.5f) {
-                float sigma2_over_rc2 = sigma_ij * sigma_ij / params[0];
-                float inv_rc6 = sigma2_over_rc2
-                    * sigma2_over_rc2 * sigma2_over_rc2;
-                unswitched_energy -= 4.0f * epsilon_ij
-                    * (inv_rc6 * inv_rc6 - inv_rc6);
-            }
-            float x = clamp(
-                (distance - params[3]) * params[9], 0.0f, 1.0f
-            );
-            float x2 = x * x;
-            float x3 = x2 * x;
-            float x4 = x3 * x;
-            float x5 = x4 * x;
-            switch_value = 1.0f
-                - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
-            if (distance > params[3] && distance < params[5]) {
-                switch_derivative = -(
-                    30.0f * x2 - 60.0f * x3 + 30.0f * x4
-                ) * params[9];
-            }
-        }
-        float lj_scale = one_four ? params[10] : 1.0f;
-        scalar += (
-            24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
-                * inv_r2 * switch_value
-            - unswitched_energy * switch_derivative * inv_distance
-        ) * lj_scale;
-    }
+class _Interaction32ForceStages(NamedTuple):
+    """Lazy arrays for profiling the experimental interaction-force graph."""
 
-    float qij = left_posq.w * right_posq.w;
-    float alpha_distance = params[7] * distance;
-    float erfc_term = mlx_atomistic_erfc_nonnegative(alpha_distance);
-    scalar += params[6] * qij * (
-        erfc_term * inv_r2 * inv_distance
-        + params[8] * exp(-params[7] * params[7] * r2) * inv_r2
-    );
-    return float3(scalar * dx, scalar * dy, scalar * dz);
-}
-"""
+    packed_posq: mx.array
+    packed_lj: mx.array
+    ordered_forces: mx.array
+    forces: mx.array
+
 
 _INTERACTION32_PACK_SOURCE = r"""
     uint ordered = thread_position_in_grid.x;
@@ -1278,33 +1211,61 @@ _INTERACTION32_FORCE_SOURCE = r"""
     uint tg_thread = thread_position_in_threadgroup.x;
     uint lane = tg_thread & 31u;
     uint sub = tg_thread >> 5u;
-    uint work = threadgroup_position_in_grid.x * GROUPS_PER_TGu + sub;
-    bool special = mode[0] != 0;
-    uint tile_count = special ? (uint)counts[1] : (uint)counts[0];
-    uint work_count = 2u * tile_count;
-    bool work_active = threads_per_simdgroup == 32u && work < work_count;
-    uint safe_work = work_active ? work : work_count - 1u;
-    uint tile = safe_work >> 1u;
-    uint left_half = safe_work & 1u;
+    uint dispatch_groups = (uint)counts[4];
+    uint global_work = threadgroup_position_in_grid.x * dispatch_groups + sub;
+    uint ordinary_work_count = (uint)counts[0];
+    uint special_work_count = (uint)counts[1];
+    uint total_work_count = ordinary_work_count + special_work_count;
+    bool in_ordinary = global_work < ordinary_work_count;
+    bool in_special = global_work >= ordinary_work_count
+        && global_work < total_work_count;
+    bool special = in_special || (ordinary_work_count == 0u && !in_ordinary);
+    uint work = in_special ? global_work - ordinary_work_count : global_work;
+    bool work_active = threads_per_simdgroup == 32u
+        && global_work < total_work_count;
+    uint safe_work = work_active ? work : 0u;
+    uint group = safe_work;
 
+    int ordinary_start = special ? 0 : ordinary_group_starts[group];
+    uint left_slice_size = (uint)counts[5];
+    uint left_slice = special
+        ? (uint)special_left_slices[group]
+        : (uint)ordinary_left_slices[ordinary_start];
+    uint interaction_count = special
+        ? 1u
+        : (uint)ordinary_group_counts[group];
     int left_block = special
-        ? special_blocks[2 * tile + 0]
-        : ordinary_left_blocks[tile];
-    int right_block = special ? special_blocks[2 * tile + 1] : -1;
+        ? special_left_blocks[group]
+        : ordinary_left_blocks[ordinary_start];
     threadgroup int left_ordered_buffer[16 * GROUPS_PER_TG];
+    threadgroup int left_atom_buffer[16 * GROUPS_PER_TG];
     threadgroup uint left_valid_buffer[16 * GROUPS_PER_TG];
     threadgroup float left_posq_buffer[64 * GROUPS_PER_TG];
     threadgroup float left_lj_buffer[32 * GROUPS_PER_TG];
     uint left_base = 16u * sub;
     uint posq_base = 64u * sub;
     uint lj_base = 32u * sub;
-    if (lane < 16u) {
-        int left_ordered = 32 * left_block + 16 * (int)left_half + (int)lane;
+    if (lane < left_slice_size) {
+        int left_ordered = 32 * left_block
+            + (int)left_slice_size * (int)left_slice + (int)lane;
         bool left_valid = work_active
             && left_ordered < counts[2]
             && atom_order[left_ordered] >= 0;
+        int left_atom = left_valid ? atom_order[left_ordered] : 0;
         left_ordered_buffer[left_base + lane] = left_ordered;
+        left_atom_buffer[left_base + lane] = left_atom;
         left_valid_buffer[left_base + lane] = left_valid ? 1u : 0u;
+#ifdef MLX_ATOMISTIC_INTERACTION32_CANONICAL
+        left_posq_buffer[posq_base + 4u * lane + 0u] =
+            positions[3 * left_atom + 0];
+        left_posq_buffer[posq_base + 4u * lane + 1u] =
+            positions[3 * left_atom + 1];
+        left_posq_buffer[posq_base + 4u * lane + 2u] =
+            positions[3 * left_atom + 2];
+        left_posq_buffer[posq_base + 4u * lane + 3u] = charges[left_atom];
+        left_lj_buffer[lj_base + 2u * lane + 0u] = half_sigma[left_atom];
+        left_lj_buffer[lj_base + 2u * lane + 1u] = sqrt_epsilon[left_atom];
+#else
         left_posq_buffer[posq_base + 4u * lane + 0u] =
             packed_posq[4 * left_ordered + 0];
         left_posq_buffer[posq_base + 4u * lane + 1u] =
@@ -1317,109 +1278,216 @@ _INTERACTION32_FORCE_SOURCE = r"""
             packed_lj[2 * left_ordered + 0];
         left_lj_buffer[lj_base + 2u * lane + 1u] =
             packed_lj[2 * left_ordered + 1];
+#endif
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    int owned_right = special
-        ? 32 * right_block + (int)lane
-        : ordinary_right_atoms[32 * tile + lane];
-    bool owned_right_valid = work_active
-        && owned_right >= 0
-        && owned_right < counts[2]
-        && atom_order[owned_right] >= 0;
-    int safe_right = owned_right_valid ? owned_right : 0;
-    float4 right_posq = float4(
-        packed_posq[4 * safe_right + 0],
-        packed_posq[4 * safe_right + 1],
-        packed_posq[4 * safe_right + 2],
-        packed_posq[4 * safe_right + 3]
-    );
-    float2 right_lj = float2(
-        packed_lj[2 * safe_right + 0],
-        packed_lj[2 * safe_right + 1]
-    );
-    uint lj_word = special ? special_lj_enabled[32 * tile + lane] : 0u;
-    uint one_four_word = special
-        ? special_lj_one_four[32 * tile + lane]
-        : 0u;
-    bool diagonal = special && left_block == right_block;
+    float box_lx = box[0];
+    float box_ly = box[1];
+    float box_lz = box[2];
+    float box_ix = box[3];
+    float box_iy = box[4];
+    float box_iz = box[5];
+    float cutoff2 = params[0];
+    float shift_flag = params[1];
+    float switch_flag = params[2];
+    float switch_start = params[3];
+    float switch_end = params[5];
+    float coulomb = params[6];
+    float ewald_alpha = params[7];
+    float ewald_self = params[8];
+    float inv_switch_width = params[9];
+    float one_four_scale = params[10];
+    float3 owned_left_force = float3(0.0f);
+    for (uint interaction = 0u; interaction < interaction_count; interaction++) {
+        uint tile = special ? group : (uint)ordinary_start + interaction;
+        int owned_right = special
+            ? special_right_atoms[32 * tile + lane]
+            : ordinary_right_atoms[32 * tile + lane];
+        bool owned_right_valid = work_active
+            && owned_right >= 0
+            && owned_right < counts[2]
+            && atom_order[owned_right] >= 0;
+        int safe_right = owned_right_valid ? owned_right : 0;
+#ifdef MLX_ATOMISTIC_INTERACTION32_CANONICAL
+        int right_atom = owned_right_valid ? atom_order[owned_right] : 0;
+        float4 right_posq = float4(
+            positions[3 * right_atom + 0],
+            positions[3 * right_atom + 1],
+            positions[3 * right_atom + 2],
+            charges[right_atom]
+        );
+        float2 right_lj = float2(
+            half_sigma[right_atom],
+            sqrt_epsilon[right_atom]
+        );
+#else
+        int right_atom = safe_right;
+        float4 right_posq = float4(
+            packed_posq[4 * safe_right + 0],
+            packed_posq[4 * safe_right + 1],
+            packed_posq[4 * safe_right + 2],
+            packed_posq[4 * safe_right + 3]
+        );
+        float2 right_lj = float2(
+            packed_lj[2 * safe_right + 0],
+            packed_lj[2 * safe_right + 1]
+        );
+#endif
+        uint lj_word = special ? special_work_lj_enabled[32 * tile + lane] : 0u;
+        uint one_four_word = special
+            ? special_work_lj_one_four[32 * tile + lane]
+            : 0u;
+        bool diagonal = special && special_diagonal[tile] != 0;
 
-    float3 right_force = float3(0.0f);
-    for (uint left_slot = 0u; left_slot < 16u; left_slot++) {
-        int left_ordered = left_ordered_buffer[left_base + left_slot];
-        bool left_valid = left_valid_buffer[left_base + left_slot] != 0u;
-        float4 left_posq = float4(
-            left_posq_buffer[posq_base + 4u * left_slot + 0u],
-            left_posq_buffer[posq_base + 4u * left_slot + 1u],
-            left_posq_buffer[posq_base + 4u * left_slot + 2u],
-            left_posq_buffer[posq_base + 4u * left_slot + 3u]
-        );
-        float2 left_lj = float2(
-            left_lj_buffer[lj_base + 2u * left_slot + 0u],
-            left_lj_buffer[lj_base + 2u * left_slot + 1u]
-        );
-        uint absolute_left_slot = 16u * left_half + left_slot;
-        bool member = left_valid && owned_right_valid
-            && (!diagonal || left_ordered < owned_right);
-        bool lj_enabled = !special
-            || ((lj_word >> absolute_left_slot) & 1u) != 0u;
-        bool one_four = special
-            && ((one_four_word >> absolute_left_slot) & 1u) != 0u;
-        float3 pair_force = member
-            ? mlx_atomistic_interaction32_pair_force(
-                left_posq,
-                left_lj,
-                right_posq,
-                right_lj,
-                box,
-                params,
-                lj_enabled,
-                one_four
-            )
-            : float3(0.0f);
-        right_force -= pair_force;
-        float3 reduced_left = float3(
-            simd_sum(pair_force.x),
-            simd_sum(pair_force.y),
-            simd_sum(pair_force.z)
-        );
-        if (
-            work_active
-            && lane == left_slot
-            && left_valid
-            && any(reduced_left != float3(0.0f))
-        ) {
+        float3 right_force = float3(0.0f);
+        for (uint left_slot = 0u; left_slot < left_slice_size; left_slot++) {
+            int left_ordered = left_ordered_buffer[left_base + left_slot];
+            bool left_valid = left_valid_buffer[left_base + left_slot] != 0u;
+            float4 left_posq = float4(
+                left_posq_buffer[posq_base + 4u * left_slot + 0u],
+                left_posq_buffer[posq_base + 4u * left_slot + 1u],
+                left_posq_buffer[posq_base + 4u * left_slot + 2u],
+                left_posq_buffer[posq_base + 4u * left_slot + 3u]
+            );
+            float2 left_lj = float2(
+                left_lj_buffer[lj_base + 2u * left_slot + 0u],
+                left_lj_buffer[lj_base + 2u * left_slot + 1u]
+            );
+            uint absolute_left_slot = left_slice_size * left_slice + left_slot;
+            bool member = left_valid && owned_right_valid
+                && (!diagonal || left_ordered < owned_right);
+            bool lj_enabled = !special
+                || ((lj_word >> absolute_left_slot) & 1u) != 0u;
+            bool one_four = special
+                && ((one_four_word >> absolute_left_slot) & 1u) != 0u;
+            float3 pair_force = float3(0.0f);
+            if (member) {
+                float dx = left_posq.x - right_posq.x;
+                float dy = left_posq.y - right_posq.y;
+                float dz = left_posq.z - right_posq.z;
+                dx -= box_lx * rint(dx * box_ix);
+                dy -= box_ly * rint(dy * box_iy);
+                dz -= box_lz * rint(dz * box_iz);
+                float r2 = dx * dx + dy * dy + dz * dz;
+                if (r2 > 0.0f && r2 < cutoff2) {
+                    float inv_distance = rsqrt(r2);
+                    float inv_r2 = inv_distance * inv_distance;
+                    float distance = r2 * inv_distance;
+                    float scalar = 0.0f;
+                    if (lj_enabled) {
+                        float sigma_ij = left_lj.x + right_lj.x;
+                        float epsilon_ij = left_lj.y * right_lj.y;
+                        float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+                        float inv_r6 = sigma2_over_r2
+                            * sigma2_over_r2 * sigma2_over_r2;
+                        float inv_r12 = inv_r6 * inv_r6;
+                        float unswitched_energy = 0.0f;
+                        float switch_value = 1.0f;
+                        float switch_derivative = 0.0f;
+                        if (switch_flag > 0.5f) {
+                            unswitched_energy =
+                                4.0f * epsilon_ij * (inv_r12 - inv_r6);
+                            if (shift_flag > 0.5f) {
+                                float sigma2_over_rc2 =
+                                    sigma_ij * sigma_ij / cutoff2;
+                                float inv_rc6 = sigma2_over_rc2
+                                    * sigma2_over_rc2 * sigma2_over_rc2;
+                                unswitched_energy -= 4.0f * epsilon_ij
+                                    * (inv_rc6 * inv_rc6 - inv_rc6);
+                            }
+                            float x = clamp(
+                                (distance - switch_start) * inv_switch_width,
+                                0.0f,
+                                1.0f
+                            );
+                            float x2 = x * x;
+                            float x3 = x2 * x;
+                            float x4 = x3 * x;
+                            float x5 = x4 * x;
+                            switch_value = 1.0f
+                                - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
+                            if (distance > switch_start && distance < switch_end) {
+                                switch_derivative = -(
+                                    30.0f * x2 - 60.0f * x3 + 30.0f * x4
+                                ) * inv_switch_width;
+                            }
+                        }
+                        float lj_scale = one_four ? one_four_scale : 1.0f;
+                        scalar += (
+                            24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
+                                * inv_r2 * switch_value
+                            - unswitched_energy * switch_derivative * inv_distance
+                        ) * lj_scale;
+                    }
+
+                    float qij = left_posq.w * right_posq.w;
+                    float alpha_distance = ewald_alpha * distance;
+                    float erfc_term =
+                        mlx_atomistic_erfc_nonnegative(alpha_distance);
+                    scalar += coulomb * qij * (
+                        erfc_term * inv_r2 * inv_distance
+                        + ewald_self * exp(-ewald_alpha * ewald_alpha * r2)
+                            * inv_r2
+                    );
+                    pair_force = float3(scalar * dx, scalar * dy, scalar * dz);
+                }
+            }
+            right_force -= pair_force;
+            float3 reduced_left = float3(
+                simd_sum(pair_force.x),
+                simd_sum(pair_force.y),
+                simd_sum(pair_force.z)
+            );
+            if (lane == left_slot) {
+                owned_left_force += reduced_left;
+            }
+        }
+        if (owned_right_valid && any(right_force != float3(0.0f))) {
             atomic_fetch_add_explicit(
-                &ordered_forces[3 * left_ordered + 0],
-                reduced_left.x,
+                &ordered_forces[3 * right_atom + 0],
+                right_force.x,
                 memory_order_relaxed
             );
             atomic_fetch_add_explicit(
-                &ordered_forces[3 * left_ordered + 1],
-                reduced_left.y,
+                &ordered_forces[3 * right_atom + 1],
+                right_force.y,
                 memory_order_relaxed
             );
             atomic_fetch_add_explicit(
-                &ordered_forces[3 * left_ordered + 2],
-                reduced_left.z,
+                &ordered_forces[3 * right_atom + 2],
+                right_force.z,
                 memory_order_relaxed
             );
         }
     }
-    if (owned_right_valid && any(right_force != float3(0.0f))) {
+    int owned_left = left_ordered_buffer[
+        left_base + min(lane, left_slice_size - 1u)
+    ];
+#ifdef MLX_ATOMISTIC_INTERACTION32_CANONICAL
+    int left_force_atom = left_atom_buffer[
+        left_base + min(lane, left_slice_size - 1u)
+    ];
+#else
+    int left_force_atom = owned_left;
+#endif
+    bool owned_left_valid = work_active
+        && lane < left_slice_size
+        && left_valid_buffer[left_base + lane] != 0u;
+    if (owned_left_valid && any(owned_left_force != float3(0.0f))) {
         atomic_fetch_add_explicit(
-            &ordered_forces[3 * owned_right + 0],
-            right_force.x,
+            &ordered_forces[3 * left_force_atom + 0],
+            owned_left_force.x,
             memory_order_relaxed
         );
         atomic_fetch_add_explicit(
-            &ordered_forces[3 * owned_right + 1],
-            right_force.y,
+            &ordered_forces[3 * left_force_atom + 1],
+            owned_left_force.y,
             memory_order_relaxed
         );
         atomic_fetch_add_explicit(
-            &ordered_forces[3 * owned_right + 2],
-            right_force.z,
+            &ordered_forces[3 * left_force_atom + 2],
+            owned_left_force.z,
             memory_order_relaxed
         );
     }
@@ -2908,21 +2976,64 @@ def _interaction32_force_kernel():
                 "packed_lj",
                 "atom_order",
                 "ordinary_left_blocks",
+                "ordinary_left_slices",
                 "ordinary_right_atoms",
-                "special_blocks",
-                "special_lj_enabled",
-                "special_lj_one_four",
+                "ordinary_group_starts",
+                "ordinary_group_counts",
+                "special_left_blocks",
+                "special_left_slices",
+                "special_right_atoms",
+                "special_work_lj_enabled",
+                "special_work_lj_one_four",
+                "special_diagonal",
                 "box",
                 "params",
                 "counts",
-                "mode",
             ],
             output_names=["ordered_forces"],
             source=_INTERACTION32_FORCE_SOURCE,
-            header=_ERF_HEADER + _INTERACTION32_PAIR_HEADER,
+            header=_ERF_HEADER,
             atomic_outputs=True,
         )
     return _interaction32_force_kernel_singleton
+
+
+def _interaction32_canonical_force_kernel():
+    """Return the cached direct-canonical 32-atom force Metal kernel."""
+
+    global _interaction32_canonical_force_kernel_singleton
+    if _interaction32_canonical_force_kernel_singleton is None:
+        _interaction32_canonical_force_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_pme_direct_canonical_force",
+            input_names=[
+                "positions",
+                "atom_order",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "ordinary_left_blocks",
+                "ordinary_left_slices",
+                "ordinary_right_atoms",
+                "ordinary_group_starts",
+                "ordinary_group_counts",
+                "special_left_blocks",
+                "special_left_slices",
+                "special_right_atoms",
+                "special_work_lj_enabled",
+                "special_work_lj_one_four",
+                "special_diagonal",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["ordered_forces"],
+            source=(
+                "#define MLX_ATOMISTIC_INTERACTION32_CANONICAL 1\n" + _INTERACTION32_FORCE_SOURCE
+            ),
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _interaction32_canonical_force_kernel_singleton
 
 
 def _interaction32_scatter_kernel():
@@ -5773,10 +5884,16 @@ def _interaction32_pme_direct_force_only(
     positions: mx.array,
     atom_order: mx.array,
     ordinary_left_blocks: mx.array,
+    ordinary_left_slices: mx.array,
     ordinary_right_atoms: mx.array,
-    special_blocks: mx.array,
-    special_lj_enabled: mx.array,
-    special_lj_one_four: mx.array,
+    ordinary_group_starts: mx.array,
+    ordinary_group_counts: mx.array,
+    special_left_blocks: mx.array,
+    special_left_slices: mx.array,
+    special_right_atoms: mx.array,
+    special_work_lj_enabled: mx.array,
+    special_work_lj_one_four: mx.array,
+    special_diagonal: mx.array,
     box_lengths_and_inverses: mx.array,
     half_sigma: mx.array,
     sqrt_epsilon: mx.array,
@@ -5788,16 +5905,26 @@ def _interaction32_pme_direct_force_only(
     one_four_scale: float,
     coulomb_constant: float,
     alpha: float,
-) -> mx.array:
+    _return_stages: bool = False,
+    _canonical_records: bool = True,
+    _simdgroups_per_threadgroup: int = _INTERACTION32_GROUPS_PER_THREADGROUP,
+    _left_slice_size: int = 16,
+) -> mx.array | _Interaction32ForceStages:
     """Evaluate the experimental SIMD-native 32-atom direct-force schedule."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     atom_order = as_mx_array(atom_order, dtype=mx.int32)
     ordinary_left_blocks = as_mx_array(ordinary_left_blocks, dtype=mx.int32)
+    ordinary_left_slices = as_mx_array(ordinary_left_slices, dtype=mx.int32)
     ordinary_right_atoms = as_mx_array(ordinary_right_atoms, dtype=mx.int32)
-    special_blocks = as_mx_array(special_blocks, dtype=mx.int32)
-    special_lj_enabled = as_mx_array(special_lj_enabled, dtype=mx.uint32)
-    special_lj_one_four = as_mx_array(special_lj_one_four, dtype=mx.uint32)
+    ordinary_group_starts = as_mx_array(ordinary_group_starts, dtype=mx.int32)
+    ordinary_group_counts = as_mx_array(ordinary_group_counts, dtype=mx.int32)
+    special_left_blocks = as_mx_array(special_left_blocks, dtype=mx.int32)
+    special_left_slices = as_mx_array(special_left_slices, dtype=mx.int32)
+    special_right_atoms = as_mx_array(special_right_atoms, dtype=mx.int32)
+    special_work_lj_enabled = as_mx_array(special_work_lj_enabled, dtype=mx.uint32)
+    special_work_lj_one_four = as_mx_array(special_work_lj_one_four, dtype=mx.uint32)
+    special_diagonal = as_mx_array(special_diagonal, dtype=mx.int32)
     box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
     half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
     sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
@@ -5814,14 +5941,21 @@ def _interaction32_pme_direct_force_only(
         32,
     ):
         raise ValueError("ordinary interaction arrays must have shapes (n,) and (n, 32)")
-    special_count = int(special_blocks.shape[0])
-    if special_blocks.shape != (special_count, 2):
-        raise ValueError("special_blocks must have shape (n_special, 2)")
-    if special_lj_enabled.shape != (special_count, 32) or special_lj_one_four.shape != (
-        special_count,
-        32,
+    if ordinary_left_slices.shape != (ordinary_count,):
+        raise ValueError("ordinary_left_slices must have one entry per ordinary tile")
+    ordinary_group_count = int(ordinary_group_starts.shape[0])
+    if ordinary_group_starts.ndim != 1 or ordinary_group_counts.shape != (ordinary_group_count,):
+        raise ValueError("ordinary interaction groups must have matching vector shapes")
+    special_count = int(special_left_blocks.shape[0])
+    if special_left_slices.shape != (special_count,) or special_diagonal.shape != (special_count,):
+        raise ValueError("special work metadata must have matching vector shapes")
+    special_shape = (special_count, 32)
+    if (
+        special_right_atoms.shape != special_shape
+        or special_work_lj_enabled.shape != special_shape
+        or special_work_lj_one_four.shape != special_shape
     ):
-        raise ValueError("special Lennard-Jones masks must have shape (n_special, 32)")
+        raise ValueError("special work arrays must have shape (n_special_work, 32)")
     if box.shape != (6,):
         raise ValueError("box_lengths_and_inverses must have shape (6,)")
     parameter_shape = (atom_count,)
@@ -5839,6 +5973,10 @@ def _interaction32_pme_direct_force_only(
         raise ValueError("coulomb_constant must be finite")
     if not isfinite(float(one_four_scale)) or one_four_scale < 0.0:
         raise ValueError("one_four_scale must be finite and non-negative")
+    if not 1 <= _simdgroups_per_threadgroup <= _INTERACTION32_GROUPS_PER_THREADGROUP:
+        raise ValueError("SIMD groups per threadgroup must be between one and four")
+    if _left_slice_size not in (4, 8, 16):
+        raise ValueError("left slice size must be 4, 8, or 16")
     cutoff_value = float(cutoff)
     if switch_distance is not None and (
         not isfinite(float(switch_distance))
@@ -5867,62 +6005,99 @@ def _interaction32_pme_direct_force_only(
         dtype=mx.float32,
     )
     pack_counts = mx.array([padded_count, atom_count], dtype=mx.int32)
-    packed_posq, packed_lj = _interaction32_pack_kernel()(
-        inputs=[
+    counts = mx.array(
+        [
+            ordinary_group_count,
+            special_count,
+            padded_count,
+            atom_count,
+            _simdgroups_per_threadgroup,
+            _left_slice_size,
+        ],
+        dtype=mx.int32,
+    )
+    schedule_inputs = [
+        ordinary_left_blocks,
+        ordinary_left_slices,
+        ordinary_right_atoms,
+        ordinary_group_starts,
+        ordinary_group_counts,
+        special_left_blocks,
+        special_left_slices,
+        special_right_atoms,
+        special_work_lj_enabled,
+        special_work_lj_one_four,
+        special_diagonal,
+        box,
+        params,
+        counts,
+    ]
+    if _canonical_records:
+        packed_posq = positions
+        packed_lj = half_sigma
+        force_inputs = [
             positions,
             atom_order,
             half_sigma,
             sqrt_epsilon,
             charges,
-            pack_counts,
-        ],
-        output_shapes=[(padded_count, 4), (padded_count, 2)],
-        output_dtypes=[mx.float32, mx.float32],
-        grid=(padded_count, 1, 1),
-        threadgroup=(min(256, padded_count), 1, 1),
-    )
-    counts = mx.array([ordinary_count, special_count, padded_count, atom_count], dtype=mx.int32)
-    force_inputs = [
-        packed_posq,
-        packed_lj,
-        atom_order,
-        ordinary_left_blocks,
-        ordinary_right_atoms,
-        special_blocks,
-        special_lj_enabled,
-        special_lj_one_four,
-        box,
-        params,
-        counts,
-    ]
+            *schedule_inputs,
+        ]
+        force_kernel = _interaction32_canonical_force_kernel()
+        force_shape = positions.shape
+    else:
+        packed_posq, packed_lj = _interaction32_pack_kernel()(
+            inputs=[
+                positions,
+                atom_order,
+                half_sigma,
+                sqrt_epsilon,
+                charges,
+                pack_counts,
+            ],
+            output_shapes=[(padded_count, 4), (padded_count, 2)],
+            output_dtypes=[mx.float32, mx.float32],
+            grid=(padded_count, 1, 1),
+            threadgroup=(min(256, padded_count), 1, 1),
+        )
+        force_inputs = [packed_posq, packed_lj, atom_order, *schedule_inputs]
+        force_kernel = _interaction32_force_kernel()
+        force_shape = (padded_count, 3)
 
-    def dispatch(tile_count: int, mode: int) -> mx.array:
-        if tile_count == 0:
-            return mx.zeros((padded_count, 3), dtype=mx.float32)
-        work_count = 2 * tile_count
-        threadgroups = (
-            work_count + _INTERACTION32_GROUPS_PER_THREADGROUP - 1
-        ) // _INTERACTION32_GROUPS_PER_THREADGROUP
-        (ordered_forces,) = _interaction32_force_kernel()(
-            inputs=[*force_inputs, mx.array([mode], dtype=mx.int32)],
-            output_shapes=[(padded_count, 3)],
+    def dispatch() -> mx.array:
+        work_count = ordinary_group_count + special_count
+        if work_count == 0:
+            return mx.zeros(force_shape, dtype=mx.float32)
+        threadgroups = (work_count + _simdgroups_per_threadgroup - 1) // _simdgroups_per_threadgroup
+        dispatch_width = 32 * _simdgroups_per_threadgroup
+        (ordered_forces,) = force_kernel(
+            inputs=force_inputs,
+            output_shapes=[force_shape],
             output_dtypes=[mx.float32],
-            grid=(threadgroups * _INTERACTION32_DISPATCH_WIDTH, 1, 1),
-            threadgroup=(_INTERACTION32_DISPATCH_WIDTH, 1, 1),
+            grid=(threadgroups * dispatch_width, 1, 1),
+            threadgroup=(dispatch_width, 1, 1),
             init_value=0.0,
         )
         return ordered_forces
 
-    ordinary_forces = dispatch(ordinary_count, 0)
-    special_forces = dispatch(special_count, 1)
-    ordered_forces = ordinary_forces + special_forces
-    (forces,) = _interaction32_scatter_kernel()(
-        inputs=[ordered_forces, atom_order, pack_counts],
-        output_shapes=[positions.shape],
-        output_dtypes=[mx.float32],
-        grid=(padded_count, 1, 1),
-        threadgroup=(min(256, padded_count), 1, 1),
-    )
+    ordered_forces = dispatch()
+    if _canonical_records:
+        forces = ordered_forces
+    else:
+        (forces,) = _interaction32_scatter_kernel()(
+            inputs=[ordered_forces, atom_order, pack_counts],
+            output_shapes=[positions.shape],
+            output_dtypes=[mx.float32],
+            grid=(padded_count, 1, 1),
+            threadgroup=(min(256, padded_count), 1, 1),
+        )
+    if _return_stages:
+        return _Interaction32ForceStages(
+            packed_posq=packed_posq,
+            packed_lj=packed_lj,
+            ordered_forces=ordered_forces,
+            forces=forces,
+        )
     return forces
 
 

@@ -40,12 +40,15 @@ def _represented_pairs(
             represented[tuple(sorted((atom_i, atom_j)))] += 1
 
     blocks = schedule.atom_order.reshape((-1, 32))
-    for left_block, right_atoms in zip(
+    for left_block, left_slice, right_atoms in zip(
         schedule.ordinary_left_blocks,
+        schedule.ordinary_left_slices,
         schedule.ordinary_right_atoms,
         strict=True,
     ):
-        for left_atom in blocks[left_block]:
+        start = schedule.left_slice_size * left_slice
+        stop = start + schedule.left_slice_size
+        for left_atom in blocks[left_block, start:stop]:
             for right_ordered in right_atoms:
                 right_atom = (
                     -1
@@ -90,12 +93,14 @@ def test_schedule_covers_each_periodic_search_pair_once():
 
     assert schedule.block_count == 2
     assert schedule.special_tile_count == 2
-    assert schedule.ordinary_tile_count == 1
+    assert schedule.ordinary_tile_count == 2
+    assert schedule.ordinary_group_count == 2
     assert set(represented) == _brute_pairs(positions, box, 3.0)
     assert set(represented.values()) == {1}
 
 
-def test_random_periodic_schedule_covers_each_pair_once():
+@pytest.mark.parametrize("left_slice_size", (4, 8, 16))
+def test_random_periodic_schedule_covers_each_pair_once(left_slice_size):
     rng = np.random.default_rng(17)
     box = np.asarray([12.0, 13.0, 14.0])
     positions = rng.random((96, 3)) * box
@@ -108,6 +113,7 @@ def test_random_periodic_schedule_covers_each_pair_once():
         search_radius=2.5,
         lj_exclusion_pairs=excluded,
         lj_one_four_pairs=one_four,
+        left_slice_size=left_slice_size,
     )
 
     represented = _represented_pairs(schedule, positions)
@@ -163,3 +169,31 @@ def test_schedule_rejects_overlapping_lj_pair_classes():
             lj_exclusion_pairs=[[0, 1]],
             lj_one_four_pairs=[[1, 0]],
         )
+
+
+def test_ordinary_groups_preserve_left_block_runs_and_tile_coverage():
+    rng = np.random.default_rng(23)
+    box = np.asarray([18.0, 19.0, 20.0])
+    positions = rng.random((256, 3)) * box
+    schedule = _build_interaction_schedule32(
+        positions,
+        box,
+        search_radius=3.0,
+        ordinary_tiles_per_group=3,
+    )
+
+    covered: list[int] = []
+    for start, count in zip(
+        schedule.ordinary_group_starts,
+        schedule.ordinary_group_counts,
+        strict=True,
+    ):
+        assert 1 <= count <= 3
+        stop = int(start + count)
+        left_blocks = schedule.ordinary_left_blocks[start:stop]
+        left_slices = schedule.ordinary_left_slices[start:stop]
+        assert np.all(left_blocks == left_blocks[0])
+        assert np.all(left_slices == left_slices[0])
+        covered.extend(range(int(start), stop))
+
+    assert covered == list(range(schedule.ordinary_tile_count))

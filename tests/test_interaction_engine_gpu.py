@@ -32,7 +32,8 @@ def _on_gpu(monkeypatch):
 
 
 @pytest.mark.gpu
-def test_interaction32_force_matches_prepared_pair_oracle():
+@pytest.mark.parametrize("left_slice_size", (4, 8, 16))
+def test_interaction32_force_matches_prepared_pair_oracle(left_slice_size):
     grid = np.stack(
         np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
         axis=-1,
@@ -61,6 +62,7 @@ def test_interaction32_force_matches_prepared_pair_oracle():
         search_radius=4.5,
         lj_exclusion_pairs=excluded,
         lj_one_four_pairs=one_four,
+        left_slice_size=left_slice_size,
     )
     assert schedule.ordinary_tile_count > 0
     assert schedule.special_tile_count > schedule.block_count
@@ -96,25 +98,27 @@ def test_interaction32_force_matches_prepared_pair_oracle():
         coulomb_constant=1389.35457644382,
         alpha=0.35,
     )
-    observed = _interaction32_direct_force_only(
-        positions,
-        schedule,
-        box,
-        half_sigma,
-        sqrt_epsilon,
-        charges,
-        cutoff=cutoff,
-        shift=False,
-        switch_distance=None,
-        one_four_scale=one_four_scale,
-        coulomb_constant=1389.35457644382,
-        alpha=0.35,
-    )
+    for canonical_records in (False, True):
+        observed = _interaction32_direct_force_only(
+            positions,
+            schedule,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            cutoff=cutoff,
+            shift=False,
+            switch_distance=None,
+            one_four_scale=one_four_scale,
+            coulomb_constant=1389.35457644382,
+            alpha=0.35,
+            _canonical_records=canonical_records,
+        )
 
-    mx.eval(reference, observed)
-    np.testing.assert_allclose(
-        np.asarray(observed),
-        np.asarray(reference),
-        rtol=2.0e-5,
-        atol=2.0e-3,
-    )
+        mx.eval(reference, observed)
+        np.testing.assert_allclose(
+            np.asarray(observed),
+            np.asarray(reference),
+            rtol=2.0e-5,
+            atol=2.0e-3,
+        )

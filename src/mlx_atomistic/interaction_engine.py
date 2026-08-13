@@ -9,9 +9,13 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import as_mx_array
-from mlx_atomistic.metal_kernels import _interaction32_pme_direct_force_only
+from mlx_atomistic.metal_kernels import (
+    _interaction32_pme_direct_force_only,
+    _Interaction32ForceStages,
+)
 
 _INTERACTION_TILE_SIZE = 32
+_DEFAULT_ORDINARY_TILES_PER_GROUP = 3
 
 
 def _normalize_pairs(pairs: object, atom_count: int, name: str) -> np.ndarray:
@@ -46,6 +50,30 @@ def _contains_sorted(sorted_values: np.ndarray, values: np.ndarray) -> np.ndarra
     result = np.zeros(values.shape, dtype=bool)
     result[in_bounds] = sorted_values[indices[in_bounds]] == values[in_bounds]
     return result
+
+
+def _group_ordinary_tiles(
+    left_blocks: np.ndarray,
+    left_slices: np.ndarray,
+    max_tiles_per_group: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    starts: list[int] = []
+    counts: list[int] = []
+    run_start = 0
+    tile_count = int(left_blocks.shape[0])
+    while run_start < tile_count:
+        run_stop = run_start + 1
+        while (
+            run_stop < tile_count
+            and left_blocks[run_stop] == left_blocks[run_start]
+            and left_slices[run_stop] == left_slices[run_start]
+        ):
+            run_stop += 1
+        for start in range(run_start, run_stop, max_tiles_per_group):
+            starts.append(start)
+            counts.append(min(max_tiles_per_group, run_stop - start))
+        run_start = run_stop
+    return np.asarray(starts, dtype=np.int32), np.asarray(counts, dtype=np.int32)
 
 
 def _cell_atom_order(
@@ -151,18 +179,95 @@ def _special_lj_masks(
     return enabled_words, one_four_words
 
 
+def _build_special_work(
+    positions: np.ndarray,
+    box: np.ndarray,
+    block_atoms: np.ndarray,
+    valid: np.ndarray,
+    special_blocks: np.ndarray,
+    lj_enabled: np.ndarray,
+    lj_one_four: np.ndarray,
+    search_radius2: float,
+    left_slice_size: int,
+) -> tuple[np.ndarray, ...]:
+    sentinel = block_atoms.size
+    left_blocks: list[int] = []
+    left_slices: list[int] = []
+    right_rows: list[np.ndarray] = []
+    enabled_rows: list[np.ndarray] = []
+    one_four_rows: list[np.ndarray] = []
+    diagonal_flags: list[int] = []
+    for tile, (left_block, right_block) in enumerate(special_blocks):
+        left_atoms = block_atoms[left_block]
+        right_atoms = block_atoms[right_block]
+        left_positions = positions[np.maximum(left_atoms, 0)]
+        right_positions = positions[np.maximum(right_atoms, 0)]
+        delta = left_positions[:, None, :] - right_positions[None, :, :]
+        delta -= box * np.rint(delta / box)
+        distance2 = np.sum(delta * delta, axis=2)
+        member = valid[left_block, :, None] & valid[right_block, None, :]
+        member &= distance2 < search_radius2
+        diagonal = left_block == right_block
+        if diagonal:
+            left_slots = np.arange(_INTERACTION_TILE_SIZE)[:, None]
+            right_slots = np.arange(_INTERACTION_TILE_SIZE)[None, :]
+            member &= left_slots < right_slots
+        for left_slice in range(_INTERACTION_TILE_SIZE // left_slice_size):
+            atom_slice = slice(
+                left_slice_size * left_slice,
+                left_slice_size * (left_slice + 1),
+            )
+            right_mask = np.any(member[atom_slice], axis=0)
+            if not np.any(right_mask):
+                continue
+            slots = np.nonzero(right_mask)[0].astype(np.int32)
+            right_row = np.full((_INTERACTION_TILE_SIZE,), sentinel, dtype=np.int32)
+            right_row[: slots.size] = np.int32(right_block * _INTERACTION_TILE_SIZE) + slots
+            enabled_row = np.zeros((_INTERACTION_TILE_SIZE,), dtype=np.uint32)
+            enabled_row[: slots.size] = lj_enabled[tile, slots]
+            one_four_row = np.zeros((_INTERACTION_TILE_SIZE,), dtype=np.uint32)
+            one_four_row[: slots.size] = lj_one_four[tile, slots]
+            left_blocks.append(int(left_block))
+            left_slices.append(left_slice)
+            right_rows.append(right_row)
+            enabled_rows.append(enabled_row)
+            one_four_rows.append(one_four_row)
+            diagonal_flags.append(int(diagonal))
+
+    work_count = len(left_blocks)
+    empty_rows = (0, _INTERACTION_TILE_SIZE)
+    return (
+        np.asarray(left_blocks, dtype=np.int32),
+        np.asarray(left_slices, dtype=np.int32),
+        np.stack(right_rows) if right_rows else np.empty(empty_rows, dtype=np.int32),
+        np.stack(enabled_rows) if enabled_rows else np.empty(empty_rows, dtype=np.uint32),
+        np.stack(one_four_rows) if one_four_rows else np.empty(empty_rows, dtype=np.uint32),
+        np.asarray(diagonal_flags, dtype=np.int32).reshape(work_count),
+    )
+
+
 @dataclass(frozen=True)
 class _InteractionSchedule32:
     atom_count: int
     search_radius: float
+    left_slice_size: int
     box_lengths: np.ndarray
     atom_order: np.ndarray
     inverse_order: np.ndarray
     ordinary_left_blocks: np.ndarray
+    ordinary_left_slices: np.ndarray
     ordinary_right_atoms: np.ndarray
+    ordinary_group_starts: np.ndarray
+    ordinary_group_counts: np.ndarray
     special_blocks: np.ndarray
     special_lj_enabled: np.ndarray
     special_lj_one_four: np.ndarray
+    special_work_left_blocks: np.ndarray
+    special_work_left_slices: np.ndarray
+    special_work_right_atoms: np.ndarray
+    special_work_lj_enabled: np.ndarray
+    special_work_lj_one_four: np.ndarray
+    special_work_diagonal: np.ndarray
 
     @property
     def padded_atom_count(self) -> int:
@@ -177,23 +282,42 @@ class _InteractionSchedule32:
         return int(self.ordinary_left_blocks.shape[0])
 
     @property
+    def ordinary_group_count(self) -> int:
+        return int(self.ordinary_group_starts.shape[0])
+
+    @property
     def special_tile_count(self) -> int:
         return int(self.special_blocks.shape[0])
+
+    @property
+    def special_work_count(self) -> int:
+        return int(self.special_work_left_blocks.shape[0])
 
 
 @dataclass(frozen=True)
 class _DeviceInteractionSchedule32:
     atom_count: int
     search_radius: float
+    left_slice_size: int
     padded_atom_count: int
     ordinary_tile_count: int
+    ordinary_group_count: int
     special_tile_count: int
     atom_order: mx.array
     ordinary_left_blocks: mx.array
+    ordinary_left_slices: mx.array
     ordinary_right_atoms: mx.array
+    ordinary_group_starts: mx.array
+    ordinary_group_counts: mx.array
     special_blocks: mx.array
     special_lj_enabled: mx.array
     special_lj_one_four: mx.array
+    special_work_left_blocks: mx.array
+    special_work_left_slices: mx.array
+    special_work_right_atoms: mx.array
+    special_work_lj_enabled: mx.array
+    special_work_lj_one_four: mx.array
+    special_work_diagonal: mx.array
 
 
 def _schedule_to_device32(
@@ -202,15 +326,29 @@ def _schedule_to_device32(
     return _DeviceInteractionSchedule32(
         atom_count=schedule.atom_count,
         search_radius=schedule.search_radius,
+        left_slice_size=schedule.left_slice_size,
         padded_atom_count=schedule.padded_atom_count,
         ordinary_tile_count=schedule.ordinary_tile_count,
+        ordinary_group_count=schedule.ordinary_group_count,
         special_tile_count=schedule.special_tile_count,
         atom_order=mx.array(schedule.atom_order, dtype=mx.int32),
         ordinary_left_blocks=mx.array(schedule.ordinary_left_blocks, dtype=mx.int32),
+        ordinary_left_slices=mx.array(schedule.ordinary_left_slices, dtype=mx.int32),
         ordinary_right_atoms=mx.array(schedule.ordinary_right_atoms, dtype=mx.int32),
+        ordinary_group_starts=mx.array(schedule.ordinary_group_starts, dtype=mx.int32),
+        ordinary_group_counts=mx.array(schedule.ordinary_group_counts, dtype=mx.int32),
         special_blocks=mx.array(schedule.special_blocks, dtype=mx.int32),
         special_lj_enabled=mx.array(schedule.special_lj_enabled, dtype=mx.uint32),
         special_lj_one_four=mx.array(schedule.special_lj_one_four, dtype=mx.uint32),
+        special_work_left_blocks=mx.array(schedule.special_work_left_blocks, dtype=mx.int32),
+        special_work_left_slices=mx.array(schedule.special_work_left_slices, dtype=mx.int32),
+        special_work_right_atoms=mx.array(schedule.special_work_right_atoms, dtype=mx.int32),
+        special_work_lj_enabled=mx.array(schedule.special_work_lj_enabled, dtype=mx.uint32),
+        special_work_lj_one_four=mx.array(
+            schedule.special_work_lj_one_four,
+            dtype=mx.uint32,
+        ),
+        special_work_diagonal=mx.array(schedule.special_work_diagonal, dtype=mx.int32),
     )
 
 
@@ -221,6 +359,8 @@ def _build_interaction_schedule32(
     search_radius: float,
     lj_exclusion_pairs: object = (),
     lj_one_four_pairs: object = (),
+    ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+    left_slice_size: int = 16,
 ) -> _InteractionSchedule32:
     positions_np = np.asarray(positions, dtype=np.float64)
     box = np.asarray(box_lengths, dtype=np.float64)
@@ -233,6 +373,10 @@ def _build_interaction_schedule32(
         raise ValueError("box_lengths must be a finite positive vector with shape (3,)")
     if not isfinite(float(search_radius)) or search_radius <= 0.0:
         raise ValueError("search_radius must be finite and positive")
+    if ordinary_tiles_per_group < 1:
+        raise ValueError("ordinary_tiles_per_group must be positive")
+    if left_slice_size not in (4, 8, 16):
+        raise ValueError("left_slice_size must be 4, 8, or 16")
     if 2.0 * float(search_radius) >= float(np.min(box)):
         raise ValueError("search_radius must be smaller than half the shortest box length")
 
@@ -259,12 +403,31 @@ def _build_interaction_schedule32(
         one_four_codes,
         atom_count,
     )
+    search_radius2 = float(search_radius) ** 2
+    (
+        special_work_left_blocks,
+        special_work_left_slices,
+        special_work_right_atoms,
+        special_work_lj_enabled,
+        special_work_lj_one_four,
+        special_work_diagonal,
+    ) = _build_special_work(
+        positions_np,
+        box,
+        block_atoms,
+        valid,
+        special_blocks,
+        special_lj_enabled,
+        special_lj_one_four,
+        search_radius2,
+        left_slice_size,
+    )
 
     traversal = np.argsort(np.sum(extents, axis=1), kind="stable")
     sentinel = block_atoms.size
     ordinary_left: list[int] = []
+    ordinary_slice: list[int] = []
     ordinary_right: list[np.ndarray] = []
-    search_radius2 = float(search_radius) ** 2
     for traversal_index, left_block in enumerate(traversal[:-1]):
         right_blocks = traversal[traversal_index + 1 :]
         delta = centers[right_blocks] - centers[left_block]
@@ -292,7 +455,9 @@ def _build_interaction_schedule32(
         left_atoms = block_atoms[left_block]
         left_valid = valid[left_block]
         left_positions = positions_np[np.maximum(left_atoms, 0)]
-        admitted: list[np.ndarray] = []
+        admitted: list[list[np.ndarray]] = [
+            [] for _ in range(_INTERACTION_TILE_SIZE // left_slice_size)
+        ]
         for right_block in candidate_right:
             right_atoms = block_atoms[right_block]
             right_valid = valid[right_block]
@@ -300,42 +465,68 @@ def _build_interaction_schedule32(
             pair_delta = left_positions[:, None, :] - right_positions[None, :, :]
             pair_delta -= box * np.rint(pair_delta / box)
             distance2 = np.sum(pair_delta * pair_delta, axis=2)
-            right_mask = np.any(
-                left_valid[:, None] & right_valid[None, :] & (distance2 < search_radius2),
-                axis=0,
-            )
-            if np.any(right_mask):
-                slots = np.nonzero(right_mask)[0].astype(np.int32)
-                admitted.append(np.int32(right_block * _INTERACTION_TILE_SIZE) + slots)
-        if not admitted:
-            continue
-        row = np.concatenate(admitted)
-        padded_size = (
-            (row.size + _INTERACTION_TILE_SIZE - 1) // _INTERACTION_TILE_SIZE
-        ) * _INTERACTION_TILE_SIZE
-        padded = np.full((padded_size,), sentinel, dtype=np.int32)
-        padded[: row.size] = row
-        tiles = padded.reshape((-1, _INTERACTION_TILE_SIZE))
-        ordinary_left.extend([int(left_block)] * tiles.shape[0])
-        ordinary_right.append(tiles)
+            pair_valid = left_valid[:, None] & right_valid[None, :]
+            for left_slice in range(_INTERACTION_TILE_SIZE // left_slice_size):
+                atom_slice = slice(
+                    left_slice_size * left_slice,
+                    left_slice_size * (left_slice + 1),
+                )
+                right_mask = np.any(
+                    pair_valid[atom_slice] & (distance2[atom_slice] < search_radius2),
+                    axis=0,
+                )
+                if np.any(right_mask):
+                    slots = np.nonzero(right_mask)[0].astype(np.int32)
+                    admitted[left_slice].append(
+                        np.int32(right_block * _INTERACTION_TILE_SIZE) + slots
+                    )
+        for left_slice, entries in enumerate(admitted):
+            if not entries:
+                continue
+            row = np.concatenate(entries)
+            padded_size = (
+                (row.size + _INTERACTION_TILE_SIZE - 1) // _INTERACTION_TILE_SIZE
+            ) * _INTERACTION_TILE_SIZE
+            padded = np.full((padded_size,), sentinel, dtype=np.int32)
+            padded[: row.size] = row
+            tiles = padded.reshape((-1, _INTERACTION_TILE_SIZE))
+            ordinary_left.extend([int(left_block)] * tiles.shape[0])
+            ordinary_slice.extend([left_slice] * tiles.shape[0])
+            ordinary_right.append(tiles)
 
     ordinary_left_array = np.asarray(ordinary_left, dtype=np.int32)
+    ordinary_slice_array = np.asarray(ordinary_slice, dtype=np.int32)
     ordinary_right_array = (
         np.concatenate(ordinary_right, axis=0)
         if ordinary_right
         else np.empty((0, _INTERACTION_TILE_SIZE), dtype=np.int32)
     )
+    ordinary_group_starts, ordinary_group_counts = _group_ordinary_tiles(
+        ordinary_left_array,
+        ordinary_slice_array,
+        ordinary_tiles_per_group,
+    )
     return _InteractionSchedule32(
         atom_count=atom_count,
         search_radius=float(search_radius),
+        left_slice_size=left_slice_size,
         box_lengths=box.astype(np.float32),
         atom_order=block_atoms.reshape(-1),
         inverse_order=inverse_order,
         ordinary_left_blocks=ordinary_left_array,
+        ordinary_left_slices=ordinary_slice_array,
         ordinary_right_atoms=ordinary_right_array,
+        ordinary_group_starts=ordinary_group_starts,
+        ordinary_group_counts=ordinary_group_counts,
         special_blocks=special_blocks,
         special_lj_enabled=special_lj_enabled,
         special_lj_one_four=special_lj_one_four,
+        special_work_left_blocks=special_work_left_blocks,
+        special_work_left_slices=special_work_left_slices,
+        special_work_right_atoms=special_work_right_atoms,
+        special_work_lj_enabled=special_work_lj_enabled,
+        special_work_lj_one_four=special_work_lj_one_four,
+        special_work_diagonal=special_work_diagonal,
     )
 
 
@@ -353,7 +544,10 @@ def _interaction32_direct_force_only(
     one_four_scale: float,
     coulomb_constant: float,
     alpha: float,
-) -> mx.array:
+    _return_stages: bool = False,
+    _canonical_records: bool = True,
+    _simdgroups_per_threadgroup: int = 4,
+) -> mx.array | _Interaction32ForceStages:
     if isinstance(schedule, _InteractionSchedule32):
         schedule = _schedule_to_device32(schedule)
     positions = as_mx_array(positions, dtype=mx.float32)
@@ -380,10 +574,16 @@ def _interaction32_direct_force_only(
         positions,
         schedule.atom_order,
         schedule.ordinary_left_blocks,
+        schedule.ordinary_left_slices,
         schedule.ordinary_right_atoms,
-        schedule.special_blocks,
-        schedule.special_lj_enabled,
-        schedule.special_lj_one_four,
+        schedule.ordinary_group_starts,
+        schedule.ordinary_group_counts,
+        schedule.special_work_left_blocks,
+        schedule.special_work_left_slices,
+        schedule.special_work_right_atoms,
+        schedule.special_work_lj_enabled,
+        schedule.special_work_lj_one_four,
+        schedule.special_work_diagonal,
         box,
         half_sigma,
         sqrt_epsilon,
@@ -394,4 +594,8 @@ def _interaction32_direct_force_only(
         one_four_scale=one_four_scale,
         coulomb_constant=coulomb_constant,
         alpha=alpha,
+        _return_stages=_return_stages,
+        _canonical_records=_canonical_records,
+        _simdgroups_per_threadgroup=_simdgroups_per_threadgroup,
+        _left_slice_size=schedule.left_slice_size,
     )
