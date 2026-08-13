@@ -3996,7 +3996,7 @@ class NonbondedPotential:
         aggregation_started = route_profiler.start()
         forces = direct_forces + reciprocal_forces + correction_forces
         route_profiler.finish(
-            "force_aggregation",
+            "pme_force_aggregation",
             aggregation_started,
             forces,
         )

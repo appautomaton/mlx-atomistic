@@ -2,7 +2,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell
-from mlx_atomistic.force_runtime import _PreparedForcePipeline
+from mlx_atomistic.force_runtime import _ExclusiveRouteProfiler, _PreparedForcePipeline
 from mlx_atomistic.neighbors import NeighborListManager
 
 
@@ -51,6 +51,24 @@ def test_prepared_pipeline_accumulates_multiple_force_terms():
     forces = pipeline.bind(None).forces(positions)
 
     np.testing.assert_allclose(np.asarray(forces), -4.0 * np.asarray(positions))
+
+
+def test_prepared_pipeline_profiles_real_aggregation_without_noop_redistribution():
+    positions = mx.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    profiler = _ExclusiveRouteProfiler()
+    pipeline = _PreparedForcePipeline.prepare(
+        (_FallbackTerm(), _FallbackTerm()),
+        cell=None,
+        route_profiler=profiler,
+    )
+
+    forces = pipeline.bind(None).forces(positions)
+    mx.eval(forces)
+    routes = profiler.report()["routes"]
+
+    assert routes["force_term_aggregation"]["count"] == 1
+    assert "virtual_site_force_redistribution" not in routes
+    assert "force_aggregation" not in routes
 
 
 def test_prepared_pipeline_binds_once_per_neighbor_generation():

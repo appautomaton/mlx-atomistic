@@ -208,7 +208,7 @@ class _BoundForcePipeline:
             total_forces = total_forces + force_array
             if aggregation_started is not None:
                 self.route_profiler.finish(
-                    "force_aggregation",
+                    "force_term_aggregation",
                     aggregation_started,
                     total_forces,
                 )
@@ -219,7 +219,11 @@ class _BoundForcePipeline:
             msg = "force pipeline did not produce forces"
             raise RuntimeError(msg)
         redistribution_started = (
-            None if self.route_profiler is None else self.route_profiler.start()
+            None
+            if self.route_profiler is None
+            or self.virtual_sites is None
+            or self.virtual_sites.n_virtual_sites == 0
+            else self.route_profiler.start()
         )
         redistributed = _redistribute_forces(
             total_forces,
@@ -228,7 +232,7 @@ class _BoundForcePipeline:
         )
         if redistribution_started is not None:
             self.route_profiler.finish(
-                "force_aggregation",
+                "virtual_site_force_redistribution",
                 redistribution_started,
                 redistributed,
             )
