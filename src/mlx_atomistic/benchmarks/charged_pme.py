@@ -743,7 +743,7 @@ def _tile_mask_occupancy(
     tile_blocks: object,
     *,
     block_size: int,
-) -> dict[str, int | float]:
+) -> dict[str, object]:
     """Summarize row and column occupancy in fixed-width spatial tiles."""
 
     words = np.asarray(member_mask, dtype=np.uint32)
@@ -770,16 +770,22 @@ def _tile_mask_occupancy(
     tile_active = active.reshape((-1, block_size, block_size))
     nonempty_columns = np.any(tile_active, axis=1)
     nonempty_rows = np.any(tile_active, axis=2)
+    column_member_counts = np.count_nonzero(tile_active, axis=1)
+    column_member_count_histogram = {
+        str(member_count): int(np.count_nonzero(column_member_counts == member_count))
+        for member_count in range(block_size + 1)
+    }
     column_count = int(nonempty_columns.size)
     row_count = int(nonempty_rows.size)
     empty_columns = column_count - int(np.count_nonzero(nonempty_columns))
     empty_rows = row_count - int(np.count_nonzero(nonempty_rows))
-    summary: dict[str, int | float] = {
+    summary: dict[str, object] = {
         "right_column_count": column_count,
         "empty_right_column_count": empty_columns,
         "empty_right_column_fraction": (
             0.0 if column_count == 0 else empty_columns / column_count
         ),
+        "right_column_member_count_histogram": column_member_count_histogram,
         "left_row_count": row_count,
         "empty_left_row_count": empty_rows,
         "empty_left_row_fraction": 0.0 if row_count == 0 else empty_rows / row_count,

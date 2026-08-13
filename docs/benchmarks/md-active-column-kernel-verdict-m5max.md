@@ -8,7 +8,9 @@ The MLX/Metal molecular-dynamics runtime now compacts every non-empty right-atom
 column from its retained 4-by-4 force tiles. A 32-lane single-instruction,
 multiple-data (SIMD) group consumes up to 32 compact column descriptors that
 share one left atom block. The descriptor is an `int32` value encoding
-`4 * tile_index + right_column`.
+`4 * tile_index + right_column`. A retained follow-up now stores the four
+column-local membership bits in the descriptor's high nibble; see
+`md-packed-column-descriptor-verdict-m5max.md`.
 
 The layout is retained because it reduces complete-wall time on both the
 23,558-atom 5DFR workload and the 94,232-atom JAC workload. It adds no package

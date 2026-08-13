@@ -54,7 +54,9 @@ The current production path has these boundaries:
   allocations on the host.
 - `_tile_parameterized_pme_direct_force_only()` in
   `src/mlx_atomistic/metal_kernels.py` evaluates the direct Lennard-Jones and
-  screened-Coulomb terms in one custom Metal kernel.
+  screened-Coulomb terms in one custom Metal kernel. Its compact column
+  descriptor now carries the four local membership bits, avoiding a recurring
+  indirect tile-mask read without changing the rejected 32-atom design.
 - `NeighborListManager._needs_rebuild_mlx_scalar()` materializes a device
   displacement result on the host every step.  The inclusive timer is mostly
   upstream GPU completion on JAC, so a smaller displacement kernel alone is

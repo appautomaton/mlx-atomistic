@@ -369,6 +369,16 @@ _PREPARED_PME_PAIRS_PER_WORKER = 8
 _TILE_PME_BLOCK_SIZE = 4
 _TILE_PME_LANES_PER_TILE = _TILE_PME_BLOCK_SIZE * _TILE_PME_BLOCK_SIZE
 _TILE_PME_MASK_WORD_COUNT = (_TILE_PME_LANES_PER_TILE + 31) // 32
+_TILE_PME_COLUMN_DESCRIPTOR_MEMBER_SHIFT = 28
+_TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK = (
+    1 << _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_SHIFT
+) - 1
+_TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR = (
+    1 << _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_SHIFT
+)
+_TILE_PME_COLUMN_DESCRIPTOR_TILE_LIMIT = (
+    _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR // _TILE_PME_BLOCK_SIZE
+)
 _TILE_BUILD_BLOCK_SIZE = 8
 _TILE_BUILD_LANES_PER_TILE = _TILE_BUILD_BLOCK_SIZE * _TILE_BUILD_BLOCK_SIZE
 _TILE_BUILD_SUBTILES_PER_TILE = (_TILE_BUILD_BLOCK_SIZE // _TILE_PME_BLOCK_SIZE) ** 2
@@ -926,7 +936,9 @@ _PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
 # left atoms, while SIMD reductions produce the four left forces without the
 # repeated threadgroup barriers and pair-force scratch buffers used by the
 # previous tile schedule. Compact column descriptors prevent lanes from being
-# assigned to tile columns whose four membership bits are all zero.
+# assigned to tile columns whose four membership bits are all zero. Each
+# descriptor also carries those four membership bits, avoiding an indirect
+# tile-mask read in the recurring force kernel.
 #
 # A threadgroup carries `_TILE_PME_GROUPS_PER_THREADGROUP` independent SIMD
 # groups so a core has several force groups in flight against memory latency,
@@ -945,7 +957,7 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     uint group = group_active ? group_id : (uint)(total_groups - 1);
     int group_start = force_group_starts[group];
     int group_count = force_group_counts[group];
-    int first_column = force_columns[group_start];
+    uint first_column = (uint)force_columns[group_start];
 
     threadgroup int left_atoms[4 * GROUPS_PER_TG];
     threadgroup float left_positions[12 * GROUPS_PER_TG];
@@ -955,7 +967,8 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     uint lbase = sub * 4u;
     uint pbase = sub * 12u;
 
-    int left_block = tile_blocks[2 * (first_column >> 2) + 0];
+    int first_tile = (int)((first_column & 0x0fffffffu) >> 2);
+    int left_block = tile_blocks[2 * first_tile + 0];
     if (lane < 4u) {
         int left_atom = atom_blocks[4 * left_block + lane];
         left_atoms[lbase + lane] = left_atom;
@@ -971,9 +984,10 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
 
     bool tile_active = group_active && lane < (uint)group_count;
     int safe_local_column = min((int)lane, group_count - 1);
-    int encoded_column = force_columns[group_start + safe_local_column];
-    int tile = encoded_column >> 2;
-    uint right_slot = (uint)(encoded_column & 3);
+    uint encoded_column = (uint)force_columns[group_start + safe_local_column];
+    int tile = (int)((encoded_column & 0x0fffffffu) >> 2);
+    uint right_slot = encoded_column & 3u;
+    uint column_member_mask = encoded_column >> 28;
     int right_block = tile_blocks[2 * tile + 1];
     int right_atom = atom_blocks[4 * right_block + right_slot];
     int safe_right = max(right_atom, 0);
@@ -990,7 +1004,6 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     float accumulated_lj_energy = 0.0f;
     float accumulated_coulomb_energy = 0.0f;
 #endif
-    uint member_word = member_mask[tile];
     uint lj_word = lj_enabled_mask[tile];
     uint one_four_word = lj_one_four_mask[tile];
     float box_lx = box[0];
@@ -1011,9 +1024,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     float one_four_scale = params[10];
 
     for (uint left_slot = 0u; left_slot < 4u; left_slot++) {
-        uint pair_lane = 4u * left_slot + right_slot;
-        uint bit = pair_lane;
-        bool member = tile_active && ((member_word >> bit) & 1u) != 0u;
+        uint bit = 4u * left_slot + right_slot;
+        bool member = tile_active
+            && ((column_member_mask >> left_slot) & 1u) != 0u;
         int left_atom = left_atoms[lbase + left_slot];
         float fx = 0.0f;
         float fy = 0.0f;
@@ -2399,7 +2412,14 @@ _NEIGHBOR_TILE_COLUMN_SCATTER_SOURCE = r"""
     for (uint column = 0u; column < 4u; column++) {
         uint column_pattern = 0x1111u << column;
         if ((word & column_pattern) != 0u) {
-            force_columns[output] = 4 * (int)tile + (int)column;
+            uint column_members = 0u;
+            for (uint left = 0u; left < 4u; left++) {
+                column_members |= (
+                    (word >> (4u * left + column)) & 1u
+                ) << left;
+            }
+            uint descriptor = (column_members << 28) | (4u * tile + column);
+            force_columns[output] = (int)descriptor;
             output++;
         }
     }
@@ -3172,7 +3192,6 @@ def _tile_pme_direct_force_only_kernel():
                 "positions",
                 "atom_blocks",
                 "tile_blocks",
-                "member_mask",
                 "lj_enabled_mask",
                 "lj_one_four_mask",
                 "force_columns",
@@ -3204,7 +3223,6 @@ def _tile_pme_direct_kernel():
                 "positions",
                 "atom_blocks",
                 "tile_blocks",
-                "member_mask",
                 "lj_enabled_mask",
                 "lj_one_four_mask",
                 "force_columns",
@@ -4267,12 +4285,18 @@ def _neighbor_tile_column_scatter_sized(
     *,
     accepted_count: int,
 ) -> mx.array:
-    """Compact non-empty right-atom columns from ordered 4x4 tiles."""
+    """Compact non-empty right columns and pack their four membership bits."""
 
     member_mask = as_mx_array(member_mask, dtype=mx.uint32)
     active_column_counts = as_mx_array(active_column_counts, dtype=mx.int32)
     prefix = as_mx_array(prefix, dtype=mx.int32)
     tile_count = int(member_mask.shape[0])
+    if tile_count > _TILE_PME_COLUMN_DESCRIPTOR_TILE_LIMIT:
+        msg = (
+            "tile count exceeds the packed force-column descriptor capacity "
+            f"({_TILE_PME_COLUMN_DESCRIPTOR_TILE_LIMIT})"
+        )
+        raise ValueError(msg)
     if member_mask.shape != (tile_count, _TILE_PME_MASK_WORD_COUNT):
         msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
@@ -6191,7 +6215,6 @@ def _tile_parameterized_pme_direct_force_only(
         positions,
         atom_blocks,
         tile_blocks,
-        member_mask,
         lj_enabled_mask,
         lj_one_four_mask,
         force_columns,

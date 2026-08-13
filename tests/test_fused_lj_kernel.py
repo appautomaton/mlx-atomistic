@@ -1000,8 +1000,11 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
     group_starts = np.asarray(tile_neighbors.tiles.force_group_starts)
     group_counts = np.asarray(tile_neighbors.tiles.force_group_counts)
     group_ends = group_starts + group_counts
-    scheduled_tiles = force_columns // tile_neighbors.tiles.block_size
-    scheduled_columns = force_columns % tile_neighbors.tiles.block_size
+    force_column_bits = force_columns.astype(np.uint32, copy=False)
+    scheduled_indices = force_column_bits & np.uint32(0x0FFFFFFF)
+    scheduled_tiles = scheduled_indices // tile_neighbors.tiles.block_size
+    scheduled_columns = scheduled_indices % tile_neighbors.tiles.block_size
+    scheduled_members = force_column_bits >> np.uint32(28)
     assert np.all(tile_blocks[1:, 0] >= tile_blocks[:-1, 0])
     assert group_starts[0] == 0
     assert np.all(group_starts[1:] == group_ends[:-1])
@@ -1015,6 +1018,13 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
     member_words = np.asarray(tile_neighbors.tiles.member_mask)[:, 0]
     column_patterns = np.array([0x1111, 0x2222, 0x4444, 0x8888], dtype=np.uint32)
     assert np.all(member_words[scheduled_tiles] & column_patterns[scheduled_columns])
+    expected_members = np.zeros_like(scheduled_members)
+    for left_slot in range(tile_neighbors.tiles.block_size):
+        pair_bits = 4 * left_slot + scheduled_columns
+        expected_members |= (
+            (member_words[scheduled_tiles] >> pair_bits) & np.uint32(1)
+        ) << np.uint32(left_slot)
+    np.testing.assert_array_equal(scheduled_members, expected_members)
     assert len(force_columns) == sum(
         np.count_nonzero(word & column_patterns) for word in member_words
     )
@@ -1255,7 +1265,8 @@ def test_direct_plus_sparse_correction_matches_reference_at_half_box():
         mx.array([[2]], dtype=mx.uint32),
         mx.zeros((1, 1), dtype=mx.uint32),
         mx.zeros((1, 1), dtype=mx.uint32),
-        mx.array([1], dtype=mx.int32),
+        # Tile zero, right column one, with left slot zero active.
+        mx.array([0x10000001], dtype=mx.int32),
         mx.array([0], dtype=mx.int32),
         mx.array([1], dtype=mx.int32),
         box,
@@ -1310,7 +1321,10 @@ def test_neighbor_tiles_reject_invalid_force_group_schedule():
             member_mask=mx.array([[1], [1]], dtype=mx.uint32),
             exact_pair_count=2,
             raw_candidate_count=2,
-            force_columns=mx.array([0, 4], dtype=mx.int32),
+            force_columns=mx.array(
+                [0x10000000, 0x10000004],
+                dtype=mx.int32,
+            ),
             force_group_starts=mx.array([0], dtype=mx.int32),
             force_group_counts=mx.array([2], dtype=mx.int32),
         )

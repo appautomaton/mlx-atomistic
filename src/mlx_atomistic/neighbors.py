@@ -22,6 +22,8 @@ from mlx_atomistic.cell_list import (
 )
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK,
+    _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR,
     _neighbor_cell_pair_candidates,
     _neighbor_cell_tile_candidates,
     _neighbor_pair_ordered_scatter_sized,
@@ -186,7 +188,10 @@ class NeighborTiles:
 
     The representation is geometry-only. Each bit in ``member_mask`` records
     one pair that was inside ``cutoff + skin`` at rebuild time. Empty tiles are
-    omitted, and materializing explicit pairs is an opt-in diagnostic action.
+    omitted. Each force-column descriptor packs its four membership bits above
+    the tile and right-column index so the recurring Metal force kernel does
+    not reload the tile membership word. Materializing explicit pairs remains
+    an opt-in diagnostic action.
     """
 
     atom_blocks: mx.array
@@ -269,10 +274,23 @@ class NeighborTiles:
                 ends = starts + counts
                 safe_starts = mx.clip(starts, 0, column_count - 1)
                 safe_ends = mx.clip(ends - 1, 0, column_count - 1)
-                first_columns = self.force_columns[safe_starts]
-                last_columns = self.force_columns[safe_ends]
+                descriptor_bits = self.force_columns.astype(mx.uint32)
+                first_descriptors = descriptor_bits[safe_starts]
+                last_descriptors = descriptor_bits[safe_ends]
+                descriptor_index_mask = np.uint32(
+                    _TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK
+                )
+                member_divisor = np.uint32(
+                    _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR
+                )
+                first_columns = first_descriptors & descriptor_index_mask
+                last_columns = last_descriptors & descriptor_index_mask
                 first_tiles = first_columns // self.block_size
                 last_tiles = last_columns // self.block_size
+                first_members = (
+                    first_descriptors // member_divisor
+                )
+                last_members = last_descriptors // member_divisor
                 safe_first_tiles = mx.clip(first_tiles, 0, self.tile_count - 1)
                 safe_last_tiles = mx.clip(last_tiles, 0, self.tile_count - 1)
                 valid = (
@@ -280,8 +298,9 @@ class NeighborTiles:
                     & (counts >= 1)
                     & (counts <= DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE)
                     & (ends <= column_count)
-                    & (first_columns >= 0)
                     & (last_columns < self.tile_count * self.block_size)
+                    & (first_members >= 1)
+                    & (last_members >= 1)
                     & (
                         self.tile_blocks[safe_first_tiles, 0]
                         == self.tile_blocks[safe_last_tiles, 0]
