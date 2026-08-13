@@ -2726,6 +2726,56 @@ def test_pme_performance_stage_summary_schema_without_fixture(tmp_path):
     assert payload["unsupported_timing_split_blockers"][0]["name"] == "pme_fixture"
 
 
+def test_pme_performance_stage_summary_prefers_production_force_rows():
+    def row(name, seconds):
+        return {
+            "name": name,
+            "mean_s": seconds,
+            "median_s": seconds,
+            "min_s": seconds,
+            "max_s": seconds,
+        }
+
+    summary = pme_performance._stage_timings(
+        [
+            row("charge_assignment_bspline", 10.0),
+            row("interpolate_field", 20.0),
+            row("charge_assignment_order5_metal", 0.2),
+            row("interpolate_complex_grid_force_only", 0.3),
+            row("forward_fft", 30.0),
+            row("influence_function", 40.0),
+            row("inverse_fft_potential_and_fields", 50.0),
+            row("forward_fft_force_path", 0.4),
+            row("inverse_fft_influence_force_path", 0.5),
+            row("reciprocal_full", 60.0),
+            row("reciprocal_force_only", 0.7),
+        ]
+    )
+
+    assert summary["assignment_interpolation"]["median_s"] == pytest.approx(0.5)
+    assert summary["reciprocal_fft_influence"]["median_s"] == pytest.approx(0.9)
+    assert summary["reciprocal_space"]["median_s"] == pytest.approx(0.7)
+
+
+def test_pme_performance_admits_current_compact_pair_policy():
+    assert pme_performance._compact_pair_policy_admitted(
+        {
+            "policy": "compact_pair",
+            "representation": "pairs",
+            "uses_shared_neighbor_policy": True,
+            "fallback_reason": None,
+        }
+    )
+    assert not pme_performance._compact_pair_policy_admitted(
+        {
+            "policy": "block_candidate",
+            "representation": "blocks",
+            "uses_shared_neighbor_policy": True,
+            "fallback_reason": None,
+        }
+    )
+
+
 def test_ewald_reference_benchmark_json_and_csv_smoke(tmp_path, capsys):
     csv_path = tmp_path / "ewald.csv"
 

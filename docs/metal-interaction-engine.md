@@ -507,6 +507,15 @@ wall, so this result does not reopen that route.  The next MD target remains the
 independently synchronized reciprocal PME path, not another direct-space or
 force-accumulation variant.
 
+That reciprocal follow-up is now complete.  Three order-five charge-spread
+launch geometries were parity-correct, but the two 25-lane layouts regressed the
+complete reciprocal graph by 23% to 31%, while the best eight-lane layout
+improved it by less than 1% and was not directionally stable on 5DFR.  The
+[spread-launch verdict](./benchmarks/md-reciprocal-spread-launch-verdict-m5max.md)
+retains the five-z-slice production kernel and closes further launch-layout
+tuning.  New work must begin from a fresh complete MD route profile rather than
+assuming either direct space or reciprocal PME remains the next bottleneck.
+
 ### Gate C: device builder
 
 Status: not run because Gate B failed.

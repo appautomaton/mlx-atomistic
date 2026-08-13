@@ -142,6 +142,7 @@ Control runs came from detached commit `91b7b0b`. Raw reports remain local and
 gitignored under `results/md-reciprocal-complex-grid/`.
 
 Do not generalize this result into a complex-grid energy path. Energy requires
-the scalar potential and has different data-flow economics. The next
-reciprocal PME candidate should be selected from a fresh synchronized profile,
-with charge-spread launch geometry as the leading kernel-level question.
+the scalar potential and has different data-flow economics. The follow-up
+[spread-launch investigation](./md-reciprocal-spread-launch-verdict-m5max.md)
+tested the leading kernel-level question and rejected all three launch-layout
+candidates. A fresh complete MD route profile must select the next target.

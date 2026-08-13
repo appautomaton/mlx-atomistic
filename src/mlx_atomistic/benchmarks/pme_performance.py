@@ -23,12 +23,17 @@ from mlx_atomistic.benchmarks import (
 from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.benchmarks.pme_validation import manifest_hash
 from mlx_atomistic.forcefields import NonbondedPotential
+from mlx_atomistic.metal_kernels import (
+    _pme_order5_forces_from_complex_grid,
+    pme_order5_charge_grid,
+)
 from mlx_atomistic.neighbors import build_neighbor_list
 from mlx_atomistic.pme import (
     _assign_charges_bspline_mx,
     _influence_function_mx,
     _interpolate_bspline_mx,
     _mesh_reciprocal_energy_forces_mx,
+    _mesh_reciprocal_forces_mx,
     _real_space_energy_forces_mx,
     _validate_inputs_mx,
     pme_coulomb_direct_space_energy_forces,
@@ -557,19 +562,41 @@ def _stage_timings(
     synchronization_blocker: str | None = SYNC_TIMING_BLOCKER,
 ) -> dict:
     by_name = {row["name"]: row for row in rows}
-    assignment_rows = [
-        by_name[name]
-        for name in (
+    production_assignment_names = (
+        "charge_assignment_order5_metal",
+        "interpolate_complex_grid_force_only",
+    )
+    assignment_names = (
+        production_assignment_names
+        if all(name in by_name for name in production_assignment_names)
+        else (
             "charge_assignment_bspline",
             "charge_assignment_cic",
             "interpolate_potential",
             "interpolate_field",
         )
+    )
+    assignment_rows = [
+        by_name[name]
+        for name in assignment_names
         if name in by_name
     ]
+    production_fft_names = (
+        "forward_fft_force_path",
+        "inverse_fft_influence_force_path",
+    )
+    fft_names = (
+        production_fft_names
+        if all(name in by_name for name in production_fft_names)
+        else (
+            "forward_fft",
+            "influence_function",
+            "inverse_fft_potential_and_fields",
+        )
+    )
     fft_rows = [
         by_name[name]
-        for name in ("forward_fft", "influence_function", "inverse_fft_potential_and_fields")
+        for name in fft_names
         if name in by_name
     ]
     correction_rows = [
@@ -588,7 +615,7 @@ def _stage_timings(
             blocker=missing_blocker,
         ),
         "reciprocal_space": _timing_summary(
-            by_name.get("reciprocal_full"),
+            by_name.get("reciprocal_force_only", by_name.get("reciprocal_full")),
             blocker=missing_blocker,
         ),
         "reciprocal_fft_influence": _sum_timing_summaries(fft_rows, blocker=missing_blocker),
@@ -606,6 +633,17 @@ def _stage_timings(
             blocker=missing_blocker,
         ),
     }
+
+
+def _compact_pair_policy_admitted(report: Mapping[str, object]) -> bool:
+    """Return whether a direct-space report matches the profiler contract."""
+
+    return (
+        report.get("policy") == "compact_pair"
+        and report.get("representation") == "pairs"
+        and report.get("uses_shared_neighbor_policy") is True
+        and report.get("fallback_reason") is None
+    )
 
 
 def _blocked_payload(
@@ -975,12 +1013,7 @@ def build_payload(
         config=config,
         pairs=direct_space_interactions,
     )
-    if (
-        direct_space_policy.get("policy") != "block_candidate"
-        or direct_space_policy.get("representation") != "blocks"
-        or direct_space_policy.get("uses_shared_neighbor_policy") is not True
-        or direct_space_policy.get("fallback_reason") is not None
-    ):
+    if not _compact_pair_policy_admitted(direct_space_policy):
         return _blocked_payload(
             fixture_dir=fixture_label,
             iterations=iterations,
@@ -1028,6 +1061,25 @@ def build_payload(
         axis=-1,
     )
     mx.eval(potential_grid, field_grid)
+
+    production_order5_metal = (
+        config.assignment_order == 5
+        and "gpu" in str(mx.default_device()).lower()
+    )
+    if production_order5_metal:
+        production_charge_grid = pme_order5_charge_grid(
+            positions,
+            charges,
+            cell_lengths,
+            config.mesh_shape,
+        )
+        mx.eval(production_charge_grid)
+        production_rho_hat = mx.fft.fftn(production_charge_grid)
+        mx.eval(production_rho_hat)
+        production_potential_grid = mx.fft.ifftn(
+            nonbonded.pme_plan.influence * production_rho_hat
+        )
+        mx.eval(production_potential_grid)
 
     correction_pairs = nonbonded._ewald_correction_pairs()
     one_four_pairs = nonbonded._ewald_one_four_pairs()
@@ -1122,6 +1174,72 @@ def build_payload(
             eval_outputs=_eval_all,
             warmups=warmups,
             iterations=iterations,
+        ),
+        *(
+            [
+                _time(
+                    "charge_assignment_order5_metal",
+                    "pme_production_force",
+                    lambda: pme_order5_charge_grid(
+                        positions,
+                        charges,
+                        cell_lengths,
+                        config.mesh_shape,
+                    ),
+                    eval_outputs=_eval_all,
+                    warmups=warmups,
+                    iterations=iterations,
+                ),
+                _time(
+                    "forward_fft_force_path",
+                    "pme_production_force",
+                    lambda: mx.fft.fftn(production_charge_grid),
+                    eval_outputs=_eval_all,
+                    warmups=warmups,
+                    iterations=iterations,
+                ),
+                _time(
+                    "inverse_fft_influence_force_path",
+                    "pme_production_force",
+                    lambda: mx.fft.ifftn(
+                        nonbonded.pme_plan.influence * production_rho_hat
+                    ),
+                    eval_outputs=_eval_all,
+                    warmups=warmups,
+                    iterations=iterations,
+                ),
+                _time(
+                    "interpolate_complex_grid_force_only",
+                    "pme_production_force",
+                    lambda: _pme_order5_forces_from_complex_grid(
+                        positions,
+                        charges,
+                        production_potential_grid,
+                        cell_lengths,
+                    ),
+                    eval_outputs=_eval_all,
+                    warmups=warmups,
+                    iterations=iterations,
+                ),
+                _time(
+                    "reciprocal_force_only",
+                    "pme_production_force",
+                    lambda: _mesh_reciprocal_forces_mx(
+                        positions,
+                        charges,
+                        cell_lengths,
+                        cell_lengths_np,
+                        config=config,
+                        coulomb_constant=nonbonded.coulomb_constant,
+                        plan=nonbonded.pme_plan,
+                    ),
+                    eval_outputs=_eval_all,
+                    warmups=warmups,
+                    iterations=iterations,
+                ),
+            ]
+            if production_order5_metal
+            else []
         ),
         _time(
             "forward_fft",
