@@ -15,7 +15,7 @@ performance ratios.
 | `gbsa-obc-small` | `comparable` | 3.3352 ms/eval | 0.001458 ms/eval | 0.0004372 OpenMM/MLX latency | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-phase3-controlled.json`; `results/same-workload-openmm-comparison/openmm-gbsa-obc-small.json` |
 | `tip4p-ew-water` | `comparable` | 6.0068 ms/eval | 0.0003339 ms/eval | 0.00005558 OpenMM/MLX latency | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-phase3-controlled.json`; `results/same-workload-openmm-comparison/openmm-tip4p-ew-water.json` |
 | `dhfr-implicit` | `comparable` | 0.3095 ns/day | 1.3136 ns/day | 4.2447 OpenMM/MLX throughput | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
-| `dhfr-explicit-pme` | `parity-passed; runtime diagnostic` | 0.047433 ns/day for one MLX step; fixed-coordinate parity passed | matching fixed-coordinate OpenMM OpenCL energy/forces; historical 752.5 ns/day remains context only | none | `results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json`; `results/scalable-charged-pme-runtime/jac-1x/charged_pme_parity_report.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
+| `dhfr-amber20-jac-pme` | `parity-passed; runtime diagnostic` | 0.047433 ns/day for one MLX step; fixed-coordinate parity passed | matching fixed-coordinate OpenMM OpenCL energy/forces; historical 752.5 ns/day remains context only | none | `results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json`; `results/scalable-charged-pme-runtime/jac-1x/charged_pme_parity_report.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
 | `jac-charged-pme-94k` | `comparable` | 0.528761 s/75 steps, two-run median | 0.100332 s/75 steps, OpenCL single precision, two-run median | 5.2701 MLX/OpenMM latency | refreshed matched artifacts under `results/md-post-pair-elision/reference-refresh*/`; fixed-coordinate parity under `results/scalable-charged-pme-runtime/jac-2x2x1/`; [`retained-stack-phase5-m5max.md`](./retained-stack-phase5-m5max.md) |
 
 ## Interpretation
@@ -61,12 +61,17 @@ one bounded NVT step at `0.004 ps`. The OpenMM Reference side runs the matching
 one-step implicit GBSA/OBC row. Because both rows are `ok`, use the ratio as a
 narrow reference comparison for this smoke workload only.
 
-`dhfr-explicit-pme` is no longer blocked by its approximately `-11 e` charge.
+`dhfr-amber20-jac-pme` is no longer blocked by its approximately `-11 e` charge.
 The artifact explicitly selects `uniform_neutralizing_plasma`; the 23,558-atom
 fixed-coordinate MLX/OpenMM report passes total/component energy and complete
 force bounds. A one-step MLX fixed-cell NVT smoke also completes. Those are two
 different operation families, so the runtime timing does not inherit a ratio
 from the parity result or from the historical OpenMM OpenCL benchmark.
+
+Here `JAC` is the AMBER20 file stem for the same 159-residue DHFR protein used
+by the OpenMM 5DFR family. The AMBER20 JAC and OpenMM 5DFR coordinates,
+force-system construction, hydrogen masses, and PME meshes differ, so they are
+separate benchmark preparations despite sharing the biological target.
 
 `jac-charged-pme-94k` extends the same manifest-matched parity contract to the
 94,232-atom 2x2x1 JAC supercell. The later 75-step run also matches the NVT
@@ -88,9 +93,9 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmar
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_opencl.py --case gbsa-obc-small --platform Reference --particles 4 --steps 1 --json > results/same-workload-openmm-comparison/openmm-gbsa-obc-small.json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_opencl.py --case tip4p-ew-water --platform Reference --particles 4 --steps 1 --json > results/same-workload-openmm-comparison/openmm-tip4p-ew-water.json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-implicit --steps 1 --json > results/same-workload-openmm-comparison/mlx-dhfr-implicit.json
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-explicit-pme --steps 1 --amber-topology results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --json > results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.dhfr --case dhfr-amber20-jac-pme --steps 1 --amber-topology results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --json > results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python scripts/benchmark_openmm_dhfr.py --case dhfr-implicit --platform Reference --steps 1 --json > results/same-workload-openmm-comparison/openmm-dhfr-implicit.json
-UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/dhfr-artifacts/dhfr-explicit-pme --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 1,1,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-1x
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/dhfr-artifacts/dhfr-amber20-jac-pme --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 1,1,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-1x
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 2,2,1 --platform OpenCL --out results/scalable-charged-pme-runtime/jac-2x2x1
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.charged_pme runtime --prepared results/scalable-charged-pme-runtime/jac-2x2x1/prepared --warmups 1 --steps 2 --out results/scalable-charged-pme-runtime/jac-2x2x1/runtime.json
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python -m mlx_atomistic.benchmarks.pme_performance --fixture-dir results/scalable-charged-pme-runtime/jac-2x2x1 --iterations 2 --warmups 1 --out-dir results/scalable-charged-pme-runtime/jac-2x2x1/profile --json
@@ -125,7 +130,7 @@ controlled OpenMM Reference latency rows.
 The `lj-synthetic-loop` result also shows a measured tiny full-loop throughput
 gap, so force evaluation, reporting cadence, and synchronization remain valid
 diagnostic follow-ups for that row. `dhfr-implicit` and charged
-`dhfr-explicit-pme` are now runnable, but their one-step rows should guide
+`dhfr-amber20-jac-pme` are now runnable, but their one-step rows should guide
 runtime-path hardening before broad performance claims. For the 94,232-atom PME
 row, optimize only from the measured plan, neighbor, direct-space, and
 nonbonded stage splits; do not infer an OpenMM speed ratio from unmatched

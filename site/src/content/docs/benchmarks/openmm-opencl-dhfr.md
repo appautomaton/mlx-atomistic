@@ -100,8 +100,11 @@ OpenMM source in this directory — no downloads required.
   to see the small-vs-large scaling on this hardware.
 - Same script, same systems, same config as the rows at
   [openmm.org/benchmarks](https://openmm.org/benchmarks).
-- The DHFR input is the AMBER JAC benchmark, originating from
-  [ambermd.org/GPUPerformance.php](https://ambermd.org/GPUPerformance.php).
+- OpenMM's `amber20-dhfr` test maps to the AMBER file stem `JAC`, originating
+  from [ambermd.org/GPUPerformance.php](https://ambermd.org/GPUPerformance.php).
+  The reported `pme` row instead uses OpenMM's `5dfr_solv-cube_equil.pdb`.
+  Both represent the same DHFR protein, but they are different prepared MD
+  systems and their performance numbers are not interchangeable.
 
 ## Open questions for follow-up benchmarks
 

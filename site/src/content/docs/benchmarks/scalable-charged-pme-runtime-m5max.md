@@ -39,7 +39,7 @@ Source for every value in this table: **[parity]**.
 
 | Field | Validated value |
 | --- | --- |
-| System | AMBER20 JAC, deterministic 2x2x1 replication |
+| System | DHFR · AMBER20 JAC preparation, deterministic 2x2x1 replication |
 | Operation | Fixed-coordinate total energy and complete forces |
 | Atoms | 94,232 |
 | Cell | Orthorhombic, 123.2894 x 123.2894 x 61.6447 A |
@@ -241,7 +241,7 @@ ratio is claimed without a fresh manifest-bound OpenMM comparison.
 ```bash
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run python \
   -m mlx_atomistic.benchmarks.charged_pme prepare \
-  --source results/dhfr-artifacts/dhfr-explicit-pme \
+  --source results/dhfr-artifacts/dhfr-amber20-jac-pme \
   --replicas 2,2,1 --assignment-order 5 \
   --background-policy uniform_neutralizing_plasma \
   --out results/scalable-charged-pme-runtime/jac-2x2x1/prepared
