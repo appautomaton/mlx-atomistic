@@ -1751,7 +1751,7 @@ def _base_report(
     return {
         "kind": "mlx_atomistic.charged_pme_parity",
         "schema_version": 1,
-        "fixture": "amber20_jac",
+        "fixture": "amber20_dhfr_jac_pme",
         "reference_engine": "openmm",
         "reference_engine_role": OPENMM_REFERENCE_ROLE,
         "mlx_prepared": str(prepared_path),

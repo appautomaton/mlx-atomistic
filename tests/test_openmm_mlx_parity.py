@@ -1370,6 +1370,7 @@ def test_charged_pme_missing_inputs_write_blocked_report(tmp_path: Path):
 
     assert payload["status"] == "blocked"
     assert payload["passed"] is False
+    assert payload["fixture"] == "amber20_dhfr_jac_pme"
     assert len(payload["blockers"]) == 4
     assert (out / _CHARGED.REPORT_NAME).exists()
 
