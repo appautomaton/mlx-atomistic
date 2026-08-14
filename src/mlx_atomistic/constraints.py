@@ -794,7 +794,6 @@ class _ShakeClusterConstraints:
             self.cluster_atoms,
             self.peripheral_counts,
             self._box(cell),
-            max_iterations=self.max_iterations,
             periodic=cell is not None,
         )
         return self._scatter_deltas(velocities, deltas)
@@ -1596,7 +1595,6 @@ class CompositeConstraints:
             shake.cluster_atoms,
             shake.peripheral_counts,
             box,
-            max_iterations=shake.max_iterations,
             periodic=cell is not None,
         )
         owners, params, settle_placeholder = self._dense_device_state(

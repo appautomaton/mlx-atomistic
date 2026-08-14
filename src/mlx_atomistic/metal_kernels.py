@@ -3093,96 +3093,82 @@ _SHAKE_CLUSTER_VELOCITY_SOURCE = r"""
     }
 
     int peripheral_count = peripheral_counts[cluster];
-    int atom[4];
-    float vx[4];
-    float vy[4];
-    float vz[4];
-    float base_vx[4];
-    float base_vy[4];
-    float base_vz[4];
-    float inverse_mass[4];
-    float unit_x[3];
-    float unit_y[3];
-    float unit_z[3];
-    for (int slot = 0; slot < 4; slot++) {
-        atom[slot] = cluster_atoms[4 * cluster + slot];
-        if (slot <= peripheral_count) {
-            int index = atom[slot];
-            vx[slot] = velocities[3 * index + 0];
-            vy[slot] = velocities[3 * index + 1];
-            vz[slot] = velocities[3 * index + 2];
-            base_vx[slot] = vx[slot];
-            base_vy[slot] = vy[slot];
-            base_vz[slot] = vz[slot];
-            inverse_mass[slot] = 1.0f / masses[index];
-        } else {
-            vx[slot] = 0.0f;
-            vy[slot] = 0.0f;
-            vz[slot] = 0.0f;
-            base_vx[slot] = 0.0f;
-            base_vy[slot] = 0.0f;
-            base_vz[slot] = 0.0f;
-            inverse_mass[slot] = 0.0f;
-        }
-    }
-
+    int center_atom = cluster_atoms[4 * cluster];
+    float3 center_velocity = constraint_load3(velocities, center_atom);
+    float inverse_center = 1.0f / masses[center_atom];
+    float3 unit[3] = {
+        float3(0.0f),
+        float3(0.0f),
+        float3(0.0f)
+    };
+    float3 outer_velocity[3] = {
+        float3(0.0f),
+        float3(0.0f),
+        float3(0.0f)
+    };
+    float inverse_outer[3] = {0.0f, 0.0f, 0.0f};
+    float relative[3] = {0.0f, 0.0f, 0.0f};
     for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
-        int slot = peripheral + 1;
-        int center_atom = atom[0];
-        int outer_atom = atom[slot];
-        float dx = positions[3 * center_atom + 0] - positions[3 * outer_atom + 0];
-        float dy = positions[3 * center_atom + 1] - positions[3 * outer_atom + 1];
-        float dz = positions[3 * center_atom + 2] - positions[3 * outer_atom + 2];
-        if (params[2] != 0) {
-            dx -= box[0] * rint(dx / box[0]);
-            dy -= box[1] * rint(dy / box[1]);
-            dz -= box[2] * rint(dz / box[2]);
-        }
-        float inverse_length = rsqrt(max(dx * dx + dy * dy + dz * dz, 1.0e-20f));
-        unit_x[peripheral] = dx * inverse_length;
-        unit_y[peripheral] = dy * inverse_length;
-        unit_z[peripheral] = dz * inverse_length;
+        int outer_atom = cluster_atoms[4 * cluster + peripheral + 1];
+        float3 displacement = constraint_minimum_image(
+            constraint_load3(positions, center_atom)
+                - constraint_load3(positions, outer_atom),
+            box,
+            params[2]
+        );
+        unit[peripheral] = constraint_safe_normalize(displacement);
+        outer_velocity[peripheral] = constraint_load3(velocities, outer_atom);
+        inverse_outer[peripheral] = 1.0f / masses[outer_atom];
+        relative[peripheral] = dot(
+            center_velocity - outer_velocity[peripheral],
+            unit[peripheral]
+        );
     }
 
-    for (int iteration = 0; iteration < params[1]; iteration++) {
-        float center_delta_x = 0.0f;
-        float center_delta_y = 0.0f;
-        float center_delta_z = 0.0f;
-        for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
-            int slot = peripheral + 1;
-            float relative = (vx[0] - vx[slot]) * unit_x[peripheral]
-                + (vy[0] - vy[slot]) * unit_y[peripheral]
-                + (vz[0] - vz[slot]) * unit_z[peripheral];
-            float weight_center = inverse_mass[0]
-                / (inverse_mass[0] + inverse_mass[slot]);
-            float weight_outer = inverse_mass[slot]
-                / (inverse_mass[0] + inverse_mass[slot]);
-            float correction_x = relative * unit_x[peripheral];
-            float correction_y = relative * unit_y[peripheral];
-            float correction_z = relative * unit_z[peripheral];
-            center_delta_x -= weight_center * correction_x;
-            center_delta_y -= weight_center * correction_y;
-            center_delta_z -= weight_center * correction_z;
-            vx[slot] += weight_outer * correction_x;
-            vy[slot] += weight_outer * correction_y;
-            vz[slot] += weight_outer * correction_z;
-        }
-        vx[0] += center_delta_x;
-        vy[0] += center_delta_y;
-        vz[0] += center_delta_z;
-    }
+    float coupling_01 = inverse_center * dot(unit[0], unit[1]);
+    float coupling_02 = inverse_center * dot(unit[0], unit[2]);
+    float coupling_12 = inverse_center * dot(unit[1], unit[2]);
+    float3 row_0 = float3(
+        peripheral_count > 0 ? inverse_center + inverse_outer[0] : 1.0f,
+        peripheral_count > 1 ? coupling_01 : 0.0f,
+        peripheral_count > 2 ? coupling_02 : 0.0f
+    );
+    float3 row_1 = float3(
+        peripheral_count > 1 ? coupling_01 : 0.0f,
+        peripheral_count > 1 ? inverse_center + inverse_outer[1] : 1.0f,
+        peripheral_count > 2 ? coupling_12 : 0.0f
+    );
+    float3 row_2 = float3(
+        peripheral_count > 2 ? coupling_02 : 0.0f,
+        peripheral_count > 2 ? coupling_12 : 0.0f,
+        peripheral_count > 2 ? inverse_center + inverse_outer[2] : 1.0f
+    );
+    float3 rhs = -float3(relative[0], relative[1], relative[2]);
+    float3 cross_12 = cross(row_1, row_2);
+    float determinant = dot(row_0, cross_12);
+    float safe_determinant = fabs(determinant) > 1.0e-20f ? determinant : 1.0f;
+    float3 multipliers = (
+        rhs.x * cross_12
+        + rhs.y * cross(row_2, row_0)
+        + rhs.z * cross(row_0, row_1)
+    ) / safe_determinant;
 
-    for (int slot = 0; slot < 4; slot++) {
-        uint output = 12 * cluster + 3 * slot;
-        if (slot <= peripheral_count) {
-            deltas[output + 0] = vx[slot] - base_vx[slot];
-            deltas[output + 1] = vy[slot] - base_vy[slot];
-            deltas[output + 2] = vz[slot] - base_vz[slot];
-        } else {
-            deltas[output + 0] = 0.0f;
-            deltas[output + 1] = 0.0f;
-            deltas[output + 2] = 0.0f;
-        }
+    float3 center_delta = float3(0.0f);
+    for (int peripheral = 0; peripheral < peripheral_count; peripheral++) {
+        center_delta += inverse_center * multipliers[peripheral] * unit[peripheral];
+    }
+    uint center_output = 12 * cluster;
+    deltas[center_output + 0] = center_delta.x;
+    deltas[center_output + 1] = center_delta.y;
+    deltas[center_output + 2] = center_delta.z;
+    for (int peripheral = 0; peripheral < 3; peripheral++) {
+        uint output = center_output + 3 * (peripheral + 1);
+        float3 outer_delta = peripheral < peripheral_count
+            ? -inverse_outer[peripheral] * multipliers[peripheral] * unit[peripheral]
+            : float3(0.0f);
+        deltas[output + 0] = outer_delta.x;
+        deltas[output + 1] = outer_delta.y;
+        deltas[output + 2] = outer_delta.z;
     }
 """
 
@@ -4005,7 +3991,7 @@ def _shake_cluster_position_kernel():
 
 
 def _shake_cluster_velocity_kernel():
-    """Return the cached disjoint SHAKE-cluster velocity kernel."""
+    """Return the cached analytical SHAKE-cluster velocity kernel."""
 
     global _shake_cluster_velocity_kernel_singleton
     if _shake_cluster_velocity_kernel_singleton is None:
@@ -4022,6 +4008,7 @@ def _shake_cluster_velocity_kernel():
             ],
             output_names=["deltas"],
             source=_SHAKE_CLUSTER_VELOCITY_SOURCE,
+            header=_CONSTRAINT_HEADER,
         )
     return _shake_cluster_velocity_kernel_singleton
 
@@ -5192,10 +5179,9 @@ def _shake_cluster_velocity_deltas(
     peripheral_counts: mx.array,
     box_lengths: mx.array,
     *,
-    max_iterations: int,
     periodic: bool,
 ) -> mx.array:
-    """Return per-cluster RATTLE velocity deltas from one Metal dispatch."""
+    """Return exact per-cluster RATTLE velocity deltas from one Metal dispatch."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     velocities = as_mx_array(velocities, dtype=mx.float32)
@@ -5222,9 +5208,6 @@ def _shake_cluster_velocity_deltas(
     if box_lengths.shape != (3,):
         msg = "box_lengths must have shape (3,)"
         raise ValueError(msg)
-    if max_iterations <= 0:
-        msg = "max_iterations must be positive"
-        raise ValueError(msg)
     if cluster_count == 0:
         return mx.zeros((0, 4, 3), dtype=mx.float32)
     threads = min(256, cluster_count)
@@ -5237,7 +5220,7 @@ def _shake_cluster_velocity_deltas(
             peripheral_counts,
             box_lengths,
             mx.array(
-                [cluster_count, max_iterations, int(periodic)],
+                [cluster_count, 0, int(periodic)],
                 dtype=mx.int32,
             ),
         ],

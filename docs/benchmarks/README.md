@@ -34,6 +34,7 @@ Each result file should answer, in order:
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
 | [md-suite.md](./md-suite.md) | mlx_atomistic | Canonical 5DFR/JAC local gate and extended MD suite | Metal | Apple Silicon |
+| [md-current-main-sustained-openmm-m5max.md](./md-current-main-sustained-openmm-m5max.md) | mlx_atomistic/openmm-reference | Current-main sustained baseline, retained analytical SHAKE velocity kernel, and rejected candidates | Metal/OpenCL | Apple M5 Max |
 | [md-small-constraint-clusters-m5max.md](./md-small-constraint-clusters-m5max.md) | mlx_atomistic | Retained small-component constraint Metal kernels on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-cell-task-reuse-m5max.md](./md-cell-task-reuse-m5max.md) | mlx_atomistic | Retained spatial-cell task reuse and schedule-prefix coalescing on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-neighbor-wait-attribution-m5max.md](./md-neighbor-wait-attribution-m5max.md) | mlx_atomistic | Neighbor wait attribution and rejected async/direct-branch candidates on 5DFR and JAC | Metal | Apple M5 Max |
