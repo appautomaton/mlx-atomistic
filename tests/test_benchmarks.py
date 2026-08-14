@@ -47,12 +47,8 @@ _EXPLICIT_PREP_SPEC.loader.exec_module(_EXPLICIT_PREP)
 
 
 def test_historical_dhfr_branch_disposition_is_documented():
-    root_inventory = (
-        ROOT / "docs/benchmarks/inventory-gap-matrix.md"
-    ).read_text()
-    site_inventory = (
-        ROOT / "site/src/content/docs/benchmarks/inventory-gap-matrix.md"
-    ).read_text()
+    root_inventory = (ROOT / "docs/benchmarks/inventory-gap-matrix.md").read_text()
+    site_inventory = (ROOT / "site/src/content/docs/benchmarks/inventory-gap-matrix.md").read_text()
 
     for text in (root_inventory, site_inventory):
         normalized = " ".join(text.split())
@@ -170,9 +166,7 @@ def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
 
 def test_dhfr_and_jac_readiness_require_explicit_inputs():
     implicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS["dhfr-implicit"])
-    explicit = dhfr.readiness_payload(
-        case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE]
-    )
+    explicit = dhfr.readiness_payload(case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE])
 
     _assert_normalized_payload(implicit, timing_metric="ns_per_day", status="blocked")
     _assert_normalized_payload(explicit, timing_metric="ns_per_day", status="blocked")
@@ -220,16 +214,12 @@ def test_dhfr_implicit_prepare_blocks_without_explicit_inputs():
 
 @pytest.mark.slow
 def test_jac_explicit_prepare_reports_amber_or_pme_gate():
-    payload = dhfr.prepare_payload(
-        case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE]
-    )
+    payload = dhfr.prepare_payload(case_spec=dhfr.CASE_SPECS[dhfr.AMBER20_JAC_CASE])
 
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["prepare"] is True
     assert payload["electrostatics_model"] == "pme"
-    assert payload["artifact_path"] == (
-        "outputs/benchmarks/dhfr-artifacts/dhfr-amber20-jac-pme"
-    )
+    assert payload["artifact_path"] == ("outputs/benchmarks/dhfr-artifacts/dhfr-amber20-jac-pme")
     assert payload["force_term_required_arrays"] == [
         "pme_mesh_shape",
         "pme_alpha",
@@ -286,9 +276,7 @@ def test_jac_explicit_pme_defaults_to_charged_order_five_contract():
 
 
 def test_jac_explicit_pme_cli_requires_caller_provided_jac_inputs():
-    args = dhfr._parse_args(
-        ["--case", "dhfr-amber20-jac-pme", "--steps", "1", "--json"]
-    )
+    args = dhfr._parse_args(["--case", "dhfr-amber20-jac-pme", "--steps", "1", "--json"])
 
     spec = dhfr._case_spec_from_args(args)
 
@@ -344,9 +332,7 @@ def test_legacy_dhfr_name_for_jac_is_rejected():
 def test_openmm_5dfr_cli_rejects_jac_and_source_substitution():
     default_args = dhfr._parse_args(["--case", dhfr.OPENMM_5DFR_CASE, "--readiness"])
 
-    assert dhfr._case_spec_from_args(default_args) == dhfr.CASE_SPECS[
-        dhfr.OPENMM_5DFR_CASE
-    ]
+    assert dhfr._case_spec_from_args(default_args) == dhfr.CASE_SPECS[dhfr.OPENMM_5DFR_CASE]
 
     substituted = dhfr._parse_args(
         [
@@ -385,10 +371,13 @@ def test_openmm_5dfr_prep_enforces_source_output_and_molecule_identity(tmp_path)
     )
     with pytest.raises(ValueError, match="cannot be substituted"):
         _EXPLICIT_PREP._require_exact_source(tmp_path, Path("JAC.prmtop"))
-    assert _EXPLICIT_PREP._results_output_path(
-        tmp_path,
-        Path("results/selected"),
-    ) == tmp_path / "results/selected"
+    assert (
+        _EXPLICIT_PREP._results_output_path(
+            tmp_path,
+            Path("results/selected"),
+        )
+        == tmp_path / "results/selected"
+    )
     with pytest.raises(ValueError, match="results/"):
         _EXPLICIT_PREP._results_output_path(tmp_path, Path("outputs/selected"))
 
@@ -1963,11 +1952,7 @@ def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
             "passed": True,
             "state": state,
             "neighbor": {"compact_pair_count": 24},
-            "timings": {
-                "measured_seconds": (
-                    1.0 if backend == "mlx_cell_pairs" else 0.8
-                )
-            },
+            "timings": {"measured_seconds": (1.0 if backend == "mlx_cell_pairs" else 0.8)},
             "route_profile": (
                 {
                     "reconciled": True,
@@ -2021,9 +2006,7 @@ def test_charged_pme_profile_combines_clean_instrumented_and_inventory(
     assert payload["checks"]["compact_pair_fallback_absent"] is True
     assert payload["checks"]["tile_direct_latency_speedup"] is True
     assert payload["checks"]["correction_latency_speedup"] is True
-    assert payload["diagnostics"]["complete_wall_speedup_fraction"] == pytest.approx(
-        0.2
-    )
+    assert payload["diagnostics"]["complete_wall_speedup_fraction"] == pytest.approx(0.2)
     assert payload["diagnostics"]["tile_pair_inventory_matches"] is True
     assert payload["diagnostics"]["tile_pair_inventory_delta"] == 0
     assert payload["openmm_admission"]["status"] == "provisional"
@@ -2048,9 +2031,7 @@ def test_charged_pme_profile_rejects_complete_regression_and_pair_fallback(
         return {
             "passed": True,
             "state": state,
-            "timings": {
-                "measured_seconds": 1.0 if backend == "mlx_cell_pairs" else 0.95
-            },
+            "timings": {"measured_seconds": 1.0 if backend == "mlx_cell_pairs" else 0.95},
             "route_profile": (
                 {
                     "reconciled": True,
@@ -2206,12 +2187,10 @@ def test_gpcrmd_pme_profile_resolves_report_schema_and_explicit_paths(tmp_path):
         )
     )
 
-    fixture, resolved_report, resolved_prepared = (
-        pme_performance._resolve_profile_paths(
-            fixture_dir=fixture_report.parent,
-            parity_report=report_path,
-            prepared=prepared,
-        )
+    fixture, resolved_report, resolved_prepared = pme_performance._resolve_profile_paths(
+        fixture_dir=fixture_report.parent,
+        parity_report=report_path,
+        prepared=prepared,
     )
     parity = pme_performance._load_parity_report(resolved_report)
 
@@ -2257,9 +2236,7 @@ def test_gpcrmd_pme_profile_admission_is_fail_closed(tmp_path):
         },
     }
     manifest["manifest_sha256"] = pme_performance.manifest_hash(manifest)
-    (tmp_path / pme_performance.GPCRMD_WORKLOAD_MANIFEST_NAME).write_text(
-        json.dumps(manifest)
-    )
+    (tmp_path / pme_performance.GPCRMD_WORKLOAD_MANIFEST_NAME).write_text(json.dumps(manifest))
     parity = {
         "schema": "gpcrmd_pme_parity_v1",
         "fixture": "gpcrmd-729-beta1-5f8u-cyanopindolol",
@@ -2301,9 +2278,7 @@ def test_gpcrmd_pme_profile_admission_is_fail_closed(tmp_path):
         },
         "runtime_contract": {"topology_pair_policy": "eager"},
     }
-    drifted_manifest["manifest_sha256"] = pme_performance.manifest_hash(
-        drifted_manifest
-    )
+    drifted_manifest["manifest_sha256"] = pme_performance.manifest_hash(drifted_manifest)
     (tmp_path / pme_performance.GPCRMD_WORKLOAD_MANIFEST_NAME).write_text(
         json.dumps(drifted_manifest)
     )
@@ -2373,6 +2348,20 @@ def test_pme_performance_build_payload_blocks_nonlazy_topology(tmp_path, monkeyp
 
     assert payload["status"] == "blocked"
     assert "prepared_topology:not_lazy" in payload["blocker"]
+
+
+def test_charged_pme_rebuild_profile_requires_tile_backend(tmp_path):
+    payload = charged_pme.runtime_payload(
+        prepared=tmp_path / "missing",
+        warmups=1,
+        steps=2,
+        neighbor_backend="mlx_cell_pairs",
+        neighbor_rebuild_profile=True,
+        out=tmp_path / "blocked.json",
+    )
+
+    assert payload["neighbor_rebuild_profile"] is True
+    assert "neighbor_rebuild_profile_requires_mlx_cell_tiles" in payload["blockers"]
 
 
 def test_pme_performance_build_payload_blocks_neighbor_build_failure(

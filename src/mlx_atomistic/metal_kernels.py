@@ -384,12 +384,11 @@ _TILE_PME_COLUMN_DESCRIPTOR_TILE_LIMIT = (
     _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR // _TILE_PME_BLOCK_SIZE
 )
 _TILE_BUILD_BLOCK_SIZE = 8
-_TILE_BUILD_LANES_PER_TILE = _TILE_BUILD_BLOCK_SIZE * _TILE_BUILD_BLOCK_SIZE
 _TILE_BUILD_SUBTILES_PER_TILE = (_TILE_BUILD_BLOCK_SIZE // _TILE_PME_BLOCK_SIZE) ** 2
 _TILE_PME_GROUPS_PER_THREADGROUP = 4
 _TILE_PME_DISPATCH_WIDTH = 32 * _TILE_PME_GROUPS_PER_THREADGROUP
 _TILE_MEMBERSHIP_THREADGROUP_SIZE = _TILE_PME_LANES_PER_TILE
-_TILE_BUILD_MEMBERSHIP_THREADGROUP_SIZE = _TILE_BUILD_LANES_PER_TILE
+_TILE_BUILD_MEMBERSHIP_THREADGROUP_SIZE = 32
 _TILE_PME_THREADGROUP_TEMPORARY_BYTES = (
     _TILE_PME_BLOCK_SIZE * (1 + 3 + 1 + 1 + 1) * 4 * _TILE_PME_GROUPS_PER_THREADGROUP
 )
@@ -2366,52 +2365,96 @@ _NEIGHBOR_CELL_TILE_CANDIDATES_SOURCE = r"""
 _NEIGHBOR_TILE_MEMBERSHIP_SOURCE = r"""
     uint lane = thread_position_in_threadgroup.x;
     uint tile = threadgroup_position_in_grid.x;
-    uint left_slot = lane >> 3;
+    uint top_left_slot = lane >> 3;
+    uint bottom_left_slot = top_left_slot + 4u;
     uint right_slot = lane & 7u;
-    threadgroup uint active[64];
 
     int left_block = tile_blocks[2 * tile + 0];
     int right_block = tile_blocks[2 * tile + 1];
-    int atom_i = atom_blocks[8 * left_block + left_slot];
-    int atom_j = atom_blocks[8 * right_block + right_slot];
-    bool valid = atom_i >= 0 && atom_j >= 0;
-    if (left_block == right_block) {
-        valid = valid && left_slot < right_slot;
+
+    // One SIMD group owns the full 8x8 coarse tile. Its first 16 lanes load
+    // each atom exactly once, then SIMD shuffles broadcast those positions to
+    // the 32 lanes. Each lane evaluates one top-half and one bottom-half pair.
+    int owned_atom = -1;
+    if (lane < 8u) {
+        owned_atom = atom_blocks[8 * left_block + lane];
+    } else if (lane < 16u) {
+        owned_atom = atom_blocks[8 * right_block + lane - 8u];
     }
-    bool close = false;
-    if (valid) {
-        float dx = positions[3 * atom_i + 0] - positions[3 * atom_j + 0];
-        float dy = positions[3 * atom_i + 1] - positions[3 * atom_j + 1];
-        float dz = positions[3 * atom_i + 2] - positions[3 * atom_j + 2];
+    int safe_owned_atom = max(owned_atom, 0);
+    float owned_x = positions[3 * safe_owned_atom + 0];
+    float owned_y = positions[3 * safe_owned_atom + 1];
+    float owned_z = positions[3 * safe_owned_atom + 2];
+
+    int atom_i_top = simd_shuffle(owned_atom, top_left_slot);
+    int atom_i_bottom = simd_shuffle(owned_atom, bottom_left_slot);
+    int atom_j = simd_shuffle(owned_atom, 8u + right_slot);
+    float ix_top = simd_shuffle(owned_x, top_left_slot);
+    float iy_top = simd_shuffle(owned_y, top_left_slot);
+    float iz_top = simd_shuffle(owned_z, top_left_slot);
+    float ix_bottom = simd_shuffle(owned_x, bottom_left_slot);
+    float iy_bottom = simd_shuffle(owned_y, bottom_left_slot);
+    float iz_bottom = simd_shuffle(owned_z, bottom_left_slot);
+    float jx = simd_shuffle(owned_x, 8u + right_slot);
+    float jy = simd_shuffle(owned_y, 8u + right_slot);
+    float jz = simd_shuffle(owned_z, 8u + right_slot);
+
+    bool top_valid = atom_i_top >= 0 && atom_j >= 0;
+    bool bottom_valid = atom_i_bottom >= 0 && atom_j >= 0;
+    if (left_block == right_block) {
+        top_valid = top_valid && top_left_slot < right_slot;
+        bottom_valid = bottom_valid && bottom_left_slot < right_slot;
+    }
+
+    bool top_close = false;
+    if (top_valid) {
+        float dx = ix_top - jx;
+        float dy = iy_top - jy;
+        float dz = iz_top - jz;
         dx -= box[0] * rint(dx / box[0]);
         dy -= box[1] * rint(dy / box[1]);
         dz -= box[2] * rint(dz / box[2]);
-        close = dx * dx + dy * dy + dz * dz < params[0];
+        top_close = dx * dx + dy * dy + dz * dz < params[0];
     }
-    active[lane] = close ? 1u : 0u;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    bool bottom_close = false;
+    if (bottom_valid) {
+        float dx = ix_bottom - jx;
+        float dy = iy_bottom - jy;
+        float dz = iz_bottom - jz;
+        dx -= box[0] * rint(dx / box[0]);
+        dy -= box[1] * rint(dy / box[1]);
+        dz -= box[2] * rint(dz / box[2]);
+        bottom_close = dx * dx + dy * dy + dz * dz < params[0];
+    }
+
+    uint bit = 1u << (4u * top_left_slot + (right_slot & 3u));
+    uint word0 = simd_sum(
+        top_close && right_slot < 4u ? bit : 0u
+    );
+    uint word1 = simd_sum(
+        top_close && right_slot >= 4u ? bit : 0u
+    );
+    uint word2 = simd_sum(
+        bottom_close && right_slot < 4u ? bit : 0u
+    );
+    uint word3 = simd_sum(
+        bottom_close && right_slot >= 4u ? bit : 0u
+    );
+    uint exact_total = simd_sum(
+        (top_close ? 1u : 0u) + (bottom_close ? 1u : 0u)
+    );
     if (lane == 0u) {
-        int exact_total = 0;
-        int subtile_total = 0;
-        for (uint quadrant = 0u; quadrant < 4u; quadrant++) {
-            uint row_base = 4u * (quadrant >> 1);
-            uint column_base = 4u * (quadrant & 1u);
-            uint word = 0u;
-            for (uint row = 0u; row < 4u; row++) {
-                for (uint column = 0u; column < 4u; column++) {
-                    uint value = active[
-                        8u * (row_base + row) + column_base + column
-                    ];
-                    word |= value << (4u * row + column);
-                    exact_total += (int)value;
-                }
-            }
-            subtile_mask[4 * tile + quadrant] = word;
-            subtile_total += word != 0u ? 1 : 0;
-        }
-        member_counts[tile] = exact_total;
-        subtile_counts[tile] = subtile_total;
+        subtile_mask[4 * tile + 0] = word0;
+        subtile_mask[4 * tile + 1] = word1;
+        subtile_mask[4 * tile + 2] = word2;
+        subtile_mask[4 * tile + 3] = word3;
+        member_counts[tile] = (int)exact_total;
+        subtile_counts[tile] =
+            (word0 != 0u ? 1 : 0)
+            + (word1 != 0u ? 1 : 0)
+            + (word2 != 0u ? 1 : 0)
+            + (word3 != 0u ? 1 : 0);
     }
 """
 
@@ -4522,7 +4565,7 @@ def _neighbor_tile_membership(
             (tile_count,),
         ],
         output_dtypes=[mx.uint32, mx.int32, mx.int32],
-        grid=(tile_count * _TILE_BUILD_LANES_PER_TILE, 1, 1),
+        grid=(tile_count * _TILE_BUILD_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
         threadgroup=(_TILE_BUILD_MEMBERSHIP_THREADGROUP_SIZE, 1, 1),
         init_value=0,
     )

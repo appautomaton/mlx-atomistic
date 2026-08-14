@@ -81,6 +81,137 @@ _MLX_MD_CACHE_POLICY_ACTIVE: ContextVar[bool] = ContextVar(
     "mlx_atomistic_mlx_md_cache_policy_active",
     default=False,
 )
+_MLX_CELL_TILE_REBUILD_PROFILE_STAGES = (
+    "validation_and_grid",
+    "cell_assignment_sort",
+    "host_task_inventory",
+    "candidate_membership",
+    "tile_inventory_readback",
+    "exact_tile_scatter_and_order",
+    "force_inventory_readback",
+    "force_schedule_scatter",
+    "result_assembly",
+)
+
+
+@dataclass
+class _MLXCellTileRebuildProfiler:
+    """Collect synchronized stage timings for the Metal tile-list builder."""
+
+    stage_samples: dict[str, list[float]] = field(
+        default_factory=lambda: {name: [] for name in _MLX_CELL_TILE_REBUILD_PROFILE_STAGES}
+    )
+    build_samples: list[float] = field(default_factory=list)
+    inventory_samples: list[dict[str, int]] = field(default_factory=list)
+
+    def record_stage(self, name: str, elapsed_seconds: float) -> None:
+        """Record one synchronized builder-stage sample."""
+
+        if name not in self.stage_samples:
+            msg = f"unknown MLX cell-tile rebuild stage {name!r}"
+            raise ValueError(msg)
+        self.stage_samples[name].append(float(elapsed_seconds))
+
+    def record_build(
+        self,
+        elapsed_seconds: float,
+        *,
+        inventory: dict[str, int],
+    ) -> None:
+        """Record one complete profiled build and its interaction inventory."""
+
+        self.build_samples.append(float(elapsed_seconds))
+        self.inventory_samples.append(dict(inventory))
+
+    def report(self) -> dict[str, object]:
+        """Return a JSON-serializable synchronized stage report."""
+
+        build_total = float(sum(self.build_samples))
+        stages = {
+            name: _timing_sample_summary(
+                self.stage_samples[name],
+                total_build_seconds=build_total,
+            )
+            for name in _MLX_CELL_TILE_REBUILD_PROFILE_STAGES
+        }
+        accounted = float(sum(float(stage["total_seconds"]) for stage in stages.values()))
+        unattributed = build_total - accounted
+        tolerance = max(1.0e-6, build_total * 0.05)
+        return {
+            "schema": "mlx_atomistic.mlx_cell_tile_rebuild_profile.v1",
+            "mode": "sequential_synchronized_builder_stages",
+            "backend": "mlx_cell_tiles",
+            "stage_order": list(_MLX_CELL_TILE_REBUILD_PROFILE_STAGES),
+            "rebuild_count": len(self.build_samples),
+            "profiled_rebuild_wall_seconds": build_total,
+            "accounted_stage_seconds": accounted,
+            "unattributed_seconds": unattributed,
+            "reconciled": -tolerance <= unattributed <= tolerance,
+            "build_samples_seconds": list(self.build_samples),
+            "stages": stages,
+            "inventories": _inventory_sample_summary(self.inventory_samples),
+        }
+
+
+_ACTIVE_MLX_CELL_TILE_REBUILD_PROFILER: ContextVar[_MLXCellTileRebuildProfiler | None] = ContextVar(
+    "mlx_atomistic_active_mlx_cell_tile_rebuild_profiler",
+    default=None,
+)
+
+
+@contextmanager
+def _profile_mlx_cell_tile_rebuilds() -> Iterator[_MLXCellTileRebuildProfiler]:
+    """Collect Metal tile-list stage timings inside the active context."""
+
+    if _ACTIVE_MLX_CELL_TILE_REBUILD_PROFILER.get() is not None:
+        msg = "MLX cell-tile rebuild profiling contexts cannot be nested"
+        raise RuntimeError(msg)
+    profiler = _MLXCellTileRebuildProfiler()
+    token = _ACTIVE_MLX_CELL_TILE_REBUILD_PROFILER.set(profiler)
+    try:
+        yield profiler
+    finally:
+        _ACTIVE_MLX_CELL_TILE_REBUILD_PROFILER.reset(token)
+
+
+def _timing_sample_summary(
+    samples: list[float],
+    *,
+    total_build_seconds: float,
+) -> dict[str, object]:
+    """Summarize one rebuild-stage sample vector."""
+
+    total = float(sum(samples))
+    return {
+        "count": len(samples),
+        "total_seconds": total,
+        "median_seconds": None if not samples else float(np.median(samples)),
+        "minimum_seconds": None if not samples else float(min(samples)),
+        "maximum_seconds": None if not samples else float(max(samples)),
+        "fraction_of_profiled_rebuild_wall": (
+            0.0 if total_build_seconds <= 0.0 else total / total_build_seconds
+        ),
+        "samples_seconds": list(samples),
+    }
+
+
+def _inventory_sample_summary(
+    samples: list[dict[str, int]],
+) -> dict[str, dict[str, int | float] | int]:
+    """Summarize integer interaction inventories across profiled rebuilds."""
+
+    if not samples:
+        return {"count": 0}
+    names = tuple(samples[0])
+    summary: dict[str, dict[str, int | float] | int] = {"count": len(samples)}
+    for name in names:
+        values = [int(sample[name]) for sample in samples]
+        summary[name] = {
+            "minimum": min(values),
+            "median": float(np.median(values)),
+            "maximum": max(values),
+        }
+    return summary
 
 
 @contextmanager
@@ -235,10 +366,7 @@ class NeighborTiles:
         if any(value is None for value in schedule) and not all(
             value is None for value in schedule
         ):
-            msg = (
-                "force columns, group starts, and group counts must all be present or "
-                "absent"
-            )
+            msg = "force columns, group starts, and group counts must all be present or absent"
             raise ValueError(msg)
         if (
             self.force_columns is not None
@@ -277,19 +405,13 @@ class NeighborTiles:
                 descriptor_bits = self.force_columns.astype(mx.uint32)
                 first_descriptors = descriptor_bits[safe_starts]
                 last_descriptors = descriptor_bits[safe_ends]
-                descriptor_index_mask = np.uint32(
-                    _TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK
-                )
-                member_divisor = np.uint32(
-                    _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR
-                )
+                descriptor_index_mask = np.uint32(_TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK)
+                member_divisor = np.uint32(_TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR)
                 first_columns = first_descriptors & descriptor_index_mask
                 last_columns = last_descriptors & descriptor_index_mask
                 first_tiles = first_columns // self.block_size
                 last_tiles = last_columns // self.block_size
-                first_members = (
-                    first_descriptors // member_divisor
-                )
+                first_members = first_descriptors // member_divisor
                 last_members = last_descriptors // member_divisor
                 safe_first_tiles = mx.clip(first_tiles, 0, self.tile_count - 1)
                 safe_last_tiles = mx.clip(last_tiles, 0, self.tile_count - 1)
@@ -1416,6 +1538,20 @@ def _build_mlx_spatial_cell_tile_list(
 ) -> NeighborList:
     """Build exact 4x4 tiles from coarse 8x8 Metal membership."""
 
+    profiler = _ACTIVE_MLX_CELL_TILE_REBUILD_PROFILER.get()
+    build_started = perf_counter() if profiler is not None else 0.0
+    stage_started = build_started
+
+    def finish_stage(name: str, *completion_values: mx.array) -> None:
+        nonlocal stage_started
+        if profiler is None:
+            return
+        if completion_values:
+            mx.eval(*completion_values)
+        completed = perf_counter()
+        profiler.record_stage(name, completed - stage_started)
+        stage_started = perf_counter()
+
     _require_orthorhombic_cell_for_compact_neighbor_backend(cell, "mlx_cell_tiles")
     lengths_mx = as_mx_array(cell.lengths, dtype=mx.float32)
     mx.eval(lengths_mx)
@@ -1444,6 +1580,7 @@ def _build_mlx_spatial_cell_tile_list(
     n_cells = tuple(int(value) for value in n_cells_array)
     cell_count = int(np.prod(n_cells_array.astype(np.int64)))
     cell_widths = lengths64 / n_cells_array.astype(np.float64)
+    finish_stage("validation_and_grid")
 
     n_cells_mx = mx.array(n_cells_array, dtype=mx.int32)
     wrapped = positions_mx - mx.floor(positions_mx / lengths_mx) * lengths_mx
@@ -1460,6 +1597,7 @@ def _build_mlx_spatial_cell_tile_list(
     )
     mx.eval(sorted_atoms, cell_counts_mx)
     cell_counts = np.asarray(cell_counts_mx, dtype=np.int32)
+    finish_stage("cell_assignment_sort")
     cell_starts = np.empty_like(cell_counts)
     if cell_count:
         cell_starts[0] = 0
@@ -1534,6 +1672,7 @@ def _build_mlx_spatial_cell_tile_list(
         np.int32,
         copy=False,
     )
+    finish_stage("host_task_inventory", atom_blocks)
     candidate_tiles = _neighbor_cell_tile_candidates(
         mx.array(cell_block_starts, dtype=mx.int32),
         mx.array(cell_block_counts, dtype=mx.int32),
@@ -1548,6 +1687,13 @@ def _build_mlx_spatial_cell_tile_list(
         lengths_mx,
         search_radius=search_radius,
     )
+    finish_stage(
+        "candidate_membership",
+        candidate_tiles,
+        candidate_subtile_mask,
+        member_counts,
+        subtile_counts,
+    )
 
     if candidate_tile_count:
         subtile_prefix = mx.cumsum(subtile_counts)
@@ -1557,6 +1703,7 @@ def _build_mlx_spatial_cell_tile_list(
         )
         mx.eval(subtile_prefix, member_prefix, inventory_counts)
         tile_count, exact_pair_count = (int(value) for value in np.asarray(inventory_counts))
+        finish_stage("tile_inventory_readback")
         tile_blocks, member_mask = _neighbor_tile_ordered_scatter_sized(
             candidate_tiles,
             candidate_subtile_mask,
@@ -1572,6 +1719,7 @@ def _build_mlx_spatial_cell_tile_list(
         force_order = mx.argsort(tile_blocks[:, 0])
         tile_blocks = tile_blocks[force_order]
         member_mask = member_mask[force_order]
+        finish_stage("exact_tile_scatter_and_order", tile_blocks, member_mask)
         column_patterns = mx.array(
             [0x1111, 0x2222, 0x4444, 0x8888],
             dtype=mx.uint32,
@@ -1582,9 +1730,7 @@ def _build_mlx_spatial_cell_tile_list(
         ).astype(mx.int32)
         active_column_prefix = mx.cumsum(active_column_counts)
         column_counts_by_left = (
-            mx.zeros((block_count,), dtype=mx.int32)
-            .at[tile_blocks[:, 0]]
-            .add(active_column_counts)
+            mx.zeros((block_count,), dtype=mx.int32).at[tile_blocks[:, 0]].add(active_column_counts)
         )
         column_prefix_by_left = mx.cumsum(column_counts_by_left)
         force_groups_by_left = (
@@ -1595,6 +1741,7 @@ def _build_mlx_spatial_cell_tile_list(
         mx.eval(active_column_prefix, column_prefix_by_left, force_group_prefix)
         active_column_count = int(np.asarray(active_column_prefix[-1]))
         force_group_count = int(np.asarray(force_group_prefix[-1]))
+        finish_stage("force_inventory_readback")
         force_columns = _neighbor_tile_column_scatter_sized(
             member_mask,
             active_column_counts,
@@ -1618,6 +1765,9 @@ def _build_mlx_spatial_cell_tile_list(
         force_columns = mx.zeros((0,), dtype=mx.int32)
         force_group_starts = mx.zeros((0,), dtype=mx.int32)
         force_group_counts = mx.zeros((0,), dtype=mx.int32)
+        finish_stage("tile_inventory_readback")
+        finish_stage("exact_tile_scatter_and_order")
+        finish_stage("force_inventory_readback")
     mx.eval(
         atom_blocks,
         tile_blocks,
@@ -1626,6 +1776,7 @@ def _build_mlx_spatial_cell_tile_list(
         force_group_starts,
         force_group_counts,
     )
+    finish_stage("force_schedule_scatter")
 
     raw_candidate_count = int(np.sum(task_atom_candidate_counts, dtype=np.int64))
     tiles = NeighborTiles(
@@ -1657,7 +1808,7 @@ def _build_mlx_spatial_cell_tile_list(
         compaction_backend="metal_spatial_tile_prefix_scan",
         fallback_reason=None,
     )
-    return NeighborList(
+    neighbor_list = NeighborList(
         None,
         cutoff=cutoff,
         skin=skin,
@@ -1665,6 +1816,21 @@ def _build_mlx_spatial_cell_tile_list(
         tiles=tiles,
         sort_diagnostic_pairs=sort_pairs,
     )
+    finish_stage("result_assembly")
+    if profiler is not None:
+        profiler.record_build(
+            perf_counter() - build_started,
+            inventory={
+                "atom_count": n_atoms,
+                "cell_count": cell_count,
+                "coarse_candidate_tile_count": candidate_tile_count,
+                "exact_tile_count": tile_count,
+                "exact_pair_count": exact_pair_count,
+                "force_column_count": int(force_columns.shape[0]),
+                "force_group_count": int(force_group_starts.shape[0]),
+            },
+        )
+    return neighbor_list
 
 
 def _build_mlx_cell_tiles(

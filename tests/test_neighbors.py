@@ -6,8 +6,11 @@ from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import LennardJonesPotential, simulate
 from mlx_atomistic.neighbors import (
+    _MLX_CELL_TILE_REBUILD_PROFILE_STAGES,
     NeighborListManager,
     NeighborTiles,
+    _MLXCellTileRebuildProfiler,
+    _profile_mlx_cell_tile_rebuilds,
     _spatial_cell_pair_tasks,
     _spatial_cell_pair_template,
     build_neighbor_list,
@@ -30,6 +33,49 @@ def _neighbor_pair_set(neighbors):
     if neighbors.blocks is not None:
         return _block_pair_set(neighbors)
     return {tuple(pair) for pair in np.asarray(neighbors.pairs).tolist()}
+
+
+def test_mlx_cell_tile_rebuild_profiler_reports_stages_and_inventories():
+    profiler = _MLXCellTileRebuildProfiler()
+    for name in _MLX_CELL_TILE_REBUILD_PROFILE_STAGES:
+        profiler.record_stage(name, 0.1)
+    profiler.record_build(
+        0.9,
+        inventory={
+            "atom_count": 100,
+            "cell_count": 27,
+            "coarse_candidate_tile_count": 200,
+            "exact_tile_count": 150,
+            "exact_pair_count": 900,
+            "force_column_count": 400,
+            "force_group_count": 20,
+        },
+    )
+
+    report = profiler.report()
+
+    assert report["schema"] == "mlx_atomistic.mlx_cell_tile_rebuild_profile.v1"
+    assert report["stage_order"] == list(_MLX_CELL_TILE_REBUILD_PROFILE_STAGES)
+    assert report["rebuild_count"] == 1
+    assert report["reconciled"] is True
+    assert report["stages"]["candidate_membership"]["median_seconds"] == pytest.approx(0.1)
+    assert report["inventories"]["exact_tile_count"] == {
+        "minimum": 150,
+        "median": 150.0,
+        "maximum": 150,
+    }
+
+
+def test_mlx_cell_tile_rebuild_profiling_context_rejects_nesting():
+    with _profile_mlx_cell_tile_rebuilds() as profiler:
+        assert isinstance(profiler, _MLXCellTileRebuildProfiler)
+        with pytest.raises(
+            RuntimeError, match="cannot be nested"
+        ), _profile_mlx_cell_tile_rebuilds():
+            pass
+
+    with _profile_mlx_cell_tile_rebuilds() as next_profiler:
+        assert next_profiler is not profiler
 
 
 def test_spatial_cell_pair_template_reuses_fixed_geometry_without_stale_counts():

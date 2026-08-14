@@ -35,6 +35,7 @@ Each result file should answer, in order:
 |---|---|---|---|---|
 | [md-suite.md](./md-suite.md) | mlx_atomistic | Canonical 5DFR/JAC local gate and extended MD suite | Metal | Apple Silicon |
 | [md-current-main-sustained-openmm-m5max.md](./md-current-main-sustained-openmm-m5max.md) | mlx_atomistic/openmm-reference | Current-main sustained baseline, retained analytical SHAKE velocity kernel, and rejected candidates | Metal/OpenCL | Apple M5 Max |
+| [md-neighbor-rebuild-simd-membership-m5max.md](./md-neighbor-rebuild-simd-membership-m5max.md) | mlx_atomistic | Retained 32-lane SIMD exact-tile membership kernel and rebuild-stage profiler | Metal | Apple M5 Max |
 | [md-small-constraint-clusters-m5max.md](./md-small-constraint-clusters-m5max.md) | mlx_atomistic | Retained small-component constraint Metal kernels on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-cell-task-reuse-m5max.md](./md-cell-task-reuse-m5max.md) | mlx_atomistic | Retained spatial-cell task reuse and schedule-prefix coalescing on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-neighbor-wait-attribution-m5max.md](./md-neighbor-wait-attribution-m5max.md) | mlx_atomistic | Neighbor wait attribution and rejected async/direct-branch candidates on 5DFR and JAC | Metal | Apple M5 Max |
@@ -87,6 +88,7 @@ Markdown summaries should cite those raw paths and reproduction commands.
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
 | `uv run python -m mlx_atomistic.benchmarks.md_suite run --suite local --out results/md-suite/current.json` | mlx_atomistic | opt-in performance | repeated 5DFR/JAC median timings and raw per-repeat JSON under `results/md-suite/` |
+| `uv run python -m mlx_atomistic.benchmarks.charged_pme runtime --prepared results/larger-system-scaling/jac-2x2x1-modern/prepared --warmups 10 --steps 75 --neighbor-rebuild-profile --out results/md-suite/rebuild-profile-jac.json` | mlx_atomistic | opt-in structural profile | synchronized exact-tile rebuild stages, interaction inventories, and runtime checks under `results/md-suite/` |
 | `uv run python -m mlx_atomistic.benchmarks.dft_hpsi_profile --manifest results/dft-workload/manifest.json --gth-source results/dft-workload/resources/Si-GTH-PBE-q4.gth --out results/dft-hpsi-stage-profile/control --warmups 3 --samples 7 --json` | mlx_atomistic | opt-in performance | atomic stage profile under `results/dft-hpsi-stage-profile/`; optional Metal capture is non-CI |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --include-large --steps 100 --json > results/mlx-md-performance.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --include-large --evaluations 10 --json > results/mlx-md-acceleration.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
@@ -111,6 +113,13 @@ Markdown summaries should cite those raw paths and reproduction commands.
 | `uv run python scripts/benchmark_m5max_reference.py lammps --classify-only --json` | lammps-reference | opt-in official case classification | normalized diagnostic JSON on stdout |
 | `uv run python scripts/benchmark_m5max_reference.py run --seconds 30 --json` | openmm-reference/lammps-reference | host-only reference benchmark suite | raw manifest under `results/m5max-reference/` |
 | `uv run python scripts/benchmark_m5max_reference.py validate --manifest results/m5max-reference/manifest.json --json` | openmm-reference/lammps-reference | reference manifest validation | validation JSON on stdout |
+
+`--neighbor-rebuild-profile` is a structural diagnostic, not a clean throughput
+measurement. It inserts completion boundaries between builder stages only while
+the flag is active. The default runtime path adds no extra completion boundary.
+The nested `neighbor_rebuild_stage_profile` report reconciles the measured build
+wall, preserves raw stage samples, and records cell, tile, pair, column, and
+force-group inventories for each rebuild.
 
 ## External inputs
 

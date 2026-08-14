@@ -48,6 +48,7 @@ from mlx_atomistic.neighbors import (
     NeighborListManager,
     NeighborTiles,
     _bounded_metal_md_cache,
+    _profile_mlx_cell_tile_rebuilds,
     build_neighbor_list,
 )
 from mlx_atomistic.pme import PMEConfig
@@ -1294,6 +1295,35 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
         np.asarray(pair_full),
         rtol=2.0e-5,
         atol=2.0e-3,
+    )
+
+
+@pytest.mark.gpu
+def test_spatial_tile_rebuild_stage_profile_reconciles_exact_inventory():
+    """The opt-in stage profiler accounts for one exact Metal tile build."""
+
+    rng = np.random.default_rng(97)
+    positions = rng.uniform(0.0, 8.0, size=(64, 3)).astype(np.float32)
+    with _profile_mlx_cell_tile_rebuilds() as profiler:
+        neighbors = build_neighbor_list(
+            positions,
+            Cell.cubic(8.0),
+            cutoff=2.6,
+            skin=0.35,
+            sort_pairs=False,
+            backend="mlx_cell_tiles",
+        )
+
+    report = profiler.report()
+    assert neighbors.tiles is not None
+    assert report["rebuild_count"] == 1
+    assert report["reconciled"] is True
+    assert all(stage["count"] == 1 for stage in report["stages"].values())
+    assert report["inventories"]["exact_tile_count"]["median"] == pytest.approx(
+        neighbors.tiles.tile_count
+    )
+    assert report["inventories"]["exact_pair_count"]["median"] == pytest.approx(
+        neighbors.tiles.exact_pair_count
     )
 
 

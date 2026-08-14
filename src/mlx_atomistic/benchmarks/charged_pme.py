@@ -7,6 +7,7 @@ import json
 import math
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,12 @@ import numpy as np
 from mlx_atomistic.artifacts import build_mlx_system_from_artifact, load_prepared_mlx_artifact
 from mlx_atomistic.benchmarks import get_hardware_info
 from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
+from mlx_atomistic.benchmarks.schema import current_git_commit
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
-from mlx_atomistic.neighbors import NeighborListManager
+from mlx_atomistic.neighbors import (
+    NeighborListManager,
+    _profile_mlx_cell_tile_rebuilds,
+)
 from mlx_atomistic.prep.io import JSON_NAME, NPZ_NAME, load_prepared_system, save_prepared_system
 from mlx_atomistic.prep.schema import center_of_mass_motion_interval
 from mlx_atomistic.prep.supercell import (
@@ -103,15 +108,12 @@ def _constraint_route_inventory(
     if constraints is not None:
         visit(constraints)
     total_pair_count = sum(int(route["pair_count"]) for route in routes.values())
-    expected_pair_count = (
-        0 if constraints is None else int(constraints.pairs.shape[0])
-    )
+    expected_pair_count = 0 if constraints is None else int(constraints.pairs.shape[0])
     water_route_complete = water_atom_count == 0 or (
         (molecule_ids_present and int(routes["settle"]["pair_count"]) > 0)
         or (
             expected_pair_count > 0
-            and int(routes["small_constraint_clusters"]["pair_count"])
-            == expected_pair_count
+            and int(routes["small_constraint_clusters"]["pair_count"]) == expected_pair_count
         )
     )
     return {
@@ -228,6 +230,7 @@ def runtime_payload(
     sample_interval: int | None = None,
     diagnostic_interval: int | None = None,
     runtime_profile: bool = False,
+    neighbor_rebuild_profile: bool = False,
     neighbor_backend: str = "mlx_cell_tiles",
 ) -> dict[str, Any]:
     """Run bounded fixed-cell charged-PME NVT with one reusable plan.
@@ -249,6 +252,8 @@ def runtime_payload(
             only the final step. Defaults to ``None``.
         runtime_profile: Enable synchronized benchmark-only route attribution.
             Defaults to ``False``.
+        neighbor_rebuild_profile: Enable synchronized stage attribution inside
+            measured Metal tile-list rebuilds. Defaults to ``False``.
         neighbor_backend: Exact spatial tile candidate or compact-pair control.
             Defaults to ``mlx_cell_tiles``.
 
@@ -259,9 +264,7 @@ def runtime_payload(
     prepared_path = Path(prepared)
     out_path = Path(out)
     sample_interval = steps if sample_interval is None else int(sample_interval)
-    diagnostic_interval = (
-        steps if diagnostic_interval is None else int(diagnostic_interval)
-    )
+    diagnostic_interval = steps if diagnostic_interval is None else int(diagnostic_interval)
     base = {
         "kind": RUNTIME_SCHEMA,
         "prepared": str(prepared_path),
@@ -276,6 +279,7 @@ def runtime_payload(
         "sample_interval": sample_interval,
         "diagnostic_interval": diagnostic_interval,
         "runtime_profile": bool(runtime_profile),
+        "neighbor_rebuild_profile": bool(neighbor_rebuild_profile),
         "neighbor_backend": str(neighbor_backend),
         "process_memory_limit_bytes": _PROCESS_MEMORY_LIMIT_BYTES,
         "status": "blocked",
@@ -303,6 +307,8 @@ def runtime_payload(
         validation_blockers.append("diagnostic_interval_must_be_positive")
     if neighbor_backend not in _RUNTIME_NEIGHBOR_BACKENDS:
         validation_blockers.append("neighbor_backend_must_be_pairs_or_tiles")
+    if neighbor_rebuild_profile and neighbor_backend != "mlx_cell_tiles":
+        validation_blockers.append("neighbor_rebuild_profile_requires_mlx_cell_tiles")
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
     validation_blockers.extend(
         f"missing_prepared_input:{path}" for path in required if not path.is_file()
@@ -349,9 +355,7 @@ def runtime_payload(
             "force_to_acceleration_scale": (
                 1.0 if unit_system is None else unit_system.force_to_acceleration_scale
             ),
-            "boltzmann_constant": (
-                1.0 if unit_system is None else unit_system.boltzmann_constant
-            ),
+            "boltzmann_constant": (1.0 if unit_system is None else unit_system.boltzmann_constant),
         }
         plan = nonbonded.pme_plan
         if plan is None:
@@ -384,31 +388,36 @@ def runtime_payload(
         reuse_after_warmup = plan.reuse_count
         measured_neighbor_update_start = neighbor_manager.update_wall_seconds
         measured_neighbor_rebuild_start = neighbor_manager.rebuild_wall_seconds
+        measured_neighbor_rebuild_count_start = neighbor_manager.rebuild_count
 
-        measured_started = time.perf_counter()
-        measured_result = simulate_nvt(
-            warmup_result.final_state.positions,
-            warmup_result.final_state.velocities,
-            masses=warmup_result.final_state.masses,
-            cell=system.cell,
-            force_terms=bound_terms,
-            neighbor_manager=neighbor_manager,
-            config=_simulation_config(
-                steps=steps,
-                dt_ps=dt_ps,
-                simulation_units=simulation_units,
-                sample_interval=sample_interval,
-                diagnostic_interval=diagnostic_interval,
-                runtime_profile=runtime_profile,
-                center_of_mass_motion_interval=cmm_interval,
-            ),
-            constraints=constraints,
-            thermostat=LangevinThermostat(
-                temperature=temperature_k,
-                friction=1.0,
-                seed=seed + 1,
-            ),
+        rebuild_profile_context = (
+            _profile_mlx_cell_tile_rebuilds() if neighbor_rebuild_profile else nullcontext(None)
         )
+        measured_started = time.perf_counter()
+        with rebuild_profile_context as rebuild_profiler:
+            measured_result = simulate_nvt(
+                warmup_result.final_state.positions,
+                warmup_result.final_state.velocities,
+                masses=warmup_result.final_state.masses,
+                cell=system.cell,
+                force_terms=bound_terms,
+                neighbor_manager=neighbor_manager,
+                config=_simulation_config(
+                    steps=steps,
+                    dt_ps=dt_ps,
+                    simulation_units=simulation_units,
+                    sample_interval=sample_interval,
+                    diagnostic_interval=diagnostic_interval,
+                    runtime_profile=runtime_profile,
+                    center_of_mass_motion_interval=cmm_interval,
+                ),
+                constraints=constraints,
+                thermostat=LangevinThermostat(
+                    temperature=temperature_k,
+                    friction=1.0,
+                    seed=seed + 1,
+                ),
+            )
         mx.eval(
             measured_result.sampled_positions,
             measured_result.sampled_velocities,
@@ -432,14 +441,11 @@ def runtime_payload(
         )
         finite = all(bool(np.all(np.isfinite(value))) for value in arrays)
         simulated_ns = steps * dt_ps / 1000.0
-        ns_per_day = (
-            simulated_ns / measured_seconds * 86400.0 if measured_seconds > 0.0 else 0.0
-        )
+        ns_per_day = simulated_ns / measured_seconds * 86400.0 if measured_seconds > 0.0 else 0.0
         neighbor_list = neighbor_manager.neighbor_list
         topology_report = {
             "pair_policy": topology.nonbonded_pair_policy,
-            "pair_cache_materialized": getattr(topology, "_nonbonded_pairs", None)
-            is not None,
+            "pair_cache_materialized": getattr(topology, "_nonbonded_pairs", None) is not None,
             "nonbonded_pair_count": topology.nonbonded_pair_count,
         }
         water_mask = np.asarray(
@@ -457,16 +463,20 @@ def runtime_payload(
             "representation": (
                 None if neighbor_list is None else neighbor_list.representation_kind
             ),
-            "fallback_reason": (
-                None if neighbor_list is None else neighbor_list.fallback_reason
-            ),
+            "fallback_reason": (None if neighbor_list is None else neighbor_list.fallback_reason),
             "measured_update_wall_seconds": (
                 neighbor_manager.update_wall_seconds - measured_neighbor_update_start
             ),
             "measured_rebuild_wall_seconds": (
                 neighbor_manager.rebuild_wall_seconds - measured_neighbor_rebuild_start
             ),
+            "measured_rebuild_count": (
+                neighbor_manager.rebuild_count - measured_neighbor_rebuild_count_start
+            ),
         }
+        rebuild_stage_profile = None if rebuild_profiler is None else rebuild_profiler.report()
+        if rebuild_stage_profile is not None:
+            rebuild_stage_profile["commit"] = current_git_commit()
         final_plan = plan.to_dict()
         process_peak_bytes = int(max_rss_mb() * 1024.0 * 1024.0)
         memory = {
@@ -477,9 +487,7 @@ def runtime_payload(
             "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
             "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
         }
-        expected_representation = (
-            "tiles" if neighbor_backend == "mlx_cell_tiles" else "pairs"
-        )
+        expected_representation = "tiles" if neighbor_backend == "mlx_cell_tiles" else "pairs"
         checks = {
             "warmup_completed": warmups >= 1,
             "measured_steps_completed": steps >= 2,
@@ -498,9 +506,7 @@ def runtime_payload(
             "lazy_topology": topology_report["pair_policy"] == "lazy",
             "pair_cache_unmaterialized": not topology_report["pair_cache_materialized"],
             "constraint_route_pair_count": constraint_routes["pair_count_matches"],
-            "performance_eligible_constraint_routes": constraint_routes[
-                "performance_eligible"
-            ],
+            "performance_eligible_constraint_routes": constraint_routes["performance_eligible"],
             "expected_neighbor_representation": (
                 neighbor_report["manager_backend"] == neighbor_backend
                 and neighbor_report["representation"] == expected_representation
@@ -511,9 +517,7 @@ def runtime_payload(
                 or neighbor_report.get("diagnostic_pairs_materialized") is False
             ),
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
-            "process_memory_within_limit": (
-                process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES
-            ),
+            "process_memory_within_limit": (process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES),
             "mlx_peak_memory_within_limit": (
                 isinstance(memory["mlx_peak_memory_bytes"], int)
                 and memory["mlx_peak_memory_bytes"] <= _PROCESS_MEMORY_LIMIT_BYTES
@@ -534,16 +538,30 @@ def runtime_payload(
             )
             checks.update(
                 {
-                    "route_profile_reconciled": bool(
-                        route_profile.get("reconciled", False)
-                    ),
+                    "route_profile_reconciled": bool(route_profile.get("reconciled", False)),
                     "route_profile_expected_direct": expected_direct_route in routes,
-                    "route_profile_no_direct_fallback": (
-                        unexpected_direct_route not in routes
-                    ),
+                    "route_profile_no_direct_fallback": (unexpected_direct_route not in routes),
                     "route_profile_reciprocal": "reciprocal_pme" in routes,
                     "route_profile_neighbor": "neighbor_update_rebuild" in routes,
                     "route_profile_integration": "integration_thermostat" in routes,
+                }
+            )
+        if neighbor_rebuild_profile:
+            checks.update(
+                {
+                    "neighbor_rebuild_profile_recorded": (
+                        rebuild_stage_profile is not None
+                        and rebuild_stage_profile["rebuild_count"] > 0
+                    ),
+                    "neighbor_rebuild_profile_reconciled": (
+                        rebuild_stage_profile is not None
+                        and bool(rebuild_stage_profile["reconciled"])
+                    ),
+                    "neighbor_rebuild_profile_matches_manager": (
+                        rebuild_stage_profile is not None
+                        and rebuild_stage_profile["rebuild_count"]
+                        == neighbor_report["measured_rebuild_count"]
+                    ),
                 }
             )
         passed = all(checks.values())
@@ -585,24 +603,17 @@ def runtime_payload(
             },
             "memory": memory,
             "state": {
-                "potential_energy_kj_mol": _last_float(
-                    measured_result.potential_energy
-                ),
+                "potential_energy_kj_mol": _last_float(measured_result.potential_energy),
                 "kinetic_energy_kj_mol": _last_float(measured_result.kinetic_energy),
                 "total_energy_kj_mol": _last_float(measured_result.total_energy),
                 "temperature_k": _last_float(measured_result.temperature),
-                "constraint_max_error_angstrom": _last_float(
-                    measured_result.constraint_max_error
-                ),
-                "sampled_step_count": int(
-                    np.asarray(measured_result.sampled_steps).shape[0]
-                ),
-                "diagnostic_step_count": int(
-                    np.asarray(measured_result.diagnostic_steps).shape[0]
-                ),
+                "constraint_max_error_angstrom": _last_float(measured_result.constraint_max_error),
+                "sampled_step_count": int(np.asarray(measured_result.sampled_steps).shape[0]),
+                "diagnostic_step_count": int(np.asarray(measured_result.diagnostic_steps).shape[0]),
             },
             "runtime_sync": measured_result.runtime_sync_report,
             "route_profile": measured_result.route_profile,
+            "neighbor_rebuild_stage_profile": rebuild_stage_profile,
         }
         return _write_runtime_payload(payload, out_path)
     except MemoryError as exc:  # pragma: no cover - host resource dependent.
@@ -694,16 +705,13 @@ def audit_openmm_runtime_artifacts(
         ),
         "single_precision": platform.get("Precision") == "single",
         "hardware_named": bool(platform.get("DeviceName")),
-        "pme_mesh_matches": runtime_pme.get("mesh_shape")
-        == manifest_pme.get("mesh_shape"),
+        "pme_mesh_matches": runtime_pme.get("mesh_shape") == manifest_pme.get("mesh_shape"),
         "pme_alpha_matches": runtime_pme.get("alpha_per_angstrom")
         == manifest_pme.get("alpha_per_angstrom"),
         "pme_cutoff_matches": runtime_pme.get("cutoff_angstrom")
         == manifest_pme.get("real_cutoff_angstrom"),
-        "runtime_operation_declared": runtime.get("operation")
-        == "fixed_cell_nvt_step",
-        "runtime_manifest_is_nvt": workload.get("operation")
-        == "fixed_cell_nvt_step",
+        "runtime_operation_declared": runtime.get("operation") == "fixed_cell_nvt_step",
+        "runtime_manifest_is_nvt": workload.get("operation") == "fixed_cell_nvt_step",
         "timestep_declared": isinstance(runtime.get("dt_ps"), int | float),
         "thermostat_declared": isinstance(runtime.get("thermostat"), Mapping),
         "constraints_declared": isinstance(
@@ -733,9 +741,7 @@ def audit_openmm_runtime_artifacts(
             if not isinstance(runtime.get("elapsed_seconds"), int | float)
             else 10.0 * float(runtime["elapsed_seconds"])
         ),
-        "note": (
-            "No OpenMM process was executed; this is a static artifact audit."
-        ),
+        "note": ("No OpenMM process was executed; this is a static artifact audit."),
     }
     if out is not None:
         _write_runtime_payload(admission, Path(out))
@@ -797,9 +803,7 @@ def _tile_mask_occupancy(
     summary: dict[str, object] = {
         "right_column_count": column_count,
         "empty_right_column_count": empty_columns,
-        "empty_right_column_fraction": (
-            0.0 if column_count == 0 else empty_columns / column_count
-        ),
+        "empty_right_column_fraction": (0.0 if column_count == 0 else empty_columns / column_count),
         "right_column_member_count_histogram": column_member_count_histogram,
         "left_row_count": row_count,
         "empty_left_row_count": empty_rows,
@@ -920,9 +924,7 @@ def _profile_tile_inventory(
     if tile_binding is NotImplemented or pair_binding is NotImplemented:
         raise RuntimeError("JAC direct-force bindings were not admitted")
     if tile_binding.tile_decline_reason is not None:
-        raise RuntimeError(
-            f"spatial tile force route declined: {tile_binding.tile_decline_reason}"
-        )
+        raise RuntimeError(f"spatial tile force route declined: {tile_binding.tile_decline_reason}")
     tile_forces = nonbonded._direct_forces_from_binding(
         system.positions,
         tile_binding,
@@ -961,11 +963,7 @@ def _profile_tile_inventory(
                 mx.eval(value)
         samples = {"reference": [], "candidate": []}
         for sample in range(6):
-            ordered = (
-                ("reference", "candidate")
-                if sample % 2 == 0
-                else ("candidate", "reference")
-            )
+            ordered = ("reference", "candidate") if sample % 2 == 0 else ("candidate", "reference")
             for name in ordered:
                 started = time.perf_counter()
                 value = calls[name]()
@@ -981,13 +979,15 @@ def _profile_tile_inventory(
         lambda: nonbonded._direct_forces_from_binding(system.positions, tile_binding),
     )
     reference_correction_seconds, fused_correction_seconds = interleaved_medians(
-        lambda: nonbonded._exception_lj_forces(
-            system.positions,
-            system.cell,
-        )
-        + nonbonded._periodic_coulomb_correction_forces(
-            system.positions,
-            system.cell,
+        lambda: (
+            nonbonded._exception_lj_forces(
+                system.positions,
+                system.cell,
+            )
+            + nonbonded._periodic_coulomb_correction_forces(
+                system.positions,
+                system.cell,
+            )
         ),
         lambda: nonbonded._prepared_sparse_correction_forces(
             system.positions,
@@ -1057,9 +1057,7 @@ def _profile_tile_inventory(
         "pair_direct_median_seconds": pair_direct_seconds,
         "tile_direct_median_seconds": tile_direct_seconds,
         "direct_speedup_fraction": (
-            0.0
-            if pair_direct_seconds <= 0.0
-            else 1.0 - tile_direct_seconds / pair_direct_seconds
+            0.0 if pair_direct_seconds <= 0.0 else 1.0 - tile_direct_seconds / pair_direct_seconds
         ),
         "rebuild_wall_seconds": tile_manager.rebuild_wall_seconds,
         "update_wall_seconds": tile_manager.update_wall_seconds,
@@ -1111,18 +1109,14 @@ def profile_payload(
     pair_after_path = out_path.parent / "pair-control-after.json"
     instrumented_path = out_path.parent / "instrumented.json"
     admission_path = out_path.parent / "openmm-admission.json"
-    default_runtime, default_manifest, default_comparison = (
-        _default_openmm_artifact_paths(prepared_path)
+    default_runtime, default_manifest, default_comparison = _default_openmm_artifact_paths(
+        prepared_path
     )
     admission = audit_openmm_runtime_artifacts(
         runtime_path=default_runtime if openmm_runtime is None else openmm_runtime,
-        workload_manifest_path=(
-            default_manifest if openmm_manifest is None else openmm_manifest
-        ),
+        workload_manifest_path=(default_manifest if openmm_manifest is None else openmm_manifest),
         manifest_comparison_path=(
-            default_comparison
-            if manifest_comparison is None
-            else manifest_comparison
+            default_comparison if manifest_comparison is None else manifest_comparison
         ),
         out=admission_path,
     )
@@ -1218,6 +1212,7 @@ def profile_payload(
         "temperature_k",
         "constraint_max_error_angstrom",
     )
+
     def states_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
         return all(
             key in left
@@ -1293,28 +1288,22 @@ def profile_payload(
         "integration_route_present": "integration_thermostat" in routes,
         "clean_instrumented_state_consistent": clean_instrumented_state_consistent,
         "control_candidate_state_consistent": control_candidate_state_consistent,
-        "process_memory_within_limit": (
-            profile_process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES
-        ),
+        "process_memory_within_limit": (profile_process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES),
         "mlx_peak_memory_within_limit": (
             isinstance(profile_memory["mlx_peak_memory_bytes"], int)
-            and profile_memory["mlx_peak_memory_bytes"]
-            <= _PROCESS_MEMORY_LIMIT_BYTES
+            and profile_memory["mlx_peak_memory_bytes"] <= _PROCESS_MEMORY_LIMIT_BYTES
         ),
         "tile_inventory_present": tile_inventory is not None,
         "tile_pair_inventory_matches": (
-            tile_inventory is not None
-            and tile_inventory.get("pair_inventory_matches") is True
+            tile_inventory is not None and tile_inventory.get("pair_inventory_matches") is True
         ),
         "tile_force_rms_within_tolerance": (
             tile_inventory is not None
-            and float(tile_inventory.get("force_rms_delta_kj_mol_angstrom", math.inf))
-            <= 2.0e-4
+            and float(tile_inventory.get("force_rms_delta_kj_mol_angstrom", math.inf)) <= 2.0e-4
         ),
         "tile_force_max_within_tolerance": (
             tile_inventory is not None
-            and float(tile_inventory.get("force_max_delta_kj_mol_angstrom", math.inf))
-            <= 2.0e-2
+            and float(tile_inventory.get("force_max_delta_kj_mol_angstrom", math.inf)) <= 2.0e-2
         ),
         "tile_active_lane_fraction": (
             tile_inventory is not None
@@ -1322,8 +1311,7 @@ def profile_payload(
         ),
         "tile_scheduled_lane_bound": (
             tile_inventory is not None
-            and int(tile_inventory.get("padded_lane_count", 200_000_001))
-            <= 200_000_000
+            and int(tile_inventory.get("padded_lane_count", 200_000_001)) <= 200_000_000
         ),
         "tile_direct_latency_speedup": (
             tile_inventory is not None
@@ -1374,8 +1362,7 @@ def profile_payload(
         "complete_wall_speedup_fraction": complete_wall_speedup_fraction,
         "complete_wall_speedup_gate": _SPATIAL_DIRECT_MIN_COMPLETE_SPEEDUP,
         "tile_pair_inventory_matches": (
-            tile_inventory is not None
-            and tile_inventory.get("pair_inventory_matches") is True
+            tile_inventory is not None and tile_inventory.get("pair_inventory_matches") is True
         ),
         "tile_pair_inventory_delta": (
             None
@@ -1384,19 +1371,13 @@ def profile_payload(
             - int(tile_inventory["reference_pair_count"])
         ),
         "tile_force_rms_delta_kj_mol_angstrom": (
-            None
-            if tile_inventory is None
-            else tile_inventory["force_rms_delta_kj_mol_angstrom"]
+            None if tile_inventory is None else tile_inventory["force_rms_delta_kj_mol_angstrom"]
         ),
         "tile_force_max_delta_kj_mol_angstrom": (
-            None
-            if tile_inventory is None
-            else tile_inventory["force_max_delta_kj_mol_angstrom"]
+            None if tile_inventory is None else tile_inventory["force_max_delta_kj_mol_angstrom"]
         ),
         "tile_direct_speedup_fraction": (
-            None
-            if tile_inventory is None
-            else tile_inventory["direct_speedup_fraction"]
+            None if tile_inventory is None else tile_inventory["direct_speedup_fraction"]
         ),
         "tile_direct_speedup_gate": _SPATIAL_DIRECT_MIN_KERNEL_SPEEDUP,
         "correction_force_rms_delta_kj_mol_angstrom": (
@@ -1410,9 +1391,7 @@ def profile_payload(
             else tile_inventory["correction_force_max_delta_kj_mol_angstrom"]
         ),
         "correction_speedup_fraction": (
-            None
-            if tile_inventory is None
-            else tile_inventory["correction_speedup_fraction"]
+            None if tile_inventory is None else tile_inventory["correction_speedup_fraction"]
         ),
         "correction_speedup_gate": _SPARSE_CORRECTION_MIN_SPEEDUP,
     }
@@ -1592,6 +1571,11 @@ def main(argv: list[str] | None = None) -> None:
         choices=sorted(_RUNTIME_NEIGHBOR_BACKENDS),
         default="mlx_cell_tiles",
     )
+    runtime_parser.add_argument(
+        "--neighbor-rebuild-profile",
+        action="store_true",
+        help="attribute synchronized stages inside measured Metal tile rebuilds",
+    )
     runtime_parser.add_argument("--out", type=Path, required=True)
     profile_parser = commands.add_parser(
         "profile",
@@ -1634,6 +1618,7 @@ def main(argv: list[str] | None = None) -> None:
             neighbor_check_interval=args.neighbor_check_interval,
             sample_interval=args.sample_interval,
             diagnostic_interval=args.diagnostic_interval,
+            neighbor_rebuild_profile=args.neighbor_rebuild_profile,
             neighbor_backend=args.neighbor_backend,
             out=args.out,
         )
