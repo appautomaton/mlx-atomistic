@@ -411,7 +411,7 @@ def test_dense_disjoint_composite_matches_sequential_constraint_oracle(monkeypat
 
 @pytest.mark.gpu
 def test_dense_composite_declines_overlap_and_runtime_profiling(monkeypatch):
-    """Overlap and synchronized profiling retain the sequential child routes."""
+    """Overlap declines dense execution while profiling preserves valid dense routes."""
 
     class ZeroForce:
         supports_virial = True
@@ -447,6 +447,8 @@ def test_dense_composite_declines_overlap_and_runtime_profiling(monkeypatch):
     )
     masses = mx.array([16.0, 1.0, 1.0, 12.0, 1.0], dtype=mx.float32)
 
+    dense_constraint_apply = constraints_module._dense_constraint_apply
+
     def fail_dense_apply(*args, **kwargs):
         raise AssertionError("fallback path must not invoke dense constraint apply")
 
@@ -462,6 +464,11 @@ def test_dense_composite_declines_overlap_and_runtime_profiling(monkeypatch):
     )
     mx.eval(projected)
     assert bool(np.all(np.isfinite(np.asarray(projected))))
+    monkeypatch.setattr(
+        constraints_module,
+        "_dense_constraint_apply",
+        dense_constraint_apply,
+    )
 
     profiled = simulate_nvt(
         positions,
@@ -480,6 +487,16 @@ def test_dense_composite_declines_overlap_and_runtime_profiling(monkeypatch):
         thermostat=LangevinThermostat(temperature=0.0, friction=0.0, seed=9),
     )
     assert profiled.route_profile["reconciled"] is True
+    constraint_routes = {
+        name
+        for name in profiled.route_profile["routes"]
+        if "constraint" in name or "settle" in name or "shake" in name
+    }
+    assert constraint_routes == {
+        "composite_constraints_position",
+        "composite_constraints_pre_force_velocity",
+        "composite_constraints_velocity",
+    }
 
 
 @pytest.mark.gpu

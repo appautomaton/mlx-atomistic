@@ -20,6 +20,7 @@ from mlx_atomistic.benchmarks.schema import current_git_commit
 CASE_REGISTRY_PATH = Path(__file__).with_name("data") / "md_suite_cases.json"
 SUITE_SCHEMA = "mlx_atomistic.md_suite.v2"
 COMPARISON_SCHEMA = "mlx_atomistic.md_suite_comparison.v2"
+STAGE_PROFILE_SCHEMA = "mlx_atomistic.md_stage_profile.v1"
 DEFAULT_LOCAL_SUITE = "local"
 DEFAULT_REPEATS = 3
 DEFAULT_WARMUP_STEPS = 10
@@ -234,6 +235,297 @@ def run_suite(
     return payload
 
 
+def profile_suite(
+    *,
+    repo_root: str | Path,
+    out: str | Path,
+    suite: str = DEFAULT_LOCAL_SUITE,
+    case_ids: Sequence[str] = (),
+    prepared_overrides: Mapping[str, str | Path] | None = None,
+    warmup_steps: int = DEFAULT_WARMUP_STEPS,
+    measured_steps: int = DEFAULT_MEASURED_STEPS,
+    neighbor_backend: str | None = None,
+    registry_path: str | Path = CASE_REGISTRY_PATH,
+    runner: Callable[..., dict[str, Any]] = runtime_payload,
+) -> dict[str, Any]:
+    """Persist a clean control and synchronized MD stage map for each case.
+
+    The synchronized route profiler intentionally changes MLX scheduling. Its
+    timings attribute exclusive stage ownership and must not be reported as
+    clean trajectory throughput. Running the clean control immediately before
+    the instrumented sample keeps both views in one auditable artifact.
+    """
+
+    if warmup_steps <= 0 or measured_steps < 2:
+        raise ValueError("warmup_steps must be positive and measured_steps must be >= 2")
+    root = Path(repo_root).resolve()
+    out_path = Path(out)
+    if not out_path.is_absolute():
+        out_path = root / out_path
+    registry = load_case_registry(registry_path)
+    selected = resolve_cases(registry=registry, suite=suite, case_ids=case_ids)
+    overrides = dict(prepared_overrides or {})
+    unknown_overrides = sorted(set(overrides) - {case.case_id for case in selected})
+    if unknown_overrides:
+        raise ValueError(f"prepared overrides do not match selected cases: {unknown_overrides}")
+
+    raw_root = out_path.parent / f"{out_path.stem}-raw"
+    rows = []
+    for case in selected:
+        prepared = Path(overrides.get(case.case_id, case.prepared_path))
+        if not prepared.is_absolute():
+            prepared = root / prepared
+        selected_backend = neighbor_backend or case.neighbor_backend
+        case_root = raw_root / case.case_id
+        clean = runner(
+            prepared=prepared,
+            warmups=warmup_steps,
+            steps=measured_steps,
+            out=case_root / "clean.json",
+            neighbor_backend=selected_backend,
+            runtime_profile=False,
+        )
+        instrumented = runner(
+            prepared=prepared,
+            warmups=warmup_steps,
+            steps=measured_steps,
+            out=case_root / "instrumented.json",
+            neighbor_backend=selected_backend,
+            runtime_profile=True,
+        )
+        rows.append(
+            _stage_profile_case(
+                case=case,
+                prepared=prepared,
+                neighbor_backend=selected_backend,
+                clean=clean,
+                instrumented=instrumented,
+                clean_output=case_root / "clean.json",
+                instrumented_output=case_root / "instrumented.json",
+            )
+        )
+
+    passed = all(row["passed"] for row in rows)
+    payload = {
+        "schema": STAGE_PROFILE_SCHEMA,
+        "suite": suite,
+        "status": "ok" if passed else "blocked_or_failed",
+        "passed": passed,
+        "commit": current_git_commit(repo_root=root),
+        "warmup_steps": warmup_steps,
+        "measured_steps": measured_steps,
+        "neighbor_backend": neighbor_backend or "case_contract",
+        "profile_semantics": {
+            "clean": "end_to_end_throughput_control",
+            "instrumented": "synchronized_exclusive_stage_attribution",
+            "instrumented_preserves_production_constraint_route": True,
+            "instrumented_preserves_lazy_force_schedule": False,
+            "final_state_comparison": (
+                "diagnostic_only because synchronized floating-point execution can "
+                "separate chaotic trajectories over long profiles"
+            ),
+            "warning": (
+                "instrumented timings introduce completion barriers and are not "
+                "clean throughput measurements"
+            ),
+        },
+        "cross_case_stage_ranking": _cross_case_stage_ranking(rows),
+        "cases": rows,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return payload
+
+
+def _stage_profile_case(
+    *,
+    case: MDBenchmarkCase,
+    prepared: Path,
+    neighbor_backend: str,
+    clean: Mapping[str, Any],
+    instrumented: Mapping[str, Any],
+    clean_output: Path,
+    instrumented_output: Path,
+) -> dict[str, Any]:
+    blockers = []
+    if clean.get("passed") is not True:
+        blockers.append("clean_control_failed")
+        blockers.extend(f"clean:{item}" for item in clean.get("blockers", ()))
+    if instrumented.get("passed") is not True:
+        blockers.append("instrumented_profile_failed")
+        blockers.extend(f"instrumented:{item}" for item in instrumented.get("blockers", ()))
+    atom_counts = {
+        int(payload["atom_count"]) for payload in (clean, instrumented) if "atom_count" in payload
+    }
+    if atom_counts != {case.expected_atom_count}:
+        blockers.append(
+            f"atom_count_mismatch:expected={case.expected_atom_count}:actual={sorted(atom_counts)}"
+        )
+    if clean.get("hardware") != instrumented.get("hardware"):
+        blockers.append("hardware_mismatch")
+    if clean.get("runtime") != instrumented.get("runtime"):
+        blockers.append("runtime_mismatch")
+
+    profile = instrumented.get("route_profile", {})
+    if not isinstance(profile, Mapping) or profile.get("reconciled") is not True:
+        blockers.append("route_profile_not_reconciled")
+    routes = profile.get("routes", {}) if isinstance(profile, Mapping) else {}
+    if not isinstance(routes, Mapping) or not routes:
+        blockers.append("route_profile_missing_routes")
+        routes = {}
+
+    state_fields = (
+        "potential_energy_kj_mol",
+        "kinetic_energy_kj_mol",
+        "total_energy_kj_mol",
+        "temperature_k",
+        "constraint_max_error_angstrom",
+    )
+    clean_state = clean.get("state", {})
+    instrumented_state = instrumented.get("state", {})
+    state_consistent = all(
+        key in clean_state
+        and key in instrumented_state
+        and np.isclose(
+            float(clean_state[key]),
+            float(instrumented_state[key]),
+            rtol=1.0e-5,
+            atol=1.0e-5,
+        )
+        for key in state_fields
+    )
+
+    instrumented_wall = float(profile.get("instrumented_wall_seconds", 0.0))
+    stages: dict[str, dict[str, Any]] = {}
+    for route_name, route_payload in routes.items():
+        if not isinstance(route_payload, Mapping):
+            blockers.append(f"invalid_route:{route_name}")
+            continue
+        stage_name = _route_stage(str(route_name))
+        stage = stages.setdefault(
+            stage_name,
+            {
+                "wall_seconds": 0.0,
+                "completion_seconds": 0.0,
+                "graph_and_host_seconds": 0.0,
+                "route_names": [],
+            },
+        )
+        for field in ("wall_seconds", "completion_seconds", "graph_and_host_seconds"):
+            stage[field] += float(route_payload.get(field, 0.0))
+        stage["route_names"].append(str(route_name))
+    residual_seconds = max(0.0, float(profile.get("residual_seconds", 0.0)))
+    if residual_seconds > 0.0:
+        stages["unattributed_runtime"] = {
+            "wall_seconds": residual_seconds,
+            "completion_seconds": 0.0,
+            "graph_and_host_seconds": residual_seconds,
+            "route_names": [],
+        }
+    stage_rows = []
+    for stage_name, values in stages.items():
+        wall_seconds = float(values["wall_seconds"])
+        stage_rows.append(
+            {
+                "stage": stage_name,
+                **values,
+                "instrumented_wall_fraction": (
+                    0.0 if instrumented_wall <= 0.0 else wall_seconds / instrumented_wall
+                ),
+            }
+        )
+    stage_rows.sort(key=lambda row: (-row["wall_seconds"], row["stage"]))
+
+    clean_seconds = clean.get("timings", {}).get("seconds_per_measured_step")
+    instrumented_seconds = instrumented.get("timings", {}).get("seconds_per_measured_step")
+    slowdown = (
+        float(instrumented_seconds) / float(clean_seconds)
+        if _positive_finite(clean_seconds) and _positive_finite(instrumented_seconds)
+        else None
+    )
+    return {
+        "case_id": case.case_id,
+        "description": case.description,
+        "role": case.role,
+        "features": list(case.features),
+        "prepared": str(prepared),
+        "expected_atom_count": case.expected_atom_count,
+        "contract_fingerprint": case.fingerprint,
+        "prepared_fingerprint": _prepared_fingerprint(prepared),
+        "neighbor_backend": neighbor_backend,
+        "status": "ok" if not blockers else "blocked_or_failed",
+        "passed": not blockers,
+        "blockers": sorted(set(blockers)),
+        "hardware": clean.get("hardware"),
+        "runtime": clean.get("runtime"),
+        "final_state_close": state_consistent,
+        "clean_seconds_per_step": clean_seconds,
+        "clean_ns_per_day": clean.get("throughput", {}).get("ns_per_day"),
+        "instrumented_seconds_per_step": instrumented_seconds,
+        "instrumentation_slowdown_ratio": slowdown,
+        "instrumented_wall_seconds": instrumented_wall,
+        "dominant_stage": None if not stage_rows else stage_rows[0]["stage"],
+        "stages": stage_rows,
+        "raw_outputs": {
+            "clean": str(clean_output),
+            "instrumented": str(instrumented_output),
+        },
+    }
+
+
+def _route_stage(route_name: str) -> str:
+    if route_name in {"neighbor_update_rebuild", "neighbor_force_binding"}:
+        return "neighbor_lifecycle"
+    if route_name in {"direct_spatial_tiles", "direct_lj_screened_coulomb"}:
+        return "direct_nonbonded"
+    if route_name == "reciprocal_pme":
+        return "reciprocal_pme"
+    if route_name == "pme_exceptions_corrections":
+        return "pme_sparse_corrections"
+    if route_name in {"bonded_fused", "other_force_terms"}:
+        return "bonded_and_other_forces"
+    if route_name in {
+        "force_term_aggregation",
+        "pme_force_aggregation",
+        "virtual_site_force_redistribution",
+    }:
+        return "force_aggregation_and_redistribution"
+    if route_name == "integration_thermostat":
+        return "integration_and_thermostat"
+    if route_name == "diagnostics_reporting":
+        return "diagnostics_and_reporting"
+    if any(token in route_name for token in ("constraint", "settle", "shake", "rattle")):
+        return "constraints"
+    return "other_runtime"
+
+
+def _cross_case_stage_ranking(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    by_stage: dict[str, list[tuple[str, float]]] = {}
+    for row in rows:
+        if row.get("passed") is not True:
+            continue
+        for stage in row.get("stages", ()):
+            by_stage.setdefault(str(stage["stage"]), []).append(
+                (str(row["case_id"]), float(stage["instrumented_wall_fraction"]))
+            )
+    ranking = []
+    for stage_name, samples in by_stage.items():
+        fractions = [fraction for _, fraction in samples]
+        ranking.append(
+            {
+                "stage": stage_name,
+                "profiled_case_count": len(samples),
+                "median_instrumented_wall_fraction": statistics.median(fractions),
+                "maximum_instrumented_wall_fraction": max(fractions),
+                "case_instrumented_wall_fractions": {
+                    case_id: fraction for case_id, fraction in sorted(samples)
+                },
+            }
+        )
+    ranking.sort(key=lambda row: (-row["median_instrumented_wall_fraction"], row["stage"]))
+    return ranking
+
+
 def compare_suites(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -280,8 +572,10 @@ def compare_suites(
         baseline_seconds = before.get("median_seconds_per_step")
         candidate_seconds = after.get("median_seconds_per_step")
         speedup = None
-        if not row_blockers and _positive_finite(baseline_seconds) and _positive_finite(
-            candidate_seconds
+        if (
+            not row_blockers
+            and _positive_finite(baseline_seconds)
+            and _positive_finite(candidate_seconds)
         ):
             speedup = float(baseline_seconds) / float(candidate_seconds) - 1.0
         else:
@@ -378,8 +672,7 @@ def _run_case(
     throughputs = [
         float(sample["throughput"]["ns_per_day"])
         for sample in samples
-        if sample.get("passed")
-        and _positive_finite(sample.get("throughput", {}).get("ns_per_day"))
+        if sample.get("passed") and _positive_finite(sample.get("throughput", {}).get("ns_per_day"))
     ]
     hardware_values = [sample.get("hardware") for sample in samples]
     runtime_values = [sample.get("runtime") for sample in samples]
@@ -391,7 +684,9 @@ def _run_case(
     relative_spread = (
         (max(timings) - min(timings)) / median_seconds
         if median_seconds is not None and len(timings) > 1
-        else 0.0 if median_seconds is not None else None
+        else 0.0
+        if median_seconds is not None
+        else None
     )
     if relative_spread is not None and relative_spread > maximum_relative_spread:
         blockers.append(
@@ -423,8 +718,7 @@ def _run_case(
         "seconds_per_step_samples": timings,
         "ns_per_day_samples": throughputs,
         "raw_outputs": [
-            str(out_dir / f"repeat-{repeat:02d}.json")
-            for repeat in range(1, repeats + 1)
+            str(out_dir / f"repeat-{repeat:02d}.json") for repeat in range(1, repeats + 1)
         ],
     }
 
@@ -443,9 +737,7 @@ def _prepared_fingerprint(path: Path) -> str | None:
         return None
     metadata = json.loads(metadata_path.read_text())
     metadata.pop("created_at", None)
-    digest = hashlib.sha256(
-        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
-    )
+    digest = hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode())
     with np.load(arrays_path, allow_pickle=False) as archive:
         for name in sorted(archive.files):
             array = np.ascontiguousarray(archive[name])
@@ -494,6 +786,23 @@ def main(argv: list[str] | None = None) -> int:
         help="override each case's committed backend contract",
     )
     run_parser.add_argument("--out", type=Path, required=True)
+    profile_parser = commands.add_parser(
+        "profile",
+        help="run clean controls and synchronized whole-step stage attribution",
+    )
+    profile_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    profile_parser.add_argument("--suite", default=DEFAULT_LOCAL_SUITE)
+    profile_parser.add_argument("--case", action="append", default=[])
+    profile_parser.add_argument("--prepared", action="append", default=[])
+    profile_parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
+    profile_parser.add_argument("--measured-steps", type=int, default=DEFAULT_MEASURED_STEPS)
+    profile_parser.add_argument(
+        "--neighbor-backend",
+        choices=("mlx_cell_pairs", "mlx_cell_tiles"),
+        default=None,
+        help="override each case's committed backend contract",
+    )
+    profile_parser.add_argument("--out", type=Path, required=True)
     compare_parser = commands.add_parser("compare", help="compare baseline and candidate runs")
     compare_parser.add_argument("--baseline", type=Path, required=True)
     compare_parser.add_argument("--candidate", type=Path, required=True)
@@ -518,6 +827,17 @@ def main(argv: list[str] | None = None) -> int:
             maximum_relative_spread=args.maximum_relative_spread,
             neighbor_backend=args.neighbor_backend,
         )
+    elif args.command == "profile":
+        payload = profile_suite(
+            repo_root=args.repo_root,
+            out=args.out,
+            suite=args.suite,
+            case_ids=args.case,
+            prepared_overrides=_prepared_overrides(args.prepared),
+            warmup_steps=args.warmup_steps,
+            measured_steps=args.measured_steps,
+            neighbor_backend=args.neighbor_backend,
+        )
     else:
         payload = compare_suites(
             json.loads(args.baseline.read_text()),
@@ -540,11 +860,13 @@ __all__ = [
     "CASE_REGISTRY_PATH",
     "COMPARISON_SCHEMA",
     "MDBenchmarkCase",
+    "STAGE_PROFILE_SCHEMA",
     "SUITE_SCHEMA",
     "case_inventory",
     "compare_suites",
     "load_case_registry",
     "main",
+    "profile_suite",
     "resolve_cases",
     "run_suite",
 ]

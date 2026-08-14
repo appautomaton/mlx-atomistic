@@ -8,10 +8,12 @@ import pytest
 
 from mlx_atomistic.artifacts import load_prepared_mlx_artifact
 from mlx_atomistic.benchmarks.md_suite import (
+    STAGE_PROFILE_SCHEMA,
     SUITE_SCHEMA,
     case_inventory,
     compare_suites,
     load_case_registry,
+    profile_suite,
     resolve_cases,
     run_suite,
 )
@@ -153,6 +155,88 @@ def test_md_suite_runner_blocks_unstable_timing_samples(tmp_path: Path):
     assert any(
         blocker.startswith("timing_spread_exceeded:")
         for blocker in payload["cases"][0]["blockers"]
+    )
+
+
+def test_md_stage_profile_keeps_clean_throughput_separate_from_stage_attribution(
+    tmp_path: Path,
+):
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        instrumented = kwargs["runtime_profile"]
+        route_profile = (
+            {
+                "instrumented_wall_seconds": 10.0,
+                "accounted_route_seconds": 9.0,
+                "residual_seconds": 1.0,
+                "reconciled": True,
+                "routes": {
+                    "direct_spatial_tiles": {
+                        "wall_seconds": 4.0,
+                        "completion_seconds": 3.8,
+                        "graph_and_host_seconds": 0.2,
+                    },
+                    "neighbor_update_rebuild": {
+                        "wall_seconds": 3.0,
+                        "completion_seconds": 2.0,
+                        "graph_and_host_seconds": 1.0,
+                    },
+                    "composite_constraints_position": {
+                        "wall_seconds": 2.0,
+                        "completion_seconds": 1.8,
+                        "graph_and_host_seconds": 0.2,
+                    },
+                },
+            }
+            if instrumented
+            else {}
+        )
+        return {
+            "passed": True,
+            "blockers": [],
+            "atom_count": 23558,
+            "hardware": {"machine": "arm64"},
+            "runtime": {"mlx_version": "test", "default_device": "gpu"},
+            "timings": {
+                "seconds_per_measured_step": 0.2 if instrumented else 0.1,
+            },
+            "throughput": {"ns_per_day": 50.0 if instrumented else 100.0},
+            "state": {
+                "potential_energy_kj_mol": -1.0,
+                "kinetic_energy_kj_mol": 1.0,
+                "total_energy_kj_mol": 0.0,
+                "temperature_k": 300.0,
+                "constraint_max_error_angstrom": 1.0e-7,
+            },
+            "route_profile": route_profile,
+        }
+
+    out = tmp_path / "profile.json"
+    payload = profile_suite(
+        repo_root=Path.cwd(),
+        out=out,
+        case_ids=("dhfr-5dfr-pme",),
+        warmup_steps=2,
+        measured_steps=4,
+        runner=fake_runner,
+    )
+
+    assert payload["schema"] == STAGE_PROFILE_SCHEMA
+    assert payload["passed"] is True
+    assert [call["runtime_profile"] for call in calls] == [False, True]
+    row = payload["cases"][0]
+    assert row["clean_seconds_per_step"] == 0.1
+    assert row["instrumentation_slowdown_ratio"] == 2.0
+    assert row["dominant_stage"] == "direct_nonbonded"
+    assert row["stages"][0]["instrumented_wall_fraction"] == pytest.approx(0.4)
+    assert payload["cross_case_stage_ranking"][0]["stage"] == "direct_nonbonded"
+    assert (
+        json.loads(out.read_text())["profile_semantics"][
+            "instrumented_preserves_lazy_force_schedule"
+        ]
+        is False
     )
 
 

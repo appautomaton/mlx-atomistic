@@ -900,6 +900,32 @@ def test_dynamic_neighbor_nvt_reports_rebuilds():
     assert int(np.array(result.pair_count)[-1]) > 0
 
 
+def test_prepared_nvt_rebinds_only_when_neighbor_generation_changes():
+    positions, velocities, cell, potential = _small_system()
+    manager = NeighborListManager(cell, cutoff=2.5, skin=2.0)
+
+    result = simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        neighbor_manager=manager,
+        config=SimulationConfig(
+            dt=0.0001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+            runtime_profile=True,
+        ),
+        thermostat=LangevinThermostat(temperature=0.0, friction=0.0, seed=5),
+    )
+
+    routes = result.route_profile["routes"]
+    assert manager.rebuild_count == 1
+    assert routes["neighbor_update_rebuild"]["count"] == 4
+    assert routes["neighbor_force_binding"]["count"] == 1
+
+
 def test_nvt_runtime_profile_is_opt_in_reconciled_and_state_preserving():
     positions, velocities, cell, potential = _small_system()
     thermostat = LangevinThermostat(temperature=1.0, friction=0.2, seed=5)

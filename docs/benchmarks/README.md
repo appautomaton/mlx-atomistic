@@ -34,6 +34,7 @@ Each result file should answer, in order:
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
 | [md-suite.md](./md-suite.md) | mlx_atomistic | Canonical 5DFR/JAC local gate and extended MD suite | Metal | Apple Silicon |
+| [md-whole-step-stage-map-m5max.md](./md-whole-step-stage-map-m5max.md) | mlx_atomistic | Clean controls plus cross-system whole-step MD stage attribution | Metal | Apple M5 Max |
 | [md-current-main-sustained-openmm-m5max.md](./md-current-main-sustained-openmm-m5max.md) | mlx_atomistic/openmm-reference | Current-main sustained baseline, retained analytical SHAKE velocity kernel, and rejected candidates | Metal/OpenCL | Apple M5 Max |
 | [md-neighbor-rebuild-simd-membership-m5max.md](./md-neighbor-rebuild-simd-membership-m5max.md) | mlx_atomistic | Retained 32-lane SIMD exact-tile membership kernel and rebuild-stage profiler | Metal | Apple M5 Max |
 | [md-small-constraint-clusters-m5max.md](./md-small-constraint-clusters-m5max.md) | mlx_atomistic | Retained small-component constraint Metal kernels on 5DFR and JAC | Metal | Apple M5 Max |

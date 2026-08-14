@@ -64,6 +64,36 @@ uv run python -m mlx_atomistic.benchmarks.md_suite compare \
   --out results/md-suite/comparison.json
 ```
 
+Build a whole-step performance map before choosing an optimization target:
+
+```bash
+uv run python -m mlx_atomistic.benchmarks.md_suite profile \
+  --suite local \
+  --warmup-steps 10 \
+  --measured-steps 75 \
+  --out results/md-suite/stage-profile.json
+```
+
+The stage profile runs one clean end-to-end control and one synchronized,
+instrumented sample for every selected case. It groups the instrumented routes
+into neighbor lifecycle, direct nonbonded, reciprocal PME, constraints,
+bonded/other forces, integration, force aggregation, sparse corrections, and
+diagnostic work. `cross_case_stage_ranking` ranks the structural shares across
+all successful cases.
+
+Only the clean sample is a throughput measurement. The instrumented sample
+adds completion barriers so stages own non-overlapping work. It preserves the
+production constraint implementation, including the dense composite Metal
+route, but it cannot preserve the ordinary lazy force schedule or asynchronous
+overlap. Its fractions are therefore structural attribution inside the
+instrumented wall, not shares of the clean wall.
+
+The final clean and instrumented states are compared as a diagnostic only.
+Added synchronization can change floating-point reduction order, and long
+chaotic trajectories can separate while both runs remain individually valid.
+Each raw runtime must still pass its own finite-state, constraint, topology,
+neighbor, and execution checks.
+
 Keep power mode, thermal state, neighbor backend, and reporting cadence fixed.
 Low Power Mode is valid for a local relative comparison when it remains
 unchanged for both runs. Its absolute throughput must not be compared with a

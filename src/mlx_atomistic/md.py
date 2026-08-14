@@ -2448,7 +2448,13 @@ def _constraint_profile_name(constraint: object, operation: str) -> str:
     family = getattr(constraint, "_profile_family", None)
     if family is None:
         family = (
-            "settle" if isinstance(constraint, SettleWaterConstraints) else "generic_constraints"
+            "settle"
+            if isinstance(constraint, SettleWaterConstraints)
+            else (
+                "composite_constraints"
+                if isinstance(constraint, CompositeConstraints)
+                else "generic_constraints"
+            )
         )
     return f"{family}_{operation}"
 
@@ -2463,76 +2469,39 @@ def _profile_constraint_positions(
     reference_positions: mx.array | None = None,
     validate: bool = True,
 ) -> tuple[mx.array, mx.array]:
-    """Apply position constraints while attributing SETTLE and generic work."""
+    """Apply the production position-constraint route behind one profile barrier."""
 
-    if not isinstance(constraints, CompositeConstraints):
-        started = profiler.start()
-        if validate:
-            step_projector = getattr(constraints, "apply_position_step", None)
-            if reference_positions is None or step_projector is None:
-                constrained, error = constraints.apply_positions(
-                    predicted_positions,
-                    masses,
-                    cell,
-                )
-            else:
-                constrained, error = step_projector(
-                    reference_positions,
-                    predicted_positions,
-                    masses,
-                    cell,
-                )
-        else:
-            constrained = _project_constraint_positions_unchecked(
-                constraints,
+    started = profiler.start()
+    if validate:
+        step_projector = getattr(constraints, "apply_position_step", None)
+        if reference_positions is None or step_projector is None:
+            constrained, error = constraints.apply_positions(
                 predicted_positions,
                 masses,
                 cell,
-                reference_positions=reference_positions,
             )
-            error = _zero_constraint_error(constrained)
-        profiler.finish(
-            _constraint_profile_name(constraints, "position"),
-            started,
-            constrained,
-            error,
-        )
-        return constrained, error
-
-    constrained = as_mx_array(predicted_positions)
-    cycles = 8 if constraints._requires_iteration else 1
-    for _ in range(cycles):
-        for child in constraints.constraints:
-            started = profiler.start()
-            step_projector = getattr(child, "apply_position_step", None)
-            if reference_positions is None or step_projector is None:
-                constrained, _ = child.apply_positions(
-                    constrained,
-                    masses,
-                    cell,
-                )
-            else:
-                constrained, _ = step_projector(
-                    reference_positions,
-                    constrained,
-                    masses,
-                    cell,
-                )
-            profiler.finish(
-                _constraint_profile_name(child, "position"),
-                started,
-                constrained,
+        else:
+            constrained, error = step_projector(
+                reference_positions,
+                predicted_positions,
+                masses,
+                cell,
             )
-    if validate:
-        validation_started = profiler.start()
-        error = constraints.max_error(constrained, cell)
-        profiler.finish(
-            "constraint_validation",
-            validation_started,
-            error,
-        )
     else:
+        constrained = _project_constraint_positions_unchecked(
+            constraints,
+            predicted_positions,
+            masses,
+            cell,
+            reference_positions=reference_positions,
+        )
         error = _zero_constraint_error(constrained)
+    profiler.finish(
+        _constraint_profile_name(constraints, "position"),
+        started,
+        constrained,
+        error,
+    )
     return constrained, error
 
 
@@ -2544,49 +2513,20 @@ def _profile_constraint_pre_force_velocities(
     cell: Cell | None,
     profiler: _ExclusiveRouteProfiler,
 ) -> mx.array:
-    """Apply the pre-force velocity projection with exclusive attribution."""
+    """Apply the production pre-force projection behind one profile barrier."""
 
-    if not isinstance(constraints, CompositeConstraints):
-        projector = getattr(
-            constraints,
-            "_apply_pre_force_velocities",
-            constraints.apply_velocities,
-        )
-        started = profiler.start()
-        constrained = projector(positions, velocities, masses, cell)
-        profiler.finish(
-            _constraint_profile_name(constraints, "pre_force_velocity"),
-            started,
-            constrained,
-        )
-        return constrained
-
-    if constraints._requires_iteration:
-        return _profile_constraint_velocities(
-            constraints,
-            positions,
-            velocities,
-            masses,
-            cell,
-            profiler,
-            operation="pre_force_velocity",
-        )
-    constrained = as_mx_array(velocities)
-    for child in constraints.constraints:
-        if isinstance(child, SettleWaterConstraints):
-            continue
-        started = profiler.start()
-        constrained = child.apply_velocities(
-            positions,
-            constrained,
-            masses,
-            cell,
-        )
-        profiler.finish(
-            _constraint_profile_name(child, "pre_force_velocity"),
-            started,
-            constrained,
-        )
+    projector = getattr(
+        constraints,
+        "_apply_pre_force_velocities",
+        constraints.apply_velocities,
+    )
+    started = profiler.start()
+    constrained = projector(positions, velocities, masses, cell)
+    profiler.finish(
+        _constraint_profile_name(constraints, "pre_force_velocity"),
+        started,
+        constrained,
+    )
     return constrained
 
 
@@ -2600,39 +2540,20 @@ def _profile_constraint_velocities(
     *,
     operation: str = "velocity",
 ) -> mx.array:
-    """Apply final velocity constraints with SETTLE/generic attribution."""
+    """Apply the production final velocity route behind one profile barrier."""
 
-    if not isinstance(constraints, CompositeConstraints):
-        started = profiler.start()
-        constrained = constraints.apply_velocities(
-            positions,
-            velocities,
-            masses,
-            cell,
-        )
-        profiler.finish(
-            _constraint_profile_name(constraints, operation),
-            started,
-            constrained,
-        )
-        return constrained
-
-    constrained = as_mx_array(velocities)
-    cycles = 8 if constraints._requires_iteration else 1
-    for _ in range(cycles):
-        for child in constraints.constraints:
-            started = profiler.start()
-            constrained = child.apply_velocities(
-                positions,
-                constrained,
-                masses,
-                cell,
-            )
-            profiler.finish(
-                _constraint_profile_name(child, operation),
-                started,
-                constrained,
-            )
+    started = profiler.start()
+    constrained = constraints.apply_velocities(
+        positions,
+        velocities,
+        masses,
+        cell,
+    )
+    profiler.finish(
+        _constraint_profile_name(constraints, operation),
+        started,
+        constrained,
+    )
     return constrained
 
 
@@ -3222,6 +3143,7 @@ def simulate_nve(
     force_binding = (
         None if prepared_force_pipeline is None else prepared_force_pipeline.bind(neighbor_list)
     )
+    bound_neighbor_list = neighbor_list if force_binding is not None else None
     if neighbor_list is None:
         pairs = None
     elif (
@@ -3375,8 +3297,9 @@ def simulate_nve(
         neighbor_list = (
             neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
         )
-        if prepared_force_pipeline is not None:
+        if prepared_force_pipeline is not None and neighbor_list is not bound_neighbor_list:
             force_binding = prepared_force_pipeline.bind(neighbor_list)
+            bound_neighbor_list = neighbor_list
         pairs = (
             None if neighbor_list is None else neighbor_list.force_candidates(prefer_tiles=False)
         )
@@ -3767,6 +3690,7 @@ def _simulate_nvt(
     force_binding = (
         None if prepared_force_pipeline is None else prepared_force_pipeline.bind(neighbor_list)
     )
+    bound_neighbor_list = neighbor_list if force_binding is not None else None
     if binding_started is not None:
         route_profiler.finish(
             "neighbor_force_binding",
@@ -4572,9 +4496,10 @@ def _simulate_nvt(
                 eval_positions,
                 _neighbor_profile_values(neighbor_list),
             )
-        if prepared_force_pipeline is not None:
+        if prepared_force_pipeline is not None and neighbor_list is not bound_neighbor_list:
             binding_started = None if route_profiler is None else route_profiler.start()
             force_binding = prepared_force_pipeline.bind(neighbor_list)
+            bound_neighbor_list = neighbor_list
             if binding_started is not None:
                 route_profiler.finish(
                     "neighbor_force_binding",

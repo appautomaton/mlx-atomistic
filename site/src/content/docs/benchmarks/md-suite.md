@@ -28,7 +28,18 @@ uv run python -m mlx_atomistic.benchmarks.md_suite list
 uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --suite local \
   --out results/md-suite/current.json
+
+uv run python -m mlx_atomistic.benchmarks.md_suite profile \
+  --suite local \
+  --out results/md-suite/stage-profile.json
 ```
+
+The profile command pairs a clean throughput control with synchronized,
+exclusive stage attribution. It preserves the production constraint route, but
+the added completion barriers do not preserve normal lazy force overlap.
+Instrumented stage fractions are structural rankings, not clean-wall shares.
+Final-state closeness is diagnostic only because long chaotic trajectories can
+separate after synchronization changes floating-point reduction order.
 
 The release registry additionally includes a JAC scaling ladder, deterministic
 30,000- and 90,000-atom TIP3P water boxes, the official 92,224-atom OpenMM
