@@ -429,6 +429,7 @@ _aligned_topology_lj_scales_kernel_singleton = None
 _neighbor_cell_pair_candidates_kernel_singleton = None
 _neighbor_pair_cutoff_mask_kernel_singleton = None
 _neighbor_pair_ordered_scatter_kernel_singleton = None
+_neighbor_cell_atom_blocks_kernel_singleton = None
 _neighbor_cell_tile_candidates_kernel_singleton = None
 _neighbor_tile_membership_kernel_singleton = None
 _neighbor_tile_ordered_scatter_kernel_singleton = None
@@ -2409,6 +2410,27 @@ _NEIGHBOR_PAIR_ORDERED_SCATTER_SOURCE = r"""
     accepted_j[out] = max(i, j);
 """
 
+_NEIGHBOR_CELL_ATOM_BLOCKS_SOURCE = r"""
+    uint cell = thread_position_in_grid.x;
+    if (cell >= (uint)counts[0]) {
+        return;
+    }
+
+    int atom_start = cell_starts[cell];
+    int atom_count = cell_counts[cell];
+    int block_start = cell_block_starts[cell];
+    int block_count = cell_block_counts[cell];
+    for (int local_block = 0; local_block < block_count; ++local_block) {
+        int block = block_start + local_block;
+        for (int slot = 0; slot < 8; ++slot) {
+            int local_atom = 8 * local_block + slot;
+            atom_blocks[8 * block + slot] = local_atom < atom_count
+                ? sorted_atoms[atom_start + local_atom]
+                : -1;
+        }
+    }
+"""
+
 _NEIGHBOR_CELL_TILE_CANDIDATES_SOURCE = r"""
     uint task = thread_position_in_grid.x;
     if (task >= (uint)counts[0]) {
@@ -4048,6 +4070,27 @@ def _neighbor_cell_tile_candidates_kernel():
     return _neighbor_cell_tile_candidates_kernel_singleton
 
 
+def _neighbor_cell_atom_blocks_kernel():
+    """Return the cached device-resident cell-to-atom-block kernel."""
+
+    global _neighbor_cell_atom_blocks_kernel_singleton
+    if _neighbor_cell_atom_blocks_kernel_singleton is None:
+        _neighbor_cell_atom_blocks_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_cell_atom_blocks",
+            input_names=[
+                "sorted_atoms",
+                "cell_starts",
+                "cell_counts",
+                "cell_block_starts",
+                "cell_block_counts",
+                "counts",
+            ],
+            output_names=["atom_blocks"],
+            source=_NEIGHBOR_CELL_ATOM_BLOCKS_SOURCE,
+        )
+    return _neighbor_cell_atom_blocks_kernel_singleton
+
+
 def _neighbor_tile_membership_kernel():
     """Return the cached coarse-tile membership and subdivision kernel."""
 
@@ -4530,6 +4573,58 @@ def _neighbor_cell_pair_candidates(
         threadgroup=(threads, 1, 1),
     )
     return pairs_i, pairs_j
+
+
+def _neighbor_cell_atom_blocks_sized(
+    sorted_atoms: mx.array,
+    cell_starts: mx.array,
+    cell_counts: mx.array,
+    cell_block_starts: mx.array,
+    cell_block_counts: mx.array,
+    *,
+    block_capacity: int,
+) -> mx.array:
+    """Scatter cell-sorted atoms into padded eight-atom blocks on Metal."""
+
+    sorted_atoms = as_mx_array(sorted_atoms, dtype=mx.int32)
+    cell_starts = as_mx_array(cell_starts, dtype=mx.int32)
+    cell_counts = as_mx_array(cell_counts, dtype=mx.int32)
+    cell_block_starts = as_mx_array(cell_block_starts, dtype=mx.int32)
+    cell_block_counts = as_mx_array(cell_block_counts, dtype=mx.int32)
+    cell_count = int(cell_counts.shape[0])
+    for name, values in (
+        ("cell_starts", cell_starts),
+        ("cell_block_starts", cell_block_starts),
+        ("cell_block_counts", cell_block_counts),
+    ):
+        if values.shape != (cell_count,):
+            msg = f"{name} must contain one value per cell"
+            raise ValueError(msg)
+    if sorted_atoms.ndim != 1:
+        msg = "sorted_atoms must be one-dimensional"
+        raise ValueError(msg)
+    if block_capacity < 0:
+        msg = "block_capacity must be non-negative"
+        raise ValueError(msg)
+    if cell_count == 0 or block_capacity == 0:
+        return mx.zeros((0, _TILE_BUILD_BLOCK_SIZE), dtype=mx.int32)
+    threads = min(256, cell_count)
+    (atom_blocks,) = _neighbor_cell_atom_blocks_kernel()(
+        inputs=[
+            sorted_atoms,
+            cell_starts,
+            cell_counts,
+            cell_block_starts,
+            cell_block_counts,
+            mx.array([cell_count], dtype=mx.int32),
+        ],
+        output_shapes=[(block_capacity, _TILE_BUILD_BLOCK_SIZE)],
+        output_dtypes=[mx.int32],
+        grid=(cell_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=-1,
+    )
+    return atom_blocks
 
 
 def _neighbor_cell_tile_candidates(

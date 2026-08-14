@@ -24,6 +24,7 @@ from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
     _TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK,
     _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR,
+    _neighbor_cell_atom_blocks_sized,
     _neighbor_cell_pair_candidates,
     _neighbor_cell_tile_candidates,
     _neighbor_pair_ordered_scatter_sized,
@@ -1596,88 +1597,108 @@ def _build_mlx_spatial_cell_tile_list(
         .add(mx.ones((n_atoms,), dtype=mx.int32))
     )
     mx.eval(sorted_atoms, cell_counts_mx)
-    cell_counts = np.asarray(cell_counts_mx, dtype=np.int32)
     finish_stage("cell_assignment_sort")
-    cell_starts = np.empty_like(cell_counts)
-    if cell_count:
-        cell_starts[0] = 0
-        np.cumsum(cell_counts[:-1], dtype=np.int64, out=cell_starts[1:])
-
-    cell_block_counts = (
-        cell_counts + DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE - 1
+    cell_prefix = mx.cumsum(cell_counts_mx)
+    cell_starts_mx = cell_prefix - cell_counts_mx
+    cell_block_counts_mx = (
+        cell_counts_mx + DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE - 1
     ) // DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE
-    cell_block_starts = np.empty_like(cell_block_counts)
-    if cell_count:
-        cell_block_starts[0] = 0
-        np.cumsum(
-            cell_block_counts[:-1],
-            dtype=np.int64,
-            out=cell_block_starts[1:],
-        )
-    block_count = int(np.sum(cell_block_counts, dtype=np.int64))
-    if block_count:
-        block_cells = np.repeat(
-            np.arange(cell_count, dtype=np.int32),
-            cell_block_counts,
-        )
-        block_local = np.arange(block_count, dtype=np.int32) - np.repeat(
-            cell_block_starts,
-            cell_block_counts,
-        )
-        block_cells_mx = mx.array(block_cells, dtype=mx.int32)
-        within_cell = (
-            mx.array(
-                block_local * DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE,
-                dtype=mx.int32,
-            )[:, None]
-            + mx.arange(DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE, dtype=mx.int32)[None, :]
-        )
-        sorted_offsets = (
-            mx.array(cell_starts, dtype=mx.int32)[block_cells_mx][:, None] + within_cell
-        )
-        valid = within_cell < cell_counts_mx[block_cells_mx][:, None]
-        safe_offsets = mx.minimum(sorted_offsets, n_atoms - 1)
-        atom_blocks = mx.where(
-            valid,
-            sorted_atoms[safe_offsets],
-            mx.array(-1, dtype=mx.int32),
-        ).astype(mx.int32)
-    else:
-        atom_blocks = mx.zeros(
-            (0, DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE),
-            dtype=mx.int32,
-        )
+    cell_block_prefix = mx.cumsum(cell_block_counts_mx)
+    cell_block_starts_mx = cell_block_prefix - cell_block_counts_mx
 
-    task_left, task_right, task_atom_candidate_counts = _spatial_cell_pair_tasks(
-        cell_counts,
+    # Geometry fixes the possible cell-pair tasks, while occupancy only changes
+    # their counts. Keep the dynamic inventory and its prefix offsets on device;
+    # the host reads four counts plus an overflow guard instead of materializing
+    # every cell count.
+    task_left_np, task_right_np, task_same_np = _spatial_cell_pair_template(
         n_cells,
-        cell_widths,
-        search_radius=search_radius,
+        tuple(float(value) for value in cell_widths),
+        float(search_radius),
     )
-    left_block_counts = cell_block_counts[task_left].astype(np.int64)
-    right_block_counts = cell_block_counts[task_right].astype(np.int64)
-    task_tile_counts = left_block_counts * right_block_counts
-    same_cell = task_left == task_right
-    same_counts = left_block_counts[same_cell]
-    task_tile_counts[same_cell] = same_counts * (same_counts + 1) // 2
-    candidate_tile_count = int(np.sum(task_tile_counts, dtype=np.int64))
-    if candidate_tile_count > np.iinfo(np.int32).max:
-        msg = "spatial tile candidate count exceeds int32 capacity"
+    task_left_mx = mx.array(task_left_np, dtype=mx.int32)
+    task_right_mx = mx.array(task_right_np, dtype=mx.int32)
+    task_same_mx = mx.array(task_same_np)
+    left_block_counts = cell_block_counts_mx[task_left_mx]
+    right_block_counts = cell_block_counts_mx[task_right_mx]
+    task_tile_counts = mx.where(
+        task_same_mx,
+        left_block_counts * (left_block_counts + 1) // 2,
+        left_block_counts * right_block_counts,
+    ).astype(mx.int32)
+
+    left_atom_counts = cell_counts_mx[task_left_mx]
+    right_atom_counts = cell_counts_mx[task_right_mx]
+    task_atom_candidate_counts = mx.where(
+        task_same_mx,
+        left_atom_counts * mx.maximum(left_atom_counts - 1, 0) // 2,
+        left_atom_counts * right_atom_counts,
+    ).astype(mx.int32)
+    task_tile_counts = mx.where(
+        task_atom_candidate_counts > 0,
+        task_tile_counts,
+        mx.array(0, dtype=mx.int32),
+    )
+    task_tile_prefix = mx.cumsum(task_tile_counts)
+    task_offsets = task_tile_prefix - task_tile_counts
+    task_atom_candidate_prefix = mx.cumsum(task_atom_candidate_counts)
+    inventory_overflow = (
+        mx.any(cell_block_counts_mx < 0)
+        | mx.any(cell_block_prefix < 0)
+        | mx.any(task_tile_counts < 0)
+        | mx.any(task_tile_prefix < 0)
+        | mx.any(task_atom_candidate_counts < 0)
+        | mx.any(task_atom_candidate_prefix < 0)
+    )
+    inventory = mx.stack(
+        (
+            cell_block_prefix[-1],
+            task_tile_prefix[-1],
+            task_atom_candidate_prefix[-1],
+            mx.sum(cell_counts_mx > 0),
+            inventory_overflow.astype(mx.int32),
+        )
+    )
+    mx.eval(inventory)
+    (
+        coarse_block_count,
+        candidate_tile_count,
+        raw_candidate_count,
+        occupied_cell_count,
+        inventory_overflowed,
+    ) = (int(value) for value in np.asarray(inventory))
+    if inventory_overflowed:
+        msg = "spatial tile inventory exceeds int32 capacity"
         raise ValueError(msg)
-    task_offsets = np.empty((task_tile_counts.shape[0],), dtype=np.int32)
-    if task_offsets.size:
-        task_offsets[0] = 0
-        np.cumsum(task_tile_counts[:-1], dtype=np.int64, out=task_offsets[1:])
-    cell_pairs = np.stack((task_left, task_right), axis=1).astype(
-        np.int32,
-        copy=False,
+    # A fixed upper bound avoids another host read before atom-block emission.
+    # Rows beyond coarse_block_count remain -1 and are never referenced by a
+    # candidate tile; later force inventories simply see zero columns for them.
+    block_capacity = (
+        0
+        if n_atoms == 0
+        else (
+            n_atoms
+            + (DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE - 1) * cell_count
+        )
+        // DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE
     )
+    if coarse_block_count > block_capacity:
+        msg = "device cell-block inventory exceeds its static capacity"
+        raise RuntimeError(msg)
+    atom_blocks = _neighbor_cell_atom_blocks_sized(
+        sorted_atoms,
+        cell_starts_mx,
+        cell_counts_mx,
+        cell_block_starts_mx,
+        cell_block_counts_mx,
+        block_capacity=block_capacity,
+    )
+    cell_pairs = mx.stack((task_left_mx, task_right_mx), axis=1)
     finish_stage("host_task_inventory", atom_blocks)
     candidate_tiles = _neighbor_cell_tile_candidates(
-        mx.array(cell_block_starts, dtype=mx.int32),
-        mx.array(cell_block_counts, dtype=mx.int32),
-        mx.array(cell_pairs, dtype=mx.int32),
-        mx.array(task_offsets, dtype=mx.int32),
+        cell_block_starts_mx,
+        cell_block_counts_mx,
+        cell_pairs,
+        task_offsets,
         candidate_count=candidate_tile_count,
     )
     candidate_subtile_mask, member_counts, subtile_counts = _neighbor_tile_membership(
@@ -1778,7 +1799,6 @@ def _build_mlx_spatial_cell_tile_list(
     )
     finish_stage("force_schedule_scatter")
 
-    raw_candidate_count = int(np.sum(task_atom_candidate_counts, dtype=np.int64))
     tiles = NeighborTiles(
         atom_blocks=atom_blocks,
         tile_blocks=tile_blocks,
@@ -1797,7 +1817,7 @@ def _build_mlx_spatial_cell_tile_list(
         pair_count=exact_pair_count,
         n_cells=n_cells,
         cell_count=cell_count,
-        occupied_cell_count=int(np.count_nonzero(cell_counts)),
+        occupied_cell_count=occupied_cell_count,
         search_radius=search_radius,
         estimated_pair_bytes=tiles.estimated_bytes,
         estimated_cell_list_bytes=estimated_cell_list_bytes,

@@ -77,6 +77,14 @@ atom. Each active tile pair therefore scans only that atom's short topology row
 instead of binary-searching the complete global pair array after every neighbor
 rebuild. The packed masks consumed by the direct-force kernel are unchanged.
 
+The spatial-tile builder keeps dynamic cell occupancy and task inventory on the
+device as well. A fixed geometry supplies a cached cell-pair template; device
+prefix sums derive cell starts, block starts, active task offsets, and candidate
+counts. A Metal kernel scatters sorted atoms into padded build blocks, and only
+four final inventory counts plus one overflow guard return to the host for sized
+output allocation and reporting. Exact tile membership and the recurring force
+schedule are unchanged.
+
 For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
 large-system route uses `mlx_cell_pairs`. The historical implementation used
 CPU-side periodic bins and candidate arrays; the current Metal route uses a
