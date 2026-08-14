@@ -53,7 +53,13 @@ later retained route instead creates blocks from spatial order and groups
 same-left tiles, while preserving canonical atom indices at force scatter.
 
 The current production path also uses specialized rigid-water/constraint
-kernels and one fused standard-bonded force dispatch. The charged-PME
+kernels and one fused standard-bonded force dispatch. Generic distance graphs
+whose connected components fit within four atoms and three pairs now use a
+component-owned Metal kernel; larger graphs retain the MLX fallback. This
+removes the large repeated scatter graph when molecule identity is unavailable,
+as documented in
+[`md-small-constraint-clusters-m5max.md`](./benchmarks/md-small-constraint-clusters-m5max.md).
+The charged-PME
 development runner now selects spatial tiles inside its narrow supported
 envelope and fails its profile gate on a compact-pair fallback. The production
 runner uses the same conservative envelope and records the selected backend in

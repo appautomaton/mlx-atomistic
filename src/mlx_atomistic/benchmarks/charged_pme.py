@@ -60,6 +60,11 @@ def _constraint_route_inventory(
             "pair_count": 0,
             "peripheral_count_histogram": {},
         },
+        "small_constraint_clusters": {
+            "object_count": 0,
+            "cluster_count": 0,
+            "pair_count": 0,
+        },
         "generic": {"object_count": 0, "pair_count": 0},
     }
 
@@ -80,6 +85,11 @@ def _constraint_route_inventory(
             for count in np.asarray(constraint.peripheral_counts, dtype=np.int32):
                 key = str(int(count))
                 histogram[key] = int(histogram.get(key, 0)) + 1
+        elif family == "small_constraint_clusters":
+            route = routes["small_constraint_clusters"]
+            route["object_count"] += 1
+            route["cluster_count"] += int(constraint._small_cluster_atoms.shape[0])
+            route["pair_count"] += pair_count
         elif hasattr(constraint, "waters"):
             route = routes["settle"]
             route["object_count"] += 1
@@ -97,7 +107,12 @@ def _constraint_route_inventory(
         0 if constraints is None else int(constraints.pairs.shape[0])
     )
     water_route_complete = water_atom_count == 0 or (
-        molecule_ids_present and int(routes["settle"]["pair_count"]) > 0
+        (molecule_ids_present and int(routes["settle"]["pair_count"]) > 0)
+        or (
+            expected_pair_count > 0
+            and int(routes["small_constraint_clusters"]["pair_count"])
+            == expected_pair_count
+        )
     )
     return {
         "routes": routes,

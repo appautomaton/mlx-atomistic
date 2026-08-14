@@ -360,6 +360,8 @@ _settle_water_position_kernel_singleton = None
 _settle_water_velocity_kernel_singleton = None
 _langevin_baoab_drift_kernel_singleton = None
 _dense_constraint_apply_kernel_singleton = None
+_small_constraint_cluster_position_kernel_singleton = None
+_small_constraint_cluster_velocity_kernel_singleton = None
 _fused_bonded_force_only_kernel_singleton = None
 
 # Neighbor compaction preserves short runs of a common left atom, so one worker
@@ -2614,6 +2616,168 @@ _DENSE_CONSTRAINT_APPLY_SOURCE = r"""
     constrained[3 * atom + 2] = value.z;
 """
 
+_SMALL_CONSTRAINT_CLUSTER_POSITION_SOURCE = r"""
+    uint cluster = thread_position_in_grid.x;
+    if (cluster >= (uint)params[0]) {
+        return;
+    }
+    int atom_count = atom_counts[cluster];
+    int pair_count = pair_counts[cluster];
+    int iterations = params[1];
+    int periodic = params[2];
+    float3 reference[4];
+    float3 original[4];
+    float3 current[4];
+    float inverse_mass[4];
+    float3 reference_delta[3];
+
+    for (int slot = 0; slot < 4; slot++) {
+        bool valid = slot < atom_count;
+        int atom = valid ? cluster_atoms[4 * cluster + slot] : 0;
+        reference[slot] = constraint_load3(reference_positions, atom);
+        original[slot] = constraint_load3(predicted_positions, atom);
+        current[slot] = original[slot];
+        inverse_mass[slot] = valid ? 1.0f / masses[atom] : 0.0f;
+    }
+    for (int pair = 0; pair < 3; pair++) {
+        int left_slot = pair_slots[6 * cluster + 2 * pair + 0];
+        int right_slot = pair_slots[6 * cluster + 2 * pair + 1];
+        reference_delta[pair] = pair < pair_count
+            ? constraint_minimum_image(
+                reference[left_slot] - reference[right_slot],
+                box,
+                periodic
+            )
+            : float3(0.0f);
+    }
+
+    for (int iteration = 0; iteration < iterations; iteration++) {
+        float3 correction[4] = {
+            float3(0.0f),
+            float3(0.0f),
+            float3(0.0f),
+            float3(0.0f)
+        };
+        for (int pair = 0; pair < pair_count; pair++) {
+            int left_slot = pair_slots[6 * cluster + 2 * pair + 0];
+            int right_slot = pair_slots[6 * cluster + 2 * pair + 1];
+            float3 displacement = constraint_minimum_image(
+                current[left_slot] - current[right_slot],
+                box,
+                periodic
+            );
+            float target = target_distances[3 * cluster + pair];
+            float error_squared = target * target - dot(displacement, displacement);
+            float inverse_mass_sum =
+                inverse_mass[left_slot] + inverse_mass[right_slot];
+            float denominator = 2.0f * inverse_mass_sum
+                * dot(displacement, reference_delta[pair]);
+            float safe_denominator = abs(denominator) > 1.0e-20f
+                ? denominator
+                : (denominator < 0.0f ? -1.0e-20f : 1.0e-20f);
+            float multiplier = error_squared / safe_denominator;
+            float3 pair_correction = multiplier * reference_delta[pair];
+            correction[left_slot] += inverse_mass[left_slot] * pair_correction;
+            correction[right_slot] -= inverse_mass[right_slot] * pair_correction;
+        }
+        for (int slot = 0; slot < atom_count; slot++) {
+            current[slot] += correction[slot];
+        }
+    }
+
+    for (int slot = 0; slot < 4; slot++) {
+        uint output = 12u * cluster + 3u * (uint)slot;
+        float3 delta = slot < atom_count
+            ? current[slot] - original[slot]
+            : float3(0.0f);
+        deltas[output + 0] = delta.x;
+        deltas[output + 1] = delta.y;
+        deltas[output + 2] = delta.z;
+    }
+"""
+
+_SMALL_CONSTRAINT_CLUSTER_VELOCITY_SOURCE = r"""
+    uint cluster = thread_position_in_grid.x;
+    if (cluster >= (uint)params[0]) {
+        return;
+    }
+    int atom_count = atom_counts[cluster];
+    int pair_count = pair_counts[cluster];
+    int iterations = params[1];
+    int periodic = params[2];
+    float3 original[4];
+    float3 current[4];
+    float inverse_mass[4];
+    float3 unit[3];
+    float weight_left[3];
+    float weight_right[3];
+
+    for (int slot = 0; slot < 4; slot++) {
+        bool valid = slot < atom_count;
+        int atom = valid ? cluster_atoms[4 * cluster + slot] : 0;
+        original[slot] = constraint_load3(velocities, atom);
+        current[slot] = original[slot];
+        inverse_mass[slot] = valid ? 1.0f / masses[atom] : 0.0f;
+    }
+    for (int pair = 0; pair < 3; pair++) {
+        int left_slot = pair_slots[6 * cluster + 2 * pair + 0];
+        int right_slot = pair_slots[6 * cluster + 2 * pair + 1];
+        if (pair < pair_count) {
+            int left_atom = cluster_atoms[4 * cluster + left_slot];
+            int right_atom = cluster_atoms[4 * cluster + right_slot];
+            float3 displacement = constraint_minimum_image(
+                constraint_load3(positions, left_atom)
+                    - constraint_load3(positions, right_atom),
+                box,
+                periodic
+            );
+            unit[pair] = constraint_safe_normalize(displacement);
+            float inverse_mass_sum =
+                inverse_mass[left_slot] + inverse_mass[right_slot];
+            weight_left[pair] = inverse_mass[left_slot] / inverse_mass_sum;
+            weight_right[pair] = inverse_mass[right_slot] / inverse_mass_sum;
+        }
+        else {
+            unit[pair] = float3(0.0f);
+            weight_left[pair] = 0.0f;
+            weight_right[pair] = 0.0f;
+        }
+    }
+
+    for (int iteration = 0; iteration < iterations; iteration++) {
+        float3 correction[4] = {
+            float3(0.0f),
+            float3(0.0f),
+            float3(0.0f),
+            float3(0.0f)
+        };
+        for (int pair = 0; pair < pair_count; pair++) {
+            int left_slot = pair_slots[6 * cluster + 2 * pair + 0];
+            int right_slot = pair_slots[6 * cluster + 2 * pair + 1];
+            float relative = dot(
+                current[left_slot] - current[right_slot],
+                unit[pair]
+            );
+            float3 pair_correction = relative * unit[pair];
+            correction[left_slot] -= weight_left[pair] * pair_correction;
+            correction[right_slot] += weight_right[pair] * pair_correction;
+        }
+        for (int slot = 0; slot < atom_count; slot++) {
+            current[slot] += correction[slot];
+        }
+    }
+
+    for (int slot = 0; slot < 4; slot++) {
+        uint output = 12u * cluster + 3u * (uint)slot;
+        float3 delta = slot < atom_count
+            ? current[slot] - original[slot]
+            : float3(0.0f);
+        deltas[output + 0] = delta.x;
+        deltas[output + 1] = delta.y;
+        deltas[output + 2] = delta.z;
+    }
+"""
+
 _SETTLE_WATER_POSITION_SOURCE = r"""
     uint water = thread_position_in_grid.x;
     if (water >= (uint)params[0]) {
@@ -3862,6 +4026,57 @@ def _shake_cluster_velocity_kernel():
     return _shake_cluster_velocity_kernel_singleton
 
 
+def _small_constraint_cluster_position_kernel():
+    """Return the cached small-component position-constraint kernel."""
+
+    global _small_constraint_cluster_position_kernel_singleton
+    if _small_constraint_cluster_position_kernel_singleton is None:
+        _small_constraint_cluster_position_kernel_singleton = mx.fast.metal_kernel(
+            name="small_constraint_cluster_position",
+            input_names=[
+                "reference_positions",
+                "predicted_positions",
+                "masses",
+                "cluster_atoms",
+                "atom_counts",
+                "pair_slots",
+                "pair_counts",
+                "target_distances",
+                "box",
+                "params",
+            ],
+            output_names=["deltas"],
+            source=_SMALL_CONSTRAINT_CLUSTER_POSITION_SOURCE,
+            header=_CONSTRAINT_HEADER,
+        )
+    return _small_constraint_cluster_position_kernel_singleton
+
+
+def _small_constraint_cluster_velocity_kernel():
+    """Return the cached small-component velocity-constraint kernel."""
+
+    global _small_constraint_cluster_velocity_kernel_singleton
+    if _small_constraint_cluster_velocity_kernel_singleton is None:
+        _small_constraint_cluster_velocity_kernel_singleton = mx.fast.metal_kernel(
+            name="small_constraint_cluster_velocity",
+            input_names=[
+                "positions",
+                "velocities",
+                "masses",
+                "cluster_atoms",
+                "atom_counts",
+                "pair_slots",
+                "pair_counts",
+                "box",
+                "params",
+            ],
+            output_names=["deltas"],
+            source=_SMALL_CONSTRAINT_CLUSTER_VELOCITY_SOURCE,
+            header=_CONSTRAINT_HEADER,
+        )
+    return _small_constraint_cluster_velocity_kernel_singleton
+
+
 def _settle_water_position_kernel():
     """Return the cached analytical SETTLE position kernel."""
 
@@ -4586,6 +4801,147 @@ def _neighbor_pair_ordered_scatter_sized(
         init_value=0,
     )
     return accepted_i, accepted_j
+
+
+def _small_constraint_cluster_position_deltas(
+    reference_positions: mx.array,
+    predicted_positions: mx.array,
+    masses: mx.array,
+    cluster_atoms: mx.array,
+    atom_counts: mx.array,
+    pair_slots: mx.array,
+    pair_counts: mx.array,
+    target_distances: mx.array,
+    box_lengths: mx.array,
+    *,
+    max_iterations: int,
+    periodic: bool,
+) -> mx.array:
+    """Return position deltas for disjoint constraint components of up to four atoms."""
+
+    reference_positions = as_mx_array(reference_positions, dtype=mx.float32)
+    predicted_positions = as_mx_array(predicted_positions, dtype=mx.float32)
+    masses = as_mx_array(masses, dtype=mx.float32)
+    cluster_atoms = as_mx_array(cluster_atoms, dtype=mx.int32)
+    atom_counts = as_mx_array(atom_counts, dtype=mx.int32)
+    pair_slots = as_mx_array(pair_slots, dtype=mx.int32)
+    pair_counts = as_mx_array(pair_counts, dtype=mx.int32)
+    target_distances = as_mx_array(target_distances, dtype=mx.float32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    if reference_positions.shape != predicted_positions.shape:
+        raise ValueError("reference and predicted positions must have matching shapes")
+    if predicted_positions.ndim != 2 or predicted_positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    if masses.shape != (predicted_positions.shape[0],):
+        raise ValueError("masses must have shape (n_atoms,)")
+    if cluster_atoms.ndim != 2 or cluster_atoms.shape[1] != 4:
+        raise ValueError("cluster_atoms must have shape (n_clusters, 4)")
+    cluster_count = int(cluster_atoms.shape[0])
+    if atom_counts.shape != (cluster_count,):
+        raise ValueError("atom_counts must have shape (n_clusters,)")
+    if pair_slots.shape != (cluster_count, 3, 2):
+        raise ValueError("pair_slots must have shape (n_clusters, 3, 2)")
+    if pair_counts.shape != (cluster_count,):
+        raise ValueError("pair_counts must have shape (n_clusters,)")
+    if target_distances.shape != (cluster_count, 3):
+        raise ValueError("target_distances must have shape (n_clusters, 3)")
+    if box_lengths.shape != (3,):
+        raise ValueError("box_lengths must have shape (3,)")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+    if cluster_count == 0:
+        return mx.zeros((0, 4, 3), dtype=mx.float32)
+    (deltas,) = _small_constraint_cluster_position_kernel()(
+        inputs=[
+            reference_positions,
+            predicted_positions,
+            masses,
+            cluster_atoms,
+            atom_counts,
+            pair_slots,
+            pair_counts,
+            target_distances,
+            box_lengths,
+            mx.array(
+                [cluster_count, max_iterations, int(periodic)],
+                dtype=mx.int32,
+            ),
+        ],
+        output_shapes=[(cluster_count, 4, 3)],
+        output_dtypes=[mx.float32],
+        grid=(cluster_count, 1, 1),
+        threadgroup=(min(256, cluster_count), 1, 1),
+        init_value=0.0,
+    )
+    return deltas
+
+
+def _small_constraint_cluster_velocity_deltas(
+    positions: mx.array,
+    velocities: mx.array,
+    masses: mx.array,
+    cluster_atoms: mx.array,
+    atom_counts: mx.array,
+    pair_slots: mx.array,
+    pair_counts: mx.array,
+    box_lengths: mx.array,
+    *,
+    max_iterations: int,
+    periodic: bool,
+) -> mx.array:
+    """Return velocity deltas for disjoint components of up to four atoms."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    velocities = as_mx_array(velocities, dtype=mx.float32)
+    masses = as_mx_array(masses, dtype=mx.float32)
+    cluster_atoms = as_mx_array(cluster_atoms, dtype=mx.int32)
+    atom_counts = as_mx_array(atom_counts, dtype=mx.int32)
+    pair_slots = as_mx_array(pair_slots, dtype=mx.int32)
+    pair_counts = as_mx_array(pair_counts, dtype=mx.int32)
+    box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
+    if positions.shape != velocities.shape:
+        raise ValueError("positions and velocities must have matching shapes")
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    if masses.shape != (positions.shape[0],):
+        raise ValueError("masses must have shape (n_atoms,)")
+    if cluster_atoms.ndim != 2 or cluster_atoms.shape[1] != 4:
+        raise ValueError("cluster_atoms must have shape (n_clusters, 4)")
+    cluster_count = int(cluster_atoms.shape[0])
+    if atom_counts.shape != (cluster_count,):
+        raise ValueError("atom_counts must have shape (n_clusters,)")
+    if pair_slots.shape != (cluster_count, 3, 2):
+        raise ValueError("pair_slots must have shape (n_clusters, 3, 2)")
+    if pair_counts.shape != (cluster_count,):
+        raise ValueError("pair_counts must have shape (n_clusters,)")
+    if box_lengths.shape != (3,):
+        raise ValueError("box_lengths must have shape (3,)")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+    if cluster_count == 0:
+        return mx.zeros((0, 4, 3), dtype=mx.float32)
+    (deltas,) = _small_constraint_cluster_velocity_kernel()(
+        inputs=[
+            positions,
+            velocities,
+            masses,
+            cluster_atoms,
+            atom_counts,
+            pair_slots,
+            pair_counts,
+            box_lengths,
+            mx.array(
+                [cluster_count, max_iterations, int(periodic)],
+                dtype=mx.int32,
+            ),
+        ],
+        output_shapes=[(cluster_count, 4, 3)],
+        output_dtypes=[mx.float32],
+        grid=(cluster_count, 1, 1),
+        threadgroup=(min(256, cluster_count), 1, 1),
+        init_value=0.0,
+    )
+    return deltas
 
 
 def _dense_constraint_apply(

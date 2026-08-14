@@ -143,6 +143,66 @@ def test_distance_dynamics_step_matches_openmm_reference_oracle():
     )
 
 
+def test_small_constraint_cluster_schedule_packs_disjoint_components():
+    constraints = DistanceConstraints(
+        [(0, 1), (1, 2), (3, 4), (4, 5), (5, 6)],
+        distances=[1.0, 1.1, 1.2, 1.3, 1.4],
+    )
+
+    assert constraints._small_cluster_supported
+    np.testing.assert_array_equal(
+        np.asarray(constraints._small_cluster_atom_counts),
+        [3, 4],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(constraints._small_cluster_pair_counts),
+        [2, 3],
+    )
+    np.testing.assert_array_equal(
+        np.sort(np.asarray(constraints._small_cluster_scatter_atoms)),
+        np.arange(7, dtype=np.int32),
+    )
+
+
+def test_small_constraint_cluster_schedule_falls_back_for_large_component():
+    constraints = DistanceConstraints(
+        [(0, 1), (1, 2), (2, 3), (3, 4)],
+        distances=1.0,
+    )
+
+    assert not constraints._small_cluster_supported
+    assert constraints._small_cluster_atoms.shape == (0, 4)
+    assert constraints._profile_family is None
+
+
+def test_unchecked_distance_step_skips_error_graph_on_cpu(monkeypatch):
+    constraints = DistanceConstraints([(0, 1)], distances=1.0, max_iterations=4)
+    reference = mx.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=mx.float32)
+    predicted = reference + mx.array(
+        [[0.01, -0.01, 0.0], [-0.02, 0.01, 0.0]],
+        dtype=mx.float32,
+    )
+    masses = mx.array([12.0, 1.0], dtype=mx.float32)
+    expected = constraints._generic_position_step(
+        reference,
+        predicted,
+        masses,
+        None,
+    )
+
+    def fail_error_graph(*args, **kwargs):
+        raise AssertionError("unchecked projection must not construct max_error")
+
+    monkeypatch.setattr(DistanceConstraints, "max_error", fail_error_graph)
+    actual = constraints._apply_position_step_unchecked(
+        reference,
+        predicted,
+        masses,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def test_disjoint_shake_clusters_match_generic_cpu_projection():
     cluster_atoms = np.asarray(
         [[0, 1, 2, 3], [4, 5, -1, -1]],

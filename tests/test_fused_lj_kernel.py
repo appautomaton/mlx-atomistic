@@ -173,6 +173,109 @@ def test_disjoint_shake_cluster_kernel_matches_mlx_reference():
 
 
 @pytest.mark.gpu
+def test_small_constraint_cluster_kernel_matches_generic_mlx_reference():
+    """General small components preserve SHAKE/RATTLE results on Metal."""
+
+    reference_np = np.asarray(
+        [
+            [2.0, 2.0, 2.0],
+            [3.0, 2.0, 2.0],
+            [2.5, 2.8660254, 2.0],
+            [5.0, 5.0, 5.0],
+            [6.0, 5.0, 5.0],
+            [7.0, 5.0, 5.0],
+            [8.0, 5.0, 5.0],
+            [10.0, 2.0, 2.0],
+            [10.0, 3.2, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    pairs = np.asarray(
+        [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 6), (7, 8)],
+        dtype=np.int32,
+    )
+    distances = np.linalg.norm(
+        reference_np[pairs[:, 0]] - reference_np[pairs[:, 1]],
+        axis=1,
+    )
+    constraints = DistanceConstraints(
+        pairs,
+        distances=distances,
+        max_iterations=20,
+    )
+    reference = mx.array(reference_np)
+    predicted = reference + mx.array(
+        [
+            [0.012, -0.007, 0.003],
+            [-0.009, 0.011, -0.002],
+            [0.006, -0.013, 0.004],
+            [-0.010, 0.005, 0.002],
+            [0.008, -0.006, -0.003],
+            [-0.005, 0.009, 0.001],
+            [0.011, -0.004, 0.002],
+            [-0.007, 0.006, -0.001],
+            [0.009, -0.008, 0.003],
+        ],
+        dtype=mx.float32,
+    )
+    masses = mx.array(
+        [12.0, 1.0, 14.0, 12.0, 1.0, 16.0, 1.0, 14.0, 1.0],
+        dtype=mx.float32,
+    )
+    velocities = mx.arange(27, dtype=mx.float32).reshape((9, 3)) * 0.013 - 0.17
+    cell = Cell.cubic(14.0)
+
+    actual_positions, actual_error = constraints.apply_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    expected_positions = constraints._generic_position_step(
+        reference,
+        predicted,
+        masses,
+        cell,
+    )
+    expected_error = constraints.max_error(expected_positions, cell)
+    actual_velocities = constraints.apply_velocities(
+        actual_positions,
+        velocities,
+        masses,
+        cell,
+    )
+    expected_velocities = constraints._generic_velocities(
+        actual_positions,
+        velocities,
+        masses,
+        cell,
+    )
+    mx.eval(
+        actual_positions,
+        expected_positions,
+        actual_error,
+        expected_error,
+        actual_velocities,
+        expected_velocities,
+    )
+
+    assert constraints._profile_family == "small_constraint_clusters"
+    np.testing.assert_allclose(
+        np.asarray(actual_positions),
+        np.asarray(expected_positions),
+        rtol=1.0e-5,
+        atol=5.0e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_velocities),
+        np.asarray(expected_velocities),
+        rtol=1.0e-5,
+        atol=2.0e-6,
+    )
+    assert float(np.asarray(actual_error)) <= float(np.asarray(expected_error)) + 1.0e-5
+
+
+@pytest.mark.gpu
 def test_dense_disjoint_composite_matches_sequential_constraint_oracle(monkeypatch):
     """Dense SETTLE+SHAKE writes preserve every constrained and free atom."""
 

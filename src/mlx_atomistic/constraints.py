@@ -14,11 +14,92 @@ from mlx_atomistic.metal_kernels import (
     _settle_water_velocity_deltas,
     _shake_cluster_position_deltas,
     _shake_cluster_velocity_deltas,
+    _small_constraint_cluster_position_deltas,
+    _small_constraint_cluster_velocity_deltas,
 )
 
 
 def _empty_pairs() -> mx.array:
     return mx.array(np.empty((0, 2), dtype=np.int32), dtype=mx.int32)
+
+
+def _build_small_constraint_clusters(
+    pairs: np.ndarray,
+    distances: np.ndarray,
+) -> tuple[np.ndarray, ...] | None:
+    """Pack disjoint graph components that fit the four-atom Metal solver."""
+
+    if pairs.shape[0] == 0:
+        return None
+    max_atom = int(np.max(pairs))
+    parent = np.arange(max_atom + 1, dtype=np.int32)
+    rank = np.zeros((max_atom + 1,), dtype=np.int8)
+
+    def find(atom: int) -> int:
+        root = atom
+        while parent[root] != root:
+            root = int(parent[root])
+        while parent[atom] != atom:
+            next_atom = int(parent[atom])
+            parent[atom] = root
+            atom = next_atom
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        if rank[left_root] < rank[right_root]:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        if rank[left_root] == rank[right_root]:
+            rank[left_root] += 1
+
+    for left, right in pairs:
+        union(int(left), int(right))
+
+    component_edges: dict[int, list[int]] = {}
+    for edge, (left, _) in enumerate(pairs):
+        component_edges.setdefault(find(int(left)), []).append(edge)
+    component_count = len(component_edges)
+    cluster_atoms = np.full((component_count, 4), -1, dtype=np.int32)
+    atom_counts = np.zeros((component_count,), dtype=np.int32)
+    pair_slots = np.zeros((component_count, 3, 2), dtype=np.int32)
+    pair_counts = np.zeros((component_count,), dtype=np.int32)
+    target_distances = np.ones((component_count, 3), dtype=np.float32)
+    scatter_atoms: list[int] = []
+    scatter_rows: list[int] = []
+    scatter_slots: list[int] = []
+    for row, edge_indices in enumerate(component_edges.values()):
+        atoms = sorted(set(int(value) for value in pairs[edge_indices].reshape(-1)))
+        if len(atoms) > 4 or len(edge_indices) > 3:
+            return None
+        atom_counts[row] = len(atoms)
+        pair_counts[row] = len(edge_indices)
+        cluster_atoms[row, : len(atoms)] = atoms
+        local_slots = {atom: slot for slot, atom in enumerate(atoms)}
+        for local_pair, edge in enumerate(edge_indices):
+            left, right = pairs[edge]
+            pair_slots[row, local_pair] = (
+                local_slots[int(left)],
+                local_slots[int(right)],
+            )
+            target_distances[row, local_pair] = distances[edge]
+        for slot, atom in enumerate(atoms):
+            scatter_atoms.append(atom)
+            scatter_rows.append(row)
+            scatter_slots.append(slot)
+    return (
+        cluster_atoms,
+        atom_counts,
+        pair_slots,
+        pair_counts,
+        target_distances,
+        np.asarray(scatter_atoms, dtype=np.int32),
+        np.asarray(scatter_rows, dtype=np.int32),
+        np.asarray(scatter_slots, dtype=np.int32),
+    )
 
 
 @dataclass(frozen=True)
@@ -59,6 +140,89 @@ class DistanceConstraints:
         object.__setattr__(self, "pairs", mx.array(pairs, dtype=mx.int32))
         object.__setattr__(self, "distances", as_mx_array(distances))
         object.__setattr__(self, "_max_pair_index", max_pair_index)
+        cluster_schedule = _build_small_constraint_clusters(pairs, distances)
+        object.__setattr__(self, "_small_cluster_supported", cluster_schedule is not None)
+        if cluster_schedule is None:
+            empty_vector = mx.zeros((0,), dtype=mx.int32)
+            object.__setattr__(self, "_small_cluster_atoms", mx.zeros((0, 4), dtype=mx.int32))
+            object.__setattr__(self, "_small_cluster_atom_counts", empty_vector)
+            object.__setattr__(
+                self,
+                "_small_cluster_pair_slots",
+                mx.zeros((0, 3, 2), dtype=mx.int32),
+            )
+            object.__setattr__(self, "_small_cluster_pair_counts", empty_vector)
+            object.__setattr__(
+                self,
+                "_small_cluster_distances",
+                mx.zeros((0, 3), dtype=mx.float32),
+            )
+            object.__setattr__(self, "_small_cluster_scatter_atoms", empty_vector)
+            object.__setattr__(self, "_small_cluster_scatter_rows", empty_vector)
+            object.__setattr__(self, "_small_cluster_scatter_slots", empty_vector)
+        else:
+            (
+                cluster_atoms,
+                atom_counts,
+                pair_slots,
+                pair_counts,
+                cluster_distances,
+                scatter_atoms,
+                scatter_rows,
+                scatter_slots,
+            ) = cluster_schedule
+            object.__setattr__(
+                self,
+                "_small_cluster_atoms",
+                mx.array(cluster_atoms, dtype=mx.int32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_atom_counts",
+                mx.array(atom_counts, dtype=mx.int32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_pair_slots",
+                mx.array(pair_slots, dtype=mx.int32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_pair_counts",
+                mx.array(pair_counts, dtype=mx.int32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_distances",
+                mx.array(cluster_distances, dtype=mx.float32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_scatter_atoms",
+                mx.array(scatter_atoms, dtype=mx.int32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_scatter_rows",
+                mx.array(scatter_rows, dtype=mx.int32),
+            )
+            object.__setattr__(
+                self,
+                "_small_cluster_scatter_slots",
+                mx.array(scatter_slots, dtype=mx.int32),
+            )
+
+    @property
+    def _profile_family(self) -> str | None:
+        """Return the active profiling family for the current MLX backend."""
+
+        if (
+            self._small_cluster_supported
+            and mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+        ):
+            return "small_constraint_clusters"
+        return None
 
     def _displacements(self, positions: mx.array, cell: Cell | None) -> mx.array:
         i = self.pairs[:, 0]
@@ -67,6 +231,85 @@ class DistanceConstraints:
         if cell is not None:
             displacement = cell.minimum_image(displacement)
         return displacement
+
+    def _small_cluster_metal_ready(
+        self,
+        arrays: tuple[mx.array, ...],
+        cell: Cell | None,
+    ) -> bool:
+        return bool(
+            self._small_cluster_supported
+            and all(values.dtype == mx.float32 for values in arrays)
+            and mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+            and (cell is None or cell.is_orthorhombic)
+        )
+
+    @staticmethod
+    def _small_cluster_box(cell: Cell | None) -> mx.array:
+        return mx.ones((3,), dtype=mx.float32) if cell is None else mx.diag(cell.matrix)
+
+    def _scatter_small_cluster_deltas(
+        self,
+        values: mx.array,
+        deltas: mx.array,
+    ) -> mx.array:
+        return values.at[self._small_cluster_scatter_atoms].add(
+            deltas[
+                self._small_cluster_scatter_rows,
+                self._small_cluster_scatter_slots,
+            ]
+        )
+
+    def _small_cluster_position_step(
+        self,
+        reference_positions: mx.array,
+        predicted_positions: mx.array,
+        masses: mx.array,
+        cell: Cell | None,
+    ) -> mx.array | None:
+        if not self._small_cluster_metal_ready(
+            (reference_positions, predicted_positions, masses),
+            cell,
+        ):
+            return None
+        deltas = _small_constraint_cluster_position_deltas(
+            reference_positions,
+            predicted_positions,
+            masses,
+            self._small_cluster_atoms,
+            self._small_cluster_atom_counts,
+            self._small_cluster_pair_slots,
+            self._small_cluster_pair_counts,
+            self._small_cluster_distances,
+            self._small_cluster_box(cell),
+            max_iterations=self.max_iterations,
+            periodic=cell is not None,
+        )
+        return self._scatter_small_cluster_deltas(predicted_positions, deltas)
+
+    def _small_cluster_velocities(
+        self,
+        positions: mx.array,
+        velocities: mx.array,
+        masses: mx.array,
+        cell: Cell | None,
+    ) -> mx.array | None:
+        if not self._small_cluster_metal_ready((positions, velocities, masses), cell):
+            return None
+        deltas = _small_constraint_cluster_velocity_deltas(
+            positions,
+            velocities,
+            masses,
+            self._small_cluster_atoms,
+            self._small_cluster_atom_counts,
+            self._small_cluster_pair_slots,
+            self._small_cluster_pair_counts,
+            self._small_cluster_box(cell),
+            max_iterations=self.max_iterations,
+            periodic=cell is not None,
+        )
+        return self._scatter_small_cluster_deltas(velocities, deltas)
 
     def max_error(self, positions, cell: Cell | None = None) -> mx.array:
         """Return the maximum absolute distance error."""
@@ -109,6 +352,78 @@ class DistanceConstraints:
             constrained = constrained.at[j].add(weight_j[:, None] * correction)
         return constrained, self.max_error(constrained, cell)
 
+    def _apply_position_step_unchecked(
+        self,
+        reference_positions,
+        predicted_positions,
+        masses,
+        cell: Cell | None = None,
+    ) -> mx.array:
+        """Apply a dynamics position step without constructing an error graph."""
+
+        reference = as_mx_array(reference_positions)
+        predicted = as_mx_array(predicted_positions)
+        masses = as_mx_array(masses)
+        if self.pairs.shape[0] == 0:
+            return predicted
+        if reference.shape != predicted.shape:
+            raise ValueError("reference_positions and predicted_positions must match")
+        if self._max_pair_index >= predicted.shape[0]:
+            raise ValueError("constraint pair index outside positions")
+        clustered = self._small_cluster_position_step(
+            reference,
+            predicted,
+            masses,
+            cell,
+        )
+        if clustered is not None:
+            return clustered
+        return self._generic_position_step(
+            reference,
+            predicted,
+            masses,
+            cell,
+        )
+
+    def _generic_position_step(
+        self,
+        reference: mx.array,
+        constrained: mx.array,
+        masses: mx.array,
+        cell: Cell | None,
+    ) -> mx.array:
+        """Apply the graph-based SHAKE fallback without building an error graph."""
+
+        i = self.pairs[:, 0]
+        j = self.pairs[:, 1]
+        inverse_masses = 1.0 / masses
+        reference_displacement = reference[i] - reference[j]
+        if cell is not None:
+            reference_displacement = cell.minimum_image(reference_displacement)
+        inverse_mass_sum = inverse_masses[i] + inverse_masses[j]
+        target_squared = self.distances * self.distances
+        for _ in range(self.max_iterations):
+            displacement = self._displacements(constrained, cell)
+            error_squared = target_squared - mx.sum(displacement * displacement, axis=-1)
+            denominator = (
+                2.0
+                * inverse_mass_sum
+                * mx.sum(
+                    displacement * reference_displacement,
+                    axis=-1,
+                )
+            )
+            safe_denominator = mx.where(
+                mx.abs(denominator) > 1.0e-20,
+                denominator,
+                mx.where(denominator < 0.0, -1.0e-20, 1.0e-20),
+            )
+            multiplier = error_squared / safe_denominator
+            correction = multiplier[:, None] * reference_displacement
+            constrained = constrained.at[i].add(inverse_masses[i, None] * correction)
+            constrained = constrained.at[j].add(-inverse_masses[j, None] * correction)
+        return constrained
+
     def apply_position_step(
         self,
         reference_positions,
@@ -130,30 +445,21 @@ class DistanceConstraints:
             msg = "constraint pair index outside positions"
             raise ValueError(msg)
 
-        i = self.pairs[:, 0]
-        j = self.pairs[:, 1]
-        inverse_masses = 1.0 / masses
-        reference_displacement = reference[i] - reference[j]
-        if cell is not None:
-            reference_displacement = cell.minimum_image(reference_displacement)
-        inverse_mass_sum = inverse_masses[i] + inverse_masses[j]
-        target_squared = self.distances * self.distances
-        for _ in range(self.max_iterations):
-            displacement = self._displacements(constrained, cell)
-            error_squared = target_squared - mx.sum(displacement * displacement, axis=-1)
-            denominator = 2.0 * inverse_mass_sum * mx.sum(
-                displacement * reference_displacement,
-                axis=-1,
-            )
-            safe_denominator = mx.where(
-                mx.abs(denominator) > 1.0e-20,
-                denominator,
-                mx.where(denominator < 0.0, -1.0e-20, 1.0e-20),
-            )
-            multiplier = error_squared / safe_denominator
-            correction = multiplier[:, None] * reference_displacement
-            constrained = constrained.at[i].add(inverse_masses[i, None] * correction)
-            constrained = constrained.at[j].add(-inverse_masses[j, None] * correction)
+        clustered = self._small_cluster_position_step(
+            reference,
+            constrained,
+            masses,
+            cell,
+        )
+        if clustered is not None:
+            return clustered, self.max_error(clustered, cell)
+
+        constrained = self._generic_position_step(
+            reference,
+            constrained,
+            masses,
+            cell,
+        )
         return constrained, self.max_error(constrained, cell)
 
     def apply_velocities(
@@ -173,6 +479,26 @@ class DistanceConstraints:
         if self._max_pair_index >= positions.shape[0]:
             msg = "constraint pair index outside positions"
             raise ValueError(msg)
+
+        clustered = self._small_cluster_velocities(
+            positions,
+            constrained,
+            masses,
+            cell,
+        )
+        if clustered is not None:
+            return clustered
+
+        return self._generic_velocities(positions, constrained, masses, cell)
+
+    def _generic_velocities(
+        self,
+        positions: mx.array,
+        constrained: mx.array,
+        masses: mx.array,
+        cell: Cell | None,
+    ) -> mx.array:
+        """Apply the graph-based RATTLE fallback."""
 
         i = self.pairs[:, 0]
         j = self.pairs[:, 1]
