@@ -2665,46 +2665,26 @@ _TILE_TOPOLOGY_LJ_MASKS_SOURCE = r"""
 
     bool excluded = false;
     if (member) {
-        int lower = 0;
-        int upper = counts[1];
-        while (lower < upper) {
-            int middle = lower + (upper - lower) / 2;
-            int known_left = excluded_i[middle];
-            int known_right = excluded_j[middle];
-            if (
-                known_left < left
-                || (known_left == left && known_right < right)
-            ) {
-                lower = middle + 1;
-            } else {
-                upper = middle;
+        int start = excluded_offsets[left];
+        int stop = excluded_offsets[left + 1];
+        for (int index = start; index < stop; ++index) {
+            if (excluded_right[index] == right) {
+                excluded = true;
+                break;
             }
         }
-        excluded = lower < counts[1]
-            && excluded_i[lower] == left
-            && excluded_j[lower] == right;
     }
 
     bool scaled = false;
-    if (member && !excluded && counts[2] > 0) {
-        int lower = 0;
-        int upper = counts[2];
-        while (lower < upper) {
-            int middle = lower + (upper - lower) / 2;
-            int known_left = one_four_i[middle];
-            int known_right = one_four_j[middle];
-            if (
-                known_left < left
-                || (known_left == left && known_right < right)
-            ) {
-                lower = middle + 1;
-            } else {
-                upper = middle;
+    if (member && !excluded) {
+        int start = one_four_offsets[left];
+        int stop = one_four_offsets[left + 1];
+        for (int index = start; index < stop; ++index) {
+            if (one_four_right[index] == right) {
+                scaled = true;
+                break;
             }
         }
-        scaled = lower < counts[2]
-            && one_four_i[lower] == left
-            && one_four_j[lower] == right;
     }
     enabled[lane] = member && !excluded ? 1u : 0u;
     one_four[lane] = scaled ? 1u : 0u;
@@ -4181,11 +4161,10 @@ def _tile_topology_lj_masks_kernel():
                 "atom_blocks",
                 "tile_blocks",
                 "member_mask",
-                "excluded_i",
-                "excluded_j",
-                "one_four_i",
-                "one_four_j",
-                "counts",
+                "excluded_offsets",
+                "excluded_right",
+                "one_four_offsets",
+                "one_four_right",
             ],
             output_names=["lj_enabled_mask", "lj_one_four_mask"],
             source=_TILE_TOPOLOGY_LJ_MASKS_SOURCE,
@@ -4878,16 +4857,20 @@ def tile_topology_lj_masks(
     atom_blocks: mx.array,
     tile_blocks: mx.array,
     member_mask: mx.array,
-    excluded_pairs: mx.array,
-    one_four_pairs: mx.array,
+    excluded_offsets: mx.array,
+    excluded_right: mx.array,
+    one_four_offsets: mx.array,
+    one_four_right: mx.array,
 ) -> tuple[mx.array, mx.array]:
-    """Build tile-aligned LJ eligibility and 1-4 masks on Metal."""
+    """Build tile-aligned LJ masks from atom-local sparse topology rows."""
 
     atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
     tile_blocks = as_mx_array(tile_blocks, dtype=mx.int32)
     member_mask = as_mx_array(member_mask, dtype=mx.uint32)
-    excluded_pairs = as_mx_array(excluded_pairs, dtype=mx.int32)
-    one_four_pairs = as_mx_array(one_four_pairs, dtype=mx.int32)
+    excluded_offsets = as_mx_array(excluded_offsets, dtype=mx.int32)
+    excluded_right = as_mx_array(excluded_right, dtype=mx.int32)
+    one_four_offsets = as_mx_array(one_four_offsets, dtype=mx.int32)
+    one_four_right = as_mx_array(one_four_right, dtype=mx.int32)
     if atom_blocks.ndim != 2 or atom_blocks.shape[1] != _TILE_PME_BLOCK_SIZE:
         msg = f"atom_blocks must have shape (n_blocks, {_TILE_PME_BLOCK_SIZE})"
         raise ValueError(msg)
@@ -4898,12 +4881,15 @@ def tile_topology_lj_masks(
     if member_mask.shape != (tile_count, _TILE_PME_MASK_WORD_COUNT):
         msg = f"member_mask must have shape (n_tiles, {_TILE_PME_MASK_WORD_COUNT})"
         raise ValueError(msg)
-    for name, values in (
-        ("excluded_pairs", excluded_pairs),
-        ("one_four_pairs", one_four_pairs),
+    for name, offsets, right in (
+        ("excluded", excluded_offsets, excluded_right),
+        ("one_four", one_four_offsets, one_four_right),
     ):
-        if values.ndim != 2 or values.shape[1] != 2:
-            msg = f"{name} must have shape (n, 2)"
+        if offsets.ndim != 1 or offsets.shape[0] < 1:
+            msg = f"{name}_offsets must be a non-empty one-dimensional array"
+            raise ValueError(msg)
+        if right.ndim != 1:
+            msg = f"{name}_right must be one-dimensional"
             raise ValueError(msg)
     if tile_count == 0:
         empty = mx.zeros((0, _TILE_PME_MASK_WORD_COUNT), dtype=mx.uint32)
@@ -4913,14 +4899,10 @@ def tile_topology_lj_masks(
             atom_blocks,
             tile_blocks,
             member_mask,
-            excluded_pairs[:, 0],
-            excluded_pairs[:, 1],
-            one_four_pairs[:, 0],
-            one_four_pairs[:, 1],
-            mx.array(
-                [tile_count, int(excluded_pairs.shape[0]), int(one_four_pairs.shape[0])],
-                dtype=mx.int32,
-            ),
+            excluded_offsets,
+            excluded_right,
+            one_four_offsets,
+            one_four_right,
         ],
         output_shapes=[
             (tile_count, _TILE_PME_MASK_WORD_COUNT),

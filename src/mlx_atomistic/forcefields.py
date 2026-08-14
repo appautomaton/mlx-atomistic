@@ -175,6 +175,27 @@ def _encoded_pairs(pairs: set[tuple[int, int]], n_atoms: int) -> np.ndarray:
     return np.sort(left * np.int64(n_atoms) + right)
 
 
+def _left_pair_csr(pairs: np.ndarray, n_atoms: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return offsets and right atoms grouped by normalized left atom."""
+
+    pair_array = np.asarray(pairs, dtype=np.int32)
+    if pair_array.size == 0:
+        return (
+            np.zeros((n_atoms + 1,), dtype=np.int32),
+            np.empty((0,), dtype=np.int32),
+        )
+    left = np.minimum(pair_array[:, 0], pair_array[:, 1])
+    right = np.maximum(pair_array[:, 0], pair_array[:, 1])
+    order = np.lexsort((right, left))
+    left = left[order]
+    right = right[order]
+    counts = np.bincount(left, minlength=n_atoms)
+    offsets = np.empty((n_atoms + 1,), dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(counts, dtype=np.int64, out=offsets[1:])
+    return offsets, right.astype(np.int32, copy=False)
+
+
 def _isin_sorted_codes(codes: np.ndarray, sorted_codes: np.ndarray) -> np.ndarray:
     if codes.size == 0 or sorted_codes.size == 0:
         return np.zeros(codes.shape, dtype=bool)
@@ -1524,6 +1545,14 @@ class NonbondedPotential:
             ),
             dtype=np.int32,
         ).reshape((-1, 2))
+        lj_exclusion_offsets, lj_exclusion_right = _left_pair_csr(
+            correction_pairs,
+            int(sigma.shape[0]),
+        )
+        lj_one_four_offsets, lj_one_four_right = _left_pair_csr(
+            lj_one_four_pairs,
+            int(sigma.shape[0]),
+        )
         correction_pairs_mx = mx.array(correction_pairs, dtype=mx.int32)
         exception_pairs_mx = mx.array(exception_pairs, dtype=mx.int32)
         exception_charge_products_mx = as_mx_array(charge_products)
@@ -1711,6 +1740,26 @@ class NonbondedPotential:
             self,
             "_aligned_lj_one_four_pairs",
             lj_one_four_pairs_mx,
+        )
+        object.__setattr__(
+            self,
+            "_aligned_lj_exclusion_offsets",
+            mx.array(lj_exclusion_offsets, dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
+            "_aligned_lj_exclusion_right",
+            mx.array(lj_exclusion_right, dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
+            "_aligned_lj_one_four_offsets",
+            mx.array(lj_one_four_offsets, dtype=mx.int32),
+        )
+        object.__setattr__(
+            self,
+            "_aligned_lj_one_four_right",
+            mx.array(lj_one_four_right, dtype=mx.int32),
         )
         object.__setattr__(
             self,
@@ -2208,8 +2257,10 @@ class NonbondedPotential:
                 tiles.atom_blocks,
                 tiles.tile_blocks,
                 tiles.member_mask,
-                self._aligned_lj_exclusion_pairs,
-                self._aligned_lj_one_four_pairs,
+                self._aligned_lj_exclusion_offsets,
+                self._aligned_lj_exclusion_right,
+                self._aligned_lj_one_four_offsets,
+                self._aligned_lj_one_four_right,
             )
             mx.eval(enabled, one_four)
             return enabled, one_four

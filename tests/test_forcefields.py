@@ -66,6 +66,15 @@ def reference_periodic_dihedral_angle(points):
     return angle * sign
 
 
+def test_left_pair_csr_groups_normalized_right_atoms_by_left_atom():
+    pairs = np.array([(4, 1), (0, 3), (3, 2), (1, 2)], dtype=np.int32)
+
+    offsets, right = forcefields_module._left_pair_csr(pairs, 5)
+
+    np.testing.assert_array_equal(offsets, [0, 1, 3, 4, 4, 4])
+    np.testing.assert_array_equal(right, [3, 2, 4, 3])
+
+
 def test_forcefield_analytic_support_matches_closed_envelope():
     terms = (
         LennardJonesPotential(),

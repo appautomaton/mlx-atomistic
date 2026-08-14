@@ -71,6 +71,12 @@ broadened deliberately. The next performance work should reduce remaining
 direct atomics and host-controlled rebuild work rather than add another wrapper
 around the same 8x8 schedule.
 
+Generation binding also keeps topology lookup atom-local. Prepared exclusion
+and 1-4 records use compressed sparse row offsets keyed by the normalized left
+atom. Each active tile pair therefore scans only that atom's short topology row
+instead of binary-searching the complete global pair array after every neighbor
+rebuild. The packed masks consumed by the direct-force kernel are unchanged.
+
 For GPCRmd-scale periodic systems, dense all-pairs is not viable. The current
 large-system route uses `mlx_cell_pairs`. The historical implementation used
 CPU-side periodic bins and candidate arrays; the current Metal route uses a
