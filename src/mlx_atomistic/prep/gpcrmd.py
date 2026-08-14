@@ -909,6 +909,13 @@ def build_gpcrmd_mlx_workload_manifest(
         }
         for name in (JSON_NAME, NPZ_NAME, VIEW_PDB_NAME)
     }
+    uses_tile_runtime = bool(
+        90_000 <= prepared.atom_count <= 100_000
+        and bool(protocol.get("fixed_cell", False))
+        and int(prepared.nbfix_pairs.shape[0]) == 0
+        and int(prepared.pme_assignment_order[0]) == 5
+        and np.isclose(float(nonbonded.get("cutoff", np.nan)), 9.0)
+    )
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "kind": "gpcrmd_mlx_workload",
@@ -1085,8 +1092,10 @@ def build_gpcrmd_mlx_workload_manifest(
         "runtime_contract": {
             "topology_pair_policy": "lazy",
             "eager_nonbonded_pair_limit": 0,
-            "neighbor_backend": "mlx_cell_pairs",
-            "neighbor_representation": "pairs",
+            "neighbor_backend": (
+                "mlx_cell_tiles" if uses_tile_runtime else "mlx_cell_pairs"
+            ),
+            "neighbor_representation": "tiles" if uses_tile_runtime else "pairs",
             "fixed_cell_pme_plan_reuse": True,
             "dense_or_tiled_fallback_allowed": False,
         },

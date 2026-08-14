@@ -130,6 +130,10 @@ class _NonbondedForceBinding:
     tile_geometry: NeighborTiles | None = None
     tile_lj_enabled_mask: mx.array | None = None
     tile_lj_one_four_mask: mx.array | None = None
+    tile_atom_type_ids: mx.array | None = None
+    tile_nbfix_type_sigma: mx.array | None = None
+    tile_nbfix_type_epsilon: mx.array | None = None
+    tile_nbfix_type_count: int = 0
     tile_decline_reason: str | None = None
 
 
@@ -1399,6 +1403,9 @@ class NonbondedPotential:
             seen_type_pairs.add(pair)
         atom_type_ids = np.empty((0,), dtype=np.int32)
         nbfix_type_pair_ids = np.empty((0, 2), dtype=np.int32)
+        nbfix_type_count_total = 0
+        nbfix_type_sigma_table = np.empty((0,), dtype=np.float32)
+        nbfix_type_epsilon_table = np.empty((0,), dtype=np.float32)
         if nbfix_type_count > 0:
             if self.atom_types is None:
                 msg = "atom_types are required when nbfix_type_pairs are provided"
@@ -1434,6 +1441,21 @@ class NonbondedPotential:
                 ],
                 dtype=np.int32,
             )
+            nbfix_type_count_total = len(type_to_id)
+            table_size = nbfix_type_count_total * nbfix_type_count_total
+            nbfix_type_sigma_table = np.zeros((table_size,), dtype=np.float32)
+            nbfix_type_epsilon_table = np.zeros((table_size,), dtype=np.float32)
+            for pair_ids, sigma_value, epsilon_value in zip(
+                nbfix_type_pair_ids,
+                nbfix_type_sigma,
+                nbfix_type_epsilon,
+                strict=True,
+            ):
+                left_id, right_id = (int(pair_ids[0]), int(pair_ids[1]))
+                forward = left_id * nbfix_type_count_total + right_id
+                reverse = right_id * nbfix_type_count_total + left_id
+                nbfix_type_sigma_table[[forward, reverse]] = sigma_value
+                nbfix_type_epsilon_table[[forward, reverse]] = epsilon_value
         exception_pair_set = {
             (min(int(i), int(j)), max(int(i), int(j))) for i, j in exception_pairs.tolist()
         }
@@ -1581,6 +1603,17 @@ class NonbondedPotential:
             self,
             "_nbfix_type_pair_ids",
             mx.array(nbfix_type_pair_ids, dtype=mx.int32),
+        )
+        object.__setattr__(self, "_nbfix_type_count", nbfix_type_count_total)
+        object.__setattr__(
+            self,
+            "_nbfix_type_sigma_table",
+            mx.array(nbfix_type_sigma_table, dtype=mx.float32),
+        )
+        object.__setattr__(
+            self,
+            "_nbfix_type_epsilon_table",
+            mx.array(nbfix_type_epsilon_table, dtype=mx.float32),
         )
         object.__setattr__(self, "_exception_pair_set", frozenset(exception_pair_set))
         object.__setattr__(
@@ -2249,7 +2282,7 @@ class NonbondedPotential:
                 rtol=1e-6,
                 atol=1e-7,
             )
-            and not self.has_nbfix
+            and int(self.nbfix_pairs.shape[0]) == 0
             and tiles.force_columns is not None
             and tiles.force_group_starts is not None
             and tiles.force_group_counts is not None
@@ -3291,6 +3324,10 @@ class NonbondedPotential:
             one_four_scale=self.lj_one_four_scale,
             coulomb_constant=self.coulomb_constant,
             alpha=self.pme_config.alpha,
+            atom_type_ids=binding.tile_atom_type_ids,
+            nbfix_type_sigma=binding.tile_nbfix_type_sigma,
+            nbfix_type_epsilon=binding.tile_nbfix_type_epsilon,
+            nbfix_type_count=binding.tile_nbfix_type_count,
             _return_energy=True,
         )
         exception_lj, exception_lj_forces = self._exception_lj_components(
@@ -3704,6 +3741,11 @@ class NonbondedPotential:
             builtins.id(self.nbfix_pairs),
             builtins.id(self.nbfix_sigma),
             builtins.id(self.nbfix_epsilon),
+            builtins.id(self._atom_type_ids),
+            builtins.id(self.nbfix_type_sigma),
+            builtins.id(self.nbfix_type_epsilon),
+            builtins.id(self._nbfix_type_sigma_table),
+            builtins.id(self._nbfix_type_epsilon_table),
             builtins.id(self._aligned_lj_exclusion_pairs),
             builtins.id(self._aligned_lj_one_four_pairs),
             repr(self.pme_config),
@@ -3813,6 +3855,20 @@ class NonbondedPotential:
             tile_geometry=tiles,
             tile_lj_enabled_mask=tile_lj_enabled_mask,
             tile_lj_one_four_mask=tile_lj_one_four_mask,
+            tile_atom_type_ids=(
+                self._atom_type_ids if int(self.nbfix_type_pairs.shape[0]) > 0 else None
+            ),
+            tile_nbfix_type_sigma=(
+                self._nbfix_type_sigma_table
+                if int(self.nbfix_type_pairs.shape[0]) > 0
+                else None
+            ),
+            tile_nbfix_type_epsilon=(
+                self._nbfix_type_epsilon_table
+                if int(self.nbfix_type_pairs.shape[0]) > 0
+                else None
+            ),
+            tile_nbfix_type_count=self._nbfix_type_count,
             tile_decline_reason=(
                 None
                 if tiles is None
@@ -3921,6 +3977,10 @@ class NonbondedPotential:
                 one_four_scale=self.lj_one_four_scale,
                 coulomb_constant=self.coulomb_constant,
                 alpha=self.pme_config.alpha,
+                atom_type_ids=binding.tile_atom_type_ids,
+                nbfix_type_sigma=binding.tile_nbfix_type_sigma,
+                nbfix_type_epsilon=binding.tile_nbfix_type_epsilon,
+                nbfix_type_count=binding.tile_nbfix_type_count,
             )
         if binding.aligned_lj_scales is None or binding.pairs is None:
             msg = "compact-pair fallback requires aligned LJ scales"

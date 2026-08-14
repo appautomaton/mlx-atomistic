@@ -411,6 +411,11 @@ def test_nonbonded_nbfix_type_pairs_substitute_lj_parameters():
     np.testing.assert_allclose(np.array(energy), expected, atol=1e-6)
     assert np.all(np.isfinite(np.array(forces)))
     assert_force_matches_finite_difference(term, positions, atol=5e-3)
+    assert term._nbfix_type_count == 2
+    sigma_table = np.asarray(term._nbfix_type_sigma_table).reshape((2, 2))
+    epsilon_table = np.asarray(term._nbfix_type_epsilon_table).reshape((2, 2))
+    np.testing.assert_allclose(sigma_table, [[0.0, 1.1], [1.1, 0.0]])
+    np.testing.assert_allclose(epsilon_table, [[0.0, 0.5], [0.5, 0.0]])
 
 
 def test_nonbonded_nbfix_explicit_pairs_substitute_lj_parameters():

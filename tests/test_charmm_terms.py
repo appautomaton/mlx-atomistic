@@ -98,6 +98,7 @@ def test_charmm_urey_bradley_force_matches_finite_difference():
     term = CHARMMUreyBradleyPotential([(0, 1, 2)], k=3.5, distance=1.45)
 
     assert term.name == "urey_bradley"
+    assert term._neighbor_tile_diagnostic_policy == "ignore"
     assert_finite_energy_forces(term, positions)
     assert_force_matches_finite_difference(term, positions)
 
@@ -143,6 +144,7 @@ def test_charmm_cmap_force_matches_finite_difference():
     )
 
     assert term.name == "charmm_cmap_terms"
+    assert term._neighbor_tile_diagnostic_policy == "ignore"
     assert_finite_energy_forces(term, positions)
     assert_force_matches_finite_difference(term, positions, atol=2e-2)
 

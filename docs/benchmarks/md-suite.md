@@ -78,10 +78,11 @@ The committed registry also defines:
 - the official 92,224-atom OpenMM ApoA1 PME workload;
 - the 92,001-atom GPCRmd 729 CHARMM workload.
 
-The neighbor backend is part of each case contract. GPCRmd uses
-`mlx_cell_pairs` because its CHARMM NBFIX path is not tile-owned; the other
-release PME cases use `mlx_cell_tiles`. `--neighbor-backend` is an explicit
-diagnostic override and changes comparison semantics.
+The neighbor backend is part of each case contract. All release PME cases use
+`mlx_cell_tiles`. GPCRmd selects the NBFIX-aware tile specialization, which
+looks up its CHARMM type-pair overrides without materializing compact pairs.
+`--neighbor-backend` is an explicit diagnostic override and changes comparison
+semantics.
 
 Generate the deterministic water artifacts without a reference engine:
 

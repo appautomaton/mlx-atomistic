@@ -104,7 +104,7 @@
       "expected_atom_count": 92001,
       "tier": "release",
       "role": "coverage",
-      "neighbor_backend": "mlx_cell_pairs",
+      "neighbor_backend": "mlx_cell_tiles",
       "features": ["charmm", "protein", "lipid", "ligand", "tip3p", "pme", "constraints", "restart"],
       "preparation_command": "uv run --with openmm python scripts/run_gpcrmd_pme_parity.py --source-manifest results/gpcrmd-pme-runtime-closure/source/fixture-manifest.json --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --mlx-prepared results/gpcrmd-pme-runtime-closure/prepared --platform Reference --out results/gpcrmd-pme-runtime-closure/parity"
     }

@@ -412,8 +412,12 @@ def _production_tile_pme_eligible(
         return False
     for term in pme_terms:
         config = getattr(term, "pme_config", None)
+        nbfix_pairs = getattr(term, "nbfix_pairs", None)
+        has_atom_pair_nbfix = bool(
+            nbfix_pairs is not None and int(nbfix_pairs.shape[0]) > 0
+        )
         if (
-            bool(getattr(term, "has_nbfix", False))
+            has_atom_pair_nbfix
             or config is None
             or int(getattr(config, "assignment_order", 0)) != 5
             or not np.isclose(

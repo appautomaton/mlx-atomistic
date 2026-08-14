@@ -538,11 +538,14 @@ def _source_protocol_settings(manifest: Mapping[str, Any]) -> dict[str, Any]:
     if pme.get("background_policy") != "reject_non_neutral":
         msg = "source-neutral GPCRmd PME must retain reject_non_neutral"
         raise ValueError(msg)
+    uses_tile_runtime = 90_000 <= atom_count <= 100_000
     expected_runtime = {
         "topology_pair_policy": "lazy",
         "eager_nonbonded_pair_limit": 0,
-        "neighbor_backend": "mlx_cell_pairs",
-        "neighbor_representation": "pairs",
+        "neighbor_backend": (
+            "mlx_cell_tiles" if uses_tile_runtime else "mlx_cell_pairs"
+        ),
+        "neighbor_representation": "tiles" if uses_tile_runtime else "pairs",
         "fixed_cell_pme_plan_reuse": True,
         "dense_or_tiled_fallback_allowed": False,
     }
@@ -793,12 +796,17 @@ def _source_protocol_completed_row(
     pme_plan_count = len(pme_plans)
     pme_build_count = sum(int(plan.get("build_count", 0)) for plan in pme_plans)
     pme_reuse_count = sum(int(plan.get("reuse_count", 0)) for plan in pme_plans)
+    expected_neighbor_backend = settings["runtime_contract"]["neighbor_backend"]
+    expected_neighbor_representation = settings["runtime_contract"][
+        "neighbor_representation"
+    ]
     runtime_contract_matches = bool(
         runtime_contract.get("fixed_cell") is True
         and runtime_contract.get("topology_pair_policy") == "lazy"
         and runtime_contract.get("eager_nonbonded_pair_limit") == 0
-        and runtime_contract.get("neighbor_backend") == "mlx_cell_pairs"
-        and runtime_contract.get("neighbor_representation") == "pairs"
+        and runtime_contract.get("neighbor_backend") == expected_neighbor_backend
+        and runtime_contract.get("neighbor_representation")
+        == expected_neighbor_representation
         and runtime_contract.get("shared_direct_space_neighbors") is True
         and runtime_contract.get("dense_or_tiled_fallback_used") is False
     )

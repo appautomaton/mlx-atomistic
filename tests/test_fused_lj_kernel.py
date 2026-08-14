@@ -1298,6 +1298,124 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
 
 
 @pytest.mark.gpu
+def test_nbfix_type_overrides_use_pair_free_spatial_tile_route():
+    """Type-pair NBFIX lookup preserves pair-reference PME energy and forces."""
+
+    rng = np.random.default_rng(73)
+    positions_np = rng.uniform(0.3, 7.7, size=(31, 3)).astype(np.float32)
+    positions = mx.array(positions_np, dtype=mx.float32)
+    cell = Cell.cubic(8.0)
+    cutoff = 2.6
+    pair_neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.35,
+        sort_pairs=True,
+        backend="mlx_cell_pairs",
+    )
+    tile_neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=0.35,
+        sort_pairs=False,
+        backend="mlx_cell_tiles",
+    )
+    assert tile_neighbors.tiles is not None
+    assert not tile_neighbors.diagnostic_pairs_materialized
+
+    sigma = rng.uniform(0.85, 1.15, size=31).astype(np.float32)
+    epsilon = rng.uniform(0.1, 0.35, size=31).astype(np.float32)
+    charges = rng.uniform(-0.4, 0.4, size=31).astype(np.float32)
+    charges -= np.mean(charges, dtype=np.float32)
+    atom_types = np.asarray(["A", "B", "C"] * 11, dtype=str)[:31]
+    topology = Topology.from_sequences(
+        n_atoms=31,
+        bonds=[(0, 1), (7, 8)],
+        one_four_pairs=[(0, 4), (7, 11)],
+        eager_nonbonded_pair_limit=0,
+    )
+    potential = NonbondedPotential(
+        sigma=sigma,
+        epsilon=epsilon,
+        charges=charges,
+        cutoff=cutoff,
+        lj_shift=True,
+        switch_distance=2.1,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.34,
+            real_cutoff=cutoff,
+        ),
+        topology=topology,
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.75,
+        atom_types=atom_types,
+        nbfix_type_pairs=[("A", "B"), ("B", "C")],
+        nbfix_type_sigma=[1.34, 0.96],
+        nbfix_type_epsilon=[0.52, 0.43],
+    ).bind_pme_plan(cell)
+
+    tile_energy, tile_forces, tile_components = (
+        potential._runtime_energy_forces_with_components(
+            positions,
+            cell,
+            tile_neighbors.tiles,
+        )
+    )
+    pair_energy, pair_forces, pair_components = (
+        potential._runtime_energy_forces_with_components(
+            positions,
+            cell,
+            pair_neighbors.diagnostic_pairs,
+        )
+    )
+    mx.eval(
+        tile_energy,
+        tile_forces,
+        pair_energy,
+        pair_forces,
+        *tile_components.values(),
+        *pair_components.values(),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(tile_energy),
+        np.asarray(pair_energy),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(tile_forces),
+        np.asarray(pair_forces),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    for name in pair_components.keys() & tile_components.keys():
+        if name == "pme_diagnostics":
+            continue
+        np.testing.assert_allclose(
+            np.asarray(tile_components[name]),
+            np.asarray(pair_components[name]),
+            rtol=2.0e-5,
+            atol=2.0e-3,
+        )
+    assert not tile_neighbors.diagnostic_pairs_materialized
+
+    binding = potential._prepare_tile_force_binding(
+        cell,
+        None,
+        tile_neighbors.tiles,
+    )
+    assert binding is not NotImplemented
+    assert binding.tile_decline_reason is None
+    assert binding.pairs is None
+    assert binding.tile_nbfix_type_count == 3
+
+
+@pytest.mark.gpu
 def test_sparse_pme_correction_uses_reference_half_box_tie_convention():
     """Sparse correction forces match Cell.minimum_image at exactly half a box."""
 

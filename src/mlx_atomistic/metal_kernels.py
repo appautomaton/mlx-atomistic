@@ -330,6 +330,8 @@ _pme_direct_force_only_kernel_singleton = None
 _prepared_pme_direct_force_only_kernel_singleton = None
 _tile_pme_direct_kernel_singleton = None
 _tile_pme_direct_force_only_kernel_singleton = None
+_tile_nbfix_pme_direct_kernel_singleton = None
+_tile_nbfix_pme_direct_force_only_kernel_singleton = None
 _interaction32_pack_kernel_singleton = None
 _interaction32_force_kernel_singleton = None
 _interaction32_canonical_force_kernel_singleton = None
@@ -966,6 +968,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     threadgroup float left_half_sigma[4 * GROUPS_PER_TG];
     threadgroup float left_sqrt_epsilon[4 * GROUPS_PER_TG];
     threadgroup float left_charges[4 * GROUPS_PER_TG];
+#ifdef MLX_ATOMISTIC_NBFIX
+    threadgroup int left_type_ids[4 * GROUPS_PER_TG];
+#endif
     uint lbase = sub * 4u;
     uint pbase = sub * 12u;
 
@@ -981,6 +986,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
         left_half_sigma[lbase + lane] = half_sigma[safe_left];
         left_sqrt_epsilon[lbase + lane] = sqrt_epsilon[safe_left];
         left_charges[lbase + lane] = charges[safe_left];
+#ifdef MLX_ATOMISTIC_NBFIX
+        left_type_ids[lbase + lane] = atom_type_ids[safe_left];
+#endif
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -999,6 +1007,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     float right_half_sigma_value = half_sigma[safe_right];
     float right_sqrt_epsilon_value = sqrt_epsilon[safe_right];
     float right_charge = charges[safe_right];
+#ifdef MLX_ATOMISTIC_NBFIX
+    int right_type_id = atom_type_ids[safe_right];
+#endif
     float accumulated_right_fx = 0.0f;
     float accumulated_right_fy = 0.0f;
     float accumulated_right_fz = 0.0f;
@@ -1024,6 +1035,9 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
     float ewald_self = params[8];
     float inv_switch_width = params[9];
     float one_four_scale = params[10];
+#ifdef MLX_ATOMISTIC_NBFIX
+    int nbfix_type_count = (int)params[11];
+#endif
 
     for (uint left_slot = 0u; left_slot < 4u; left_slot++) {
         uint bit = 4u * left_slot + right_slot;
@@ -1058,6 +1072,16 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
                         + right_half_sigma_value;
                     float epsilon_ij = left_sqrt_epsilon[lbase + left_slot]
                         * right_sqrt_epsilon_value;
+#ifdef MLX_ATOMISTIC_NBFIX
+                    int nbfix_index =
+                        left_type_ids[lbase + left_slot] * nbfix_type_count
+                        + right_type_id;
+                    float nbfix_sigma_value = nbfix_sigma[nbfix_index];
+                    if (nbfix_sigma_value > 0.0f) {
+                        sigma_ij = nbfix_sigma_value;
+                        epsilon_ij = nbfix_epsilon[nbfix_index];
+                    }
+#endif
                     float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
                     float inv_r6 =
                         sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
@@ -1206,6 +1230,16 @@ _TILE_PREPARED_PME_DIRECT_SOURCE = r"""
 
 _TILE_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
     "#define MLX_ATOMISTIC_FORCE_ONLY 1\n" + _TILE_PREPARED_PME_DIRECT_SOURCE
+)
+
+_TILE_NBFIX_PREPARED_PME_DIRECT_SOURCE = (
+    "#define MLX_ATOMISTIC_NBFIX 1\n" + _TILE_PREPARED_PME_DIRECT_SOURCE
+)
+
+_TILE_NBFIX_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE = (
+    "#define MLX_ATOMISTIC_FORCE_ONLY 1\n"
+    "#define MLX_ATOMISTIC_NBFIX 1\n"
+    + _TILE_PREPARED_PME_DIRECT_SOURCE
 )
 
 _INTERACTION32_GROUPS_PER_THREADGROUP = 4
@@ -3362,6 +3396,40 @@ def _tile_pme_direct_force_only_kernel():
     return _tile_pme_direct_force_only_kernel_singleton
 
 
+def _tile_nbfix_pme_direct_force_only_kernel():
+    """Return the cached NBFIX-aware spatial 4x4 direct-force kernel."""
+
+    global _tile_nbfix_pme_direct_force_only_kernel_singleton
+    if _tile_nbfix_pme_direct_force_only_kernel_singleton is None:
+        _tile_nbfix_pme_direct_force_only_kernel_singleton = mx.fast.metal_kernel(
+            name="spatial_tile_nbfix_parameterized_pme_direct_force_only",
+            input_names=[
+                "positions",
+                "atom_blocks",
+                "tile_blocks",
+                "lj_enabled_mask",
+                "lj_one_four_mask",
+                "force_columns",
+                "force_group_starts",
+                "force_group_counts",
+                "box",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "atom_type_ids",
+                "nbfix_sigma",
+                "nbfix_epsilon",
+                "params",
+                "ngroups",
+            ],
+            output_names=["forces"],
+            source=_TILE_NBFIX_PREPARED_PME_DIRECT_FORCE_ONLY_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _tile_nbfix_pme_direct_force_only_kernel_singleton
+
+
 def _tile_pme_direct_kernel():
     """Return the cached spatial 4x4 tile direct energy/force kernel."""
 
@@ -3391,6 +3459,40 @@ def _tile_pme_direct_kernel():
             atomic_outputs=True,
         )
     return _tile_pme_direct_kernel_singleton
+
+
+def _tile_nbfix_pme_direct_kernel():
+    """Return the cached NBFIX-aware spatial 4x4 energy/force kernel."""
+
+    global _tile_nbfix_pme_direct_kernel_singleton
+    if _tile_nbfix_pme_direct_kernel_singleton is None:
+        _tile_nbfix_pme_direct_kernel_singleton = mx.fast.metal_kernel(
+            name="spatial_tile_nbfix_parameterized_pme_direct",
+            input_names=[
+                "positions",
+                "atom_blocks",
+                "tile_blocks",
+                "lj_enabled_mask",
+                "lj_one_four_mask",
+                "force_columns",
+                "force_group_starts",
+                "force_group_counts",
+                "box",
+                "half_sigma",
+                "sqrt_epsilon",
+                "charges",
+                "atom_type_ids",
+                "nbfix_sigma",
+                "nbfix_epsilon",
+                "params",
+                "ngroups",
+            ],
+            output_names=["forces", "group_lj_energy", "group_coulomb_energy"],
+            source=_TILE_NBFIX_PREPARED_PME_DIRECT_SOURCE,
+            header=_ERF_HEADER,
+            atomic_outputs=True,
+        )
+    return _tile_nbfix_pme_direct_kernel_singleton
 
 
 def _interaction32_pack_kernel():
@@ -6448,9 +6550,18 @@ def _tile_parameterized_pme_direct_force_only(
     one_four_scale: float,
     coulomb_constant: float,
     alpha: float,
+    atom_type_ids: mx.array | None = None,
+    nbfix_type_sigma: mx.array | None = None,
+    nbfix_type_epsilon: mx.array | None = None,
+    nbfix_type_count: int = 0,
     _return_energy: bool = False,
 ) -> mx.array | tuple[mx.array, mx.array, mx.array]:
-    """Evaluate prepared direct forces from exact spatial 4x4 tiles."""
+    """Evaluate prepared direct forces from exact spatial 4x4 tiles.
+
+    Type-pair NBFIX parameters select a dedicated kernel specialization. The
+    ordinary tile kernel and its input contract remain unchanged when the
+    optional lookup table is absent.
+    """
 
     positions = as_mx_array(positions, dtype=mx.float32)
     atom_blocks = as_mx_array(atom_blocks, dtype=mx.int32)
@@ -6465,6 +6576,11 @@ def _tile_parameterized_pme_direct_force_only(
     half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
     sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
     charges = as_mx_array(charges, dtype=mx.float32)
+    nbfix_inputs = (atom_type_ids, nbfix_type_sigma, nbfix_type_epsilon)
+    has_nbfix = any(value is not None for value in nbfix_inputs)
+    if has_nbfix and not all(value is not None for value in nbfix_inputs):
+        msg = "NBFIX tile inputs must be provided together"
+        raise ValueError(msg)
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
         raise ValueError(msg)
@@ -6500,6 +6616,26 @@ def _tile_parameterized_pme_direct_force_only(
     if charges.shape != (n_atoms,):
         msg = "charges must have shape (n_atoms,)"
         raise ValueError(msg)
+    if has_nbfix:
+        atom_type_ids = as_mx_array(atom_type_ids, dtype=mx.int32)
+        nbfix_type_sigma = as_mx_array(nbfix_type_sigma, dtype=mx.float32)
+        nbfix_type_epsilon = as_mx_array(nbfix_type_epsilon, dtype=mx.float32)
+        if atom_type_ids.shape != (n_atoms,):
+            msg = "atom_type_ids must have shape (n_atoms,)"
+            raise ValueError(msg)
+        if nbfix_type_count <= 0:
+            msg = "nbfix_type_count must be positive when NBFIX inputs are provided"
+            raise ValueError(msg)
+        table_shape = (nbfix_type_count * nbfix_type_count,)
+        if (
+            nbfix_type_sigma.shape != table_shape
+            or nbfix_type_epsilon.shape != table_shape
+        ):
+            msg = "NBFIX parameter tables must have shape (nbfix_type_count ** 2,)"
+            raise ValueError(msg)
+    elif nbfix_type_count != 0:
+        msg = "nbfix_type_count requires NBFIX tile inputs"
+        raise ValueError(msg)
     if cutoff is None or not isfinite(float(cutoff)) or cutoff <= 0.0:
         msg = "tile PME direct forces require a finite positive cutoff"
         raise ValueError(msg)
@@ -6534,22 +6670,22 @@ def _tile_parameterized_pme_direct_force_only(
     switch_value = 0.0 if switch_distance is None else float(switch_distance)
     switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
     alpha_value = float(alpha)
-    params = mx.array(
-        [
-            cutoff_value * cutoff_value,
-            float(bool(shift)),
-            float(has_switch),
-            switch_value,
-            switch_width,
-            cutoff_value,
-            float(coulomb_constant),
-            alpha_value,
-            2.0 * alpha_value / sqrt(pi),
-            1.0 / switch_width,
-            float(one_four_scale),
-        ],
-        dtype=mx.float32,
-    )
+    parameter_values = [
+        cutoff_value * cutoff_value,
+        float(bool(shift)),
+        float(has_switch),
+        switch_value,
+        switch_width,
+        cutoff_value,
+        float(coulomb_constant),
+        alpha_value,
+        2.0 * alpha_value / sqrt(pi),
+        1.0 / switch_width,
+        float(one_four_scale),
+    ]
+    if has_nbfix:
+        parameter_values.append(float(nbfix_type_count))
+    params = mx.array(parameter_values, dtype=mx.float32)
     inputs = [
         positions,
         atom_blocks,
@@ -6563,9 +6699,12 @@ def _tile_parameterized_pme_direct_force_only(
         half_sigma,
         sqrt_epsilon,
         charges,
-        params,
-        mx.array([group_count], dtype=mx.int32),
     ]
+    if has_nbfix:
+        inputs.extend(
+            (atom_type_ids, nbfix_type_sigma, nbfix_type_epsilon),
+        )
+    inputs.extend((params, mx.array([group_count], dtype=mx.int32)))
     dispatch = {
         "grid": (
             _tile_pme_threadgroup_count(group_count) * _TILE_PME_DISPATCH_WIDTH,
@@ -6576,17 +6715,25 @@ def _tile_parameterized_pme_direct_force_only(
         "init_value": 0.0,
     }
     if _return_energy:
-        forces, group_lj_energy, group_coulomb_energy = _tile_pme_direct_kernel()(
+        kernel = (
+            _tile_nbfix_pme_direct_kernel()
+            if has_nbfix
+            else _tile_pme_direct_kernel()
+        )
+        forces, group_lj_energy, group_coulomb_energy = kernel(
             inputs=inputs,
             output_shapes=[(n_atoms, 3), (group_count,), (group_count,)],
             output_dtypes=[mx.float32, mx.float32, mx.float32],
             **dispatch,
         )
         return mx.sum(group_lj_energy), mx.sum(group_coulomb_energy), forces
-    (forces,) = _tile_pme_direct_force_only_kernel()(
-        inputs=[
-            *inputs,
-        ],
+    kernel = (
+        _tile_nbfix_pme_direct_force_only_kernel()
+        if has_nbfix
+        else _tile_pme_direct_force_only_kernel()
+    )
+    (forces,) = kernel(
+        inputs=inputs,
         output_shapes=[(n_atoms, 3)],
         output_dtypes=[mx.float32],
         **dispatch,

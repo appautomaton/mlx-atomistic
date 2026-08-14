@@ -88,12 +88,15 @@ def _all_pairs(count: int) -> mx.array:
     return mx.array(pairs, dtype=mx.int32)
 
 
-def _dihedral_angle(
+def _dihedral_angles(
     positions: mx.array,
-    atoms: tuple[int, int, int, int],
+    atoms: mx.array,
     cell: Cell | None,
 ) -> mx.array:
-    i, j, k, m = atoms
+    i = atoms[:, 0]
+    j = atoms[:, 1]
+    k = atoms[:, 2]
+    m = atoms[:, 3]
     delta_ab = positions[j] - positions[i]
     delta_bc = positions[j] - positions[k]
     delta_cd = positions[m] - positions[k]
@@ -189,12 +192,13 @@ def _periodic_bicubic_coefficients(grids: np.ndarray) -> np.ndarray:
     return coefficients
 
 
-def _periodic_cubic_grid_value(
+def _periodic_cubic_grid_values(
     coefficients: mx.array,
+    map_indices: mx.array,
     phi: mx.array,
     psi: mx.array,
 ) -> mx.array:
-    size = int(coefficients.shape[0])
+    size = int(coefficients.shape[1])
     scale = size / (2.0 * pi)
     phi_scaled = -phi * scale
     psi_scaled = -psi * scale
@@ -203,19 +207,31 @@ def _periodic_cubic_grid_value(
     phi_floor = mx.floor(phi_scaled)
     psi_floor = mx.floor(psi_scaled)
     patch = coefficients[
+        map_indices,
         phi_floor.astype(mx.int32),
         psi_floor.astype(mx.int32),
     ]
     phi_t = phi_scaled - phi_floor
     psi_t = psi_scaled - psi_floor
-    phi_powers = mx.stack([mx.ones_like(phi_t), phi_t, phi_t * phi_t, phi_t**3])
-    psi_powers = mx.stack([mx.ones_like(psi_t), psi_t, psi_t * psi_t, psi_t**3])
-    return mx.sum(patch * phi_powers[:, None] * psi_powers[None, :])
+    phi_powers = mx.stack(
+        [mx.ones_like(phi_t), phi_t, phi_t * phi_t, phi_t**3],
+        axis=-1,
+    )
+    psi_powers = mx.stack(
+        [mx.ones_like(psi_t), psi_t, psi_t * psi_t, psi_t**3],
+        axis=-1,
+    )
+    return mx.sum(
+        patch * phi_powers[:, :, None] * psi_powers[:, None, :],
+        axis=(1, 2),
+    )
 
 
 @dataclass(frozen=True)
 class CHARMMUreyBradleyPotential:
     """CHARMM Urey-Bradley 1-3 distance term for angle triplets."""
+
+    _neighbor_tile_diagnostic_policy = "ignore"
 
     urey_bradley_terms: object
     k: object
@@ -304,13 +320,13 @@ class CHARMMUreyBradleyPotential:
 class CHARMMCMAPPotential:
     """CHARMM CMAP correction with periodic natural bicubic interpolation."""
 
+    _neighbor_tile_diagnostic_policy = "ignore"
+
     charmm_cmap_terms: object
     cmap_grids: object
     cmap_indices: object | None = None
     name: str = "charmm_cmap_terms"
     supports_virial: bool = True
-    _terms_np: np.ndarray = field(init=False, repr=False)
-    _indices_np: np.ndarray = field(init=False, repr=False)
     _coefficients: mx.array = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -341,8 +357,6 @@ class CHARMMCMAPPotential:
         object.__setattr__(self, "charmm_cmap_terms", mx.array(terms, dtype=mx.int32))
         object.__setattr__(self, "cmap_grids", as_mx_array(grids))
         object.__setattr__(self, "cmap_indices", mx.array(indices, dtype=mx.int32))
-        object.__setattr__(self, "_terms_np", terms)
-        object.__setattr__(self, "_indices_np", indices)
         object.__setattr__(
             self,
             "_coefficients",
@@ -362,18 +376,18 @@ class CHARMMCMAPPotential:
         """
 
         positions = as_mx_array(positions)
-        if self._terms_np.shape[0] == 0:
+        if self.charmm_cmap_terms.shape[0] == 0:
             return _zero_energy(positions)
-        energy = _zero_energy(positions)
-        for term, map_index in zip(self._terms_np.tolist(), self._indices_np.tolist(), strict=True):
-            phi = _dihedral_angle(positions, tuple(term[:4]), cell)
-            psi = _dihedral_angle(positions, tuple(term[4:]), cell)
-            energy = energy + _periodic_cubic_grid_value(
-                self._coefficients[int(map_index)],
+        phi = _dihedral_angles(positions, self.charmm_cmap_terms[:, :4], cell)
+        psi = _dihedral_angles(positions, self.charmm_cmap_terms[:, 4:], cell)
+        return mx.sum(
+            _periodic_cubic_grid_values(
+                self._coefficients,
+                self.cmap_indices,
                 phi,
                 psi,
             )
-        return energy
+        )
 
     def energy_forces(
         self,
@@ -397,7 +411,7 @@ class CHARMMCMAPPotential:
 
         del pairs
         positions = as_mx_array(positions)
-        if self._terms_np.shape[0] == 0:
+        if self.charmm_cmap_terms.shape[0] == 0:
             return _zero_energy(positions), mx.zeros_like(positions)
 
         def energy_fn(current_positions: mx.array) -> mx.array:

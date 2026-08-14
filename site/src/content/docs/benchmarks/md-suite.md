@@ -34,8 +34,8 @@ The release registry additionally includes a JAC scaling ladder, deterministic
 30,000- and 90,000-atom TIP3P water boxes, the official 92,224-atom OpenMM
 ApoA1 PME workload, and GPCRmd 729.
 
-Neighbor backend is a per-case contract. GPCRmd uses `mlx_cell_pairs` for its
-CHARMM NBFIX path; the other release PME cases use `mlx_cell_tiles`.
+Neighbor backend is a per-case contract. All release PME cases use
+`mlx_cell_tiles`; GPCRmd selects its NBFIX-aware tile specialization.
 
 Raw repeat payloads and prepared artifacts remain under gitignored `results/`.
 The committed registry is

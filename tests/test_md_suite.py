@@ -38,6 +38,8 @@ def test_md_suite_registry_defines_local_acceptance_pair_and_release_cases():
         "gpcrmd-729-pme",
     }
     assert len({case.fingerprint for case in release}) == len(release)
+    gpcrmd = next(case for case in release if case.case_id == "gpcrmd-729-pme")
+    assert gpcrmd.neighbor_backend == "mlx_cell_tiles"
 
 
 def test_md_suite_inventory_reports_prepared_artifact_availability(tmp_path: Path):

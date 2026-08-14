@@ -990,6 +990,7 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
             assignment_order=5,
         ),
         has_nbfix=False,
+        nbfix_pairs=np.empty((0, 2), dtype=np.int32),
     )
 
     selected = runner._production_neighbor_manager(
@@ -1026,7 +1027,22 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
     assert selected_small is not None and selected_small.backend == "mlx_cell_tiles"
     assert pinned_pairs is not None and pinned_pairs.backend == "mlx_cell_pairs"
     assert npt is not None and npt.backend == "mlx_cell_pairs"
-    nbfix_term = SimpleNamespace(**{**vars(pme_term), "has_nbfix": True})
+    type_nbfix_term = SimpleNamespace(**{**vars(pme_term), "has_nbfix": True})
+    selected_type_nbfix = runner._production_neighbor_manager(
+        system,
+        (type_nbfix_term,),
+        require_production=True,
+        fixed_cell=True,
+    )
+    assert selected_type_nbfix is not None
+    assert selected_type_nbfix.backend == "mlx_cell_tiles"
+    nbfix_term = SimpleNamespace(
+        **{
+            **vars(pme_term),
+            "has_nbfix": True,
+            "nbfix_pairs": np.asarray([[0, 1]], dtype=np.int32),
+        }
+    )
     order_four_term = SimpleNamespace(
         **{
             **vars(pme_term),
