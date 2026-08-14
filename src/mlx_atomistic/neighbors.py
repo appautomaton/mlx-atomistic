@@ -30,6 +30,8 @@ from mlx_atomistic.metal_kernels import (
     _neighbor_pair_ordered_scatter_sized,
     _neighbor_tile_column_scatter_sized,
     _neighbor_tile_force_groups_sized,
+    _neighbor_tile_left_counts,
+    _neighbor_tile_left_scatter_sized,
     _neighbor_tile_member_counts,
     _neighbor_tile_member_pairs_sized,
     _neighbor_tile_membership,
@@ -66,6 +68,15 @@ DEFAULT_MLX_CELL_TILE_BLOCK_SIZE = 4
 DEFAULT_MLX_CELL_TILE_BUILD_BLOCK_SIZE = 8
 DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE = 32
 DEFAULT_MLX_CELL_TILE_BATCH = 65_536
+# Below this inventory, compacting followed by MLX argsort is cheaper than
+# traversing the cell-task schedule a second time. Above it, direct left-block
+# grouping avoids the superlinear global sort. The 3M crossover is conservative
+# relative to the measured 2.3M tie point on M5 Max.
+_MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MIN_CANDIDATES = 3_000_000
+# One Metal thread traverses all coarse blocks owned by a cell. Keep unusually
+# concentrated cells on the parallel compact-and-sort path so pathological
+# occupancy cannot serialize the direct-grouped scatter.
+_MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MAX_BLOCKS_PER_CELL = 8
 _MLX_MD_CACHE_LIMIT_BYTES = 4_000_000_000
 # Default neighbor backend for systems above the dense-pair limit. Measured on
 # M5 Max (4k/16k/50k LJ, 2026-06-18): compacting candidates to real pairs
@@ -1656,6 +1667,7 @@ def _build_mlx_spatial_cell_tile_list(
             task_atom_candidate_prefix[-1],
             mx.sum(cell_counts_mx > 0),
             inventory_overflow.astype(mx.int32),
+            mx.max(cell_block_counts_mx),
         )
     )
     mx.eval(inventory)
@@ -1665,6 +1677,7 @@ def _build_mlx_spatial_cell_tile_list(
         raw_candidate_count,
         occupied_cell_count,
         inventory_overflowed,
+        max_cell_block_count,
     ) = (int(value) for value in np.asarray(inventory))
     if inventory_overflowed:
         msg = "spatial tile inventory exceeds int32 capacity"
@@ -1716,30 +1729,68 @@ def _build_mlx_spatial_cell_tile_list(
         subtile_counts,
     )
 
+    use_left_grouped_scatter = False
     if candidate_tile_count:
-        subtile_prefix = mx.cumsum(subtile_counts)
-        member_prefix = mx.cumsum(member_counts)
-        inventory_counts = mx.stack(
-            (subtile_prefix[-1], member_prefix[-1]),
+        use_left_grouped_scatter = (
+            candidate_tile_count >= _MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MIN_CANDIDATES
+            and max_cell_block_count
+            <= _MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MAX_BLOCKS_PER_CELL
         )
-        mx.eval(subtile_prefix, member_prefix, inventory_counts)
-        tile_count, exact_pair_count = (int(value) for value in np.asarray(inventory_counts))
-        finish_stage("tile_inventory_readback")
-        tile_blocks, member_mask = _neighbor_tile_ordered_scatter_sized(
-            candidate_tiles,
-            candidate_subtile_mask,
-            subtile_counts,
-            subtile_prefix,
-            accepted_count=tile_count,
-        )
+        if not use_left_grouped_scatter:
+            subtile_prefix = mx.cumsum(subtile_counts)
+            member_prefix = mx.cumsum(member_counts)
+            inventory_counts = mx.stack(
+                (subtile_prefix[-1], member_prefix[-1]),
+            )
+            mx.eval(subtile_prefix, member_prefix, inventory_counts)
+            tile_count, exact_pair_count = (
+                int(value) for value in np.asarray(inventory_counts)
+            )
+            finish_stage("tile_inventory_readback")
+            tile_blocks, member_mask = _neighbor_tile_ordered_scatter_sized(
+                candidate_tiles,
+                candidate_subtile_mask,
+                subtile_counts,
+                subtile_prefix,
+                accepted_count=tile_count,
+            )
+            # Compact-and-sort is the lower-overhead path for smaller tile
+            # inventories. Sorting also groups each force owner's left block.
+            force_order = mx.argsort(tile_blocks[:, 0])
+            tile_blocks = tile_blocks[force_order]
+            member_mask = member_mask[force_order]
+        else:
+            fine_tile_counts = _neighbor_tile_left_counts(
+                candidate_subtile_mask,
+                cell_block_starts_mx,
+                cell_block_counts_mx,
+                cell_pairs,
+                task_offsets,
+                task_tile_counts,
+                block_capacity=block_capacity,
+            )
+            fine_tile_prefix = mx.cumsum(fine_tile_counts)
+            inventory_counts = mx.stack(
+                (fine_tile_prefix[-1], mx.sum(member_counts)),
+            )
+            mx.eval(fine_tile_prefix, inventory_counts)
+            tile_count, exact_pair_count = (
+                int(value) for value in np.asarray(inventory_counts)
+            )
+            finish_stage("tile_inventory_readback")
+            tile_blocks, member_mask = _neighbor_tile_left_scatter_sized(
+                candidate_subtile_mask,
+                cell_block_starts_mx,
+                cell_block_counts_mx,
+                cell_pairs,
+                task_offsets,
+                task_tile_counts,
+                fine_tile_counts,
+                fine_tile_prefix,
+                accepted_count=tile_count,
+            )
         atom_blocks = atom_blocks.reshape((-1, DEFAULT_MLX_CELL_TILE_BLOCK_SIZE))
         block_count = int(atom_blocks.shape[0])
-        # Cell-pair tasks are spatially coherent but periodic canonicalization
-        # does not guarantee monotonic block IDs. Group only the much smaller
-        # non-empty tile inventory so every force group owns one left block.
-        force_order = mx.argsort(tile_blocks[:, 0])
-        tile_blocks = tile_blocks[force_order]
-        member_mask = member_mask[force_order]
         finish_stage("exact_tile_scatter_and_order", tile_blocks, member_mask)
         column_patterns = mx.array(
             [0x1111, 0x2222, 0x4444, 0x8888],
@@ -1843,7 +1894,10 @@ def _build_mlx_spatial_cell_tile_list(
             inventory={
                 "atom_count": n_atoms,
                 "cell_count": cell_count,
+                "occupied_cell_count": occupied_cell_count,
+                "max_cell_block_count": max_cell_block_count,
                 "coarse_candidate_tile_count": candidate_tile_count,
+                "left_grouped_scatter": int(use_left_grouped_scatter),
                 "exact_tile_count": tile_count,
                 "exact_pair_count": exact_pair_count,
                 "force_column_count": int(force_columns.shape[0]),

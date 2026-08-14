@@ -15,6 +15,7 @@ import pytest
 
 import mlx_atomistic.constraints as constraints_module
 import mlx_atomistic.md as md_module
+import mlx_atomistic.neighbors as neighbors_module
 from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
@@ -1085,9 +1086,14 @@ def test_spatial_neighbor_pipeline_matches_cpu_oracle_for_edge_cases(case):
 
 
 @pytest.mark.gpu
-def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
+def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route(monkeypatch):
     """Device-built spatial tiles preserve membership, topology, and forces."""
 
+    monkeypatch.setattr(
+        neighbors_module,
+        "_MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MIN_CANDIDATES",
+        0,
+    )
     rng = np.random.default_rng(41)
     lattice = (
         np.stack(np.meshgrid(np.arange(3), np.arange(3), np.arange(3)), axis=-1)
@@ -1108,14 +1114,16 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
         sort_pairs=True,
         backend="mlx_cell_pairs",
     )
-    tile_neighbors = build_neighbor_list(
-        positions,
-        cell,
-        cutoff=2.6,
-        skin=0.35,
-        sort_pairs=True,
-        backend="mlx_cell_tiles",
-    )
+    with _profile_mlx_cell_tile_rebuilds() as profiler:
+        tile_neighbors = build_neighbor_list(
+            positions,
+            cell,
+            cutoff=2.6,
+            skin=0.35,
+            sort_pairs=True,
+            backend="mlx_cell_tiles",
+        )
+    assert profiler.report()["inventories"]["left_grouped_scatter"]["median"] == 1
     assert tile_neighbors.tiles is not None
     assert not tile_neighbors.diagnostic_pairs_materialized
     assert tile_neighbors.estimated_pair_bytes == tile_neighbors.tiles.estimated_bytes
@@ -1364,6 +1372,32 @@ def test_spatial_tile_rebuild_stage_profile_reconciles_exact_inventory():
     assert report["inventories"]["exact_pair_count"]["median"] == pytest.approx(
         neighbors.tiles.exact_pair_count
     )
+
+
+@pytest.mark.gpu
+def test_left_grouped_tile_scatter_declines_concentrated_cell(monkeypatch):
+    """A highly occupied cell retains the parallel compact-and-sort route."""
+
+    monkeypatch.setattr(
+        neighbors_module,
+        "_MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MIN_CANDIDATES",
+        0,
+    )
+    positions = np.linspace(0.10, 0.25, 72 * 3, dtype=np.float32).reshape((72, 3))
+    with _profile_mlx_cell_tile_rebuilds() as profiler:
+        neighbors = build_neighbor_list(
+            positions,
+            Cell.cubic(16.0),
+            cutoff=1.0,
+            skin=0.0,
+            sort_pairs=False,
+            backend="mlx_cell_tiles",
+        )
+
+    report = profiler.report()
+    assert neighbors.pair_count == 72 * 71 // 2
+    assert report["inventories"]["max_cell_block_count"]["median"] == 9
+    assert report["inventories"]["left_grouped_scatter"]["median"] == 0
 
 
 @pytest.mark.gpu

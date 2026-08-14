@@ -464,6 +464,8 @@ _neighbor_cell_atom_blocks_kernel_singleton = None
 _neighbor_cell_tile_candidates_kernel_singleton = None
 _neighbor_tile_membership_kernel_singleton = None
 _neighbor_tile_ordered_scatter_kernel_singleton = None
+_neighbor_tile_left_counts_kernel_singleton = None
+_neighbor_tile_left_scatter_kernel_singleton = None
 _neighbor_tile_column_scatter_kernel_singleton = None
 _neighbor_tile_force_groups_kernel_singleton = None
 _neighbor_tile_member_counts_kernel_singleton = None
@@ -2614,6 +2616,150 @@ _NEIGHBOR_TILE_ORDERED_SCATTER_SOURCE = r"""
     }
 """
 
+_NEIGHBOR_TILE_LEFT_COUNTS_SOURCE = r"""
+    uint cell = thread_position_in_grid.x;
+    if (cell >= (uint)counts[0]) {
+        return;
+    }
+    int left_start = cell_block_starts[cell];
+    int left_count = cell_block_counts[cell];
+    int task_total = counts[1];
+    int lower = 0;
+    int upper = task_total;
+    while (lower < upper) {
+        int middle = lower + (upper - lower) / 2;
+        if (cell_pairs[2 * middle + 0] < (int)cell) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    int task_start = lower;
+    upper = task_total;
+    while (lower < upper) {
+        int middle = lower + (upper - lower) / 2;
+        if (cell_pairs[2 * middle + 0] <= (int)cell) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    int task_count = lower - task_start;
+    for (int local_left = 0; local_left < left_count; local_left++) {
+        int top_count = 0;
+        int bottom_count = 0;
+        for (int local_task = 0; local_task < task_count; local_task++) {
+            int task = task_start + local_task;
+            if (task_tile_counts[task] == 0) {
+                continue;
+            }
+            int right_cell = cell_pairs[2 * task + 1];
+            int right_count = cell_block_counts[right_cell];
+            int candidate = task_offsets[task];
+            int right_begin = 0;
+            if (right_cell == (int)cell) {
+                candidate += local_left * left_count
+                    - local_left * (local_left - 1) / 2;
+                right_begin = local_left;
+            } else {
+                candidate += local_left * right_count;
+            }
+            for (int local_right = right_begin; local_right < right_count; local_right++) {
+                top_count += subtile_mask[4 * candidate + 0] != 0u ? 1 : 0;
+                top_count += subtile_mask[4 * candidate + 1] != 0u ? 1 : 0;
+                bottom_count += subtile_mask[4 * candidate + 2] != 0u ? 1 : 0;
+                bottom_count += subtile_mask[4 * candidate + 3] != 0u ? 1 : 0;
+                candidate++;
+            }
+        }
+        int coarse_left = left_start + local_left;
+        fine_tile_counts[2 * coarse_left + 0] = top_count;
+        fine_tile_counts[2 * coarse_left + 1] = bottom_count;
+    }
+"""
+
+_NEIGHBOR_TILE_LEFT_SCATTER_SOURCE = r"""
+    uint cell = thread_position_in_grid.x;
+    if (cell >= (uint)counts[0]) {
+        return;
+    }
+    int left_start = cell_block_starts[cell];
+    int left_count = cell_block_counts[cell];
+    int task_total = counts[1];
+    int lower = 0;
+    int upper = task_total;
+    while (lower < upper) {
+        int middle = lower + (upper - lower) / 2;
+        if (cell_pairs[2 * middle + 0] < (int)cell) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    int task_start = lower;
+    upper = task_total;
+    while (lower < upper) {
+        int middle = lower + (upper - lower) / 2;
+        if (cell_pairs[2 * middle + 0] <= (int)cell) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    int task_count = lower - task_start;
+    for (int local_left = 0; local_left < left_count; local_left++) {
+        int coarse_left = left_start + local_left;
+        int top_output = fine_tile_prefix[2 * coarse_left + 0]
+            - fine_tile_counts[2 * coarse_left + 0];
+        int bottom_output = fine_tile_prefix[2 * coarse_left + 1]
+            - fine_tile_counts[2 * coarse_left + 1];
+        for (int local_task = 0; local_task < task_count; local_task++) {
+            int task = task_start + local_task;
+            if (task_tile_counts[task] == 0) {
+                continue;
+            }
+            int right_cell = cell_pairs[2 * task + 1];
+            int right_start = cell_block_starts[right_cell];
+            int right_count = cell_block_counts[right_cell];
+            int candidate = task_offsets[task];
+            int right_begin = 0;
+            if (right_cell == (int)cell) {
+                candidate += local_left * left_count
+                    - local_left * (local_left - 1) / 2;
+                right_begin = local_left;
+            } else {
+                candidate += local_left * right_count;
+            }
+            for (int local_right = right_begin; local_right < right_count; local_right++) {
+                int coarse_right = right_start + local_right;
+                for (int quadrant = 0; quadrant < 2; quadrant++) {
+                    uint word = subtile_mask[4 * candidate + quadrant];
+                    if (word == 0u) {
+                        continue;
+                    }
+                    accepted_tile_blocks[2 * top_output + 0] = 2 * coarse_left;
+                    accepted_tile_blocks[2 * top_output + 1] =
+                        2 * coarse_right + quadrant;
+                    accepted_member_mask[top_output] = word;
+                    top_output++;
+                }
+                for (int quadrant = 2; quadrant < 4; quadrant++) {
+                    uint word = subtile_mask[4 * candidate + quadrant];
+                    if (word == 0u) {
+                        continue;
+                    }
+                    accepted_tile_blocks[2 * bottom_output + 0] = 2 * coarse_left + 1;
+                    accepted_tile_blocks[2 * bottom_output + 1] =
+                        2 * coarse_right + (quadrant & 1);
+                    accepted_member_mask[bottom_output] = word;
+                    bottom_output++;
+                }
+                candidate++;
+            }
+        }
+    }
+"""
+
 _NEIGHBOR_TILE_COLUMN_SCATTER_SOURCE = r"""
     uint tile = thread_position_in_grid.x;
     if (tile >= (uint)counts[0] || active_column_counts[tile] == 0) {
@@ -4156,6 +4302,52 @@ def _neighbor_tile_ordered_scatter_kernel():
     return _neighbor_tile_ordered_scatter_kernel_singleton
 
 
+def _neighbor_tile_left_counts_kernel():
+    """Return the cached exact-tile counts-by-left-block kernel."""
+
+    global _neighbor_tile_left_counts_kernel_singleton
+    if _neighbor_tile_left_counts_kernel_singleton is None:
+        _neighbor_tile_left_counts_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_left_counts",
+            input_names=[
+                "subtile_mask",
+                "cell_block_starts",
+                "cell_block_counts",
+                "cell_pairs",
+                "task_offsets",
+                "task_tile_counts",
+                "counts",
+            ],
+            output_names=["fine_tile_counts"],
+            source=_NEIGHBOR_TILE_LEFT_COUNTS_SOURCE,
+        )
+    return _neighbor_tile_left_counts_kernel_singleton
+
+
+def _neighbor_tile_left_scatter_kernel():
+    """Return the cached exact-tile left-grouped scatter kernel."""
+
+    global _neighbor_tile_left_scatter_kernel_singleton
+    if _neighbor_tile_left_scatter_kernel_singleton is None:
+        _neighbor_tile_left_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="neighbor_tile_left_scatter",
+            input_names=[
+                "subtile_mask",
+                "cell_block_starts",
+                "cell_block_counts",
+                "cell_pairs",
+                "task_offsets",
+                "task_tile_counts",
+                "fine_tile_counts",
+                "fine_tile_prefix",
+                "counts",
+            ],
+            output_names=["accepted_tile_blocks", "accepted_member_mask"],
+            source=_NEIGHBOR_TILE_LEFT_SCATTER_SOURCE,
+        )
+    return _neighbor_tile_left_scatter_kernel_singleton
+
+
 def _neighbor_tile_column_scatter_kernel():
     """Return the cached non-empty tile-column compaction kernel."""
 
@@ -4814,6 +5006,135 @@ def _neighbor_tile_ordered_scatter_sized(
         output_dtypes=[mx.int32, mx.uint32],
         grid=(tile_count, 1, 1),
         threadgroup=(min(256, tile_count), 1, 1),
+        init_value=0,
+    )
+    return accepted_tiles, accepted_mask
+
+
+def _neighbor_tile_left_counts(
+    subtile_mask: mx.array,
+    cell_block_starts: mx.array,
+    cell_block_counts: mx.array,
+    cell_pairs: mx.array,
+    task_offsets: mx.array,
+    task_tile_counts: mx.array,
+    *,
+    block_capacity: int,
+) -> mx.array:
+    """Count exact 4x4 subtiles directly by their final left block."""
+
+    subtile_mask = as_mx_array(subtile_mask, dtype=mx.uint32)
+    cell_block_starts = as_mx_array(cell_block_starts, dtype=mx.int32)
+    cell_block_counts = as_mx_array(cell_block_counts, dtype=mx.int32)
+    cell_pairs = as_mx_array(cell_pairs, dtype=mx.int32)
+    task_offsets = as_mx_array(task_offsets, dtype=mx.int32)
+    task_tile_counts = as_mx_array(task_tile_counts, dtype=mx.int32)
+    cell_count = int(cell_block_starts.shape[0])
+    task_count = int(cell_pairs.shape[0])
+    if cell_block_counts.shape != (cell_count,):
+        msg = "cell block starts and counts must have matching vector shapes"
+        raise ValueError(msg)
+    if cell_pairs.ndim != 2 or cell_pairs.shape[1] != 2:
+        msg = "cell_pairs must have shape (n_tasks, 2)"
+        raise ValueError(msg)
+    if task_offsets.shape != (task_count,) or task_tile_counts.shape != (task_count,):
+        msg = "task offsets and tile counts must contain one value per task"
+        raise ValueError(msg)
+    if subtile_mask.ndim != 2 or subtile_mask.shape[1] != _TILE_BUILD_SUBTILES_PER_TILE:
+        msg = f"subtile_mask must have {_TILE_BUILD_SUBTILES_PER_TILE} columns"
+        raise ValueError(msg)
+    if block_capacity < 0:
+        msg = "block_capacity must be non-negative"
+        raise ValueError(msg)
+    if cell_count == 0 or block_capacity == 0:
+        return mx.zeros((2 * block_capacity,), dtype=mx.int32)
+    threads = min(256, cell_count)
+    (fine_tile_counts,) = _neighbor_tile_left_counts_kernel()(
+        inputs=[
+            subtile_mask,
+            cell_block_starts,
+            cell_block_counts,
+            cell_pairs,
+            task_offsets,
+            task_tile_counts,
+            mx.array([cell_count, task_count], dtype=mx.int32),
+        ],
+        output_shapes=[(2 * block_capacity,)],
+        output_dtypes=[mx.int32],
+        grid=(cell_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0,
+    )
+    return fine_tile_counts
+
+
+def _neighbor_tile_left_scatter_sized(
+    subtile_mask: mx.array,
+    cell_block_starts: mx.array,
+    cell_block_counts: mx.array,
+    cell_pairs: mx.array,
+    task_offsets: mx.array,
+    task_tile_counts: mx.array,
+    fine_tile_counts: mx.array,
+    fine_tile_prefix: mx.array,
+    *,
+    accepted_count: int,
+) -> tuple[mx.array, mx.array]:
+    """Scatter exact subtiles in deterministic final-left-block order."""
+
+    subtile_mask = as_mx_array(subtile_mask, dtype=mx.uint32)
+    cell_block_starts = as_mx_array(cell_block_starts, dtype=mx.int32)
+    cell_block_counts = as_mx_array(cell_block_counts, dtype=mx.int32)
+    cell_pairs = as_mx_array(cell_pairs, dtype=mx.int32)
+    task_offsets = as_mx_array(task_offsets, dtype=mx.int32)
+    task_tile_counts = as_mx_array(task_tile_counts, dtype=mx.int32)
+    fine_tile_counts = as_mx_array(fine_tile_counts, dtype=mx.int32)
+    fine_tile_prefix = as_mx_array(fine_tile_prefix, dtype=mx.int32)
+    cell_count = int(cell_block_starts.shape[0])
+    task_count = int(cell_pairs.shape[0])
+    if cell_block_counts.shape != (cell_count,):
+        msg = "cell block starts and counts must have matching vector shapes"
+        raise ValueError(msg)
+    if cell_pairs.ndim != 2 or cell_pairs.shape[1] != 2:
+        msg = "cell_pairs must have shape (n_tasks, 2)"
+        raise ValueError(msg)
+    if task_offsets.shape != (task_count,) or task_tile_counts.shape != (task_count,):
+        msg = "task offsets and tile counts must contain one value per task"
+        raise ValueError(msg)
+    if subtile_mask.ndim != 2 or subtile_mask.shape[1] != _TILE_BUILD_SUBTILES_PER_TILE:
+        msg = f"subtile_mask must have {_TILE_BUILD_SUBTILES_PER_TILE} columns"
+        raise ValueError(msg)
+    if fine_tile_prefix.shape != fine_tile_counts.shape or fine_tile_counts.ndim != 1:
+        msg = "fine tile counts and prefix must have matching vector shapes"
+        raise ValueError(msg)
+    if accepted_count < 0:
+        msg = "accepted_count must be non-negative"
+        raise ValueError(msg)
+    if accepted_count == 0:
+        return (
+            mx.zeros((0, 2), dtype=mx.int32),
+            mx.zeros((0, _TILE_PME_MASK_WORD_COUNT), dtype=mx.uint32),
+        )
+    threads = min(256, cell_count)
+    accepted_tiles, accepted_mask = _neighbor_tile_left_scatter_kernel()(
+        inputs=[
+            subtile_mask,
+            cell_block_starts,
+            cell_block_counts,
+            cell_pairs,
+            task_offsets,
+            task_tile_counts,
+            fine_tile_counts,
+            fine_tile_prefix,
+            mx.array([cell_count, task_count], dtype=mx.int32),
+        ],
+        output_shapes=[
+            (accepted_count, 2),
+            (accepted_count, _TILE_PME_MASK_WORD_COUNT),
+        ],
+        output_dtypes=[mx.int32, mx.uint32],
+        grid=(cell_count, 1, 1),
+        threadgroup=(threads, 1, 1),
         init_value=0,
     )
     return accepted_tiles, accepted_mask
