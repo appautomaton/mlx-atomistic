@@ -108,6 +108,24 @@ axis. The small difference comes from analytical evaluation and atomic
 accumulation order rather than a physics change. The raw result is
 `results/md-suite/cmap-gpcr-force-parity.json`.
 
+## Cross-system non-regression
+
+The extended kernel signature is also visible to systems without CHARMM CMAP,
+so the canonical 5DFR/JAC pair was rerun for 750 steps and three repeats against
+the same `4f22a86` control:
+
+| Workload | Control median | Candidate median | Throughput change |
+| --- | ---: | ---: | ---: |
+| 5DFR | 1.1894 ms/step | 1.2030 ms/step | -1.14% |
+| JAC 4-cell | 3.9021 ms/step | 3.8845 ms/step | +0.45% |
+
+Both suite rows passed. The 5DFR movement remains below the committed 3%
+non-regression ceiling and is not reported as a speedup. The JAC movement is
+also below the improvement gate. These rows establish transfer safety; the
+performance claim remains the independently interleaved GPCRmd result. Raw
+suite and comparison payloads use the
+`results/md-suite/charmm-cross-system-*.json` prefix.
+
 ## Reproduction
 
 The whole-step profile was:
