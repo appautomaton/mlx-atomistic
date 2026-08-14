@@ -64,7 +64,7 @@ from mlx_atomistic.pme import (
     _pme_coulomb_nonreciprocal_strain_energy,
     _pme_coulomb_reciprocal_energy_forces_virial,
     _pme_coulomb_reciprocal_virial,
-    _prepared_pme_reciprocal_space_energy_forces,
+    _prepared_pme_reciprocal_space_forces,
     pme_coulomb_direct_space_energy_forces,
     pme_coulomb_energy_forces,
     pme_coulomb_reciprocal_space_energy_forces,
@@ -119,7 +119,7 @@ class _NonbondedForceBinding:
     """Prepared ordinary-step binding for fused PME nonbonded forces."""
 
     cell: Cell
-    pairs: mx.array
+    pairs: mx.array | None
     pme_plan: PMEExecutionPlan
     aligned_lj_scales: mx.array | None
     box_lengths_and_inverses: mx.array
@@ -195,6 +195,8 @@ def _cross(a: mx.array, b: mx.array) -> mx.array:
 @dataclass(frozen=True)
 class HarmonicBondPotential:
     """Harmonic bond stretch potential."""
+
+    _neighbor_tile_diagnostic_policy = "ignore"
 
     bonds: object
     k: object
@@ -311,6 +313,8 @@ class HarmonicBondPotential:
 @dataclass(frozen=True)
 class HarmonicAnglePotential:
     """Harmonic angle bend potential."""
+
+    _neighbor_tile_diagnostic_policy = "ignore"
 
     angles: object
     k: object
@@ -454,6 +458,8 @@ class HarmonicAnglePotential:
 class PositionalRestraintPotential:
     """Harmonic positional restraint for selected atoms."""
 
+    _neighbor_tile_diagnostic_policy = "ignore"
+
     reference_positions: object
     mask: object
     k: float
@@ -524,6 +530,8 @@ class PositionalRestraintPotential:
 @dataclass(frozen=True)
 class PeriodicDihedralPotential:
     """Periodic torsion potential with the package dihedral-angle convention."""
+
+    _neighbor_tile_diagnostic_policy = "ignore"
 
     dihedrals: object
     k: object
@@ -697,6 +705,8 @@ class RBDihedralPotential:
     Uses the OpenMM RB convention: E = sum(Cn * cos(phi - pi)^n), where phi is
     the package/OpenMM-style periodic dihedral angle.
     """
+
+    _neighbor_tile_diagnostic_policy = "ignore"
 
     dihedrals: object
     c0: object
@@ -925,7 +935,7 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
 
 @dataclass(frozen=True)
 class _FusedBondedForceBinding:
-    """Prepared force-only binding for the four standard bonded families."""
+    """Prepared force-only binding for available standard bonded families."""
 
     term_indices: frozenset[int]
     box_lengths: mx.array
@@ -961,13 +971,9 @@ def _prepare_fused_bonded_force_binding(
     force_terms: tuple[object, ...],
     cell: Cell | None,
 ) -> _FusedBondedForceBinding | None:
-    """Prepare the exact standard bonded family set for one Metal dispatch."""
+    """Prepare supported standard bonded families for one Metal dispatch."""
 
-    if (
-        "gpu" not in str(mx.default_device()).lower()
-        or cell is None
-        or not cell.is_orthorhombic
-    ):
+    if "gpu" not in str(mx.default_device()).lower() or cell is None or not cell.is_orthorhombic:
         return None
     family_types = (
         HarmonicBondPotential,
@@ -983,16 +989,39 @@ def _prepare_fused_bonded_force_binding(
         if term_type in matched:
             return None
         matched[term_type] = (index, term)
-    if set(matched) != set(family_types):
+    if len(matched) < 2:
         return None
+    empty_terms = {
+        HarmonicBondPotential: HarmonicBondPotential((), k=0.0, length=0.0),
+        HarmonicAnglePotential: HarmonicAnglePotential((), k=0.0, angle=0.0),
+        PeriodicDihedralPotential: PeriodicDihedralPotential(
+            (),
+            k=0.0,
+            periodicity=0.0,
+            phase=0.0,
+        ),
+        ImproperDihedralPotential: ImproperDihedralPotential(
+            (),
+            k=0.0,
+            periodicity=0.0,
+            phase=0.0,
+        ),
+    }
+    selected = {
+        family_type: matched.get(
+            family_type,
+            (-1, empty_terms[family_type]),
+        )[1]
+        for family_type in family_types
+    }
     term_indices = frozenset(index for index, _ in matched.values())
     return _FusedBondedForceBinding(
         term_indices=term_indices,
         box_lengths=mx.diag(cell.matrix),
-        bond=matched[HarmonicBondPotential][1],
-        angle=matched[HarmonicAnglePotential][1],
-        dihedral=matched[PeriodicDihedralPotential][1],
-        improper=matched[ImproperDihedralPotential][1],
+        bond=selected[HarmonicBondPotential],
+        angle=selected[HarmonicAnglePotential],
+        dihedral=selected[PeriodicDihedralPotential],
+        improper=selected[ImproperDihedralPotential],
     )
 
 
@@ -1158,6 +1187,8 @@ class CoulombPotential:
 @dataclass(frozen=True)
 class NonbondedPotential:
     """Combined Lennard-Jones and Coulomb pair potential."""
+
+    _neighbor_tile_diagnostic_policy = "consume"
 
     sigma: object
     epsilon: object
@@ -1438,8 +1469,7 @@ class NonbondedPotential:
         one_four_pairs_mx = mx.array(one_four_pairs, dtype=mx.int32)
         lj_one_four_pairs_mx = mx.array(lj_one_four_pairs, dtype=mx.int32)
         correction_charge_products = -(
-            charges[correction_pairs_mx[:, 0]]
-            * charges[correction_pairs_mx[:, 1]]
+            charges[correction_pairs_mx[:, 0]] * charges[correction_pairs_mx[:, 1]]
         )
         one_four_charge_products = (
             (self.coulomb_one_four_scale - 1.0)
@@ -2117,27 +2147,33 @@ class NonbondedPotential:
         one_four_words = np.zeros_like(member_words)
         bit_indices = np.arange(32, dtype=np.uint32)
         bit_weights = np.left_shift(np.uint32(1), bit_indices)
+        block_size = tiles.block_size
+        lanes_per_tile = tiles.lanes_per_tile
         n_atoms = int(self.sigma.shape[0])
         for start in range(0, tiles.tile_count, 65_536):
             stop = min(start + 65_536, tiles.tile_count)
             words = member_words[start:stop]
-            active = np.concatenate(
-                (
-                    ((words[:, :1] >> bit_indices) & np.uint32(1)).astype(bool),
-                    ((words[:, 1:] >> bit_indices) & np.uint32(1)).astype(bool),
-                ),
-                axis=1,
-            )
+            active = np.zeros((stop - start, lanes_per_tile), dtype=bool)
+            for word_index in range(tiles.mask_word_count):
+                lane_start = 32 * word_index
+                lane_stop = min(lane_start + 32, lanes_per_tile)
+                active[:, lane_start:lane_stop] = (
+                    (
+                        words[:, word_index, None]
+                        >> bit_indices[None, : lane_stop - lane_start]
+                    )
+                    & np.uint32(1)
+                ).astype(bool)
             block_pairs = tile_blocks[start:stop]
             left = atom_blocks[block_pairs[:, 0]][:, :, None]
             right = atom_blocks[block_pairs[:, 1]][:, None, :]
-            left = np.broadcast_to(left, (stop - start, 8, 8)).reshape((-1, 64))
-            right = np.broadcast_to(right, (stop - start, 8, 8)).reshape((-1, 64))
+            tile_shape = (stop - start, block_size, block_size)
+            left = np.broadcast_to(left, tile_shape).reshape((-1, lanes_per_tile))
+            right = np.broadcast_to(right, tile_shape).reshape((-1, lanes_per_tile))
             safe_left = np.maximum(left, 0).astype(np.int64, copy=False)
             safe_right = np.maximum(right, 0).astype(np.int64, copy=False)
-            codes = (
-                np.minimum(safe_left, safe_right) * np.int64(n_atoms)
-                + np.maximum(safe_left, safe_right)
+            codes = np.minimum(safe_left, safe_right) * np.int64(n_atoms) + np.maximum(
+                safe_left, safe_right
             )
             enabled = active & (left >= 0) & (right >= 0)
             if self.topology is not None:
@@ -2154,26 +2190,20 @@ class NonbondedPotential:
                     else self.topology._one_four_codes
                 ),
             )
-            enabled_words[start:stop, 0] = np.sum(
-                enabled[:, :32].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
-            enabled_words[start:stop, 1] = np.sum(
-                enabled[:, 32:].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
-            one_four_words[start:stop, 0] = np.sum(
-                one_four[:, :32].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
-            one_four_words[start:stop, 1] = np.sum(
-                one_four[:, 32:].astype(np.uint32) * bit_weights,
-                axis=1,
-                dtype=np.uint32,
-            )
+            for word_index in range(tiles.mask_word_count):
+                lane_start = 32 * word_index
+                lane_stop = min(lane_start + 32, lanes_per_tile)
+                weights = bit_weights[: lane_stop - lane_start]
+                enabled_words[start:stop, word_index] = np.sum(
+                    enabled[:, lane_start:lane_stop].astype(np.uint32) * weights,
+                    axis=1,
+                    dtype=np.uint32,
+                )
+                one_four_words[start:stop, word_index] = np.sum(
+                    one_four[:, lane_start:lane_stop].astype(np.uint32) * weights,
+                    axis=1,
+                    dtype=np.uint32,
+                )
         return (
             mx.array(enabled_words, dtype=mx.uint32),
             mx.array(one_four_words, dtype=mx.uint32),
@@ -2198,6 +2228,31 @@ class NonbondedPotential:
                 atol=1e-7,
             )
             and not self.has_nbfix
+        )
+
+    def _supports_fused_pme_tile_direct(
+        self,
+        cell: Cell,
+        tiles: NeighborTiles,
+    ) -> bool:
+        """Return whether exact spatial tiles own the recurring direct route."""
+
+        return (
+            "gpu" in str(mx.default_device()).lower()
+            and cell.is_orthorhombic
+            and self.cutoff is not None
+            and self.pme_config is not None
+            and self.pme_config.real_cutoff is not None
+            and np.isclose(
+                float(self.cutoff),
+                float(self.pme_config.real_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            and not self.has_nbfix
+            and tiles.force_columns is not None
+            and tiles.force_group_starts is not None
+            and tiles.force_group_counts is not None
         )
 
     def _block_components(
@@ -3088,7 +3143,7 @@ class NonbondedPotential:
         self,
         positions: mx.array,
         cell: Cell | None,
-        pairs: mx.array | NeighborBlocks | None,
+        pairs: mx.array | NeighborBlocks | NeighborTiles | None,
     ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
         """Return recurring energy components without mesh-inspection metadata."""
 
@@ -3104,6 +3159,12 @@ class NonbondedPotential:
         if self.pme_config is None:
             msg = "PME electrostatics requires pme_config"
             raise ValueError(msg)
+        if isinstance(pairs, NeighborTiles):
+            return self._runtime_tile_energy_forces_with_components(
+                positions,
+                cell,
+                pairs,
+            )
 
         direct_space_pairs = self._validated_pme_direct_space_pairs(
             cell,
@@ -3146,6 +3207,98 @@ class NonbondedPotential:
         )
         dispersion_energy = self._dispersion_correction_energy(cell)
         lj_energy = lj_energy + exception_lj + dispersion_energy
+        reciprocal_energy, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
+            positions,
+            self.charges,
+            cell,
+            coulomb_constant=self.coulomb_constant,
+            config=self.pme_config,
+            include_self_correction=False,
+            plan=self.pme_plan,
+        )
+        self_energy = (
+            -float(self.coulomb_constant)
+            * self.pme_config.alpha
+            / float(np.sqrt(np.pi))
+            * mx.sum(self.charges * self.charges)
+        )
+        if self.pme_config.background_policy == "uniform_neutralizing_plasma":
+            net_charge = mx.sum(self.charges)
+            background_energy = (
+                -float(self.coulomb_constant)
+                * float(np.pi)
+                / (2.0 * cell.volume * self.pme_config.alpha * self.pme_config.alpha)
+                * net_charge
+                * net_charge
+            )
+        else:
+            background_energy = mx.sum(self.charges * 0.0)
+        correction_energy, correction_forces, correction_components = (
+            self._periodic_coulomb_corrections(
+                positions,
+                cell,
+            )
+        )
+        coulomb_energy = (
+            coulomb_real_energy
+            + reciprocal_energy
+            + self_energy
+            + background_energy
+            + correction_energy
+        )
+        components = {
+            "lj": lj_energy,
+            "lj_dispersion_correction": dispersion_energy,
+            "coulomb": coulomb_energy,
+            "coulomb_real": coulomb_real_energy,
+            "coulomb_reciprocal": reciprocal_energy,
+            "coulomb_self": self_energy,
+            "coulomb_background": background_energy,
+            **correction_components,
+        }
+        forces = direct_forces + exception_lj_forces + reciprocal_forces + correction_forces
+        return lj_energy + coulomb_energy, forces, components
+
+    def _runtime_tile_energy_forces_with_components(
+        self,
+        positions: mx.array,
+        cell: Cell,
+        tiles: NeighborTiles,
+    ) -> tuple[mx.array, mx.array, dict[str, mx.array | object]]:
+        """Evaluate a pair-free diagnostic pass from exact spatial tiles."""
+
+        binding = self._prepare_tile_force_binding(cell, None, tiles)
+        if binding is NotImplemented or binding.tile_decline_reason is not None:
+            msg = "exact spatial tiles do not support the requested PME diagnostic"
+            raise ValueError(msg)
+        lj_direct, coulomb_real_energy, direct_forces = _tile_parameterized_pme_direct_force_only(
+            positions,
+            tiles.atom_blocks,
+            tiles.tile_blocks,
+            tiles.member_mask,
+            binding.tile_lj_enabled_mask,
+            binding.tile_lj_one_four_mask,
+            tiles.force_columns,
+            tiles.force_group_starts,
+            tiles.force_group_counts,
+            binding.box_lengths_and_inverses,
+            binding.half_sigma,
+            binding.sqrt_epsilon,
+            self.charges,
+            cutoff=self.cutoff,
+            shift=self.lj_shift,
+            switch_distance=self.switch_distance,
+            one_four_scale=self.lj_one_four_scale,
+            coulomb_constant=self.coulomb_constant,
+            alpha=self.pme_config.alpha,
+            _return_energy=True,
+        )
+        exception_lj, exception_lj_forces = self._exception_lj_components(
+            positions,
+            cell,
+        )
+        dispersion_energy = self._dispersion_correction_energy(cell)
+        lj_energy = lj_direct + exception_lj + dispersion_energy
         reciprocal_energy, reciprocal_forces = pme_coulomb_reciprocal_space_energy_forces(
             positions,
             self.charges,
@@ -3294,12 +3447,7 @@ class NonbondedPotential:
             background_energy = (
                 -float(self.coulomb_constant)
                 * float(np.pi)
-                / (
-                    2.0
-                    * cell.volume
-                    * self.pme_config.alpha
-                    * self.pme_config.alpha
-                )
+                / (2.0 * cell.volume * self.pme_config.alpha * self.pme_config.alpha)
                 * net_charge
                 * net_charge
             )
@@ -3328,12 +3476,7 @@ class NonbondedPotential:
             "coulomb_background": background_energy,
             **correction_components,
         }
-        forces = (
-            direct_forces
-            + exception_lj_forces
-            + reciprocal_forces
-            + correction_forces
-        )
+        forces = direct_forces + exception_lj_forces + reciprocal_forces + correction_forces
 
         ids = normalize_molecule_ids(
             molecule_ids,
@@ -3377,19 +3520,11 @@ class NonbondedPotential:
                 strained_positions,
                 strained_cell,
             )
-            if (
-                self.pme_config.background_policy
-                == "uniform_neutralizing_plasma"
-            ):
+            if self.pme_config.background_policy == "uniform_neutralizing_plasma":
                 strained_background = (
                     -float(self.coulomb_constant)
                     * float(np.pi)
-                    / (
-                        2.0
-                        * strained_cell.volume
-                        * self.pme_config.alpha
-                        * self.pme_config.alpha
-                    )
+                    / (2.0 * strained_cell.volume * self.pme_config.alpha * self.pme_config.alpha)
                     * net_charge
                     * net_charge
                 )
@@ -3409,10 +3544,7 @@ class NonbondedPotential:
             masses=masses,
             molecule_ids=molecule_ids,
         )
-        local_virial = (
-            mx.diag(direct_atomic_diagonal + molecular_correction)
-            + small_virial
-        )
+        local_virial = mx.diag(direct_atomic_diagonal + molecular_correction) + small_virial
         strain_pairs = cutoff_strain_pairs
         if strain_pairs is None:
             strain_pairs = self._compact_cutoff_strain_pairs(
@@ -3427,17 +3559,13 @@ class NonbondedPotential:
         ):
             msg = "cutoff strain pairs must have shape (n_pairs, 2)"
             raise ValueError(msg)
-        aligned_strain_lj_scales = (
-            self._compact_aligned_lj_scales(strain_pairs)
-        )
+        aligned_strain_lj_scales = self._compact_aligned_lj_scales(strain_pairs)
         needs_lj = not (
             self.lj_shift
             or self.switch_distance is not None
             or not bool(np.any(np.asarray(self.epsilon) != 0.0))
         )
-        needs_coulomb = bool(
-            np.any(np.asarray(self.charges) != 0.0)
-        )
+        needs_coulomb = bool(np.any(np.asarray(self.charges) != 0.0))
         cutoff_correction = fused_pme_cutoff_correction_virial(
             positions,
             strain_centers,
@@ -3454,11 +3582,7 @@ class NonbondedPotential:
             include_lj=needs_lj,
             include_coulomb=needs_coulomb,
         )
-        virial = (
-            local_virial
-            + reciprocal_virial
-            + cutoff_correction
-        )
+        virial = local_virial + reciprocal_virial + cutoff_correction
         return lj_energy + coulomb_energy, forces, components, virial
 
     def _runtime_energy_forces_with_components_virial_reusing_pairs(
@@ -3553,7 +3677,7 @@ class NonbondedPotential:
         pairs: mx.array | NeighborBlocks | None,
         tiles: NeighborTiles,
     ) -> _NonbondedForceBinding | NotImplementedType:
-        """Prepare tile topology ownership while retaining compact-pair forces."""
+        """Prepare tile topology ownership with an optional compact fallback."""
 
         return self._prepare_force_binding_impl(cell, pairs, tiles=tiles)
 
@@ -3566,9 +3690,7 @@ class NonbondedPotential:
         """Return every declared input that owns a prepared force binding."""
 
         return (
-            None
-            if cell is None
-            else np.asarray(cell.matrix, dtype=np.float32).tobytes(),
+            None if cell is None else np.asarray(cell.matrix, dtype=np.float32).tobytes(),
             builtins.id(self.pme_plan),
             getattr(self.pme_plan, "fingerprint", None),
             builtins.id(self.topology),
@@ -3615,11 +3737,31 @@ class NonbondedPotential:
             or self.pme_plan is None
         ):
             return NotImplemented
-        direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
+        if tiles is not None and pairs is None:
+            report = pme_direct_space_policy_report(
+                cell,
+                config=self.pme_config,
+                pairs=mx.zeros((0, 2), dtype=mx.int32),
+                plan=self.pme_plan,
+            )
+            if not report["uses_shared_neighbor_policy"]:
+                reason = (
+                    report.get("fallback_reason") or "pme_direct_space_shared_policy_unsupported"
+                )
+                msg = f"PME production direct-space shared tile policy unsupported: {reason}"
+                raise ValueError(msg)
+            direct_space_pairs = None
+        else:
+            direct_space_pairs = self._validated_pme_direct_space_pairs(cell, pairs)
         pair_force_ready = self._supports_fused_pme_direct(cell, direct_space_pairs)
-        if not pair_force_ready and tiles is None:
-            return NotImplemented
-        if not isinstance(direct_space_pairs, mx.array):
+        tile_force_ready = bool(
+            tiles is not None and self._supports_fused_pme_tile_direct(cell, tiles)
+        )
+        if (
+            not pair_force_ready
+            and not tile_force_ready
+            and not isinstance(direct_space_pairs, mx.array)
+        ):
             return NotImplemented
         identity = self._force_binding_context_identity(
             cell,
@@ -3656,20 +3798,12 @@ class NonbondedPotential:
             tile_lj_enabled_mask, tile_lj_one_four_mask = self._tile_aligned_lj_masks(
                 tiles,
             )
-        tile_force_ready = bool(
-            tiles is not None
-            and pair_force_ready
-            and tiles.force_group_starts is not None
-            and tiles.force_group_counts is not None
-        )
         binding = _NonbondedForceBinding(
             cell=cell,
             pairs=direct_space_pairs,
             pme_plan=self.pme_plan,
             aligned_lj_scales=(
-                None
-                if tile_force_ready
-                else self._compact_aligned_lj_scales(direct_space_pairs)
+                None if tile_force_ready else self._compact_aligned_lj_scales(direct_space_pairs)
             ),
             box_lengths_and_inverses=box_cache[1],
             half_sigma=lj_invariants[2],
@@ -3731,7 +3865,7 @@ class NonbondedPotential:
         if not isinstance(binding, _NonbondedForceBinding):
             msg = "nonbonded force binding has an incompatible type"
             raise TypeError(msg)
-        if not binding.pair_force_ready:
+        if not binding.pair_force_ready and binding.tile_decline_reason is not None:
             return NotImplemented
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:
@@ -3739,11 +3873,10 @@ class NonbondedPotential:
             raise ValueError(msg)
 
         direct_forces = self._direct_forces_from_binding(positions, binding)
-        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+        reciprocal_forces = _prepared_pme_reciprocal_space_forces(
             positions,
             self.charges,
             binding.pme_plan,
-            include_self_correction=False,
         )
         return (
             direct_forces
@@ -3775,6 +3908,7 @@ class NonbondedPotential:
                 tiles.member_mask,
                 binding.tile_lj_enabled_mask,
                 binding.tile_lj_one_four_mask,
+                tiles.force_columns,
                 tiles.force_group_starts,
                 tiles.force_group_counts,
                 binding.box_lengths_and_inverses,
@@ -3788,7 +3922,7 @@ class NonbondedPotential:
                 coulomb_constant=self.coulomb_constant,
                 alpha=self.pme_config.alpha,
             )
-        if binding.aligned_lj_scales is None:
+        if binding.aligned_lj_scales is None or binding.pairs is None:
             msg = "compact-pair fallback requires aligned LJ scales"
             raise RuntimeError(msg)
         return _prepared_parameterized_pme_direct_force_only(
@@ -3817,7 +3951,7 @@ class NonbondedPotential:
         if not isinstance(binding, _NonbondedForceBinding):
             msg = "nonbonded force binding has an incompatible type"
             raise TypeError(msg)
-        if not binding.pair_force_ready:
+        if not binding.pair_force_ready and binding.tile_decline_reason is not None:
             return NotImplemented
         positions = as_mx_array(positions)
         if positions.ndim != 2 or positions.shape[1] != 3:
@@ -3829,8 +3963,7 @@ class NonbondedPotential:
         route_profiler.finish(
             (
                 "direct_spatial_tiles"
-                if binding.tile_geometry is not None
-                and binding.tile_decline_reason is None
+                if binding.tile_geometry is not None and binding.tile_decline_reason is None
                 else "direct_lj_screened_coulomb"
             ),
             direct_started,
@@ -3838,11 +3971,10 @@ class NonbondedPotential:
         )
 
         reciprocal_started = route_profiler.start()
-        _, reciprocal_forces = _prepared_pme_reciprocal_space_energy_forces(
+        reciprocal_forces = _prepared_pme_reciprocal_space_forces(
             positions,
             self.charges,
             binding.pme_plan,
-            include_self_correction=False,
         )
         route_profiler.finish(
             "reciprocal_pme",
@@ -3864,7 +3996,7 @@ class NonbondedPotential:
         aggregation_started = route_profiler.start()
         forces = direct_forces + reciprocal_forces + correction_forces
         route_profiler.finish(
-            "force_aggregation",
+            "pme_force_aggregation",
             aggregation_started,
             forces,
         )

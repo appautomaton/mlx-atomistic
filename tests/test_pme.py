@@ -6,6 +6,8 @@ import mlx_atomistic.pme as pme_module
 from mlx_atomistic.benchmarks import ewald_reference
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _pme_order5_forces,
+    _pme_order5_forces_from_complex_grid,
     pme_order5_charge_grid,
     pme_order5_energy_forces,
 )
@@ -26,6 +28,7 @@ from mlx_atomistic.pme import (
     _interpolate_cic_mx,
     _pme_coulomb_reciprocal_virial,
     _prepared_pme_reciprocal_space_energy_forces,
+    _prepared_pme_reciprocal_space_forces,
     assign_charges_bspline,
     assign_charges_cic,
     pme_coulomb_direct_space_energy_forces,
@@ -167,6 +170,28 @@ def test_prepared_reciprocal_pme_matches_checked_path_without_readmission(monkey
     np.testing.assert_allclose(np.asarray(actual_energy), np.asarray(expected_energy), atol=1e-6)
     np.testing.assert_allclose(np.asarray(actual_forces), np.asarray(expected_forces), atol=1e-6)
     assert plan.reuse_count == 2
+
+
+def test_prepared_reciprocal_force_only_matches_energy_force_path():
+    cell = Cell.cubic(12.0)
+    config = PMEConfig(mesh_shape=(16, 16, 16), alpha=0.35, real_cutoff=5.0)
+    plan = PMEExecutionPlan(cell, config=config)
+    _, expected_forces = _prepared_pme_reciprocal_space_energy_forces(
+        _positions(),
+        _charges(),
+        plan,
+    )
+    actual_forces = _prepared_pme_reciprocal_space_forces(
+        _positions(),
+        _charges(),
+        plan,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_forces),
+        np.asarray(expected_forces),
+        atol=1e-6,
+    )
 
 
 def test_pme_execution_plan_rejects_mismatches_and_rebuilds_explicitly():
@@ -973,6 +998,18 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             potential_grid,
             lengths,
         )
+        force_only = _pme_order5_forces(
+            positions,
+            charges,
+            potential_grid,
+            lengths,
+        )
+        complex_force_only = _pme_order5_forces_from_complex_grid(
+            positions,
+            charges,
+            potential_grid.astype(mx.complex64) / float(np.prod(mesh_shape)),
+            lengths,
+        )
 
         def fixed_grid_energy(coordinates):
             values = _interpolate_bspline_mx(
@@ -993,6 +1030,8 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             energy_gradient,
             metal_energy,
             metal_forces,
+            force_only,
+            complex_force_only,
         )
 
         np.testing.assert_allclose(
@@ -1012,6 +1051,18 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             -2.0 * np.asarray(energy_gradient),
             rtol=2e-5,
             atol=2e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(force_only),
+            np.asarray(metal_forces),
+            rtol=2e-6,
+            atol=2e-7,
+        )
+        np.testing.assert_allclose(
+            np.asarray(complex_force_only),
+            np.asarray(metal_forces),
+            rtol=2e-6,
+            atol=2e-7,
         )
     finally:
         mx.set_default_device(previous)
@@ -1034,6 +1085,7 @@ def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
         pytest.skip("Metal GPU unavailable")
     try:
         pme_module._COMPILED_RECIPROCAL_EVALUATORS.pop(cache_key, None)
+        pme_module._COMPILED_RECIPROCAL_FORCE_EVALUATORS.pop(cache_key, None)
         positions = mx.array(np.asarray(_positions()), dtype=mx.float32)
         charges = mx.array(np.asarray(_charges()), dtype=mx.float32)
         cell = Cell.cubic(12.0)
@@ -1065,8 +1117,20 @@ def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
             )
         )
         mx.eval(compiled_energy, compiled_forces)
+        force_only = _prepared_pme_reciprocal_space_forces(
+            positions,
+            charges,
+            plan,
+        )
+        shifted_force_only = _prepared_pme_reciprocal_space_forces(
+            positions + mx.array([12.0, -24.0, 36.0], dtype=mx.float32),
+            charges,
+            plan,
+        )
+        mx.eval(force_only, shifted_force_only)
 
         assert cache_key in pme_module._COMPILED_RECIPROCAL_EVALUATORS
+        assert cache_key in pme_module._COMPILED_RECIPROCAL_FORCE_EVALUATORS
         np.testing.assert_allclose(
             np.asarray(compiled_energy),
             np.asarray(reference_energy),
@@ -1079,8 +1143,21 @@ def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
             rtol=1e-6,
             atol=1e-6,
         )
+        np.testing.assert_allclose(
+            np.asarray(force_only),
+            np.asarray(reference_forces),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(shifted_force_only),
+            np.asarray(force_only),
+            rtol=1e-6,
+            atol=1e-6,
+        )
     finally:
         pme_module._COMPILED_RECIPROCAL_EVALUATORS.pop(cache_key, None)
+        pme_module._COMPILED_RECIPROCAL_FORCE_EVALUATORS.pop(cache_key, None)
         mx.set_default_device(previous)
         mx.set_default_stream(mx.new_stream(previous))
 

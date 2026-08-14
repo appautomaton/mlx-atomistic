@@ -3,7 +3,7 @@ title: "Same-Workload OpenMM Comparison"
 ---
 
 
-Date: 2026-07-15
+Date: 2026-07-15; JAC runtime refreshed 2026-08-11
 
 Scope: refreshed controlled `mlx_atomistic` vs `openmm-reference` comparison.
 This report only compares rows where workload and metric match. Rows marked
@@ -19,7 +19,7 @@ performance ratios.
 | `tip4p-ew-water` | `comparable` | 6.0068 ms/eval | 0.0003339 ms/eval | 0.00005558 OpenMM/MLX latency | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-phase3-controlled.json`; `results/same-workload-openmm-comparison/openmm-tip4p-ew-water.json` |
 | `dhfr-implicit` | `comparable` | 0.3095 ns/day | 1.3136 ns/day | 4.2447 OpenMM/MLX throughput | `results/same-workload-openmm-comparison/summary.json`; `results/same-workload-openmm-comparison/mlx-dhfr-implicit.json`; `results/same-workload-openmm-comparison/openmm-dhfr-implicit.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
 | `dhfr-explicit-pme` | `parity-passed; runtime diagnostic` | 0.047433 ns/day for one MLX step; fixed-coordinate parity passed | matching fixed-coordinate OpenMM OpenCL energy/forces; historical 752.5 ns/day remains context only | none | `results/scalable-charged-pme-runtime/jac-1x/runtime-smoke.json`; `results/scalable-charged-pme-runtime/jac-1x/charged_pme_parity_report.json`; [`same-workload-dhfr-stretch.md`](./same-workload-dhfr-stretch.md) |
-| `jac-charged-pme-94k` | `comparable` | 1.004613 s/75 steps | 0.102947 s/75 steps, OpenCL single precision | 9.7586 MLX/OpenMM latency | matched artifacts under `results/larger-system-scaling/jac-2x2x1-modern/matched-runtime-v2/`; fixed-coordinate parity under `results/scalable-charged-pme-runtime/jac-2x2x1/`; [`scalable-charged-pme-runtime-m5max.md`](./scalable-charged-pme-runtime-m5max.md) |
+| `jac-charged-pme-94k` | `comparable` | 0.528761 s/75 steps, two-run median | 0.100332 s/75 steps, OpenCL single precision, two-run median | 5.2701 MLX/OpenMM latency | refreshed matched artifacts under `results/md-post-pair-elision/reference-refresh*/`; fixed-coordinate parity under `results/scalable-charged-pme-runtime/jac-2x2x1/`; [`retained-stack-phase5-m5max.md`](./retained-stack-phase5-m5max.md) |
 
 ## Interpretation
 
@@ -74,10 +74,11 @@ from the parity result or from the historical OpenMM OpenCL benchmark.
 `jac-charged-pme-94k` extends the same manifest-matched parity contract to the
 94,232-atom 2x2x1 JAC supercell. The later 75-step run also matches the NVT
 operation, timestep, thermostat, constraints, PME configuration, warmup and
-measurement counts, precision, and timing boundary. Its `9.7586x` MLX/OpenMM
-latency ratio is therefore comparable for this exact Apple M5 Max protocol.
-Independent random streams mean the trajectories are statistically, not
-pathwise, comparable.
+measurement counts, precision, and timing boundary. The 2026-08-11 refresh ran
+two MLX/OpenMM pairs under the same AC Low Power Mode state. All generated
+comparisons passed their manifest gates; the ratio of medians is `5.2701x` for
+this exact Apple M5 Max protocol. Independent random streams mean the
+trajectories are statistically, not pathwise, comparable.
 
 ## Reproducer
 

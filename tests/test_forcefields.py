@@ -151,10 +151,7 @@ def test_rb_dihedral_reference_expression_uses_periodic_angle_minus_pi():
     periodic_phi = reference_periodic_dihedral_angle(positions)
     rb_phi = periodic_phi - pi
     rb_cosine = np.cos(rb_phi)
-    expected = sum(
-        coefficient * rb_cosine**power
-        for power, coefficient in enumerate(coefficients)
-    )
+    expected = sum(coefficient * rb_cosine**power for power, coefficient in enumerate(coefficients))
 
     assert np.isfinite(np.asarray(energy))
     assert np.all(np.isfinite(np.asarray(forces)))
@@ -1134,6 +1131,7 @@ def test_nonbonded_tile_binding_owns_topology_masks_and_compact_fallback(
     )
     tiles = neighbors.tiles
     assert tiles is not None
+    assert not neighbors.diagnostic_pairs_materialized
 
     binding = term._prepare_tile_force_binding(
         cell,
@@ -1164,9 +1162,7 @@ def test_nonbonded_tile_binding_owns_topology_masks_and_compact_fallback(
     expected_scales = np.asarray(
         term._compact_aligned_lj_scales(neighbors.diagnostic_pairs),
     )
-    lane_by_pair = {
-        tuple(pair): scale for pair, scale in zip(lane_pairs, lane_scales, strict=True)
-    }
+    lane_by_pair = {tuple(pair): scale for pair, scale in zip(lane_pairs, lane_scales, strict=True)}
     np.testing.assert_allclose(
         np.asarray([lane_by_pair[tuple(pair)] for pair in expected_pairs]),
         expected_scales,

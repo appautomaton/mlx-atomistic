@@ -429,6 +429,41 @@ def test_constrained_langevin_matches_rattle_baoab_ordering():
     )
 
 
+def test_cpu_constrained_nvt_never_submits_force_graph_asynchronously(monkeypatch):
+    """The CPU correctness route never enters the Metal-only async fast path."""
+
+    positions, velocities, cell, potential = _small_system()
+    constraints = DistanceConstraints([(0, 1)], distances=[1.2], max_iterations=8)
+    manager = NeighborListManager(
+        cell,
+        cutoff=2.5,
+        skin=0.4,
+        check_interval=1,
+        backend="periodic_cell_list",
+    )
+    submissions = []
+    monkeypatch.setattr(mx, "async_eval", lambda *values: submissions.append(values))
+
+    simulate_nvt(
+        positions,
+        velocities,
+        cell=cell,
+        force_terms=potential,
+        neighbor_manager=manager,
+        constraints=constraints,
+        config=SimulationConfig(
+            dt=0.001,
+            steps=3,
+            sample_interval=3,
+            diagnostic_interval=3,
+            pressure_diagnostics=False,
+        ),
+        thermostat=LangevinThermostat(temperature=1.0, friction=0.2, seed=5),
+    )
+
+    assert submissions == []
+
+
 def test_nose_hoover_thermostat_validation():
     with pytest.raises(ValueError, match="temperature"):
         NoseHooverThermostat(temperature=0.0)

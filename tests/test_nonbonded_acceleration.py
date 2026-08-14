@@ -506,6 +506,7 @@ def test_lazy_large_periodic_nonbonded_refuses_dense_fallback_and_reports_compac
 
     assert result.nonbonded_report["backend"] == "mlx_dense_pairs"
     assert result.nonbonded_report["representation_kind"] == "pairs"
+    assert result.nonbonded_report["diagnostic_pairs_materialized"] is True
     assert result.nonbonded_report["pair_count"] == int(result.pair_count[-1])
     assert result.nonbonded_report["cutoff"] == 1.6
     assert result.nonbonded_report["skin"] == 0.2

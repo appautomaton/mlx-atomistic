@@ -99,6 +99,65 @@ def _assert_reference_payload(payload, *, engine, benchmark_name, timing_metric)
     assert "commit" in payload
 
 
+def test_charged_pme_tile_mask_occupancy_counts_empty_rows_and_columns():
+    occupancy = charged_pme._tile_mask_occupancy(
+        [
+            [524545, 0],
+            [255, 0],
+        ],
+        [
+            [0, 1],
+            [0, 2],
+        ],
+        block_size=8,
+    )
+
+    assert occupancy == {
+        "right_column_count": 16,
+        "empty_right_column_count": 6,
+        "empty_right_column_fraction": 0.375,
+        "right_column_member_count_histogram": {
+            "0": 6,
+            "1": 9,
+            "2": 1,
+            "3": 0,
+            "4": 0,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "8": 0,
+        },
+        "left_row_count": 16,
+        "empty_left_row_count": 12,
+        "empty_left_row_fraction": 0.75,
+        "subdivision_4x4_tile_count": 3,
+        "subdivision_4x4_padded_lane_count": 48,
+        "subdivision_4x4_active_lane_fraction": 11 / 48,
+        "subdivision_4x4_force_group_count": 1,
+    }
+
+    execution_occupancy = charged_pme._tile_mask_occupancy(
+        [[33]],
+        [[0, 1]],
+        block_size=4,
+    )
+    assert execution_occupancy == {
+        "right_column_count": 4,
+        "empty_right_column_count": 2,
+        "empty_right_column_fraction": 0.5,
+        "right_column_member_count_histogram": {
+            "0": 2,
+            "1": 2,
+            "2": 0,
+            "3": 0,
+            "4": 0,
+        },
+        "left_row_count": 4,
+        "empty_left_row_count": 2,
+        "empty_left_row_fraction": 0.5,
+    }
+
+
 def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     assert row["comparison_pair_id"] == pair_id
     assert row["comparison_role"] == "mlx"
@@ -1752,6 +1811,23 @@ def test_charged_pme_runtime_requires_warmup_and_two_measured_steps(tmp_path):
     assert "measured_steps_must_be_at_least_two" in payload["blockers"]
 
 
+def test_charged_pme_runtime_config_propagates_cmm_removal_cadence():
+    config = charged_pme._simulation_config(
+        steps=2,
+        dt_ps=0.004,
+        simulation_units={
+            "kinetic_energy_scale": 1.0,
+            "force_to_acceleration_scale": 1.0,
+            "boltzmann_constant": 1.0,
+        },
+        sample_interval=2,
+        diagnostic_interval=2,
+        center_of_mass_motion_interval=1,
+    )
+
+    assert config.center_of_mass_motion_interval == 1
+
+
 def _write_openmm_admission_inputs(tmp_path, *, complete):
     runtime_path = tmp_path / "openmm-runtime.json"
     manifest_path = tmp_path / "openmm-manifest.json"
@@ -2666,6 +2742,56 @@ def test_pme_performance_stage_summary_schema_without_fixture(tmp_path):
     assert "hardware" in payload
     assert payload["stage_timings"]["direct_space"]["available"] is False
     assert payload["unsupported_timing_split_blockers"][0]["name"] == "pme_fixture"
+
+
+def test_pme_performance_stage_summary_prefers_production_force_rows():
+    def row(name, seconds):
+        return {
+            "name": name,
+            "mean_s": seconds,
+            "median_s": seconds,
+            "min_s": seconds,
+            "max_s": seconds,
+        }
+
+    summary = pme_performance._stage_timings(
+        [
+            row("charge_assignment_bspline", 10.0),
+            row("interpolate_field", 20.0),
+            row("charge_assignment_order5_metal", 0.2),
+            row("interpolate_complex_grid_force_only", 0.3),
+            row("forward_fft", 30.0),
+            row("influence_function", 40.0),
+            row("inverse_fft_potential_and_fields", 50.0),
+            row("forward_fft_force_path", 0.4),
+            row("inverse_fft_influence_force_path", 0.5),
+            row("reciprocal_full", 60.0),
+            row("reciprocal_force_only", 0.7),
+        ]
+    )
+
+    assert summary["assignment_interpolation"]["median_s"] == pytest.approx(0.5)
+    assert summary["reciprocal_fft_influence"]["median_s"] == pytest.approx(0.9)
+    assert summary["reciprocal_space"]["median_s"] == pytest.approx(0.7)
+
+
+def test_pme_performance_admits_current_compact_pair_policy():
+    assert pme_performance._compact_pair_policy_admitted(
+        {
+            "policy": "compact_pair",
+            "representation": "pairs",
+            "uses_shared_neighbor_policy": True,
+            "fallback_reason": None,
+        }
+    )
+    assert not pme_performance._compact_pair_policy_admitted(
+        {
+            "policy": "block_candidate",
+            "representation": "blocks",
+            "uses_shared_neighbor_policy": True,
+            "fallback_reason": None,
+        }
+    )
 
 
 def test_ewald_reference_benchmark_json_and_csv_smoke(tmp_path, capsys):

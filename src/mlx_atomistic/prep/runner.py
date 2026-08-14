@@ -57,7 +57,7 @@ from mlx_atomistic.prep.io import (
     load_prepared_system,
     write_view_pdb,
 )
-from mlx_atomistic.prep.schema import PreparedSystem
+from mlx_atomistic.prep.schema import PreparedSystem, center_of_mass_motion_interval
 from mlx_atomistic.protocols import (
     MinimizeThenNVTProtocol,
     ProtocolCompatibilityError,
@@ -80,6 +80,21 @@ PRESSURE_DIAGNOSTIC_ATOM_LIMIT = 50_000
 # 4.0 A) because it rebuilt 15 fewer times. Both runs preserved cutoff physics.
 GPCRMD_NEIGHBOR_SKIN = 5.5
 GPCRMD_NEIGHBOR_WORKERS = max(1, min(8, os.cpu_count() or 1))
+_PRODUCTION_TILE_PME_ATOM_WINDOWS = (
+    (23_000, 24_000),
+    (90_000, 100_000),
+)
+_PRODUCTION_TILE_PME_CUTOFF = 9.0
+_CHECKPOINT_NEIGHBOR_BACKENDS = frozenset(
+    {
+        "auto",
+        "periodic_cell_list",
+        "mlx_dense_pairs",
+        "mlx_cell_pairs",
+        "mlx_cell_blocks",
+        "mlx_cell_tiles",
+    }
+)
 
 
 def _artifact_from_prepared_system(
@@ -207,27 +222,6 @@ def _initialize_system_velocities(
 
 def _simulation_config_with_virtual_sites(*, virtual_sites=None, **kwargs) -> SimulationConfig:
     return SimulationConfig(virtual_sites=virtual_sites, **kwargs)
-
-
-def _center_of_mass_motion_interval(
-    protocol_metadata: dict[str, Any],
-) -> int | None:
-    policy = dict(protocol_metadata).get("center_of_mass_motion")
-    if policy is None:
-        return None
-    if not isinstance(policy, dict):
-        msg = "center_of_mass_motion protocol metadata must be a mapping"
-        raise TypeError(msg)
-    if not bool(policy.get("enabled", False)):
-        return None
-    if policy.get("force") != "CMMotionRemover":
-        msg = "unsupported center_of_mass_motion force"
-        raise ValueError(msg)
-    frequency = int(policy.get("frequency_steps", 0))
-    if frequency <= 0:
-        msg = "center_of_mass_motion frequency_steps must be positive"
-        raise ValueError(msg)
-    return frequency
 
 
 class _VirtualSiteForceAdapter:
@@ -385,13 +379,63 @@ def _project_and_rescale_velocities(
     return velocities.astype(np.float32)
 
 
+def _production_tile_pme_eligible(
+    system,
+    lazy_terms,
+    *,
+    fixed_cell: bool,
+    neighbor_skin: float,
+) -> bool:
+    """Return whether the measured large fixed-cell PME tile envelope applies."""
+
+    if not fixed_cell or "gpu" not in str(mx.default_device()).lower():
+        return False
+    pme_terms = tuple(
+        term for term in lazy_terms if getattr(term, "electrostatics", None) == "pme"
+    )
+    if not pme_terms or not np.isclose(
+        neighbor_skin,
+        GPCRMD_NEIGHBOR_SKIN,
+        rtol=1e-8,
+        atol=1e-10,
+    ):
+        return False
+    topology = getattr(pme_terms[0], "topology", None)
+    atom_count = int(getattr(topology, "n_atoms", 0))
+    positions = getattr(system, "positions", None)
+    if positions is not None and getattr(positions, "ndim", 0) == 2:
+        atom_count = int(positions.shape[0])
+    if not any(
+        minimum <= atom_count <= maximum
+        for minimum, maximum in _PRODUCTION_TILE_PME_ATOM_WINDOWS
+    ):
+        return False
+    for term in pme_terms:
+        config = getattr(term, "pme_config", None)
+        if (
+            bool(getattr(term, "has_nbfix", False))
+            or config is None
+            or int(getattr(config, "assignment_order", 0)) != 5
+            or not np.isclose(
+                float(getattr(term, "cutoff", np.nan)),
+                _PRODUCTION_TILE_PME_CUTOFF,
+                rtol=1e-6,
+                atol=1e-7,
+            )
+        ):
+            return False
+    return True
+
+
 def _production_neighbor_manager(
     system,
     force_terms,
     *,
     require_production: bool,
+    fixed_cell: bool = True,
     neighbor_skin: float = GPCRMD_NEIGHBOR_SKIN,
     neighbor_check_interval: int = 1,
+    recorded_backend: str | None = None,
 ) -> NeighborListManager | None:
     if not require_production:
         return None
@@ -454,6 +498,25 @@ def _production_neighbor_manager(
     ):
         msg = "production compact-neighbor force terms require one shared cutoff"
         raise ValueError(msg)
+    tile_eligible = uses_pme and _production_tile_pme_eligible(
+        system,
+        lazy_terms,
+        fixed_cell=fixed_cell,
+        neighbor_skin=neighbor_skin,
+    )
+    selected_backend = (
+        "mlx_cell_tiles"
+        if tile_eligible
+        else ("mlx_cell_pairs" if uses_pme else "auto")
+    )
+    if recorded_backend is not None:
+        if recorded_backend not in _CHECKPOINT_NEIGHBOR_BACKENDS:
+            msg = f"resume checkpoint has unsupported neighbor backend {recorded_backend!r}"
+            raise ValueError(msg)
+        if recorded_backend == "mlx_cell_tiles" and not tile_eligible:
+            msg = "resume checkpoint tile backend is outside the current production envelope"
+            raise ValueError(msg)
+        selected_backend = recorded_backend
     return NeighborListManager(
         system.cell,
         cutoff=reference_cutoff,
@@ -461,7 +524,7 @@ def _production_neighbor_manager(
         check_interval=neighbor_check_interval,
         sort_pairs=False,
         max_workers=GPCRMD_NEIGHBOR_WORKERS,
-        backend="mlx_cell_pairs" if uses_pme else "auto",
+        backend=selected_backend,
         displacement_check_backend="mlx_scalar",
     )
 
@@ -592,7 +655,7 @@ def _runtime_execution_contract(
         "shared_direct_space_neighbors": bool(
             pme_term_count
             and neighbor_manager is not None
-            and representation_kind in {"blocks", "pairs"}
+            and representation_kind in {"blocks", "pairs", "tiles"}
         ),
         "dense_or_tiled_fallback_used": bool(
             backend in {"dense_all_pairs", "tiled_all_pairs"} or fallback_reason
@@ -898,7 +961,7 @@ def run_mlx(
         not bound_pme_plan or (use_npt and lazy_nonbonded)
     )
     hmr_state = artifact.hmr_state
-    center_of_mass_motion_interval = _center_of_mass_motion_interval(
+    cmm_interval = center_of_mass_motion_interval(
         prepared_system.metadata.protocol_metadata
     )
     compile_force_evaluator = _compile_force_evaluator_safe(force_terms)
@@ -970,8 +1033,14 @@ def run_mlx(
         runtime_system,
         force_terms,
         require_production=require_production,
+        fixed_cell=not use_npt,
         neighbor_skin=neighbor_skin,
         neighbor_check_interval=neighbor_check_interval,
+        recorded_backend=(
+            None
+            if checkpoint is None
+            else checkpoint.neighbor_policy.get("backend")
+        ),
     )
     if checkpoint is not None:
         _restore_checkpoint_neighbor_state(
@@ -1007,7 +1076,7 @@ def run_mlx(
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
-                center_of_mass_motion_interval=center_of_mass_motion_interval,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,
@@ -1042,7 +1111,7 @@ def run_mlx(
             seed=seed,
             diagnostic_interval=diagnostic_interval,
             compile_force_evaluator=compile_force_evaluator,
-            center_of_mass_motion_interval=center_of_mass_motion_interval,
+            center_of_mass_motion_interval=cmm_interval,
             ensemble=protocol_report.metadata["ensemble"],
             proof_mode=protocol_report.metadata["proof_mode"],
             barostat=protocol_report.metadata["barostat"],
@@ -1098,7 +1167,7 @@ def run_mlx(
                 initial_step=initial_step,
                 initial_time=initial_time,
                 virtual_sites=system.virtual_sites,
-                center_of_mass_motion_interval=center_of_mass_motion_interval,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             thermostat=LangevinThermostat(
                 temperature=temperature,

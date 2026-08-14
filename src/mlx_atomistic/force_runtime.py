@@ -48,9 +48,7 @@ class _ExclusiveRouteProfiler:
         )
         route["count"] = int(route["count"]) + 1
         route["wall_seconds"] = float(route["wall_seconds"]) + wall_seconds
-        route["completion_seconds"] = (
-            float(route["completion_seconds"]) + completion_seconds
-        )
+        route["completion_seconds"] = float(route["completion_seconds"]) + completion_seconds
 
     def report(self) -> dict[str, Any]:
         """Return reconciled route totals for the instrumented execution."""
@@ -61,15 +59,12 @@ class _ExclusiveRouteProfiler:
                 **values,
                 "graph_and_host_seconds": max(
                     0.0,
-                    float(values["wall_seconds"])
-                    - float(values["completion_seconds"]),
+                    float(values["wall_seconds"]) - float(values["completion_seconds"]),
                 ),
             }
             for name, values in sorted(self._routes.items())
         }
-        accounted_seconds = sum(
-            float(values["wall_seconds"]) for values in routes.values()
-        )
+        accounted_seconds = sum(float(values["wall_seconds"]) for values in routes.values())
         residual_seconds = instrumented_wall_seconds - accounted_seconds
         tolerance_seconds = max(1.0e-9, instrumented_wall_seconds * 1.0e-9)
         reconciled = residual_seconds >= -tolerance_seconds
@@ -81,9 +76,7 @@ class _ExclusiveRouteProfiler:
             "accounted_route_seconds": accounted_seconds,
             "residual_seconds": residual_seconds,
             "reconciliation_error_seconds": (
-                instrumented_wall_seconds
-                - accounted_seconds
-                - residual_seconds
+                instrumented_wall_seconds - accounted_seconds - residual_seconds
             ),
             "reconciled": reconciled,
             "routes": routes,
@@ -135,15 +128,11 @@ class _BoundForcePipeline:
             if evaluation_positions is None
             else as_mx_array(evaluation_positions)
         )
-        total_forces = mx.zeros_like(eval_positions)
+        total_forces: mx.array | None = None
         fused_term_indices: frozenset[int] = frozenset()
         if self.fused_bonded_binding is not None:
             fused_term_indices = self.fused_bonded_binding.term_indices
-            fused_started = (
-                None
-                if self.route_profiler is None
-                else self.route_profiler.start()
-            )
+            fused_started = None if self.route_profiler is None else self.route_profiler.start()
             fused_forces = self.fused_bonded_binding.forces(eval_positions)
             if fused_started is not None:
                 self.route_profiler.finish(
@@ -151,18 +140,7 @@ class _BoundForcePipeline:
                     fused_started,
                     fused_forces,
                 )
-            aggregation_started = (
-                None
-                if self.route_profiler is None
-                else self.route_profiler.start()
-            )
-            total_forces = total_forces + fused_forces
-            if aggregation_started is not None:
-                self.route_profiler.finish(
-                    "force_aggregation",
-                    aggregation_started,
-                    total_forces,
-                )
+            total_forces = fused_forces
         for term_index, (term, binding) in enumerate(
             zip(
                 self.force_terms,
@@ -220,24 +198,31 @@ class _BoundForcePipeline:
                     route_started,
                     forces,
                 )
+            force_array = as_mx_array(forces)
+            if total_forces is None:
+                total_forces = force_array
+                continue
             aggregation_started = (
-                None
-                if self.route_profiler is None
-                else self.route_profiler.start()
+                None if self.route_profiler is None else self.route_profiler.start()
             )
-            total_forces = total_forces + as_mx_array(forces)
+            total_forces = total_forces + force_array
             if aggregation_started is not None:
                 self.route_profiler.finish(
-                    "force_aggregation",
+                    "force_term_aggregation",
                     aggregation_started,
                     total_forces,
                 )
         if not self.force_terms:
             msg = "force_terms must not be empty"
             raise ValueError(msg)
+        if total_forces is None:
+            msg = "force pipeline did not produce forces"
+            raise RuntimeError(msg)
         redistribution_started = (
             None
             if self.route_profiler is None
+            or self.virtual_sites is None
+            or self.virtual_sites.n_virtual_sites == 0
             else self.route_profiler.start()
         )
         redistributed = _redistribute_forces(
@@ -247,7 +232,7 @@ class _BoundForcePipeline:
         )
         if redistribution_started is not None:
             self.route_profiler.finish(
-                "force_aggregation",
+                "virtual_site_force_redistribution",
                 redistribution_started,
                 redistributed,
             )
@@ -318,54 +303,81 @@ class _PreparedForcePipeline:
             A force evaluator bound to the exact list object.
         """
 
-        interactions = (
-            None if neighbor_list is None else neighbor_list.diagnostic_pairs
-        )
-        tiles = (
-            None
-            if neighbor_list is None
-            else neighbor_list.force_candidates(prefer_tiles=True)
-        )
+        tiles = None if neighbor_list is None else neighbor_list.force_candidates(prefer_tiles=True)
         if not isinstance(tiles, NeighborTiles):
             tiles = None
-        term_context = []
-        for term in self.force_terms:
-            identify = getattr(term, "_force_binding_context_identity", None)
-            term_context.append(
-                identify(self.cell, interactions, tiles)
-                if callable(identify)
-                else id(term)
-            )
-        context_identity = (
-            None
-            if self.cell is None
-            else np.asarray(self.cell.matrix, dtype=np.float32).tobytes(),
-            str(mx.default_device()),
-            None if interactions is None else id(interactions),
-            None if interactions is None else str(interactions.dtype),
-            None if tiles is None else id(tiles),
-            None if tiles is None else tiles.generation,
-            tuple(term_context),
+        tile_policies = tuple(
+            getattr(term, "_neighbor_tile_diagnostic_policy", None) for term in self.force_terms
         )
+        tile_owned = bool(
+            tiles is not None
+            and "consume" in tile_policies
+            and all(policy in {"consume", "ignore"} for policy in tile_policies)
+        )
+        interactions = (
+            None if neighbor_list is None or tile_owned else neighbor_list.diagnostic_pairs
+        )
+
+        def prepare_bindings(
+            pair_interactions: object | None,
+        ) -> list[object | NotImplementedType]:
+            bindings: list[object | NotImplementedType] = []
+            for term in self.force_terms:
+                prepare = getattr(term, "_prepare_force_binding", None)
+                prepare_tiles = getattr(term, "_prepare_tile_force_binding", None)
+                if tiles is not None and callable(prepare_tiles):
+                    binding = prepare_tiles(self.cell, pair_interactions, tiles)
+                else:
+                    binding = (
+                        prepare(self.cell, pair_interactions)
+                        if callable(prepare)
+                        else NotImplemented
+                    )
+                bindings.append(binding)
+            return bindings
+
+        def binding_identity(pair_interactions: object | None) -> tuple[object, ...]:
+            term_context = []
+            for term in self.force_terms:
+                identify = getattr(term, "_force_binding_context_identity", None)
+                term_context.append(
+                    identify(self.cell, pair_interactions, tiles)
+                    if callable(identify)
+                    else id(term)
+                )
+            return (
+                None
+                if self.cell is None
+                else np.asarray(self.cell.matrix, dtype=np.float32).tobytes(),
+                str(mx.default_device()),
+                None if pair_interactions is None else id(pair_interactions),
+                None if pair_interactions is None else str(pair_interactions.dtype),
+                None if tiles is None else id(tiles),
+                None if tiles is None else tiles.generation,
+                tuple(term_context),
+            )
+
+        context_identity = binding_identity(interactions)
         if (
             neighbor_list is self._cached_neighbor_list
             and self._cached_binding is not None
             and context_identity == self._cached_context_identity
         ):
             return self._cached_binding
-        term_bindings: list[object | NotImplementedType] = []
-        for term in self.force_terms:
-            prepare = getattr(term, "_prepare_force_binding", None)
-            prepare_tiles = getattr(term, "_prepare_tile_force_binding", None)
-            if tiles is not None and callable(prepare_tiles):
-                binding = prepare_tiles(self.cell, interactions, tiles)
-            else:
-                binding = (
-                    prepare(self.cell, interactions)
-                    if callable(prepare)
-                    else NotImplemented
-                )
-            term_bindings.append(binding)
+        term_bindings = prepare_bindings(interactions)
+        if tile_owned and any(
+            getattr(term, "cutoff", None) is not None and binding is NotImplemented
+            for term, binding in zip(self.force_terms, term_bindings, strict=True)
+        ):
+            interactions = None if neighbor_list is None else neighbor_list.diagnostic_pairs
+            context_identity = binding_identity(interactions)
+            if (
+                neighbor_list is self._cached_neighbor_list
+                and self._cached_binding is not None
+                and context_identity == self._cached_context_identity
+            ):
+                return self._cached_binding
+            term_bindings = prepare_bindings(interactions)
         bound = _BoundForcePipeline(
             force_terms=self.force_terms,
             term_bindings=tuple(term_bindings),
