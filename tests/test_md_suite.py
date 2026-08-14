@@ -88,6 +88,7 @@ def test_md_suite_runner_persists_medians_and_contracts(tmp_path: Path):
             "atom_count": atom_count,
             "hardware": {"machine": "arm64"},
             "runtime": {"mlx_version": "test", "default_device": "gpu"},
+            "neighbor": {"measured_rebuild_wall_seconds": 0.01},
             "timings": {"seconds_per_measured_step": seconds_per_step},
             "throughput": {"ns_per_day": 100.0 / seconds_per_step},
         }
@@ -109,9 +110,48 @@ def test_md_suite_runner_persists_medians_and_contracts(tmp_path: Path):
         "jac-94k-pme",
     ]
     assert all(row["sample_count"] == 3 for row in payload["cases"])
+    assert all(row["rehearsal_passed"] for row in payload["cases"])
+    assert all(row["relative_timing_spread"] < 0.10 for row in payload["cases"])
     assert all(row["contract_fingerprint"] for row in payload["cases"])
-    assert len(calls) == 6
+    assert len(calls) == 8
+    assert [call["steps"] for call in calls if call["out"].name == "rehearsal.json"] == [
+        75,
+        75,
+    ]
     assert json.loads(out.read_text())["passed"] is True
+
+
+def test_md_suite_runner_blocks_unstable_timing_samples(tmp_path: Path):
+    timings = iter((0.1, 0.1, 0.14, 0.1))
+
+    def fake_runner(**kwargs):
+        seconds_per_step = next(timings)
+        return {
+            "passed": True,
+            "blockers": [],
+            "atom_count": 23558,
+            "hardware": {"machine": "arm64"},
+            "runtime": {"mlx_version": "test", "default_device": "gpu"},
+            "timings": {"seconds_per_measured_step": seconds_per_step},
+            "throughput": {"ns_per_day": 100.0 / seconds_per_step},
+        }
+
+    payload = run_suite(
+        repo_root=Path.cwd(),
+        out=tmp_path / "unstable.json",
+        case_ids=("dhfr-5dfr-pme",),
+        repeats=3,
+        warmup_steps=2,
+        measured_steps=4,
+        runner=fake_runner,
+    )
+
+    assert payload["passed"] is False
+    assert payload["cases"][0]["relative_timing_spread"] == pytest.approx(0.4)
+    assert any(
+        blocker.startswith("timing_spread_exceeded:")
+        for blocker in payload["cases"][0]["blockers"]
+    )
 
 
 def test_md_suite_comparison_requires_5dfr_non_regression_and_jac_improvement():
@@ -175,6 +215,8 @@ def _suite_payload(*, five_seconds: float, jac_seconds: float, commit: str) -> d
         "repeats": 3,
         "warmup_steps": 10,
         "measured_steps": 75,
+        "rehearsal_steps": 75,
+        "maximum_relative_spread": 0.10,
         "neighbor_backend": "mlx_cell_tiles",
         "cases": [
             {

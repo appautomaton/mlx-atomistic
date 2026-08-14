@@ -18,12 +18,18 @@ comparison only when 5DFR does not regress by more than 3% and JAC improves by
 at least 3%. Thresholds are command-line options, but both required cases must
 remain present and comparable.
 
-Every case runs three times by default after ten warmup steps. The persisted
-metric is the median end-to-end seconds per measured step. A comparison is
-blocked when the case contract, step counts, repeat count, or neighbor backend
-does not match. It also fingerprints prepared artifact contents and requires
-matching hardware and MLX runtime metadata, so differently prepared systems
-cannot produce an eligible speedup ratio under the same case name.
+Every case first runs an unmeasured 75-step rehearsal. This reaches an ordinary
+neighbor rebuild on the local contracts and warms the recurring Metal shapes
+before three recorded repeats, each with ten warmup steps. The persisted metric
+is the median end-to-end seconds per measured step. A case is blocked when its
+recorded timing range exceeds 10% of the median. This prevents cold compilation,
+thermal transitions, or frequency drift from becoming an eligible speedup.
+
+A comparison is blocked when the case contract, rehearsal and measured step
+counts, repeat count, spread limit, or neighbor backend does not match. It also
+fingerprints prepared artifact contents and requires matching hardware and MLX
+runtime metadata, so differently prepared systems cannot produce an eligible
+speedup ratio under the same case name.
 
 ## Commands
 
@@ -39,6 +45,7 @@ Run the baseline and candidate from their respective commits or worktrees:
 uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --suite local \
   --repeats 3 \
+  --rehearsal-steps 75 \
   --warmup-steps 10 \
   --measured-steps 75 \
   --out results/md-suite/baseline.json
@@ -46,6 +53,7 @@ uv run python -m mlx_atomistic.benchmarks.md_suite run \
 uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --suite local \
   --repeats 3 \
+  --rehearsal-steps 75 \
   --warmup-steps 10 \
   --measured-steps 75 \
   --out results/md-suite/candidate.json

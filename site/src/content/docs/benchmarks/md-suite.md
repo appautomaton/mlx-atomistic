@@ -14,10 +14,13 @@ tests and isolated kernel microbenchmarks.
 | `jac-94k-pme` | 94,232 | `mlx_cell_tiles` | Improvement gate for production-scale direct space, PME, memory traffic, and scheduling. |
 
 One case is deliberately insufficient. The default comparison requires 5DFR
-to remain within 3% of the baseline and JAC to improve by at least 3%. Each
-case runs three times by default and reports the median end-to-end seconds per
-measured step. Comparisons require matching case contracts, prepared artifact
-contents, hardware metadata, MLX runtime, step counts, and neighbor backend.
+to remain within 3% of the baseline and JAC to improve by at least 3%. Each case
+first runs an unmeasured 75-step rehearsal to warm recurring neighbor-rebuild
+and Metal shapes. It then runs three recorded repeats and reports the median
+end-to-end seconds per measured step. A timing range above 10% of the median
+blocks the case. Comparisons require matching case contracts, prepared artifact
+contents, hardware metadata, MLX runtime, rehearsal and measured step counts,
+spread limits, and neighbor backends.
 
 ```bash
 uv run python -m mlx_atomistic.benchmarks.md_suite list

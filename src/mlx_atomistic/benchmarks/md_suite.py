@@ -18,12 +18,14 @@ from mlx_atomistic.benchmarks.charged_pme import runtime_payload
 from mlx_atomistic.benchmarks.schema import current_git_commit
 
 CASE_REGISTRY_PATH = Path(__file__).with_name("data") / "md_suite_cases.json"
-SUITE_SCHEMA = "mlx_atomistic.md_suite.v1"
-COMPARISON_SCHEMA = "mlx_atomistic.md_suite_comparison.v1"
+SUITE_SCHEMA = "mlx_atomistic.md_suite.v2"
+COMPARISON_SCHEMA = "mlx_atomistic.md_suite_comparison.v2"
 DEFAULT_LOCAL_SUITE = "local"
 DEFAULT_REPEATS = 3
 DEFAULT_WARMUP_STEPS = 10
 DEFAULT_MEASURED_STEPS = 75
+DEFAULT_REHEARSAL_STEPS = 75
+DEFAULT_MAXIMUM_RELATIVE_SPREAD = 0.10
 
 
 @dataclass(frozen=True)
@@ -166,14 +168,21 @@ def run_suite(
     repeats: int = DEFAULT_REPEATS,
     warmup_steps: int = DEFAULT_WARMUP_STEPS,
     measured_steps: int = DEFAULT_MEASURED_STEPS,
+    rehearsal_steps: int = DEFAULT_REHEARSAL_STEPS,
+    maximum_relative_spread: float = DEFAULT_MAXIMUM_RELATIVE_SPREAD,
     neighbor_backend: str | None = None,
     registry_path: str | Path = CASE_REGISTRY_PATH,
     runner: Callable[..., dict[str, Any]] = runtime_payload,
 ) -> dict[str, Any]:
     """Run selected prepared PME cases and persist a comparison-ready payload."""
 
-    if repeats <= 0 or warmup_steps <= 0 or measured_steps < 2:
-        raise ValueError("repeats and warmup_steps must be positive; measured_steps must be >= 2")
+    if repeats <= 0 or warmup_steps <= 0 or measured_steps < 2 or rehearsal_steps < 2:
+        raise ValueError(
+            "repeats and warmup_steps must be positive; "
+            "measured_steps and rehearsal_steps must be >= 2"
+        )
+    if not math.isfinite(maximum_relative_spread) or maximum_relative_spread < 0.0:
+        raise ValueError("maximum_relative_spread must be finite and nonnegative")
     root = Path(repo_root).resolve()
     out_path = Path(out)
     if not out_path.is_absolute():
@@ -199,6 +208,8 @@ def run_suite(
                 repeats=repeats,
                 warmup_steps=warmup_steps,
                 measured_steps=measured_steps,
+                rehearsal_steps=rehearsal_steps,
+                maximum_relative_spread=maximum_relative_spread,
                 neighbor_backend=neighbor_backend or case.neighbor_backend,
                 runner=runner,
             )
@@ -213,6 +224,8 @@ def run_suite(
         "repeats": repeats,
         "warmup_steps": warmup_steps,
         "measured_steps": measured_steps,
+        "rehearsal_steps": rehearsal_steps,
+        "maximum_relative_spread": maximum_relative_spread,
         "neighbor_backend": neighbor_backend or "case_contract",
         "cases": rows,
     }
@@ -235,7 +248,13 @@ def compare_suites(
         blockers.append("suite_schema_mismatch")
     if baseline.get("neighbor_backend") != candidate.get("neighbor_backend"):
         blockers.append("neighbor_backend_mismatch")
-    for name in ("repeats", "warmup_steps", "measured_steps"):
+    for name in (
+        "repeats",
+        "warmup_steps",
+        "measured_steps",
+        "rehearsal_steps",
+        "maximum_relative_spread",
+    ):
         if baseline.get(name) != candidate.get(name):
             blockers.append(f"{name}_mismatch")
     baseline_rows = {row.get("case_id"): row for row in baseline.get("cases", ())}
@@ -315,12 +334,25 @@ def _run_case(
     repeats: int,
     warmup_steps: int,
     measured_steps: int,
+    rehearsal_steps: int,
+    maximum_relative_spread: float,
     neighbor_backend: str,
     runner: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     prepared_fingerprint = _prepared_fingerprint(prepared)
     samples = []
     blockers = []
+    rehearsal_output = out_dir / "rehearsal.json"
+    rehearsal = runner(
+        prepared=prepared,
+        warmups=warmup_steps,
+        steps=rehearsal_steps,
+        out=rehearsal_output,
+        neighbor_backend=neighbor_backend,
+    )
+    if not rehearsal.get("passed", False):
+        blockers.append("rehearsal_failed")
+        blockers.extend(str(item) for item in rehearsal.get("blockers", ()))
     for repeat in range(1, repeats + 1):
         sample = runner(
             prepared=prepared,
@@ -355,6 +387,17 @@ def _run_case(
         blockers.append("hardware_changed_between_repeats")
     if any(value != runtime_values[0] for value in runtime_values[1:]):
         blockers.append("runtime_changed_between_repeats")
+    median_seconds = statistics.median(timings) if timings else None
+    relative_spread = (
+        (max(timings) - min(timings)) / median_seconds
+        if median_seconds is not None and len(timings) > 1
+        else 0.0 if median_seconds is not None else None
+    )
+    if relative_spread is not None and relative_spread > maximum_relative_spread:
+        blockers.append(
+            "timing_spread_exceeded:"
+            f"actual={relative_spread:.6f}:maximum={maximum_relative_spread:.6f}"
+        )
     passed = len(timings) == repeats and len(throughputs) == repeats and not blockers
     return {
         "case_id": case.case_id,
@@ -371,9 +414,12 @@ def _run_case(
         "status": "ok" if passed else "blocked_or_failed",
         "passed": passed,
         "blockers": sorted(set(blockers)),
+        "rehearsal_passed": rehearsal.get("passed", False),
+        "rehearsal_output": str(rehearsal_output),
         "sample_count": len(samples),
-        "median_seconds_per_step": statistics.median(timings) if timings else None,
+        "median_seconds_per_step": median_seconds,
         "median_ns_per_day": statistics.median(throughputs) if throughputs else None,
+        "relative_timing_spread": relative_spread,
         "seconds_per_step_samples": timings,
         "ns_per_day_samples": throughputs,
         "raw_outputs": [
@@ -435,6 +481,12 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     run_parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     run_parser.add_argument("--measured-steps", type=int, default=DEFAULT_MEASURED_STEPS)
+    run_parser.add_argument("--rehearsal-steps", type=int, default=DEFAULT_REHEARSAL_STEPS)
+    run_parser.add_argument(
+        "--maximum-relative-spread",
+        type=float,
+        default=DEFAULT_MAXIMUM_RELATIVE_SPREAD,
+    )
     run_parser.add_argument(
         "--neighbor-backend",
         choices=("mlx_cell_pairs", "mlx_cell_tiles"),
@@ -462,6 +514,8 @@ def main(argv: list[str] | None = None) -> int:
             repeats=args.repeats,
             warmup_steps=args.warmup_steps,
             measured_steps=args.measured_steps,
+            rehearsal_steps=args.rehearsal_steps,
+            maximum_relative_spread=args.maximum_relative_spread,
             neighbor_backend=args.neighbor_backend,
         )
     else:
