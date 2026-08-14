@@ -24,7 +24,11 @@ from mlx_atomistic.constraints import (
 )
 from mlx_atomistic.core import Cell
 from mlx_atomistic.force_runtime import _PreparedForcePipeline
-from mlx_atomistic.forcefields import NonbondedPotential
+from mlx_atomistic.forcefields import (
+    HarmonicAnglePotential,
+    HarmonicBondPotential,
+    NonbondedPotential,
+)
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.md import (
     LangevinThermostat,
@@ -1280,6 +1284,16 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
     pair_full = potential._forces_from_binding(positions, pair_binding)
     pipeline = _PreparedForcePipeline.prepare((potential,), cell=cell)
     routed_forces = pipeline.bind(tile_neighbors).forces(positions)
+    bonded = HarmonicBondPotential([(2, 3)], k=[45.0], length=[1.7])
+    angled = HarmonicAnglePotential([(2, 3, 4)], k=[20.0], angle=[1.8])
+    fused_pipeline = _PreparedForcePipeline.prepare((bonded, angled, potential), cell=cell)
+    fused_binding = fused_pipeline.bind(tile_neighbors)
+    assert fused_binding.fused_sparse_correction_term_index == 2
+    assert fused_binding.fused_sparse_correction_binding is not None
+    fused_routed_forces = fused_binding.forces(positions)
+    _, bonded_forces = bonded.energy_forces(positions, cell)
+    _, angled_forces = angled.energy_forces(positions, cell)
+    fused_reference = bonded_forces + angled_forces + pair_full
     mx.eval(
         tile_direct,
         pair_direct,
@@ -1288,6 +1302,8 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
         tile_full,
         pair_full,
         routed_forces,
+        fused_routed_forces,
+        fused_reference,
     )
     np.testing.assert_allclose(
         np.asarray(tile_direct),
@@ -1310,6 +1326,12 @@ def test_spatial_tile_builder_and_direct_kernel_match_compact_pair_route():
     np.testing.assert_allclose(
         np.asarray(routed_forces),
         np.asarray(pair_full),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fused_routed_forces),
+        np.asarray(fused_reference),
         rtol=2.0e-5,
         atol=2.0e-3,
     )

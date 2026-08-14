@@ -38,6 +38,7 @@ Each result file should answer, in order:
 | [md-charmm-cmap-metal-m5max.md](./md-charmm-cmap-metal-m5max.md) | mlx_atomistic | Retained Urey-Bradley and analytical CMAP fused bonded Metal route on GPCRmd 729 | Metal | Apple M5 Max |
 | [md-topology-mask-csr-m5max.md](./md-topology-mask-csr-m5max.md) | mlx_atomistic | Retained atom-local CSR topology-mask binding on JAC and GPCRmd | Metal | Apple M5 Max |
 | [md-device-neighbor-inventory-m5max.md](./md-device-neighbor-inventory-m5max.md) | mlx_atomistic | Retained device-resident spatial-tile neighbor inventory on 5DFR, JAC, and GPCRmd | Metal | Apple M5 Max |
+| [md-shared-force-buffer-m5max.md](./md-shared-force-buffer-m5max.md) | mlx_atomistic | Retained shared bonded and sparse PME force buffer on 5DFR, JAC, and GPCRmd | Metal | Apple M5 Max |
 | [md-current-main-sustained-openmm-m5max.md](./md-current-main-sustained-openmm-m5max.md) | mlx_atomistic/openmm-reference | Current-main sustained baseline, retained analytical SHAKE velocity kernel, and rejected candidates | Metal/OpenCL | Apple M5 Max |
 | [md-neighbor-rebuild-simd-membership-m5max.md](./md-neighbor-rebuild-simd-membership-m5max.md) | mlx_atomistic | Retained 32-lane SIMD exact-tile membership kernel and rebuild-stage profiler | Metal | Apple M5 Max |
 | [md-small-constraint-clusters-m5max.md](./md-small-constraint-clusters-m5max.md) | mlx_atomistic | Retained small-component constraint Metal kernels on 5DFR and JAC | Metal | Apple M5 Max |

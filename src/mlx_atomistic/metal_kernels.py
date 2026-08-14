@@ -202,8 +202,10 @@ _BONDED_FORCE_SOURCE = r"""
     uint improper_count = (uint)counts[3];
     uint cmap_count = (uint)counts[4];
     uint cmap_grid_size = (uint)counts[5];
+    uint correction_count = (uint)counts[6];
     uint total_count = (
         bond_count + angle_count + dihedral_count + improper_count + cmap_count
+            + correction_count
     );
     if (task >= total_count) {
         return;
@@ -400,6 +402,35 @@ _BONDED_FORCE_SOURCE = r"""
             psi_geometry,
             scale * derivative_psi_t
         );
+        return;
+    }
+    task -= cmap_count;
+
+    if (task < correction_count) {
+        int atom_i = correction_atoms[2 * task + 0];
+        int atom_j = correction_atoms[2 * task + 1];
+        float3 displacement = mlx_atomistic_bonded_displacement(
+            positions, atom_i, atom_j, box
+        );
+        float r2 = dot(displacement, displacement);
+        if (r2 <= 0.0f) {
+            return;
+        }
+        float inv_distance = rsqrt(r2);
+        float inv_r2 = inv_distance * inv_distance;
+        float scalar = correction_coulomb[0] * correction_charge_products[task]
+            * inv_r2 * inv_distance;
+        float epsilon = correction_lj_epsilon[task];
+        if (epsilon > 0.0f) {
+            float sigma = correction_lj_sigma[task];
+            float sigma2_over_r2 = sigma * sigma * inv_r2;
+            float inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2;
+            float inv_r12 = inv_r6 * inv_r6;
+            scalar += 24.0f * epsilon * (2.0f * inv_r12 - inv_r6) * inv_r2;
+        }
+        float3 force = scalar * displacement;
+        mlx_atomistic_add_bonded_force(forces, atom_i, force);
+        mlx_atomistic_add_bonded_force(forces, atom_j, -force);
     }
 """
 
@@ -4431,6 +4462,11 @@ def _fused_bonded_force_only_kernel():
                 "cmap_atoms",
                 "cmap_indices",
                 "cmap_coefficients",
+                "correction_atoms",
+                "correction_charge_products",
+                "correction_lj_sigma",
+                "correction_lj_epsilon",
+                "correction_coulomb",
                 "counts",
             ],
             output_names=["forces"],
@@ -5886,8 +5922,13 @@ def _fused_bonded_force_only(
     cmap_atoms: mx.array,
     cmap_indices: mx.array,
     cmap_coefficients: mx.array,
+    correction_atoms: mx.array | None = None,
+    correction_charge_products: mx.array | None = None,
+    correction_lj_sigma: mx.array | None = None,
+    correction_lj_epsilon: mx.array | None = None,
+    correction_coulomb_constant: float = 0.0,
 ) -> mx.array:
-    """Evaluate standard and CHARMM CMAP bonded families in one dispatch."""
+    """Evaluate bonded families and optional sparse PME corrections in one dispatch."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
@@ -5908,6 +5949,29 @@ def _fused_bonded_force_only(
     cmap_atoms = as_mx_array(cmap_atoms, dtype=mx.int32)
     cmap_indices = as_mx_array(cmap_indices, dtype=mx.int32)
     cmap_coefficients = as_mx_array(cmap_coefficients, dtype=mx.float32)
+    correction_inputs = (
+        correction_atoms,
+        correction_charge_products,
+        correction_lj_sigma,
+        correction_lj_epsilon,
+    )
+    has_corrections = any(value is not None for value in correction_inputs)
+    if has_corrections and not all(value is not None for value in correction_inputs):
+        msg = "sparse PME correction inputs must be provided together"
+        raise ValueError(msg)
+    if has_corrections:
+        correction_atoms = as_mx_array(correction_atoms, dtype=mx.int32)
+        correction_charge_products = as_mx_array(
+            correction_charge_products,
+            dtype=mx.float32,
+        )
+        correction_lj_sigma = as_mx_array(correction_lj_sigma, dtype=mx.float32)
+        correction_lj_epsilon = as_mx_array(correction_lj_epsilon, dtype=mx.float32)
+    else:
+        correction_atoms = mx.zeros((0, 2), dtype=mx.int32)
+        correction_charge_products = mx.zeros((0,), dtype=mx.float32)
+        correction_lj_sigma = mx.zeros((0,), dtype=mx.float32)
+        correction_lj_epsilon = mx.zeros((0,), dtype=mx.float32)
 
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
@@ -5921,6 +5985,7 @@ def _fused_bonded_force_only(
         dihedral_atoms.shape[0],
         improper_atoms.shape[0],
         cmap_atoms.shape[0],
+        correction_atoms.shape[0],
     )
     arrays = (
         (bond_atoms, bond_k, bond_length, 2, "bond"),
@@ -5966,11 +6031,28 @@ def _fused_bonded_force_only(
     if cmap_coefficients.shape[1] != cmap_coefficients.shape[2]:
         msg = "cmap coefficient grids must be square"
         raise ValueError(msg)
+    if correction_atoms.ndim != 2 or correction_atoms.shape[1] != 2:
+        msg = "correction_atoms must have shape (n, 2)"
+        raise ValueError(msg)
+    for name, values in (
+        ("correction_charge_products", correction_charge_products),
+        ("correction_lj_sigma", correction_lj_sigma),
+        ("correction_lj_epsilon", correction_lj_epsilon),
+    ):
+        if values.shape != (counts[5],):
+            msg = f"{name} must have shape ({counts[5]},)"
+            raise ValueError(msg)
+    if not isfinite(float(correction_coulomb_constant)):
+        msg = "correction_coulomb_constant must be finite"
+        raise ValueError(msg)
 
     total_count = sum(counts)
     if total_count == 0:
         return mx.zeros_like(positions)
-    count_array = mx.array((*counts, cmap_coefficients.shape[1]), dtype=mx.int32)
+    count_array = mx.array(
+        (*counts[:5], cmap_coefficients.shape[1], counts[5]),
+        dtype=mx.int32,
+    )
     threads = min(256, total_count)
     (forces,) = _fused_bonded_force_only_kernel()(
         inputs=[
@@ -5993,6 +6075,11 @@ def _fused_bonded_force_only(
             mx.reshape(cmap_atoms, (-1,)),
             cmap_indices,
             mx.reshape(cmap_coefficients, (-1,)),
+            mx.reshape(correction_atoms, (-1,)),
+            correction_charge_products,
+            correction_lj_sigma,
+            correction_lj_epsilon,
+            mx.array([float(correction_coulomb_constant)], dtype=mx.float32),
             count_array,
         ],
         output_shapes=[positions.shape],

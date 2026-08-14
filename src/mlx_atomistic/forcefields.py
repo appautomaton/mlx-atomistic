@@ -959,6 +959,17 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
 
 
 @dataclass(frozen=True)
+class _FusedSparsePMECorrectionBinding:
+    """Sparse PME correction inputs owned by a shared Metal force buffer."""
+
+    pairs: mx.array
+    charge_products: mx.array
+    lj_sigma: mx.array
+    lj_epsilon: mx.array
+    coulomb_constant: float
+
+
+@dataclass(frozen=True)
 class _FusedBondedForceBinding:
     """Prepared force-only binding for supported bonded families."""
 
@@ -970,8 +981,14 @@ class _FusedBondedForceBinding:
     improper: ImproperDihedralPotential
     cmap: CHARMMCMAPPotential
 
-    def forces(self, positions: mx.array) -> mx.array:
-        """Evaluate all bound bonded interactions in one Metal dispatch."""
+    def forces(
+        self,
+        positions: mx.array,
+        sparse_pme_corrections: _FusedSparsePMECorrectionBinding | None = None,
+    ) -> mx.array:
+        """Evaluate bound bonded interactions and optional PME corrections."""
+
+        corrections = sparse_pme_corrections
 
         return _fused_bonded_force_only(
             positions,
@@ -993,6 +1010,17 @@ class _FusedBondedForceBinding:
             self.cmap.charmm_cmap_terms,
             self.cmap.cmap_indices,
             self.cmap._coefficients,
+            correction_atoms=None if corrections is None else corrections.pairs,
+            correction_charge_products=(
+                None if corrections is None else corrections.charge_products
+            ),
+            correction_lj_sigma=None if corrections is None else corrections.lj_sigma,
+            correction_lj_epsilon=(
+                None if corrections is None else corrections.lj_epsilon
+            ),
+            correction_coulomb_constant=(
+                0.0 if corrections is None else corrections.coulomb_constant
+            ),
         )
 
 
@@ -4003,6 +4031,25 @@ class NonbondedPotential:
             coulomb_constant=self.coulomb_constant,
         )
 
+    def _fused_sparse_pme_correction_binding(
+        self,
+        binding: _NonbondedForceBinding,
+    ) -> _FusedSparsePMECorrectionBinding | None:
+        """Expose validated sparse PME inputs to a shared Metal force dispatch."""
+
+        if (
+            "gpu" not in str(mx.default_device()).lower()
+            or not isinstance(binding, _NonbondedForceBinding)
+        ):
+            return None
+        return _FusedSparsePMECorrectionBinding(
+            pairs=self._sparse_correction_pairs,
+            charge_products=self._sparse_correction_charge_products,
+            lj_sigma=self._sparse_correction_lj_sigma,
+            lj_epsilon=self._sparse_correction_lj_epsilon,
+            coulomb_constant=self.coulomb_constant,
+        )
+
     def _forces_from_binding(
         self,
         positions: mx.array,
@@ -4020,20 +4067,28 @@ class NonbondedPotential:
             msg = "positions must have shape (n_atoms, 3)"
             raise ValueError(msg)
 
+        return self._forces_from_binding_without_sparse_corrections(
+            positions,
+            binding,
+        ) + self._prepared_sparse_correction_forces(
+            positions,
+            binding,
+        )
+
+    def _forces_from_binding_without_sparse_corrections(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+    ) -> mx.array:
+        """Evaluate prepared PME forces whose sparse corrections have another owner."""
+
         direct_forces = self._direct_forces_from_binding(positions, binding)
         reciprocal_forces = _prepared_pme_reciprocal_space_forces(
             positions,
             self.charges,
             binding.pme_plan,
         )
-        return (
-            direct_forces
-            + reciprocal_forces
-            + self._prepared_sparse_correction_forces(
-                positions,
-                binding,
-            )
-        )
+        return direct_forces + reciprocal_forces
 
     def _direct_forces_from_binding(
         self,
@@ -4147,6 +4202,57 @@ class NonbondedPotential:
 
         aggregation_started = route_profiler.start()
         forces = direct_forces + reciprocal_forces + correction_forces
+        route_profiler.finish(
+            "pme_force_aggregation",
+            aggregation_started,
+            forces,
+        )
+        return forces
+
+    def _profile_forces_from_binding_without_sparse_corrections(
+        self,
+        positions: mx.array,
+        binding: _NonbondedForceBinding,
+        route_profiler,
+    ) -> mx.array:
+        """Profile prepared PME forces whose sparse work has another owner."""
+
+        if not isinstance(binding, _NonbondedForceBinding):
+            msg = "nonbonded force binding has an incompatible type"
+            raise TypeError(msg)
+        if not binding.pair_force_ready and binding.tile_decline_reason is not None:
+            return NotImplemented
+        positions = as_mx_array(positions)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            msg = "positions must have shape (n_atoms, 3)"
+            raise ValueError(msg)
+
+        direct_started = route_profiler.start()
+        direct_forces = self._direct_forces_from_binding(positions, binding)
+        route_profiler.finish(
+            (
+                "direct_spatial_tiles"
+                if binding.tile_geometry is not None and binding.tile_decline_reason is None
+                else "direct_lj_screened_coulomb"
+            ),
+            direct_started,
+            direct_forces,
+        )
+
+        reciprocal_started = route_profiler.start()
+        reciprocal_forces = _prepared_pme_reciprocal_space_forces(
+            positions,
+            self.charges,
+            binding.pme_plan,
+        )
+        route_profiler.finish(
+            "reciprocal_pme",
+            reciprocal_started,
+            reciprocal_forces,
+        )
+
+        aggregation_started = route_profiler.start()
+        forces = direct_forces + reciprocal_forces
         route_profiler.finish(
             "pme_force_aggregation",
             aggregation_started,

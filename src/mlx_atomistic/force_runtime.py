@@ -103,6 +103,8 @@ class _BoundForcePipeline:
     cell: Cell | None
     virtual_sites: VirtualSiteManager | None
     fused_bonded_binding: object | None = None
+    fused_sparse_correction_term_index: int | None = None
+    fused_sparse_correction_binding: object | None = None
     route_profiler: _ExclusiveRouteProfiler | None = None
 
     def forces(
@@ -133,7 +135,10 @@ class _BoundForcePipeline:
         if self.fused_bonded_binding is not None:
             fused_term_indices = self.fused_bonded_binding.term_indices
             fused_started = None if self.route_profiler is None else self.route_profiler.start()
-            fused_forces = self.fused_bonded_binding.forces(eval_positions)
+            fused_forces = self.fused_bonded_binding.forces(
+                eval_positions,
+                self.fused_sparse_correction_binding,
+            )
             if fused_started is not None:
                 self.route_profiler.finish(
                     "bonded_fused",
@@ -150,10 +155,23 @@ class _BoundForcePipeline:
         ):
             if term_index in fused_term_indices:
                 continue
-            bound_method = getattr(term, "_forces_from_binding", None)
+            fused_sparse_owner = term_index == self.fused_sparse_correction_term_index
+            bound_method = getattr(
+                term,
+                (
+                    "_forces_from_binding_without_sparse_corrections"
+                    if fused_sparse_owner
+                    else "_forces_from_binding"
+                ),
+                None,
+            )
             profiled_bound_method = getattr(
                 term,
-                "_profile_forces_from_binding",
+                (
+                    "_profile_forces_from_binding_without_sparse_corrections"
+                    if fused_sparse_owner
+                    else "_profile_forces_from_binding"
+                ),
                 None,
             )
             route_started = None
@@ -378,6 +396,24 @@ class _PreparedForcePipeline:
             ):
                 return self._cached_binding
             term_bindings = prepare_bindings(interactions)
+        fused_sparse_correction_term_index = None
+        fused_sparse_correction_binding = None
+        if self.fused_bonded_binding is not None:
+            for term_index, (term, binding) in enumerate(
+                zip(self.force_terms, term_bindings, strict=True)
+            ):
+                prepare_fused_corrections = getattr(
+                    term,
+                    "_fused_sparse_pme_correction_binding",
+                    None,
+                )
+                if binding is NotImplemented or not callable(prepare_fused_corrections):
+                    continue
+                correction_binding = prepare_fused_corrections(binding)
+                if correction_binding is not None:
+                    fused_sparse_correction_term_index = term_index
+                    fused_sparse_correction_binding = correction_binding
+                    break
         bound = _BoundForcePipeline(
             force_terms=self.force_terms,
             term_bindings=tuple(term_bindings),
@@ -385,6 +421,8 @@ class _PreparedForcePipeline:
             cell=self.cell,
             virtual_sites=self.virtual_sites,
             fused_bonded_binding=self.fused_bonded_binding,
+            fused_sparse_correction_term_index=fused_sparse_correction_term_index,
+            fused_sparse_correction_binding=fused_sparse_correction_binding,
             route_profiler=self.route_profiler,
         )
         self._cached_neighbor_list = neighbor_list
