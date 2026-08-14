@@ -33,6 +33,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [md-suite.md](./md-suite.md) | mlx_atomistic | Canonical 5DFR/JAC local gate and extended MD suite | Metal | Apple Silicon |
 | [md-small-constraint-clusters-m5max.md](./md-small-constraint-clusters-m5max.md) | mlx_atomistic | Retained small-component constraint Metal kernels on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-cell-task-reuse-m5max.md](./md-cell-task-reuse-m5max.md) | mlx_atomistic | Retained spatial-cell task reuse and schedule-prefix coalescing on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-neighbor-wait-attribution-m5max.md](./md-neighbor-wait-attribution-m5max.md) | mlx_atomistic | Neighbor wait attribution and rejected async/direct-branch candidates on 5DFR and JAC | Metal | Apple M5 Max |
@@ -69,6 +70,7 @@ LAMMPS, OpenCL, large downloaded fixtures, or committed raw outputs.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
+| `uv run python -m mlx_atomistic.benchmarks.md_suite list` | mlx_atomistic | fast developer | committed case contracts and local artifact availability |
 | `uv run --locked --no-default-groups --extra prep --group test python -m pytest tests/test_benchmarks.py -m "not slow"` | mlx_atomistic | fast developer | pytest stdout; opt-in reference/data/gpu/perf tests skip |
 | `uv run python -m mlx_atomistic.benchmarks.mm_force_terms --evaluations 1 --particles 16 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --sizes 16 --evaluations 1 --json` | mlx_atomistic | fast developer | normalized JSON on stdout |
@@ -83,6 +85,7 @@ Markdown summaries should cite those raw paths and reproduction commands.
 
 | Command | Engine | Tier | Output |
 | --- | --- | --- | --- |
+| `uv run python -m mlx_atomistic.benchmarks.md_suite run --suite local --out results/md-suite/current.json` | mlx_atomistic | opt-in performance | repeated 5DFR/JAC median timings and raw per-repeat JSON under `results/md-suite/` |
 | `uv run python -m mlx_atomistic.benchmarks.dft_hpsi_profile --manifest results/dft-workload/manifest.json --gth-source results/dft-workload/resources/Si-GTH-PBE-q4.gth --out results/dft-hpsi-stage-profile/control --warmups 3 --samples 7 --json` | mlx_atomistic | opt-in performance | atomic stage profile under `results/dft-hpsi-stage-profile/`; optional Metal capture is non-CI |
 | `uv run python -m mlx_atomistic.benchmarks.md_performance --include-large --steps 100 --json > results/mlx-md-performance.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |
 | `uv run python -m mlx_atomistic.benchmarks.md_acceleration --include-large --evaluations 10 --json > results/mlx-md-acceleration.json` | mlx_atomistic | opt-in performance | raw JSON under `results/` |

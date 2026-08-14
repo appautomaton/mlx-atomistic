@@ -1,4 +1,4 @@
-"""Prepare the exact OpenMM ``5dfr`` solvated PME benchmark for MLX.
+"""Prepare official OpenMM ``5dfr`` or ``ApoA1`` PME benchmarks for MLX.
 
 OpenMM is a reference-only construction surface. The resulting prepared
 artifact and source manifest are the boundary consumed by the MLX runtime.
@@ -50,6 +50,65 @@ EXPECTED_FORCE_CLASSES = {
     "NonbondedForce": 1,
     "PeriodicTorsionForce": 1,
 }
+
+
+class ExplicitBenchmarkSpec:
+    """Construction contract for one official OpenMM explicit PME fixture."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        case_id: str,
+        manifest_schema: str,
+        source_pdb: Path,
+        default_out: Path,
+        force_field_files: tuple[str, ...],
+        parameter_source: str,
+        water_residue_names: tuple[str, ...],
+        lipid_residue_names: tuple[str, ...] = (),
+        expected_force_classes: dict[str, int] | None = None,
+    ) -> None:
+        self.name = name
+        self.case_id = case_id
+        self.manifest_schema = manifest_schema
+        self.source_pdb = source_pdb
+        self.default_out = default_out
+        self.force_field_files = force_field_files
+        self.parameter_source = parameter_source
+        self.water_residue_names = water_residue_names
+        self.lipid_residue_names = lipid_residue_names
+        self.expected_force_classes = expected_force_classes
+
+
+DHFR_SPEC = ExplicitBenchmarkSpec(
+    name="5dfr",
+    case_id=CASE_ID,
+    manifest_schema=MANIFEST_SCHEMA,
+    source_pdb=OPENMM_DHFR_SOLVATED,
+    default_out=DEFAULT_OUT,
+    force_field_files=FORCE_FIELD_FILES,
+    parameter_source="openmm_amber99sb_tip3p",
+    water_residue_names=("HOH",),
+    expected_force_classes=EXPECTED_FORCE_CLASSES,
+)
+APOA1_SPEC = ExplicitBenchmarkSpec(
+    name="apoa1",
+    case_id="apoa1-pme",
+    manifest_schema="mlx-atomistic.openmm-apoa1-preparation.v1",
+    source_pdb=Path("vendors/openmm/examples/benchmarks/apoa1.pdb"),
+    default_out=Path("results/md-benchmarks/apoa1/prepared"),
+    force_field_files=(
+        "amber14/protein.ff14SB.xml",
+        "amber14/lipid17.xml",
+        "amber14/tip3p.xml",
+    ),
+    parameter_source="openmm_amber14_lipid17_tip3p",
+    water_residue_names=("TIP", "HOH", "WAT"),
+    lipid_residue_names=("POP", "POPC"),
+    expected_force_classes=EXPECTED_FORCE_CLASSES,
+)
+EXPLICIT_BENCHMARK_SPECS = {spec.name: spec for spec in (DHFR_SPEC, APOA1_SPEC)}
 PARAMETER_ARRAY_NAMES = (
     "masses",
     "charges",
@@ -78,16 +137,18 @@ INDEX_ARRAY_NAMES = (
 
 def main() -> None:
     args = _parse_args()
-    result = prepare_openmm_5dfr(
+    spec = EXPLICIT_BENCHMARK_SPECS[args.case]
+    result = prepare_openmm_explicit(
+        spec=spec,
         repo_root=args.repo_root,
-        pdb_path=args.pdb,
-        out_dir=args.out,
+        pdb_path=spec.source_pdb if args.pdb is None else args.pdb,
+        out_dir=spec.default_out if args.out is None else args.out,
     )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         print(
-            "prepared exact OpenMM 5dfr artifact: "
+            f"prepared exact OpenMM {spec.name} artifact: "
             f"{result['artifact_path']} ({result['atom_count']} atoms, "
             f"{result['molecule_count']} molecules)"
         )
@@ -101,8 +162,41 @@ def prepare_openmm_5dfr(
 ) -> dict[str, Any]:
     """Build and export the selected Amber99SB/TIP3P PME ``5dfr`` system."""
 
+    return prepare_openmm_explicit(
+        spec=DHFR_SPEC,
+        repo_root=repo_root,
+        pdb_path=pdb_path,
+        out_dir=out_dir,
+    )
+
+
+def prepare_openmm_apoa1(
+    *,
+    repo_root: Path,
+    pdb_path: Path,
+    out_dir: Path,
+) -> dict[str, Any]:
+    """Build and export the official Amber14/Lipid17/TIP3P ApoA1 PME system."""
+
+    return prepare_openmm_explicit(
+        spec=APOA1_SPEC,
+        repo_root=repo_root,
+        pdb_path=pdb_path,
+        out_dir=out_dir,
+    )
+
+
+def prepare_openmm_explicit(
+    *,
+    spec: ExplicitBenchmarkSpec,
+    repo_root: Path,
+    pdb_path: Path,
+    out_dir: Path,
+) -> dict[str, Any]:
+    """Build one exact official OpenMM explicit-solvent PME benchmark artifact."""
+
     root = Path(repo_root).resolve()
-    source_pdb = _require_exact_source(root, pdb_path)
+    source_pdb = _require_exact_source(root, pdb_path, spec=spec)
     benchmark_source = (root / OPENMM_BENCHMARK_SOURCE).resolve()
     if not benchmark_source.is_file():
         msg = f"missing OpenMM benchmark construction source: {OPENMM_BENCHMARK_SOURCE}"
@@ -113,7 +207,7 @@ def prepare_openmm_5dfr(
     app = api.app
     unit = api.unit
     pdb = app.PDBFile(str(source_pdb))
-    force_field = app.ForceField(*FORCE_FIELD_FILES)
+    force_field = app.ForceField(*spec.force_field_files)
     system = force_field.createSystem(
         pdb.topology,
         nonbondedMethod=app.PME,
@@ -130,7 +224,7 @@ def prepare_openmm_5dfr(
     )
     nonbonded.setEwaldErrorTolerance(5.0e-4)
     nonbonded.setUseDispersionCorrection(True)
-    force_class_counts = _validated_force_classes(system)
+    force_class_counts = _validated_force_classes(system, spec=spec)
     context_payload = _resolved_context_payload(
         api=api,
         system=system,
@@ -142,9 +236,10 @@ def prepare_openmm_5dfr(
         system=system,
         topology=pdb.topology,
         positions=pdb.positions,
-        source_pdb=OPENMM_DHFR_SOLVATED,
+        source_pdb=spec.source_pdb,
         force_class_counts=force_class_counts,
         context_payload=context_payload,
+        spec=spec,
     )
     save_prepared_system(prepared, artifact_dir)
 
@@ -176,12 +271,13 @@ def prepare_openmm_5dfr(
         benchmark_source=benchmark_source,
         force_class_counts=force_class_counts,
         context_payload=context_payload,
+        spec=spec,
     )
     manifest_path = artifact_dir / MANIFEST_NAME
     manifest_path.write_text(_canonical_json(manifest) + "\n")
     return {
         "status": "ok",
-        "case_id": CASE_ID,
+        "case_id": spec.case_id,
         "artifact_path": str(artifact_dir.relative_to(root)),
         "manifest_path": str(manifest_path.relative_to(root)),
         "artifact_files": [
@@ -210,6 +306,7 @@ def _prepared_from_openmm(
     source_pdb: Path,
     force_class_counts: dict[str, int],
     context_payload: dict[str, Any],
+    spec: ExplicitBenchmarkSpec = DHFR_SPEC,
 ) -> PreparedSystem:
     unit = api.unit
     atoms = list(topology.atoms())
@@ -240,7 +337,7 @@ def _prepared_from_openmm(
     cell_matrix = np.asarray(context_payload["cell_matrix_angstrom"], dtype=np.float32)
     diagonal = np.diag(cell_matrix)
     if not np.allclose(cell_matrix, np.diag(diagonal), rtol=0.0, atol=1.0e-6):
-        msg = "selected 5dfr preparation requires an orthorhombic periodic cell"
+        msg = f"selected {spec.name} preparation requires an orthorhombic periodic cell"
         raise ValueError(msg)
 
     pme = dict(context_payload["pme"])
@@ -259,20 +356,22 @@ def _prepared_from_openmm(
     )
     hydrogen_count = int(np.count_nonzero(atom_payload["symbols"] == "H"))
     residue_names = np.char.upper(np.asarray(atom_payload["residue_names"], dtype=str))
-    water_mask = residue_names == "HOH"
+    water_mask = np.isin(residue_names, spec.water_residue_names)
+    lipid_mask = np.isin(residue_names, spec.lipid_residue_names)
+    receptor_mask = ~(water_mask | lipid_mask)
     metadata = PreparedSystemMetadata(
         artifact_version=ARTIFACT_VERSION,
         created_at=datetime.now(UTC).isoformat(),
         source={
             "kind": "openmm_forcefield",
             "parser": "scripts/prepare_openmm_dhfr_explicit.py",
-            "case_id": CASE_ID,
+            "case_id": spec.case_id,
             "pdb_path": str(source_pdb),
-            "forcefield_files": list(FORCE_FIELD_FILES),
+            "forcefield_files": list(spec.force_field_files),
             "openmm_version": api.openmm.version.version,
         },
         selections={
-            "case_id": CASE_ID,
+            "case_id": spec.case_id,
             "atom_count": atom_count,
             "hydrogen_count": hydrogen_count,
             "molecule_count": int(context_payload["molecule_count"]),
@@ -283,6 +382,8 @@ def _prepared_from_openmm(
             "solvent_model": "explicit",
             "water_model": "tip3p",
             "electrostatics_model": "pme",
+            "water_atom_count": int(np.count_nonzero(water_mask)),
+            "lipid_atom_count": int(np.count_nonzero(lipid_mask)),
         },
         units={
             "coordinates": "angstrom",
@@ -294,7 +395,7 @@ def _prepared_from_openmm(
             "temperature": "kelvin",
             "force": "kilojoule_per_mole_per_angstrom",
         },
-        parameter_source="openmm_amber99sb_tip3p",
+        parameter_source=spec.parameter_source,
         compatibility_report={
             "production_force_field": True,
             "physical_units": True,
@@ -306,6 +407,7 @@ def _prepared_from_openmm(
             "solvent_model": "explicit",
             "water_model": "tip3p",
             "virtual_sites_present": False,
+            "lipids_present": bool(np.any(lipid_mask)),
             "supported_terms": terms,
             "required_terms": terms,
             "unsupported_terms": [],
@@ -320,7 +422,7 @@ def _prepared_from_openmm(
             },
             "force_field_provenance": {
                 "source": "OpenMM ForceField",
-                "files": list(FORCE_FIELD_FILES),
+                "files": list(spec.force_field_files),
                 "constraints": "HBonds",
                 "rigid_water": True,
                 "hydrogen_mass_amu": 1.5,
@@ -336,9 +438,9 @@ def _prepared_from_openmm(
             "background_policy": background_policy,
         },
         protocol_metadata={
-            "case_id": CASE_ID,
+            "case_id": spec.case_id,
             "construction": {
-                "forcefield_files": list(FORCE_FIELD_FILES),
+                "forcefield_files": list(spec.force_field_files),
                 "nonbonded_method": "PME",
                 "cutoff_angstrom": 9.0,
                 "constraints": "HBonds",
@@ -395,7 +497,7 @@ def _prepared_from_openmm(
         dihedral_phase=dihedral_phase,
         nonbonded_pairs=empty_indices(2),
         ligand_mask=np.zeros(atom_count, dtype=bool),
-        receptor_mask=~water_mask,
+        receptor_mask=receptor_mask,
         restraint_mask=np.zeros(atom_count, dtype=bool),
         reference_positions=positions_a.copy(),
         cell_lengths=diagonal,
@@ -408,7 +510,7 @@ def _prepared_from_openmm(
         nonbonded_exception_epsilon=exceptions[3],
         water_mask=water_mask,
         ion_mask=np.zeros(atom_count, dtype=bool),
-        lipid_mask=np.zeros(atom_count, dtype=bool),
+        lipid_mask=lipid_mask,
         pme_mesh_shape=np.asarray(pme["mesh_shape"], dtype=np.int32),
         pme_alpha=np.asarray([pme["alpha_per_angstrom"]], dtype=np.float32),
         pme_real_cutoff=np.asarray([9.0], dtype=np.float32),
@@ -489,15 +591,20 @@ def _resolved_context_payload(
     }
 
 
-def _validated_force_classes(system: Any) -> dict[str, int]:
+def _validated_force_classes(
+    system: Any,
+    *,
+    spec: ExplicitBenchmarkSpec = DHFR_SPEC,
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for index in range(system.getNumForces()):
         name = type(system.getForce(index)).__name__
         counts[name] = counts.get(name, 0) + 1
-    if counts != EXPECTED_FORCE_CLASSES:
+    expected = spec.expected_force_classes or EXPECTED_FORCE_CLASSES
+    if counts != expected:
         msg = (
-            "selected 5dfr force classes do not match the exact supported set: "
-            f"expected={EXPECTED_FORCE_CLASSES}, actual={counts}"
+            f"selected {spec.name} force classes do not match the exact supported set: "
+            f"expected={expected}, actual={counts}"
         )
         raise ValueError(msg)
     return dict(sorted(counts.items()))
@@ -571,8 +678,9 @@ def _source_manifest(
     benchmark_source: Path,
     force_class_counts: dict[str, int],
     context_payload: dict[str, Any],
+    spec: ExplicitBenchmarkSpec = DHFR_SPEC,
 ) -> dict[str, Any]:
-    forcefield_resources = _forcefield_resources(api)
+    forcefield_resources = _forcefield_resources(api, spec=spec)
     array_descriptors = {
         name: _array_descriptor(np.asarray(getattr(prepared, name)))
         for name in (*PARAMETER_ARRAY_NAMES, *INDEX_ARRAY_NAMES)
@@ -596,14 +704,14 @@ def _source_manifest(
         for name in ("prepared_system.json", "prepared_system.npz", "view.pdb")
     }
     manifest: dict[str, Any] = {
-        "schema": MANIFEST_SCHEMA,
-        "case_id": CASE_ID,
+        "schema": spec.manifest_schema,
+        "case_id": spec.case_id,
         "created_at": datetime.now(UTC).isoformat(),
         "source": {
             "pdb": _file_record(
                 source_pdb,
                 role="coordinates_and_atom_order",
-                display_path=OPENMM_DHFR_SOLVATED,
+                display_path=spec.source_pdb,
             ),
             "vendor_benchmark": _file_record(
                 benchmark_source,
@@ -614,7 +722,7 @@ def _source_manifest(
             "openmm_version": api.openmm.version.version,
         },
         "construction": {
-            "forcefield_files": list(FORCE_FIELD_FILES),
+            "forcefield_files": list(spec.force_field_files),
             "nonbonded_method": "PME",
             "cutoff_angstrom": 9.0,
             "constraints": "HBonds",
@@ -658,10 +766,14 @@ def _source_manifest(
     return manifest
 
 
-def _forcefield_resources(api: _common.OpenMMApi) -> list[dict[str, Any]]:
+def _forcefield_resources(
+    api: _common.OpenMMApi,
+    *,
+    spec: ExplicitBenchmarkSpec = DHFR_SPEC,
+) -> list[dict[str, Any]]:
     data_dir = Path(api.app.__file__).resolve().parent / "data"
     records = []
-    for name in FORCE_FIELD_FILES:
+    for name in spec.force_field_files:
         path = data_dir / name
         if not path.is_file():
             msg = f"missing installed OpenMM force-field resource: {name}"
@@ -676,17 +788,22 @@ def _forcefield_resources(api: _common.OpenMMApi) -> list[dict[str, Any]]:
     return records
 
 
-def _require_exact_source(repo_root: Path, pdb_path: Path) -> Path:
+def _require_exact_source(
+    repo_root: Path,
+    pdb_path: Path,
+    *,
+    spec: ExplicitBenchmarkSpec = DHFR_SPEC,
+) -> Path:
     requested = (repo_root / pdb_path).resolve()
-    expected = (repo_root / OPENMM_DHFR_SOLVATED).resolve()
+    expected = (repo_root / spec.source_pdb).resolve()
     if requested != expected:
         msg = (
-            f"{CASE_ID} requires exactly {OPENMM_DHFR_SOLVATED}; "
-            "JAC and synthetic solvent inputs cannot be substituted"
+            f"{spec.case_id} requires exactly {spec.source_pdb}; "
+            "alternate coordinates cannot be substituted"
         )
         raise ValueError(msg)
     if not expected.is_file():
-        msg = f"missing exact OpenMM 5dfr source: {OPENMM_DHFR_SOLVATED}"
+        msg = f"missing exact OpenMM {spec.name} source: {spec.source_pdb}"
         raise FileNotFoundError(msg)
     return expected
 
@@ -698,10 +815,10 @@ def _results_output_path(repo_root: Path, out_dir: Path) -> Path:
     try:
         relative = resolved.relative_to(results_root)
     except ValueError as exc:
-        msg = "5dfr preparation output must stay below the repository results/ directory"
+        msg = "explicit benchmark output must stay below the repository results/ directory"
         raise ValueError(msg) from exc
     if not relative.parts:
-        msg = "5dfr preparation output must name a directory below results/"
+        msg = "explicit benchmark output must name a directory below results/"
         raise ValueError(msg)
     return resolved
 
@@ -748,8 +865,9 @@ def _canonical_json(value: Any) -> str:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--pdb", type=Path, default=OPENMM_DHFR_SOLVATED)
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--case", choices=tuple(EXPLICIT_BENCHMARK_SPECS), default="5dfr")
+    parser.add_argument("--pdb", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 

@@ -1,0 +1,112 @@
+{
+  "schema": "mlx_atomistic.md_suite_cases.v1",
+  "suites": {
+    "local": [
+      "dhfr-5dfr-pme",
+      "jac-94k-pme"
+    ],
+    "scaling": [
+      "jac-23k-pme",
+      "jac-47k-pme",
+      "jac-94k-pme"
+    ],
+    "release": [
+      "dhfr-5dfr-pme",
+      "jac-94k-pme",
+      "tip3p-water-30k",
+      "tip3p-water-90k",
+      "apoa1-pme",
+      "gpcrmd-729-pme"
+    ]
+  },
+  "cases": [
+    {
+      "id": "dhfr-5dfr-pme",
+      "description": "OpenMM 5DFR explicit-solvent PME workload",
+      "prepared_path": "results/dhfr-npt-closure/prepared",
+      "expected_atom_count": 23558,
+      "tier": "local",
+      "role": "non_regression",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["protein", "tip3p", "pme", "constraints"],
+      "preparation_command": "uv run --with openmm python scripts/prepare_openmm_dhfr_explicit.py --case 5dfr --json"
+    },
+    {
+      "id": "jac-23k-pme",
+      "description": "AMBER20 JAC one-cell PME scaling workload",
+      "prepared_path": "results/larger-system-scaling/jac-1x-modern/prepared",
+      "expected_atom_count": 23558,
+      "tier": "scaling",
+      "role": "scaling",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["protein", "tip3p", "pme", "charged_system", "constraints"],
+      "preparation_command": "uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/larger-system-scaling/jac-1x-modern/prepared --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 1,1,1 --platform Reference --out results/larger-system-scaling/jac-1x-modern/parity"
+    },
+    {
+      "id": "jac-47k-pme",
+      "description": "AMBER20 JAC two-cell PME scaling workload",
+      "prepared_path": "results/larger-system-scaling/jac-2x1x1-modern/prepared",
+      "expected_atom_count": 47116,
+      "tier": "scaling",
+      "role": "scaling",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["protein", "tip3p", "pme", "charged_system", "constraints"],
+      "preparation_command": "uv run python -m mlx_atomistic.benchmarks.charged_pme prepare --source results/larger-system-scaling/jac-1x-modern/prepared --replicas 2,1,1 --out results/larger-system-scaling/jac-2x1x1-modern/prepared"
+    },
+    {
+      "id": "jac-94k-pme",
+      "description": "AMBER20 JAC four-cell production-scale PME workload",
+      "prepared_path": "results/larger-system-scaling/jac-2x2x1-modern/prepared",
+      "expected_atom_count": 94232,
+      "tier": "local",
+      "role": "improvement",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["protein", "tip3p", "pme", "charged_system", "constraints", "large_system"],
+      "preparation_command": "uv run python -m mlx_atomistic.benchmarks.charged_pme prepare --source results/larger-system-scaling/jac-1x-modern/prepared --replicas 2,2,1 --out results/larger-system-scaling/jac-2x2x1-modern/prepared"
+    },
+    {
+      "id": "tip3p-water-30k",
+      "description": "Deterministic 10,000-molecule TIP3P water PME workload",
+      "prepared_path": "results/md-benchmarks/tip3p-water-30k/prepared",
+      "expected_atom_count": 30000,
+      "tier": "release",
+      "role": "coverage",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["tip3p", "pme", "settle", "constraints"],
+      "preparation_command": "uv run python -m mlx_atomistic.benchmarks.tip3p_water --preset 30k --out results/md-benchmarks/tip3p-water-30k/prepared"
+    },
+    {
+      "id": "tip3p-water-90k",
+      "description": "Deterministic 30,000-molecule TIP3P water PME workload",
+      "prepared_path": "results/md-benchmarks/tip3p-water-90k/prepared",
+      "expected_atom_count": 90000,
+      "tier": "release",
+      "role": "coverage",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["tip3p", "pme", "settle", "constraints", "large_system"],
+      "preparation_command": "uv run python -m mlx_atomistic.benchmarks.tip3p_water --preset 90k --out results/md-benchmarks/tip3p-water-90k/prepared"
+    },
+    {
+      "id": "apoa1-pme",
+      "description": "Official OpenMM ApoA1 protein-lipid-water PME workload",
+      "prepared_path": "results/md-benchmarks/apoa1/prepared",
+      "expected_atom_count": 92224,
+      "tier": "release",
+      "role": "reference",
+      "neighbor_backend": "mlx_cell_tiles",
+      "features": ["protein", "lipid", "tip3p", "pme", "constraints", "large_system"],
+      "preparation_command": "uv run --with openmm python scripts/prepare_openmm_dhfr_explicit.py --case apoa1 --json"
+    },
+    {
+      "id": "gpcrmd-729-pme",
+      "description": "Source-backed GPCRmd 729 CHARMM PME workload",
+      "prepared_path": "results/gpcrmd-pme-runtime-closure/prepared",
+      "expected_atom_count": 92001,
+      "tier": "release",
+      "role": "coverage",
+      "neighbor_backend": "mlx_cell_pairs",
+      "features": ["charmm", "protein", "lipid", "ligand", "tip3p", "pme", "constraints", "restart"],
+      "preparation_command": "uv run --with openmm python scripts/run_gpcrmd_pme_parity.py --source-manifest results/gpcrmd-pme-runtime-closure/source/fixture-manifest.json --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --mlx-prepared results/gpcrmd-pme-runtime-closure/prepared --platform Reference --out results/gpcrmd-pme-runtime-closure/parity"
+    }
+  ]
+}

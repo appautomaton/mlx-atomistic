@@ -50,6 +50,7 @@ Issues = "https://github.com/appautomaton/mlx-atomistic/issues"
 
 [project.scripts]
 mlx-atomistic-benchmark = "mlx_atomistic.benchmarks.md_performance:main"
+mlx-atomistic-md-suite = "mlx_atomistic.benchmarks.md_suite:main"
 
 [project.optional-dependencies]
 notebook = [
