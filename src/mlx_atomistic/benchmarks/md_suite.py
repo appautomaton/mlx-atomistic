@@ -482,7 +482,12 @@ def _route_stage(route_name: str) -> str:
         return "reciprocal_pme"
     if route_name == "pme_exceptions_corrections":
         return "pme_sparse_corrections"
-    if route_name in {"bonded_fused", "other_force_terms"}:
+    if route_name in {
+        "bonded_fused",
+        "other_force_terms",
+        "urey_bradley",
+        "charmm_cmap",
+    }:
         return "bonded_and_other_forces"
     if route_name in {
         "force_term_aggregation",

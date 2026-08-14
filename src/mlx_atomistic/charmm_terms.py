@@ -232,6 +232,7 @@ class CHARMMUreyBradleyPotential:
     """CHARMM Urey-Bradley 1-3 distance term for angle triplets."""
 
     _neighbor_tile_diagnostic_policy = "ignore"
+    _force_profile_route = "urey_bradley"
 
     urey_bradley_terms: object
     k: object
@@ -321,6 +322,7 @@ class CHARMMCMAPPotential:
     """CHARMM CMAP correction with periodic natural bicubic interpolation."""
 
     _neighbor_tile_diagnostic_policy = "ignore"
+    _force_profile_route = "charmm_cmap"
 
     charmm_cmap_terms: object
     cmap_grids: object

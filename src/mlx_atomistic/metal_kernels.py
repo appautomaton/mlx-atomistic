@@ -8,8 +8,8 @@ outputs and reductions entirely.
 The simple kernel covers scalar reduced-unit LJ. The parameterized kernel covers
 per-atom Lorentz-Berthelot parameters, topology scales, shifts, and smooth switching
 for the production biomolecular path. A separate force-only kernel combines standard
-bond, angle, periodic-torsion, and improper interactions into one output. Unsupported
-cases fall back transparently.
+bond, angle, periodic-torsion, improper, and CHARMM correction-map interactions into
+one output. Unsupported cases fall back transparently.
 
 Because ``tests/conftest.py`` forces ``MLX_ATOMISTIC_DEVICE=cpu``, the kernel is built
 lazily on first use (not at import) so importing this module never triggers a Metal
@@ -200,7 +200,11 @@ _BONDED_FORCE_SOURCE = r"""
     uint angle_count = (uint)counts[1];
     uint dihedral_count = (uint)counts[2];
     uint improper_count = (uint)counts[3];
-    uint total_count = bond_count + angle_count + dihedral_count + improper_count;
+    uint cmap_count = (uint)counts[4];
+    uint cmap_grid_size = (uint)counts[5];
+    uint total_count = (
+        bond_count + angle_count + dihedral_count + improper_count + cmap_count
+    );
     if (task >= total_count) {
         return;
     }
@@ -318,6 +322,83 @@ _BONDED_FORCE_SOURCE = r"""
             atom_m,
             geometry,
             force_derivative
+        );
+        return;
+    }
+    task -= improper_count;
+
+    if (task < cmap_count) {
+        int atom_i = cmap_atoms[8 * task + 0];
+        int atom_j = cmap_atoms[8 * task + 1];
+        int atom_k = cmap_atoms[8 * task + 2];
+        int atom_m = cmap_atoms[8 * task + 3];
+        int atom_n = cmap_atoms[8 * task + 4];
+        int atom_o = cmap_atoms[8 * task + 5];
+        int atom_p = cmap_atoms[8 * task + 6];
+        int atom_q = cmap_atoms[8 * task + 7];
+        MLXAtomisticDihedralGeometry phi_geometry = mlx_atomistic_dihedral_geometry(
+            positions, atom_i, atom_j, atom_k, atom_m, box
+        );
+        MLXAtomisticDihedralGeometry psi_geometry = mlx_atomistic_dihedral_geometry(
+            positions, atom_n, atom_o, atom_p, atom_q, box
+        );
+
+        float scale = (float)cmap_grid_size / (2.0f * M_PI_F);
+        float phi_scaled = -phi_geometry.phi * scale;
+        float psi_scaled = -psi_geometry.phi * scale;
+        phi_scaled -= floor(phi_scaled / (float)cmap_grid_size) * cmap_grid_size;
+        psi_scaled -= floor(psi_scaled / (float)cmap_grid_size) * cmap_grid_size;
+        float phi_floor = floor(phi_scaled);
+        float psi_floor = floor(psi_scaled);
+        uint phi_index = (uint)phi_floor;
+        uint psi_index = (uint)psi_floor;
+        float phi_t = phi_scaled - phi_floor;
+        float psi_t = psi_scaled - psi_floor;
+        float phi_t2 = phi_t * phi_t;
+        float psi_t2 = psi_t * psi_t;
+        float phi_powers[4] = {1.0f, phi_t, phi_t2, phi_t2 * phi_t};
+        float psi_powers[4] = {1.0f, psi_t, psi_t2, psi_t2 * psi_t};
+        float phi_derivatives[4] = {0.0f, 1.0f, 2.0f * phi_t, 3.0f * phi_t2};
+        float psi_derivatives[4] = {0.0f, 1.0f, 2.0f * psi_t, 3.0f * psi_t2};
+        uint coefficient_base = 16u * (
+            ((uint)cmap_indices[task] * cmap_grid_size + phi_index)
+                * cmap_grid_size
+            + psi_index
+        );
+        float derivative_phi_t = 0.0f;
+        float derivative_psi_t = 0.0f;
+        for (uint row = 0; row < 4; ++row) {
+            for (uint column = 0; column < 4; ++column) {
+                float coefficient = cmap_coefficients[
+                    coefficient_base + 4u * row + column
+                ];
+                derivative_phi_t += (
+                    coefficient * phi_derivatives[row] * psi_powers[column]
+                );
+                derivative_psi_t += (
+                    coefficient * phi_powers[row] * psi_derivatives[column]
+                );
+            }
+        }
+        // This helper accepts -dE/d(angle).  The CMAP lookup coordinate is
+        // -angle*scale, so the two signs cancel.
+        mlx_atomistic_apply_dihedral_force(
+            forces,
+            atom_i,
+            atom_j,
+            atom_k,
+            atom_m,
+            phi_geometry,
+            scale * derivative_phi_t
+        );
+        mlx_atomistic_apply_dihedral_force(
+            forces,
+            atom_n,
+            atom_o,
+            atom_p,
+            atom_q,
+            psi_geometry,
+            scale * derivative_psi_t
         );
     }
 """
@@ -4325,6 +4406,9 @@ def _fused_bonded_force_only_kernel():
                 "improper_k",
                 "improper_periodicity",
                 "improper_phase",
+                "cmap_atoms",
+                "cmap_indices",
+                "cmap_coefficients",
                 "counts",
             ],
             output_names=["forces"],
@@ -5722,8 +5806,11 @@ def _fused_bonded_force_only(
     improper_k: mx.array,
     improper_periodicity: mx.array,
     improper_phase: mx.array,
+    cmap_atoms: mx.array,
+    cmap_indices: mx.array,
+    cmap_coefficients: mx.array,
 ) -> mx.array:
-    """Evaluate four standard bonded families in one force-only dispatch."""
+    """Evaluate standard and CHARMM CMAP bonded families in one dispatch."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     box_lengths = as_mx_array(box_lengths, dtype=mx.float32)
@@ -5741,6 +5828,9 @@ def _fused_bonded_force_only(
     improper_k = as_mx_array(improper_k, dtype=mx.float32)
     improper_periodicity = as_mx_array(improper_periodicity, dtype=mx.float32)
     improper_phase = as_mx_array(improper_phase, dtype=mx.float32)
+    cmap_atoms = as_mx_array(cmap_atoms, dtype=mx.int32)
+    cmap_indices = as_mx_array(cmap_indices, dtype=mx.int32)
+    cmap_coefficients = as_mx_array(cmap_coefficients, dtype=mx.float32)
 
     if positions.ndim != 2 or positions.shape[1] != 3:
         msg = "positions must have shape (n_atoms, 3)"
@@ -5753,6 +5843,7 @@ def _fused_bonded_force_only(
         angle_atoms.shape[0],
         dihedral_atoms.shape[0],
         improper_atoms.shape[0],
+        cmap_atoms.shape[0],
     )
     arrays = (
         (bond_atoms, bond_k, bond_length, 2, "bond"),
@@ -5786,11 +5877,23 @@ def _fused_bonded_force_only(
     if improper_phase.shape != (counts[3],):
         msg = f"improper_phase must have shape ({counts[3]},)"
         raise ValueError(msg)
+    if cmap_atoms.ndim != 2 or cmap_atoms.shape[1] != 8:
+        msg = "cmap_atoms must have shape (n, 8)"
+        raise ValueError(msg)
+    if cmap_indices.shape != (counts[4],):
+        msg = f"cmap_indices must have shape ({counts[4]},)"
+        raise ValueError(msg)
+    if cmap_coefficients.ndim != 5 or cmap_coefficients.shape[-2:] != (4, 4):
+        msg = "cmap_coefficients must have shape (n_maps, grid, grid, 4, 4)"
+        raise ValueError(msg)
+    if cmap_coefficients.shape[1] != cmap_coefficients.shape[2]:
+        msg = "cmap coefficient grids must be square"
+        raise ValueError(msg)
 
     total_count = sum(counts)
     if total_count == 0:
         return mx.zeros_like(positions)
-    count_array = mx.array(counts, dtype=mx.int32)
+    count_array = mx.array((*counts, cmap_coefficients.shape[1]), dtype=mx.int32)
     threads = min(256, total_count)
     (forces,) = _fused_bonded_force_only_kernel()(
         inputs=[
@@ -5810,6 +5913,9 @@ def _fused_bonded_force_only(
             improper_k,
             improper_periodicity,
             improper_phase,
+            mx.reshape(cmap_atoms, (-1,)),
+            cmap_indices,
+            mx.reshape(cmap_coefficients, (-1,)),
             count_array,
         ],
         output_shapes=[positions.shape],

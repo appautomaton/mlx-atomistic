@@ -55,7 +55,12 @@ later retained route instead creates blocks from spatial order and groups
 same-left tiles, while preserving canonical atom indices at force scatter.
 
 The current production path also uses specialized rigid-water/constraint
-kernels and one fused standard-bonded force dispatch. The charged-PME
+kernels and one fused bonded force dispatch. In addition to the standard bond,
+angle, periodic-torsion, and improper families, that dispatch maps CHARMM
+Urey-Bradley terms onto harmonic 1-3 bond records and evaluates prepared CMAP
+bicubic derivatives analytically. This avoids a recurring CMAP automatic-
+differentiation graph and redundant full-force aggregation without changing
+the CPU or diagnostic energy path. The charged-PME
 development runner now selects spatial tiles inside its narrow supported
 envelope and fails its profile gate on a compact-pair fallback. The production
 runner uses the same conservative envelope and records the selected backend in

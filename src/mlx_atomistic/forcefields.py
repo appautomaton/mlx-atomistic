@@ -939,7 +939,7 @@ class ImproperDihedralPotential(PeriodicDihedralPotential):
 
 @dataclass(frozen=True)
 class _FusedBondedForceBinding:
-    """Prepared force-only binding for available standard bonded families."""
+    """Prepared force-only binding for supported bonded families."""
 
     term_indices: frozenset[int]
     box_lengths: mx.array
@@ -947,6 +947,7 @@ class _FusedBondedForceBinding:
     angle: HarmonicAnglePotential
     dihedral: PeriodicDihedralPotential
     improper: ImproperDihedralPotential
+    cmap: CHARMMCMAPPotential
 
     def forces(self, positions: mx.array) -> mx.array:
         """Evaluate all bound bonded interactions in one Metal dispatch."""
@@ -968,6 +969,9 @@ class _FusedBondedForceBinding:
             self.improper.k,
             self.improper.periodicity,
             self.improper.phase,
+            self.cmap.charmm_cmap_terms,
+            self.cmap.cmap_indices,
+            self.cmap._coefficients,
         )
 
 
@@ -975,15 +979,20 @@ def _prepare_fused_bonded_force_binding(
     force_terms: tuple[object, ...],
     cell: Cell | None,
 ) -> _FusedBondedForceBinding | None:
-    """Prepare supported standard bonded families for one Metal dispatch."""
+    """Prepare supported bonded families for one Metal dispatch."""
 
     if "gpu" not in str(mx.default_device()).lower() or cell is None or not cell.is_orthorhombic:
         return None
-    family_types = (
+    standard_family_types = (
         HarmonicBondPotential,
         HarmonicAnglePotential,
         PeriodicDihedralPotential,
         ImproperDihedralPotential,
+    )
+    family_types = (
+        *standard_family_types,
+        CHARMMUreyBradleyPotential,
+        CHARMMCMAPPotential,
     )
     matched: dict[type[object], tuple[int, object]] = {}
     for index, term in enumerate(force_terms):
@@ -993,7 +1002,7 @@ def _prepare_fused_bonded_force_binding(
         if term_type in matched:
             return None
         matched[term_type] = (index, term)
-    if len(matched) < 2:
+    if not matched or (len(matched) == 1 and CHARMMCMAPPotential not in matched):
         return None
     empty_terms = {
         HarmonicBondPotential: HarmonicBondPotential((), k=0.0, length=0.0),
@@ -1016,16 +1025,48 @@ def _prepare_fused_bonded_force_binding(
             family_type,
             (-1, empty_terms[family_type]),
         )[1]
-        for family_type in family_types
+        for family_type in standard_family_types
     }
+    bond = selected[HarmonicBondPotential]
+    urey_match = matched.get(CHARMMUreyBradleyPotential)
+    if urey_match is not None:
+        urey = urey_match[1]
+        bond = HarmonicBondPotential(
+            np.concatenate(
+                (
+                    np.asarray(bond.bonds, dtype=np.int32),
+                    np.asarray(urey.urey_bradley_terms, dtype=np.int32)[:, ::2],
+                ),
+                axis=0,
+            ),
+            k=np.concatenate(
+                (
+                    np.asarray(bond.k, dtype=np.float32),
+                    np.asarray(urey.k, dtype=np.float32),
+                )
+            ),
+            length=np.concatenate(
+                (
+                    np.asarray(bond.length, dtype=np.float32),
+                    np.asarray(urey.distance, dtype=np.float32),
+                )
+            ),
+        )
     term_indices = frozenset(index for index, _ in matched.values())
+    cmap = matched.get(CHARMMCMAPPotential, (-1, None))[1]
+    if cmap is None:
+        cmap = CHARMMCMAPPotential(
+            (),
+            cmap_grids=np.zeros((1, 4, 4), dtype=np.float32),
+        )
     return _FusedBondedForceBinding(
         term_indices=term_indices,
         box_lengths=mx.diag(cell.matrix),
-        bond=selected[HarmonicBondPotential],
+        bond=bond,
         angle=selected[HarmonicAnglePotential],
         dihedral=selected[PeriodicDihedralPotential],
         improper=selected[ImproperDihedralPotential],
+        cmap=cmap,
     )
 
 

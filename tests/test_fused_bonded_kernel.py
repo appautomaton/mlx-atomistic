@@ -4,6 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_atomistic.charmm_terms import CHARMMCMAPPotential, CHARMMUreyBradleyPotential
 from mlx_atomistic.core import Cell
 from mlx_atomistic.force_runtime import _PreparedForcePipeline
 from mlx_atomistic.forcefields import (
@@ -41,11 +42,30 @@ def _on_gpu(monkeypatch):
         frozenset({"angle", "dihedral"}),
         frozenset({"bond", "angle", "dihedral"}),
         frozenset({"bond", "angle", "dihedral", "improper"}),
+        frozenset({"bond", "angle", "dihedral", "improper", "urey_bradley"}),
+        frozenset({"charmm_cmap"}),
+        frozenset(
+            {
+                "bond",
+                "angle",
+                "dihedral",
+                "improper",
+                "urey_bradley",
+                "charmm_cmap",
+            }
+        ),
     ],
-    ids=["two-families", "three-families", "four-families"],
+    ids=[
+        "two-families",
+        "three-families",
+        "four-families",
+        "charmm-urey-bradley",
+        "charmm-cmap-only",
+        "charmm-cmap",
+    ],
 )
-def test_fused_bonded_pipeline_matches_standard_force_terms(included_families):
-    """One fused dispatch preserves each available standard bonded formula."""
+def test_fused_bonded_pipeline_matches_supported_force_terms(included_families):
+    """One fused dispatch preserves every supported bonded-force formula."""
 
     positions = mx.array(
         [
@@ -61,6 +81,8 @@ def test_fused_bonded_pipeline_matches_standard_force_terms(included_families):
         dtype=mx.float32,
     )
     cell = Cell.cubic(8.0)
+    cmap_axis = np.linspace(-np.pi, np.pi, 24, endpoint=False)
+    cmap_phi, cmap_psi = np.meshgrid(cmap_axis, cmap_axis, indexing="ij")
     available_terms = {
         "bond": HarmonicBondPotential(
             [(0, 1), (1, 2), (4, 5)],
@@ -84,6 +106,28 @@ def test_fused_bonded_pipeline_matches_standard_force_terms(included_families):
             periodicity=[0.0, 2.0],
             phase=[0.1, -0.4],
         ),
+        "urey_bradley": CHARMMUreyBradleyPotential(
+            [(0, 7, 2), (4, 0, 6)],
+            k=[70.0, 55.0],
+            distance=[1.1, 1.5],
+        ),
+        "charmm_cmap": CHARMMCMAPPotential(
+            [
+                (0, 1, 2, 3, 1, 2, 3, 4),
+                (3, 4, 5, 6, 4, 5, 6, 7),
+            ],
+            cmap_grids=np.stack(
+                [
+                    np.sin(cmap_phi)
+                    + 0.2 * np.cos(cmap_psi)
+                    + 0.1 * np.sin(cmap_phi - cmap_psi),
+                    0.3 * np.cos(cmap_phi)
+                    - np.sin(cmap_psi)
+                    + 0.07 * np.cos(2.0 * cmap_phi + cmap_psi),
+                ]
+            ),
+            cmap_indices=[0, 1],
+        ),
     }
     terms = tuple(
         term
@@ -101,6 +145,8 @@ def test_fused_bonded_pipeline_matches_standard_force_terms(included_families):
     )
     binding = pipeline.bind(None)
     assert binding.fused_bonded_binding is not None
+    if {"urey_bradley", "charmm_cmap"} & included_families:
+        assert binding.fused_bonded_binding.term_indices == frozenset(range(len(terms)))
     actual = binding.forces(positions)
     mx.eval(reference, actual)
 

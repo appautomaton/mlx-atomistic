@@ -131,3 +131,8 @@ remaining useful across force fields:
    producer/consumer design exists.
 
 The raw JSON remains gitignored under `results/md-suite/`.
+
+The CHARMM attribution item is now closed by the retained Urey-Bradley and
+analytical CMAP Metal force path. Its clean GPCRmd result and force-parity
+evidence are recorded in
+[md-charmm-cmap-metal-m5max.md](./md-charmm-cmap-metal-m5max.md).

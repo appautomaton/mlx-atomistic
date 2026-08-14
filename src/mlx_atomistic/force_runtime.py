@@ -194,7 +194,7 @@ class _BoundForcePipeline:
                 )
             if route_started is not None:
                 self.route_profiler.finish(
-                    "other_force_terms",
+                    str(getattr(term, "_force_profile_route", "other_force_terms")),
                     route_started,
                     forces,
                 )
