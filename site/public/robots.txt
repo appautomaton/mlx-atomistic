@@ -45,4 +45,4 @@ Allow: /
 User-agent: CCBot
 Allow: /
 
-Sitemap: https://appautomaton.github.io/mlx-atomistic/sitemap-index.xml
+Sitemap: https://appautomaton.renocrypt.com/mlx-atomistic/sitemap-index.xml

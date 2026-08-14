@@ -4,12 +4,13 @@ Date: 2026-07-15; runtime comparison updated 2026-08-01
 
 Status: `validated-envelope`. The MLX/Metal product runtime passed independent
 OpenMM energy/force parity and a bounded fixed-cell NVT gate for the charged
-94,232-atom 2x2x1 replication of the AMBER20 JAC DHFR preparation. `JAC` is
-the AMBER20 file stem for DHFR, not a different protein. This is the validated
-workload; it is not the separately prepared OpenMM 5DFR case, a GPCRmd
-membrane run, or a general PME production certification. A later
-manifest-bound 75-step MLX/OpenMM run established a `9.7586x` throughput ratio
-for this exact workload.
+94,232-atom AMBER20 JAC 2x2x1 supercell. This is the validated workload; it is
+not a GPCRmd membrane run or a general PME production certification. A later
+manifest-bound 75-step MLX/OpenMM run established a historical `9.7586x`
+throughput ratio for this exact workload. A 2026-08-11 same-power-state refresh
+after the retained tile and pair-lifetime work reduced the two-run
+ratio-of-medians to `5.2701x`; see
+[`retained-stack-phase5-m5max.md`](./retained-stack-phase5-m5max.md).
 
 ## Raw evidence
 

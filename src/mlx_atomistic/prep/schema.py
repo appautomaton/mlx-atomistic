@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,29 @@ from mlx_atomistic.pme import (
 
 ARTIFACT_VERSION = 3
 SUPPORTED_ARTIFACT_VERSIONS = frozenset({1, 2, ARTIFACT_VERSION})
+
+
+def center_of_mass_motion_interval(
+    protocol_metadata: Mapping[str, Any],
+) -> int | None:
+    """Return the admitted CMMotionRemover cadence from protocol metadata."""
+
+    policy = protocol_metadata.get("center_of_mass_motion")
+    if policy is None:
+        return None
+    if not isinstance(policy, dict):
+        msg = "center_of_mass_motion protocol metadata must be a mapping"
+        raise TypeError(msg)
+    if not bool(policy.get("enabled", False)):
+        return None
+    if policy.get("force") != "CMMotionRemover":
+        msg = "unsupported center_of_mass_motion force"
+        raise ValueError(msg)
+    frequency = int(policy.get("frequency_steps", 0))
+    if frequency <= 0:
+        msg = "center_of_mass_motion frequency_steps must be positive"
+        raise ValueError(msg)
+    return frequency
 
 
 @dataclass(frozen=True)

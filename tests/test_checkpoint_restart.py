@@ -380,6 +380,7 @@ def test_production_pme_checkpoint_split_matches_uninterrupted_run(tmp_path):
     checkpoint = load_simulation_checkpoint(split_checkpoint)
     assert checkpoint.step == 2
     assert checkpoint.time == pytest.approx(0.002)
+    assert checkpoint.neighbor_policy["backend"] == "mlx_cell_pairs"
     assert checkpoint.metadata["fixed_cell"] is True
     assert checkpoint.metadata["runtime_execution_contract"] == {
         "dense_or_tiled_fallback_used": False,

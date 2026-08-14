@@ -2,10 +2,10 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import sitemap from "@astrojs/sitemap";
 import starlightLlmsTxt from "starlight-llms-txt";
-import { socialHead } from "./src/seo.mjs";
+import { SITE, socialHead } from "./src/seo.mjs";
 
 export default defineConfig({
-  site: "https://appautomaton.github.io",
+  site: "https://appautomaton.renocrypt.com",
   base: "/mlx-atomistic",
   trailingSlash: "ignore",
   integrations: [
@@ -67,6 +67,23 @@ export default defineConfig({
         },
       ],
     }),
-    sitemap(),
+    // A sitemap is a list of addresses worth indexing, so two kinds of page
+    // are kept out of it.
+    //
+    // The first is the slashless base. Under trailingSlash: "ignore" the base
+    // index is emitted twice, as /mlx-atomistic/ and again without the slash,
+    // and Pages answers the slashless form with a 301 to the other. Listing it
+    // spends a crawl on an address that was never the destination, while the
+    // page's own canonical has named the slashed form all along.
+    //
+    // The second is the generated API reference under /api/. Those pages carry
+    // noindex, and asking a crawler to fetch a page in order to be told not to
+    // index it is the whole cost with none of the benefit. They stay reachable
+    // through the sidebar and the /api/ index, which is hand-written and stays
+    // listed here.
+    sitemap({
+      filter: (page) =>
+        page !== SITE && (!page.startsWith(`${SITE}/api/`) || page === `${SITE}/api/`),
+    }),
   ],
 });

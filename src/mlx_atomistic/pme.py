@@ -14,6 +14,7 @@ import numpy as np
 
 from mlx_atomistic.core import Cell
 from mlx_atomistic.metal_kernels import (
+    _pme_order5_forces_from_complex_grid,
     pme_order5_charge_grid,
     pme_order5_energy_forces,
 )
@@ -40,6 +41,10 @@ PME_BACKGROUND_POLICIES = (
 )
 PME_EXECUTION_PLAN_SCHEMA_VERSION = 1
 _COMPILED_RECIPROCAL_EVALUATORS: dict[
+    tuple[tuple[int, int, int], int, str],
+    object,
+] = {}
+_COMPILED_RECIPROCAL_FORCE_EVALUATORS: dict[
     tuple[tuple[int, int, int], int, str],
     object,
 ] = {}
@@ -1503,21 +1508,12 @@ def pme_coulomb_reciprocal_space_energy_forces(
     return energy.astype(mx.float32), forces.astype(mx.float32)
 
 
-def _prepared_pme_reciprocal_space_energy_forces(
+def _prepared_reciprocal_inputs(
     positions: mx.array,
     charges: mx.array,
     plan: PMEExecutionPlan,
-    *,
-    include_self_correction: bool = True,
 ) -> tuple[mx.array, mx.array]:
-    """Evaluate reciprocal PME from setup-validated, plan-bound inputs.
-
-    This private production path deliberately omits the public wrapper's
-    recurring host-side finite, charge-policy, cell, and plan admission.  Its
-    caller must own a ``PMEExecutionPlan`` already validated against immutable
-    charges and the current cell, and must perform dynamic position health
-    checks before force evaluation.
-    """
+    """Normalize setup-validated inputs for a bound reciprocal PME plan."""
 
     positions_mx = mx.array(positions, dtype=mx.float32)
     charges_mx = mx.array(charges, dtype=mx.float32)
@@ -1528,13 +1524,36 @@ def _prepared_pme_reciprocal_space_energy_forces(
         msg = "charges must have shape (n_atoms,)"
         raise ValueError(msg)
 
+    # Charge assignment and interpolation both apply periodic wrapping. Passing
+    # the normalized array directly avoids materializing the same wrapped
+    # coordinates once more ahead of those recurring stages.
+    return positions_mx, charges_mx
+
+
+def _prepared_pme_reciprocal_space_energy_forces(
+    positions: mx.array,
+    charges: mx.array,
+    plan: PMEExecutionPlan,
+    *,
+    include_self_correction: bool = True,
+) -> tuple[mx.array, mx.array]:
+    """Evaluate reciprocal PME from setup-validated, plan-bound inputs.
+
+    This private production path deliberately omits the public wrapper's
+    recurring host-side finite, charge-policy, cell, and plan admission. Its
+    caller must own a ``PMEExecutionPlan`` already validated against immutable
+    charges and the current cell, and must perform dynamic position health
+    checks before force evaluation.
+    """
+
+    wrapped_positions, charges_mx = _prepared_reciprocal_inputs(
+        positions,
+        charges,
+        plan,
+    )
     config = plan.config
     cell_lengths_np = plan._cell_lengths_np
     cell_lengths_mx = plan._cell_lengths_mx
-    wrapped_positions = (
-        positions_mx
-        - mx.floor(positions_mx / cell_lengths_mx) * cell_lengths_mx
-    )
     plan._record_reuse(0.0)
     energy, forces, _ = _mesh_reciprocal_energy_forces_mx(
         wrapped_positions,
@@ -1558,6 +1577,35 @@ def _prepared_pme_reciprocal_space_energy_forces(
             background_policy=config.background_policy,
         )
     return energy.astype(mx.float32), forces.astype(mx.float32)
+
+
+def _prepared_pme_reciprocal_space_forces(
+    positions: mx.array,
+    charges: mx.array,
+    plan: PMEExecutionPlan,
+) -> mx.array:
+    """Evaluate only reciprocal PME forces from a validated fixed-cell plan.
+
+    Scalar self and neutralizing-plasma corrections are position-independent,
+    so omitting reciprocal energy does not change the returned forces.
+    """
+
+    wrapped_positions, charges_mx = _prepared_reciprocal_inputs(
+        positions,
+        charges,
+        plan,
+    )
+    plan._record_reuse(0.0)
+    forces = _mesh_reciprocal_forces_mx(
+        wrapped_positions,
+        charges_mx,
+        plan._cell_lengths_mx,
+        plan._cell_lengths_np,
+        config=plan.config,
+        coulomb_constant=plan.coulomb_constant,
+        plan=plan,
+    )
+    return forces.astype(mx.float32)
 
 
 def _pme_coulomb_energy_forces_impl(
@@ -2307,6 +2355,59 @@ def _real_space_block_energy_forces_mx(
     return mx.sum(pair_energy), forces
 
 
+def _mesh_reciprocal_forces_mx(
+    positions: mx.array,
+    charges: mx.array,
+    cell_lengths: mx.array,
+    cell_lengths_np: np.ndarray,
+    *,
+    config: PMEConfig,
+    coulomb_constant: float,
+    plan: PMEExecutionPlan,
+) -> mx.array:
+    """Evaluate the recurring reciprocal force graph without scalar energy."""
+
+    del cell_lengths_np, coulomb_constant
+    cache_key = (
+        config.mesh_shape,
+        config.assignment_order,
+        str(mx.default_device()),
+    )
+    if (
+        "gpu" in str(mx.default_device()).lower()
+        and isinstance(plan, PMEExecutionPlan)
+        and (
+            cache_key in _COMPILED_RECIPROCAL_FORCE_EVALUATORS
+            or plan.reuse_count > 1
+        )
+    ):
+        evaluator = _compiled_reciprocal_force_evaluator(
+            config.mesh_shape,
+            assignment_order=config.assignment_order,
+        )
+        return evaluator(
+            positions,
+            charges,
+            cell_lengths,
+            plan.influence,
+            *plan.wavevectors,
+        )
+
+    _, forces, _, _ = _mesh_reciprocal_energy_forces_core_mx(
+        positions,
+        charges,
+        cell_lengths,
+        influence=plan.influence,
+        wavevectors=plan.wavevectors,
+        mesh_shape=config.mesh_shape,
+        assignment_order=config.assignment_order,
+        grid_size=plan.grid_size,
+        allow_order5_metal=isinstance(plan, PMEExecutionPlan),
+        include_energy=False,
+    )
+    return forces
+
+
 def _mesh_reciprocal_energy_forces_mx(
     positions: mx.array,
     charges: mx.array,
@@ -2385,6 +2486,7 @@ def _mesh_reciprocal_energy_forces_core_mx(
     assignment_order: int,
     grid_size: int,
     allow_order5_metal: bool,
+    include_energy: bool = True,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     use_order5_metal = (
         allow_order5_metal
@@ -2409,35 +2511,94 @@ def _mesh_reciprocal_energy_forces_core_mx(
         )
     rho_hat = mx.fft.fftn(charge_grid)
     phi_hat = influence * rho_hat
-    potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
     if use_order5_metal:
-        energy, forces = pme_order5_energy_forces(
-            positions,
-            charges,
-            potential_grid,
-            cell_lengths,
-        )
+        if include_energy:
+            potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
+            energy, forces = pme_order5_energy_forces(
+                positions,
+                charges,
+                potential_grid,
+                cell_lengths,
+            )
+        else:
+            energy = mx.array(0.0, dtype=mx.float32)
+            potential_grid = mx.fft.ifftn(phi_hat)
+            forces = _pme_order5_forces_from_complex_grid(
+                positions,
+                charges,
+                potential_grid,
+                cell_lengths,
+            )
         return energy, forces, charge_grid, rho_hat
     field_grids = [
         mx.real(mx.fft.ifftn((-1j * k_axis) * phi_hat)) * float(grid_size)
         for k_axis in wavevectors
     ]
     field_grid = mx.stack(field_grids, axis=-1)
-    potential_at_atoms = _interpolate_bspline_mx(
-        positions,
-        potential_grid,
-        cell_lengths,
-        assignment_order=assignment_order,
-    )
     field_at_atoms = _interpolate_bspline_mx(
         positions,
         field_grid,
         cell_lengths,
         assignment_order=assignment_order,
     )
-    energy = 0.5 * mx.sum(charges * potential_at_atoms)
+    if include_energy:
+        potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
+        potential_at_atoms = _interpolate_bspline_mx(
+            positions,
+            potential_grid,
+            cell_lengths,
+            assignment_order=assignment_order,
+        )
+        energy = 0.5 * mx.sum(charges * potential_at_atoms)
+    else:
+        energy = mx.array(0.0, dtype=mx.float32)
     forces = charges[:, None] * field_at_atoms
     return energy, forces, charge_grid, rho_hat
+
+
+def _compiled_reciprocal_force_evaluator(
+    mesh_shape: tuple[int, int, int],
+    *,
+    assignment_order: int,
+):
+    """Return a cached compiled reciprocal PME force-only graph."""
+
+    cache_key = (
+        mesh_shape,
+        assignment_order,
+        str(mx.default_device()),
+    )
+    cached = _COMPILED_RECIPROCAL_FORCE_EVALUATORS.get(cache_key)
+    if cached is not None:
+        return cached
+    grid_size = int(np.prod(mesh_shape, dtype=np.int64))
+
+    def evaluate(
+        positions: mx.array,
+        charges: mx.array,
+        cell_lengths: mx.array,
+        influence: mx.array,
+        kx: mx.array,
+        ky: mx.array,
+        kz: mx.array,
+    ) -> mx.array:
+        _, forces, _, _ = _mesh_reciprocal_energy_forces_core_mx(
+            positions,
+            charges,
+            cell_lengths,
+            influence=influence,
+            wavevectors=(kx, ky, kz),
+            mesh_shape=mesh_shape,
+            assignment_order=assignment_order,
+            grid_size=grid_size,
+            allow_order5_metal=True,
+            include_energy=False,
+        )
+        return forces
+
+    compiled = mx.compile(evaluate)
+    _COMPILED_RECIPROCAL_FORCE_EVALUATORS[cache_key] = compiled
+    return compiled
 
 
 def _compiled_reciprocal_evaluator(

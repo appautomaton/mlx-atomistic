@@ -1,6 +1,6 @@
 <p align="center">
-  <a href="https://appautomaton.github.io/mlx-atomistic/">
-    <img src="https://appautomaton.github.io/mlx-atomistic/og.png" alt="mlx-atomistic: Apple Silicon-native molecular dynamics and DFT runtime on MLX and Metal" width="760">
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/">
+    <img src="https://appautomaton.renocrypt.com/mlx-atomistic/og.png" alt="mlx-atomistic: Apple Silicon-native molecular dynamics and DFT runtime on MLX and Metal" width="760">
   </a>
 </p>
 
@@ -13,21 +13,21 @@
 </p>
 
 <p align="center">
-  <a href="https://appautomaton.github.io/mlx-atomistic/"><img alt="Documentation" src="https://img.shields.io/badge/docs-appautomaton.github.io-0c8c7e?style=flat-square&logo=readthedocs&logoColor=white"></a>
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/"><img alt="Documentation" src="https://img.shields.io/badge/docs-appautomaton.renocrypt.com-0c8c7e?style=flat-square&logo=readthedocs&logoColor=white"></a>
   <a href="https://pypi.org/project/mlx-atomistic/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mlx-atomistic?style=flat-square&logo=pypi&logoColor=white"></a>
   <a href="https://github.com/appautomaton/mlx-atomistic/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/appautomaton/mlx-atomistic/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1d1d1f?style=flat-square">
-  <a href="https://appautomaton.github.io"><img alt="Part of App Automaton" src="https://img.shields.io/badge/part%20of-App%20Automaton-0c8c7e?style=flat-square"></a>
+  <a href="https://appautomaton.renocrypt.com"><img alt="Part of App Automaton" src="https://img.shields.io/badge/part%20of-App%20Automaton-0c8c7e?style=flat-square"></a>
 </p>
 
 <p align="center">
-  <b><a href="https://appautomaton.github.io/mlx-atomistic/">Documentation</a></b> ·
-  <a href="https://appautomaton.github.io/mlx-atomistic/overview/">Overview</a> ·
-  <a href="https://appautomaton.github.io/mlx-atomistic/mm/molecular-mechanics/">Molecular mechanics</a> ·
-  <a href="https://appautomaton.github.io/mlx-atomistic/dft/dft-scf-core/">DFT</a> ·
-  <a href="https://appautomaton.github.io/mlx-atomistic/api/">API reference</a> ·
-  <a href="https://appautomaton.github.io/mlx-atomistic/benchmarks/">Benchmarks</a>
+  <b><a href="https://appautomaton.renocrypt.com/mlx-atomistic/">Documentation</a></b> ·
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/overview/">Overview</a> ·
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/mm/molecular-mechanics/">Molecular mechanics</a> ·
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/dft/dft-scf-core/">DFT</a> ·
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/api/">API reference</a> ·
+  <a href="https://appautomaton.renocrypt.com/mlx-atomistic/benchmarks/">Benchmarks</a>
 </p>
 
 ---
@@ -62,8 +62,8 @@ validation surfaces only. They never replace the MLX runtime path.
   GROMACS `.top`/`.gro` subsets, with explicit physical-unit metadata.
 - **Reference-validation ready:** OpenMM and LAMMPS surfaces are opt-in local
   validation lanes, not package/runtime dependencies.
-- **Self-documenting:** Google-style docstrings generate the [API reference](https://appautomaton.github.io/mlx-atomistic/api/)
-  and an [`llms.txt`](https://appautomaton.github.io/mlx-atomistic/llms.txt) for agentic tools.
+- **Self-documenting:** Google-style docstrings generate the [API reference](https://appautomaton.renocrypt.com/mlx-atomistic/api/)
+  and an [`llms.txt`](https://appautomaton.renocrypt.com/mlx-atomistic/llms.txt) for agentic tools.
 
 ## Quick start
 
@@ -111,13 +111,13 @@ under gitignored `results/`.
 ## Documentation
 
 The full documentation (narrative guides plus an auto-generated API reference)
-lives at **[appautomaton.github.io/mlx-atomistic](https://appautomaton.github.io/mlx-atomistic/)**:
+lives at **[appautomaton.renocrypt.com/mlx-atomistic](https://appautomaton.renocrypt.com/mlx-atomistic/)**:
 
-- [Overview](https://appautomaton.github.io/mlx-atomistic/overview/): what the runtime is and how the pieces fit.
-- [Molecular mechanics](https://appautomaton.github.io/mlx-atomistic/mm/molecular-mechanics/): topology, force-field terms, virtual sites, GBSA/OBC, soft-core λ, replica exchange.
-- [Density functional theory](https://appautomaton.github.io/mlx-atomistic/dft/dft-scf-core/): plane-wave SCF, exchange-correlation, mixing, forces.
-- [API reference](https://appautomaton.github.io/mlx-atomistic/api/): generated directly from the package docstrings.
-- [Benchmarks](https://appautomaton.github.io/mlx-atomistic/benchmarks/): validation gauntlet, stability, and performance methodology.
+- [Overview](https://appautomaton.renocrypt.com/mlx-atomistic/overview/): what the runtime is and how the pieces fit.
+- [Molecular mechanics](https://appautomaton.renocrypt.com/mlx-atomistic/mm/molecular-mechanics/): topology, force-field terms, virtual sites, GBSA/OBC, soft-core λ, replica exchange.
+- [Density functional theory](https://appautomaton.renocrypt.com/mlx-atomistic/dft/dft-scf-core/): plane-wave SCF, exchange-correlation, mixing, forces.
+- [API reference](https://appautomaton.renocrypt.com/mlx-atomistic/api/): generated directly from the package docstrings.
+- [Benchmarks](https://appautomaton.renocrypt.com/mlx-atomistic/benchmarks/): validation gauntlet, stability, and performance methodology.
 
 The narrative source lives in [`docs/`](docs/) and the site itself in [`site/`](site/).
 The API pages are regenerated from the package on every deploy, so they never drift
@@ -135,7 +135,7 @@ and reference-engine provenance, and [`docs/units.md`](docs/units.md) for the un
 
 ## Part of App Automaton
 
-mlx-atomistic is part of **[App Automaton](https://appautomaton.github.io)**, a set of
+mlx-atomistic is part of **[App Automaton](https://appautomaton.renocrypt.com)**, a set of
 open skills, harnesses, and on-device tools for engineering with AI coding agents,
 focused on local-first, Apple-Silicon-native execution.
 

@@ -23,11 +23,12 @@ from mlx_atomistic.force_runtime import (
     _ExclusiveRouteProfiler,
     _PreparedForcePipeline,
 )
-from mlx_atomistic.metal_kernels import fused_lj_forces
+from mlx_atomistic.metal_kernels import _fused_langevin_baoab_drift, fused_lj_forces
 from mlx_atomistic.neighbors import (
     NeighborBlocks,
     NeighborList,
     NeighborListManager,
+    _bounded_metal_md_cache,
 )
 from mlx_atomistic.nonbonded import (
     DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
@@ -1580,9 +1581,7 @@ def _evaluate_force_terms(
 
     if request.mode == "diagnostic":
         named_terms = (
-            _named_force_terms(force_terms)
-            if named_force_terms is None
-            else named_force_terms
+            _named_force_terms(force_terms) if named_force_terms is None else named_force_terms
         )
         if request.virial_mode == VIRIAL_SUPPORT_ANALYTIC:
             combined = _analytic_diagnostic_by_term(
@@ -1908,10 +1907,7 @@ def _analytic_diagnostic_by_term(
     unnamed_terms = tuple(term for _, term in force_terms)
     if (
         cell is None
-        or (
-            virtual_sites is not None
-            and virtual_sites.n_virtual_sites > 0
-        )
+        or (virtual_sites is not None and virtual_sites.n_virtual_sites > 0)
         or _groupable_potential_terms(unnamed_terms, pairs)
     ):
         return NotImplemented
@@ -2002,10 +1998,7 @@ def _analytic_diagnostic_by_term(
                 None,
             )
             if not callable(virial_method):
-                msg = (
-                    "analytic virial support requires "
-                    "analytic_virial_tensor"
-                )
+                msg = "analytic virial support requires analytic_virial_tensor"
                 raise ValueError(msg)
             term_virial = virial_method(
                 eval_positions,
@@ -2022,9 +2015,7 @@ def _analytic_diagnostic_by_term(
         component_count = 0
         for component_name, component_energy in components.items():
             if _is_energy_component(component_energy):
-                energy_by_term[f"{name}.{component_name}"] = (
-                    component_energy
-                )
+                energy_by_term[f"{name}.{component_name}"] = component_energy
                 component_count += 1
         if component_count == 0:
             energy_by_term[name] = energy
@@ -2032,11 +2023,7 @@ def _analytic_diagnostic_by_term(
         if term_virial.shape != (3, 3):
             msg = "analytic virial contributions must have shape (3, 3)"
             raise ValueError(msg)
-        total_energy = (
-            energy
-            if total_energy is None
-            else total_energy + energy
-        )
+        total_energy = energy if total_energy is None else total_energy + energy
         total_forces = total_forces + forces
         total_virial = total_virial + mx.diag(mx.diag(term_virial))
 
@@ -2119,13 +2106,10 @@ def _diagnostic_cutoff_strain_pairs(
     ):
         return None
     required_shell = (
-        float(np.max(np.asarray(cell.lengths, dtype=np.float64)))
-        * strain_epsilon
-        * 1.1
+        float(np.max(np.asarray(cell.lengths, dtype=np.float64))) * strain_epsilon * 1.1
     )
-    remaining_pair_margin = (
-        float(neighbor_list.skin)
-        - 2.0 * float(neighbor_manager.last_max_displacement)
+    remaining_pair_margin = float(neighbor_list.skin) - 2.0 * float(
+        neighbor_manager.last_max_displacement
     )
     if remaining_pair_margin + 1.0e-7 < required_shell:
         return None
@@ -2464,9 +2448,7 @@ def _constraint_profile_name(constraint: object, operation: str) -> str:
     family = getattr(constraint, "_profile_family", None)
     if family is None:
         family = (
-            "settle"
-            if isinstance(constraint, SettleWaterConstraints)
-            else "generic_constraints"
+            "settle" if isinstance(constraint, SettleWaterConstraints) else "generic_constraints"
         )
     return f"{family}_{operation}"
 
@@ -2657,7 +2639,9 @@ def _profile_constraint_velocities(
 def _neighbor_profile_values(neighbor_list: NeighborList | None) -> tuple[mx.array, ...]:
     if neighbor_list is None:
         return ()
-    values = [neighbor_list.pairs]
+    values = []
+    if neighbor_list.materialized_diagnostic_pairs is not None:
+        values.append(neighbor_list.materialized_diagnostic_pairs)
     if neighbor_list.blocks is not None:
         values.extend(
             (
@@ -2674,14 +2658,26 @@ def _neighbor_profile_values(neighbor_list: NeighborList | None) -> tuple[mx.arr
                 neighbor_list.tiles.member_mask,
             )
         )
-        if neighbor_list.tiles.force_group_starts is not None:
+        if neighbor_list.tiles.force_columns is not None:
             values.extend(
                 (
+                    neighbor_list.tiles.force_columns,
                     neighbor_list.tiles.force_group_starts,
                     neighbor_list.tiles.force_group_counts,
                 )
             )
     return tuple(values)
+
+
+def _force_terms_support_tile_diagnostics(
+    force_terms: tuple[ForceTerm, ...],
+) -> bool:
+    """Return whether every term declares exact-tile diagnostic ownership."""
+
+    policies = tuple(
+        getattr(term, "_neighbor_tile_diagnostic_policy", None) for term in force_terms
+    )
+    return "consume" in policies and all(policy in {"consume", "ignore"} for policy in policies)
 
 
 def _validate_compact_nonbonded_backend(
@@ -2721,6 +2717,7 @@ def _nonbonded_runtime_report(
             "rebuild_count": 0,
             "estimated_pair_memory_bytes": dense_pair_count * 2 * 4,
             "estimated_compact_pair_memory_bytes": dense_pair_count * 2 * 4,
+            "diagnostic_pairs_materialized": True,
             "estimated_cell_list_memory_bytes": 0,
             "representation_kind": "pairs",
             "candidate_count": dense_pair_count,
@@ -2743,6 +2740,7 @@ def _nonbonded_runtime_report(
         "rebuild_count": 0 if neighbor_manager is None else neighbor_manager.rebuild_count,
         "estimated_pair_memory_bytes": neighbor_list.estimated_pair_bytes,
         "estimated_compact_pair_memory_bytes": neighbor_list.estimated_compact_pair_bytes,
+        "diagnostic_pairs_materialized": (neighbor_list.diagnostic_pairs_materialized),
         "estimated_cell_list_memory_bytes": neighbor_list.estimated_cell_list_bytes,
         "representation_kind": neighbor_list.representation_kind,
         "candidate_count": neighbor_list.candidate_count,
@@ -2864,6 +2862,28 @@ def _langevin_block_execution_enabled(
     )
 
 
+def _async_force_submission_enabled(
+    config: SimulationConfig,
+    *,
+    thermostat: object,
+    constraints: object | None,
+    prepared_force_pipeline: _PreparedForcePipeline | None,
+    neighbor_list: NeighborList | None,
+) -> bool:
+    """Whether one NVT step may submit its force graph without blocking."""
+
+    return (
+        not config.runtime_profile
+        and isinstance(thermostat, LangevinThermostat)
+        and constraints is not None
+        and prepared_force_pipeline is not None
+        and neighbor_list is not None
+        and neighbor_list.tiles is not None
+        and "gpu" in str(mx.default_device()).lower()
+        and callable(getattr(mx, "async_eval", None))
+    )
+
+
 def _normalize_reporters(
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None,
 ) -> tuple[RuntimeReporter, ...]:
@@ -2891,7 +2911,7 @@ def _notify_reporters(
 
 
 def _zero_constraint_error(positions: mx.array) -> mx.array:
-    return mx.sum(positions[:, 0] * 0.0)
+    return mx.array(0.0, dtype=positions.dtype)
 
 
 def _materialize_sampled_state(
@@ -3118,6 +3138,7 @@ def simulate(
     )
 
 
+@_bounded_metal_md_cache()
 def simulate_nve(
     positions,
     velocities,
@@ -3199,23 +3220,32 @@ def simulate_nve(
         )
     )
     force_binding = (
-        None
-        if prepared_force_pipeline is None
-        else prepared_force_pipeline.bind(neighbor_list)
+        None if prepared_force_pipeline is None else prepared_force_pipeline.bind(neighbor_list)
     )
-    pairs = (
-        None
-        if neighbor_list is None
-        else neighbor_list.force_candidates(prefer_tiles=False)
-    )
+    if neighbor_list is None:
+        pairs = None
+    elif (
+        not config.pressure_diagnostics
+        and force_binding is not None
+        and force_binding.interactions is None
+        and neighbor_list.tiles is not None
+        and _force_terms_support_tile_diagnostics(unnamed_terms)
+    ):
+        pairs = neighbor_list.tiles
+    else:
+        pairs = neighbor_list.diagnostic_pairs
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
-    cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
-        neighbor_manager,
-        neighbor_list,
-        cell,
+    cutoff_strain_pairs = (
+        _diagnostic_cutoff_strain_pairs(
+            neighbor_manager,
+            neighbor_list,
+            cell,
+        )
+        if config.pressure_diagnostics
+        else None
     )
     force_evaluation_wall_seconds = 0.0
     energy_forces_by_term = _make_energy_forces_by_term_evaluator(
@@ -3224,9 +3254,7 @@ def simulate_nve(
         pairs=pairs,
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
         virtual_sites=virtual_sites,
-        virial_mode=(
-            config.pressure_virial_mode if config.pressure_diagnostics else None
-        ),
+        virial_mode=(config.pressure_virial_mode if config.pressure_diagnostics else None),
         masses=masses,
         cutoff_strain_pairs=cutoff_strain_pairs,
     )
@@ -3238,9 +3266,7 @@ def simulate_nve(
         virtual_sites=virtual_sites,
     )
     force_start = perf_counter()
-    potential_energy, forces, energy_by_term, diagnostic_virial = (
-        energy_forces_by_term(positions)
-    )
+    potential_energy, forces, energy_by_term, diagnostic_virial = energy_forces_by_term(positions)
     force_evaluation_wall_seconds += perf_counter() - force_start
     state = SimulationState(
         positions=positions,
@@ -3352,9 +3378,7 @@ def simulate_nve(
         if prepared_force_pipeline is not None:
             force_binding = prepared_force_pipeline.bind(neighbor_list)
         pairs = (
-            None
-            if neighbor_list is None
-            else neighbor_list.force_candidates(prefer_tiles=False)
+            None if neighbor_list is None else neighbor_list.force_candidates(prefer_tiles=False)
         )
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
@@ -3396,11 +3420,7 @@ def simulate_nve(
                 cell=cell,
                 pairs=pairs,
                 virtual_sites=virtual_sites,
-                virial_mode=(
-                    config.pressure_virial_mode
-                    if config.pressure_diagnostics
-                    else None
-                ),
+                virial_mode=(config.pressure_virial_mode if config.pressure_diagnostics else None),
                 masses=masses,
                 cutoff_strain_pairs=cutoff_strain_pairs,
             )
@@ -3486,16 +3506,14 @@ def simulate_nve(
                     boltzmann_constant=config.boltzmann_constant,
                 )
             )
-            virial, pressure_tensor_value, pressure_value = (
-                _pressure_diagnostics_from_virial(
-                    diagnostic_virial,
-                    state.positions,
-                    state.velocities,
-                    masses,
-                    cell=cell,
-                    kinetic_energy_scale=config.kinetic_energy_scale,
-                    enabled=config.pressure_diagnostics,
-                )
+            virial, pressure_tensor_value, pressure_value = _pressure_diagnostics_from_virial(
+                diagnostic_virial,
+                state.positions,
+                state.velocities,
+                masses,
+                cell=cell,
+                kinetic_energy_scale=config.kinetic_energy_scale,
+                enabled=config.pressure_diagnostics,
             )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)
@@ -3636,6 +3654,7 @@ def simulate_nvt(
     )
 
 
+@_bounded_metal_md_cache()
 def _simulate_nvt(
     positions,
     velocities,
@@ -3655,9 +3674,7 @@ def _simulate_nvt(
 
     if config is None:
         config = SimulationConfig()
-    route_profiler = (
-        _ExclusiveRouteProfiler() if config.runtime_profile else None
-    )
+    route_profiler = _ExclusiveRouteProfiler() if config.runtime_profile else None
     virtual_sites = config.virtual_sites
     reporters_tuple = _normalize_reporters(reporters)
     runtime_sync = _RuntimeSyncRecorder()
@@ -3680,8 +3697,10 @@ def _simulate_nvt(
     positions = as_mx_array(positions)
     velocities = as_mx_array(velocities)
     masses = as_mx_array([1.0] * positions.shape[0]) if masses is None else as_mx_array(masses)
+    masses_col = masses[:, None]
+    zero_constraint_error = _zero_constraint_error(positions)
     constraint_error = (
-        _zero_constraint_error(positions)
+        zero_constraint_error
         if initial_diagnostics is None
         else initial_diagnostics.constraint_error
     )
@@ -3717,9 +3736,7 @@ def _simulate_nvt(
     temperature_dof = _temperature_degrees_of_freedom(positions, constraints)
 
     eval_positions = _neighbor_evaluation_positions(positions, virtual_sites)
-    neighbor_started = (
-        None if route_profiler is None else route_profiler.start()
-    )
+    neighbor_started = None if route_profiler is None else route_profiler.start()
     if neighbor_manager is None:
         neighbor_list = None
     elif initial_diagnostics is None:
@@ -3746,32 +3763,39 @@ def _simulate_nvt(
             route_profiler=route_profiler,
         )
     )
-    binding_started = (
-        None if route_profiler is None else route_profiler.start()
-    )
+    binding_started = None if route_profiler is None else route_profiler.start()
     force_binding = (
-        None
-        if prepared_force_pipeline is None
-        else prepared_force_pipeline.bind(neighbor_list)
+        None if prepared_force_pipeline is None else prepared_force_pipeline.bind(neighbor_list)
     )
     if binding_started is not None:
         route_profiler.finish(
             "neighbor_force_binding",
             binding_started,
         )
-    pairs = (
-        None
-        if neighbor_list is None
-        else neighbor_list.force_candidates(prefer_tiles=False)
-    )
+    if neighbor_list is None:
+        pairs = None
+    elif (
+        not config.pressure_diagnostics
+        and force_binding is not None
+        and force_binding.interactions is None
+        and neighbor_list.tiles is not None
+        and _force_terms_support_tile_diagnostics(unnamed_terms)
+    ):
+        pairs = neighbor_list.tiles
+    else:
+        pairs = neighbor_list.diagnostic_pairs
     pair_count = (
         _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
     )
     rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
-    cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
-        neighbor_manager,
-        neighbor_list,
-        cell,
+    cutoff_strain_pairs = (
+        _diagnostic_cutoff_strain_pairs(
+            neighbor_manager,
+            neighbor_list,
+            cell,
+        )
+        if config.pressure_diagnostics
+        else None
     )
     force_evaluation_wall_seconds = 0.0
     energy_forces_by_term = _make_energy_forces_by_term_evaluator(
@@ -3780,9 +3804,7 @@ def _simulate_nvt(
         pairs=pairs,
         compile_evaluator=config.compile_force_evaluator and neighbor_manager is None,
         virtual_sites=virtual_sites,
-        virial_mode=(
-            config.pressure_virial_mode if config.pressure_diagnostics else None
-        ),
+        virial_mode=(config.pressure_virial_mode if config.pressure_diagnostics else None),
         masses=masses,
         cutoff_strain_pairs=cutoff_strain_pairs,
     )
@@ -3801,12 +3823,10 @@ def _simulate_nvt(
         virtual_sites=virtual_sites,
     )
     force_start = perf_counter()
-    diagnostic_profile_started = (
-        None if route_profiler is None else route_profiler.start()
-    )
+    diagnostic_profile_started = None if route_profiler is None else route_profiler.start()
     if initial_diagnostics is None:
-        potential_energy, forces, energy_by_term, diagnostic_virial = (
-            energy_forces_by_term(positions)
+        potential_energy, forces, energy_by_term, diagnostic_virial = energy_forces_by_term(
+            positions
         )
     else:
         potential_energy = initial_diagnostics.potential_energy
@@ -3866,6 +3886,7 @@ def _simulate_nvt(
     velocity_decay = None
     noise_scale = None
     thermal_scale = None
+    metal_langevin_drift = None
     nh_chain_position = None
     nh_chain_velocity = None
     nh_thermal_mass = None
@@ -3886,6 +3907,25 @@ def _simulate_nvt(
             / config.kinetic_energy_scale
         )
         thermal_scale = noise_scale / mx.sqrt(masses)[:, None]
+        if (
+            mx.metal.is_available()
+            and "gpu" in str(mx.default_device()).lower()
+            and state.positions.dtype == mx.float32
+            and (cell is None or cell.is_orthorhombic)
+        ):
+            metal_langevin_drift = (
+                config.force_to_acceleration_scale / masses,
+                mx.ones((3,), dtype=mx.float32) if cell is None else mx.diag(cell.matrix),
+                mx.array(
+                    [
+                        0.5 * config.dt,
+                        velocity_decay,
+                        float(cell is not None and config.wrap_positions),
+                    ],
+                    dtype=mx.float32,
+                ),
+                mx.array([state.positions.shape[0]], dtype=mx.int32),
+            )
         thermostat_metadata = _thermostat_metadata(
             thermostat,
             dof=temperature_dof,
@@ -3913,16 +3953,14 @@ def _simulate_nvt(
             chain_velocity=float(np.asarray(nh_chain_velocity)),
         )
     if initial_diagnostics is None:
-        virial, pressure_tensor_value, pressure_value = (
-            _pressure_diagnostics_from_virial(
-                diagnostic_virial,
-                state.positions,
-                state.velocities,
-                masses,
-                cell=cell,
-                kinetic_energy_scale=config.kinetic_energy_scale,
-                enabled=config.pressure_diagnostics,
-            )
+        virial, pressure_tensor_value, pressure_value = _pressure_diagnostics_from_virial(
+            diagnostic_virial,
+            state.positions,
+            state.velocities,
+            masses,
+            cell=cell,
+            kinetic_energy_scale=config.kinetic_energy_scale,
+            enabled=config.pressure_diagnostics,
         )
     else:
         virial = initial_diagnostics.virial_tensor
@@ -3977,13 +4015,19 @@ def _simulate_nvt(
         constraints=constraints,
         virtual_sites=virtual_sites,
     )
+    async_force_submission = _async_force_submission_enabled(
+        config,
+        thermostat=thermostat,
+        constraints=constraints,
+        prepared_force_pipeline=prepared_force_pipeline,
+        neighbor_list=neighbor_list,
+    )
     if _batched:
         fscale = config.force_to_acceleration_scale
         dt = config.dt
         # Use the same arithmetic as the per-step loop below (division by the
         # mass column, not multiply-by-reciprocal) so the batched trajectory is
         # bit-for-bit identical, not just close.
-        masses_col = masses[:, None]
         sqrt_masses_col = mx.sqrt(masses)[:, None]
 
         def _langevin_substep(pos, vel, forces, prng, block_pairs):
@@ -4072,10 +4116,7 @@ def _simulate_nvt(
                 split_keys = mx.random.split(prng, 2)
                 prng = split_keys[0]
                 noise = mx.random.normal(vel.shape, key=split_keys[1])
-                middle = (
-                    velocity_decay * vel_half
-                    + (noise_scale / sqrt_masses_col) * noise
-                )
+                middle = velocity_decay * vel_half + (noise_scale / sqrt_masses_col) * noise
                 pos = pos + 0.5 * dt * middle
                 if cell is not None and config.wrap_positions:
                     pos = cell.wrap(pos)
@@ -4095,9 +4136,7 @@ def _simulate_nvt(
                         virtual_sites=None,
                     )
                 else:
-                    replay_binding = prepared_force_pipeline.bind(
-                        replay_neighbor_list
-                    )
+                    replay_binding = prepared_force_pipeline.bind(replay_neighbor_list)
                     forces = replay_binding.forces(
                         pos,
                         evaluation_positions=pos,
@@ -4221,12 +4260,10 @@ def _simulate_nvt(
                             for name, energies in potential_energy_by_term.items()
                         }
                     else:
-                        cutoff_strain_pairs = (
-                            _diagnostic_cutoff_strain_pairs(
-                                neighbor_manager,
-                                neighbor_list,
-                                cell,
-                            )
+                        cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
+                            neighbor_manager,
+                            neighbor_list,
+                            cell,
                         )
                         (
                             potential_energy,
@@ -4240,9 +4277,7 @@ def _simulate_nvt(
                             pairs=pairs,
                             virtual_sites=None,
                             virial_mode=(
-                                config.pressure_virial_mode
-                                if config.pressure_diagnostics
-                                else None
+                                config.pressure_virial_mode if config.pressure_diagnostics else None
                             ),
                             masses=masses,
                             cutoff_strain_pairs=cutoff_strain_pairs,
@@ -4405,9 +4440,7 @@ def _simulate_nvt(
         )
     )
     for local_step in step_range:
-        integration_started = (
-            None if route_profiler is None else route_profiler.start()
-        )
+        integration_started = None if route_profiler is None else route_profiler.start()
         current_step = config.initial_step + local_step
         current_time = config.initial_time + local_step * config.dt
         diagnostic_step = _is_diagnostic_step(
@@ -4415,23 +4448,35 @@ def _simulate_nvt(
             config,
             final=local_step == config.steps,
         )
-        sample_step = (
-            current_step % config.sample_interval == 0
-            or local_step == config.steps
-        )
+        sample_step = current_step % config.sample_interval == 0 or local_step == config.steps
         validate_constraint_step = diagnostic_step or sample_step
-        acceleration = config.force_to_acceleration_scale * state.forces / masses[:, None]
         if isinstance(thermostat, LangevinThermostat):
-            velocities_half = state.velocities + 0.5 * config.dt * acceleration
-            next_positions = state.positions + 0.5 * config.dt * velocities_half
-
             keys = mx.random.split(key, 2)
             key = keys[0]
             noise = mx.random.normal(state.velocities.shape, key=keys[1])
-            middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
-
-            next_positions = next_positions + 0.5 * config.dt * middle_velocities
+            if metal_langevin_drift is None:
+                acceleration = config.force_to_acceleration_scale * state.forces / masses_col
+                velocities_half = state.velocities + 0.5 * config.dt * acceleration
+                next_positions = state.positions + 0.5 * config.dt * velocities_half
+                if cell is not None and config.wrap_positions:
+                    next_positions = cell.wrap(next_positions)
+                middle_velocities = velocity_decay * velocities_half + thermal_scale * noise
+                next_positions = next_positions + 0.5 * config.dt * middle_velocities
+            else:
+                force_scale_over_mass, metal_box, metal_params, metal_counts = metal_langevin_drift
+                next_positions, middle_velocities = _fused_langevin_baoab_drift(
+                    state.positions,
+                    state.velocities,
+                    state.forces,
+                    force_scale_over_mass,
+                    thermal_scale[:, 0],
+                    noise,
+                    metal_box,
+                    metal_params,
+                    metal_counts,
+                )
         else:
+            acceleration = config.force_to_acceleration_scale * state.forces / masses_col
             current_kinetic = kinetic_energy(
                 state.velocities,
                 masses,
@@ -4444,13 +4489,11 @@ def _simulate_nvt(
             scaled_velocities = state.velocities * thermostat_scale
             velocities_half = scaled_velocities + 0.5 * config.dt * acceleration
             next_positions = state.positions + config.dt * velocities_half
-        if cell is not None and config.wrap_positions:
+        if cell is not None and config.wrap_positions and metal_langevin_drift is None:
             next_positions = cell.wrap(next_positions)
-        constraint_error = _zero_constraint_error(next_positions)
+        constraint_error = zero_constraint_error
         velocity_before_final_kick = (
-            middle_velocities
-            if isinstance(thermostat, LangevinThermostat)
-            else velocities_half
+            middle_velocities if isinstance(thermostat, LangevinThermostat) else velocities_half
         )
         if integration_started is not None:
             route_profiler.finish(
@@ -4508,20 +4551,16 @@ def _simulate_nvt(
                     cell,
                 )
             else:
-                velocity_before_final_kick = (
-                    _profile_constraint_pre_force_velocities(
-                        constraints,
-                        next_positions,
-                        velocity_before_final_kick,
-                        masses,
-                        cell,
-                        route_profiler,
-                    )
+                velocity_before_final_kick = _profile_constraint_pre_force_velocities(
+                    constraints,
+                    next_positions,
+                    velocity_before_final_kick,
+                    masses,
+                    cell,
+                    route_profiler,
                 )
 
-        neighbor_started = (
-            None if route_profiler is None else route_profiler.start()
-        )
+        neighbor_started = None if route_profiler is None else route_profiler.start()
         eval_positions = _neighbor_evaluation_positions(next_positions, virtual_sites)
         neighbor_list = (
             neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
@@ -4534,36 +4573,40 @@ def _simulate_nvt(
                 _neighbor_profile_values(neighbor_list),
             )
         if prepared_force_pipeline is not None:
-            binding_started = (
-                None if route_profiler is None else route_profiler.start()
-            )
+            binding_started = None if route_profiler is None else route_profiler.start()
             force_binding = prepared_force_pipeline.bind(neighbor_list)
             if binding_started is not None:
                 route_profiler.finish(
                     "neighbor_force_binding",
                     binding_started,
                 )
-        pairs = (
-            None
-            if neighbor_list is None
-            else neighbor_list.force_candidates(prefer_tiles=False)
-        )
+        deferred_final = defer_final_diagnostics and local_step == config.steps
+        full_diagnostic_step = diagnostic_step and not deferred_final
+        if neighbor_list is None:
+            pairs = None
+        elif (
+            full_diagnostic_step
+            and not config.pressure_diagnostics
+            and force_binding is not None
+            and force_binding.interactions is None
+            and neighbor_list.tiles is not None
+            and _force_terms_support_tile_diagnostics(unnamed_terms)
+        ):
+            pairs = neighbor_list.tiles
+        elif full_diagnostic_step or deferred_final or force_binding is None:
+            pairs = neighbor_list.diagnostic_pairs
+        else:
+            pairs = force_binding.interactions
         pair_count = (
             _dense_pair_count(eval_positions) if neighbor_list is None else neighbor_list.pair_count
         )
         rebuild_count = 0 if neighbor_manager is None else neighbor_manager.rebuild_count
 
-        deferred_final = defer_final_diagnostics and local_step == config.steps
-        full_diagnostic_step = diagnostic_step and not deferred_final
         force_start = perf_counter()
         force_profile_started = (
             None
             if route_profiler is None
-            or (
-                force_binding is not None
-                and not full_diagnostic_step
-                and not deferred_final
-            )
+            or (force_binding is not None and not full_diagnostic_step and not deferred_final)
             else route_profiler.start()
         )
         diagnostic_virial = None
@@ -4582,10 +4625,14 @@ def _simulate_nvt(
             next_forces = forces_evaluator(next_positions)
             energy_by_term = None
         elif full_diagnostic_step:
-            cutoff_strain_pairs = _diagnostic_cutoff_strain_pairs(
-                neighbor_manager,
-                neighbor_list,
-                cell,
+            cutoff_strain_pairs = (
+                _diagnostic_cutoff_strain_pairs(
+                    neighbor_manager,
+                    neighbor_list,
+                    cell,
+                )
+                if config.pressure_diagnostics
+                else None
             )
             (
                 potential_energy,
@@ -4598,11 +4645,7 @@ def _simulate_nvt(
                 cell=cell,
                 pairs=pairs,
                 virtual_sites=virtual_sites,
-                virial_mode=(
-                    config.pressure_virial_mode
-                    if config.pressure_diagnostics
-                    else None
-                ),
+                virial_mode=(config.pressure_virial_mode if config.pressure_diagnostics else None),
                 masses=masses,
                 cutoff_strain_pairs=cutoff_strain_pairs,
             )
@@ -4651,10 +4694,17 @@ def _simulate_nvt(
                 diagnostic_virial,
             )
         force_evaluation_wall_seconds += perf_counter() - force_start
-        final_integration_started = (
-            None if route_profiler is None else route_profiler.start()
-        )
-        next_acceleration = config.force_to_acceleration_scale * next_forces / masses[:, None]
+        if (
+            async_force_submission
+            and force_binding is not None
+            and neighbor_list is not None
+            and neighbor_list.tiles is not None
+            and not full_diagnostic_step
+            and not deferred_final
+        ):
+            mx.async_eval(next_forces)
+        final_integration_started = None if route_profiler is None else route_profiler.start()
+        next_acceleration = config.force_to_acceleration_scale * next_forces / masses_col
         next_velocities = velocity_before_final_kick + 0.5 * config.dt * next_acceleration
         if final_integration_started is not None:
             route_profiler.finish(
@@ -4680,9 +4730,7 @@ def _simulate_nvt(
                     cell,
                     route_profiler,
                 )
-        post_integration_started = (
-            None if route_profiler is None else route_profiler.start()
-        )
+        post_integration_started = None if route_profiler is None else route_profiler.start()
         if (
             config.center_of_mass_motion_interval is not None
             and current_step % config.center_of_mass_motion_interval == 0
@@ -4788,16 +4836,14 @@ def _simulate_nvt(
                 pressure_tensor_value = pressure_tensors[-1]
                 pressure_value = pressures[-1]
             else:
-                virial, pressure_tensor_value, pressure_value = (
-                    _pressure_diagnostics_from_virial(
-                        diagnostic_virial,
-                        state.positions,
-                        state.velocities,
-                        masses,
-                        cell=cell,
-                        kinetic_energy_scale=config.kinetic_energy_scale,
-                        enabled=config.pressure_diagnostics,
-                    )
+                virial, pressure_tensor_value, pressure_value = _pressure_diagnostics_from_virial(
+                    diagnostic_virial,
+                    state.positions,
+                    state.velocities,
+                    masses,
+                    cell=cell,
+                    kinetic_energy_scale=config.kinetic_energy_scale,
+                    enabled=config.pressure_diagnostics,
                 )
             virials.append(virial)
             pressure_tensors.append(pressure_tensor_value)
@@ -4893,6 +4939,7 @@ def _simulate_nvt(
     )
 
 
+@_bounded_metal_md_cache()
 def simulate_npt(
     positions,
     velocities,
@@ -5614,9 +5661,7 @@ def _attempt_barostat_move(
         proposed_neighbor_list = None
     old_pairs = None if old_neighbor_list is None else old_neighbor_list.diagnostic_pairs
     proposed_pairs = (
-        None
-        if proposed_neighbor_list is None
-        else proposed_neighbor_list.diagnostic_pairs
+        None if proposed_neighbor_list is None else proposed_neighbor_list.diagnostic_pairs
     )
     old_energy = (
         _energy_forces_from_terms(

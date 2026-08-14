@@ -44,7 +44,7 @@ dependencies = [
 ]
 
 [project.urls]
-Documentation = "https://appautomaton.github.io/mlx-atomistic/"
+Documentation = "https://appautomaton.renocrypt.com/mlx-atomistic/"
 Source = "https://github.com/appautomaton/mlx-atomistic"
 Issues = "https://github.com/appautomaton/mlx-atomistic/issues"
 

@@ -20,6 +20,7 @@ from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.prep.io import JSON_NAME, NPZ_NAME, load_prepared_system, save_prepared_system
+from mlx_atomistic.prep.schema import center_of_mass_motion_interval
 from mlx_atomistic.prep.supercell import (
     normalize_supercell_replicas,
     prepared_supercell_summary,
@@ -59,6 +60,11 @@ def _constraint_route_inventory(
             "pair_count": 0,
             "peripheral_count_histogram": {},
         },
+        "small_constraint_clusters": {
+            "object_count": 0,
+            "cluster_count": 0,
+            "pair_count": 0,
+        },
         "generic": {"object_count": 0, "pair_count": 0},
     }
 
@@ -79,6 +85,11 @@ def _constraint_route_inventory(
             for count in np.asarray(constraint.peripheral_counts, dtype=np.int32):
                 key = str(int(count))
                 histogram[key] = int(histogram.get(key, 0)) + 1
+        elif family == "small_constraint_clusters":
+            route = routes["small_constraint_clusters"]
+            route["object_count"] += 1
+            route["cluster_count"] += int(constraint._small_cluster_atoms.shape[0])
+            route["pair_count"] += pair_count
         elif hasattr(constraint, "waters"):
             route = routes["settle"]
             route["object_count"] += 1
@@ -96,7 +107,12 @@ def _constraint_route_inventory(
         0 if constraints is None else int(constraints.pairs.shape[0])
     )
     water_route_complete = water_atom_count == 0 or (
-        molecule_ids_present and int(routes["settle"]["pair_count"]) > 0
+        (molecule_ids_present and int(routes["settle"]["pair_count"]) > 0)
+        or (
+            expected_pair_count > 0
+            and int(routes["small_constraint_clusters"]["pair_count"])
+            == expected_pair_count
+        )
     )
     return {
         "routes": routes,
@@ -300,6 +316,9 @@ def runtime_payload(
     try:
         setup_started = time.perf_counter()
         artifact = load_prepared_mlx_artifact(prepared_path, require_production=True)
+        cmm_interval = center_of_mass_motion_interval(
+            dict(artifact.metadata.get("protocol_metadata", {}))
+        )
         system, force_terms, constraints = build_mlx_system_from_artifact(
             artifact,
             eager_nonbonded_pair_limit=0,
@@ -352,6 +371,7 @@ def runtime_payload(
                 simulation_units=simulation_units,
                 sample_interval=warmups,
                 diagnostic_interval=warmups,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -380,6 +400,7 @@ def runtime_payload(
                 sample_interval=sample_interval,
                 diagnostic_interval=diagnostic_interval,
                 runtime_profile=runtime_profile,
+                center_of_mass_motion_interval=cmm_interval,
             ),
             constraints=constraints,
             thermostat=LangevinThermostat(
@@ -485,6 +506,10 @@ def runtime_payload(
                 and neighbor_report["representation"] == expected_representation
             ),
             "no_neighbor_fallback": neighbor_report["fallback_reason"] is None,
+            "tile_diagnostic_pairs_unmaterialized": (
+                neighbor_backend != "mlx_cell_tiles"
+                or neighbor_report.get("diagnostic_pairs_materialized") is False
+            ),
             "positive_throughput": math.isfinite(ns_per_day) and ns_per_day > 0.0,
             "process_memory_within_limit": (
                 process_peak_bytes <= _PROCESS_MEMORY_LIMIT_BYTES
@@ -533,6 +558,7 @@ def runtime_payload(
             "plan": final_plan,
             "topology": topology_report,
             "constraint_routes": constraint_routes,
+            "center_of_mass_motion_interval": cmm_interval,
             "neighbor": neighbor_report,
             "checks": checks,
             "finite": finite,
@@ -727,6 +753,111 @@ def _default_openmm_artifact_paths(
     )
 
 
+def _tile_mask_occupancy(
+    member_mask: object,
+    tile_blocks: object,
+    *,
+    block_size: int,
+) -> dict[str, object]:
+    """Summarize row and column occupancy in fixed-width spatial tiles."""
+
+    words = np.asarray(member_mask, dtype=np.uint32)
+    if block_size <= 0:
+        msg = "tile block size must be positive"
+        raise ValueError(msg)
+    lanes_per_tile = block_size * block_size
+    word_count = (lanes_per_tile + 31) // 32
+    if words.ndim != 2 or words.shape[1] != word_count:
+        msg = f"tile member masks must have shape (n_tiles, {word_count})"
+        raise ValueError(msg)
+    blocks = np.asarray(tile_blocks, dtype=np.int32)
+    if blocks.shape != (words.shape[0], 2):
+        msg = "tile blocks must have shape (n_tiles, 2)"
+        raise ValueError(msg)
+    bit_indices = np.arange(32, dtype=np.uint32)
+    active = np.concatenate(
+        [
+            ((words[:, index : index + 1] >> bit_indices) & np.uint32(1)).astype(bool)
+            for index in range(word_count)
+        ],
+        axis=1,
+    )[:, :lanes_per_tile]
+    tile_active = active.reshape((-1, block_size, block_size))
+    nonempty_columns = np.any(tile_active, axis=1)
+    nonempty_rows = np.any(tile_active, axis=2)
+    column_member_counts = np.count_nonzero(tile_active, axis=1)
+    column_member_count_histogram = {
+        str(member_count): int(np.count_nonzero(column_member_counts == member_count))
+        for member_count in range(block_size + 1)
+    }
+    column_count = int(nonempty_columns.size)
+    row_count = int(nonempty_rows.size)
+    empty_columns = column_count - int(np.count_nonzero(nonempty_columns))
+    empty_rows = row_count - int(np.count_nonzero(nonempty_rows))
+    summary: dict[str, object] = {
+        "right_column_count": column_count,
+        "empty_right_column_count": empty_columns,
+        "empty_right_column_fraction": (
+            0.0 if column_count == 0 else empty_columns / column_count
+        ),
+        "right_column_member_count_histogram": column_member_count_histogram,
+        "left_row_count": row_count,
+        "empty_left_row_count": empty_rows,
+        "empty_left_row_fraction": 0.0 if row_count == 0 else empty_rows / row_count,
+    }
+    if block_size == 8:
+        active_quadrants = np.stack(
+            [
+                np.any(tile_active[:, row : row + 4, column : column + 4], axis=(1, 2))
+                for row in (0, 4)
+                for column in (0, 4)
+            ],
+            axis=1,
+        )
+        subtile_count = int(np.count_nonzero(active_quadrants))
+        exact_pair_count = int(np.count_nonzero(active))
+        subtile_padded_lane_count = subtile_count * 16
+        active_indices = np.argwhere(active_quadrants)
+        if active_indices.size:
+            tile_indices = active_indices[:, 0]
+            quadrants = active_indices[:, 1]
+            left_halves = quadrants // 2
+            right_halves = quadrants % 2
+            left_subblocks = 2 * blocks[tile_indices, 0] + left_halves
+            quadrant_columns = np.count_nonzero(
+                np.any(
+                    tile_active.reshape((-1, 2, 4, 2, 4)),
+                    axis=2,
+                ),
+                axis=3,
+            )
+            active_columns = quadrant_columns[
+                tile_indices,
+                left_halves,
+                right_halves,
+            ]
+            columns_by_left = np.bincount(
+                left_subblocks,
+                weights=active_columns,
+            ).astype(np.int64)
+            subtile_force_group_count = int(np.sum((columns_by_left + 31) // 32))
+        else:
+            subtile_force_group_count = 0
+        summary.update(
+            {
+                "subdivision_4x4_tile_count": subtile_count,
+                "subdivision_4x4_padded_lane_count": subtile_padded_lane_count,
+                "subdivision_4x4_active_lane_fraction": (
+                    0.0
+                    if subtile_padded_lane_count == 0
+                    else exact_pair_count / subtile_padded_lane_count
+                ),
+                "subdivision_4x4_force_group_count": subtile_force_group_count,
+            }
+        )
+    return summary
+
+
 def _profile_tile_inventory(
     prepared: Path,
     *,
@@ -759,6 +890,7 @@ def _profile_tile_inventory(
         tiles.atom_blocks,
         tiles.tile_blocks,
         tiles.member_mask,
+        tiles.force_columns,
         tiles.force_group_starts,
         tiles.force_group_counts,
     )
@@ -882,11 +1014,18 @@ def _profile_tile_inventory(
         "tile_topology_mask_bytes": tile_topology_bytes,
         "pair_scale_bytes": pair_scale_bytes,
     }
+    mask_occupancy = _tile_mask_occupancy(
+        tiles.member_mask,
+        tiles.tile_blocks,
+        block_size=tiles.block_size,
+    )
     return {
         "backend": tile_manager.backend,
         "block_size": tiles.block_size,
         "block_count": tiles.block_count,
         "tile_count": tiles.tile_count,
+        "active_column_count": tiles.active_column_count,
+        "scheduled_column_count": tiles.scheduled_column_count,
         "force_group_count": tiles.force_group_count,
         "exact_pair_count": tiles.exact_pair_count,
         "reference_pair_count": reference_pair_count,
@@ -902,6 +1041,7 @@ def _profile_tile_inventory(
             if tiles.padded_lane_count == 0
             else tiles.exact_pair_count / tiles.padded_lane_count
         ),
+        **mask_occupancy,
         "force_rms_delta_kj_mol_angstrom": force_rms_delta,
         "force_max_delta_kj_mol_angstrom": force_max_delta,
         "force_max_reference_kj_mol_angstrom": force_max_reference,
@@ -1322,6 +1462,7 @@ def _simulation_config(
     sample_interval: int,
     diagnostic_interval: int,
     runtime_profile: bool = False,
+    center_of_mass_motion_interval: int | None = None,
 ) -> SimulationConfig:
     return SimulationConfig(
         dt=dt_ps,
@@ -1331,6 +1472,7 @@ def _simulation_config(
         pressure_diagnostics=False,
         compile_force_evaluator=False,
         runtime_profile=runtime_profile,
+        center_of_mass_motion_interval=center_of_mass_motion_interval,
         **simulation_units,
     )
 
