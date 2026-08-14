@@ -33,6 +33,7 @@ Each result file should answer, in order:
 
 | File | Engine | System | Platform | Host |
 |---|---|---|---|---|
+| [md-cell-task-reuse-m5max.md](./md-cell-task-reuse-m5max.md) | mlx_atomistic | Retained spatial-cell task reuse and schedule-prefix coalescing on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-neighbor-wait-attribution-m5max.md](./md-neighbor-wait-attribution-m5max.md) | mlx_atomistic | Neighbor wait attribution and rejected async/direct-branch candidates on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-combined-constraint-verdict-m5max.md](./md-combined-constraint-verdict-m5max.md) | mlx_atomistic | Rejected combined position/velocity constraint route on 5DFR and JAC | Metal | Apple M5 Max |
 | [md-final-force-kick-verdict-m5max.md](./md-final-force-kick-verdict-m5max.md) | mlx_atomistic | Rejected constrained final force-kick fusion on 5DFR and JAC | Metal | Apple M5 Max |

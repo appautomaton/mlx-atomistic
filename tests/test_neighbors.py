@@ -51,6 +51,13 @@ def test_spatial_cell_pair_template_reuses_fixed_geometry_without_stale_counts()
         widths,
         search_radius=1.2,
     )
+    dense_counts = np.full((12,), 2, dtype=np.int32)
+    dense_left, dense_right, dense_candidates = _spatial_cell_pair_tasks(
+        dense_counts,
+        n_cells,
+        widths,
+        search_radius=1.2,
+    )
 
     cached_left, cached_right, cached_same = _spatial_cell_pair_template(
         n_cells,
@@ -59,10 +66,16 @@ def test_spatial_cell_pair_template_reuses_fixed_geometry_without_stale_counts()
     )
     cache = _spatial_cell_pair_template.cache_info()
     assert cache.misses == 1
-    assert cache.hits == 2
+    assert cache.hits == 3
     assert not cached_left.flags.writeable
     assert not cached_right.flags.writeable
     assert not cached_same.flags.writeable
+    assert dense_left is cached_left
+    assert dense_right is cached_right
+    np.testing.assert_array_equal(
+        dense_candidates,
+        np.where(cached_same, 1, 4),
+    )
     np.testing.assert_array_equal(cached_same, cached_left == cached_right)
     first_pairs = set(zip(first_left.tolist(), first_right.tolist(), strict=True))
     second_pairs = set(zip(second_left.tolist(), second_right.tolist(), strict=True))

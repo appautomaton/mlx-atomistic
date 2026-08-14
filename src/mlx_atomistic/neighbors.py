@@ -1581,14 +1581,6 @@ def _build_mlx_spatial_cell_tile_list(
             axis=(1, 2),
         ).astype(mx.int32)
         active_column_prefix = mx.cumsum(active_column_counts)
-        mx.eval(active_column_prefix)
-        active_column_count = int(np.asarray(active_column_prefix[-1]))
-        force_columns = _neighbor_tile_column_scatter_sized(
-            member_mask,
-            active_column_counts,
-            active_column_prefix,
-            accepted_count=active_column_count,
-        )
         column_counts_by_left = (
             mx.zeros((block_count,), dtype=mx.int32)
             .at[tile_blocks[:, 0]]
@@ -1599,8 +1591,16 @@ def _build_mlx_spatial_cell_tile_list(
             column_counts_by_left + DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE - 1
         ) // DEFAULT_MLX_CELL_TILE_FORCE_GROUP_SIZE
         force_group_prefix = mx.cumsum(force_groups_by_left)
-        mx.eval(column_prefix_by_left, force_group_prefix)
+        # These inventories are independent until their sized scatter kernels.
+        mx.eval(active_column_prefix, column_prefix_by_left, force_group_prefix)
+        active_column_count = int(np.asarray(active_column_prefix[-1]))
         force_group_count = int(np.asarray(force_group_prefix[-1]))
+        force_columns = _neighbor_tile_column_scatter_sized(
+            member_mask,
+            active_column_counts,
+            active_column_prefix,
+            accepted_count=active_column_count,
+        )
         force_group_starts, force_group_counts = _neighbor_tile_force_groups_sized(
             column_counts_by_left,
             column_prefix_by_left,
@@ -2115,6 +2115,9 @@ def _spatial_cell_pair_tasks(
     same_counts = left_counts[same]
     candidate_counts[same] = same_counts * np.maximum(same_counts - 1, 0) // 2
     occupied = candidate_counts > 0
+    # Boolean indexing would copy both cached templates on dense solvent grids.
+    if bool(np.all(occupied)):
+        return left, right, candidate_counts
     return (
         left[occupied],
         right[occupied],
