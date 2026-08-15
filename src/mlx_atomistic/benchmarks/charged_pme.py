@@ -19,6 +19,7 @@ from mlx_atomistic.artifacts import build_mlx_system_from_artifact, load_prepare
 from mlx_atomistic.benchmarks import get_hardware_info
 from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.benchmarks.schema import current_git_commit
+from mlx_atomistic.interaction_engine import _profile_interaction32_rebuilds
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
 from mlx_atomistic.neighbors import (
     NeighborListManager,
@@ -255,7 +256,8 @@ def runtime_payload(
         runtime_profile: Enable synchronized benchmark-only route attribution.
             Defaults to ``False``.
         neighbor_rebuild_profile: Enable synchronized stage attribution inside
-            measured Metal tile-list rebuilds. Defaults to ``False``.
+            measured Metal tile-list or Interaction32 rebuilds. Defaults to
+            ``False``.
         neighbor_backend: Exact spatial tile candidate or compact-pair control.
             Defaults to ``mlx_cell_tiles``.
 
@@ -309,8 +311,13 @@ def runtime_payload(
         validation_blockers.append("diagnostic_interval_must_be_positive")
     if neighbor_backend not in _RUNTIME_NEIGHBOR_BACKENDS:
         validation_blockers.append("neighbor_backend_must_be_registered_runtime_backend")
-    if neighbor_rebuild_profile and neighbor_backend != "mlx_cell_tiles":
-        validation_blockers.append("neighbor_rebuild_profile_requires_mlx_cell_tiles")
+    if neighbor_rebuild_profile and neighbor_backend not in {
+        "mlx_cell_tiles",
+        "mlx_interaction32",
+    }:
+        validation_blockers.append(
+            "neighbor_rebuild_profile_requires_structured_metal_backend"
+        )
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
     validation_blockers.extend(
         f"missing_prepared_input:{path}" for path in required if not path.is_file()
@@ -394,9 +401,12 @@ def runtime_payload(
         measured_neighbor_rebuild_start = neighbor_manager.rebuild_wall_seconds
         measured_neighbor_rebuild_count_start = neighbor_manager.rebuild_count
 
-        rebuild_profile_context = (
-            _profile_mlx_cell_tile_rebuilds() if neighbor_rebuild_profile else nullcontext(None)
-        )
+        if not neighbor_rebuild_profile:
+            rebuild_profile_context = nullcontext(None)
+        elif neighbor_backend == "mlx_cell_tiles":
+            rebuild_profile_context = _profile_mlx_cell_tile_rebuilds()
+        else:
+            rebuild_profile_context = _profile_interaction32_rebuilds()
         measured_started = time.perf_counter()
         with rebuild_profile_context as rebuild_profiler:
             measured_result = simulate_nvt(
@@ -1584,7 +1594,10 @@ def main(argv: list[str] | None = None) -> None:
     runtime_parser.add_argument(
         "--neighbor-rebuild-profile",
         action="store_true",
-        help="attribute synchronized stages inside measured Metal tile rebuilds",
+        help=(
+            "attribute synchronized stages inside measured Metal tile or "
+            "Interaction32 rebuilds"
+        ),
     )
     runtime_parser.add_argument("--out", type=Path, required=True)
     profile_parser = commands.add_parser(

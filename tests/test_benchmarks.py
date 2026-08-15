@@ -2352,7 +2352,7 @@ def test_pme_performance_build_payload_blocks_nonlazy_topology(tmp_path, monkeyp
     assert "prepared_topology:not_lazy" in payload["blocker"]
 
 
-def test_charged_pme_rebuild_profile_requires_tile_backend(tmp_path):
+def test_charged_pme_rebuild_profile_requires_structured_metal_backend(tmp_path):
     payload = charged_pme.runtime_payload(
         prepared=tmp_path / "missing",
         warmups=1,
@@ -2363,7 +2363,10 @@ def test_charged_pme_rebuild_profile_requires_tile_backend(tmp_path):
     )
 
     assert payload["neighbor_rebuild_profile"] is True
-    assert "neighbor_rebuild_profile_requires_mlx_cell_tiles" in payload["blockers"]
+    assert (
+        "neighbor_rebuild_profile_requires_structured_metal_backend"
+        in payload["blockers"]
+    )
 
 
 def test_pme_performance_build_payload_blocks_neighbor_build_failure(

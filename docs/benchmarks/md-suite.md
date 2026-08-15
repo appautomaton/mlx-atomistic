@@ -78,6 +78,22 @@ uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --out results/md-suite/interaction32.json
 ```
 
+Attribute non-overlapping synchronized stages inside its measured rebuilds:
+
+```bash
+uv run python -m mlx_atomistic.benchmarks.charged_pme runtime \
+  --prepared results/dhfr-npt-closure/prepared \
+  --neighbor-backend mlx_interaction32 \
+  --neighbor-rebuild-profile \
+  --warmups 10 \
+  --steps 750 \
+  --out results/md-suite/interaction32-rebuild-profile.json
+```
+
+This mode deliberately synchronizes geometry, topology preparation, special
+inventory, count/prefix, admission, scatter, and completion boundaries. Use it
+for attribution only; run the same workload without the flag for throughput.
+
 Build a whole-step performance map before choosing an optimization target:
 
 ```bash

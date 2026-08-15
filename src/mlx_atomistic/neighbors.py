@@ -23,7 +23,11 @@ from mlx_atomistic.cell_list import (
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.interaction_engine import (
     _DeviceFusedHalfSchedule32,
+    _interaction32_profile_finish_build,
+    _interaction32_profile_finish_stage,
+    _interaction32_profile_start,
     _Interaction32ScheduleCapacity,
+    _PreparedInteraction32Topology,
     _retry_device_fused_half_schedule32,
     _try_build_device_fused_half_schedule32,
 )
@@ -975,6 +979,12 @@ class NeighborListManager:
         repr=False,
         compare=False,
     )
+    _interaction32_topology: _PreparedInteraction32Topology | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.check_interval <= 0:
@@ -1138,6 +1148,7 @@ class NeighborListManager:
         box_lengths = np.asarray(np.diag(np.asarray(self.cell.matrix)), dtype=np.float32)
         search_radius = self.cutoff + self.skin
         generation = self.rebuild_count + 1
+        build_started = _interaction32_profile_start()
         attempt = _try_build_device_fused_half_schedule32(
             positions_mx,
             box_lengths,
@@ -1147,13 +1158,17 @@ class NeighborListManager:
             lj_exclusion_pairs=self.interaction32_exclusion_pairs,
             lj_one_four_pairs=self.interaction32_one_four_pairs,
             ordinary_tiles_per_group=self.interaction32_ordinary_tiles_per_group,
+            topology=self._interaction32_topology,
         )
+        self._interaction32_topology = attempt.topology
+        overflow_retry = attempt.overflow
         if attempt.overflow:
             attempt = _retry_device_fused_half_schedule32(attempt)
         schedule = attempt.schedule
         if schedule is None or schedule.generation is None:
             msg = "Interaction32 schedule build did not commit a generation"
             raise RuntimeError(msg)
+        completion_started = _interaction32_profile_start()
         arrays = (
             schedule.atom_order,
             schedule.ordinary_left_blocks,
@@ -1195,7 +1210,7 @@ class NeighborListManager:
             compaction_backend="metal_interaction32_device_builder",
             fallback_reason=None,
         )
-        return NeighborList(
+        neighbor_list = NeighborList(
             None,
             cutoff=self.cutoff,
             skin=self.skin,
@@ -1205,6 +1220,28 @@ class NeighborListManager:
             reference_positions=positions_mx,
             cell=self.cell,
         )
+        _interaction32_profile_finish_stage(
+            "schedule_completion",
+            completion_started,
+        )
+        capacity = schedule.generation.capacity
+        _interaction32_profile_finish_build(
+            build_started,
+            inventory={
+                "atom_count": inventory.geometry.atom_count,
+                "occupied_cell_count": inventory.occupied_cell_count,
+                "ordinary_right_entry_count": inventory.right_entry_count,
+                "ordinary_logical_pair_lanes": inventory.logical_pair_lanes,
+                "ordinary_tile_count": inventory.ordinary_tile_count,
+                "ordinary_group_count": inventory.ordinary_group_count,
+                "special_tile_count": inventory.special_tile_count,
+                "ordinary_tile_capacity": capacity.ordinary_tiles,
+                "ordinary_group_capacity": capacity.ordinary_groups,
+                "special_tile_capacity": capacity.special_tiles,
+                "overflow_retry_count": int(overflow_retry),
+            },
+        )
+        return neighbor_list
 
     def update(self, positions) -> NeighborList:
         """Return a current neighbor list, rebuilding if needed."""
@@ -1304,6 +1341,7 @@ class NeighborListManager:
             update_wall_seconds=self.update_wall_seconds,
         )
         candidate._interaction32_capacity = self._interaction32_capacity
+        candidate._interaction32_topology = self._interaction32_topology
         candidate.rebuild(positions)
         return candidate
 

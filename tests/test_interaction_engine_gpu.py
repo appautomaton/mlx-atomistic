@@ -11,6 +11,7 @@ import pytest
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.interaction_engine import (
+    _INTERACTION32_REBUILD_PROFILE_STAGES,
     _assemble_device_fused_half_schedule32,
     _build_device_block_geometry32,
     _build_device_ordinary_schedule32,
@@ -27,6 +28,7 @@ from mlx_atomistic.interaction_engine import (
     _make_atom_blocks,
     _normalize_pairs,
     _owner_compute32_direct_force_only,
+    _profile_interaction32_rebuilds,
     _retry_device_fused_half_schedule32,
     _special_block_codes,
     _try_build_device_fused_half_schedule32,
@@ -790,6 +792,67 @@ def test_device_schedule_generation_fingerprints_topology_changes():
         first.schedule.generation.topology_digest
         != changed.schedule.generation.topology_digest
     )
+
+
+@pytest.mark.gpu
+def test_interaction32_rebuild_stage_profile_reconciles_exact_inventory():
+    """Opt-in synchronized profiling accounts for complete manager rebuilds."""
+
+    rng = np.random.default_rng(127)
+    positions = rng.uniform(0.0, 20.0, size=(257, 3)).astype(np.float32)
+    manager = NeighborListManager(
+        Cell.orthorhombic([20.0, 20.0, 20.0]),
+        cutoff=4.0,
+        skin=0.5,
+        backend="mlx_interaction32",
+        interaction32_exclusion_pairs=[[0, 1], [40, 80]],
+        interaction32_one_four_pairs=[[2, 3]],
+    )
+
+    with _profile_interaction32_rebuilds() as profiler:
+        first = manager.rebuild(positions)
+        first_topology = manager._interaction32_topology
+        moved = positions.copy()
+        moved[0, 0] += 0.01
+        second = manager.rebuild(moved)
+        assert manager._interaction32_topology is first_topology
+
+    report = profiler.report()
+    assert report["schema"] == "mlx_atomistic.interaction32_rebuild_profile.v1"
+    assert report["backend"] == "mlx_interaction32"
+    assert report["stage_order"] == list(_INTERACTION32_REBUILD_PROFILE_STAGES)
+    assert report["rebuild_count"] == 2
+    assert report["reconciled"] is True
+    assert report["inventories"]["count"] == 2
+    assert report["inventories"]["atom_count"]["median"] == 257.0
+    assert report["inventories"]["overflow_retry_count"] == {
+        "minimum": 0,
+        "median": 0.5,
+        "maximum": 1,
+    }
+    assert all(stage["count"] == 2 for stage in report["stages"].values())
+    assert first.interaction32 is not None
+    assert second.interaction32 is not None
+    assert first._pairs is None
+    assert second._pairs is None
+
+    manager.interaction32_exclusion_pairs = [[0, 1], [5, 6], [40, 80]]
+    changed = manager.rebuild(moved)
+    assert manager._interaction32_topology is not first_topology
+    assert changed.interaction32 is not None
+    assert first.interaction32.generation is not None
+    assert changed.interaction32.generation is not None
+    assert (
+        first.interaction32.generation.topology_digest
+        != changed.interaction32.generation.topology_digest
+    )
+
+    with (
+        _profile_interaction32_rebuilds(),
+        pytest.raises(RuntimeError, match="cannot be nested"),
+        _profile_interaction32_rebuilds(),
+    ):
+        pass
 
 
 @pytest.mark.gpu

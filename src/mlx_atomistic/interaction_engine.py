@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from hashlib import sha256
 from math import ceil, isfinite
+from time import perf_counter
 
 import mlx.core as mx
 import numpy as np
@@ -28,6 +32,184 @@ _INTERACTION_TILE_SIZE = 32
 _DEFAULT_ORDINARY_TILES_PER_GROUP = 3
 _INTERACTION32_CAPACITY_RESERVE = 1.25
 _INTERACTION32_CAPACITY_QUANTUM = 64
+_INTERACTION32_REBUILD_PROFILE_STAGES = (
+    "geometry_validation_and_sort",
+    "topology_preparation",
+    "special_block_inventory",
+    "ordinary_count_and_prefix_readback",
+    "capacity_admission",
+    "ordinary_scatter",
+    "special_scatter",
+    "schedule_completion",
+)
+
+
+def _interaction32_timing_summary(
+    samples: list[float],
+    *,
+    total_build_seconds: float,
+) -> dict[str, object]:
+    """Summarize one synchronized Interaction32 builder-stage sample vector."""
+
+    total = float(sum(samples))
+    return {
+        "count": len(samples),
+        "total_seconds": total,
+        "median_seconds": None if not samples else float(np.median(samples)),
+        "minimum_seconds": None if not samples else float(min(samples)),
+        "maximum_seconds": None if not samples else float(max(samples)),
+        "fraction_of_profiled_rebuild_wall": (
+            0.0 if total_build_seconds <= 0.0 else total / total_build_seconds
+        ),
+        "samples_seconds": list(samples),
+    }
+
+
+def _interaction32_inventory_summary(
+    samples: list[dict[str, int]],
+) -> dict[str, dict[str, int | float] | int]:
+    """Summarize integer Interaction32 inventories across profiled rebuilds."""
+
+    if not samples:
+        return {"count": 0}
+    names = tuple(samples[0])
+    summary: dict[str, dict[str, int | float] | int] = {"count": len(samples)}
+    for name in names:
+        values = [int(sample[name]) for sample in samples]
+        summary[name] = {
+            "minimum": min(values),
+            "median": float(np.median(values)),
+            "maximum": max(values),
+        }
+    return summary
+
+
+@dataclass
+class _Interaction32RebuildProfiler:
+    """Collect synchronized stage timings for the Interaction32 builder."""
+
+    stage_samples: dict[str, list[float]] = field(
+        default_factory=lambda: {
+            name: [] for name in _INTERACTION32_REBUILD_PROFILE_STAGES
+        }
+    )
+    build_samples: list[float] = field(default_factory=list)
+    inventory_samples: list[dict[str, int]] = field(default_factory=list)
+
+    def record_stage(self, name: str, elapsed_seconds: float) -> None:
+        """Record one synchronized builder-stage sample."""
+
+        if name not in self.stage_samples:
+            msg = f"unknown Interaction32 rebuild stage {name!r}"
+            raise ValueError(msg)
+        self.stage_samples[name].append(float(elapsed_seconds))
+
+    def record_build(
+        self,
+        elapsed_seconds: float,
+        *,
+        inventory: dict[str, int],
+    ) -> None:
+        """Record one complete profiled build and its interaction inventory."""
+
+        self.build_samples.append(float(elapsed_seconds))
+        self.inventory_samples.append(dict(inventory))
+
+    def report(self) -> dict[str, object]:
+        """Return a JSON-serializable synchronized stage report."""
+
+        build_total = float(sum(self.build_samples))
+        stages = {
+            name: _interaction32_timing_summary(
+                self.stage_samples[name],
+                total_build_seconds=build_total,
+            )
+            for name in _INTERACTION32_REBUILD_PROFILE_STAGES
+        }
+        accounted = float(sum(float(stage["total_seconds"]) for stage in stages.values()))
+        unattributed = build_total - accounted
+        tolerance = max(1.0e-6, build_total * 0.05)
+        stage_counts_match = all(
+            len(samples) == len(self.build_samples)
+            for samples in self.stage_samples.values()
+        )
+        return {
+            "schema": "mlx_atomistic.interaction32_rebuild_profile.v1",
+            "mode": "sequential_synchronized_builder_stages",
+            "backend": "mlx_interaction32",
+            "stage_order": list(_INTERACTION32_REBUILD_PROFILE_STAGES),
+            "rebuild_count": len(self.build_samples),
+            "profiled_rebuild_wall_seconds": build_total,
+            "accounted_stage_seconds": accounted,
+            "unattributed_seconds": unattributed,
+            "reconciled": stage_counts_match and -tolerance <= unattributed <= tolerance,
+            "build_samples_seconds": list(self.build_samples),
+            "stages": stages,
+            "inventories": _interaction32_inventory_summary(self.inventory_samples),
+        }
+
+
+_ACTIVE_INTERACTION32_REBUILD_PROFILER: ContextVar[
+    _Interaction32RebuildProfiler | None
+] = ContextVar(
+    "mlx_atomistic_active_interaction32_rebuild_profiler",
+    default=None,
+)
+
+
+@contextmanager
+def _profile_interaction32_rebuilds() -> Iterator[_Interaction32RebuildProfiler]:
+    """Collect synchronized Interaction32 stage timings inside the context."""
+
+    if _ACTIVE_INTERACTION32_REBUILD_PROFILER.get() is not None:
+        msg = "Interaction32 rebuild profiling contexts cannot be nested"
+        raise RuntimeError(msg)
+    profiler = _Interaction32RebuildProfiler()
+    token = _ACTIVE_INTERACTION32_REBUILD_PROFILER.set(profiler)
+    try:
+        yield profiler
+    finally:
+        _ACTIVE_INTERACTION32_REBUILD_PROFILER.reset(token)
+
+
+def _interaction32_profile_start() -> float | None:
+    """Start one opt-in wall-clock interval without affecting the fast path."""
+
+    if _ACTIVE_INTERACTION32_REBUILD_PROFILER.get() is None:
+        return None
+    return perf_counter()
+
+
+def _interaction32_profile_finish_stage(
+    name: str,
+    started: float | None,
+    *values: object,
+) -> None:
+    """Synchronize and record one opt-in builder stage."""
+
+    if started is None:
+        return
+    if values:
+        mx.eval(*values)
+    profiler = _ACTIVE_INTERACTION32_REBUILD_PROFILER.get()
+    if profiler is None:
+        raise RuntimeError("Interaction32 rebuild profiling context ended during a stage")
+    profiler.record_stage(name, perf_counter() - started)
+
+
+def _interaction32_profile_finish_build(
+    started: float | None,
+    *,
+    inventory: dict[str, int],
+) -> None:
+    """Record one complete Interaction32 rebuild when profiling is active."""
+
+    if started is None:
+        return
+    profiler = _ACTIVE_INTERACTION32_REBUILD_PROFILER.get()
+    if profiler is None:
+        raise RuntimeError("Interaction32 rebuild profiling context ended during a build")
+    profiler.record_build(perf_counter() - started, inventory=inventory)
 
 
 def _normalize_pairs(pairs: object, atom_count: int, name: str) -> np.ndarray:
@@ -355,6 +537,22 @@ class _DeviceBlockGeometry32:
 
 
 @dataclass(frozen=True)
+class _PreparedInteraction32Topology:
+    """Immutable topology payload shared by every spatial generation."""
+
+    atom_count: int
+    exclusion_source_id: int
+    one_four_source_id: int
+    device: str
+    digest: str
+    exclusion_pairs: mx.array
+    one_four_pairs: mx.array
+    topology_offsets: mx.array
+    topology_neighbors: mx.array
+    topology_classes: mx.array
+
+
+@dataclass(frozen=True)
 class _DeviceSpecialBlockInventory32:
     atom_count: int
     block_count: int
@@ -448,6 +646,7 @@ class _Interaction32Generation:
 @dataclass(frozen=True)
 class _DeviceScheduleBuildAttempt32:
     inventory: _DeviceScheduleInventory32
+    topology: _PreparedInteraction32Topology
     requested_capacity: _Interaction32ScheduleCapacity | None
     recommended_capacity: _Interaction32ScheduleCapacity
     overflow_fields: tuple[str, ...]
@@ -719,6 +918,7 @@ def _build_device_special_block_inventory32(
     *,
     lj_exclusion_pairs: object = (),
     lj_one_four_pairs: object = (),
+    topology: _PreparedInteraction32Topology | None = None,
 ) -> _DeviceSpecialBlockInventory32:
     """Mark diagonal and topology-bearing packed block pairs on device."""
 
@@ -727,15 +927,16 @@ def _build_device_special_block_inventory32(
     block_code_capacity = block_count * block_count
     if block_code_capacity > np.iinfo(np.int32).max:
         raise ValueError("32-atom block-pair inventory exceeds int32 capacity")
-    exclusions = _normalize_pairs(lj_exclusion_pairs, atom_count, "lj_exclusion_pairs")
-    one_four = _normalize_pairs(lj_one_four_pairs, atom_count, "lj_one_four_pairs")
-    exclusion_codes = _pair_codes(exclusions, atom_count)
-    one_four_codes = _pair_codes(one_four, atom_count)
-    if np.any(_contains_sorted(exclusion_codes, one_four_codes)):
-        raise ValueError("LJ exclusion and one-four pair sets must be disjoint")
-
-    exclusion_pairs = mx.array(exclusions, dtype=mx.int32)
-    one_four_pairs = mx.array(one_four, dtype=mx.int32)
+    if topology is None:
+        topology = _prepare_interaction32_topology(
+            atom_count,
+            lj_exclusion_pairs=lj_exclusion_pairs,
+            lj_one_four_pairs=lj_one_four_pairs,
+        )
+    if topology.atom_count != atom_count:
+        raise ValueError("prepared Interaction32 topology must match the geometry")
+    exclusion_pairs = topology.exclusion_pairs
+    one_four_pairs = topology.one_four_pairs
     code_groups = [
         mx.arange(block_count, dtype=mx.int32) * (block_count + 1),
     ]
@@ -756,11 +957,6 @@ def _build_device_special_block_inventory32(
         )
     )
     special_count = mx.sum(block_code_unique).astype(mx.int32)
-    topology_offsets, topology_neighbors, topology_classes = _build_owner_topology(
-        atom_count,
-        exclusions,
-        one_four,
-    )
     return _DeviceSpecialBlockInventory32(
         atom_count=atom_count,
         block_count=block_count,
@@ -769,9 +965,9 @@ def _build_device_special_block_inventory32(
         block_codes=block_codes,
         block_code_unique=block_code_unique,
         special_count=special_count,
-        topology_offsets=mx.array(topology_offsets, dtype=mx.int32),
-        topology_neighbors=mx.array(topology_neighbors, dtype=mx.int32),
-        topology_classes=mx.array(topology_classes, dtype=mx.int32),
+        topology_offsets=topology.topology_offsets,
+        topology_neighbors=topology.topology_neighbors,
+        topology_classes=topology.topology_classes,
     )
 
 
@@ -1073,12 +1269,62 @@ def _interaction32_topology_digest(
     return digest.hexdigest()
 
 
+def _prepare_interaction32_topology(
+    atom_count: int,
+    *,
+    lj_exclusion_pairs: object = (),
+    lj_one_four_pairs: object = (),
+) -> _PreparedInteraction32Topology:
+    """Prepare immutable topology data for reuse across spatial generations."""
+
+    exclusions = _normalize_pairs(lj_exclusion_pairs, atom_count, "lj_exclusion_pairs")
+    one_four = _normalize_pairs(lj_one_four_pairs, atom_count, "lj_one_four_pairs")
+    exclusion_codes = _pair_codes(exclusions, atom_count)
+    one_four_codes = _pair_codes(one_four, atom_count)
+    if np.any(_contains_sorted(exclusion_codes, one_four_codes)):
+        raise ValueError("LJ exclusion and one-four pair sets must be disjoint")
+    topology_offsets, topology_neighbors, topology_classes = _build_owner_topology(
+        atom_count,
+        exclusions,
+        one_four,
+    )
+    return _PreparedInteraction32Topology(
+        atom_count=atom_count,
+        exclusion_source_id=id(lj_exclusion_pairs),
+        one_four_source_id=id(lj_one_four_pairs),
+        device=str(mx.default_device()),
+        digest=_interaction32_topology_digest(atom_count, exclusions, one_four),
+        exclusion_pairs=mx.array(exclusions, dtype=mx.int32),
+        one_four_pairs=mx.array(one_four, dtype=mx.int32),
+        topology_offsets=mx.array(topology_offsets, dtype=mx.int32),
+        topology_neighbors=mx.array(topology_neighbors, dtype=mx.int32),
+        topology_classes=mx.array(topology_classes, dtype=mx.int32),
+    )
+
+
+def _interaction32_topology_matches_sources(
+    topology: _PreparedInteraction32Topology,
+    *,
+    atom_count: int,
+    lj_exclusion_pairs: object,
+    lj_one_four_pairs: object,
+) -> bool:
+    """Return whether a topology snapshot still owns the declared inputs."""
+
+    return (
+        topology.atom_count == atom_count
+        and topology.exclusion_source_id == id(lj_exclusion_pairs)
+        and topology.one_four_source_id == id(lj_one_four_pairs)
+        and topology.device == str(mx.default_device())
+    )
+
+
 def _materialize_device_schedule_attempt32(
     inventory: _DeviceScheduleInventory32,
     *,
+    topology: _PreparedInteraction32Topology,
     capacity: _Interaction32ScheduleCapacity,
     generation_value: int,
-    topology_digest: str,
 ) -> _DeviceScheduleBuildAttempt32:
     """Materialize one admitted generation after all capacity checks pass."""
 
@@ -1087,30 +1333,53 @@ def _materialize_device_schedule_attempt32(
     if overflow_fields:
         return _DeviceScheduleBuildAttempt32(
             inventory=inventory,
+            topology=topology,
             requested_capacity=capacity,
             recommended_capacity=recommended,
             overflow_fields=overflow_fields,
             generation_value=generation_value,
-            topology_digest=topology_digest,
+            topology_digest=topology.digest,
             schedule=None,
         )
+    ordinary_started = _interaction32_profile_start()
     ordinary = _materialize_device_ordinary_schedule32(
         inventory,
         tile_capacity=capacity.ordinary_tiles,
         group_capacity=capacity.ordinary_groups,
     )
+    _interaction32_profile_finish_stage(
+        "ordinary_scatter",
+        ordinary_started,
+        ordinary.ordinary_left_blocks,
+        ordinary.ordinary_right_atoms,
+        ordinary.ordinary_half_modes,
+        ordinary.ordinary_group_starts,
+        ordinary.ordinary_group_counts,
+    )
+    special_started = _interaction32_profile_start()
     special = _build_device_special_schedule32(
         inventory.geometry,
         inventory.special,
         special_tile_count=inventory.special_tile_count,
         tile_capacity=capacity.special_tiles,
     )
+    _interaction32_profile_finish_stage(
+        "special_scatter",
+        special_started,
+        special.special_blocks,
+        special.special_work_left_blocks,
+        special.special_work_left_slices,
+        special.special_work_right_atoms,
+        special.special_work_lj_enabled,
+        special.special_work_lj_one_four,
+        special.special_work_diagonal,
+    )
     generation = _Interaction32Generation(
         value=generation_value,
         atom_count=inventory.geometry.atom_count,
         box_lengths=tuple(float(value) for value in inventory.geometry.box_lengths),
         search_radius=inventory.geometry.search_radius,
-        topology_digest=topology_digest,
+        topology_digest=topology.digest,
         capacity=capacity,
     )
     schedule = _assemble_device_fused_half_schedule32(
@@ -1121,11 +1390,12 @@ def _materialize_device_schedule_attempt32(
     )
     return _DeviceScheduleBuildAttempt32(
         inventory=inventory,
+        topology=topology,
         requested_capacity=capacity,
         recommended_capacity=capacity,
         overflow_fields=(),
         generation_value=generation_value,
-        topology_digest=topology_digest,
+        topology_digest=topology.digest,
         schedule=schedule,
     )
 
@@ -1140,59 +1410,97 @@ def _try_build_device_fused_half_schedule32(
     lj_exclusion_pairs: object = (),
     lj_one_four_pairs: object = (),
     ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+    topology: _PreparedInteraction32Topology | None = None,
 ) -> _DeviceScheduleBuildAttempt32:
     """Count one candidate generation and stop before scatter on overflow."""
 
     if generation_value < 0:
         raise ValueError("generation_value must be non-negative")
+    geometry_started = _interaction32_profile_start()
     geometry = _build_device_block_geometry32(
         positions,
         box_lengths,
         search_radius=search_radius,
     )
-    exclusions = _normalize_pairs(
-        lj_exclusion_pairs,
-        geometry.atom_count,
-        "lj_exclusion_pairs",
+    _interaction32_profile_finish_stage(
+        "geometry_validation_and_sort",
+        geometry_started,
+        geometry.occupied_cell_count,
+        geometry.atom_order,
+        geometry.inverse_order,
+        geometry.center_radius,
+        geometry.half_extent,
+        geometry.block_traversal,
     )
-    one_four = _normalize_pairs(
-        lj_one_four_pairs,
-        geometry.atom_count,
-        "lj_one_four_pairs",
+    topology_started = _interaction32_profile_start()
+    if topology is None or not _interaction32_topology_matches_sources(
+        topology,
+        atom_count=geometry.atom_count,
+        lj_exclusion_pairs=lj_exclusion_pairs,
+        lj_one_four_pairs=lj_one_four_pairs,
+    ):
+        topology = _prepare_interaction32_topology(
+            geometry.atom_count,
+            lj_exclusion_pairs=lj_exclusion_pairs,
+            lj_one_four_pairs=lj_one_four_pairs,
+        )
+    _interaction32_profile_finish_stage(
+        "topology_preparation",
+        topology_started,
+        topology.exclusion_pairs,
+        topology.one_four_pairs,
+        topology.topology_offsets,
+        topology.topology_neighbors,
+        topology.topology_classes,
     )
+    special_inventory_started = _interaction32_profile_start()
     special = _build_device_special_block_inventory32(
         geometry,
-        lj_exclusion_pairs=exclusions,
-        lj_one_four_pairs=one_four,
+        topology=topology,
     )
+    _interaction32_profile_finish_stage(
+        "special_block_inventory",
+        special_inventory_started,
+        special.exclusion_pairs,
+        special.one_four_pairs,
+        special.block_codes,
+        special.block_code_unique,
+        special.special_count,
+        special.topology_offsets,
+        special.topology_neighbors,
+        special.topology_classes,
+    )
+    count_started = _interaction32_profile_start()
     inventory = _count_device_schedule_inventory32(
         positions,
         geometry,
         special,
         ordinary_tiles_per_group=ordinary_tiles_per_group,
     )
-    topology_digest = _interaction32_topology_digest(
-        geometry.atom_count,
-        exclusions,
-        one_four,
+    _interaction32_profile_finish_stage(
+        "ordinary_count_and_prefix_readback",
+        count_started,
     )
+    admission_started = _interaction32_profile_start()
     recommended = _interaction32_capacity_for_inventory(inventory, capacity)
     overflow_fields = _interaction32_capacity_overflow_fields(inventory, capacity)
+    _interaction32_profile_finish_stage("capacity_admission", admission_started)
     if overflow_fields:
         return _DeviceScheduleBuildAttempt32(
             inventory=inventory,
+            topology=topology,
             requested_capacity=capacity,
             recommended_capacity=recommended,
             overflow_fields=overflow_fields,
             generation_value=generation_value,
-            topology_digest=topology_digest,
+            topology_digest=topology.digest,
             schedule=None,
         )
     return _materialize_device_schedule_attempt32(
         inventory,
+        topology=topology,
         capacity=capacity,
         generation_value=generation_value,
-        topology_digest=topology_digest,
     )
 
 
@@ -1208,9 +1516,9 @@ def _retry_device_fused_half_schedule32(
     selected = attempt.recommended_capacity if capacity is None else capacity
     return _materialize_device_schedule_attempt32(
         attempt.inventory,
+        topology=attempt.topology,
         capacity=selected,
         generation_value=attempt.generation_value,
-        topology_digest=attempt.topology_digest,
     )
 
 

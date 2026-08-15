@@ -150,23 +150,22 @@ evidence remains in the JAC, GPCRmd, and same-workload reports indexed from the
 
 ## Current Bottleneck Direction
 
-The 32-atom Direct Space route now wins complete trajectories, while its
-Neighbor generation is still slower than production tiles. The next shared
-target is therefore the Interaction32 builder itself, especially the repeated
-ordinary traversal and GPCRmd topology-bearing special inventory. Work should
-proceed in this order:
+The 32-atom Direct Space route and its Neighbor builder now both beat the
+production tile route on 5DFR, JAC, and GPCRmd. Synchronized attribution showed
+that 59.9-72.3% of the original builder wall rebuilt fixed topology data on
+every spatial generation. A manager-owned immutable topology snapshot removed
+that repeated host transfer, sorting, deduplication, owner-table construction,
+and allocation while retaining geometry-dependent special-block mapping.
 
-1. attribute count, prefix, scatter, topology, and completion costs without
-   changing the clean execution path;
-2. reduce repeated geometric work or temporary allocation while preserving the
-   capacity and generation contract;
-3. consider a native MLX primitive only if the single scalar inventory boundary
-   is measured as material;
-4. return to constraints and CHARMM bonded work after the builder is no longer
-   the candidate's largest regression against production.
+The next target must come from a fresh whole-step profile of the improved
+runtime. Inside the remaining builder, ordinary count/prefix and ordinary
+scatter are now the two comparable large-system costs. They should be changed
+only if they remain material in the complete trajectory profile. The scalar
+capacity admission is measured in microseconds and does not justify a native
+C++ MLX primitive.
 
 The experimental 32-atom engine is not the default production route. Its
 device-built schedule now passes the initial 5DFR, JAC, and NBFIX-bearing
-GPCRmd end-to-end gate. It remains opt-in while builder optimization and broader
-stability coverage continue. See
+GPCRmd end-to-end gate. It remains opt-in while broader stability coverage and
+whole-step profiling continue. See
 [`metal-interaction-engine.md`](./metal-interaction-engine.md).

@@ -258,6 +258,61 @@ direct force is cheaper. This makes builder stage attribution the next target;
 it does not yet justify a C++ MLX primitive because the remaining scalar
 inventory boundary has not been isolated as the cause.
 
+### Topology snapshot checkpoint
+
+The follow-up attribution added an opt-in, sequentially synchronized
+Interaction32 rebuild profile. It separates geometry, topology preparation,
+geometry-dependent special-block inventory, ordinary count/prefix readback,
+capacity admission, ordinary scatter, special scatter, and completion. The
+profiler is inactive on the clean path and adds no device synchronization when
+disabled.
+
+Before the optimization, fixed topology processing dominated every system:
+
+| Workload | Profiled builder | Fixed topology share | Fixed topology median |
+| --- | ---: | ---: | ---: |
+| 5DFR | 14.84 ms/rebuild | 61.3% | 8.64 ms |
+| JAC 4-cell | 59.50 ms/rebuild | 59.9% | 34.46 ms |
+| GPCRmd 729 | 82.59 ms/rebuild | 72.3% | 57.60 ms |
+
+Exclusion and one-four pairs, topology owner offsets, neighbor classes, and the
+topology digest depend on topology rather than positions. They are now prepared
+once as a manager-owned immutable snapshot and reused across spatial
+generations. Reassigning either topology source invalidates the snapshot, and a
+cell candidate inherits it. Special block codes still rebuild from the current
+atom ordering, so dynamic geometry is not frozen.
+
+With the snapshot active, steady-state topology lookup is 0.005-0.006 ms and
+the remaining geometry-dependent special inventory is 0.39-0.64 ms. The same
+750-step synchronized profiles measured these builder reductions:
+
+| Workload | Before | After | Builder reduction |
+| --- | ---: | ---: | ---: |
+| 5DFR | 14.84 ms/rebuild | 6.52 ms/rebuild | 56.1% |
+| JAC 4-cell | 59.50 ms/rebuild | 29.02 ms/rebuild | 51.2% |
+| GPCRmd 729 | 82.59 ms/rebuild | 27.22 ms/rebuild | 67.0% |
+
+A separate clean production/candidate/candidate/production comparison used two
+independent processes per arm, ten warmup steps, 750 measured steps, seed 17,
+skin 5.5 A, and unchanged Low Power Mode. Every arm passed finite-state,
+constraint, topology, memory, Neighbor-representation, and PME-plan reuse
+checks.
+
+| Workload | Production tiles | Interaction32 | Complete-wall speedup | Production builder | Interaction32 builder |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5DFR | 1.7922 ms/step | 1.4448 ms/step | 19.39% | 11.72 ms/rebuild | 5.78 ms/rebuild |
+| JAC 4-cell | 6.9320 ms/step | 5.3844 ms/step | 22.33% | 48.92 ms/rebuild | 27.34 ms/rebuild |
+| GPCRmd 729 | 7.8009 ms/step | 5.9995 ms/step | 23.09% | 46.10 ms/rebuild | 26.37 ms/rebuild |
+
+Raw JSON is under
+`results/md-suite/interaction32-builder-topology-cache-2026-08-15/`. The old
+builder control is commit `25adc7d`. These results close the builder regression
+that remained at the moving-NVT checkpoint. The next decision must use a fresh
+whole-step profile. If the builder is still selected, ordinary count/prefix and
+ordinary scatter are its next shared targets. Capacity admission is already a
+microsecond-scale host boundary, so this checkpoint does not authorize a C++
+MLX primitive.
+
 ### C2: optional native state boundary
 
 `mx.fast.metal_kernel` requires host-provided output shapes and direct dispatch
