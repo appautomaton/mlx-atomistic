@@ -834,8 +834,11 @@ def kinetic_energy(
 def _remove_center_of_mass_velocity(
     velocities: mx.array,
     masses: mx.array,
+    *,
+    total_mass: mx.array | None = None,
 ) -> mx.array:
-    total_mass = mx.sum(masses)
+    if total_mass is None:
+        total_mass = mx.sum(masses)
     center_velocity = mx.sum(masses[:, None] * velocities, axis=0) / total_mass
     return velocities - center_velocity
 
@@ -4398,6 +4401,11 @@ def _simulate_nvt(
             constraints.apply_velocities,
         )
     )
+    center_of_mass_total_mass = (
+        None
+        if config.center_of_mass_motion_interval is None
+        else mx.sum(masses)
+    )
     for local_step in step_range:
         integration_started = None if route_profiler is None else route_profiler.start()
         current_step = config.initial_step + local_step
@@ -4698,6 +4706,7 @@ def _simulate_nvt(
             next_velocities = _remove_center_of_mass_velocity(
                 next_velocities,
                 masses,
+                total_mass=center_of_mass_total_mass,
             )
         if isinstance(thermostat, NoseHooverThermostat):
             next_velocities = next_velocities * mx.exp(-0.5 * config.dt * nh_chain_velocity)
