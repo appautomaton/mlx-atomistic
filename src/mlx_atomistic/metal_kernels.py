@@ -448,6 +448,7 @@ _interaction32_pack_kernel_singleton = None
 _interaction32_force_kernel_singleton = None
 _interaction32_canonical_force_kernel_singleton = None
 _interaction32_fused_half_canonical_force_kernel_singleton = None
+_interaction32_fused_half_nbfix_canonical_force_kernel_singleton = None
 _interaction32_scatter_kernel_singleton = None
 _owner_compute32_force_kernel_singleton = None
 _sparse_pme_correction_force_only_kernel_singleton = None
@@ -1444,6 +1445,9 @@ _INTERACTION32_FORCE_SOURCE = r"""
     uint posq_base = 64u * sub;
     uint lj_base = 32u * sub;
 #endif
+#ifdef MLX_ATOMISTIC_NBFIX
+    threadgroup int left_type_buffer[32 * GROUPS_PER_TG];
+#endif
     if (lane < left_slice_size) {
         int left_ordered = 32 * left_block
             + (int)left_slice_size * (int)left_slice + (int)lane;
@@ -1464,6 +1468,9 @@ _INTERACTION32_FORCE_SOURCE = r"""
         left_posq_buffer[posq_base + 4u * lane + 3u] = charges[left_atom];
         left_lj_buffer[lj_base + 2u * lane + 0u] = half_sigma[left_atom];
         left_lj_buffer[lj_base + 2u * lane + 1u] = sqrt_epsilon[left_atom];
+#ifdef MLX_ATOMISTIC_NBFIX
+        left_type_buffer[left_base + lane] = atom_type_ids[left_atom];
+#endif
 #else
         left_posq_buffer[posq_base + 4u * lane + 0u] =
             packed_posq[4 * left_ordered + 0];
@@ -1497,6 +1504,9 @@ _INTERACTION32_FORCE_SOURCE = r"""
     float ewald_self = params[8];
     float inv_switch_width = params[9];
     float one_four_scale = params[10];
+#ifdef MLX_ATOMISTIC_NBFIX
+    int nbfix_type_count = (int)params[11];
+#endif
     float3 owned_left_force = float3(0.0f);
     for (uint interaction = 0u; interaction < interaction_count; interaction++) {
         uint tile = special ? group : (uint)ordinary_start + interaction;
@@ -1520,6 +1530,9 @@ _INTERACTION32_FORCE_SOURCE = r"""
             half_sigma[right_atom],
             sqrt_epsilon[right_atom]
         );
+#ifdef MLX_ATOMISTIC_NBFIX
+        int right_type_id = atom_type_ids[right_atom];
+#endif
 #else
         int right_atom = safe_right;
         float4 right_posq = float4(
@@ -1577,6 +1590,17 @@ _INTERACTION32_FORCE_SOURCE = r"""
                     if (lj_enabled) {
                         float sigma_ij = left_lj.x + right_lj.x;
                         float epsilon_ij = left_lj.y * right_lj.y;
+#ifdef MLX_ATOMISTIC_NBFIX
+                        int nbfix_index =
+                            left_type_buffer[left_base + left_slot]
+                                * nbfix_type_count
+                            + right_type_id;
+                        float nbfix_sigma_value = nbfix_sigma[nbfix_index];
+                        if (nbfix_sigma_value > 0.0f) {
+                            sigma_ij = nbfix_sigma_value;
+                            epsilon_ij = nbfix_epsilon[nbfix_index];
+                        }
+#endif
                         float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
                         float inv_r6 = sigma2_over_r2
                             * sigma2_over_r2 * sigma2_over_r2;
@@ -3930,6 +3954,53 @@ def _interaction32_fused_half_canonical_force_kernel():
             atomic_outputs=True,
         )
     return _interaction32_fused_half_canonical_force_kernel_singleton
+
+
+def _interaction32_fused_half_nbfix_canonical_force_kernel():
+    """Return the NBFIX-aware fused-half canonical force Metal kernel."""
+
+    global _interaction32_fused_half_nbfix_canonical_force_kernel_singleton
+    if _interaction32_fused_half_nbfix_canonical_force_kernel_singleton is None:
+        _interaction32_fused_half_nbfix_canonical_force_kernel_singleton = (
+            mx.fast.metal_kernel(
+                name="interaction32_fused_half_nbfix_pme_direct_canonical_force",
+                input_names=[
+                    "positions",
+                    "atom_order",
+                    "half_sigma",
+                    "sqrt_epsilon",
+                    "charges",
+                    "atom_type_ids",
+                    "nbfix_sigma",
+                    "nbfix_epsilon",
+                    "ordinary_left_blocks",
+                    "ordinary_right_atoms",
+                    "ordinary_half_modes",
+                    "ordinary_group_starts",
+                    "ordinary_group_counts",
+                    "special_left_blocks",
+                    "special_left_slices",
+                    "special_right_atoms",
+                    "special_work_lj_enabled",
+                    "special_work_lj_one_four",
+                    "special_diagonal",
+                    "box",
+                    "params",
+                    "counts",
+                ],
+                output_names=["ordered_forces"],
+                source=(
+                    "#define MLX_ATOMISTIC_INTERACTION32_CANONICAL 1\n"
+                    "#define MLX_ATOMISTIC_INTERACTION32_FUSED_HALF 1\n"
+                    "#define MLX_ATOMISTIC_INTERACTION32_SHARED_EWALD_EXP 1\n"
+                    "#define MLX_ATOMISTIC_NBFIX 1\n"
+                    + _INTERACTION32_FORCE_SOURCE
+                ),
+                header=_ERF_HEADER,
+                atomic_outputs=True,
+            )
+        )
+    return _interaction32_fused_half_nbfix_canonical_force_kernel_singleton
 
 
 def _interaction32_scatter_kernel():
@@ -7621,6 +7692,10 @@ def _interaction32_fused_half_pme_direct_force_only(
     one_four_scale: float,
     coulomb_constant: float,
     alpha: float,
+    atom_type_ids: mx.array | None = None,
+    nbfix_type_sigma: mx.array | None = None,
+    nbfix_type_epsilon: mx.array | None = None,
+    nbfix_type_count: int = 0,
     _simdgroups_per_threadgroup: int = _INTERACTION32_GROUPS_PER_THREADGROUP,
 ) -> mx.array:
     """Evaluate fused 16-atom memberships with one right-force write."""
@@ -7642,6 +7717,10 @@ def _interaction32_fused_half_pme_direct_force_only(
     half_sigma = as_mx_array(half_sigma, dtype=mx.float32)
     sqrt_epsilon = as_mx_array(sqrt_epsilon, dtype=mx.float32)
     charges = as_mx_array(charges, dtype=mx.float32)
+    nbfix_inputs = (atom_type_ids, nbfix_type_sigma, nbfix_type_epsilon)
+    has_nbfix = any(value is not None for value in nbfix_inputs)
+    if has_nbfix and not all(value is not None for value in nbfix_inputs):
+        raise ValueError("NBFIX interaction inputs must be provided together")
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ValueError("positions must have shape (n_atoms, 3)")
     atom_count = int(positions.shape[0])
@@ -7682,6 +7761,22 @@ def _interaction32_fused_half_pme_direct_force_only(
         or charges.shape != parameter_shape
     ):
         raise ValueError("prepared nonbonded parameters must match the atom count")
+    if has_nbfix:
+        atom_type_ids = as_mx_array(atom_type_ids, dtype=mx.int32)
+        nbfix_type_sigma = as_mx_array(nbfix_type_sigma, dtype=mx.float32)
+        nbfix_type_epsilon = as_mx_array(nbfix_type_epsilon, dtype=mx.float32)
+        if atom_type_ids.shape != parameter_shape:
+            raise ValueError("atom_type_ids must match the atom count")
+        if nbfix_type_count <= 0:
+            raise ValueError("nbfix_type_count must be positive with NBFIX inputs")
+        table_shape = (nbfix_type_count * nbfix_type_count,)
+        if (
+            nbfix_type_sigma.shape != table_shape
+            or nbfix_type_epsilon.shape != table_shape
+        ):
+            raise ValueError("NBFIX tables must have shape (nbfix_type_count ** 2,)")
+    elif nbfix_type_count != 0:
+        raise ValueError("nbfix_type_count requires NBFIX interaction inputs")
     if not isfinite(float(cutoff)) or cutoff <= 0.0:
         raise ValueError("cutoff must be finite and positive")
     if not isfinite(float(alpha)) or alpha <= 0.0:
@@ -7703,22 +7798,22 @@ def _interaction32_fused_half_pme_direct_force_only(
     switch_value = 0.0 if switch_distance is None else float(switch_distance)
     switch_width = 1.0 if switch_distance is None else cutoff_value - switch_value
     alpha_value = float(alpha)
-    params = mx.array(
-        [
-            cutoff_value * cutoff_value,
-            float(bool(shift)),
-            float(switch_distance is not None),
-            switch_value,
-            switch_width,
-            cutoff_value,
-            float(coulomb_constant),
-            alpha_value,
-            2.0 * alpha_value / sqrt(pi),
-            1.0 / switch_width,
-            float(one_four_scale),
-        ],
-        dtype=mx.float32,
-    )
+    parameter_values = [
+        cutoff_value * cutoff_value,
+        float(bool(shift)),
+        float(switch_distance is not None),
+        switch_value,
+        switch_width,
+        cutoff_value,
+        float(coulomb_constant),
+        alpha_value,
+        2.0 * alpha_value / sqrt(pi),
+        1.0 / switch_width,
+        float(one_four_scale),
+    ]
+    if has_nbfix:
+        parameter_values.append(float(nbfix_type_count))
+    params = mx.array(parameter_values, dtype=mx.float32)
     counts = mx.array(
         [
             ordinary_group_count,
@@ -7737,13 +7832,17 @@ def _interaction32_fused_half_pme_direct_force_only(
         work_count + _simdgroups_per_threadgroup - 1
     ) // _simdgroups_per_threadgroup
     dispatch_width = 32 * _simdgroups_per_threadgroup
-    (forces,) = _interaction32_fused_half_canonical_force_kernel()(
-        inputs=[
-            positions,
-            atom_order,
-            half_sigma,
-            sqrt_epsilon,
-            charges,
+    inputs = [
+        positions,
+        atom_order,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+    ]
+    if has_nbfix:
+        inputs.extend((atom_type_ids, nbfix_type_sigma, nbfix_type_epsilon))
+    inputs.extend(
+        (
             ordinary_left_blocks,
             ordinary_right_atoms,
             ordinary_half_modes,
@@ -7758,7 +7857,15 @@ def _interaction32_fused_half_pme_direct_force_only(
             box,
             params,
             counts,
-        ],
+        )
+    )
+    kernel = (
+        _interaction32_fused_half_nbfix_canonical_force_kernel()
+        if has_nbfix
+        else _interaction32_fused_half_canonical_force_kernel()
+    )
+    (forces,) = kernel(
+        inputs=inputs,
         output_shapes=[positions.shape],
         output_dtypes=[mx.float32],
         grid=(threadgroups * dispatch_width, 1, 1),

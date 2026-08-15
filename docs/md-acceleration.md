@@ -158,7 +158,8 @@ these structural boundaries:
 2. improve device locality shared by Direct Space and PME;
 3. reduce global force accumulation while preserving a cross-system win.
 
-The experimental 32-atom engine is not the production route. Its next gate is
-a device-built schedule with an end-to-end trajectory win, not another
-host-built kernel microbenchmark. See
+The experimental 32-atom engine is not the production route. Sustained
+force-only blocks now pass on 5DFR, JAC, and NBFIX-bearing GPCRmd, reopening its
+device-builder gate. Its next required result is a device-built schedule with
+an end-to-end trajectory win, not another host-built kernel microbenchmark. See
 [`metal-interaction-engine.md`](./metal-interaction-engine.md).

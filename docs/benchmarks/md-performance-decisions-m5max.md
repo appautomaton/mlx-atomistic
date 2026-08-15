@@ -78,6 +78,24 @@ Neighbor commits. The runnable contract is documented in
 | Native 4-by-4 search | It reduced Direct Space padding but multiplied candidate search and prefix work. The retained hybrid uses 8-by-8 search and 4-by-4 execution. | `999a632` |
 | No-atomic 32-atom owner-computes | It evaluated each pair twice, ran 2.2-2.5 times slower, and accumulated unacceptable float32 error along long owner lists. | design prototype; see `docs/metal-interaction-engine.md` |
 
+## Reopened Research Direction
+
+The atomic `fused_half32` path is distinct from the rejected no-atomic
+owner-computes design. Its original short-block force result was too small to
+justify a device builder. A 2026-08-14 re-evaluation used eight
+direction-balanced samples of 750 synchronized calls and found sustained
+direct-force reductions of 15.40% on 5DFR, 26.47% on JAC, and 26.76% on
+GPCRmd. The GPCRmd run includes a new specialization for the production CHARMM
+NBFIX type table. Force RMS deltas remained below `6.9e-5 kJ/mol/A`, and
+maximum deltas remained below `5.5e-4 kJ/mol/A`.
+
+This evidence reopens only the device-builder gate. The current research
+schedule is host-built through SciPy and takes about 4.2 seconds on 5DFR and
+17.0-17.6 seconds on the 92k-94k systems. It is not a runtime candidate and no
+complete Molecular Dynamics speedup is claimed. See
+[`metal-interaction-engine.md`](../metal-interaction-engine.md) for the active
+promotion gates and reproducer.
+
 ## Current Interpretation
 
 Three patterns recur across the rejected work:

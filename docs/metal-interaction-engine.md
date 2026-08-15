@@ -14,6 +14,43 @@ isolated kernel is insufficient. The required result is a device-built,
 device-resident schedule that improves a complete constrained Particle Mesh
 Ewald (PME) trajectory.
 
+The sustained force gate was reopened on 2026-08-14. Earlier 16-call timing
+blocks showed only a small advantage and correctly blocked production work at
+that time. New 750-call, direction-balanced blocks expose a repeatable benefit
+under the same sustained memory and power pressure as long trajectories. The
+`fused_half32` candidate now also applies the production CHARMM NBFIX type
+table, so the force surface covers 5DFR, JAC, and GPCRmd.
+
+| Workload | Production direct force | `fused_half32` | Reduction | RMS / maximum force delta |
+| --- | ---: | ---: | ---: | ---: |
+| 5DFR | 0.8897 ms | 0.7527 ms | 15.40% | `6.84e-5` / `5.19e-4` kJ/mol/A |
+| JAC | 3.7297 ms | 2.7425 ms | 26.47% | `5.18e-5` / `3.97e-4` kJ/mol/A |
+| GPCRmd 729 with NBFIX | 4.3586 ms | 3.1922 ms | 26.76% | `5.84e-5` / `5.49e-4` kJ/mol/A |
+
+Each row used eight samples, 750 individually synchronized calls per sample,
+and both control-first and candidate-first directions. Every direction was
+positive. These are force-only results, not complete-trajectory claims. The
+research schedule still takes about 4.2 seconds to build for 5DFR and 17.0-17.6
+seconds for JAC and GPCRmd because it uses a host SciPy `cKDTree` oracle. That
+builder cannot enter the runtime. The next authorized work is therefore Gate C,
+not direct-force promotion.
+
+The command shape for each prepared artifact was:
+
+```bash
+uv run python scripts/benchmark_interaction32.py <prepared> \
+  --architecture fused_half32 \
+  --ordinary-tiles-per-group 3 \
+  --warmups 4 \
+  --samples 8 \
+  --timing-block-count 750 \
+  --out results/md-suite/round1-sustained-interaction32/<case>.json
+```
+
+The raw payloads remain local and gitignored under `results/`. The benchmark
+schema is `mlx_atomistic.interaction32_force_benchmark.v4`; it records whether
+the production NBFIX type table was active.
+
 No C++ extension or additional package is justified at the current boundary.
 MLX custom Metal kernels can express the required prototypes. A native
 extension becomes relevant only if a measured allocation, synchronization, or
@@ -89,7 +126,9 @@ The minimum useful family is:
    membership, compacts 32 right atoms, and reports overflow without host-built
    schedules.
 4. `compute_ordinary_interactions_32` evaluates recurring Lennard-Jones and
-   screened Coulomb work with SIMD rotation and register accumulation.
+   screened Coulomb work with SIMD rotation and register accumulation. Its
+   canonical-record specialization applies the same optional NBFIX type table
+   as the production tile kernel.
 5. `compute_special_interactions_32` handles sparse topology-owned work.
 6. `scatter_ordered_force_32` is optional for diagnostics when the force buffer
    uses packed atom order.
@@ -128,12 +167,17 @@ diagnostic only and cannot pass this gate.
 
 ### Gate B: Force Kernel
 
+Status: passed for sustained force-only evaluation; full-runtime promotion is
+not authorized.
+
 Compare the production 4-by-4 route, a 32-atom atomic route, and any
 owner-computes variant on the same immutable schedule. Measure complete force
 wall, global writes, force error, and memory. Reject a kernel that wins only on
 synthetic dense occupancy.
 
 ### Gate C: Device Builder
+
+Status: next active gate.
 
 Build and reuse the schedule entirely on device. Include half-skin admission,
 periodic boundary cases, concentrated occupancy, logical-capacity overflow,

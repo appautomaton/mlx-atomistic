@@ -481,6 +481,10 @@ def benchmark(
                 one_four_scale=nonbonded.lj_one_four_scale,
                 coulomb_constant=nonbonded.coulomb_constant,
                 alpha=nonbonded.pme_config.alpha,
+                atom_type_ids=tile_binding.tile_atom_type_ids,
+                nbfix_type_sigma=tile_binding.tile_nbfix_type_sigma,
+                nbfix_type_epsilon=tile_binding.tile_nbfix_type_epsilon,
+                nbfix_type_count=tile_binding.tile_nbfix_type_count,
                 _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
             )
 
@@ -520,13 +524,17 @@ def benchmark(
     control_median = float(np.median(timings["control"]))
     candidate_median = float(np.median(timings["candidate"]))
     return {
-        "schema": "mlx_atomistic.interaction32_force_benchmark.v3",
+        "schema": "mlx_atomistic.interaction32_force_benchmark.v4",
         "prepared": str(prepared),
         "architecture": architecture,
         "atom_count": schedule.atom_count,
         "cutoff_angstrom": cutoff,
         "skin_angstrom": skin,
         "search_radius_angstrom": cutoff + skin,
+        "nonbonded_surface": {
+            "nbfix_type_table": tile_binding.tile_atom_type_ids is not None,
+            "nbfix_type_count": tile_binding.tile_nbfix_type_count,
+        },
         "production": {
             "block_size": tiles.block_size,
             "tile_count": tiles.tile_count,

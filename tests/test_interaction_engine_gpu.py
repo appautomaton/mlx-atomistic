@@ -6,6 +6,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_atomistic.core import Cell
+from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.interaction_engine import (
     _build_interaction_schedule32,
     _build_owner_compute_schedule32,
@@ -15,6 +17,9 @@ from mlx_atomistic.interaction_engine import (
     _owner_compute32_direct_force_only,
 )
 from mlx_atomistic.metal_kernels import _prepared_parameterized_pme_direct_force_only
+from mlx_atomistic.neighbors import build_neighbor_list
+from mlx_atomistic.pme import PMEConfig
+from mlx_atomistic.topology import Topology
 
 
 @pytest.fixture(autouse=True)
@@ -179,3 +184,91 @@ def test_interaction32_force_matches_prepared_pair_oracle(left_slice_size):
             rtol=2.0e-5,
             atol=2.0e-3,
         )
+
+
+@pytest.mark.gpu
+def test_fused_half32_nbfix_force_matches_production_tiles():
+    """Fused 32-atom work applies the production NBFIX type table."""
+
+    grid = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    )
+    positions_np = 1.5 + 1.35 * grid.reshape((-1, 3)).astype(np.float32)
+    atom_count = positions_np.shape[0]
+    positions = mx.array(positions_np, dtype=mx.float32)
+    box_lengths = np.asarray([20.0, 20.0, 20.0], dtype=np.float32)
+    cell = Cell.orthorhombic(box_lengths)
+    cutoff = 4.0
+    skin = 0.5
+    atom_types = np.asarray(["A", "B", "C"] * 32, dtype=str)
+    potential = NonbondedPotential(
+        sigma=np.linspace(0.9, 1.1, atom_count, dtype=np.float32),
+        epsilon=np.linspace(0.12, 0.28, atom_count, dtype=np.float32),
+        charges=np.linspace(-0.45, 0.45, atom_count, dtype=np.float32),
+        cutoff=cutoff,
+        lj_shift=True,
+        switch_distance=3.2,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=cutoff,
+        ),
+        topology=Topology.from_sequences(
+            n_atoms=atom_count,
+            eager_nonbonded_pair_limit=0,
+        ),
+        atom_types=atom_types,
+        nbfix_type_pairs=[("A", "B"), ("B", "C")],
+        nbfix_type_sigma=[1.42, 0.82],
+        nbfix_type_epsilon=[0.61, 0.47],
+    ).bind_pme_plan(cell)
+    neighbors = build_neighbor_list(
+        positions,
+        cell,
+        cutoff=cutoff,
+        skin=skin,
+        sort_pairs=False,
+        backend="mlx_cell_tiles",
+    )
+    assert neighbors.tiles is not None
+    binding = potential._prepare_tile_force_binding(cell, None, neighbors.tiles)
+    assert binding is not NotImplemented
+    assert binding.tile_decline_reason is None
+    assert binding.tile_atom_type_ids is not None
+    assert binding.tile_nbfix_type_count == 3
+
+    base_schedule = _build_interaction_schedule32(
+        positions_np,
+        box_lengths,
+        search_radius=cutoff + skin,
+        left_slice_size=16,
+    )
+    schedule = _fuse_interaction_halves32(base_schedule)
+    reference = potential._direct_forces_from_binding(positions, binding)
+    observed = _fused_half32_direct_force_only(
+        positions,
+        schedule,
+        binding.box_lengths_and_inverses,
+        binding.half_sigma,
+        binding.sqrt_epsilon,
+        potential.charges,
+        cutoff=cutoff,
+        shift=potential.lj_shift,
+        switch_distance=potential.switch_distance,
+        one_four_scale=potential.lj_one_four_scale,
+        coulomb_constant=potential.coulomb_constant,
+        alpha=potential.pme_config.alpha,
+        atom_type_ids=binding.tile_atom_type_ids,
+        nbfix_type_sigma=binding.tile_nbfix_type_sigma,
+        nbfix_type_epsilon=binding.tile_nbfix_type_epsilon,
+        nbfix_type_count=binding.tile_nbfix_type_count,
+    )
+    mx.eval(reference, observed)
+    np.testing.assert_allclose(
+        np.asarray(observed),
+        np.asarray(reference),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )

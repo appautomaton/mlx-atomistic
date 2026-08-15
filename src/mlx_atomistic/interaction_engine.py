@@ -966,6 +966,10 @@ def _fused_half32_direct_force_only(
     one_four_scale: float,
     coulomb_constant: float,
     alpha: float,
+    atom_type_ids: mx.array | None = None,
+    nbfix_type_sigma: mx.array | None = None,
+    nbfix_type_epsilon: mx.array | None = None,
+    nbfix_type_count: int = 0,
     _simdgroups_per_threadgroup: int = 4,
 ) -> mx.array:
     if isinstance(schedule, _FusedHalfSchedule32):
@@ -1001,6 +1005,10 @@ def _fused_half32_direct_force_only(
         one_four_scale=one_four_scale,
         coulomb_constant=coulomb_constant,
         alpha=alpha,
+        atom_type_ids=atom_type_ids,
+        nbfix_type_sigma=nbfix_type_sigma,
+        nbfix_type_epsilon=nbfix_type_epsilon,
+        nbfix_type_count=nbfix_type_count,
         _simdgroups_per_threadgroup=_simdgroups_per_threadgroup,
     )
 
