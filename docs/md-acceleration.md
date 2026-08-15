@@ -233,12 +233,21 @@ claiming a runtime gain. That evidence selected Reciprocal PME as the next
 bounded profiling target.
 
 That bounded PME target is now complete. The retained force-only route uses a
-real half-spectrum and a normalized-real Metal consumer. Because it reduces a
-previously secondary stage without changing Neighbor work, the next decision
-must begin with a fresh whole-step profile. Direct Space is expected to remain
-the leading shared candidate, but that expectation is not a substitute for the
-new profile. Builder capacity admission remains too small to justify native C++
-work.
+real half-spectrum and a normalized-real Metal consumer. The subsequent
+three-system whole-step profile ranks Direct Space first at a 22.41% median
+instrumented share and reciprocal PME second at 17.74%.
+
+Follow-up attribution prevents several false starts. A three-force-array sum is
+only about 0.13-0.16 ms in isolation, so its larger synchronized profile share
+mostly belongs to a preceding barrier. An arithmetic-preserving checksum shows
+that Direct force atomics account for only 0.87-3.18% of the kernel. Spatially
+ordered static parameters, PME mesh sorting after amortization, and right-lane
+AABB culling all fail the cross-system transfer gate. The AABB test is the most
+instructive: it can reject 52-54% of logical pair lanes, yet still regresses all
+three systems because the SIMD loop and reductions remain. Future Direct work
+must remove complete SIMD work items or improve useful-pair arithmetic rather
+than add divergent lane-level branches. Builder capacity admission remains too
+small to justify native C++ work.
 
 The 32-atom engine is now the default inside the bounded, measured fixed-cell
 Metal PME envelope. Existing checkpoints continue to pin their recorded
