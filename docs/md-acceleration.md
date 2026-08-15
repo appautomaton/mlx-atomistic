@@ -104,6 +104,9 @@ established MLX implementation.
 Constraint topology is partitioned once:
 
 - rigid water uses analytical SETTLE;
+- artifacts without molecule identifiers recover rigid water only when the
+  water mask and constraint graph prove a complete set of disjoint O-H-H
+  triangles; ambiguous graphs fail closed to the existing generic route;
 - disjoint central-atom clusters use specialized SHAKE/RATTLE kernels;
 - independent components up to four atoms and three edges use a component-owned
   Metal solver;
@@ -112,6 +115,18 @@ Constraint topology is partitioned once:
 Combining already-dependent constraint dispatches produced isolated wins but
 did not transfer reliably to sustained JAC trajectories. Those prototypes are
 closed in the decision ledger.
+
+The GPCRmd 729 artifact has no molecule identifiers but does have a complete
+water mask and constraint graph. Topology recovery proves 19,944 disjoint
+rigid waters, covering all 59,832 marked water atoms, then leaves 19,064
+non-water constraint pairs in 9,709 SHAKE clusters. This replaces one
+29,653-component, 20-iteration route with analytical SETTLE plus the existing
+dense composite path. A same-context position-balanced 1,000-step diagnostic
+improved both directions by 5.31% and 32.37%, with an 18.82% balanced median.
+Because the machine changed Metal performance states between independent
+processes, the retained claim is the conservative 5.1-5.3% complete-wall gain.
+The passing profile and A/B artifacts are under
+`results/md-suite/gpcrmd-water-topology-settle-{profile,shared-context}-2026-08-15/`.
 
 ## Current Evidence
 
@@ -170,7 +185,11 @@ The cache is admitted only when it is at most 64 MiB. Larger systems retain the
 original sparse two-pass builder, preserving the runtime's scalable memory
 boundary. Capacity admission remains a microsecond-scale host operation and
 does not justify a native C++ MLX primitive. A new whole-step profile, rather
-than another builder micro-optimization, must select the next target.
+than another builder micro-optimization, selected constraints as the next
+tractable target. After recovered SETTLE, a passing GPCRmd profile ranks Direct
+Space first at 38.71% of synchronized wall, followed by the Neighbor lifecycle
+at 14.06%, with PME and constraints both near 12.78%. The next experiment must
+therefore return to Direct Space or PME rather than extending the builder.
 
 The experimental 32-atom engine is not the default production route. Its
 device-built schedule now passes the initial 5DFR, JAC, and NBFIX-bearing

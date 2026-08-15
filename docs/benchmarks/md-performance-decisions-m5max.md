@@ -37,6 +37,7 @@ git show <commit>:docs/benchmarks/<historical-file>.md
 | 2026-08-14 | Shared bonded/correction force buffer | Sparse Particle Mesh Ewald (PME) corrections joined the bonded buffer instead of allocating another full force array. Wall improved 1.77% on 5DFR, 0.90% on JAC, and 0.68% on GPCRmd. | `3f281e0` |
 | 2026-08-14 | Adaptive left-grouped exact-tile scatter | Large inventories avoid the global exact-tile sort; small or pathologically occupied cells retain compact-and-sort. Final wall improved 4.08% on JAC and 2.36% on GPCRmd with 0.26% 5DFR noise. | `8899994` |
 | 2026-08-15 | Bounded Interaction32 mode cache | The count kernel retains each right atom's two-bit half-membership mode, so ordinary scatter no longer repeats periodic geometry and 32-by-32 membership work. A 64 MiB admission limit preserves the original sparse fallback. Position-balanced 750-step walls improved 2.78-4.80% on 5DFR, 1.53-2.04% on JAC, and 2.57-3.03% on GPCRmd. | `0066b58` |
+| 2026-08-15 | Topology-recovered rigid water | When molecule identifiers are absent, a fail-closed constraint-graph proof recovers only complete disjoint O-H-H water triangles. GPCRmd moves 19,944 waters from a 20-iteration small-component route to analytical SETTLE. Same-context 1,000-step pairs improved 5.31% and 32.37%; the retained claim is the conservative 5.1-5.3% complete-wall gain because independent processes changed Metal performance states. | `7b93553` |
 
 The adaptive scatter retains its own
 [boundary report](./md-left-grouped-neighbor-scatter-m5max.md) because it is the
@@ -80,6 +81,7 @@ Neighbor commits. The runnable contract is documented in
 | No-atomic 32-atom owner-computes | It evaluated each pair twice, ran 2.2-2.5 times slower, and accumulated unacceptable float32 error along long owner lists. | design prototype; see `docs/metal-interaction-engine.md` |
 | Direct-kernel layout variants | Changing ordinary group width or SIMD-group count did not transfer across systems. OpenMM-style lane rotation was about 80% slower on 5DFR, and single-periodic-copy was neutral to slower while increasing JAC force error. | uncommitted prototypes; local results dated 2026-08-15 |
 | Special-half write fusion | Serial 32-atom special work helped GPCRmd but regressed 5DFR and JAC. A parallel paired-write variant preserved force parity but regressed all three systems by 0.8-3.6%. | uncommitted prototypes; local results dated 2026-08-15 |
+| Per-cluster position-constraint early exit | Synchronized GPCRmd position attribution improved 5.9%, but a control/candidate/candidate/control clean gate was neutral to 0.30% slower. The branch did not transfer through the production lazy schedule, so the prototype was removed. | uncommitted prototype; local results dated 2026-08-15 |
 
 ## Interaction32 Promotion
 
@@ -96,6 +98,15 @@ turn the general runtime into a quadratic-memory design. Interaction32 remains
 an opt-in backend while broader stability coverage continues. See
 [`metal-interaction-engine.md`](../metal-interaction-engine.md) for the builder
 contract and promotion evidence.
+
+The subsequent whole-step profile moved attention away from builder internals.
+GPCRmd's missing molecule identifiers had forced 59,832 known water atoms
+through the general small-component constraint solver. Commit `7b93553`
+recovers rigid waters only when the water mask, element identities, and exact
+three-edge constraint components prove the partition. Any incomplete,
+cross-linked, duplicated, or non-O-H-H component keeps the previous fallback.
+After this change Direct Space remains the dominant GPCRmd stage; constraints
+are approximately level with PME rather than the next independent target.
 
 ## Current Interpretation
 
