@@ -313,6 +313,48 @@ ordinary scatter are its next shared targets. Capacity admission is already a
 microsecond-scale host boundary, so this checkpoint does not authorize a C++
 MLX primitive.
 
+### C1 packed membership checkpoint
+
+The post-snapshot whole-step profile selected Direct Space as the largest
+shared route and retained the Neighbor lifecycle as a material secondary cost.
+Inside rebuilds, ordinary count/prefix and ordinary scatter represented about
+78% of 5DFR wall and 91% of JAC and GPCRmd wall. Inspection confirmed that
+scatter repeated the count kernel's periodic block rejection and 32-by-32 atom
+membership calculation.
+
+The retained builder now packs each right atom's membership mode into two bits
+during count. Sixteen modes fit in one `uint32`, so each upper-triangular block
+pair uses two words. Scatter decodes those words and performs only prefix-local
+schedule writes. The packed path is admitted only when its temporary storage is
+at most 64 MiB; larger systems use the unchanged sparse two-pass path. The
+measured caches were 2.17 MB on 5DFR, 34.68 MB on JAC, and 33.07 MB on GPCRmd.
+
+Synchronized rebuild medians changed as follows:
+
+| Workload | Snapshot builder | Packed-mode builder | Reduction |
+| --- | ---: | ---: | ---: |
+| 5DFR | 6.47 ms | 2.91 ms | 55.1% |
+| JAC 4-cell | 27.20 ms | 12.41 ms | 54.4% |
+| GPCRmd 729 | 26.73 ms | 12.61 ms | 52.8% |
+
+A separate `control, candidate, candidate, control` run used independent
+processes, ten warmup steps, 750 measured steps, seed 17, skin 5.5 A, and an
+unchanged power state. Every arm passed finite-state, constraint, topology,
+memory, Neighbor-representation, and PME-plan reuse checks.
+
+| Workload | Control range | Candidate range | Directional speedups |
+| --- | ---: | ---: | ---: |
+| 5DFR | 0.9547-0.9777 ms/step | 0.9282-0.9307 ms/step | 2.78%, 4.80% |
+| JAC 4-cell | 2.9726-2.9862 ms/step | 2.9254-2.9270 ms/step | 1.53%, 2.04% |
+| GPCRmd 729 | 3.2004-3.2174 ms/step | 3.1182-3.1199 ms/step | 2.57%, 3.03% |
+
+Raw JSON is under
+`results/md-suite/interaction32-packed-mode-cache-{screen,formal}-2026-08-15/`.
+The control is `e2040e2`; the retained implementation is `0066b58`. MLX and
+process peak memory remained within run-to-run noise. This closes the repeated
+ordinary traversal target without changing the C2 decision: capacity admission
+is still too small to justify a native primitive.
+
 ### C2: optional native state boundary
 
 `mx.fast.metal_kernel` requires host-provided output shapes and direct dispatch
@@ -331,14 +373,15 @@ The candidate advances only in this order:
 
 ### Gate A: Inventory
 
+Status: passed for the bounded opt-in backend.
+
 Record schedule size, occupancy, sparse-pair fraction, bytes, and rebuild time
 on small Lennard-Jones, 5DFR, JAC, and GPCRmd systems. A host-built schedule is
 diagnostic only and cannot pass this gate.
 
 ### Gate B: Force Kernel
 
-Status: passed for sustained force-only evaluation; full-runtime promotion is
-not authorized.
+Status: passed and integrated into the opt-in runtime backend.
 
 Compare the production 4-by-4 route, a 32-atom atomic route, and any
 owner-computes variant on the same immutable schedule. Measure complete force

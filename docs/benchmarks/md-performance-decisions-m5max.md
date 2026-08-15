@@ -1,6 +1,6 @@
 # MD Performance Decision Ledger on Apple M5 Max
 
-Date: 2026-08-14
+Date: 2026-08-15
 
 This ledger is the compact history of production Molecular Dynamics (MD)
 performance work. It replaces one report per micro-optimization while
@@ -36,6 +36,7 @@ git show <commit>:docs/benchmarks/<historical-file>.md
 | 2026-08-14 | CHARMM Urey-Bradley and correction map | Moved Urey-Bradley into bond records and differentiated prepared correction map (CMAP) patches analytically in the fused bonded dispatch. GPCRmd throughput improved 26.49% against the pre-fusion control. | `ced64a4` |
 | 2026-08-14 | Shared bonded/correction force buffer | Sparse Particle Mesh Ewald (PME) corrections joined the bonded buffer instead of allocating another full force array. Wall improved 1.77% on 5DFR, 0.90% on JAC, and 0.68% on GPCRmd. | `3f281e0` |
 | 2026-08-14 | Adaptive left-grouped exact-tile scatter | Large inventories avoid the global exact-tile sort; small or pathologically occupied cells retain compact-and-sort. Final wall improved 4.08% on JAC and 2.36% on GPCRmd with 0.26% 5DFR noise. | `8899994` |
+| 2026-08-15 | Bounded Interaction32 mode cache | The count kernel retains each right atom's two-bit half-membership mode, so ordinary scatter no longer repeats periodic geometry and 32-by-32 membership work. A 64 MiB admission limit preserves the original sparse fallback. Position-balanced 750-step walls improved 2.78-4.80% on 5DFR, 1.53-2.04% on JAC, and 2.57-3.03% on GPCRmd. | `0066b58` |
 
 The adaptive scatter retains its own
 [boundary report](./md-left-grouped-neighbor-scatter-m5max.md) because it is the
@@ -77,24 +78,24 @@ Neighbor commits. The runnable contract is documented in
 | Pre-force SHAKE deferral | Correctness passed, but the long paired median was 0.39% slower and only one of four pairs improved. | `c1caefc` |
 | Native 4-by-4 search | It reduced Direct Space padding but multiplied candidate search and prefix work. The retained hybrid uses 8-by-8 search and 4-by-4 execution. | `999a632` |
 | No-atomic 32-atom owner-computes | It evaluated each pair twice, ran 2.2-2.5 times slower, and accumulated unacceptable float32 error along long owner lists. | design prototype; see `docs/metal-interaction-engine.md` |
+| Direct-kernel layout variants | Changing ordinary group width or SIMD-group count did not transfer across systems. OpenMM-style lane rotation was about 80% slower on 5DFR, and single-periodic-copy was neutral to slower while increasing JAC force error. | uncommitted prototypes; local results dated 2026-08-15 |
+| Special-half write fusion | Serial 32-atom special work helped GPCRmd but regressed 5DFR and JAC. A parallel paired-write variant preserved force parity but regressed all three systems by 0.8-3.6%. | uncommitted prototypes; local results dated 2026-08-15 |
 
-## Reopened Research Direction
+## Interaction32 Promotion
 
-The atomic `fused_half32` path is distinct from the rejected no-atomic
-owner-computes design. Its original short-block force result was too small to
-justify a device builder. A 2026-08-14 re-evaluation used eight
-direction-balanced samples of 750 synchronized calls and found sustained
-direct-force reductions of 15.40% on 5DFR, 26.47% on JAC, and 26.76% on
-GPCRmd. The GPCRmd run includes a new specialization for the production CHARMM
-NBFIX type table. Force RMS deltas remained below `6.9e-5 kJ/mol/A`, and
-maximum deltas remained below `5.5e-4 kJ/mol/A`.
+The atomic `fused_half32` force path is distinct from the rejected no-atomic
+owner-computes design. It now has a Metal device builder, retained capacity,
+generation ownership, NBFIX support, and an immutable topology snapshot.
+Against production tiles, the topology-snapshot checkpoint improved complete
+750-step walls by 19.39% on 5DFR, 22.33% on JAC, and 23.09% on GPCRmd.
 
-This evidence reopens only the device-builder gate. The current research
-schedule is host-built through SciPy and takes about 4.2 seconds on 5DFR and
-17.0-17.6 seconds on the 92k-94k systems. It is not a runtime candidate and no
-complete Molecular Dynamics speedup is claimed. See
-[`metal-interaction-engine.md`](../metal-interaction-engine.md) for the active
-promotion gates and reproducer.
+The bounded mode cache in `0066b58` removes the remaining repeated ordinary
+membership traversal for systems whose packed cache is at most 64 MiB. Larger
+systems retain the exact sparse two-pass builder, so this promotion does not
+turn the general runtime into a quadratic-memory design. Interaction32 remains
+an opt-in backend while broader stability coverage continues. See
+[`metal-interaction-engine.md`](../metal-interaction-engine.md) for the builder
+contract and promotion evidence.
 
 ## Current Interpretation
 

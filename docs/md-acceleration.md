@@ -150,19 +150,27 @@ evidence remains in the JAC, GPCRmd, and same-workload reports indexed from the
 
 ## Current Bottleneck Direction
 
-The 32-atom Direct Space route and its Neighbor builder now both beat the
-production tile route on 5DFR, JAC, and GPCRmd. Synchronized attribution showed
-that 59.9-72.3% of the original builder wall rebuilt fixed topology data on
-every spatial generation. A manager-owned immutable topology snapshot removed
-that repeated host transfer, sorting, deduplication, owner-table construction,
-and allocation while retaining geometry-dependent special-block mapping.
+The 32-atom Direct Space route and its Neighbor builder beat the production
+tile route on 5DFR, JAC, and GPCRmd. An immutable topology snapshot first
+removed repeated host topology preparation. A subsequent fresh whole-step
+profile identified Direct Space as 16.87%, 32.94%, and 36.11% of synchronized
+wall on the three systems. The Neighbor lifecycle remained material at 11.79%,
+14.18%, and 15.03%, but was not the leading stage.
 
-The next target must come from a fresh whole-step profile of the improved
-runtime. Inside the remaining builder, ordinary count/prefix and ordinary
-scatter are now the two comparable large-system costs. They should be changed
-only if they remain material in the complete trajectory profile. The scalar
-capacity admission is measured in microseconds and does not justify a native
-C++ MLX primitive.
+Builder attribution then showed that ordinary count/prefix plus ordinary
+scatter owned about 78% of 5DFR rebuild wall and 91% of JAC and GPCRmd rebuild
+wall. Both stages recomputed the same periodic block and atom memberships. The
+count kernel now retains each membership mode in two bits, and scatter decodes
+that temporary cache instead of repeating the geometry. Median rebuild time
+fell from 6.47 to 2.91 ms on 5DFR, 27.20 to 12.41 ms on JAC, and 26.73 to
+12.61 ms on GPCRmd. Position-balanced 750-step complete walls improved in both
+directions on every system, by 1.53-4.80%.
+
+The cache is admitted only when it is at most 64 MiB. Larger systems retain the
+original sparse two-pass builder, preserving the runtime's scalable memory
+boundary. Capacity admission remains a microsecond-scale host operation and
+does not justify a native C++ MLX primitive. A new whole-step profile, rather
+than another builder micro-optimization, must select the next target.
 
 The experimental 32-atom engine is not the default production route. Its
 device-built schedule now passes the initial 5DFR, JAC, and NBFIX-bearing
