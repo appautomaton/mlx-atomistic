@@ -450,6 +450,11 @@ _interaction32_canonical_force_kernel_singleton = None
 _interaction32_fused_half_canonical_force_kernel_singleton = None
 _interaction32_fused_half_nbfix_canonical_force_kernel_singleton = None
 _interaction32_scatter_kernel_singleton = None
+_interaction32_block_geometry_kernel_singleton = None
+_interaction32_ordinary_count_kernel_singleton = None
+_interaction32_ordinary_scatter_kernel_singleton = None
+_interaction32_special_block_scatter_kernel_singleton = None
+_interaction32_special_work_kernel_singleton = None
 _owner_compute32_force_kernel_singleton = None
 _sparse_pme_correction_force_only_kernel_singleton = None
 _pme_cutoff_correction_virial_kernel_singleton = None
@@ -1384,6 +1389,425 @@ _INTERACTION32_PACK_SOURCE = r"""
     packed_posq[4 * ordered + 3] = valid ? charges[safe_atom] : 0.0f;
     packed_lj[2 * ordered + 0] = valid ? half_sigma[safe_atom] : 0.0f;
     packed_lj[2 * ordered + 1] = valid ? sqrt_epsilon[safe_atom] : 0.0f;
+"""
+
+_INTERACTION32_BLOCK_GEOMETRY_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint block = threadgroup_position_in_grid.x;
+    uint block_count = (uint)counts[0];
+    uint atom_count = (uint)counts[1];
+    if (block >= block_count) {
+        return;
+    }
+
+    uint ordered = 32u * block + lane;
+    int atom = atom_order[ordered];
+    bool valid = atom >= 0 && atom < (int)atom_count;
+    int safe_atom = valid ? atom : 0;
+    int reference_atom = atom_order[32u * block];
+    float3 reference = float3(
+        positions[3 * reference_atom + 0],
+        positions[3 * reference_atom + 1],
+        positions[3 * reference_atom + 2]
+    );
+    float3 value = float3(
+        positions[3 * safe_atom + 0],
+        positions[3 * safe_atom + 1],
+        positions[3 * safe_atom + 2]
+    );
+    float3 delta = value - reference;
+    delta.x -= box[0] * rint(delta.x * box[3]);
+    delta.y -= box[1] * rint(delta.y * box[4]);
+    delta.z -= box[2] * rint(delta.z * box[5]);
+    float3 unwrapped = reference + delta;
+    float weight = valid ? 1.0f : 0.0f;
+    float valid_count = simd_sum(weight);
+    float3 center = float3(
+        simd_sum(valid ? unwrapped.x : 0.0f),
+        simd_sum(valid ? unwrapped.y : 0.0f),
+        simd_sum(valid ? unwrapped.z : 0.0f)
+    ) / valid_count;
+    float3 centered = valid ? unwrapped - center : float3(0.0f);
+    float3 extent = float3(
+        simd_max(abs(centered.x)),
+        simd_max(abs(centered.y)),
+        simd_max(abs(centered.z))
+    );
+    float radius2 = simd_max(dot(centered, centered));
+    if (lane == 0u) {
+        center.x -= box[0] * floor(center.x * box[3]);
+        center.y -= box[1] * floor(center.y * box[4]);
+        center.z -= box[2] * floor(center.z * box[5]);
+        center_radius[4 * block + 0] = center.x;
+        center_radius[4 * block + 1] = center.y;
+        center_radius[4 * block + 2] = center.z;
+        center_radius[4 * block + 3] = sqrt(radius2);
+        half_extent[3 * block + 0] = extent.x;
+        half_extent[3 * block + 1] = extent.y;
+        half_extent[3 * block + 2] = extent.z;
+    }
+"""
+
+_INTERACTION32_ORDINARY_COMMON_SOURCE = r"""
+inline bool mlx_atomistic_interaction32_blocks_may_interact(
+    uint left_block,
+    uint right_block,
+    device const float* center_radius,
+    device const float* half_extent,
+    thread const float* box,
+    float search_radius,
+    float search_radius2
+) {
+    float3 delta = float3(
+        center_radius[4 * right_block + 0]
+            - center_radius[4 * left_block + 0],
+        center_radius[4 * right_block + 1]
+            - center_radius[4 * left_block + 1],
+        center_radius[4 * right_block + 2]
+            - center_radius[4 * left_block + 2]
+    );
+    delta.x -= box[0] * rint(delta.x * box[3]);
+    delta.y -= box[1] * rint(delta.y * box[4]);
+    delta.z -= box[2] * rint(delta.z * box[5]);
+    float sphere_limit = search_radius
+        + center_radius[4 * left_block + 3]
+        + center_radius[4 * right_block + 3];
+    if (dot(delta, delta) >= sphere_limit * sphere_limit) {
+        return false;
+    }
+    float3 separated = max(
+        abs(delta)
+            - float3(
+                half_extent[3 * left_block + 0]
+                    + half_extent[3 * right_block + 0],
+                half_extent[3 * left_block + 1]
+                    + half_extent[3 * right_block + 1],
+                half_extent[3 * left_block + 2]
+                    + half_extent[3 * right_block + 2]
+            ),
+        float3(0.0f)
+    );
+    return dot(separated, separated) < search_radius2;
+}
+
+inline uint mlx_atomistic_interaction32_half_mode(
+    int right_atom,
+    device const float* positions,
+    threadgroup const int* left_atoms,
+    threadgroup const float* left_positions,
+    thread const float* box,
+    float search_radius2
+) {
+    if (right_atom < 0) {
+        return 0u;
+    }
+    float3 right = float3(
+        positions[3 * right_atom + 0],
+        positions[3 * right_atom + 1],
+        positions[3 * right_atom + 2]
+    );
+    bool first = false;
+    bool second = false;
+    for (uint left_slot = 0u; left_slot < 32u; left_slot++) {
+        if (left_atoms[left_slot] < 0) {
+            continue;
+        }
+        float3 delta = float3(
+            left_positions[3 * left_slot + 0] - right.x,
+            left_positions[3 * left_slot + 1] - right.y,
+            left_positions[3 * left_slot + 2] - right.z
+        );
+        delta.x -= box[0] * rint(delta.x * box[3]);
+        delta.y -= box[1] * rint(delta.y * box[4]);
+        delta.z -= box[2] * rint(delta.z * box[5]);
+        bool member = dot(delta, delta) < search_radius2;
+        first = first || (member && left_slot < 16u);
+        second = second || (member && left_slot >= 16u);
+    }
+    return (first ? 1u : 0u) | (second ? 2u : 0u);
+}
+"""
+
+_INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint traversal_index = threadgroup_position_in_grid.x;
+    uint block_count = (uint)counts[0];
+    uint special_code_count = (uint)counts[1];
+    if (traversal_index >= block_count) {
+        return;
+    }
+    uint left_block = (uint)block_traversal[traversal_index];
+    threadgroup int left_atoms[32];
+    threadgroup float left_positions[96];
+    int left_atom = atom_order[32u * left_block + lane];
+    int safe_left = max(left_atom, 0);
+    left_atoms[lane] = left_atom;
+    left_positions[3u * lane + 0u] = positions[3 * safe_left + 0];
+    left_positions[3u * lane + 1u] = positions[3 * safe_left + 1];
+    left_positions[3u * lane + 2u] = positions[3 * safe_left + 2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_box[6];
+    for (uint axis = 0u; axis < 6u; axis++) {
+        local_box[axis] = box[axis];
+    }
+    float search_radius = params[0];
+    float search_radius2 = params[1];
+    uint mode1_count = 0u;
+    uint mode2_count = 0u;
+    uint mode3_count = 0u;
+    for (
+        uint right_index = traversal_index + 1u;
+        right_index < block_count;
+        right_index++
+    ) {
+        uint right_block = (uint)block_traversal[right_index];
+        uint low_block = min(left_block, right_block);
+        uint high_block = max(left_block, right_block);
+        int block_code = (int)(low_block * block_count + high_block);
+        bool include_lane = false;
+        if (lane == 0u) {
+            uint low = 0u;
+            uint high = special_code_count;
+            while (low < high) {
+                uint middle = low + (high - low) / 2u;
+                if (special_codes[middle] < block_code) {
+                    low = middle + 1u;
+                } else {
+                    high = middle;
+                }
+            }
+            bool special = low < special_code_count
+                && special_codes[low] == block_code;
+            if (!special) {
+                include_lane = mlx_atomistic_interaction32_blocks_may_interact(
+                    left_block,
+                    right_block,
+                    center_radius,
+                    half_extent,
+                    local_box,
+                    search_radius,
+                    search_radius2
+                );
+            }
+        }
+        bool include = simd_broadcast(include_lane, 0u);
+        if (!include) {
+            continue;
+        }
+        int right_ordered = 32 * (int)right_block + (int)lane;
+        int right_atom = atom_order[right_ordered];
+        uint mode = mlx_atomistic_interaction32_half_mode(
+            right_atom,
+            positions,
+            left_atoms,
+            left_positions,
+            local_box,
+            search_radius2
+        );
+        mode1_count += simd_sum(mode == 1u ? 1u : 0u);
+        mode2_count += simd_sum(mode == 2u ? 1u : 0u);
+        mode3_count += simd_sum(mode == 3u ? 1u : 0u);
+    }
+    if (lane == 0u) {
+        mode_counts[3u * traversal_index + 0u] = (int)mode1_count;
+        mode_counts[3u * traversal_index + 1u] = (int)mode2_count;
+        mode_counts[3u * traversal_index + 2u] = (int)mode3_count;
+    }
+"""
+
+_INTERACTION32_ORDINARY_SCATTER_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint traversal_index = threadgroup_position_in_grid.x;
+    uint block_count = (uint)counts[0];
+    uint special_code_count = (uint)counts[1];
+    if (traversal_index >= block_count) {
+        return;
+    }
+    uint left_block = (uint)block_traversal[traversal_index];
+    threadgroup int left_atoms[32];
+    threadgroup float left_positions[96];
+    int left_atom = atom_order[32u * left_block + lane];
+    int safe_left = max(left_atom, 0);
+    left_atoms[lane] = left_atom;
+    left_positions[3u * lane + 0u] = positions[3 * safe_left + 0];
+    left_positions[3u * lane + 1u] = positions[3 * safe_left + 1];
+    left_positions[3u * lane + 2u] = positions[3 * safe_left + 2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_box[6];
+    for (uint axis = 0u; axis < 6u; axis++) {
+        local_box[axis] = box[axis];
+    }
+    float search_radius = params[0];
+    float search_radius2 = params[1];
+    uint run_base = 3u * traversal_index;
+    if (lane == 0u) {
+        for (uint mode_slot = 0u; mode_slot < 3u; mode_slot++) {
+            uint run = run_base + mode_slot;
+            int tile_count = mode_tile_counts[run];
+            int tile_start = mode_tile_prefix[run] - tile_count;
+            for (int local_tile = 0; local_tile < tile_count; local_tile++) {
+                int tile = tile_start + local_tile;
+                ordinary_left_blocks[tile] = (int)left_block;
+                ordinary_half_modes[tile] = (int)mode_slot + 1;
+            }
+        }
+    }
+
+    uint seen1 = 0u;
+    uint seen2 = 0u;
+    uint seen3 = 0u;
+    for (
+        uint right_index = traversal_index + 1u;
+        right_index < block_count;
+        right_index++
+    ) {
+        uint right_block = (uint)block_traversal[right_index];
+        uint low_block = min(left_block, right_block);
+        uint high_block = max(left_block, right_block);
+        int block_code = (int)(low_block * block_count + high_block);
+        bool include_lane = false;
+        if (lane == 0u) {
+            uint low = 0u;
+            uint high = special_code_count;
+            while (low < high) {
+                uint middle = low + (high - low) / 2u;
+                if (special_codes[middle] < block_code) {
+                    low = middle + 1u;
+                } else {
+                    high = middle;
+                }
+            }
+            bool special = low < special_code_count
+                && special_codes[low] == block_code;
+            if (!special) {
+                include_lane = mlx_atomistic_interaction32_blocks_may_interact(
+                    left_block,
+                    right_block,
+                    center_radius,
+                    half_extent,
+                    local_box,
+                    search_radius,
+                    search_radius2
+                );
+            }
+        }
+        bool include = simd_broadcast(include_lane, 0u);
+        if (!include) {
+            continue;
+        }
+        int right_ordered = 32 * (int)right_block + (int)lane;
+        int right_atom = atom_order[right_ordered];
+        uint mode = mlx_atomistic_interaction32_half_mode(
+            right_atom,
+            positions,
+            left_atoms,
+            left_positions,
+            local_box,
+            search_radius2
+        );
+        uint is1 = mode == 1u ? 1u : 0u;
+        uint is2 = mode == 2u ? 1u : 0u;
+        uint is3 = mode == 3u ? 1u : 0u;
+        uint rank1 = simd_prefix_exclusive_sum(is1);
+        uint rank2 = simd_prefix_exclusive_sum(is2);
+        uint rank3 = simd_prefix_exclusive_sum(is3);
+        uint count1 = simd_sum(is1);
+        uint count2 = simd_sum(is2);
+        uint count3 = simd_sum(is3);
+        uint local_entry = mode == 1u
+            ? seen1 + rank1
+            : (mode == 2u ? seen2 + rank2 : seen3 + rank3);
+        if (mode != 0u) {
+            uint run = run_base + mode - 1u;
+            int tile_count = mode_tile_counts[run];
+            int tile_start = mode_tile_prefix[run] - tile_count;
+            uint tile = (uint)tile_start + local_entry / 32u;
+            uint slot = local_entry & 31u;
+            ordinary_right_atoms[32u * tile + slot] = right_ordered;
+        }
+        seen1 += count1;
+        seen2 += count2;
+        seen3 += count3;
+    }
+"""
+
+_INTERACTION32_SPECIAL_BLOCK_SCATTER_SOURCE = r"""
+    uint index = thread_position_in_grid.x;
+    uint raw_code_count = (uint)counts[0];
+    uint block_count = (uint)counts[1];
+    if (index >= raw_code_count || special_unique[index] == 0) {
+        return;
+    }
+    uint code = (uint)special_codes[index];
+    int output = special_prefix[index] - 1;
+    special_blocks[2 * output + 0] = (int)(code / block_count);
+    special_blocks[2 * output + 1] = (int)(code % block_count);
+"""
+
+_INTERACTION32_SPECIAL_WORK_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint tile = threadgroup_position_in_grid.x;
+    uint tile_count = (uint)counts[0];
+    uint padded_count = (uint)counts[1];
+    if (tile >= tile_count) {
+        return;
+    }
+
+    int left_block = special_blocks[2u * tile + 0u];
+    int right_block = special_blocks[2u * tile + 1u];
+    uint left_ordered = 32u * (uint)left_block + lane;
+    uint right_ordered = 32u * (uint)right_block + lane;
+    threadgroup int left_atoms[32];
+    left_atoms[lane] = atom_order[left_ordered];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int right_atom = atom_order[right_ordered];
+    uint enabled_word = 0u;
+    uint one_four_word = 0u;
+    if (right_atom >= 0) {
+        for (uint left_slot = 0u; left_slot < 32u; left_slot++) {
+            int left_atom = left_atoms[left_slot];
+            if (left_atom < 0 || left_atom == right_atom) {
+                continue;
+            }
+            int topology_class = -1;
+            int start = topology_offsets[left_atom];
+            int stop = topology_offsets[left_atom + 1];
+            for (int index = start; index < stop; index++) {
+                if (topology_neighbors[index] == right_atom) {
+                    topology_class = topology_classes[index];
+                    break;
+                }
+            }
+            if (topology_class != 0) {
+                enabled_word |= 1u << left_slot;
+            }
+            if (topology_class == 1) {
+                one_four_word |= 1u << left_slot;
+            }
+        }
+    }
+
+    uint first_work = 2u * tile;
+    uint second_work = first_work + 1u;
+    int stored_right = right_atom >= 0 ? (int)right_ordered : (int)padded_count;
+    special_right_atoms[32u * first_work + lane] = stored_right;
+    special_right_atoms[32u * second_work + lane] = stored_right;
+    special_lj_enabled[32u * first_work + lane] = enabled_word;
+    special_lj_enabled[32u * second_work + lane] = enabled_word;
+    special_lj_one_four[32u * first_work + lane] = one_four_word;
+    special_lj_one_four[32u * second_work + lane] = one_four_word;
+    if (lane == 0u) {
+        int diagonal = left_block == right_block ? 1 : 0;
+        special_left_blocks[first_work] = left_block;
+        special_left_blocks[second_work] = left_block;
+        special_left_slices[first_work] = 0;
+        special_left_slices[second_work] = 1;
+        special_diagonal[first_work] = diagonal;
+        special_diagonal[second_work] = diagonal;
+    }
 """
 
 _INTERACTION32_FORCE_SOURCE = r"""
@@ -3841,6 +4265,123 @@ def _interaction32_pack_kernel():
             source=_INTERACTION32_PACK_SOURCE,
         )
     return _interaction32_pack_kernel_singleton
+
+
+def _interaction32_block_geometry_kernel():
+    """Return the packed 32-atom block-bounds Metal kernel."""
+
+    global _interaction32_block_geometry_kernel_singleton
+    if _interaction32_block_geometry_kernel_singleton is None:
+        _interaction32_block_geometry_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_block_geometry",
+            input_names=["positions", "atom_order", "box", "counts"],
+            output_names=["center_radius", "half_extent"],
+            source=_INTERACTION32_BLOCK_GEOMETRY_SOURCE,
+        )
+    return _interaction32_block_geometry_kernel_singleton
+
+
+def _interaction32_ordinary_count_kernel():
+    """Return the packed 32-atom ordinary-membership count kernel."""
+
+    global _interaction32_ordinary_count_kernel_singleton
+    if _interaction32_ordinary_count_kernel_singleton is None:
+        _interaction32_ordinary_count_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_ordinary_mode_counts",
+            input_names=[
+                "positions",
+                "atom_order",
+                "center_radius",
+                "half_extent",
+                "block_traversal",
+                "special_codes",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["mode_counts"],
+            source=_INTERACTION32_ORDINARY_COUNT_SOURCE,
+            header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
+        )
+    return _interaction32_ordinary_count_kernel_singleton
+
+
+def _interaction32_ordinary_scatter_kernel():
+    """Return the compact packed 32-atom ordinary-membership scatter kernel."""
+
+    global _interaction32_ordinary_scatter_kernel_singleton
+    if _interaction32_ordinary_scatter_kernel_singleton is None:
+        _interaction32_ordinary_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_ordinary_mode_scatter",
+            input_names=[
+                "positions",
+                "atom_order",
+                "center_radius",
+                "half_extent",
+                "block_traversal",
+                "special_codes",
+                "mode_tile_counts",
+                "mode_tile_prefix",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=[
+                "ordinary_left_blocks",
+                "ordinary_right_atoms",
+                "ordinary_half_modes",
+            ],
+            source=_INTERACTION32_ORDINARY_SCATTER_SOURCE,
+            header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
+        )
+    return _interaction32_ordinary_scatter_kernel_singleton
+
+
+def _interaction32_special_block_scatter_kernel():
+    """Return the compact special-block scatter Metal kernel."""
+
+    global _interaction32_special_block_scatter_kernel_singleton
+    if _interaction32_special_block_scatter_kernel_singleton is None:
+        _interaction32_special_block_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_special_block_scatter",
+            input_names=[
+                "special_codes",
+                "special_unique",
+                "special_prefix",
+                "counts",
+            ],
+            output_names=["special_blocks"],
+            source=_INTERACTION32_SPECIAL_BLOCK_SCATTER_SOURCE,
+        )
+    return _interaction32_special_block_scatter_kernel_singleton
+
+
+def _interaction32_special_work_kernel():
+    """Return the two-half special-topology work Metal kernel."""
+
+    global _interaction32_special_work_kernel_singleton
+    if _interaction32_special_work_kernel_singleton is None:
+        _interaction32_special_work_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_special_work",
+            input_names=[
+                "atom_order",
+                "special_blocks",
+                "topology_offsets",
+                "topology_neighbors",
+                "topology_classes",
+                "counts",
+            ],
+            output_names=[
+                "special_left_blocks",
+                "special_left_slices",
+                "special_right_atoms",
+                "special_lj_enabled",
+                "special_lj_one_four",
+                "special_diagonal",
+            ],
+            source=_INTERACTION32_SPECIAL_WORK_SOURCE,
+        )
+    return _interaction32_special_work_kernel_singleton
 
 
 def _interaction32_force_kernel():
@@ -7444,6 +7985,291 @@ def _tile_parameterized_pme_direct_force_only(
         **dispatch,
     )
     return forces
+
+
+def _interaction32_block_geometry(
+    positions: mx.array,
+    atom_order: mx.array,
+    box_lengths_and_inverses: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Compute periodic centers, radii, and extents for packed atom blocks."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    atom_count = int(positions.shape[0])
+    if atom_count == 0:
+        raise ValueError("block geometry requires at least one atom")
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    if int(atom_order.shape[0]) < atom_count:
+        raise ValueError("atom_order cannot be shorter than the atom count")
+    if box.shape != (6,):
+        raise ValueError("box_lengths_and_inverses must have shape (6,)")
+    block_count = int(atom_order.shape[0]) // 32
+    return _interaction32_block_geometry_kernel()(
+        inputs=[
+            positions,
+            atom_order,
+            box,
+            mx.array([block_count, atom_count], dtype=mx.int32),
+        ],
+        output_shapes=[(block_count, 4), (block_count, 3)],
+        output_dtypes=[mx.float32, mx.float32],
+        grid=(block_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        init_value=0.0,
+    )
+
+
+def _interaction32_ordinary_mode_counts(
+    positions: mx.array,
+    atom_order: mx.array,
+    center_radius: mx.array,
+    half_extent: mx.array,
+    block_traversal: mx.array,
+    special_codes: mx.array,
+    box_lengths_and_inverses: mx.array,
+    *,
+    search_radius: float,
+) -> mx.array:
+    """Count ordinary right atoms by half-membership mode for each left block."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    center_radius = as_mx_array(center_radius, dtype=mx.float32)
+    half_extent = as_mx_array(half_extent, dtype=mx.float32)
+    block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
+    special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    block_count = int(atom_order.shape[0]) // 32
+    if center_radius.shape != (block_count, 4):
+        raise ValueError("center_radius must have shape (n_blocks, 4)")
+    if half_extent.shape != (block_count, 3):
+        raise ValueError("half_extent must have shape (n_blocks, 3)")
+    if block_traversal.shape != (block_count,):
+        raise ValueError("block_traversal must have shape (n_blocks,)")
+    if special_codes.ndim != 1 or special_codes.shape[0] < block_count:
+        raise ValueError("special_codes must contain sorted diagonal block codes")
+    if box.shape != (6,):
+        raise ValueError("box_lengths_and_inverses must have shape (6,)")
+    if not isfinite(float(search_radius)) or search_radius <= 0.0:
+        raise ValueError("search_radius must be finite and positive")
+    radius = float(search_radius)
+    (mode_counts,) = _interaction32_ordinary_count_kernel()(
+        inputs=[
+            positions,
+            atom_order,
+            center_radius,
+            half_extent,
+            block_traversal,
+            special_codes,
+            box,
+            mx.array([radius, radius * radius], dtype=mx.float32),
+            mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
+        ],
+        output_shapes=[(block_count, 3)],
+        output_dtypes=[mx.int32],
+        grid=(block_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        init_value=0,
+    )
+    return mode_counts
+
+
+def _interaction32_ordinary_scatter_sized(
+    positions: mx.array,
+    atom_order: mx.array,
+    center_radius: mx.array,
+    half_extent: mx.array,
+    block_traversal: mx.array,
+    special_codes: mx.array,
+    mode_tile_counts: mx.array,
+    mode_tile_prefix: mx.array,
+    box_lengths_and_inverses: mx.array,
+    *,
+    search_radius: float,
+    accepted_tile_count: int,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Scatter compact ordinary rows after device count and prefix stages."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    center_radius = as_mx_array(center_radius, dtype=mx.float32)
+    half_extent = as_mx_array(half_extent, dtype=mx.float32)
+    block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
+    special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    mode_tile_counts = as_mx_array(mode_tile_counts, dtype=mx.int32)
+    mode_tile_prefix = as_mx_array(mode_tile_prefix, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    block_count = int(atom_order.shape[0]) // 32
+    run_shape = (block_count * 3,)
+    if mode_tile_counts.shape != run_shape or mode_tile_prefix.shape != run_shape:
+        raise ValueError("mode tile counts and prefixes must have shape (3*n_blocks,)")
+    if center_radius.shape != (block_count, 4):
+        raise ValueError("center_radius must have shape (n_blocks, 4)")
+    if half_extent.shape != (block_count, 3):
+        raise ValueError("half_extent must have shape (n_blocks, 3)")
+    if block_traversal.shape != (block_count,):
+        raise ValueError("block_traversal must have shape (n_blocks,)")
+    if special_codes.ndim != 1 or special_codes.shape[0] < block_count:
+        raise ValueError("special_codes must contain sorted diagonal block codes")
+    if box.shape != (6,):
+        raise ValueError("box_lengths_and_inverses must have shape (6,)")
+    if not isfinite(float(search_radius)) or search_radius <= 0.0:
+        raise ValueError("search_radius must be finite and positive")
+    if accepted_tile_count < 0:
+        raise ValueError("accepted_tile_count must be non-negative")
+    if accepted_tile_count == 0:
+        return (
+            mx.zeros((0,), dtype=mx.int32),
+            mx.zeros((0, 32), dtype=mx.int32),
+            mx.zeros((0,), dtype=mx.int32),
+        )
+    radius = float(search_radius)
+    return _interaction32_ordinary_scatter_kernel()(
+        inputs=[
+            positions,
+            atom_order,
+            center_radius,
+            half_extent,
+            block_traversal,
+            special_codes,
+            mode_tile_counts,
+            mode_tile_prefix,
+            box,
+            mx.array([radius, radius * radius], dtype=mx.float32),
+            mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
+        ],
+        output_shapes=[
+            (accepted_tile_count,),
+            (accepted_tile_count, 32),
+            (accepted_tile_count,),
+        ],
+        output_dtypes=[mx.int32, mx.int32, mx.int32],
+        grid=(block_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        init_value=int(atom_order.shape[0]),
+    )
+
+
+def _interaction32_special_blocks_sized(
+    special_codes: mx.array,
+    special_unique: mx.array,
+    special_prefix: mx.array,
+    *,
+    block_count: int,
+    special_count: int,
+) -> mx.array:
+    """Compact flagged 32-atom block pairs into a sized device array."""
+
+    special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    special_unique = as_mx_array(special_unique, dtype=mx.int32)
+    special_prefix = as_mx_array(special_prefix, dtype=mx.int32)
+    raw_code_count = int(special_codes.shape[0])
+    if block_count < 1:
+        raise ValueError("block_count must be positive")
+    if special_codes.ndim != 1 or raw_code_count < block_count:
+        raise ValueError("special_codes must contain sorted diagonal block codes")
+    if special_unique.shape != (raw_code_count,):
+        raise ValueError("special_unique must contain one marker per raw block code")
+    if special_prefix.shape != (raw_code_count,):
+        raise ValueError("special_prefix must contain one value per raw block code")
+    if special_count < 0 or special_count > raw_code_count:
+        raise ValueError("special_count is incompatible with the block inventory")
+    if special_count == 0:
+        return mx.zeros((0, 2), dtype=mx.int32)
+    threads = min(256, raw_code_count)
+    (special_blocks,) = _interaction32_special_block_scatter_kernel()(
+        inputs=[
+            special_codes,
+            special_unique,
+            special_prefix,
+            mx.array([raw_code_count, block_count], dtype=mx.int32),
+        ],
+        output_shapes=[(special_count, 2)],
+        output_dtypes=[mx.int32],
+        grid=(raw_code_count, 1, 1),
+        threadgroup=(threads, 1, 1),
+        init_value=0,
+    )
+    return special_blocks
+
+
+def _interaction32_special_work_two_halves(
+    atom_order: mx.array,
+    special_blocks: mx.array,
+    topology_offsets: mx.array,
+    topology_neighbors: mx.array,
+    topology_classes: mx.array,
+) -> tuple[mx.array, ...]:
+    """Build conservative two-half work and topology masks for special blocks."""
+
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    special_blocks = as_mx_array(special_blocks, dtype=mx.int32)
+    topology_offsets = as_mx_array(topology_offsets, dtype=mx.int32)
+    topology_neighbors = as_mx_array(topology_neighbors, dtype=mx.int32)
+    topology_classes = as_mx_array(topology_classes, dtype=mx.int32)
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    if special_blocks.ndim != 2 or special_blocks.shape[1] != 2:
+        raise ValueError("special_blocks must have shape (n_special, 2)")
+    atom_count = int(topology_offsets.shape[0]) - 1
+    if atom_count < 1:
+        raise ValueError("topology_offsets must contain one boundary per atom")
+    topology_count = int(topology_neighbors.shape[0])
+    if topology_classes.shape != (topology_count,):
+        raise ValueError("topology neighbors and classes must have matching shapes")
+    special_count = int(special_blocks.shape[0])
+    work_count = 2 * special_count
+    if special_count == 0:
+        return (
+            mx.zeros((0,), dtype=mx.int32),
+            mx.zeros((0,), dtype=mx.int32),
+            mx.zeros((0, 32), dtype=mx.int32),
+            mx.zeros((0, 32), dtype=mx.uint32),
+            mx.zeros((0, 32), dtype=mx.uint32),
+            mx.zeros((0,), dtype=mx.int32),
+        )
+    return _interaction32_special_work_kernel()(
+        inputs=[
+            atom_order,
+            special_blocks,
+            topology_offsets,
+            topology_neighbors,
+            topology_classes,
+            mx.array([special_count, int(atom_order.shape[0])], dtype=mx.int32),
+        ],
+        output_shapes=[
+            (work_count,),
+            (work_count,),
+            (work_count, 32),
+            (work_count, 32),
+            (work_count, 32),
+            (work_count,),
+        ],
+        output_dtypes=[
+            mx.int32,
+            mx.int32,
+            mx.int32,
+            mx.uint32,
+            mx.uint32,
+            mx.int32,
+        ],
+        grid=(special_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        init_value=0,
+    )
 
 
 def _interaction32_pme_direct_force_only(

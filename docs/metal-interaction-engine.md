@@ -155,6 +155,94 @@ Every admitted generation must preserve:
 - bounded memory under repeated rebuilds;
 - canonical public atom indexing.
 
+## Device Builder Contract
+
+Gate C is split into two measured boundaries. C1 proves the builder algorithm
+with MLX custom Metal kernels. C2 removes the remaining scalar sizing boundary
+only if C1 shows that it is material.
+
+### C1: device-built payload with sized allocation
+
+1. Wrap positions, assign fine spatial keys, and produce a canonical-to-packed
+   32-atom order with MLX `argsort`.
+2. One SIMD group per packed block computes its center, radius, and axis-aligned
+   half extent without materializing a block-by-atom position tensor.
+3. Static canonical exclusion and 1-4 pairs map through the inverse order.
+   Sorted sparse block-pair codes define diagonal and topology-bearing special
+   work. Ordinary traversal uses binary search rather than a quadratic dense
+   block-pair flag table.
+4. The ordinary count kernel assigns one SIMD group to each left block. It
+   rejects right blocks by sphere and axis-aligned bounds, skips special block
+   pairs, and counts unique right atoms in three buckets: first half only,
+   second half only, and both halves.
+5. MLX prefix scans the three count vectors. One synchronized inventory read
+   obtains ordinary rows, force groups, and the special-block count. No
+   atom identifiers, positions, bounds, or membership payloads cross to the
+   host.
+6. The ordinary scatter kernel repeats the exact geometric test and writes
+   compact 32-right-atom rows directly into final left-block and half-mode
+   order. Existing grouped-work emission builds runs of at most three rows.
+7. Each compact special block conservatively emits two 16-atom rows. The force
+   kernel applies the exact distance test, while device-built topology masks
+   retain production exclusion and 1-4 semantics, including diagonal ownership.
+
+The two-pass ordinary search deliberately trades repeated distance-only tests
+for deterministic compact output and avoids global atomic allocation. Its
+complete rebuild wall, not its kernel time alone, decides whether it survives.
+
+### C1 measured checkpoint
+
+The first device-builder checkpoint passes synthetic periodic, topology, and
+complete-force oracles and three real fixed-coordinate artifacts. All runs used
+Low Power Mode, eight position-balanced samples, and 750 synchronized force
+calls per timing block. Generated JSON remains under
+`results/md-suite/round2-device-builder/` and is not a package input.
+
+| System | Atoms | Device build | Production force | Candidate force | Force speedup | RMS force delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5DFR | 23,558 | 11.75 ms | 0.839 ms | 0.756 ms | 9.9% | `6.85e-5` |
+| JAC | 94,232 | 37.18 ms | 3.577 ms | 2.646 ms | 26.0% | `5.19e-5` |
+| GPCRmd | 92,001 | 50.63 ms | 4.189 ms | 3.121 ms | 25.5% | `5.83e-5` |
+
+The device builder reproduces the host prototype's size-ordered ordinary
+inventory. This ordering is performance-critical: a correct block-ID traversal
+retained nearly the same logical work but changed force locality enough to lose
+the candidate benefit. Special work currently over-allocates at most one empty
+half per special block; that small conservative cost is measured before adding
+another geometry compaction stage.
+
+The force-only rebuild break-even is about 142 steps for 5DFR, 40 for JAC, and
+47 for GPCRmd. These are not trajectory claims. Promotion still requires the
+capacity/generation contract and measured rebuild frequency in moving NVT
+trajectories.
+
+### Capacity, overflow, and generation
+
+The following is the promotion contract, not yet the behavior of the C1
+prototype. The first admitted generation sizes exact arrays from C1 inventory. Later
+generations retain at least 125% row and group capacity, rounded to a stable
+allocation quantum. Count kernels always write logical counts and an overflow
+bit before scatter. Scatter is forbidden when any logical count exceeds
+capacity. An overflowed candidate generation never replaces the previous
+valid schedule; a safe host boundary may grow capacity and retry.
+
+Generation identity includes atom order, box, search radius, topology identity,
+logical counts, and capacity. Force bindings rebind only after a complete new
+generation passes overflow, uniqueness, periodic membership, and topology
+checks. Public positions and forces remain in canonical order.
+
+### C2: optional native state boundary
+
+`mx.fast.metal_kernel` requires host-provided output shapes and direct dispatch
+sizes. C1 therefore retains one scalar inventory synchronization per rebuild.
+That is acceptable for the algorithm gate but is not called fully
+device-resident. A C++ MLX `Primitive` becomes authorized only when C1 beats the
+production builder plus force path and profiling shows this scalar boundary is
+material. The native version must use the active MLX stream, functional state
+tokens, validated buffer donation, indirect dispatch, and the same fail-closed
+overflow contract. It must not create a private command queue or mutable global
+device state.
+
 ## Promotion Gates
 
 The candidate advances only in this order:

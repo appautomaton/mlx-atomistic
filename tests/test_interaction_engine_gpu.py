@@ -9,12 +9,22 @@ import pytest
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.interaction_engine import (
+    _assemble_device_fused_half_schedule32,
+    _build_device_block_geometry32,
+    _build_device_ordinary_schedule32,
+    _build_device_special_block_inventory32,
+    _build_device_special_schedule32,
     _build_interaction_schedule32,
     _build_owner_compute_schedule32,
+    _cell_atom_order,
     _fuse_interaction_halves32,
     _fused_half32_direct_force_only,
+    _group_ordinary_tiles,
     _interaction32_direct_force_only,
+    _make_atom_blocks,
+    _normalize_pairs,
     _owner_compute32_direct_force_only,
+    _special_block_codes,
 )
 from mlx_atomistic.metal_kernels import _prepared_parameterized_pme_direct_force_only
 from mlx_atomistic.neighbors import build_neighbor_list
@@ -184,6 +194,411 @@ def test_interaction32_force_matches_prepared_pair_oracle(left_slice_size):
             rtol=2.0e-5,
             atol=2.0e-3,
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("atom_count", (1, 31, 32, 33, 257))
+def test_device_block_geometry_matches_host_oracle(atom_count):
+    """Device ordering and periodic block bounds match the host oracle."""
+
+    rng = np.random.default_rng(79 + atom_count)
+    box = np.asarray([20.0, 21.0, 22.0], dtype=np.float32)
+    positions = rng.uniform(-2.0, 24.0, size=(atom_count, 3)).astype(np.float32)
+    search_radius = 4.5
+    observed = _build_device_block_geometry32(
+        positions,
+        box,
+        search_radius=search_radius,
+    )
+    mx.eval(
+        observed.atom_order,
+        observed.inverse_order,
+        observed.center_radius,
+        observed.half_extent,
+        observed.block_traversal,
+    )
+
+    expected_order = _cell_atom_order(positions, box, search_radius)
+    (
+        _expected_blocks,
+        _expected_valid,
+        expected_centers,
+        expected_extents,
+        expected_radii,
+        expected_inverse,
+    ) = _make_atom_blocks(positions, box, expected_order)
+    expected_padded = np.full((observed.padded_atom_count,), -1, dtype=np.int32)
+    expected_padded[:atom_count] = expected_order
+    np.testing.assert_array_equal(np.asarray(observed.atom_order), expected_padded)
+    np.testing.assert_array_equal(np.asarray(observed.inverse_order), expected_inverse)
+
+    observed_center_radius = np.asarray(observed.center_radius)
+    center_delta = observed_center_radius[:, :3] - expected_centers
+    center_delta -= box * np.rint(center_delta / box)
+    np.testing.assert_allclose(center_delta, 0.0, rtol=0.0, atol=2.0e-5)
+    np.testing.assert_allclose(
+        observed_center_radius[:, 3],
+        expected_radii,
+        rtol=2.0e-5,
+        atol=2.0e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(observed.half_extent),
+        expected_extents,
+        rtol=2.0e-5,
+        atol=2.0e-5,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(observed.block_traversal),
+        np.argsort(np.sum(expected_extents, axis=1), kind="stable"),
+    )
+
+
+@pytest.mark.gpu
+def test_device_special_block_inventory_matches_host_oracle():
+    """Device topology flags identify the same unique special block pairs."""
+
+    rng = np.random.default_rng(97)
+    atom_count = 257
+    box = np.asarray([20.0, 21.0, 22.0], dtype=np.float32)
+    positions = rng.uniform(0.0, box, size=(atom_count, 3)).astype(np.float32)
+    exclusions = np.asarray([[0, 1], [0, 40], [100, 200]], dtype=np.int32)
+    one_four = np.asarray([[2, 3], [50, 120]], dtype=np.int32)
+    geometry = _build_device_block_geometry32(
+        positions,
+        box,
+        search_radius=4.5,
+    )
+    inventory = _build_device_special_block_inventory32(
+        geometry,
+        lj_exclusion_pairs=exclusions,
+        lj_one_four_pairs=one_four,
+    )
+    mx.eval(
+        geometry.atom_order,
+        geometry.inverse_order,
+        inventory.block_codes,
+        inventory.block_code_unique,
+        inventory.special_count,
+    )
+
+    expected = _special_block_codes(
+        geometry.block_count,
+        np.asarray(geometry.inverse_order),
+        _normalize_pairs(exclusions, atom_count, "lj_exclusion_pairs"),
+        _normalize_pairs(one_four, atom_count, "lj_one_four_pairs"),
+    )
+    observed = np.unique(np.asarray(inventory.block_codes)).astype(np.int64)
+    np.testing.assert_array_equal(observed, expected)
+    assert int(np.asarray(inventory.special_count)) == expected.shape[0]
+
+
+@pytest.mark.gpu
+def test_device_ordinary_schedule_matches_periodic_brute_force():
+    """Two-pass device scatter preserves exact half-mode memberships."""
+
+    rng = np.random.default_rng(101)
+    atom_count = 257
+    box = np.asarray([20.0, 21.0, 22.0], dtype=np.float32)
+    positions = rng.uniform(0.0, box, size=(atom_count, 3)).astype(np.float32)
+    positions[0] = [0.05, 10.0, 10.0]
+    positions[1] = [19.95, 10.0, 10.0]
+    search_radius = 4.5
+    geometry = _build_device_block_geometry32(
+        positions,
+        box,
+        search_radius=search_radius,
+    )
+    special = _build_device_special_block_inventory32(
+        geometry,
+        lj_exclusion_pairs=[[0, 1], [10, 100]],
+        lj_one_four_pairs=[[20, 200]],
+    )
+    schedule = _build_device_ordinary_schedule32(
+        positions,
+        geometry,
+        special,
+    )
+    mx.eval(
+        geometry.atom_order,
+        special.block_codes,
+        schedule.mode_entry_counts,
+        schedule.ordinary_left_blocks,
+        schedule.ordinary_right_atoms,
+        schedule.ordinary_half_modes,
+        schedule.ordinary_group_starts,
+        schedule.ordinary_group_counts,
+    )
+
+    atom_order = np.asarray(geometry.atom_order)
+    block_traversal = np.asarray(geometry.block_traversal)
+    special_codes = set(np.asarray(special.block_codes).tolist())
+    expected: dict[tuple[int, int], int] = {}
+    expected_counts = np.zeros((geometry.block_count, 3), dtype=np.int32)
+    search_radius2 = search_radius * search_radius
+    for traversal_index, left_block in enumerate(block_traversal):
+        left_atoms = atom_order[32 * left_block : 32 * (left_block + 1)]
+        valid_left = left_atoms >= 0
+        left_positions = positions[np.maximum(left_atoms, 0)]
+        for right_block in block_traversal[traversal_index + 1 :]:
+            low_block = min(left_block, right_block)
+            high_block = max(left_block, right_block)
+            if low_block * geometry.block_count + high_block in special_codes:
+                continue
+            for right_slot in range(32):
+                right_ordered = 32 * right_block + right_slot
+                right_atom = atom_order[right_ordered]
+                if right_atom < 0:
+                    continue
+                delta = left_positions - positions[right_atom]
+                delta -= box * np.rint(delta / box)
+                member = valid_left & (np.sum(delta * delta, axis=1) < search_radius2)
+                mode = int(np.any(member[:16])) | (int(np.any(member[16:])) << 1)
+                if mode:
+                    expected[(left_block, right_ordered)] = mode
+                    expected_counts[traversal_index, mode - 1] += 1
+
+    observed: dict[tuple[int, int], int] = {}
+    sentinel = geometry.padded_atom_count
+    for left_block, mode, right_row in zip(
+        np.asarray(schedule.ordinary_left_blocks),
+        np.asarray(schedule.ordinary_half_modes),
+        np.asarray(schedule.ordinary_right_atoms),
+        strict=True,
+    ):
+        valid_rights = right_row[right_row < sentinel]
+        assert np.all(right_row[valid_rights.shape[0] :] == sentinel)
+        for right_ordered in valid_rights:
+            key = (int(left_block), int(right_ordered))
+            assert key not in observed
+            observed[key] = int(mode)
+
+    assert observed == expected
+    np.testing.assert_array_equal(
+        np.asarray(schedule.mode_entry_counts),
+        expected_counts,
+    )
+    assert schedule.right_entry_count == len(expected)
+    expected_starts, expected_group_counts = _group_ordinary_tiles(
+        np.asarray(schedule.ordinary_left_blocks),
+        np.asarray(schedule.ordinary_half_modes),
+        3,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.ordinary_group_starts),
+        expected_starts,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.ordinary_group_counts),
+        expected_group_counts,
+    )
+
+
+@pytest.mark.gpu
+def test_device_special_schedule_matches_topology_oracle():
+    """Device special work preserves block order and exact topology masks."""
+
+    rng = np.random.default_rng(103)
+    atom_count = 257
+    box = np.asarray([20.0, 21.0, 22.0], dtype=np.float32)
+    positions = rng.uniform(0.0, box, size=(atom_count, 3)).astype(np.float32)
+    exclusions = np.asarray([[0, 1], [0, 40], [100, 200]], dtype=np.int32)
+    one_four = np.asarray([[2, 3], [50, 120]], dtype=np.int32)
+    geometry = _build_device_block_geometry32(
+        positions,
+        box,
+        search_radius=4.5,
+    )
+    inventory = _build_device_special_block_inventory32(
+        geometry,
+        lj_exclusion_pairs=exclusions,
+        lj_one_four_pairs=one_four,
+    )
+    schedule = _build_device_special_schedule32(geometry, inventory)
+    mx.eval(
+        geometry.atom_order,
+        schedule.special_blocks,
+        schedule.special_work_left_blocks,
+        schedule.special_work_left_slices,
+        schedule.special_work_right_atoms,
+        schedule.special_work_lj_enabled,
+        schedule.special_work_lj_one_four,
+        schedule.special_work_diagonal,
+    )
+
+    atom_order = np.asarray(geometry.atom_order)
+    inverse_order = np.asarray(geometry.inverse_order)
+    expected_codes = _special_block_codes(
+        geometry.block_count,
+        inverse_order,
+        _normalize_pairs(exclusions, atom_count, "lj_exclusion_pairs"),
+        _normalize_pairs(one_four, atom_count, "lj_one_four_pairs"),
+    )
+    expected_blocks = np.stack(
+        (
+            expected_codes // geometry.block_count,
+            expected_codes % geometry.block_count,
+        ),
+        axis=1,
+    ).astype(np.int32)
+    observed_blocks = np.asarray(schedule.special_blocks)
+    np.testing.assert_array_equal(observed_blocks, expected_blocks)
+    assert schedule.special_tile_count == expected_blocks.shape[0]
+    assert schedule.special_work_count == 2 * expected_blocks.shape[0]
+
+    expected_left = np.repeat(expected_blocks[:, 0], 2)
+    expected_slices = np.tile(np.asarray([0, 1], dtype=np.int32), expected_blocks.shape[0])
+    expected_diagonal = np.repeat(
+        (expected_blocks[:, 0] == expected_blocks[:, 1]).astype(np.int32),
+        2,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.special_work_left_blocks),
+        expected_left,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.special_work_left_slices),
+        expected_slices,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.special_work_diagonal),
+        expected_diagonal,
+    )
+
+    exclusion_set = {tuple(pair) for pair in np.sort(exclusions, axis=1)}
+    one_four_set = {tuple(pair) for pair in np.sort(one_four, axis=1)}
+    right_rows = np.asarray(schedule.special_work_right_atoms)[::2]
+    enabled_rows = np.asarray(schedule.special_work_lj_enabled)[::2]
+    one_four_rows = np.asarray(schedule.special_work_lj_one_four)[::2]
+    for tile, (left_block, right_block) in enumerate(expected_blocks):
+        left_atoms = atom_order[32 * left_block : 32 * (left_block + 1)]
+        for right_slot in range(32):
+            right_ordered = 32 * right_block + right_slot
+            right_atom = atom_order[right_ordered]
+            expected_right = (
+                right_ordered if right_atom >= 0 else geometry.padded_atom_count
+            )
+            assert right_rows[tile, right_slot] == expected_right
+            enabled_word = 0
+            one_four_word = 0
+            if right_atom >= 0:
+                for left_slot, left_atom in enumerate(left_atoms):
+                    if left_atom < 0 or left_atom == right_atom:
+                        continue
+                    pair = tuple(sorted((int(left_atom), int(right_atom))))
+                    if pair not in exclusion_set:
+                        enabled_word |= 1 << left_slot
+                    if pair in one_four_set:
+                        one_four_word |= 1 << left_slot
+            assert int(enabled_rows[tile, right_slot]) == enabled_word
+            assert int(one_four_rows[tile, right_slot]) == one_four_word
+
+    np.testing.assert_array_equal(
+        np.asarray(schedule.special_work_right_atoms)[0::2],
+        np.asarray(schedule.special_work_right_atoms)[1::2],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.special_work_lj_enabled)[0::2],
+        np.asarray(schedule.special_work_lj_enabled)[1::2],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.special_work_lj_one_four)[0::2],
+        np.asarray(schedule.special_work_lj_one_four)[1::2],
+    )
+
+
+@pytest.mark.gpu
+def test_device_built_fused_half32_force_matches_pair_oracle():
+    """Combined device-built ordinary and special work preserves direct forces."""
+
+    grid = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    )
+    positions_np = 2.0 + 1.4 * grid.reshape((-1, 3)).astype(np.float32)
+    atom_count = positions_np.shape[0]
+    box_lengths = np.asarray([20.0, 20.0, 20.0], dtype=np.float32)
+    cutoff = 4.0
+    search_radius = 4.5
+    one_four_scale = 0.5
+    geometry = _build_device_block_geometry32(
+        positions_np,
+        box_lengths,
+        search_radius=search_radius,
+    )
+    mx.eval(geometry.atom_order)
+    atom_order = np.asarray(geometry.atom_order)
+    excluded = np.sort(np.asarray([[atom_order[0], atom_order[32]]]), axis=1)
+    one_four = np.sort(np.asarray([[atom_order[1], atom_order[33]]]), axis=1)
+    inventory = _build_device_special_block_inventory32(
+        geometry,
+        lj_exclusion_pairs=excluded,
+        lj_one_four_pairs=one_four,
+    )
+    ordinary = _build_device_ordinary_schedule32(
+        positions_np,
+        geometry,
+        inventory,
+    )
+    special = _build_device_special_schedule32(geometry, inventory)
+    schedule = _assemble_device_fused_half_schedule32(
+        geometry,
+        ordinary,
+        special,
+    )
+
+    pair_i, pair_j = np.triu_indices(atom_count, k=1)
+    pairs = np.stack((pair_i, pair_j), axis=1).astype(np.int32)
+    codes = pairs[:, 0] * atom_count + pairs[:, 1]
+    lj_scales = np.ones((pairs.shape[0],), dtype=np.float32)
+    lj_scales[codes == atom_count * excluded[0, 0] + excluded[0, 1]] = 0.0
+    lj_scales[codes == atom_count * one_four[0, 0] + one_four[0, 1]] = one_four_scale
+
+    positions = mx.array(positions_np, dtype=mx.float32)
+    box = mx.concatenate(
+        (
+            mx.array(box_lengths, dtype=mx.float32),
+            1.0 / mx.array(box_lengths, dtype=mx.float32),
+        )
+    )
+    half_sigma = mx.full((atom_count,), 0.55, dtype=mx.float32)
+    sqrt_epsilon = mx.full((atom_count,), np.sqrt(0.2), dtype=mx.float32)
+    charges = mx.array(np.linspace(-0.5, 0.5, atom_count), dtype=mx.float32)
+    reference = _prepared_parameterized_pme_direct_force_only(
+        positions,
+        mx.array(pairs, dtype=mx.int32),
+        box,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+        mx.array(lj_scales, dtype=mx.float32),
+        cutoff=cutoff,
+        shift=False,
+        switch_distance=None,
+        coulomb_constant=1389.35457644382,
+        alpha=0.35,
+    )
+    observed = _fused_half32_direct_force_only(
+        positions,
+        schedule,
+        box,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+        cutoff=cutoff,
+        shift=False,
+        switch_distance=None,
+        one_four_scale=one_four_scale,
+        coulomb_constant=1389.35457644382,
+        alpha=0.35,
+    )
+    mx.eval(reference, observed)
+    np.testing.assert_allclose(
+        np.asarray(observed),
+        np.asarray(reference),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
 
 
 @pytest.mark.gpu

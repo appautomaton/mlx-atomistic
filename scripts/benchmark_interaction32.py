@@ -18,6 +18,11 @@ from mlx_atomistic.artifacts import (
 )
 from mlx_atomistic.benchmarks.charged_pme import _bind_pme_plans, _find_pme_term
 from mlx_atomistic.interaction_engine import (
+    _assemble_device_fused_half_schedule32,
+    _build_device_block_geometry32,
+    _build_device_ordinary_schedule32,
+    _build_device_special_block_inventory32,
+    _build_device_special_schedule32,
     _build_interaction_schedule32,
     _build_owner_compute_schedule32,
     _fuse_interaction_halves32,
@@ -375,6 +380,68 @@ def benchmark(
             "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
             "oracle_build_seconds": schedule_build_seconds,
         }
+    elif architecture == "device_fused_half32":
+        geometry = _build_device_block_geometry32(
+            system.positions,
+            box_lengths,
+            search_radius=cutoff + skin,
+        )
+        special_inventory = _build_device_special_block_inventory32(
+            geometry,
+            lj_exclusion_pairs=exclusion_pairs,
+            lj_one_four_pairs=one_four_pairs,
+        )
+        ordinary_schedule = _build_device_ordinary_schedule32(
+            system.positions,
+            geometry,
+            special_inventory,
+            ordinary_tiles_per_group=ordinary_tiles_per_group,
+        )
+        special_schedule = _build_device_special_schedule32(
+            geometry,
+            special_inventory,
+            special_tile_count=ordinary_schedule.special_tile_count_inventory,
+        )
+        device_schedule = _assemble_device_fused_half_schedule32(
+            geometry,
+            ordinary_schedule,
+            special_schedule,
+        )
+        mx.eval(
+            device_schedule.atom_order,
+            device_schedule.ordinary_left_blocks,
+            device_schedule.ordinary_right_atoms,
+            device_schedule.ordinary_half_modes,
+            device_schedule.ordinary_group_starts,
+            device_schedule.ordinary_group_counts,
+            device_schedule.special_work_left_blocks,
+            device_schedule.special_work_left_slices,
+            device_schedule.special_work_right_atoms,
+            device_schedule.special_work_lj_enabled,
+            device_schedule.special_work_lj_one_four,
+            device_schedule.special_work_diagonal,
+        )
+        schedule_build_seconds = time.perf_counter() - schedule_started
+        schedule = device_schedule
+        candidate_inventory = {
+            "block_count": geometry.block_count,
+            "ordinary_tile_count": ordinary_schedule.ordinary_tile_count,
+            "ordinary_group_count": ordinary_schedule.ordinary_group_count,
+            "ordinary_tiles_per_group_limit": ordinary_tiles_per_group,
+            "ordinary_right_atom_entries": ordinary_schedule.right_entry_count,
+            "ordinary_logical_pair_lanes": ordinary_schedule.logical_pair_lanes,
+            "special_tile_count": special_schedule.special_tile_count,
+            "special_work_count": special_schedule.special_work_count,
+            "sparse_special_code_entries": int(special_inventory.block_codes.shape[0]),
+            "scheduled_pair_lanes": (
+                ordinary_schedule.logical_pair_lanes
+                + special_schedule.special_work_count * 16 * 32
+            ),
+            "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
+            "device_build_seconds": schedule_build_seconds,
+            "host_payload_arrays": 0,
+            "scalar_inventory_materializations": 1,
+        }
     elif architecture == "owner_compute32":
         schedule = _build_owner_compute_schedule32(
             positions_np,
@@ -524,7 +591,7 @@ def benchmark(
     control_median = float(np.median(timings["control"]))
     candidate_median = float(np.median(timings["candidate"]))
     return {
-        "schema": "mlx_atomistic.interaction32_force_benchmark.v4",
+        "schema": "mlx_atomistic.interaction32_force_benchmark.v5",
         "prepared": str(prepared),
         "architecture": architecture,
         "atom_count": schedule.atom_count,
@@ -568,7 +635,12 @@ def main() -> None:
     parser.add_argument("prepared", type=Path)
     parser.add_argument(
         "--architecture",
-        choices=("interaction32", "fused_half32", "owner_compute32"),
+        choices=(
+            "interaction32",
+            "fused_half32",
+            "device_fused_half32",
+            "owner_compute32",
+        ),
         default="interaction32",
     )
     parser.add_argument("--skin", type=float, default=5.5)

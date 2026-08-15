@@ -11,9 +11,15 @@ from scipy.spatial import cKDTree
 
 from mlx_atomistic.core import as_mx_array
 from mlx_atomistic.metal_kernels import (
+    _interaction32_block_geometry,
     _interaction32_fused_half_pme_direct_force_only,
+    _interaction32_ordinary_mode_counts,
+    _interaction32_ordinary_scatter_sized,
     _interaction32_pme_direct_force_only,
+    _interaction32_special_blocks_sized,
+    _interaction32_special_work_two_halves,
     _Interaction32ForceStages,
+    _neighbor_tile_force_groups_sized,
     _owner_compute32_pme_direct_force_only,
 )
 
@@ -324,6 +330,73 @@ class _DeviceInteractionSchedule32:
 
 
 @dataclass(frozen=True)
+class _DeviceBlockGeometry32:
+    atom_count: int
+    search_radius: float
+    box_lengths: np.ndarray
+    atom_order: mx.array
+    inverse_order: mx.array
+    center_radius: mx.array
+    half_extent: mx.array
+    block_traversal: mx.array
+
+    @property
+    def padded_atom_count(self) -> int:
+        return int(self.atom_order.shape[0])
+
+    @property
+    def block_count(self) -> int:
+        return self.padded_atom_count // _INTERACTION_TILE_SIZE
+
+
+@dataclass(frozen=True)
+class _DeviceSpecialBlockInventory32:
+    atom_count: int
+    block_count: int
+    exclusion_pairs: mx.array
+    one_four_pairs: mx.array
+    block_codes: mx.array
+    block_code_unique: mx.array
+    special_count: mx.array
+    topology_offsets: mx.array
+    topology_neighbors: mx.array
+    topology_classes: mx.array
+
+
+@dataclass(frozen=True)
+class _DeviceOrdinarySchedule32:
+    atom_count: int
+    search_radius: float
+    padded_atom_count: int
+    right_entry_count: int
+    logical_pair_lanes: int
+    ordinary_tile_count: int
+    ordinary_group_count: int
+    special_tile_count_inventory: int
+    mode_entry_counts: mx.array
+    ordinary_left_blocks: mx.array
+    ordinary_right_atoms: mx.array
+    ordinary_half_modes: mx.array
+    ordinary_group_starts: mx.array
+    ordinary_group_counts: mx.array
+
+
+@dataclass(frozen=True)
+class _DeviceSpecialSchedule32:
+    atom_count: int
+    padded_atom_count: int
+    special_tile_count: int
+    special_work_count: int
+    special_blocks: mx.array
+    special_work_left_blocks: mx.array
+    special_work_left_slices: mx.array
+    special_work_right_atoms: mx.array
+    special_work_lj_enabled: mx.array
+    special_work_lj_one_four: mx.array
+    special_work_diagonal: mx.array
+
+
+@dataclass(frozen=True)
 class _FusedHalfSchedule32:
     atom_count: int
     search_radius: float
@@ -462,6 +535,323 @@ def _schedule_to_device32(
             dtype=mx.uint32,
         ),
         special_work_diagonal=mx.array(schedule.special_work_diagonal, dtype=mx.int32),
+    )
+
+
+def _build_device_block_geometry32(
+    positions: object,
+    box_lengths: object,
+    *,
+    search_radius: float,
+) -> _DeviceBlockGeometry32:
+    """Build the spatial atom order and periodic 32-atom block bounds on device."""
+
+    positions_mx = as_mx_array(positions, dtype=mx.float32)
+    box = np.asarray(box_lengths, dtype=np.float32)
+    if positions_mx.ndim != 2 or positions_mx.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    atom_count = int(positions_mx.shape[0])
+    if atom_count == 0:
+        raise ValueError("device block geometry requires atoms")
+    if box.shape != (3,) or np.any(~np.isfinite(box)) or np.any(box <= 0.0):
+        raise ValueError("box_lengths must be a finite positive vector with shape (3,)")
+    if not isfinite(float(search_radius)) or search_radius <= 0.0:
+        raise ValueError("search_radius must be finite and positive")
+    if 2.0 * float(search_radius) >= float(np.min(box)):
+        raise ValueError("search_radius must be smaller than half the shortest box length")
+
+    cell_width = float(search_radius) / 3.0
+    cell_counts = np.maximum(np.floor(box / cell_width).astype(np.int64), 1)
+    cell_count = int(np.prod(cell_counts, dtype=np.int64))
+    if cell_count > np.iinfo(np.int32).max:
+        raise ValueError("device spatial cell inventory exceeds int32 capacity")
+    box_mx = mx.array(box, dtype=mx.float32)
+    cell_counts_mx = mx.array(cell_counts.astype(np.int32), dtype=mx.int32)
+    wrapped = positions_mx - box_mx * mx.floor(positions_mx / box_mx)
+    cells = mx.floor(wrapped * cell_counts_mx / box_mx).astype(mx.int32)
+    cells = mx.minimum(cells, cell_counts_mx - 1)
+    keys = cells[:, 0] + cell_counts_mx[0] * (
+        cells[:, 1] + cell_counts_mx[1] * cells[:, 2]
+    )
+    atom_order = mx.argsort(keys).astype(mx.int32)
+    padded_atom_count = (
+        (atom_count + _INTERACTION_TILE_SIZE - 1) // _INTERACTION_TILE_SIZE
+    ) * _INTERACTION_TILE_SIZE
+    padding = padded_atom_count - atom_count
+    if padding:
+        atom_order = mx.concatenate(
+            (atom_order, mx.full((padding,), -1, dtype=mx.int32)),
+        )
+    inverse_order = (
+        mx.zeros((atom_count,), dtype=mx.int32)
+        .at[atom_order[:atom_count]]
+        .add(mx.arange(atom_count, dtype=mx.int32))
+    )
+    box_lengths_and_inverses = mx.concatenate((box_mx, 1.0 / box_mx))
+    center_radius, half_extent = _interaction32_block_geometry(
+        positions_mx,
+        atom_order,
+        box_lengths_and_inverses,
+    )
+    block_traversal = mx.argsort(mx.sum(half_extent, axis=1)).astype(mx.int32)
+    return _DeviceBlockGeometry32(
+        atom_count=atom_count,
+        search_radius=float(search_radius),
+        box_lengths=box,
+        atom_order=atom_order,
+        inverse_order=inverse_order,
+        center_radius=center_radius,
+        half_extent=half_extent,
+        block_traversal=block_traversal,
+    )
+
+
+def _build_device_special_block_inventory32(
+    geometry: _DeviceBlockGeometry32,
+    *,
+    lj_exclusion_pairs: object = (),
+    lj_one_four_pairs: object = (),
+) -> _DeviceSpecialBlockInventory32:
+    """Mark diagonal and topology-bearing packed block pairs on device."""
+
+    atom_count = geometry.atom_count
+    block_count = geometry.block_count
+    block_code_capacity = block_count * block_count
+    if block_code_capacity > np.iinfo(np.int32).max:
+        raise ValueError("32-atom block-pair inventory exceeds int32 capacity")
+    exclusions = _normalize_pairs(lj_exclusion_pairs, atom_count, "lj_exclusion_pairs")
+    one_four = _normalize_pairs(lj_one_four_pairs, atom_count, "lj_one_four_pairs")
+    exclusion_codes = _pair_codes(exclusions, atom_count)
+    one_four_codes = _pair_codes(one_four, atom_count)
+    if np.any(_contains_sorted(exclusion_codes, one_four_codes)):
+        raise ValueError("LJ exclusion and one-four pair sets must be disjoint")
+
+    exclusion_pairs = mx.array(exclusions, dtype=mx.int32)
+    one_four_pairs = mx.array(one_four, dtype=mx.int32)
+    code_groups = [
+        mx.arange(block_count, dtype=mx.int32) * (block_count + 1),
+    ]
+    for pairs in (exclusion_pairs, one_four_pairs):
+        if int(pairs.shape[0]) == 0:
+            continue
+        ordered = geometry.inverse_order[pairs]
+        blocks = ordered // _INTERACTION_TILE_SIZE
+        low = mx.minimum(blocks[:, 0], blocks[:, 1])
+        high = mx.maximum(blocks[:, 0], blocks[:, 1])
+        code_groups.append(low * block_count + high)
+    codes = mx.concatenate(code_groups)
+    block_codes = mx.sort(codes)
+    block_code_unique = mx.concatenate(
+        (
+            mx.ones((1,), dtype=mx.int32),
+            (block_codes[1:] != block_codes[:-1]).astype(mx.int32),
+        )
+    )
+    special_count = mx.sum(block_code_unique).astype(mx.int32)
+    topology_offsets, topology_neighbors, topology_classes = _build_owner_topology(
+        atom_count,
+        exclusions,
+        one_four,
+    )
+    return _DeviceSpecialBlockInventory32(
+        atom_count=atom_count,
+        block_count=block_count,
+        exclusion_pairs=exclusion_pairs,
+        one_four_pairs=one_four_pairs,
+        block_codes=block_codes,
+        block_code_unique=block_code_unique,
+        special_count=special_count,
+        topology_offsets=mx.array(topology_offsets, dtype=mx.int32),
+        topology_neighbors=mx.array(topology_neighbors, dtype=mx.int32),
+        topology_classes=mx.array(topology_classes, dtype=mx.int32),
+    )
+
+
+def _build_device_ordinary_schedule32(
+    positions: object,
+    geometry: _DeviceBlockGeometry32,
+    special: _DeviceSpecialBlockInventory32,
+    *,
+    ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+) -> _DeviceOrdinarySchedule32:
+    """Build compact ordinary half-mode rows from device block geometry."""
+
+    if special.atom_count != geometry.atom_count or special.block_count != geometry.block_count:
+        raise ValueError("special inventory must match the device block geometry")
+    if ordinary_tiles_per_group < 1:
+        raise ValueError("ordinary_tiles_per_group must be positive")
+    positions_mx = as_mx_array(positions, dtype=mx.float32)
+    if positions_mx.shape != (geometry.atom_count, 3):
+        raise ValueError(f"positions must have shape ({geometry.atom_count}, 3)")
+    box_mx = mx.array(geometry.box_lengths, dtype=mx.float32)
+    box_lengths_and_inverses = mx.concatenate((box_mx, 1.0 / box_mx))
+    mode_entry_counts = _interaction32_ordinary_mode_counts(
+        positions_mx,
+        geometry.atom_order,
+        geometry.center_radius,
+        geometry.half_extent,
+        geometry.block_traversal,
+        special.block_codes,
+        box_lengths_and_inverses,
+        search_radius=geometry.search_radius,
+    )
+    flat_entry_counts = mode_entry_counts.reshape((-1,))
+    mode_tile_counts = (
+        flat_entry_counts + _INTERACTION_TILE_SIZE - 1
+    ) // _INTERACTION_TILE_SIZE
+    mode_tile_prefix = mx.cumsum(mode_tile_counts)
+    mode_group_counts = (
+        mode_tile_counts + ordinary_tiles_per_group - 1
+    ) // ordinary_tiles_per_group
+    mode_group_prefix = mx.cumsum(mode_group_counts)
+    logical_pair_lanes = mx.sum(
+        mode_entry_counts
+        * mx.array([16, 16, 32], dtype=mx.int32)[None, :]
+    )
+    inventory = mx.stack(
+        (
+            mx.sum(flat_entry_counts),
+            mode_tile_prefix[-1],
+            mode_group_prefix[-1],
+            logical_pair_lanes,
+            special.special_count,
+        )
+    )
+    mx.eval(inventory)
+    (
+        right_entry_count,
+        ordinary_tile_count,
+        ordinary_group_count,
+        logical_pair_lane_count,
+        special_tile_count_inventory,
+    ) = (int(value) for value in np.asarray(inventory))
+    ordinary_left_blocks, ordinary_right_atoms, ordinary_half_modes = (
+        _interaction32_ordinary_scatter_sized(
+            positions_mx,
+            geometry.atom_order,
+            geometry.center_radius,
+            geometry.half_extent,
+            geometry.block_traversal,
+            special.block_codes,
+            mode_tile_counts,
+            mode_tile_prefix,
+            box_lengths_and_inverses,
+            search_radius=geometry.search_radius,
+            accepted_tile_count=ordinary_tile_count,
+        )
+    )
+    ordinary_group_starts, ordinary_group_counts = _neighbor_tile_force_groups_sized(
+        mode_tile_counts,
+        mode_tile_prefix,
+        mode_group_counts,
+        mode_group_prefix,
+        accepted_count=ordinary_group_count,
+        items_per_group=ordinary_tiles_per_group,
+    )
+    return _DeviceOrdinarySchedule32(
+        atom_count=geometry.atom_count,
+        search_radius=geometry.search_radius,
+        padded_atom_count=geometry.padded_atom_count,
+        right_entry_count=right_entry_count,
+        logical_pair_lanes=logical_pair_lane_count,
+        ordinary_tile_count=ordinary_tile_count,
+        ordinary_group_count=ordinary_group_count,
+        special_tile_count_inventory=special_tile_count_inventory,
+        mode_entry_counts=mode_entry_counts,
+        ordinary_left_blocks=ordinary_left_blocks,
+        ordinary_right_atoms=ordinary_right_atoms,
+        ordinary_half_modes=ordinary_half_modes,
+        ordinary_group_starts=ordinary_group_starts,
+        ordinary_group_counts=ordinary_group_counts,
+    )
+
+
+def _build_device_special_schedule32(
+    geometry: _DeviceBlockGeometry32,
+    special: _DeviceSpecialBlockInventory32,
+    *,
+    special_tile_count: int | None = None,
+) -> _DeviceSpecialSchedule32:
+    """Build compact special blocks and conservative two-half work on device."""
+
+    if special.atom_count != geometry.atom_count or special.block_count != geometry.block_count:
+        raise ValueError("special inventory must match the device block geometry")
+    special_prefix = mx.cumsum(special.block_code_unique)
+    if special_tile_count is None:
+        mx.eval(special.special_count)
+        special_tile_count = int(np.asarray(special.special_count))
+    if not 0 <= special_tile_count <= special.block_count * special.block_count:
+        raise ValueError("special tile count is incompatible with the block inventory")
+    special_blocks = _interaction32_special_blocks_sized(
+        special.block_codes,
+        special.block_code_unique,
+        special_prefix,
+        block_count=geometry.block_count,
+        special_count=special_tile_count,
+    )
+    (
+        special_work_left_blocks,
+        special_work_left_slices,
+        special_work_right_atoms,
+        special_work_lj_enabled,
+        special_work_lj_one_four,
+        special_work_diagonal,
+    ) = _interaction32_special_work_two_halves(
+        geometry.atom_order,
+        special_blocks,
+        special.topology_offsets,
+        special.topology_neighbors,
+        special.topology_classes,
+    )
+    return _DeviceSpecialSchedule32(
+        atom_count=geometry.atom_count,
+        padded_atom_count=geometry.padded_atom_count,
+        special_tile_count=special_tile_count,
+        special_work_count=2 * special_tile_count,
+        special_blocks=special_blocks,
+        special_work_left_blocks=special_work_left_blocks,
+        special_work_left_slices=special_work_left_slices,
+        special_work_right_atoms=special_work_right_atoms,
+        special_work_lj_enabled=special_work_lj_enabled,
+        special_work_lj_one_four=special_work_lj_one_four,
+        special_work_diagonal=special_work_diagonal,
+    )
+
+
+def _assemble_device_fused_half_schedule32(
+    geometry: _DeviceBlockGeometry32,
+    ordinary: _DeviceOrdinarySchedule32,
+    special: _DeviceSpecialSchedule32,
+) -> _DeviceFusedHalfSchedule32:
+    """Assemble matching device-built ordinary and special schedule sections."""
+
+    if (
+        ordinary.atom_count != geometry.atom_count
+        or special.atom_count != geometry.atom_count
+        or ordinary.padded_atom_count != geometry.padded_atom_count
+        or special.padded_atom_count != geometry.padded_atom_count
+        or ordinary.search_radius != geometry.search_radius
+        or special.special_tile_count != ordinary.special_tile_count_inventory
+    ):
+        raise ValueError("device schedule sections must share one block generation")
+    return _DeviceFusedHalfSchedule32(
+        atom_count=geometry.atom_count,
+        search_radius=geometry.search_radius,
+        padded_atom_count=geometry.padded_atom_count,
+        ordinary_tile_count=ordinary.ordinary_tile_count,
+        ordinary_group_count=ordinary.ordinary_group_count,
+        atom_order=geometry.atom_order,
+        ordinary_left_blocks=ordinary.ordinary_left_blocks,
+        ordinary_right_atoms=ordinary.ordinary_right_atoms,
+        ordinary_half_modes=ordinary.ordinary_half_modes,
+        ordinary_group_starts=ordinary.ordinary_group_starts,
+        ordinary_group_counts=ordinary.ordinary_group_counts,
+        special_work_left_blocks=special.special_work_left_blocks,
+        special_work_left_slices=special.special_work_left_slices,
+        special_work_right_atoms=special.special_work_right_atoms,
+        special_work_lj_enabled=special.special_work_lj_enabled,
+        special_work_lj_one_four=special.special_work_lj_one_four,
+        special_work_diagonal=special.special_work_diagonal,
     )
 
 
