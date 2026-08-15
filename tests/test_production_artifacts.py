@@ -378,6 +378,58 @@ def test_artifact_constraints_partition_rigid_waters_from_residual_bonds():
     assert remaining.max_iterations == 8
 
 
+def test_artifact_constraints_recover_rigid_waters_without_molecule_ids():
+    arrays = {
+        "symbols": np.asarray(["O", "H", "H", "C", "H"], dtype=str),
+        "water_mask": np.asarray([True, True, True, False, False]),
+        "masses": np.asarray([16.0, 1.0, 1.0, 12.0, 1.0], dtype=np.float32),
+    }
+    pairs = np.asarray(
+        [[0, 1], [0, 2], [1, 2], [3, 4]],
+        dtype=np.int32,
+    )
+    distances = np.asarray([0.9572, 0.9572, 1.5139, 1.09], dtype=np.float32)
+
+    constraints = _runtime_constraints_from_artifact(
+        arrays,
+        pairs,
+        distances,
+        system_atom_count=5,
+        max_iterations=40,
+    )
+
+    assert isinstance(constraints, CompositeConstraints)
+    settle, remaining = constraints.constraints
+    assert isinstance(settle, SettleWaterConstraints)
+    assert isinstance(remaining, _ShakeClusterConstraints)
+    np.testing.assert_array_equal(np.asarray(settle.waters), [[0, 1, 2]])
+    np.testing.assert_array_equal(np.asarray(remaining.pairs), [[3, 4]])
+
+
+def test_artifact_constraints_fail_closed_on_ambiguous_water_graph():
+    arrays = {
+        "symbols": np.asarray(["O", "H", "H", "C"], dtype=str),
+        "water_mask": np.asarray([True, True, True, False]),
+    }
+    pairs = np.asarray(
+        [[0, 1], [0, 2], [1, 2], [2, 3]],
+        dtype=np.int32,
+    )
+    distances = np.asarray([0.9572, 0.9572, 1.5139, 1.0], dtype=np.float32)
+
+    constraints = _runtime_constraints_from_artifact(
+        arrays,
+        pairs,
+        distances,
+        system_atom_count=4,
+        max_iterations=40,
+    )
+
+    assert isinstance(constraints, DistanceConstraints)
+    assert constraints.max_iterations == 40
+    np.testing.assert_array_equal(np.asarray(constraints.pairs), pairs)
+
+
 def test_artifact_constraints_partition_disjoint_star_clusters_after_settle():
     arrays = {
         "symbols": np.asarray(

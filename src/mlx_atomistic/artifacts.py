@@ -2163,12 +2163,10 @@ def _rigid_water_constraint_partition(
     )
     if (
         water_mask.shape[0] < system_atom_count
-        or molecule_ids.shape[0] < system_atom_count
         or symbols.shape[0] < system_atom_count
     ):
         return None
     water_mask = water_mask[:system_atom_count]
-    molecule_ids = molecule_ids[:system_atom_count]
     symbols = symbols[:system_atom_count]
     water_atoms = np.flatnonzero(water_mask)
     if water_atoms.size == 0:
@@ -2183,12 +2181,41 @@ def _rigid_water_constraint_partition(
             return None
         edge_rows[edge] = row
 
+    if molecule_ids.shape[0] >= system_atom_count:
+        molecule_ids = molecule_ids[:system_atom_count]
+        water_groups = [
+            np.flatnonzero(molecule_ids == molecule_id)
+            for molecule_id in np.unique(molecule_ids[water_mask])
+        ]
+    else:
+        adjacency = {int(atom): set() for atom in water_atoms}
+        for left, right in edge_rows:
+            left_is_water = bool(water_mask[left])
+            right_is_water = bool(water_mask[right])
+            if left_is_water != right_is_water:
+                return None
+            if left_is_water:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+        water_groups = []
+        unseen = set(adjacency)
+        while unseen:
+            pending = [min(unseen)]
+            component: set[int] = set()
+            while pending:
+                atom = pending.pop()
+                if atom in component:
+                    continue
+                component.add(atom)
+                unseen.discard(atom)
+                pending.extend(adjacency[atom] - component)
+            water_groups.append(np.asarray(sorted(component), dtype=np.int32))
+
     waters: list[tuple[int, int, int]] = []
     water_rows: list[int] = []
     oh_distances: list[float] = []
     hh_distances: list[float] = []
-    for molecule_id in np.unique(molecule_ids[water_mask]):
-        members = np.flatnonzero(molecule_ids == molecule_id)
+    for members in water_groups:
         if (
             members.shape != (3,)
             or not np.all(water_mask[members])

@@ -34,6 +34,7 @@ from mlx_atomistic.benchmarks import (
     stability,
     validation_gauntlet,
 )
+from mlx_atomistic.constraints import SettleWaterConstraints
 
 ROOT = Path(__file__).resolve().parents[1]
 _EXPLICIT_PREP_PATH = ROOT / "scripts" / "prepare_openmm_dhfr_explicit.py"
@@ -60,6 +61,29 @@ def test_benchmark_documentation_has_one_index_and_decision_ledgers():
     assert "59.231 s" in dft_ledger
     assert "Reference engines never enter" in index
     assert "position-balanced" in md_ledger
+
+
+def test_constraint_inventory_accepts_topology_recovered_settle():
+    constraints = SettleWaterConstraints(
+        [(0, 1, 2)],
+        oh_distance=0.9572,
+        hh_distance=1.5139,
+    )
+
+    complete = charged_pme._constraint_route_inventory(
+        constraints,
+        water_atom_count=3,
+        molecule_ids_present=False,
+    )
+    incomplete = charged_pme._constraint_route_inventory(
+        constraints,
+        water_atom_count=6,
+        molecule_ids_present=False,
+    )
+
+    assert complete["pair_count_matches"] is True
+    assert complete["performance_eligible"] is True
+    assert incomplete["performance_eligible"] is False
 
 
 def _assert_normalized_payload(payload, *, timing_metric, status="ok"):

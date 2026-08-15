@@ -113,7 +113,7 @@ def _constraint_route_inventory(
     total_pair_count = sum(int(route["pair_count"]) for route in routes.values())
     expected_pair_count = 0 if constraints is None else int(constraints.pairs.shape[0])
     water_route_complete = water_atom_count == 0 or (
-        (molecule_ids_present and int(routes["settle"]["pair_count"]) > 0)
+        int(routes["settle"]["pair_count"]) == water_atom_count
         or (
             expected_pair_count > 0
             and int(routes["small_constraint_clusters"]["pair_count"]) == expected_pair_count
