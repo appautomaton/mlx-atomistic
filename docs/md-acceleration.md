@@ -200,6 +200,16 @@ Space first at 38.71% of synchronized wall, followed by the Neighbor lifecycle
 at 14.06%, with PME and constraints both near 12.78%. The next experiment must
 therefore return to Direct Space or PME rather than extending the builder.
 
+A follow-up Direct Space component profile separated ordinary and special work
+on the same retained schedule. After subtracting a separate zero-output
+baseline, ordinary work remained about three times larger than special work on
+both 5DFR and NBFIX-bearing GPCRmd. A zero-epsilon LJ arithmetic branch then
+improved isolated 5DFR and 30k TIP3P blocks, but regressed ApoA1 and GPCRmd and
+changed sign across the two JAC 94k directions. The prototype was removed.
+Together with the earlier rejected owner-computes, lane-rotation, grouping, and
+special-write variants, this closes another Direct Space screen without
+claiming a runtime gain. Reciprocal PME is the next bounded profiling target.
+
 The 32-atom engine is now the default inside the bounded, measured fixed-cell
 Metal PME envelope. Existing checkpoints continue to pin their recorded
 backend, and every unsupported configuration retains the previous fallback.
