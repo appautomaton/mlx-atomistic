@@ -452,7 +452,9 @@ _interaction32_fused_half_nbfix_canonical_force_kernel_singleton = None
 _interaction32_scatter_kernel_singleton = None
 _interaction32_block_geometry_kernel_singleton = None
 _interaction32_ordinary_count_kernel_singleton = None
+_interaction32_ordinary_cached_count_kernel_singleton = None
 _interaction32_ordinary_scatter_kernel_singleton = None
+_interaction32_ordinary_cached_scatter_kernel_singleton = None
 _interaction32_special_block_scatter_kernel_singleton = None
 _interaction32_special_work_kernel_singleton = None
 _owner_compute32_force_kernel_singleton = None
@@ -1556,11 +1558,18 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
     uint mode1_count = 0u;
     uint mode2_count = 0u;
     uint mode3_count = 0u;
+#ifdef MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES
+    uint pair_row_start = traversal_index
+        * (2u * block_count - traversal_index - 1u) / 2u;
+#endif
     for (
         uint right_index = traversal_index + 1u;
         right_index < block_count;
         right_index++
     ) {
+#ifdef MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES
+        uint pair_index = pair_row_start + right_index - traversal_index - 1u;
+#endif
         uint right_block = (uint)block_traversal[right_index];
         uint low_block = min(left_block, right_block);
         uint high_block = max(left_block, right_block);
@@ -1593,6 +1602,11 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
         }
         bool include = simd_broadcast(include_lane, 0u);
         if (!include) {
+#ifdef MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES
+            if (lane == 0u || lane == 16u) {
+                mode_words[2u * pair_index + (lane >> 4u)] = 0u;
+            }
+#endif
             continue;
         }
         int right_ordered = 32 * (int)right_block + (int)lane;
@@ -1608,11 +1622,85 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
         mode1_count += simd_sum(mode == 1u ? 1u : 0u);
         mode2_count += simd_sum(mode == 2u ? 1u : 0u);
         mode3_count += simd_sum(mode == 3u ? 1u : 0u);
+#ifdef MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES
+        uint packed_modes = 0u;
+        uint first_lane = 16u * (lane >> 4u);
+        for (uint offset = 0u; offset < 16u; offset++) {
+            uint source_mode = simd_shuffle(mode, first_lane + offset);
+            packed_modes |= source_mode << (2u * offset);
+        }
+        if (lane == 0u || lane == 16u) {
+            mode_words[2u * pair_index + (lane >> 4u)] = packed_modes;
+        }
+#endif
     }
     if (lane == 0u) {
         mode_counts[3u * traversal_index + 0u] = (int)mode1_count;
         mode_counts[3u * traversal_index + 1u] = (int)mode2_count;
         mode_counts[3u * traversal_index + 2u] = (int)mode3_count;
+    }
+"""
+
+_INTERACTION32_ORDINARY_CACHED_SCATTER_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint traversal_index = threadgroup_position_in_grid.x;
+    uint block_count = (uint)counts[0];
+    if (traversal_index >= block_count) {
+        return;
+    }
+    uint left_block = (uint)block_traversal[traversal_index];
+    uint run_base = 3u * traversal_index;
+    if (lane == 0u) {
+        for (uint mode_slot = 0u; mode_slot < 3u; mode_slot++) {
+            uint run = run_base + mode_slot;
+            int tile_count = mode_tile_counts[run];
+            int tile_start = mode_tile_prefix[run] - tile_count;
+            for (int local_tile = 0; local_tile < tile_count; local_tile++) {
+                int tile = tile_start + local_tile;
+                ordinary_left_blocks[tile] = (int)left_block;
+                ordinary_half_modes[tile] = (int)mode_slot + 1;
+            }
+        }
+    }
+
+    uint seen1 = 0u;
+    uint seen2 = 0u;
+    uint seen3 = 0u;
+    uint pair_row_start = traversal_index
+        * (2u * block_count - traversal_index - 1u) / 2u;
+    for (
+        uint right_index = traversal_index + 1u;
+        right_index < block_count;
+        right_index++
+    ) {
+        uint pair_index = pair_row_start + right_index - traversal_index - 1u;
+        uint right_block = (uint)block_traversal[right_index];
+        int right_ordered = 32 * (int)right_block + (int)lane;
+        uint packed_modes = mode_words[2u * pair_index + (lane >> 4u)];
+        uint mode = (packed_modes >> (2u * (lane & 15u))) & 3u;
+        uint is1 = mode == 1u ? 1u : 0u;
+        uint is2 = mode == 2u ? 1u : 0u;
+        uint is3 = mode == 3u ? 1u : 0u;
+        uint rank1 = simd_prefix_exclusive_sum(is1);
+        uint rank2 = simd_prefix_exclusive_sum(is2);
+        uint rank3 = simd_prefix_exclusive_sum(is3);
+        uint count1 = simd_sum(is1);
+        uint count2 = simd_sum(is2);
+        uint count3 = simd_sum(is3);
+        uint local_entry = mode == 1u
+            ? seen1 + rank1
+            : (mode == 2u ? seen2 + rank2 : seen3 + rank3);
+        if (mode != 0u) {
+            uint run = run_base + mode - 1u;
+            int tile_count = mode_tile_counts[run];
+            int tile_start = mode_tile_prefix[run] - tile_count;
+            uint tile = (uint)tile_start + local_entry / 32u;
+            uint slot = local_entry & 31u;
+            ordinary_right_atoms[32u * tile + slot] = right_ordered;
+        }
+        seen1 += count1;
+        seen2 += count2;
+        seen3 += count3;
     }
 """
 
@@ -4306,6 +4394,34 @@ def _interaction32_ordinary_count_kernel():
     return _interaction32_ordinary_count_kernel_singleton
 
 
+def _interaction32_ordinary_cached_count_kernel():
+    """Return the count kernel that retains packed two-bit membership modes."""
+
+    global _interaction32_ordinary_cached_count_kernel_singleton
+    if _interaction32_ordinary_cached_count_kernel_singleton is None:
+        _interaction32_ordinary_cached_count_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_ordinary_cached_mode_counts",
+            input_names=[
+                "positions",
+                "atom_order",
+                "center_radius",
+                "half_extent",
+                "block_traversal",
+                "special_codes",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["mode_counts", "mode_words"],
+            source=(
+                "#define MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES 1\n"
+                + _INTERACTION32_ORDINARY_COUNT_SOURCE
+            ),
+            header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
+        )
+    return _interaction32_ordinary_cached_count_kernel_singleton
+
+
 def _interaction32_ordinary_scatter_kernel():
     """Return the compact packed 32-atom ordinary-membership scatter kernel."""
 
@@ -4335,6 +4451,31 @@ def _interaction32_ordinary_scatter_kernel():
             header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
         )
     return _interaction32_ordinary_scatter_kernel_singleton
+
+
+def _interaction32_ordinary_cached_scatter_kernel():
+    """Return the scatter kernel that decodes retained membership modes."""
+
+    global _interaction32_ordinary_cached_scatter_kernel_singleton
+    if _interaction32_ordinary_cached_scatter_kernel_singleton is None:
+        _interaction32_ordinary_cached_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_ordinary_cached_mode_scatter",
+            input_names=[
+                "block_traversal",
+                "mode_words",
+                "mode_tile_counts",
+                "mode_tile_prefix",
+                "counts",
+            ],
+            output_names=[
+                "ordinary_left_blocks",
+                "ordinary_right_atoms",
+                "ordinary_half_modes",
+            ],
+            source=_INTERACTION32_ORDINARY_CACHED_SCATTER_SOURCE,
+            header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
+        )
+    return _interaction32_ordinary_cached_scatter_kernel_singleton
 
 
 def _interaction32_special_block_scatter_kernel():
@@ -8034,8 +8175,9 @@ def _interaction32_ordinary_mode_counts(
     box_lengths_and_inverses: mx.array,
     *,
     search_radius: float,
-) -> mx.array:
-    """Count ordinary right atoms by half-membership mode for each left block."""
+    retain_modes: bool = True,
+) -> tuple[mx.array, mx.array | None]:
+    """Count ordinary modes and retain a packed two-bit membership cache."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     atom_order = as_mx_array(atom_order, dtype=mx.int32)
@@ -8062,25 +8204,37 @@ def _interaction32_ordinary_mode_counts(
     if not isfinite(float(search_radius)) or search_radius <= 0.0:
         raise ValueError("search_radius must be finite and positive")
     radius = float(search_radius)
+    block_pair_count = block_count * (block_count - 1) // 2
+    inputs = [
+        positions,
+        atom_order,
+        center_radius,
+        half_extent,
+        block_traversal,
+        special_codes,
+        box,
+        mx.array([radius, radius * radius], dtype=mx.float32),
+        mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
+    ]
+    if retain_modes:
+        mode_counts, mode_words = _interaction32_ordinary_cached_count_kernel()(
+            inputs=inputs,
+            output_shapes=[(block_count, 3), (2 * block_pair_count,)],
+            output_dtypes=[mx.int32, mx.uint32],
+            grid=(block_count * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            init_value=0,
+        )
+        return mode_counts, mode_words
     (mode_counts,) = _interaction32_ordinary_count_kernel()(
-        inputs=[
-            positions,
-            atom_order,
-            center_radius,
-            half_extent,
-            block_traversal,
-            special_codes,
-            box,
-            mx.array([radius, radius * radius], dtype=mx.float32),
-            mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
-        ],
+        inputs=inputs,
         output_shapes=[(block_count, 3)],
         output_dtypes=[mx.int32],
         grid=(block_count * 32, 1, 1),
         threadgroup=(32, 1, 1),
         init_value=0,
     )
-    return mode_counts
+    return mode_counts, None
 
 
 def _interaction32_ordinary_scatter_sized(
@@ -8090,6 +8244,7 @@ def _interaction32_ordinary_scatter_sized(
     half_extent: mx.array,
     block_traversal: mx.array,
     special_codes: mx.array,
+    mode_words: mx.array | None,
     mode_tile_counts: mx.array,
     mode_tile_prefix: mx.array,
     box_lengths_and_inverses: mx.array,
@@ -8097,7 +8252,7 @@ def _interaction32_ordinary_scatter_sized(
     search_radius: float,
     accepted_tile_count: int,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Scatter compact ordinary rows after device count and prefix stages."""
+    """Scatter compact ordinary rows from packed two-bit membership modes."""
 
     positions = as_mx_array(positions, dtype=mx.float32)
     atom_order = as_mx_array(atom_order, dtype=mx.int32)
@@ -8105,6 +8260,8 @@ def _interaction32_ordinary_scatter_sized(
     half_extent = as_mx_array(half_extent, dtype=mx.float32)
     block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
     special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    if mode_words is not None:
+        mode_words = as_mx_array(mode_words, dtype=mx.uint32)
     mode_tile_counts = as_mx_array(mode_tile_counts, dtype=mx.int32)
     mode_tile_prefix = as_mx_array(mode_tile_prefix, dtype=mx.int32)
     box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
@@ -8113,6 +8270,7 @@ def _interaction32_ordinary_scatter_sized(
     if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
         raise ValueError("atom_order must be a padded vector divisible by 32")
     block_count = int(atom_order.shape[0]) // 32
+    block_pair_count = block_count * (block_count - 1) // 2
     run_shape = (block_count * 3,)
     if mode_tile_counts.shape != run_shape or mode_tile_prefix.shape != run_shape:
         raise ValueError("mode tile counts and prefixes must have shape (3*n_blocks,)")
@@ -8124,6 +8282,8 @@ def _interaction32_ordinary_scatter_sized(
         raise ValueError("block_traversal must have shape (n_blocks,)")
     if special_codes.ndim != 1 or special_codes.shape[0] < block_count:
         raise ValueError("special_codes must contain sorted diagonal block codes")
+    if mode_words is not None and mode_words.shape != (2 * block_pair_count,):
+        raise ValueError("mode_words must store two packed words per block pair")
     if box.shape != (6,):
         raise ValueError("box_lengths_and_inverses must have shape (6,)")
     if not isfinite(float(search_radius)) or search_radius <= 0.0:
@@ -8135,6 +8295,25 @@ def _interaction32_ordinary_scatter_sized(
             mx.zeros((0,), dtype=mx.int32),
             mx.zeros((0, 32), dtype=mx.int32),
             mx.zeros((0,), dtype=mx.int32),
+        )
+    if mode_words is not None:
+        return _interaction32_ordinary_cached_scatter_kernel()(
+            inputs=[
+                block_traversal,
+                mode_words,
+                mode_tile_counts,
+                mode_tile_prefix,
+                mx.array([block_count], dtype=mx.int32),
+            ],
+            output_shapes=[
+                (accepted_tile_count,),
+                (accepted_tile_count, 32),
+                (accepted_tile_count,),
+            ],
+            output_dtypes=[mx.int32, mx.int32, mx.int32],
+            grid=(block_count * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            init_value=int(atom_order.shape[0]),
         )
     radius = float(search_radius)
     return _interaction32_ordinary_scatter_kernel()(

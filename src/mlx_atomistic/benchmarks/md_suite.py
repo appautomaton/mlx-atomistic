@@ -476,7 +476,11 @@ def _stage_profile_case(
 def _route_stage(route_name: str) -> str:
     if route_name in {"neighbor_update_rebuild", "neighbor_force_binding"}:
         return "neighbor_lifecycle"
-    if route_name in {"direct_spatial_tiles", "direct_lj_screened_coulomb"}:
+    if route_name in {
+        "direct_spatial_tiles",
+        "direct_lj_screened_coulomb",
+        "direct_interaction32",
+    }:
         return "direct_nonbonded"
     if route_name == "reciprocal_pme":
         return "reciprocal_pme"

@@ -32,6 +32,7 @@ _INTERACTION_TILE_SIZE = 32
 _DEFAULT_ORDINARY_TILES_PER_GROUP = 3
 _INTERACTION32_CAPACITY_RESERVE = 1.25
 _INTERACTION32_CAPACITY_QUANTUM = 64
+_INTERACTION32_MODE_CACHE_LIMIT_BYTES = 64 * 1024 * 1024
 _INTERACTION32_REBUILD_PROFILE_STAGES = (
     "geometry_validation_and_sort",
     "topology_preparation",
@@ -615,7 +616,9 @@ class _DeviceScheduleInventory32:
     ordinary_tile_count: int
     ordinary_group_count: int
     special_tile_count: int
+    mode_cache_bytes: int
     mode_entry_counts: mx.array
+    mode_words: mx.array | None
     mode_tile_counts: mx.array
     mode_tile_prefix: mx.array
     mode_group_counts: mx.array
@@ -977,6 +980,7 @@ def _count_device_schedule_inventory32(
     special: _DeviceSpecialBlockInventory32,
     *,
     ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+    _mode_cache_limit_bytes: int = _INTERACTION32_MODE_CACHE_LIMIT_BYTES,
 ) -> _DeviceScheduleInventory32:
     """Count the logical ordinary and special schedule inventory on device."""
 
@@ -984,12 +988,15 @@ def _count_device_schedule_inventory32(
         raise ValueError("special inventory must match the device block geometry")
     if ordinary_tiles_per_group < 1:
         raise ValueError("ordinary_tiles_per_group must be positive")
+    if _mode_cache_limit_bytes < 0:
+        raise ValueError("mode cache limit must be non-negative")
     positions_mx = as_mx_array(positions, dtype=mx.float32)
     if positions_mx.shape != (geometry.atom_count, 3):
         raise ValueError(f"positions must have shape ({geometry.atom_count}, 3)")
     box_mx = mx.array(geometry.box_lengths, dtype=mx.float32)
     box_lengths_and_inverses = mx.concatenate((box_mx, 1.0 / box_mx))
-    mode_entry_counts = _interaction32_ordinary_mode_counts(
+    mode_cache_bytes = 4 * geometry.block_count * (geometry.block_count - 1)
+    mode_entry_counts, mode_words = _interaction32_ordinary_mode_counts(
         positions_mx,
         geometry.atom_order,
         geometry.center_radius,
@@ -998,6 +1005,7 @@ def _count_device_schedule_inventory32(
         special.block_codes,
         box_lengths_and_inverses,
         search_radius=geometry.search_radius,
+        retain_modes=0 < mode_cache_bytes <= _mode_cache_limit_bytes,
     )
     flat_entry_counts = mode_entry_counts.reshape((-1,))
     mode_tile_counts = (
@@ -1042,7 +1050,9 @@ def _count_device_schedule_inventory32(
         ordinary_tile_count=ordinary_tile_count,
         ordinary_group_count=ordinary_group_count,
         special_tile_count=special_tile_count_inventory,
+        mode_cache_bytes=mode_cache_bytes if mode_words is not None else 0,
         mode_entry_counts=mode_entry_counts,
+        mode_words=mode_words,
         mode_tile_counts=mode_tile_counts,
         mode_tile_prefix=mode_tile_prefix,
         mode_group_counts=mode_group_counts,
@@ -1059,14 +1069,11 @@ def _materialize_device_ordinary_schedule32(
     """Scatter ordinary schedule payload only after capacity admission."""
 
     geometry = inventory.geometry
-    special = inventory.special
     if tile_capacity < inventory.ordinary_tile_count:
         raise ValueError("ordinary tile capacity is below the logical inventory")
     if group_capacity < inventory.ordinary_group_count:
         raise ValueError("ordinary group capacity is below the logical inventory")
     positions_mx = inventory.positions
-    if positions_mx.shape != (geometry.atom_count, 3):
-        raise ValueError(f"positions must have shape ({geometry.atom_count}, 3)")
     box_mx = mx.array(geometry.box_lengths, dtype=mx.float32)
     box_lengths_and_inverses = mx.concatenate((box_mx, 1.0 / box_mx))
     ordinary_left_blocks, ordinary_right_atoms, ordinary_half_modes = (
@@ -1076,7 +1083,8 @@ def _materialize_device_ordinary_schedule32(
             geometry.center_radius,
             geometry.half_extent,
             geometry.block_traversal,
-            special.block_codes,
+            inventory.special.block_codes,
+            inventory.mode_words,
             inventory.mode_tile_counts,
             inventory.mode_tile_prefix,
             box_lengths_and_inverses,
@@ -1120,6 +1128,7 @@ def _build_device_ordinary_schedule32(
     special: _DeviceSpecialBlockInventory32,
     *,
     ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+    _mode_cache_limit_bytes: int = _INTERACTION32_MODE_CACHE_LIMIT_BYTES,
 ) -> _DeviceOrdinarySchedule32:
     """Build an exact-sized ordinary schedule for research callers."""
 
@@ -1128,6 +1137,7 @@ def _build_device_ordinary_schedule32(
         geometry,
         special,
         ordinary_tiles_per_group=ordinary_tiles_per_group,
+        _mode_cache_limit_bytes=_mode_cache_limit_bytes,
     )
     return _materialize_device_ordinary_schedule32(
         inventory,

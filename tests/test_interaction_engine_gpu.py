@@ -11,6 +11,7 @@ import pytest
 from mlx_atomistic.core import Cell
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.interaction_engine import (
+    _INTERACTION32_MODE_CACHE_LIMIT_BYTES,
     _INTERACTION32_REBUILD_PROFILE_STAGES,
     _assemble_device_fused_half_schedule32,
     _build_device_block_geometry32,
@@ -20,12 +21,14 @@ from mlx_atomistic.interaction_engine import (
     _build_interaction_schedule32,
     _build_owner_compute_schedule32,
     _cell_atom_order,
+    _count_device_schedule_inventory32,
     _fuse_interaction_halves32,
     _fused_half32_direct_force_only,
     _group_ordinary_tiles,
     _interaction32_direct_force_only,
     _Interaction32ScheduleCapacity,
     _make_atom_blocks,
+    _materialize_device_ordinary_schedule32,
     _normalize_pairs,
     _owner_compute32_direct_force_only,
     _profile_interaction32_rebuilds,
@@ -302,8 +305,14 @@ def test_device_special_block_inventory_matches_host_oracle():
 
 
 @pytest.mark.gpu
-def test_device_ordinary_schedule_matches_periodic_brute_force():
-    """Two-pass device scatter preserves exact half-mode memberships."""
+@pytest.mark.parametrize(
+    "mode_cache_limit_bytes",
+    [0, _INTERACTION32_MODE_CACHE_LIMIT_BYTES],
+)
+def test_device_ordinary_schedule_matches_periodic_brute_force(
+    mode_cache_limit_bytes,
+):
+    """Cached and fallback scatter preserve exact half-mode memberships."""
 
     rng = np.random.default_rng(101)
     atom_count = 257
@@ -322,10 +331,17 @@ def test_device_ordinary_schedule_matches_periodic_brute_force():
         lj_exclusion_pairs=[[0, 1], [10, 100]],
         lj_one_four_pairs=[[20, 200]],
     )
-    schedule = _build_device_ordinary_schedule32(
+    inventory = _count_device_schedule_inventory32(
         positions,
         geometry,
         special,
+        _mode_cache_limit_bytes=mode_cache_limit_bytes,
+    )
+    assert (inventory.mode_words is not None) == (mode_cache_limit_bytes > 0)
+    schedule = _materialize_device_ordinary_schedule32(
+        inventory,
+        tile_capacity=inventory.ordinary_tile_count,
+        group_capacity=inventory.ordinary_group_count,
     )
     mx.eval(
         geometry.atom_order,

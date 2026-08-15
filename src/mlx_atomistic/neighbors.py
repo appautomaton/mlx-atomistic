@@ -1235,6 +1235,7 @@ class NeighborListManager:
                 "ordinary_tile_count": inventory.ordinary_tile_count,
                 "ordinary_group_count": inventory.ordinary_group_count,
                 "special_tile_count": inventory.special_tile_count,
+                "mode_cache_bytes": inventory.mode_cache_bytes,
                 "ordinary_tile_capacity": capacity.ordinary_tiles,
                 "ordinary_group_capacity": capacity.ordinary_groups,
                 "special_tile_capacity": capacity.special_tiles,

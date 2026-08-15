@@ -10,6 +10,7 @@ from mlx_atomistic.artifacts import load_prepared_mlx_artifact
 from mlx_atomistic.benchmarks.md_suite import (
     STAGE_PROFILE_SCHEMA,
     SUITE_SCHEMA,
+    _route_stage,
     case_inventory,
     compare_suites,
     load_case_registry,
@@ -238,6 +239,14 @@ def test_md_stage_profile_keeps_clean_throughput_separate_from_stage_attribution
         ]
         is False
     )
+
+
+@pytest.mark.parametrize(
+    "route_name",
+    ("direct_spatial_tiles", "direct_lj_screened_coulomb", "direct_interaction32"),
+)
+def test_md_stage_profile_classifies_every_direct_nonbonded_route(route_name):
+    assert _route_stage(route_name) == "direct_nonbonded"
 
 
 def test_md_suite_comparison_requires_5dfr_non_regression_and_jac_improvement():
