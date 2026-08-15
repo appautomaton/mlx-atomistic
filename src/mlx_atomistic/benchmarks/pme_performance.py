@@ -24,7 +24,7 @@ from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.benchmarks.pme_validation import manifest_hash
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.metal_kernels import (
-    _pme_order5_forces_from_complex_grid,
+    _pme_order5_forces_from_normalized_real_grid,
     pme_order5_charge_grid,
 )
 from mlx_atomistic.neighbors import build_neighbor_list
@@ -378,11 +378,16 @@ def _gpcrmd_manifest_admission(
             f"manifest={manifest_fixture}:parity={fixture}"
         )
 
+    uses_interaction32_runtime = 90_000 <= artifact_atom_count <= 100_000
     expected_runtime_contract = {
         "topology_pair_policy": "lazy",
         "eager_nonbonded_pair_limit": 0,
-        "neighbor_backend": "mlx_cell_pairs",
-        "neighbor_representation": "pairs",
+        "neighbor_backend": (
+            "mlx_interaction32" if uses_interaction32_runtime else "mlx_cell_pairs"
+        ),
+        "neighbor_representation": (
+            "interaction32" if uses_interaction32_runtime else "pairs"
+        ),
         "fixed_cell_pme_plan_reuse": True,
         "dense_or_tiled_fallback_allowed": False,
     }
@@ -564,7 +569,7 @@ def _stage_timings(
     by_name = {row["name"]: row for row in rows}
     production_assignment_names = (
         "charge_assignment_order5_metal",
-        "interpolate_complex_grid_force_only",
+        "interpolate_normalized_real_grid_force_only",
     )
     assignment_names = (
         production_assignment_names
@@ -582,8 +587,8 @@ def _stage_timings(
         if name in by_name
     ]
     production_fft_names = (
-        "forward_fft_force_path",
-        "inverse_fft_influence_force_path",
+        "forward_real_fft_force_path",
+        "inverse_real_fft_influence_force_path",
     )
     fft_names = (
         production_fft_names
@@ -1074,10 +1079,14 @@ def build_payload(
             config.mesh_shape,
         )
         mx.eval(production_charge_grid)
-        production_rho_hat = mx.fft.fftn(production_charge_grid)
+        rfft_last_axis = config.mesh_shape[-1] // 2 + 1
+        rfft_influence = nonbonded.pme_plan.influence[..., :rfft_last_axis]
+        production_rho_hat = mx.fft.rfftn(production_charge_grid)
         mx.eval(production_rho_hat)
-        production_potential_grid = mx.fft.ifftn(
-            nonbonded.pme_plan.influence * production_rho_hat
+        production_potential_grid = mx.fft.irfftn(
+            rfft_influence * production_rho_hat,
+            s=config.mesh_shape,
+            axes=(0, 1, 2),
         )
         mx.eval(production_potential_grid)
 
@@ -1191,27 +1200,29 @@ def build_payload(
                     iterations=iterations,
                 ),
                 _time(
-                    "forward_fft_force_path",
+                    "forward_real_fft_force_path",
                     "pme_production_force",
-                    lambda: mx.fft.fftn(production_charge_grid),
+                    lambda: mx.fft.rfftn(production_charge_grid),
                     eval_outputs=_eval_all,
                     warmups=warmups,
                     iterations=iterations,
                 ),
                 _time(
-                    "inverse_fft_influence_force_path",
+                    "inverse_real_fft_influence_force_path",
                     "pme_production_force",
-                    lambda: mx.fft.ifftn(
-                        nonbonded.pme_plan.influence * production_rho_hat
+                    lambda: mx.fft.irfftn(
+                        rfft_influence * production_rho_hat,
+                        s=config.mesh_shape,
+                        axes=(0, 1, 2),
                     ),
                     eval_outputs=_eval_all,
                     warmups=warmups,
                     iterations=iterations,
                 ),
                 _time(
-                    "interpolate_complex_grid_force_only",
+                    "interpolate_normalized_real_grid_force_only",
                     "pme_production_force",
-                    lambda: _pme_order5_forces_from_complex_grid(
+                    lambda: _pme_order5_forces_from_normalized_real_grid(
                         positions,
                         charges,
                         production_potential_grid,
@@ -1436,6 +1447,9 @@ def build_payload(
             "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
             "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
         },
+        "production_force_spectrum_shape": (
+            list(production_rho_hat.shape) if production_order5_metal else None
+        ),
     }
     missing_splits = []
     if not dense_reference_supported:

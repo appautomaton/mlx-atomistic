@@ -8,6 +8,7 @@ from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.metal_kernels import (
     _pme_order5_forces,
     _pme_order5_forces_from_complex_grid,
+    _pme_order5_forces_from_normalized_real_grid,
     pme_order5_charge_grid,
     pme_order5_energy_forces,
 )
@@ -1010,6 +1011,12 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             potential_grid.astype(mx.complex64) / float(np.prod(mesh_shape)),
             lengths,
         )
+        normalized_real_force_only = _pme_order5_forces_from_normalized_real_grid(
+            positions,
+            charges,
+            potential_grid / float(np.prod(mesh_shape)),
+            lengths,
+        )
 
         def fixed_grid_energy(coordinates):
             values = _interpolate_bspline_mx(
@@ -1064,17 +1071,24 @@ def test_order5_pme_metal_kernels_match_mlx_numerics(monkeypatch):
             rtol=2e-6,
             atol=2e-7,
         )
+        np.testing.assert_allclose(
+            np.asarray(normalized_real_force_only),
+            np.asarray(metal_forces),
+            rtol=2e-6,
+            atol=2e-7,
+        )
     finally:
         mx.set_default_device(previous)
         mx.set_default_stream(mx.new_stream(previous))
 
 
 @pytest.mark.gpu
-def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
+@pytest.mark.parametrize("mesh_shape", [(16, 16, 16), (15, 14, 13)])
+def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch, mesh_shape):
     previous = mx.default_device()
     monkeypatch.setenv("MLX_ATOMISTIC_DEVICE", "gpu")
     device = mx.Device(mx.gpu, 0)
-    cache_key = ((16, 16, 16), 5, str(device))
+    cache_key = (mesh_shape, 5, str(device))
     try:
         mx.set_default_device(device)
         mx.set_default_stream(mx.new_stream(device))
@@ -1090,7 +1104,7 @@ def test_compiled_reciprocal_pme_matches_uncompiled_gpu_path(monkeypatch):
         charges = mx.array(np.asarray(_charges()), dtype=mx.float32)
         cell = Cell.cubic(12.0)
         config = PMEConfig(
-            mesh_shape=(16, 16, 16),
+            mesh_shape=mesh_shape,
             alpha=0.35,
             real_cutoff=5.0,
             assignment_order=5,

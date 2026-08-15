@@ -14,7 +14,7 @@ import numpy as np
 
 from mlx_atomistic.core import Cell
 from mlx_atomistic.metal_kernels import (
-    _pme_order5_forces_from_complex_grid,
+    _pme_order5_forces_from_normalized_real_grid,
     pme_order5_charge_grid,
     pme_order5_energy_forces,
 )
@@ -2509,21 +2509,29 @@ def _mesh_reciprocal_energy_forces_core_mx(
             mesh_shape,
             assignment_order=assignment_order,
         )
+    if use_order5_metal and not include_energy:
+        last_axis_modes = mesh_shape[-1] // 2 + 1
+        rho_hat = mx.fft.rfftn(charge_grid)
+        phi_hat = influence[..., :last_axis_modes] * rho_hat
+        potential_grid = mx.fft.irfftn(
+            phi_hat,
+            s=mesh_shape,
+            axes=(0, 1, 2),
+        )
+        energy = mx.array(0.0, dtype=mx.float32)
+        forces = _pme_order5_forces_from_normalized_real_grid(
+            positions,
+            charges,
+            potential_grid,
+            cell_lengths,
+        )
+        return energy, forces, charge_grid, rho_hat
     rho_hat = mx.fft.fftn(charge_grid)
     phi_hat = influence * rho_hat
     if use_order5_metal:
         if include_energy:
             potential_grid = mx.real(mx.fft.ifftn(phi_hat)) * float(grid_size)
             energy, forces = pme_order5_energy_forces(
-                positions,
-                charges,
-                potential_grid,
-                cell_lengths,
-            )
-        else:
-            energy = mx.array(0.0, dtype=mx.float32)
-            potential_grid = mx.fft.ifftn(phi_hat)
-            forces = _pme_order5_forces_from_complex_grid(
                 positions,
                 charges,
                 potential_grid,
