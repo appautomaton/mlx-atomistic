@@ -93,13 +93,32 @@ relaxation, and custom kernels remain out of scope.
 
 ## Periodic Plane-Wave Forces
 
-`periodic_scf_forces(system, result)` evaluates local GTH, nonlocal GTH, and
-Ewald ion contributions from a converged `PeriodicSCFResult`. The accepted
-eight-atom MgO check used 48 reconverged ±0.01 bohr SCFs: 21 of 24 Cartesian
-components passed the unchanged `1e-4 Ha/bohr` gate. The three failures are a
-recorded float32 total-energy precision limit, with a maximum deviation of
-`2.246e-4 Ha/bohr`; symmetry and refinement checks did not indicate an analytic
-force bug.
+The production periodic path has a separate fixed-cell force implementation:
+
+```text
+F_i = F_i(local GTH) + F_i(nonlocal GTH) + F_i(Ewald ions)
+```
+
+`periodic_scf_forces(system, result)` requires a converged
+`PeriodicSCFResult` with an exact system fingerprint. The local term
+differentiates the reciprocal-space ionic phase against the converged density;
+the nonlocal term differentiates each GTH projector phase and sums occupied
+states with their k-point integration weights; and the ion-ion term uses the
+analytic Ewald derivative.
+
+At fixed cell, the plane-wave basis does not depend on ionic positions, so
+there is no ionic Pulay-force term. Bounded fixed-state and reconverged
+two-species finite-difference tests cover the implementation.
+
+The full eight-atom MgO validation uses the accepted 70 Ha, 6-by-6-by-6
+PBE-GTH workload and 48 reconverged SCFs at ±0.01 bohr. At the unchanged
+`1e-4 Ha/bohr` gate, 21 of 24 analytic-versus-central-difference components
+pass. The remaining O 6-x and O 7-y/z components are recorded as a known
+float32 total-energy precision limitation, with a maximum deviation of
+`2.246e-4 Ha/bohr`; the threshold is not weakened. Their analytic equilibrium
+forces remain symmetry-correct and near zero, while tighter SCF continuation
+shifts the finite-difference values non-monotonically without a systematic
+atom-axis pattern.
 
 ## Benchmark Evidence
 

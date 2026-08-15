@@ -14,6 +14,8 @@ rm -rf "$RELEASE_DIST"
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv lock --check
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv sync --locked --no-default-groups --extra prep --group test
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --group test ruff check src tests scripts
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-project --python 3.13.12 python scripts/sync_site_docs.py
+UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-project --python 3.13.12 python scripts/sync_site_docs.py --check
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --no-project --with griffe --python 3.13.12 python scripts/gen_api_docs.py
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --extra prep --group test python -m pytest -m "not slow"
 UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache uv run --locked --no-default-groups --extra prep --group test python -m pytest --cov=mlx_atomistic --cov-report=term-missing

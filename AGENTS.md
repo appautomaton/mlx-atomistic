@@ -6,9 +6,10 @@ everything under `vendors/` are reference and validation surfaces only. They
 never sit on the MLX runtime path and never replace it.
 
 This file is the authoritative, cross-tool source of truth for working in this
-repository. Read it in full at the start of a session. Narrative documentation
-lives under `docs/` and in the docs site (`site/src/content/docs/`). Reach for
-it when a section here points you deeper.
+repository. Read it in full at the start of a session. Canonical narrative and
+benchmark documentation lives under `docs/`. The docs site renders generated
+copies under `site/src/content/docs/`; never maintain those copies by hand.
+Reach for the canonical source when a section here points you deeper.
 
 ## Ground rules
 
@@ -91,15 +92,15 @@ Test markers (see `pyproject.toml` and `conftest.py`):
 
 ## Documentation and docstrings
 
-The docs site under `site/` has two parts. Hand-written narrative lives under
-`site/src/content/docs/` (overview, foundations, mm, dft, benchmarks, project).
-The API reference under `.../api/` is generated from the package by
-`scripts/gen_api_docs.py`, a static Griffe parse with no import and no MLX,
-git-ignored and rebuilt on deploy. The build also emits `llms.txt` and
-`llms-full.txt` for agentic consumption.
+The docs site under `site/` is fully generated from two canonical sources.
+Narrative and benchmarks come from `docs/` through
+`scripts/sync_site_docs.py`. The API reference comes from package docstrings
+through `scripts/gen_api_docs.py`, a static Griffe parse with no import and no
+MLX. Both output trees are git-ignored and rebuilt on deploy. The site build
+also emits `llms.txt` and `llms-full.txt` for agentic consumption.
 
-Never hand-edit the API pages. Edit the docstrings and let the generator rebuild
-them.
+Never hand-edit generated site pages. Edit `docs/` for narrative, or edit
+docstrings for API reference, and let the relevant generator rebuild them.
 
 House style for public docstrings:
 

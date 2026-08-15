@@ -46,18 +46,20 @@ _EXPLICIT_PREP = importlib.util.module_from_spec(_EXPLICIT_PREP_SPEC)
 _EXPLICIT_PREP_SPEC.loader.exec_module(_EXPLICIT_PREP)
 
 
-def test_historical_dhfr_branch_disposition_is_documented():
-    root_inventory = (ROOT / "docs/benchmarks/inventory-gap-matrix.md").read_text()
-    site_inventory = (ROOT / "site/src/content/docs/benchmarks/inventory-gap-matrix.md").read_text()
+def test_benchmark_documentation_has_one_index_and_decision_ledgers():
+    index = (ROOT / "docs/benchmarks/README.md").read_text()
+    md_ledger = (ROOT / "docs/benchmarks/md-performance-decisions-m5max.md").read_text()
+    dft_ledger = (
+        ROOT / "docs/benchmarks/dft-performance-decisions-m5max.md"
+    ).read_text()
 
-    for text in (root_inventory, site_inventory):
-        normalized = " ".join(text.split())
-        assert "feat/neutralized-dhfr-pme-validation" in normalized
-        assert "7584ec5" in normalized
-        assert "retired, not merged" in normalized
-        assert "24,488-atom neutral TIP3P/NaCl" in normalized
-        assert "not a DHFR protein" in normalized
-        assert "NPT plus analytic virial remain open" in normalized
+    assert "Active Performance and Decisions" in index
+    assert "MD Performance Decision Ledger" in md_ledger
+    assert "8899994" in md_ledger
+    assert "DFT Performance Decision Ledger" in dft_ledger
+    assert "59.231 s" in dft_ledger
+    assert "Reference engines never enter" in index
+    assert "position-balanced" in md_ledger
 
 
 def _assert_normalized_payload(payload, *, timing_metric, status="ok"):

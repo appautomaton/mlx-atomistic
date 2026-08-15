@@ -76,6 +76,15 @@ vendors/
 # regenerated from src/ by scripts/gen_api_docs.py on every build.
 site/src/content/docs/api/
 
+# Auto-generated Starlight narrative and benchmark pages. Canonical Markdown
+# lives under docs/ and is rendered by scripts/sync_site_docs.py.
+site/src/content/docs/overview.md
+site/src/content/docs/foundations/
+site/src/content/docs/mm/
+site/src/content/docs/dft/
+site/src/content/docs/benchmarks/
+site/src/content/docs/project/
+
 # Astro / Starlight build state
 site/.astro/
 site/node_modules/

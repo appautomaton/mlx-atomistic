@@ -5,9 +5,11 @@ on:
     branches:
       - main
     paths:
+      - "docs/**"
       - "site/**"
       - "src/**"
       - "scripts/gen_api_docs.py"
+      - "scripts/sync_site_docs.py"
       - "pyproject.toml"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
@@ -39,6 +41,10 @@ jobs:
       - name: Generate API reference
         working-directory: ${{ github.workspace }}
         run: uv run --no-project --with griffe --python 3.13.12 python scripts/gen_api_docs.py
+
+      - name: Generate narrative documentation
+        working-directory: ${{ github.workspace }}
+        run: uv run --no-project --python 3.13.12 python scripts/sync_site_docs.py
 
       - name: Set up Node
         uses: actions/setup-node@v6

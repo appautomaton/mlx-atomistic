@@ -307,21 +307,16 @@ def test_dft_material_validation_documentation_preserves_scope_and_limits():
     root_summary = (
         ROOT / "docs/benchmarks/dft-material-validation.md"
     ).read_text()
-    site_summary = (
-        ROOT
-        / "site/src/content/docs/benchmarks/dft-material-validation.md"
-    ).read_text()
     production_doc = (ROOT / "docs/dft-production-core.md").read_text()
 
-    for text in (root_summary, site_summary):
-        assert "PeriodicDFTSystem" in text
-        assert "0.578 eV" in text
-        assert "0.438 meV/atom" in text
-        assert "16.89%" in text
-        assert "21 of 24" in text
-        assert "2.246e-4 Ha/bohr" in text
-        assert "threshold was not weakened" in text
-        assert "universal periodic DFT accuracy" in text
+    assert "PeriodicDFTSystem" in root_summary
+    assert "0.578 eV" in root_summary
+    assert "0.438 meV/atom" in root_summary
+    assert "16.89%" in root_summary
+    assert "21 of 24" in root_summary
+    assert "2.246e-4 Ha/bohr" in root_summary
+    assert "threshold was not weakened" in root_summary
+    assert "universal periodic DFT accuracy" in root_summary
     normalized_production = " ".join(production_doc.split())
     assert "legacy `DFTSystem`/`run_scf`" in normalized_production
     assert "`PeriodicDFTSystem`/`run_periodic_scf`" in normalized_production

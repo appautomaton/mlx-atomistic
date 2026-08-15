@@ -10,7 +10,7 @@ manifest-bound 75-step MLX/OpenMM run established a historical `9.7586x`
 throughput ratio for this exact workload. A 2026-08-11 same-power-state refresh
 after the retained tile and pair-lifetime work reduced the two-run
 ratio-of-medians to `5.2701x`; see
-[`retained-stack-phase5-m5max.md`](./retained-stack-phase5-m5max.md).
+the [MD performance decision ledger](./md-performance-decisions-m5max.md).
 
 ## Raw evidence
 

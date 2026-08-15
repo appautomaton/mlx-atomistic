@@ -508,17 +508,15 @@ def test_runtime_boundary_docs_label_reference_surfaces():
 
 def test_testing_documentation_matches_linux_cpu_ci_and_opt_in_tiers():
     testing_doc = (ROOT / "docs/testing.md").read_text()
-    site_testing_doc = (
-        ROOT / "site/src/content/docs/foundations/testing.md"
-    ).read_text()
     agents_doc = (ROOT / "AGENTS.md").read_text()
 
-    for text in (testing_doc, site_testing_doc):
-        assert "ubuntu-22.04" in text
-        assert 'pytest -m "not slow"' in text
-        assert "--run-reference" in text
-        assert "--run-data" in text
-        assert "--run-perf" in text
-        assert "Metal is a local" in text
-        assert "hosted macOS sessions can collect tests" not in text
+    assert "ubuntu-22.04" in testing_doc
+    assert 'pytest -m "not slow"' in testing_doc
+    assert "--run-reference" in testing_doc
+    assert "--run-data" in testing_doc
+    assert "--run-perf" in testing_doc
+    assert "Metal is a local" in testing_doc
+    assert "hosted macOS sessions can collect tests" not in testing_doc
     assert "`reference`, `data`, `gpu`, `perf`" in agents_doc
+    assert "scripts/sync_site_docs.py" in agents_doc
+    assert "never maintain those copies by hand" in agents_doc
