@@ -8170,6 +8170,7 @@ def _interaction32_special_blocks_sized(
     *,
     block_count: int,
     special_count: int,
+    block_capacity: int | None = None,
 ) -> mx.array:
     """Compact flagged 32-atom block pairs into a sized device array."""
 
@@ -8187,7 +8188,11 @@ def _interaction32_special_blocks_sized(
         raise ValueError("special_prefix must contain one value per raw block code")
     if special_count < 0 or special_count > raw_code_count:
         raise ValueError("special_count is incompatible with the block inventory")
-    if special_count == 0:
+    if block_capacity is None:
+        block_capacity = special_count
+    if block_capacity < special_count:
+        raise ValueError("special block capacity is below the logical inventory")
+    if block_capacity == 0:
         return mx.zeros((0, 2), dtype=mx.int32)
     threads = min(256, raw_code_count)
     (special_blocks,) = _interaction32_special_block_scatter_kernel()(
@@ -8197,7 +8202,7 @@ def _interaction32_special_blocks_sized(
             special_prefix,
             mx.array([raw_code_count, block_count], dtype=mx.int32),
         ],
-        output_shapes=[(special_count, 2)],
+        output_shapes=[(block_capacity, 2)],
         output_dtypes=[mx.int32],
         grid=(raw_code_count, 1, 1),
         threadgroup=(threads, 1, 1),
@@ -8212,6 +8217,8 @@ def _interaction32_special_work_two_halves(
     topology_offsets: mx.array,
     topology_neighbors: mx.array,
     topology_classes: mx.array,
+    *,
+    work_capacity: int | None = None,
 ) -> tuple[mx.array, ...]:
     """Build conservative two-half work and topology masks for special blocks."""
 
@@ -8232,7 +8239,11 @@ def _interaction32_special_work_two_halves(
         raise ValueError("topology neighbors and classes must have matching shapes")
     special_count = int(special_blocks.shape[0])
     work_count = 2 * special_count
-    if special_count == 0:
+    if work_capacity is None:
+        work_capacity = work_count
+    if work_capacity < work_count:
+        raise ValueError("special work capacity is below the logical inventory")
+    if work_capacity == 0:
         return (
             mx.zeros((0,), dtype=mx.int32),
             mx.zeros((0,), dtype=mx.int32),
@@ -8251,12 +8262,12 @@ def _interaction32_special_work_two_halves(
             mx.array([special_count, int(atom_order.shape[0])], dtype=mx.int32),
         ],
         output_shapes=[
-            (work_count,),
-            (work_count,),
-            (work_count, 32),
-            (work_count, 32),
-            (work_count, 32),
-            (work_count,),
+            (work_capacity,),
+            (work_capacity,),
+            (work_capacity, 32),
+            (work_capacity, 32),
+            (work_capacity, 32),
+            (work_capacity,),
         ],
         output_dtypes=[
             mx.int32,

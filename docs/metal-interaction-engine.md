@@ -2,17 +2,17 @@
 
 ## Status
 
-The 32-atom engine is an experimental architecture surface, not the production
-Molecular Dynamics (MD) route. Production currently uses coarse 8-by-8
-Neighbor search tiles, exact 4-by-4 force tiles, and 32 active-column Metal
-groups. That path has device-built schedules, broad force-field coverage, and
-the accepted end-to-end benchmarks.
+The 32-atom engine is now an end-to-end experimental Molecular Dynamics (MD)
+backend named `mlx_interaction32`. It is opt-in and is not the default
+production route. The default still uses coarse 8-by-8 Neighbor search tiles,
+exact 4-by-4 force tiles, and 32 active-column Metal groups.
 
-The experimental 32-atom kernels remain useful only if they can demonstrate a
-larger structural improvement than the production 4-by-4 engine. A faster
-isolated kernel is insufficient. The required result is a device-built,
-device-resident schedule that improves a complete constrained Particle Mesh
-Ewald (PME) trajectory.
+The experimental backend owns retained device capacity, fail-closed overflow,
+Neighbor generation identity, the recurring direct-force schedule, and lazy
+diagnostic tiles. It has now improved complete constrained Particle Mesh Ewald
+(PME) trajectories on 5DFR, JAC, and GPCRmd. Promotion remains separate: the
+backend stays opt-in until broader correctness and stability coverage supports
+changing the default case contracts.
 
 The sustained force gate was reopened on 2026-08-14. Earlier 16-call timing
 blocks showed only a small advantage and correctly blocked production work at
@@ -29,11 +29,9 @@ table, so the force surface covers 5DFR, JAC, and GPCRmd.
 
 Each row used eight samples, 750 individually synchronized calls per sample,
 and both control-first and candidate-first directions. Every direction was
-positive. These are force-only results, not complete-trajectory claims. The
-research schedule still takes about 4.2 seconds to build for 5DFR and 17.0-17.6
-seconds for JAC and GPCRmd because it uses a host SciPy `cKDTree` oracle. That
-builder cannot enter the runtime. The next authorized work is therefore Gate C,
-not direct-force promotion.
+positive. These historical force-only results authorized the device builder.
+The host SciPy `cKDTree` schedule remains an oracle only and never enters the
+runtime.
 
 The command shape for each prepared artifact was:
 
@@ -218,18 +216,47 @@ trajectories.
 
 ### Capacity, overflow, and generation
 
-The following is the promotion contract, not yet the behavior of the C1
-prototype. The first admitted generation sizes exact arrays from C1 inventory. Later
-generations retain at least 125% row and group capacity, rounded to a stable
-allocation quantum. Count kernels always write logical counts and an overflow
-bit before scatter. Scatter is forbidden when any logical count exceeds
-capacity. An overflowed candidate generation never replaces the previous
-valid schedule; a safe host boundary may grow capacity and retry.
+The first admitted generation reserves at least 125% row and group capacity,
+rounded to a 64-record allocation quantum. Later generations retain that
+capacity until an inventory grows beyond it. Count kernels expose every logical
+count before scatter. Scatter is forbidden when any count exceeds capacity. An
+overflowed candidate generation never replaces the previous valid schedule; a
+safe host boundary grows capacity and retries the already-counted inventory.
 
-Generation identity includes atom order, box, search radius, topology identity,
-logical counts, and capacity. Force bindings rebind only after a complete new
-generation passes overflow, uniqueness, periodic membership, and topology
-checks. Public positions and forces remain in canonical order.
+Generation identity includes atom count, box, search radius, topology digest,
+capacity, and a monotonic generation value. Force bindings rebind only after a
+complete new generation passes capacity admission. Tests prove that an
+overflowed generation leaves the prior schedule active and that a force binding
+rejects the wrong generation. Public positions and forces remain in canonical
+order.
+
+### Moving NVT checkpoint
+
+On 2026-08-15 the retained-capacity builder was connected to the prepared force
+pipeline through the opt-in `mlx_interaction32` Neighbor backend. Ordinary steps
+use only the 32-atom schedule. Energy and virial diagnostics lazily build exact
+`NeighborTiles` for the same reference generation; they never materialize the
+60-million-pair GPCRmd shell. The backend participates in the same asynchronous
+force-submission path as production tiles.
+
+The clean comparison used two independent processes per arm, ten warmup steps,
+750 measured steps, seed 17, skin 5.5 A, unchanged diagnostics, and Low Power
+Mode. Order was balanced as control/candidate/candidate/control, reversed for
+JAC. Raw JSON is under
+`results/md-suite/round2-device-builder/moving-ab-v2/`.
+
+| Workload | Production tiles | `mlx_interaction32` | Complete-wall speedup | Candidate rebuild wall / count | Metal peak memory change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5DFR | 1.7496 ms/step | 1.5992 ms/step | 8.60% | 0.3038 s / 21.5 | -16.2% |
+| JAC 4-cell | 6.8322 ms/step | 5.9439 ms/step | 13.00% | 1.2362 s / 21 | -18.5% |
+| GPCRmd 729 | 7.8329 ms/step | 7.4761 ms/step | 4.56% | 2.1509 s / 26.5 | -18.7% |
+
+The candidate builder is still slower than the production tile builder: about
+14.1 versus 11.2 ms per rebuild on 5DFR, 58.9 versus 46.6 ms on JAC, and 81.2
+versus 44.6 ms on GPCRmd. The complete trajectory wins because the recurring
+direct force is cheaper. This makes builder stage attribution the next target;
+it does not yet justify a C++ MLX primitive because the remaining scalar
+inventory boundary has not been isolated as the cause.
 
 ### C2: optional native state boundary
 
@@ -265,7 +292,7 @@ synthetic dense occupancy.
 
 ### Gate C: Device Builder
 
-Status: next active gate.
+Status: passed for the opt-in runtime backend.
 
 Build and reuse the schedule entirely on device. Include half-skin admission,
 periodic boundary cases, concentrated occupancy, logical-capacity overflow,
@@ -273,6 +300,8 @@ and generation rebinding. The amortized rebuild plus force cost must beat the
 production engine.
 
 ### Gate D: Full Trajectory
+
+Status: initial three-system pass; default promotion remains pending.
 
 Run position-balanced, independent-process comparisons on 5DFR, JAC, and
 GPCRmd. Require stable complete-wall improvement, force parity, finite state,

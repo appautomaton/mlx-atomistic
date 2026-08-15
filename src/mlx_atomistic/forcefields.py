@@ -26,6 +26,11 @@ from mlx_atomistic.custom_force import (
     CustomForcePotential as CustomForcePotential,
 )
 from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
+from mlx_atomistic.interaction_engine import (
+    _DeviceFusedHalfSchedule32,
+    _fused_half32_direct_force_only,
+    _interaction32_topology_digest,
+)
 from mlx_atomistic.metal_kernels import (
     _fused_bonded_force_only,
     _prepared_parameterized_pme_direct_force_only,
@@ -135,6 +140,7 @@ class _NonbondedForceBinding:
     tile_nbfix_type_epsilon: mx.array | None = None
     tile_nbfix_type_count: int = 0
     tile_decline_reason: str | None = None
+    interaction32_schedule: _DeviceFusedHalfSchedule32 | None = None
 
 
 def _topology_pair_scales(
@@ -1768,6 +1774,15 @@ class NonbondedPotential:
             self,
             "_aligned_lj_one_four_pairs",
             lj_one_four_pairs_mx,
+        )
+        object.__setattr__(
+            self,
+            "_interaction32_topology_digest",
+            _interaction32_topology_digest(
+                int(sigma.shape[0]),
+                correction_pairs,
+                lj_one_four_pairs,
+            ),
         )
         object.__setattr__(
             self,
@@ -3838,6 +3853,111 @@ class NonbondedPotential:
 
         return self._prepare_force_binding_impl(cell, pairs, tiles=tiles)
 
+    def _prepare_interaction32_force_binding(
+        self,
+        cell: Cell | None,
+        pairs: mx.array | NeighborBlocks | None,
+        schedule: _DeviceFusedHalfSchedule32,
+    ) -> _NonbondedForceBinding | NotImplementedType:
+        """Bind one generation-owned Interaction32 direct-force schedule."""
+
+        del pairs
+        if (
+            self.electrostatics != "pme"
+            or cell is None
+            or not cell.is_orthorhombic
+            or self.pme_config is None
+            or self.pme_plan is None
+            or self.cutoff is None
+            or self.pme_config.real_cutoff is None
+            or not np.isclose(
+                float(self.cutoff),
+                float(self.pme_config.real_cutoff),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            or int(self.nbfix_pairs.shape[0]) != 0
+            or schedule.generation is None
+            or schedule.atom_count != int(self.sigma.shape[0])
+        ):
+            return NotImplemented
+        generation = schedule.generation
+        if generation.topology_digest != self._interaction32_topology_digest:
+            msg = "Interaction32 schedule topology does not match the nonbonded force term"
+            raise ValueError(msg)
+        cell_lengths = np.asarray(np.diag(np.asarray(cell.matrix)), dtype=np.float32)
+        if not np.allclose(
+            np.asarray(generation.box_lengths, dtype=np.float32),
+            cell_lengths,
+            rtol=0.0,
+            atol=1.0e-6,
+        ):
+            msg = "Interaction32 schedule box does not match the nonbonded force term"
+            raise ValueError(msg)
+        report = pme_direct_space_policy_report(
+            cell,
+            config=self.pme_config,
+            pairs=mx.zeros((0, 2), dtype=mx.int32),
+            plan=self.pme_plan,
+        )
+        if not report["uses_shared_neighbor_policy"]:
+            return NotImplemented
+        identity = (
+            *self._force_binding_context_identity(cell, None, None),
+            "interaction32",
+            builtins.id(schedule),
+            generation.value,
+            generation.topology_digest,
+        )
+        cache = self._force_binding_cache
+        if cache is not None and cache.cache_identity == identity:
+            return cache
+        lj_invariants = self._prepared_lj_invariants_cache
+        lj_identity = (builtins.id(self.sigma), builtins.id(self.epsilon))
+        if lj_invariants is None or lj_invariants[:2] != lj_identity:
+            half_sigma = 0.5 * self.sigma
+            sqrt_epsilon = mx.sqrt(self.epsilon)
+            mx.eval(half_sigma, sqrt_epsilon)
+            lj_invariants = (*lj_identity, half_sigma, sqrt_epsilon)
+            object.__setattr__(self, "_prepared_lj_invariants_cache", lj_invariants)
+        box_cache = self._prepared_box_cache
+        if box_cache is None or box_cache[0] is not cell:
+            box_lengths = mx.diag(cell.matrix)
+            box_lengths_and_inverses = mx.concatenate(
+                (box_lengths, 1.0 / box_lengths),
+            )
+            mx.eval(box_lengths_and_inverses)
+            box_cache = (cell, box_lengths_and_inverses)
+            object.__setattr__(self, "_prepared_box_cache", box_cache)
+        binding = _NonbondedForceBinding(
+            cell=cell,
+            pairs=None,
+            pme_plan=self.pme_plan,
+            aligned_lj_scales=None,
+            box_lengths_and_inverses=box_cache[1],
+            half_sigma=lj_invariants[2],
+            sqrt_epsilon=lj_invariants[3],
+            cache_identity=identity,
+            pair_force_ready=False,
+            tile_atom_type_ids=(
+                self._atom_type_ids if int(self.nbfix_type_pairs.shape[0]) > 0 else None
+            ),
+            tile_nbfix_type_sigma=(
+                self._nbfix_type_sigma_table
+                if int(self.nbfix_type_pairs.shape[0]) > 0
+                else None
+            ),
+            tile_nbfix_type_epsilon=(
+                self._nbfix_type_epsilon_table
+                if int(self.nbfix_type_pairs.shape[0]) > 0
+                else None
+            ),
+            tile_nbfix_type_count=self._nbfix_type_count,
+            interaction32_schedule=schedule,
+        )
+        object.__setattr__(self, "_force_binding_cache", binding)
+        return binding
+
     def _force_binding_context_identity(
         self,
         cell: Cell | None,
@@ -4097,6 +4217,31 @@ class NonbondedPotential:
     ) -> mx.array:
         """Evaluate the admitted spatial-tile or compact-pair direct route."""
 
+        interaction32 = binding.interaction32_schedule
+        if interaction32 is not None:
+            generation = interaction32.generation
+            if generation is None:
+                msg = "Interaction32 binding requires generation ownership"
+                raise RuntimeError(msg)
+            return _fused_half32_direct_force_only(
+                positions,
+                interaction32,
+                binding.box_lengths_and_inverses,
+                binding.half_sigma,
+                binding.sqrt_epsilon,
+                self.charges,
+                cutoff=self.cutoff,
+                shift=self.lj_shift,
+                switch_distance=self.switch_distance,
+                one_four_scale=self.lj_one_four_scale,
+                coulomb_constant=self.coulomb_constant,
+                alpha=self.pme_config.alpha,
+                atom_type_ids=binding.tile_atom_type_ids,
+                nbfix_type_sigma=binding.tile_nbfix_type_sigma,
+                nbfix_type_epsilon=binding.tile_nbfix_type_epsilon,
+                nbfix_type_count=binding.tile_nbfix_type_count,
+                expected_generation=generation.value,
+            )
         tiles = binding.tile_geometry
         if (
             tiles is not None
@@ -4169,9 +4314,13 @@ class NonbondedPotential:
         direct_forces = self._direct_forces_from_binding(positions, binding)
         route_profiler.finish(
             (
-                "direct_spatial_tiles"
-                if binding.tile_geometry is not None and binding.tile_decline_reason is None
-                else "direct_lj_screened_coulomb"
+                "direct_interaction32"
+                if binding.interaction32_schedule is not None
+                else (
+                    "direct_spatial_tiles"
+                    if binding.tile_geometry is not None and binding.tile_decline_reason is None
+                    else "direct_lj_screened_coulomb"
+                )
             ),
             direct_started,
             direct_forces,
@@ -4231,9 +4380,13 @@ class NonbondedPotential:
         direct_forces = self._direct_forces_from_binding(positions, binding)
         route_profiler.finish(
             (
-                "direct_spatial_tiles"
-                if binding.tile_geometry is not None and binding.tile_decline_reason is None
-                else "direct_lj_screened_coulomb"
+                "direct_interaction32"
+                if binding.interaction32_schedule is not None
+                else (
+                    "direct_spatial_tiles"
+                    if binding.tile_geometry is not None and binding.tile_decline_reason is None
+                    else "direct_lj_screened_coulomb"
+                )
             ),
             direct_started,
             direct_forces,

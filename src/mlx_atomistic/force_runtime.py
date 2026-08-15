@@ -12,6 +12,7 @@ import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.forcefields import _prepare_fused_bonded_force_binding
+from mlx_atomistic.interaction_engine import _DeviceFusedHalfSchedule32
 from mlx_atomistic.neighbors import NeighborList, NeighborTiles
 from mlx_atomistic.virtual_sites import VirtualSiteManager
 
@@ -321,19 +322,23 @@ class _PreparedForcePipeline:
             A force evaluator bound to the exact list object.
         """
 
-        tiles = None if neighbor_list is None else neighbor_list.force_candidates(prefer_tiles=True)
-        if not isinstance(tiles, NeighborTiles):
-            tiles = None
+        structured = (
+            None if neighbor_list is None else neighbor_list.force_candidates(prefer_tiles=True)
+        )
+        tiles = structured if isinstance(structured, NeighborTiles) else None
+        interaction32 = (
+            structured if isinstance(structured, _DeviceFusedHalfSchedule32) else None
+        )
         tile_policies = tuple(
             getattr(term, "_neighbor_tile_diagnostic_policy", None) for term in self.force_terms
         )
-        tile_owned = bool(
-            tiles is not None
+        structured_owned = bool(
+            (tiles is not None or interaction32 is not None)
             and "consume" in tile_policies
             and all(policy in {"consume", "ignore"} for policy in tile_policies)
         )
         interactions = (
-            None if neighbor_list is None or tile_owned else neighbor_list.diagnostic_pairs
+            None if neighbor_list is None or structured_owned else neighbor_list.diagnostic_pairs
         )
 
         def prepare_bindings(
@@ -343,7 +348,22 @@ class _PreparedForcePipeline:
             for term in self.force_terms:
                 prepare = getattr(term, "_prepare_force_binding", None)
                 prepare_tiles = getattr(term, "_prepare_tile_force_binding", None)
-                if tiles is not None and callable(prepare_tiles):
+                prepare_interaction32 = getattr(
+                    term,
+                    "_prepare_interaction32_force_binding",
+                    None,
+                )
+                if (
+                    interaction32 is not None
+                    and pair_interactions is None
+                    and callable(prepare_interaction32)
+                ):
+                    binding = prepare_interaction32(
+                        self.cell,
+                        pair_interactions,
+                        interaction32,
+                    )
+                elif tiles is not None and callable(prepare_tiles):
                     binding = prepare_tiles(self.cell, pair_interactions, tiles)
                 else:
                     binding = (
@@ -372,6 +392,12 @@ class _PreparedForcePipeline:
                 None if pair_interactions is None else str(pair_interactions.dtype),
                 None if tiles is None else id(tiles),
                 None if tiles is None else tiles.generation,
+                None if interaction32 is None else id(interaction32),
+                (
+                    None
+                    if interaction32 is None or interaction32.generation is None
+                    else interaction32.generation.value
+                ),
                 tuple(term_context),
             )
 
@@ -383,7 +409,7 @@ class _PreparedForcePipeline:
         ):
             return self._cached_binding
         term_bindings = prepare_bindings(interactions)
-        if tile_owned and any(
+        if structured_owned and any(
             getattr(term, "cutoff", None) is not None and binding is NotImplemented
             for term, binding in zip(self.force_terms, term_bindings, strict=True)
         ):

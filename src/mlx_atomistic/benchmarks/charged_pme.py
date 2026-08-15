@@ -46,7 +46,9 @@ _SPATIAL_DIRECT_MIN_COMPLETE_SPEEDUP = 0.15
 # complete-wall A/B below is the authoritative retention gate.
 _SPATIAL_DIRECT_MIN_KERNEL_SPEEDUP = 0.25
 _SPARSE_CORRECTION_MIN_SPEEDUP = 0.20
-_RUNTIME_NEIGHBOR_BACKENDS = frozenset({"mlx_cell_pairs", "mlx_cell_tiles"})
+_RUNTIME_NEIGHBOR_BACKENDS = frozenset(
+    {"mlx_cell_pairs", "mlx_cell_tiles", "mlx_interaction32"}
+)
 
 
 def _constraint_route_inventory(
@@ -306,7 +308,7 @@ def runtime_payload(
     if diagnostic_interval <= 0:
         validation_blockers.append("diagnostic_interval_must_be_positive")
     if neighbor_backend not in _RUNTIME_NEIGHBOR_BACKENDS:
-        validation_blockers.append("neighbor_backend_must_be_pairs_or_tiles")
+        validation_blockers.append("neighbor_backend_must_be_registered_runtime_backend")
     if neighbor_rebuild_profile and neighbor_backend != "mlx_cell_tiles":
         validation_blockers.append("neighbor_rebuild_profile_requires_mlx_cell_tiles")
     required = (prepared_path / JSON_NAME, prepared_path / NPZ_NAME)
@@ -345,6 +347,8 @@ def runtime_payload(
             sort_pairs=False,
             backend=neighbor_backend,
             displacement_check_backend="mlx_scalar",
+            interaction32_exclusion_pairs=nonbonded._aligned_lj_exclusion_pairs,
+            interaction32_one_four_pairs=nonbonded._aligned_lj_one_four_pairs,
         )
         setup_seconds = time.perf_counter() - setup_started
         unit_system = artifact.unit_system
@@ -487,7 +491,11 @@ def runtime_payload(
             "mlx_peak_memory_bytes": _mlx_memory_value("get_peak_memory"),
             "mlx_cache_memory_bytes": _mlx_memory_value("get_cache_memory"),
         }
-        expected_representation = "tiles" if neighbor_backend == "mlx_cell_tiles" else "pairs"
+        expected_representation = {
+            "mlx_cell_pairs": "pairs",
+            "mlx_cell_tiles": "tiles",
+            "mlx_interaction32": "interaction32",
+        }[neighbor_backend]
         checks = {
             "warmup_completed": warmups >= 1,
             "measured_steps_completed": steps >= 2,
@@ -526,21 +534,23 @@ def runtime_payload(
         if runtime_profile:
             route_profile = measured_result.route_profile
             routes = route_profile.get("routes", {})
-            expected_direct_route = (
-                "direct_spatial_tiles"
-                if neighbor_backend == "mlx_cell_tiles"
-                else "direct_lj_screened_coulomb"
-            )
-            unexpected_direct_route = (
-                "direct_lj_screened_coulomb"
-                if neighbor_backend == "mlx_cell_tiles"
-                else "direct_spatial_tiles"
-            )
+            expected_direct_route = {
+                "mlx_cell_pairs": "direct_lj_screened_coulomb",
+                "mlx_cell_tiles": "direct_spatial_tiles",
+                "mlx_interaction32": "direct_interaction32",
+            }[neighbor_backend]
+            unexpected_direct_routes = {
+                "direct_lj_screened_coulomb",
+                "direct_spatial_tiles",
+                "direct_interaction32",
+            } - {expected_direct_route}
             checks.update(
                 {
                     "route_profile_reconciled": bool(route_profile.get("reconciled", False)),
                     "route_profile_expected_direct": expected_direct_route in routes,
-                    "route_profile_no_direct_fallback": (unexpected_direct_route not in routes),
+                    "route_profile_no_direct_fallback": not (
+                        unexpected_direct_routes & routes.keys()
+                    ),
                     "route_profile_reciprocal": "reciprocal_pme" in routes,
                     "route_profile_neighbor": "neighbor_update_rebuild" in routes,
                     "route_profile_integration": "integration_thermostat" in routes,

@@ -786,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument(
         "--neighbor-backend",
-        choices=("mlx_cell_pairs", "mlx_cell_tiles"),
+        choices=("mlx_cell_pairs", "mlx_cell_tiles", "mlx_interaction32"),
         default=None,
         help="override each case's committed backend contract",
     )
@@ -803,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
     profile_parser.add_argument("--measured-steps", type=int, default=DEFAULT_MEASURED_STEPS)
     profile_parser.add_argument(
         "--neighbor-backend",
-        choices=("mlx_cell_pairs", "mlx_cell_tiles"),
+        choices=("mlx_cell_pairs", "mlx_cell_tiles", "mlx_interaction32"),
         default=None,
         help="override each case's committed backend contract",
     )

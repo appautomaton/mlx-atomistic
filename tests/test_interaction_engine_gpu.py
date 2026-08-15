@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from math import ceil
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -21,13 +23,17 @@ from mlx_atomistic.interaction_engine import (
     _fused_half32_direct_force_only,
     _group_ordinary_tiles,
     _interaction32_direct_force_only,
+    _Interaction32ScheduleCapacity,
     _make_atom_blocks,
     _normalize_pairs,
     _owner_compute32_direct_force_only,
+    _retry_device_fused_half_schedule32,
     _special_block_codes,
+    _try_build_device_fused_half_schedule32,
 )
+from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
 from mlx_atomistic.metal_kernels import _prepared_parameterized_pme_direct_force_only
-from mlx_atomistic.neighbors import build_neighbor_list
+from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 from mlx_atomistic.pme import PMEConfig
 from mlx_atomistic.topology import Topology
 
@@ -602,6 +608,191 @@ def test_device_built_fused_half32_force_matches_pair_oracle():
 
 
 @pytest.mark.gpu
+def test_device_schedule_capacity_overflow_retry_and_generation_ownership():
+    """Overflow stops before schedule publication and retry owns one generation."""
+
+    grid = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    )
+    positions_np = 2.0 + 1.4 * grid.reshape((-1, 3)).astype(np.float32)
+    atom_count = positions_np.shape[0]
+    box_lengths = np.asarray([20.0, 20.0, 20.0], dtype=np.float32)
+    exclusions = np.asarray([[0, 40]], dtype=np.int32)
+    one_four = np.asarray([[1, 41]], dtype=np.int32)
+    initial = _try_build_device_fused_half_schedule32(
+        positions_np,
+        box_lengths,
+        search_radius=4.5,
+        capacity=None,
+        generation_value=7,
+        lj_exclusion_pairs=exclusions,
+        lj_one_four_pairs=one_four,
+    )
+    assert initial.overflow
+    assert initial.schedule is None
+    assert initial.overflow_fields == (
+        "ordinary_tiles",
+        "ordinary_groups",
+        "special_tiles",
+    )
+    logical_counts = (
+        initial.inventory.ordinary_tile_count,
+        initial.inventory.ordinary_group_count,
+        initial.inventory.special_tile_count,
+    )
+    reserved_counts = (
+        initial.recommended_capacity.ordinary_tiles,
+        initial.recommended_capacity.ordinary_groups,
+        initial.recommended_capacity.special_tiles,
+    )
+    for logical, reserved in zip(logical_counts, reserved_counts, strict=True):
+        assert reserved >= ceil(1.25 * logical)
+        assert reserved % 64 == 0
+
+    admitted = _retry_device_fused_half_schedule32(initial)
+    assert not admitted.overflow
+    assert admitted.inventory is initial.inventory
+    assert admitted.schedule is not None
+    assert admitted.schedule.generation is not None
+    assert admitted.schedule.generation.value == 7
+    assert admitted.schedule.generation.capacity == initial.recommended_capacity
+    active_schedule = admitted.schedule
+    mx.eval(
+        active_schedule.atom_order,
+        active_schedule.ordinary_right_atoms,
+        active_schedule.special_work_lj_enabled,
+    )
+
+    too_small = _Interaction32ScheduleCapacity(
+        ordinary_tiles=max(0, initial.inventory.ordinary_tile_count - 1),
+        ordinary_groups=initial.recommended_capacity.ordinary_groups,
+        special_tiles=initial.recommended_capacity.special_tiles,
+    )
+    rejected = _try_build_device_fused_half_schedule32(
+        positions_np,
+        box_lengths,
+        search_radius=4.5,
+        capacity=too_small,
+        generation_value=8,
+        lj_exclusion_pairs=exclusions,
+        lj_one_four_pairs=one_four,
+    )
+    assert rejected.overflow_fields == ("ordinary_tiles",)
+    assert rejected.schedule is None
+    assert active_schedule is admitted.schedule
+    rejected_retry = _retry_device_fused_half_schedule32(
+        rejected,
+        capacity=too_small,
+    )
+    assert rejected_retry.overflow_fields == ("ordinary_tiles",)
+    assert rejected_retry.schedule is None
+
+    exact = _Interaction32ScheduleCapacity(
+        ordinary_tiles=rejected.inventory.ordinary_tile_count,
+        ordinary_groups=rejected.inventory.ordinary_group_count,
+        special_tiles=rejected.inventory.special_tile_count,
+    )
+    exact_attempt = _try_build_device_fused_half_schedule32(
+        positions_np,
+        box_lengths,
+        search_radius=4.5,
+        capacity=exact,
+        generation_value=8,
+        lj_exclusion_pairs=exclusions,
+        lj_one_four_pairs=one_four,
+    )
+    assert not exact_attempt.overflow
+    assert exact_attempt.schedule is not None
+    assert exact_attempt.schedule.generation is not None
+    assert exact_attempt.schedule.generation.capacity == exact
+
+    positions = mx.array(positions_np, dtype=mx.float32)
+    box = mx.concatenate(
+        (
+            mx.array(box_lengths, dtype=mx.float32),
+            1.0 / mx.array(box_lengths, dtype=mx.float32),
+        )
+    )
+    half_sigma = mx.full((atom_count,), 0.55, dtype=mx.float32)
+    sqrt_epsilon = mx.full((atom_count,), np.sqrt(0.2), dtype=mx.float32)
+    charges = mx.array(np.linspace(-0.5, 0.5, atom_count), dtype=mx.float32)
+    matched = _fused_half32_direct_force_only(
+        positions,
+        active_schedule,
+        box,
+        half_sigma,
+        sqrt_epsilon,
+        charges,
+        cutoff=4.0,
+        shift=False,
+        switch_distance=None,
+        one_four_scale=0.5,
+        coulomb_constant=1389.35457644382,
+        alpha=0.35,
+        expected_generation=7,
+    )
+    mx.eval(matched)
+    assert np.all(np.isfinite(np.asarray(matched)))
+    with pytest.raises(ValueError, match="generation"):
+        _fused_half32_direct_force_only(
+            positions,
+            active_schedule,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            cutoff=4.0,
+            shift=False,
+            switch_distance=None,
+            one_four_scale=0.5,
+            coulomb_constant=1389.35457644382,
+            alpha=0.35,
+            expected_generation=8,
+        )
+
+
+@pytest.mark.gpu
+def test_device_schedule_generation_fingerprints_topology_changes():
+    """Generation metadata changes when canonical special topology changes."""
+
+    rng = np.random.default_rng(107)
+    positions = rng.uniform(0.0, 20.0, size=(257, 3)).astype(np.float32)
+    box = np.asarray([20.0, 21.0, 22.0], dtype=np.float32)
+    first = _try_build_device_fused_half_schedule32(
+        positions,
+        box,
+        search_radius=4.5,
+        capacity=None,
+        generation_value=11,
+        lj_exclusion_pairs=[[0, 1]],
+        lj_one_four_pairs=[[2, 3]],
+    )
+    first = _retry_device_fused_half_schedule32(first)
+    assert first.schedule is not None
+    changed = _try_build_device_fused_half_schedule32(
+        positions,
+        box,
+        search_radius=4.5,
+        capacity=first.recommended_capacity,
+        generation_value=12,
+        lj_exclusion_pairs=[[0, 1], [10, 20]],
+        lj_one_four_pairs=[[2, 3]],
+    )
+    if changed.overflow:
+        changed = _retry_device_fused_half_schedule32(changed)
+    assert changed.schedule is not None
+    assert first.schedule.generation is not None
+    assert changed.schedule.generation is not None
+    assert first.schedule.generation.value == 11
+    assert changed.schedule.generation.value == 12
+    assert (
+        first.schedule.generation.topology_digest
+        != changed.schedule.generation.topology_digest
+    )
+
+
+@pytest.mark.gpu
 def test_fused_half32_nbfix_force_matches_production_tiles():
     """Fused 32-atom work applies the production NBFIX type table."""
 
@@ -687,3 +878,136 @@ def test_fused_half32_nbfix_force_matches_production_tiles():
         rtol=2.0e-5,
         atol=2.0e-3,
     )
+
+
+@pytest.mark.gpu
+def test_interaction32_neighbor_backend_tracks_moving_nvt_control():
+    """The opt-in managed backend preserves a short moving PME trajectory."""
+
+    grid = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    )
+    positions_np = 1.5 + 1.35 * grid.reshape((-1, 3)).astype(np.float32)
+    atom_count = positions_np.shape[0]
+    velocities_np = np.linspace(
+        -0.02,
+        0.02,
+        atom_count * 3,
+        dtype=np.float32,
+    ).reshape((atom_count, 3))
+    cell = Cell.cubic(20.0)
+    cutoff = 4.0
+    skin = 0.5
+    exclusions = np.asarray([[0, 1], [31, 32]], dtype=np.int32)
+    one_four = np.asarray([[2, 5], [33, 37]], dtype=np.int32)
+    potential = NonbondedPotential(
+        sigma=np.linspace(0.9, 1.1, atom_count, dtype=np.float32),
+        epsilon=np.linspace(0.12, 0.28, atom_count, dtype=np.float32),
+        charges=np.linspace(-0.45, 0.45, atom_count, dtype=np.float32),
+        cutoff=cutoff,
+        electrostatics="pme",
+        pme_config=PMEConfig(
+            mesh_shape=(16, 16, 16),
+            alpha=0.35,
+            real_cutoff=cutoff,
+        ),
+        topology=Topology.from_sequences(
+            n_atoms=atom_count,
+            exclusions=exclusions,
+            one_four_pairs=one_four,
+            eager_nonbonded_pair_limit=0,
+        ),
+        lj_one_four_scale=0.5,
+        coulomb_one_four_scale=0.8,
+    ).bind_pme_plan(cell)
+    config = SimulationConfig(
+        dt=1.0e-4,
+        steps=3,
+        sample_interval=3,
+        diagnostic_interval=3,
+        pressure_diagnostics=False,
+    )
+    thermostat = LangevinThermostat(temperature=0.0, friction=0.0, seed=7)
+
+    def run(backend):
+        manager = NeighborListManager(
+            cell,
+            cutoff=cutoff,
+            skin=skin,
+            backend=backend,
+            displacement_check_backend="mlx_scalar",
+            interaction32_exclusion_pairs=potential._aligned_lj_exclusion_pairs,
+            interaction32_one_four_pairs=potential._aligned_lj_one_four_pairs,
+        )
+        result = simulate_nvt(
+            mx.array(positions_np),
+            mx.array(velocities_np),
+            cell=cell,
+            force_terms=potential,
+            neighbor_manager=manager,
+            config=config,
+            thermostat=thermostat,
+        )
+        mx.eval(result.final_state.positions, result.final_state.forces)
+        return result, manager
+
+    control, control_manager = run("mlx_cell_tiles")
+    observed, observed_manager = run("mlx_interaction32")
+
+    assert control_manager.rebuild_count == observed_manager.rebuild_count == 1
+    assert observed_manager.neighbor_list is not None
+    assert observed_manager.neighbor_list.interaction32 is not None
+    assert observed_manager.neighbor_list.interaction32.generation is not None
+    assert observed_manager.neighbor_list.interaction32.generation.value == 1
+    assert observed_manager.neighbor_list.diagnostic_pairs_materialized is False
+    assert observed_manager.neighbor_list._diagnostic_tiles is not None
+    assert observed_manager.neighbor_list.supports_async_force_submission is True
+    first_schedule = observed_manager.neighbor_list.interaction32
+    np.testing.assert_allclose(
+        np.asarray(observed.final_state.positions),
+        np.asarray(control.final_state.positions),
+        rtol=2.0e-5,
+        atol=2.0e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(observed.final_state.forces),
+        np.asarray(control.final_state.forces),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+
+    displaced = np.asarray(observed.final_state.positions).copy()
+    displaced[0, 0] += 0.26
+    rebuilt = observed_manager.update(mx.array(displaced))
+
+    assert observed_manager.rebuild_count == 2
+    assert rebuilt.interaction32 is not None
+    assert rebuilt.interaction32.generation is not None
+    assert rebuilt.interaction32.generation.value == 2
+    assert first_schedule.generation is not None
+    assert rebuilt.interaction32.generation.capacity.ordinary_tiles >= (
+        first_schedule.generation.capacity.ordinary_tiles
+    )
+    assert rebuilt.interaction32.generation.capacity.ordinary_groups >= (
+        first_schedule.generation.capacity.ordinary_groups
+    )
+    assert rebuilt.interaction32.generation.capacity.special_tiles >= (
+        first_schedule.generation.capacity.special_tiles
+    )
+
+    wrong_topology_manager = NeighborListManager(
+        cell,
+        cutoff=cutoff,
+        skin=skin,
+        backend="mlx_interaction32",
+        displacement_check_backend="mlx_scalar",
+    )
+    wrong_topology = wrong_topology_manager.update(mx.array(positions_np))
+    assert wrong_topology.interaction32 is not None
+    with pytest.raises(ValueError, match="topology does not match"):
+        potential._prepare_interaction32_force_binding(
+            cell,
+            None,
+            wrong_topology.interaction32,
+        )

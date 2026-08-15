@@ -2587,6 +2587,41 @@ def _neighbor_profile_values(neighbor_list: NeighborList | None) -> tuple[mx.arr
                     neighbor_list.tiles.force_group_counts,
                 )
             )
+    if neighbor_list.interaction32 is not None:
+        schedule = neighbor_list.interaction32
+        values.extend(
+            (
+                schedule.atom_order,
+                schedule.ordinary_left_blocks,
+                schedule.ordinary_right_atoms,
+                schedule.ordinary_half_modes,
+                schedule.ordinary_group_starts,
+                schedule.ordinary_group_counts,
+                schedule.special_work_left_blocks,
+                schedule.special_work_left_slices,
+                schedule.special_work_right_atoms,
+                schedule.special_work_lj_enabled,
+                schedule.special_work_lj_one_four,
+                schedule.special_work_diagonal,
+            )
+        )
+    if neighbor_list._diagnostic_tiles is not None:
+        tiles = neighbor_list._diagnostic_tiles
+        values.extend(
+            (
+                tiles.atom_blocks,
+                tiles.tile_blocks,
+                tiles.member_mask,
+            )
+        )
+        if tiles.force_columns is not None:
+            values.extend(
+                (
+                    tiles.force_columns,
+                    tiles.force_group_starts,
+                    tiles.force_group_counts,
+                )
+            )
     return tuple(values)
 
 
@@ -2799,7 +2834,7 @@ def _async_force_submission_enabled(
         and constraints is not None
         and prepared_force_pipeline is not None
         and neighbor_list is not None
-        and neighbor_list.tiles is not None
+        and neighbor_list.supports_async_force_submission
         and "gpu" in str(mx.default_device()).lower()
         and callable(getattr(mx, "async_eval", None))
     )
@@ -3150,10 +3185,10 @@ def simulate_nve(
         not config.pressure_diagnostics
         and force_binding is not None
         and force_binding.interactions is None
-        and neighbor_list.tiles is not None
+        and neighbor_list.supports_tile_diagnostics
         and _force_terms_support_tile_diagnostics(unnamed_terms)
     ):
-        pairs = neighbor_list.tiles
+        pairs = neighbor_list.diagnostic_force_candidates(prefer_tiles=True)
     else:
         pairs = neighbor_list.diagnostic_pairs
     pair_count = (
@@ -3702,10 +3737,10 @@ def _simulate_nvt(
         not config.pressure_diagnostics
         and force_binding is not None
         and force_binding.interactions is None
-        and neighbor_list.tiles is not None
+        and neighbor_list.supports_tile_diagnostics
         and _force_terms_support_tile_diagnostics(unnamed_terms)
     ):
-        pairs = neighbor_list.tiles
+        pairs = neighbor_list.diagnostic_force_candidates(prefer_tiles=True)
     else:
         pairs = neighbor_list.diagnostic_pairs
     pair_count = (
@@ -4514,10 +4549,10 @@ def _simulate_nvt(
             and not config.pressure_diagnostics
             and force_binding is not None
             and force_binding.interactions is None
-            and neighbor_list.tiles is not None
+            and neighbor_list.supports_tile_diagnostics
             and _force_terms_support_tile_diagnostics(unnamed_terms)
         ):
-            pairs = neighbor_list.tiles
+            pairs = neighbor_list.diagnostic_force_candidates(prefer_tiles=True)
         elif full_diagnostic_step or deferred_final or force_binding is None:
             pairs = neighbor_list.diagnostic_pairs
         else:
@@ -4623,7 +4658,7 @@ def _simulate_nvt(
             async_force_submission
             and force_binding is not None
             and neighbor_list is not None
-            and neighbor_list.tiles is not None
+            and neighbor_list.supports_async_force_submission
             and not full_diagnostic_step
             and not deferred_final
         ):

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
+from hashlib import sha256
+from math import ceil, isfinite
 
 import mlx.core as mx
 import numpy as np
@@ -25,6 +26,8 @@ from mlx_atomistic.metal_kernels import (
 
 _INTERACTION_TILE_SIZE = 32
 _DEFAULT_ORDINARY_TILES_PER_GROUP = 3
+_INTERACTION32_CAPACITY_RESERVE = 1.25
+_INTERACTION32_CAPACITY_QUANTUM = 64
 
 
 def _normalize_pairs(pairs: object, atom_count: int, name: str) -> np.ndarray:
@@ -334,6 +337,8 @@ class _DeviceBlockGeometry32:
     atom_count: int
     search_radius: float
     box_lengths: np.ndarray
+    cell_counts: tuple[int, int, int]
+    occupied_cell_count: mx.array
     atom_order: mx.array
     inverse_order: mx.array
     center_radius: mx.array
@@ -372,6 +377,8 @@ class _DeviceOrdinarySchedule32:
     logical_pair_lanes: int
     ordinary_tile_count: int
     ordinary_group_count: int
+    ordinary_tile_capacity: int
+    ordinary_group_capacity: int
     special_tile_count_inventory: int
     mode_entry_counts: mx.array
     ordinary_left_blocks: mx.array
@@ -387,6 +394,8 @@ class _DeviceSpecialSchedule32:
     padded_atom_count: int
     special_tile_count: int
     special_work_count: int
+    special_tile_capacity: int
+    special_work_capacity: int
     special_blocks: mx.array
     special_work_left_blocks: mx.array
     special_work_left_slices: mx.array
@@ -394,6 +403,61 @@ class _DeviceSpecialSchedule32:
     special_work_lj_enabled: mx.array
     special_work_lj_one_four: mx.array
     special_work_diagonal: mx.array
+
+
+@dataclass(frozen=True)
+class _DeviceScheduleInventory32:
+    positions: mx.array
+    geometry: _DeviceBlockGeometry32
+    special: _DeviceSpecialBlockInventory32
+    ordinary_tiles_per_group: int
+    occupied_cell_count: int
+    right_entry_count: int
+    logical_pair_lanes: int
+    ordinary_tile_count: int
+    ordinary_group_count: int
+    special_tile_count: int
+    mode_entry_counts: mx.array
+    mode_tile_counts: mx.array
+    mode_tile_prefix: mx.array
+    mode_group_counts: mx.array
+    mode_group_prefix: mx.array
+
+
+@dataclass(frozen=True)
+class _Interaction32ScheduleCapacity:
+    ordinary_tiles: int
+    ordinary_groups: int
+    special_tiles: int
+
+    @property
+    def special_work(self) -> int:
+        return 2 * self.special_tiles
+
+
+@dataclass(frozen=True)
+class _Interaction32Generation:
+    value: int
+    atom_count: int
+    box_lengths: tuple[float, float, float]
+    search_radius: float
+    topology_digest: str
+    capacity: _Interaction32ScheduleCapacity
+
+
+@dataclass(frozen=True)
+class _DeviceScheduleBuildAttempt32:
+    inventory: _DeviceScheduleInventory32
+    requested_capacity: _Interaction32ScheduleCapacity | None
+    recommended_capacity: _Interaction32ScheduleCapacity
+    overflow_fields: tuple[str, ...]
+    generation_value: int
+    topology_digest: str
+    schedule: _DeviceFusedHalfSchedule32 | None
+
+    @property
+    def overflow(self) -> bool:
+        return bool(self.overflow_fields)
 
 
 @dataclass(frozen=True)
@@ -466,6 +530,44 @@ class _DeviceFusedHalfSchedule32:
     special_work_lj_enabled: mx.array
     special_work_lj_one_four: mx.array
     special_work_diagonal: mx.array
+    generation: _Interaction32Generation | None = None
+
+    @property
+    def special_work_count(self) -> int:
+        """Return the number of scheduled special half-block work items."""
+
+        return int(self.special_work_left_blocks.shape[0])
+
+    @property
+    def estimated_bytes(self) -> int:
+        """Estimate resident schedule storage from its packed device arrays."""
+
+        if self.generation is not None:
+            capacity = self.generation.capacity
+            ordinary_tile_bytes = 4 + 32 * 4 + 4
+            ordinary_group_bytes = 2 * 4
+            special_work_bytes = 4 + 4 + 32 * 4 + 32 * 4 + 32 * 4 + 4
+            return (
+                self.padded_atom_count * 4
+                + capacity.ordinary_tiles * ordinary_tile_bytes
+                + capacity.ordinary_groups * ordinary_group_bytes
+                + capacity.special_work * special_work_bytes
+            )
+        arrays = (
+            self.atom_order,
+            self.ordinary_left_blocks,
+            self.ordinary_right_atoms,
+            self.ordinary_half_modes,
+            self.ordinary_group_starts,
+            self.ordinary_group_counts,
+            self.special_work_left_blocks,
+            self.special_work_left_slices,
+            self.special_work_right_atoms,
+            self.special_work_lj_enabled,
+            self.special_work_lj_one_four,
+            self.special_work_diagonal,
+        )
+        return sum(int(np.prod(array.shape, dtype=np.int64)) * 4 for array in arrays)
 
 
 @dataclass(frozen=True)
@@ -574,6 +676,10 @@ def _build_device_block_geometry32(
         cells[:, 1] + cell_counts_mx[1] * cells[:, 2]
     )
     atom_order = mx.argsort(keys).astype(mx.int32)
+    sorted_keys = keys[atom_order]
+    occupied_cell_count = (
+        1 + mx.sum((sorted_keys[1:] != sorted_keys[:-1]).astype(mx.int32))
+    ).astype(mx.int32)
     padded_atom_count = (
         (atom_count + _INTERACTION_TILE_SIZE - 1) // _INTERACTION_TILE_SIZE
     ) * _INTERACTION_TILE_SIZE
@@ -598,6 +704,8 @@ def _build_device_block_geometry32(
         atom_count=atom_count,
         search_radius=float(search_radius),
         box_lengths=box,
+        cell_counts=tuple(int(value) for value in cell_counts),
+        occupied_cell_count=occupied_cell_count,
         atom_order=atom_order,
         inverse_order=inverse_order,
         center_radius=center_radius,
@@ -667,14 +775,14 @@ def _build_device_special_block_inventory32(
     )
 
 
-def _build_device_ordinary_schedule32(
+def _count_device_schedule_inventory32(
     positions: object,
     geometry: _DeviceBlockGeometry32,
     special: _DeviceSpecialBlockInventory32,
     *,
     ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
-) -> _DeviceOrdinarySchedule32:
-    """Build compact ordinary half-mode rows from device block geometry."""
+) -> _DeviceScheduleInventory32:
+    """Count the logical ordinary and special schedule inventory on device."""
 
     if special.atom_count != geometry.atom_count or special.block_count != geometry.block_count:
         raise ValueError("special inventory must match the device block geometry")
@@ -715,6 +823,7 @@ def _build_device_ordinary_schedule32(
             mode_group_prefix[-1],
             logical_pair_lanes,
             special.special_count,
+            geometry.occupied_cell_count,
         )
     )
     mx.eval(inventory)
@@ -724,7 +833,46 @@ def _build_device_ordinary_schedule32(
         ordinary_group_count,
         logical_pair_lane_count,
         special_tile_count_inventory,
+        occupied_cell_count,
     ) = (int(value) for value in np.asarray(inventory))
+    return _DeviceScheduleInventory32(
+        positions=positions_mx,
+        geometry=geometry,
+        special=special,
+        ordinary_tiles_per_group=ordinary_tiles_per_group,
+        occupied_cell_count=occupied_cell_count,
+        right_entry_count=right_entry_count,
+        logical_pair_lanes=logical_pair_lane_count,
+        ordinary_tile_count=ordinary_tile_count,
+        ordinary_group_count=ordinary_group_count,
+        special_tile_count=special_tile_count_inventory,
+        mode_entry_counts=mode_entry_counts,
+        mode_tile_counts=mode_tile_counts,
+        mode_tile_prefix=mode_tile_prefix,
+        mode_group_counts=mode_group_counts,
+        mode_group_prefix=mode_group_prefix,
+    )
+
+
+def _materialize_device_ordinary_schedule32(
+    inventory: _DeviceScheduleInventory32,
+    *,
+    tile_capacity: int,
+    group_capacity: int,
+) -> _DeviceOrdinarySchedule32:
+    """Scatter ordinary schedule payload only after capacity admission."""
+
+    geometry = inventory.geometry
+    special = inventory.special
+    if tile_capacity < inventory.ordinary_tile_count:
+        raise ValueError("ordinary tile capacity is below the logical inventory")
+    if group_capacity < inventory.ordinary_group_count:
+        raise ValueError("ordinary group capacity is below the logical inventory")
+    positions_mx = inventory.positions
+    if positions_mx.shape != (geometry.atom_count, 3):
+        raise ValueError(f"positions must have shape ({geometry.atom_count}, 3)")
+    box_mx = mx.array(geometry.box_lengths, dtype=mx.float32)
+    box_lengths_and_inverses = mx.concatenate((box_mx, 1.0 / box_mx))
     ordinary_left_blocks, ordinary_right_atoms, ordinary_half_modes = (
         _interaction32_ordinary_scatter_sized(
             positions_mx,
@@ -733,36 +881,62 @@ def _build_device_ordinary_schedule32(
             geometry.half_extent,
             geometry.block_traversal,
             special.block_codes,
-            mode_tile_counts,
-            mode_tile_prefix,
+            inventory.mode_tile_counts,
+            inventory.mode_tile_prefix,
             box_lengths_and_inverses,
             search_radius=geometry.search_radius,
-            accepted_tile_count=ordinary_tile_count,
+            accepted_tile_count=tile_capacity,
         )
     )
     ordinary_group_starts, ordinary_group_counts = _neighbor_tile_force_groups_sized(
-        mode_tile_counts,
-        mode_tile_prefix,
-        mode_group_counts,
-        mode_group_prefix,
-        accepted_count=ordinary_group_count,
-        items_per_group=ordinary_tiles_per_group,
+        inventory.mode_tile_counts,
+        inventory.mode_tile_prefix,
+        inventory.mode_group_counts,
+        inventory.mode_group_prefix,
+        accepted_count=group_capacity,
+        items_per_group=inventory.ordinary_tiles_per_group,
     )
+    ordinary_tile_count = inventory.ordinary_tile_count
+    ordinary_group_count = inventory.ordinary_group_count
     return _DeviceOrdinarySchedule32(
         atom_count=geometry.atom_count,
         search_radius=geometry.search_radius,
         padded_atom_count=geometry.padded_atom_count,
-        right_entry_count=right_entry_count,
-        logical_pair_lanes=logical_pair_lane_count,
+        right_entry_count=inventory.right_entry_count,
+        logical_pair_lanes=inventory.logical_pair_lanes,
         ordinary_tile_count=ordinary_tile_count,
         ordinary_group_count=ordinary_group_count,
-        special_tile_count_inventory=special_tile_count_inventory,
-        mode_entry_counts=mode_entry_counts,
-        ordinary_left_blocks=ordinary_left_blocks,
-        ordinary_right_atoms=ordinary_right_atoms,
-        ordinary_half_modes=ordinary_half_modes,
-        ordinary_group_starts=ordinary_group_starts,
-        ordinary_group_counts=ordinary_group_counts,
+        ordinary_tile_capacity=tile_capacity,
+        ordinary_group_capacity=group_capacity,
+        special_tile_count_inventory=inventory.special_tile_count,
+        mode_entry_counts=inventory.mode_entry_counts,
+        ordinary_left_blocks=ordinary_left_blocks[:ordinary_tile_count],
+        ordinary_right_atoms=ordinary_right_atoms[:ordinary_tile_count],
+        ordinary_half_modes=ordinary_half_modes[:ordinary_tile_count],
+        ordinary_group_starts=ordinary_group_starts[:ordinary_group_count],
+        ordinary_group_counts=ordinary_group_counts[:ordinary_group_count],
+    )
+
+
+def _build_device_ordinary_schedule32(
+    positions: object,
+    geometry: _DeviceBlockGeometry32,
+    special: _DeviceSpecialBlockInventory32,
+    *,
+    ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+) -> _DeviceOrdinarySchedule32:
+    """Build an exact-sized ordinary schedule for research callers."""
+
+    inventory = _count_device_schedule_inventory32(
+        positions,
+        geometry,
+        special,
+        ordinary_tiles_per_group=ordinary_tiles_per_group,
+    )
+    return _materialize_device_ordinary_schedule32(
+        inventory,
+        tile_capacity=inventory.ordinary_tile_count,
+        group_capacity=inventory.ordinary_group_count,
     )
 
 
@@ -771,6 +945,7 @@ def _build_device_special_schedule32(
     special: _DeviceSpecialBlockInventory32,
     *,
     special_tile_count: int | None = None,
+    tile_capacity: int | None = None,
 ) -> _DeviceSpecialSchedule32:
     """Build compact special blocks and conservative two-half work on device."""
 
@@ -782,12 +957,17 @@ def _build_device_special_schedule32(
         special_tile_count = int(np.asarray(special.special_count))
     if not 0 <= special_tile_count <= special.block_count * special.block_count:
         raise ValueError("special tile count is incompatible with the block inventory")
+    if tile_capacity is None:
+        tile_capacity = special_tile_count
+    if tile_capacity < special_tile_count:
+        raise ValueError("special tile capacity is below the logical inventory")
     special_blocks = _interaction32_special_blocks_sized(
         special.block_codes,
         special.block_code_unique,
         special_prefix,
         block_count=geometry.block_count,
         special_count=special_tile_count,
+        block_capacity=tile_capacity,
     )
     (
         special_work_left_blocks,
@@ -798,23 +978,239 @@ def _build_device_special_schedule32(
         special_work_diagonal,
     ) = _interaction32_special_work_two_halves(
         geometry.atom_order,
-        special_blocks,
+        special_blocks[:special_tile_count],
         special.topology_offsets,
         special.topology_neighbors,
         special.topology_classes,
+        work_capacity=2 * tile_capacity,
     )
+    special_work_count = 2 * special_tile_count
     return _DeviceSpecialSchedule32(
         atom_count=geometry.atom_count,
         padded_atom_count=geometry.padded_atom_count,
         special_tile_count=special_tile_count,
-        special_work_count=2 * special_tile_count,
-        special_blocks=special_blocks,
-        special_work_left_blocks=special_work_left_blocks,
-        special_work_left_slices=special_work_left_slices,
-        special_work_right_atoms=special_work_right_atoms,
-        special_work_lj_enabled=special_work_lj_enabled,
-        special_work_lj_one_four=special_work_lj_one_four,
-        special_work_diagonal=special_work_diagonal,
+        special_work_count=special_work_count,
+        special_tile_capacity=tile_capacity,
+        special_work_capacity=2 * tile_capacity,
+        special_blocks=special_blocks[:special_tile_count],
+        special_work_left_blocks=special_work_left_blocks[:special_work_count],
+        special_work_left_slices=special_work_left_slices[:special_work_count],
+        special_work_right_atoms=special_work_right_atoms[:special_work_count],
+        special_work_lj_enabled=special_work_lj_enabled[:special_work_count],
+        special_work_lj_one_four=special_work_lj_one_four[:special_work_count],
+        special_work_diagonal=special_work_diagonal[:special_work_count],
+    )
+
+
+def _interaction32_reserved_capacity(logical_count: int) -> int:
+    """Round a logical count to the stable 25 percent reserve policy."""
+
+    if logical_count < 0:
+        raise ValueError("logical capacity count must be non-negative")
+    if logical_count == 0:
+        return 0
+    reserved = ceil(logical_count * _INTERACTION32_CAPACITY_RESERVE)
+    quantum = _INTERACTION32_CAPACITY_QUANTUM
+    return ((reserved + quantum - 1) // quantum) * quantum
+
+
+def _interaction32_capacity_for_inventory(
+    inventory: _DeviceScheduleInventory32,
+    current: _Interaction32ScheduleCapacity | None = None,
+) -> _Interaction32ScheduleCapacity:
+    """Return retained or grown capacity for one logical inventory."""
+
+    required = _Interaction32ScheduleCapacity(
+        ordinary_tiles=_interaction32_reserved_capacity(
+            inventory.ordinary_tile_count
+        ),
+        ordinary_groups=_interaction32_reserved_capacity(
+            inventory.ordinary_group_count
+        ),
+        special_tiles=_interaction32_reserved_capacity(
+            inventory.special_tile_count
+        ),
+    )
+    if current is None:
+        return required
+    return _Interaction32ScheduleCapacity(
+        ordinary_tiles=max(current.ordinary_tiles, required.ordinary_tiles),
+        ordinary_groups=max(current.ordinary_groups, required.ordinary_groups),
+        special_tiles=max(current.special_tiles, required.special_tiles),
+    )
+
+
+def _interaction32_capacity_overflow_fields(
+    inventory: _DeviceScheduleInventory32,
+    capacity: _Interaction32ScheduleCapacity | None,
+) -> tuple[str, ...]:
+    """Name every logical inventory that cannot fit the supplied capacity."""
+
+    if capacity is None:
+        return ("ordinary_tiles", "ordinary_groups", "special_tiles")
+    fields: list[str] = []
+    if inventory.ordinary_tile_count > capacity.ordinary_tiles:
+        fields.append("ordinary_tiles")
+    if inventory.ordinary_group_count > capacity.ordinary_groups:
+        fields.append("ordinary_groups")
+    if inventory.special_tile_count > capacity.special_tiles:
+        fields.append("special_tiles")
+    return tuple(fields)
+
+
+def _interaction32_topology_digest(
+    atom_count: int,
+    exclusions: np.ndarray,
+    one_four: np.ndarray,
+) -> str:
+    """Fingerprint canonical topology inputs for generation ownership."""
+
+    digest = sha256()
+    digest.update(np.asarray([atom_count], dtype="<i8").tobytes())
+    for label, pairs in ((b"exclusions", exclusions), (b"one_four", one_four)):
+        digest.update(label)
+        digest.update(np.asarray(pairs, dtype="<i4").tobytes())
+    return digest.hexdigest()
+
+
+def _materialize_device_schedule_attempt32(
+    inventory: _DeviceScheduleInventory32,
+    *,
+    capacity: _Interaction32ScheduleCapacity,
+    generation_value: int,
+    topology_digest: str,
+) -> _DeviceScheduleBuildAttempt32:
+    """Materialize one admitted generation after all capacity checks pass."""
+
+    overflow_fields = _interaction32_capacity_overflow_fields(inventory, capacity)
+    recommended = _interaction32_capacity_for_inventory(inventory, capacity)
+    if overflow_fields:
+        return _DeviceScheduleBuildAttempt32(
+            inventory=inventory,
+            requested_capacity=capacity,
+            recommended_capacity=recommended,
+            overflow_fields=overflow_fields,
+            generation_value=generation_value,
+            topology_digest=topology_digest,
+            schedule=None,
+        )
+    ordinary = _materialize_device_ordinary_schedule32(
+        inventory,
+        tile_capacity=capacity.ordinary_tiles,
+        group_capacity=capacity.ordinary_groups,
+    )
+    special = _build_device_special_schedule32(
+        inventory.geometry,
+        inventory.special,
+        special_tile_count=inventory.special_tile_count,
+        tile_capacity=capacity.special_tiles,
+    )
+    generation = _Interaction32Generation(
+        value=generation_value,
+        atom_count=inventory.geometry.atom_count,
+        box_lengths=tuple(float(value) for value in inventory.geometry.box_lengths),
+        search_radius=inventory.geometry.search_radius,
+        topology_digest=topology_digest,
+        capacity=capacity,
+    )
+    schedule = _assemble_device_fused_half_schedule32(
+        inventory.geometry,
+        ordinary,
+        special,
+        generation=generation,
+    )
+    return _DeviceScheduleBuildAttempt32(
+        inventory=inventory,
+        requested_capacity=capacity,
+        recommended_capacity=capacity,
+        overflow_fields=(),
+        generation_value=generation_value,
+        topology_digest=topology_digest,
+        schedule=schedule,
+    )
+
+
+def _try_build_device_fused_half_schedule32(
+    positions: object,
+    box_lengths: object,
+    *,
+    search_radius: float,
+    capacity: _Interaction32ScheduleCapacity | None,
+    generation_value: int,
+    lj_exclusion_pairs: object = (),
+    lj_one_four_pairs: object = (),
+    ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
+) -> _DeviceScheduleBuildAttempt32:
+    """Count one candidate generation and stop before scatter on overflow."""
+
+    if generation_value < 0:
+        raise ValueError("generation_value must be non-negative")
+    geometry = _build_device_block_geometry32(
+        positions,
+        box_lengths,
+        search_radius=search_radius,
+    )
+    exclusions = _normalize_pairs(
+        lj_exclusion_pairs,
+        geometry.atom_count,
+        "lj_exclusion_pairs",
+    )
+    one_four = _normalize_pairs(
+        lj_one_four_pairs,
+        geometry.atom_count,
+        "lj_one_four_pairs",
+    )
+    special = _build_device_special_block_inventory32(
+        geometry,
+        lj_exclusion_pairs=exclusions,
+        lj_one_four_pairs=one_four,
+    )
+    inventory = _count_device_schedule_inventory32(
+        positions,
+        geometry,
+        special,
+        ordinary_tiles_per_group=ordinary_tiles_per_group,
+    )
+    topology_digest = _interaction32_topology_digest(
+        geometry.atom_count,
+        exclusions,
+        one_four,
+    )
+    recommended = _interaction32_capacity_for_inventory(inventory, capacity)
+    overflow_fields = _interaction32_capacity_overflow_fields(inventory, capacity)
+    if overflow_fields:
+        return _DeviceScheduleBuildAttempt32(
+            inventory=inventory,
+            requested_capacity=capacity,
+            recommended_capacity=recommended,
+            overflow_fields=overflow_fields,
+            generation_value=generation_value,
+            topology_digest=topology_digest,
+            schedule=None,
+        )
+    return _materialize_device_schedule_attempt32(
+        inventory,
+        capacity=capacity,
+        generation_value=generation_value,
+        topology_digest=topology_digest,
+    )
+
+
+def _retry_device_fused_half_schedule32(
+    attempt: _DeviceScheduleBuildAttempt32,
+    *,
+    capacity: _Interaction32ScheduleCapacity | None = None,
+) -> _DeviceScheduleBuildAttempt32:
+    """Retry an overflowed inventory without repeating spatial search."""
+
+    if not attempt.overflow or attempt.schedule is not None:
+        raise ValueError("only an overflowed build attempt can be retried")
+    selected = attempt.recommended_capacity if capacity is None else capacity
+    return _materialize_device_schedule_attempt32(
+        attempt.inventory,
+        capacity=selected,
+        generation_value=attempt.generation_value,
+        topology_digest=attempt.topology_digest,
     )
 
 
@@ -822,6 +1218,8 @@ def _assemble_device_fused_half_schedule32(
     geometry: _DeviceBlockGeometry32,
     ordinary: _DeviceOrdinarySchedule32,
     special: _DeviceSpecialSchedule32,
+    *,
+    generation: _Interaction32Generation | None = None,
 ) -> _DeviceFusedHalfSchedule32:
     """Assemble matching device-built ordinary and special schedule sections."""
 
@@ -852,6 +1250,7 @@ def _assemble_device_fused_half_schedule32(
         special_work_lj_enabled=special.special_work_lj_enabled,
         special_work_lj_one_four=special.special_work_lj_one_four,
         special_work_diagonal=special.special_work_diagonal,
+        generation=generation,
     )
 
 
@@ -1360,10 +1759,16 @@ def _fused_half32_direct_force_only(
     nbfix_type_sigma: mx.array | None = None,
     nbfix_type_epsilon: mx.array | None = None,
     nbfix_type_count: int = 0,
+    expected_generation: int | None = None,
     _simdgroups_per_threadgroup: int = 4,
 ) -> mx.array:
     if isinstance(schedule, _FusedHalfSchedule32):
         schedule = _fused_half_schedule_to_device32(schedule)
+    if expected_generation is not None and (
+        schedule.generation is None
+        or schedule.generation.value != expected_generation
+    ):
+        raise ValueError("interaction schedule generation does not match the force binding")
     positions = as_mx_array(positions, dtype=mx.float32)
     if positions.shape != (schedule.atom_count, 3):
         raise ValueError(f"positions must have shape ({schedule.atom_count}, 3) for the schedule")

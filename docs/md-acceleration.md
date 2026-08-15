@@ -42,6 +42,7 @@ work.
 | `mlx_cell_pairs` | general large orthorhombic systems | device-built exact pairs |
 | `mlx_cell_blocks` | fixed-shape compatibility and diagnostics | padded blocks |
 | `mlx_cell_tiles` | measured Metal PME route | exact masked 4-by-4 force tiles |
+| `mlx_interaction32` | opt-in PME performance candidate | retained device-built 32-atom schedule |
 
 The general `auto` policy selects dense pairs below its atom limit and cell
 pairs above it. Performance runners select `mlx_cell_tiles` explicitly only
@@ -114,17 +115,18 @@ closed in the decision ledger.
 
 ## Current Evidence
 
-The latest clean, position-balanced 750-step comparison at commit `8899994`
-measured:
+The latest clean, position-balanced 750-step comparison on 2026-08-15 measured
+the opt-in `mlx_interaction32` backend against the default production tiles:
 
 | Workload | Atoms | Control | Current | Result |
 | --- | ---: | ---: | ---: | ---: |
-| 5DFR | 23,558 | 1.0881 ms/step | 1.0910 ms/step | 0.26% noise; no material regression |
-| JAC 4-cell | 94,232 | 3.3983 ms/step | 3.2597 ms/step | 4.08% faster |
-| GPCRmd 729 | 92,001 | 3.9123 ms/step | 3.8200 ms/step | 2.36% faster |
+| 5DFR | 23,558 | 1.7496 ms/step | 1.5992 ms/step | 8.60% faster |
+| JAC 4-cell | 94,232 | 6.8322 ms/step | 5.9439 ms/step | 13.00% faster |
+| GPCRmd 729 | 92,001 | 7.8329 ms/step | 7.4761 ms/step | 4.56% faster |
 
-This comparison isolates the adaptive left-grouped scatter. It is not a
-same-date OpenMM ratio. Reference-engine comparisons must use a matched
+The comparison used two processes per arm, ten warmup steps, Low Power Mode,
+and a balanced control/candidate/candidate/control order. It is not a same-date
+OpenMM ratio. Reference-engine comparisons must use a matched
 manifest, platform, precision, protocol, power state, and measurement window.
 
 The canonical local performance gate is documented in
@@ -148,18 +150,23 @@ evidence remains in the JAC, GPCRmd, and same-workload reports indexed from the
 
 ## Current Bottleneck Direction
 
-Large-system profiles consistently identify Direct Space and the Neighbor
-generation lifecycle as the shared costs. GPCRmd additionally exposes CHARMM
-bonded work. The next performance candidates should therefore change one of
-these structural boundaries:
+The 32-atom Direct Space route now wins complete trajectories, while its
+Neighbor generation is still slower than production tiles. The next shared
+target is therefore the Interaction32 builder itself, especially the repeated
+ordinary traversal and GPCRmd topology-bearing special inventory. Work should
+proceed in this order:
 
-1. reduce host admission or allocation boundaries without hiding correctness
-   checks;
-2. improve device locality shared by Direct Space and PME;
-3. reduce global force accumulation while preserving a cross-system win.
+1. attribute count, prefix, scatter, topology, and completion costs without
+   changing the clean execution path;
+2. reduce repeated geometric work or temporary allocation while preserving the
+   capacity and generation contract;
+3. consider a native MLX primitive only if the single scalar inventory boundary
+   is measured as material;
+4. return to constraints and CHARMM bonded work after the builder is no longer
+   the candidate's largest regression against production.
 
-The experimental 32-atom engine is not the production route. Sustained
-force-only blocks now pass on 5DFR, JAC, and NBFIX-bearing GPCRmd, reopening its
-device-builder gate. Its next required result is a device-built schedule with
-an end-to-end trajectory win, not another host-built kernel microbenchmark. See
+The experimental 32-atom engine is not the default production route. Its
+device-built schedule now passes the initial 5DFR, JAC, and NBFIX-bearing
+GPCRmd end-to-end gate. It remains opt-in while builder optimization and broader
+stability coverage continue. See
 [`metal-interaction-engine.md`](./metal-interaction-engine.md).

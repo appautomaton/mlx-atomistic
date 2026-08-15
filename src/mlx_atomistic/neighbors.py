@@ -21,6 +21,12 @@ from mlx_atomistic.cell_list import (
     estimate_pair_list_bytes,
 )
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.interaction_engine import (
+    _DeviceFusedHalfSchedule32,
+    _Interaction32ScheduleCapacity,
+    _retry_device_fused_half_schedule32,
+    _try_build_device_fused_half_schedule32,
+)
 from mlx_atomistic.metal_kernels import (
     _TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK,
     _TILE_PME_COLUMN_DESCRIPTOR_MEMBER_DIVISOR,
@@ -47,6 +53,7 @@ NeighborBackend = Literal[
     "mlx_cell_pairs",
     "mlx_cell_blocks",
     "mlx_cell_tiles",
+    "mlx_interaction32",
 ]
 NeighborCheckBackend = Literal["numpy", "mlx_scalar"]
 _ALLOWED_NEIGHBOR_BACKENDS = {
@@ -56,6 +63,7 @@ _ALLOWED_NEIGHBOR_BACKENDS = {
     "mlx_cell_pairs",
     "mlx_cell_blocks",
     "mlx_cell_tiles",
+    "mlx_interaction32",
 }
 _ALLOWED_NEIGHBOR_CHECK_BACKENDS = {"numpy", "mlx_scalar"}
 DEFAULT_MLX_DENSE_PAIR_LIMIT = 4096
@@ -615,6 +623,10 @@ class NeighborList:
     stats: PairListStats | None = None
     blocks: NeighborBlocks | None = None
     tiles: NeighborTiles | None = None
+    interaction32: _DeviceFusedHalfSchedule32 | None = None
+    _reference_positions: mx.array | None = field(default=None, repr=False, compare=False)
+    _cell: Cell | None = field(default=None, repr=False, compare=False)
+    _diagnostic_tiles: NeighborTiles | None = field(default=None, repr=False, compare=False)
     _sort_diagnostic_pairs: bool = field(default=False, repr=False, compare=False)
 
     def __init__(
@@ -625,8 +637,11 @@ class NeighborList:
         stats: PairListStats | None = None,
         blocks: NeighborBlocks | None = None,
         tiles: NeighborTiles | None = None,
+        interaction32: _DeviceFusedHalfSchedule32 | None = None,
         *,
         sort_diagnostic_pairs: bool = False,
+        reference_positions: mx.array | None = None,
+        cell: Cell | None = None,
     ) -> None:
         object.__setattr__(self, "_pairs", pairs)
         object.__setattr__(self, "cutoff", cutoff)
@@ -634,15 +649,27 @@ class NeighborList:
         object.__setattr__(self, "stats", stats)
         object.__setattr__(self, "blocks", blocks)
         object.__setattr__(self, "tiles", tiles)
+        object.__setattr__(self, "interaction32", interaction32)
+        object.__setattr__(self, "_reference_positions", reference_positions)
+        object.__setattr__(self, "_cell", cell)
+        object.__setattr__(self, "_diagnostic_tiles", None)
         object.__setattr__(self, "_sort_diagnostic_pairs", sort_diagnostic_pairs)
         self.__post_init__()
 
     def __post_init__(self) -> None:
-        if self.blocks is not None and self.tiles is not None:
-            msg = "a neighbor list may contain blocks or tiles, not both"
+        representations = sum(
+            value is not None for value in (self.blocks, self.tiles, self.interaction32)
+        )
+        if representations > 1:
+            msg = "a neighbor list may contain only one structured representation"
             raise ValueError(msg)
-        if self._pairs is None and self.tiles is None:
-            msg = "pairs may be deferred only when exact tiles are present"
+        if self._pairs is None and self.tiles is None and self.interaction32 is None:
+            msg = "pairs may be deferred only when a structured representation is present"
+            raise ValueError(msg)
+        if self.interaction32 is not None and (
+            self._reference_positions is None or self._cell is None
+        ):
+            msg = "Interaction32 diagnostics require reference positions and a cell"
             raise ValueError(msg)
         if self._pairs is not None and (self._pairs.ndim != 2 or self._pairs.shape[1] != 2):
             msg = "pairs must have shape (n_pairs, 2)"
@@ -675,6 +702,8 @@ class NeighborList:
             return self.blocks.candidate_count
         if self.tiles is not None:
             return self.tiles.exact_pair_count
+        if self.interaction32 is not None:
+            return int(self.stats.pair_count) if self.stats is not None else 0
         return self._pairs.shape[0]
 
     @property
@@ -683,6 +712,12 @@ class NeighborList:
 
         if self.tiles is not None:
             return self.tiles.exact_pair_count
+        if self.interaction32 is not None:
+            if self._pairs is not None:
+                return int(self._pairs.shape[0])
+            if self._diagnostic_tiles is not None:
+                return self._diagnostic_tiles.exact_pair_count
+            return 0
         return int(self._pairs.shape[0])
 
     @property
@@ -703,18 +738,75 @@ class NeighborList:
 
         pairs = self._pairs
         if pairs is None:
-            if self.tiles is None:
-                msg = "deferred diagnostic pairs require exact tiles"
+            if self.tiles is None and self.interaction32 is None:
+                msg = "deferred diagnostic pairs require a structured representation"
                 raise RuntimeError(msg)
-            pairs = self.tiles.materialize_pairs(sort=self._sort_diagnostic_pairs)
+            if self.tiles is not None:
+                pairs = self.tiles.materialize_pairs(sort=self._sort_diagnostic_pairs)
+            else:
+                pairs = self._materialize_interaction32_diagnostic_tiles().materialize_pairs(
+                    sort=self._sort_diagnostic_pairs
+                )
             object.__setattr__(self, "_pairs", pairs)
         return pairs
+
+    @property
+    def supports_tile_diagnostics(self) -> bool:
+        """Whether exact diagnostic tiles are resident or can be built lazily."""
+
+        return self.tiles is not None or self.interaction32 is not None
+
+    @property
+    def supports_async_force_submission(self) -> bool:
+        """Whether the active structured force route supports asynchronous submission."""
+
+        return self.tiles is not None or self.interaction32 is not None
+
+    def diagnostic_force_candidates(
+        self,
+        *,
+        prefer_tiles: bool,
+    ) -> mx.array | NeighborTiles:
+        """Return an exact diagnostic representation for this generation."""
+
+        if prefer_tiles:
+            if self.tiles is not None:
+                return self.tiles
+            if self.interaction32 is not None:
+                return self._materialize_interaction32_diagnostic_tiles()
+        return self.diagnostic_pairs
+
+    def _materialize_interaction32_diagnostic_tiles(self) -> NeighborTiles:
+        """Build exact tiles only when an Interaction32 generation needs diagnostics."""
+
+        tiles = self._diagnostic_tiles
+        if tiles is not None:
+            return tiles
+        if self.interaction32 is None or self._reference_positions is None or self._cell is None:
+            msg = "Interaction32 diagnostic tiles require a complete generation context"
+            raise RuntimeError(msg)
+        generation = self.interaction32.generation
+        diagnostics = build_neighbor_list(
+            self._reference_positions,
+            self._cell,
+            cutoff=self.cutoff,
+            skin=self.skin,
+            sort_pairs=self._sort_diagnostic_pairs,
+            backend="mlx_cell_tiles",
+            generation=0 if generation is None else generation.value,
+        )
+        tiles = diagnostics.tiles
+        if tiles is None:
+            msg = "Interaction32 diagnostics did not produce exact tiles"
+            raise RuntimeError(msg)
+        object.__setattr__(self, "_diagnostic_tiles", tiles)
+        return tiles
 
     def force_candidates(
         self,
         *,
         prefer_tiles: bool,
-    ) -> mx.array | NeighborTiles:
+    ) -> mx.array | NeighborTiles | _DeviceFusedHalfSchedule32:
         """Select compact pairs or exact tiles for force binding.
 
         Args:
@@ -727,6 +819,8 @@ class NeighborList:
 
         if prefer_tiles and self.tiles is not None:
             return self.tiles
+        if prefer_tiles and self.interaction32 is not None:
+            return self.interaction32
         return self.diagnostic_pairs
 
     @property
@@ -736,6 +830,8 @@ class NeighborList:
         # Keep the compatibility surface pair-oriented for exact tiles until a
         # production tile force route is selected explicitly.
         if self.tiles is not None:
+            return self.diagnostic_pairs
+        if self.interaction32 is not None:
             return self.diagnostic_pairs
         return self.blocks if self.blocks is not None else self.diagnostic_pairs
 
@@ -758,6 +854,17 @@ class NeighborList:
                 0 if self._pairs is None else estimate_pair_list_bytes(self.compact_pair_count)
             )
             return self.tiles.estimated_bytes + diagnostic_bytes
+        if self.interaction32 is not None:
+            diagnostic_bytes = (
+                (
+                    0
+                    if self._diagnostic_tiles is None
+                    else self._diagnostic_tiles.estimated_bytes
+                )
+                if self._pairs is None
+                else estimate_pair_list_bytes(int(self._pairs.shape[0]))
+            )
+            return self.interaction32.estimated_bytes + diagnostic_bytes
         if self.stats is None:
             return int(self.pair_count) * 2 * np.dtype(np.int32).itemsize
         return self.stats.estimated_pair_bytes
@@ -808,7 +915,7 @@ class NeighborList:
     def estimated_compact_pair_bytes(self) -> int:
         """Estimated bytes for compact int32 pairs accepted by the search radius."""
 
-        if self.tiles is not None and self._pairs is None:
+        if (self.tiles is not None or self.interaction32 is not None) and self._pairs is None:
             return 0
         return estimate_pair_list_bytes(self.compact_pair_count)
 
@@ -846,6 +953,9 @@ class NeighborListManager:
     max_mlx_dense_atoms: int = DEFAULT_MLX_DENSE_PAIR_LIMIT
     block_size: int = DEFAULT_MLX_CELL_BLOCK_SIZE
     displacement_check_backend: NeighborCheckBackend = "numpy"
+    interaction32_exclusion_pairs: object = ()
+    interaction32_one_four_pairs: object = ()
+    interaction32_ordinary_tiles_per_group: int = 3
     neighbor_list: NeighborList | None = None
     reference_positions: mx.array | None = None
     rebuild_count: int = 0
@@ -855,6 +965,12 @@ class NeighborListManager:
     update_wall_seconds: float = 0.0
     _cache_clear_pending: bool = field(
         default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction32_capacity: _Interaction32ScheduleCapacity | None = field(
+        default=None,
         init=False,
         repr=False,
         compare=False,
@@ -873,6 +989,9 @@ class NeighborListManager:
             raise ValueError(msg)
         if self.block_size <= 0:
             msg = "block_size must be positive"
+            raise ValueError(msg)
+        if self.interaction32_ordinary_tiles_per_group <= 0:
+            msg = "interaction32_ordinary_tiles_per_group must be positive"
             raise ValueError(msg)
 
     @property
@@ -977,17 +1096,21 @@ class NeighborListManager:
 
         self._release_pending_metal_cache()
         start = perf_counter()
-        neighbor_list = build_neighbor_list(
-            positions,
-            self.cell,
-            cutoff=self.cutoff,
-            skin=self.skin,
-            sort_pairs=self.sort_pairs,
-            max_workers=self.max_workers,
-            backend=self.backend,
-            max_mlx_dense_atoms=self.max_mlx_dense_atoms,
-            block_size=self.block_size,
-            generation=self.rebuild_count + 1,
+        neighbor_list = (
+            self._build_interaction32_neighbor_list(positions)
+            if self.backend == "mlx_interaction32"
+            else build_neighbor_list(
+                positions,
+                self.cell,
+                cutoff=self.cutoff,
+                skin=self.skin,
+                sort_pairs=self.sort_pairs,
+                max_workers=self.max_workers,
+                backend=self.backend,
+                max_mlx_dense_atoms=self.max_mlx_dense_atoms,
+                block_size=self.block_size,
+                generation=self.rebuild_count + 1,
+            )
         )
         self.neighbor_list = neighbor_list
         self.rebuild_wall_seconds += perf_counter() - start
@@ -998,8 +1121,90 @@ class NeighborListManager:
         self._cache_clear_pending = self.neighbor_list.compaction_backend in {
             "metal_spatial_prefix_scan",
             "metal_spatial_tile_prefix_scan",
+            "metal_interaction32_device_builder",
         }
         return self.neighbor_list
+
+    def _build_interaction32_neighbor_list(self, positions) -> NeighborList:
+        """Build one retained-capacity Interaction32 neighbor generation."""
+
+        if not _uses_metal_device():
+            msg = "mlx_interaction32 requires the Metal device"
+            raise ValueError(msg)
+        if not self.cell.is_orthorhombic:
+            msg = "mlx_interaction32 requires an orthorhombic periodic cell"
+            raise ValueError(msg)
+        positions_mx = as_mx_array(positions, dtype=mx.float32)
+        box_lengths = np.asarray(np.diag(np.asarray(self.cell.matrix)), dtype=np.float32)
+        search_radius = self.cutoff + self.skin
+        generation = self.rebuild_count + 1
+        attempt = _try_build_device_fused_half_schedule32(
+            positions_mx,
+            box_lengths,
+            search_radius=search_radius,
+            capacity=self._interaction32_capacity,
+            generation_value=generation,
+            lj_exclusion_pairs=self.interaction32_exclusion_pairs,
+            lj_one_four_pairs=self.interaction32_one_four_pairs,
+            ordinary_tiles_per_group=self.interaction32_ordinary_tiles_per_group,
+        )
+        if attempt.overflow:
+            attempt = _retry_device_fused_half_schedule32(attempt)
+        schedule = attempt.schedule
+        if schedule is None or schedule.generation is None:
+            msg = "Interaction32 schedule build did not commit a generation"
+            raise RuntimeError(msg)
+        arrays = (
+            schedule.atom_order,
+            schedule.ordinary_left_blocks,
+            schedule.ordinary_right_atoms,
+            schedule.ordinary_half_modes,
+            schedule.ordinary_group_starts,
+            schedule.ordinary_group_counts,
+            schedule.special_work_left_blocks,
+            schedule.special_work_left_slices,
+            schedule.special_work_right_atoms,
+            schedule.special_work_lj_enabled,
+            schedule.special_work_lj_one_four,
+            schedule.special_work_diagonal,
+        )
+        mx.eval(*arrays)
+        self._interaction32_capacity = schedule.generation.capacity
+        inventory = attempt.inventory
+        scheduled_pair_lanes = (
+            inventory.logical_pair_lanes
+            + schedule.special_work_count * 16 * 32
+        )
+        cell_counts = inventory.geometry.cell_counts
+        cell_count = int(np.prod(np.asarray(cell_counts), dtype=np.int64))
+        stats = PairListStats(
+            pair_count=scheduled_pair_lanes,
+            n_cells=cell_counts,
+            cell_count=cell_count,
+            occupied_cell_count=inventory.occupied_cell_count,
+            search_radius=search_radius,
+            estimated_pair_bytes=schedule.estimated_bytes,
+            estimated_cell_list_bytes=(
+                positions_mx.shape[0] * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
+                + cell_count * 2 * _INT_BYTES
+            ),
+            backend="mlx_interaction32",
+            representation_kind="interaction32",
+            candidate_count=scheduled_pair_lanes,
+            estimated_candidate_bytes=schedule.estimated_bytes,
+            compaction_backend="metal_interaction32_device_builder",
+            fallback_reason=None,
+        )
+        return NeighborList(
+            None,
+            cutoff=self.cutoff,
+            skin=self.skin,
+            stats=stats,
+            interaction32=schedule,
+            sort_diagnostic_pairs=self.sort_pairs,
+            reference_positions=positions_mx,
+            cell=self.cell,
+        )
 
     def update(self, positions) -> NeighborList:
         """Return a current neighbor list, rebuilding if needed."""
@@ -1089,10 +1294,16 @@ class NeighborListManager:
             max_mlx_dense_atoms=self.max_mlx_dense_atoms,
             block_size=self.block_size,
             displacement_check_backend=self.displacement_check_backend,
+            interaction32_exclusion_pairs=self.interaction32_exclusion_pairs,
+            interaction32_one_four_pairs=self.interaction32_one_four_pairs,
+            interaction32_ordinary_tiles_per_group=(
+                self.interaction32_ordinary_tiles_per_group
+            ),
             rebuild_count=self.rebuild_count,
             rebuild_wall_seconds=self.rebuild_wall_seconds,
             update_wall_seconds=self.update_wall_seconds,
         )
+        candidate._interaction32_capacity = self._interaction32_capacity
         candidate.rebuild(positions)
         return candidate
 
@@ -1120,6 +1331,7 @@ class NeighborListManager:
             "max_mlx_dense_atoms",
             "block_size",
             "displacement_check_backend",
+            "interaction32_ordinary_tiles_per_group",
         )
         mismatches = tuple(
             name for name in policy if getattr(self, name) != getattr(candidate, name)
@@ -1139,6 +1351,7 @@ class NeighborListManager:
         self.rebuild_wall_seconds = candidate.rebuild_wall_seconds
         self.update_wall_seconds = candidate.update_wall_seconds
         self._cache_clear_pending = candidate._cache_clear_pending
+        self._interaction32_capacity = candidate._interaction32_capacity
 
 
 def build_neighbor_list(
@@ -1220,6 +1433,12 @@ def build_neighbor_list(
             sort_pairs=sort_pairs,
             generation=generation,
         )
+    if backend == "mlx_interaction32":
+        msg = (
+            "mlx_interaction32 requires NeighborListManager so topology and retained "
+            "capacity remain generation-owned"
+        )
+        raise ValueError(msg)
 
     positions_np = np.asarray(positions_mx, dtype=np.float32)
     if not np.all(np.isfinite(positions_np)):

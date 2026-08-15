@@ -64,6 +64,20 @@ uv run python -m mlx_atomistic.benchmarks.md_suite compare \
   --out results/md-suite/comparison.json
 ```
 
+Evaluate the opt-in 32-atom backend without changing the committed production
+case contracts:
+
+```bash
+uv run python -m mlx_atomistic.benchmarks.md_suite run \
+  --suite local \
+  --neighbor-backend mlx_interaction32 \
+  --repeats 3 \
+  --rehearsal-steps 75 \
+  --warmup-steps 10 \
+  --measured-steps 750 \
+  --out results/md-suite/interaction32.json
+```
+
 Build a whole-step performance map before choosing an optimization target:
 
 ```bash
@@ -111,8 +125,10 @@ The committed registry also defines:
 The neighbor backend is part of each case contract. All release PME cases use
 `mlx_cell_tiles`. GPCRmd selects the NBFIX-aware tile specialization, which
 looks up its CHARMM type-pair overrides without materializing compact pairs.
-`--neighbor-backend` is an explicit diagnostic override and changes comparison
-semantics.
+`mlx_interaction32` is an opt-in device-built 32-atom force schedule. It retains
+capacity across Neighbor generations and creates production tiles lazily only
+at energy or virial diagnostic boundaries. `--neighbor-backend` is an explicit
+diagnostic override and changes comparison semantics.
 
 Generate the deterministic water artifacts without a reference engine:
 

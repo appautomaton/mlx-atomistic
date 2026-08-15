@@ -18,11 +18,6 @@ from mlx_atomistic.artifacts import (
 )
 from mlx_atomistic.benchmarks.charged_pme import _bind_pme_plans, _find_pme_term
 from mlx_atomistic.interaction_engine import (
-    _assemble_device_fused_half_schedule32,
-    _build_device_block_geometry32,
-    _build_device_ordinary_schedule32,
-    _build_device_special_block_inventory32,
-    _build_device_special_schedule32,
     _build_interaction_schedule32,
     _build_owner_compute_schedule32,
     _fuse_interaction_halves32,
@@ -31,7 +26,9 @@ from mlx_atomistic.interaction_engine import (
     _interaction32_direct_force_only,
     _owner_compute32_direct_force_only,
     _owner_schedule_to_device32,
+    _retry_device_fused_half_schedule32,
     _schedule_to_device32,
+    _try_build_device_fused_half_schedule32,
 )
 from mlx_atomistic.neighbors import _MLX_MD_CACHE_LIMIT_BYTES, NeighborListManager
 
@@ -208,6 +205,7 @@ def benchmark(
     canonical_records: bool,
     simdgroups_per_threadgroup: int,
     left_slice_size: int,
+    builder_rebuild_samples: int = 3,
 ) -> dict[str, object]:
     _activate_metal()
     artifact = load_prepared_mlx_artifact(prepared, require_production=True)
@@ -381,64 +379,99 @@ def benchmark(
             "oracle_build_seconds": schedule_build_seconds,
         }
     elif architecture == "device_fused_half32":
-        geometry = _build_device_block_geometry32(
+        if builder_rebuild_samples < 1:
+            raise ValueError("builder_rebuild_samples must be positive")
+
+        def evaluate_schedule_payload(schedule) -> None:
+            mx.eval(
+                schedule.atom_order,
+                schedule.ordinary_left_blocks,
+                schedule.ordinary_right_atoms,
+                schedule.ordinary_half_modes,
+                schedule.ordinary_group_starts,
+                schedule.ordinary_group_counts,
+                schedule.special_work_left_blocks,
+                schedule.special_work_left_slices,
+                schedule.special_work_right_atoms,
+                schedule.special_work_lj_enabled,
+                schedule.special_work_lj_one_four,
+                schedule.special_work_diagonal,
+            )
+
+        attempt = _try_build_device_fused_half_schedule32(
             system.positions,
             box_lengths,
             search_radius=cutoff + skin,
-        )
-        special_inventory = _build_device_special_block_inventory32(
-            geometry,
+            capacity=None,
+            generation_value=1,
             lj_exclusion_pairs=exclusion_pairs,
             lj_one_four_pairs=one_four_pairs,
-        )
-        ordinary_schedule = _build_device_ordinary_schedule32(
-            system.positions,
-            geometry,
-            special_inventory,
             ordinary_tiles_per_group=ordinary_tiles_per_group,
         )
-        special_schedule = _build_device_special_schedule32(
-            geometry,
-            special_inventory,
-            special_tile_count=ordinary_schedule.special_tile_count_inventory,
-        )
-        device_schedule = _assemble_device_fused_half_schedule32(
-            geometry,
-            ordinary_schedule,
-            special_schedule,
-        )
-        mx.eval(
-            device_schedule.atom_order,
-            device_schedule.ordinary_left_blocks,
-            device_schedule.ordinary_right_atoms,
-            device_schedule.ordinary_half_modes,
-            device_schedule.ordinary_group_starts,
-            device_schedule.ordinary_group_counts,
-            device_schedule.special_work_left_blocks,
-            device_schedule.special_work_left_slices,
-            device_schedule.special_work_right_atoms,
-            device_schedule.special_work_lj_enabled,
-            device_schedule.special_work_lj_one_four,
-            device_schedule.special_work_diagonal,
-        )
+        if not attempt.overflow or attempt.schedule is not None:
+            raise RuntimeError("initial lifecycle probe must request reserved capacity")
+        attempt = _retry_device_fused_half_schedule32(attempt)
+        if attempt.overflow or attempt.schedule is None:
+            raise RuntimeError("reserved lifecycle retry did not produce a schedule")
+        device_schedule = attempt.schedule
+        inventory = attempt.inventory
+        capacity = attempt.recommended_capacity
+        evaluate_schedule_payload(device_schedule)
         schedule_build_seconds = time.perf_counter() - schedule_started
         schedule = device_schedule
+        retained_rebuild_seconds = []
+        for sample in range(builder_rebuild_samples):
+            rebuild_started = time.perf_counter()
+            rebuilt = _try_build_device_fused_half_schedule32(
+                system.positions,
+                box_lengths,
+                search_radius=cutoff + skin,
+                capacity=capacity,
+                generation_value=sample + 2,
+                lj_exclusion_pairs=exclusion_pairs,
+                lj_one_four_pairs=one_four_pairs,
+                ordinary_tiles_per_group=ordinary_tiles_per_group,
+            )
+            if rebuilt.overflow or rebuilt.schedule is None:
+                raise RuntimeError("retained device capacity overflowed unchanged positions")
+            evaluate_schedule_payload(rebuilt.schedule)
+            retained_rebuild_seconds.append(time.perf_counter() - rebuild_started)
+        reserved_schedule_bytes = (
+            capacity.ordinary_tiles * (4 + 32 * 4 + 4)
+            + capacity.ordinary_groups * (2 * 4)
+            + capacity.special_tiles * (2 * 4)
+            + capacity.special_work * (4 + 4 + 32 * 4 + 32 * 4 + 32 * 4 + 4)
+        )
         candidate_inventory = {
-            "block_count": geometry.block_count,
-            "ordinary_tile_count": ordinary_schedule.ordinary_tile_count,
-            "ordinary_group_count": ordinary_schedule.ordinary_group_count,
+            "block_count": inventory.geometry.block_count,
+            "ordinary_tile_count": inventory.ordinary_tile_count,
+            "ordinary_group_count": inventory.ordinary_group_count,
             "ordinary_tiles_per_group_limit": ordinary_tiles_per_group,
-            "ordinary_right_atom_entries": ordinary_schedule.right_entry_count,
-            "ordinary_logical_pair_lanes": ordinary_schedule.logical_pair_lanes,
-            "special_tile_count": special_schedule.special_tile_count,
-            "special_work_count": special_schedule.special_work_count,
-            "sparse_special_code_entries": int(special_inventory.block_codes.shape[0]),
+            "ordinary_right_atom_entries": inventory.right_entry_count,
+            "ordinary_logical_pair_lanes": inventory.logical_pair_lanes,
+            "special_tile_count": inventory.special_tile_count,
+            "special_work_count": 2 * inventory.special_tile_count,
+            "sparse_special_code_entries": int(inventory.special.block_codes.shape[0]),
             "scheduled_pair_lanes": (
-                ordinary_schedule.logical_pair_lanes
-                + special_schedule.special_work_count * 16 * 32
+                inventory.logical_pair_lanes
+                + 2 * inventory.special_tile_count * 16 * 32
             ),
+            "capacity": {
+                "ordinary_tiles": capacity.ordinary_tiles,
+                "ordinary_groups": capacity.ordinary_groups,
+                "special_tiles": capacity.special_tiles,
+                "special_work": capacity.special_work,
+                "reserve_fraction": 0.25,
+                "allocation_quantum": 64,
+                "estimated_schedule_bytes": reserved_schedule_bytes,
+            },
+            "generation": device_schedule.generation.value,
             "simdgroups_per_threadgroup": simdgroups_per_threadgroup,
             "device_build_seconds": schedule_build_seconds,
+            "retained_capacity_rebuild": {
+                "samples_seconds": retained_rebuild_seconds,
+                "median_seconds": float(np.median(retained_rebuild_seconds)),
+            },
             "host_payload_arrays": 0,
             "scalar_inventory_materializations": 1,
         }
@@ -655,6 +688,7 @@ def main() -> None:
     )
     parser.add_argument("--simdgroups-per-threadgroup", type=int, default=4)
     parser.add_argument("--left-slice-size", type=int, default=16)
+    parser.add_argument("--builder-rebuild-samples", type=int, default=3)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     report = benchmark(
@@ -668,6 +702,7 @@ def main() -> None:
         canonical_records=args.canonical_records,
         simdgroups_per_threadgroup=args.simdgroups_per_threadgroup,
         left_slice_size=args.left_slice_size,
+        builder_rebuild_samples=args.builder_rebuild_samples,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.out is None:
