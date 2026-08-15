@@ -189,6 +189,23 @@ work but lost more time to an extra pass or register pressure. The next bounded
 target is therefore the remaining reciprocal FFT cost, not another small Direct
 formula branch.
 
+A fresh reciprocal profile then measured the complete force-only graph at
+0.615 ms on JAC and 0.510 ms on GPCRmd. Synchronized charge spread, forward
+FFT, inverse FFT, and interpolation probes all sat near the same 0.26--0.31 ms
+launch-and-completion floor, so none remained a dominant substage. Sharing
+B-spline weights across spread workers produced no directional win. Splitting
+each atom's 125 interpolation reads across five workers regressed JAC by
+2.4--5.6% and GPCRmd by 5.2--13.0%. The retained one-thread interpolation and
+five-thread spread therefore remain the measured layouts.
+
+The apparent diagnostics share in the short whole-step profile is not a new
+per-step hotspot. `diagnostics_reporting` ran only twice in 75 measured steps,
+at the initial and final boundaries, and each call intentionally evaluated the
+full energy/force report. Its per-step contribution falls by roughly an order
+of magnitude in the 750-step canonical gate. The next runtime boundary is the
+interface between integration and constraints, where intermediate kicks and
+position corrections may be consumed by the existing Metal RATTLE kernels.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.
