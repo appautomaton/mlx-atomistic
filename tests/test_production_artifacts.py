@@ -1020,7 +1020,7 @@ def test_gpcrmd_production_neighbor_manager_uses_compact_pme_pairs():
         )
 
 
-def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
+def test_production_neighbor_manager_selects_and_pins_accelerated_pme_envelope(
     monkeypatch,
 ):
     import mlx_atomistic.prep.runner as runner
@@ -1043,6 +1043,10 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
         ),
         has_nbfix=False,
         nbfix_pairs=np.empty((0, 2), dtype=np.int32),
+        pme_plan=object(),
+        _aligned_lj_exclusion_pairs=np.empty((0, 2), dtype=np.int32),
+        _aligned_lj_one_four_pairs=np.empty((0, 2), dtype=np.int32),
+        _prepare_interaction32_force_binding=lambda *args: None,
     )
 
     selected = runner._production_neighbor_manager(
@@ -1055,9 +1059,37 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
         cell=system.cell,
         positions=SimpleNamespace(ndim=2, shape=(23_558, 3)),
     )
+    measured_small_term = SimpleNamespace(
+        **{
+            **vars(pme_term),
+            "topology": Topology.from_sequences(
+                n_atoms=23_558,
+                eager_nonbonded_pair_limit=0,
+            ),
+        }
+    )
     selected_small = runner._production_neighbor_manager(
         measured_small_system,
-        (pme_term,),
+        (measured_small_term,),
+        require_production=True,
+        fixed_cell=True,
+    )
+    measured_water_system = SimpleNamespace(
+        cell=system.cell,
+        positions=SimpleNamespace(ndim=2, shape=(30_000, 3)),
+    )
+    measured_water_term = SimpleNamespace(
+        **{
+            **vars(pme_term),
+            "topology": Topology.from_sequences(
+                n_atoms=30_000,
+                eager_nonbonded_pair_limit=0,
+            ),
+        }
+    )
+    selected_water = runner._production_neighbor_manager(
+        measured_water_system,
+        (measured_water_term,),
         require_production=True,
         fixed_cell=True,
     )
@@ -1068,6 +1100,20 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
         fixed_cell=True,
         recorded_backend="mlx_cell_pairs",
     )
+    pinned_tiles = runner._production_neighbor_manager(
+        system,
+        (pme_term,),
+        require_production=True,
+        fixed_cell=True,
+        recorded_backend="mlx_cell_tiles",
+    )
+    pinned_interaction32 = runner._production_neighbor_manager(
+        system,
+        (pme_term,),
+        require_production=True,
+        fixed_cell=True,
+        recorded_backend="mlx_interaction32",
+    )
     npt = runner._production_neighbor_manager(
         system,
         (pme_term,),
@@ -1075,9 +1121,17 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
         fixed_cell=False,
     )
 
-    assert selected is not None and selected.backend == "mlx_cell_tiles"
-    assert selected_small is not None and selected_small.backend == "mlx_cell_tiles"
+    assert selected is not None and selected.backend == "mlx_interaction32"
+    assert selected_small is not None and selected_small.backend == "mlx_interaction32"
+    assert selected_water is not None and selected_water.backend == "mlx_interaction32"
+    assert selected.interaction32_exclusion_pairs is pme_term._aligned_lj_exclusion_pairs
+    assert selected.interaction32_one_four_pairs is pme_term._aligned_lj_one_four_pairs
     assert pinned_pairs is not None and pinned_pairs.backend == "mlx_cell_pairs"
+    assert pinned_tiles is not None and pinned_tiles.backend == "mlx_cell_tiles"
+    assert (
+        pinned_interaction32 is not None
+        and pinned_interaction32.backend == "mlx_interaction32"
+    )
     assert npt is not None and npt.backend == "mlx_cell_pairs"
     type_nbfix_term = SimpleNamespace(**{**vars(pme_term), "has_nbfix": True})
     selected_type_nbfix = runner._production_neighbor_manager(
@@ -1087,7 +1141,21 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
         fixed_cell=True,
     )
     assert selected_type_nbfix is not None
-    assert selected_type_nbfix.backend == "mlx_cell_tiles"
+    assert selected_type_nbfix.backend == "mlx_interaction32"
+    tile_only_term = SimpleNamespace(
+        **{
+            **vars(pme_term),
+            "_prepare_interaction32_force_binding": None,
+        }
+    )
+    selected_tile_only = runner._production_neighbor_manager(
+        system,
+        (tile_only_term,),
+        require_production=True,
+        fixed_cell=True,
+    )
+    assert selected_tile_only is not None
+    assert selected_tile_only.backend == "mlx_cell_tiles"
     nbfix_term = SimpleNamespace(
         **{
             **vars(pme_term),
@@ -1101,15 +1169,15 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
             "pme_config": replace(pme_term.pme_config, assignment_order=4),
         }
     )
-    unmeasured_mid_system = SimpleNamespace(
+    unpromoted_mid_system = SimpleNamespace(
         cell=system.cell,
-        positions=SimpleNamespace(ndim=2, shape=(50_000, 3)),
+        positions=SimpleNamespace(ndim=2, shape=(47_116, 3)),
     )
     for candidate_system, candidate_term, skin in (
         (system, nbfix_term, runner.GPCRMD_NEIGHBOR_SKIN),
         (system, order_four_term, runner.GPCRMD_NEIGHBOR_SKIN),
         (system, pme_term, 4.0),
-        (unmeasured_mid_system, pme_term, runner.GPCRMD_NEIGHBOR_SKIN),
+        (unpromoted_mid_system, pme_term, runner.GPCRMD_NEIGHBOR_SKIN),
     ):
         fallback = runner._production_neighbor_manager(
             candidate_system,
@@ -1127,19 +1195,27 @@ def test_production_neighbor_manager_selects_and_pins_measured_tile_envelope(
             fixed_cell=False,
             recorded_backend="mlx_cell_tiles",
         )
+    with pytest.raises(ValueError, match="outside the current production envelope"):
+        runner._production_neighbor_manager(
+            system,
+            (pme_term,),
+            require_production=True,
+            fixed_cell=False,
+            recorded_backend="mlx_interaction32",
+        )
 
     contract = runner._runtime_execution_contract(
         (pme_term,),
         neighbor_manager=selected,
         nonbonded_report={
-            "backend": "mlx_cell_tiles",
-            "representation_kind": "tiles",
+            "backend": "mlx_interaction32",
+            "representation_kind": "interaction32",
             "fallback_reason": None,
         },
         fixed_cell=True,
     )
     assert contract["shared_direct_space_neighbors"] is True
-    assert contract["neighbor_representation"] == "tiles"
+    assert contract["neighbor_representation"] == "interaction32"
 
 
 def test_gpcrmd_short_range_prototype_pme_artifact_runs_cutoff_not_pme(tmp_path):

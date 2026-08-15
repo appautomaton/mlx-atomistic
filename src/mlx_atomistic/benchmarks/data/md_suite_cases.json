@@ -27,7 +27,7 @@
       "expected_atom_count": 23558,
       "tier": "local",
       "role": "non_regression",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["protein", "tip3p", "pme", "constraints"],
       "preparation_command": "uv run --with openmm python scripts/prepare_openmm_dhfr_explicit.py --case 5dfr --json"
     },
@@ -38,7 +38,7 @@
       "expected_atom_count": 23558,
       "tier": "scaling",
       "role": "scaling",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["protein", "tip3p", "pme", "charged_system", "constraints"],
       "preparation_command": "uv run --with openmm python scripts/run_charged_pme_parity.py --mlx-prepared results/larger-system-scaling/jac-1x-modern/prepared --amber-prmtop results/inputs/Amber20_Benchmark_Suite/PME/Topologies/JAC.prmtop --amber-coordinates results/inputs/Amber20_Benchmark_Suite/PME/Coordinates/JAC.inpcrd --replicas 1,1,1 --platform Reference --out results/larger-system-scaling/jac-1x-modern/parity"
     },
@@ -60,7 +60,7 @@
       "expected_atom_count": 94232,
       "tier": "local",
       "role": "improvement",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["protein", "tip3p", "pme", "charged_system", "constraints", "large_system"],
       "preparation_command": "uv run python -m mlx_atomistic.benchmarks.charged_pme prepare --source results/larger-system-scaling/jac-1x-modern/prepared --replicas 2,2,1 --out results/larger-system-scaling/jac-2x2x1-modern/prepared"
     },
@@ -71,7 +71,7 @@
       "expected_atom_count": 30000,
       "tier": "release",
       "role": "coverage",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["tip3p", "pme", "settle", "constraints"],
       "preparation_command": "uv run python -m mlx_atomistic.benchmarks.tip3p_water --preset 30k --out results/md-benchmarks/tip3p-water-30k/prepared"
     },
@@ -82,7 +82,7 @@
       "expected_atom_count": 90000,
       "tier": "release",
       "role": "coverage",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["tip3p", "pme", "settle", "constraints", "large_system"],
       "preparation_command": "uv run python -m mlx_atomistic.benchmarks.tip3p_water --preset 90k --out results/md-benchmarks/tip3p-water-90k/prepared"
     },
@@ -93,7 +93,7 @@
       "expected_atom_count": 92224,
       "tier": "release",
       "role": "reference",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["protein", "lipid", "tip3p", "pme", "constraints", "large_system"],
       "preparation_command": "uv run --with openmm python scripts/prepare_openmm_dhfr_explicit.py --case apoa1 --json"
     },
@@ -104,7 +104,7 @@
       "expected_atom_count": 92001,
       "tier": "release",
       "role": "coverage",
-      "neighbor_backend": "mlx_cell_tiles",
+      "neighbor_backend": "mlx_interaction32",
       "features": ["charmm", "protein", "lipid", "ligand", "tip3p", "pme", "constraints", "restart"],
       "preparation_command": "uv run --with openmm python scripts/run_gpcrmd_pme_parity.py --source-manifest results/gpcrmd-pme-runtime-closure/source/fixture-manifest.json --cache notebooks/ligand-receptor-motion/data/gpcrmd-cache/729 --mlx-prepared results/gpcrmd-pme-runtime-closure/prepared --platform Reference --out results/gpcrmd-pme-runtime-closure/parity"
     }

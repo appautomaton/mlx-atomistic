@@ -95,7 +95,11 @@ The bounded mode cache in `0066b58` removes the remaining repeated ordinary
 membership traversal for systems whose packed cache is at most 64 MiB. Larger
 systems retain the exact sparse two-pass builder, so this promotion does not
 turn the general runtime into a quadratic-memory design. Interaction32 remains
-an opt-in backend while broader stability coverage continues. See
+bounded to the measured Metal fixed-cell PME envelope. A six-system release
+gate, cross-system force parity, and isolated low-power comparisons on 30k/90k
+water and ApoA1 completed the default-promotion evidence. The unstable 47k JAC
+midpoint remains on production tiles, while eligible 23k--31k and 90k--100k
+runs now default to Interaction32. See
 [`metal-interaction-engine.md`](../metal-interaction-engine.md) for the builder
 contract and promotion evidence.
 

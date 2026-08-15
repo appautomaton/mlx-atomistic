@@ -41,12 +41,13 @@ work.
 | `mlx_dense_pairs` | small periodic systems | exact explicit pairs |
 | `mlx_cell_pairs` | general large orthorhombic systems | device-built exact pairs |
 | `mlx_cell_blocks` | fixed-shape compatibility and diagnostics | padded blocks |
-| `mlx_cell_tiles` | measured Metal PME route | exact masked 4-by-4 force tiles |
-| `mlx_interaction32` | opt-in PME performance candidate | retained device-built 32-atom schedule |
+| `mlx_cell_tiles` | explicit/checkpoint-compatible Metal fallback | exact masked 4-by-4 force tiles |
+| `mlx_interaction32` | measured fixed-cell Metal PME default | retained device-built 32-atom schedule |
 
 The general `auto` policy selects dense pairs below its atom limit and cell
-pairs above it. Performance runners select `mlx_cell_tiles` explicitly only
-when the force path and validation contract admit tiles.
+pairs above it. The prepared production selector chooses `mlx_interaction32`
+only inside the validated fixed-cell PME envelope. Unsupported devices, cells,
+PME settings, topology surfaces, and atom counts retain tiles or compact pairs.
 
 The tile builder now has four distinct granularities:
 
@@ -130,8 +131,8 @@ The passing profile and A/B artifacts are under
 
 ## Current Evidence
 
-The latest clean, position-balanced 750-step comparison on 2026-08-15 measured
-the opt-in `mlx_interaction32` backend against the default production tiles:
+The initial clean, position-balanced 750-step comparison on 2026-08-15 measured
+`mlx_interaction32` against the former production tile route:
 
 | Workload | Atoms | Control | Current | Result |
 | --- | ---: | ---: | ---: | ---: |
@@ -143,6 +144,14 @@ The comparison used two processes per arm, ten warmup steps, Low Power Mode,
 and a balanced control/candidate/candidate/control order. It is not a same-date
 OpenMM ratio. Reference-engine comparisons must use a matched
 manifest, platform, precision, protocol, power state, and measurement window.
+
+The promotion follow-up added force parity and a 750-step trajectory smoke gate
+for all six release systems. Every trajectory passed with no fallback and
+20--40 measured Neighbor rebuilds. Isolated, position-balanced low-power runs
+for the newly covered systems measured 28.2--33.2% improvements on 30k TIP3P
+water, 30.9--33.8% on 90k TIP3P water, and 17.4--27.6% on ApoA1. The unstable
+47,116-atom JAC midpoint remains on `mlx_cell_tiles`, so default promotion is
+bounded to the measured 23,000--31,000 and 90,000--100,000 atom windows.
 
 The canonical local performance gate is documented in
 [`md-suite.md`](./benchmarks/md-suite.md). Long-form physics and reference
@@ -191,8 +200,8 @@ Space first at 38.71% of synchronized wall, followed by the Neighbor lifecycle
 at 14.06%, with PME and constraints both near 12.78%. The next experiment must
 therefore return to Direct Space or PME rather than extending the builder.
 
-The experimental 32-atom engine is not the default production route. Its
-device-built schedule now passes the initial 5DFR, JAC, and NBFIX-bearing
-GPCRmd end-to-end gate. It remains opt-in while broader stability coverage and
-whole-step profiling continue. See
+The 32-atom engine is now the default inside the bounded, measured fixed-cell
+Metal PME envelope. Existing checkpoints continue to pin their recorded
+backend, and every unsupported configuration retains the previous fallback.
+See
 [`metal-interaction-engine.md`](./metal-interaction-engine.md).

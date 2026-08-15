@@ -42,7 +42,7 @@ def test_md_suite_registry_defines_local_acceptance_pair_and_release_cases():
     }
     assert len({case.fingerprint for case in release}) == len(release)
     gpcrmd = next(case for case in release if case.case_id == "gpcrmd-729-pme")
-    assert gpcrmd.neighbor_backend == "mlx_cell_tiles"
+    assert gpcrmd.neighbor_backend == "mlx_interaction32"
 
 
 def test_md_suite_inventory_reports_prepared_artifact_availability(tmp_path: Path):
@@ -123,6 +123,7 @@ def test_md_suite_runner_persists_medians_and_contracts(tmp_path: Path):
         75,
         75,
     ]
+    assert {call["neighbor_backend"] for call in calls} == {"mlx_interaction32"}
     assert json.loads(out.read_text())["passed"] is True
 
 

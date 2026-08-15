@@ -80,11 +80,11 @@ PRESSURE_DIAGNOSTIC_ATOM_LIMIT = 50_000
 # 4.0 A) because it rebuilt 15 fewer times. Both runs preserved cutoff physics.
 GPCRMD_NEIGHBOR_SKIN = 5.5
 GPCRMD_NEIGHBOR_WORKERS = max(1, min(8, os.cpu_count() or 1))
-_PRODUCTION_TILE_PME_ATOM_WINDOWS = (
-    (23_000, 24_000),
+_PRODUCTION_ACCELERATED_PME_ATOM_WINDOWS = (
+    (23_000, 31_000),
     (90_000, 100_000),
 )
-_PRODUCTION_TILE_PME_CUTOFF = 9.0
+_PRODUCTION_ACCELERATED_PME_CUTOFF = 9.0
 _CHECKPOINT_NEIGHBOR_BACKENDS = frozenset(
     {
         "auto",
@@ -93,6 +93,7 @@ _CHECKPOINT_NEIGHBOR_BACKENDS = frozenset(
         "mlx_cell_pairs",
         "mlx_cell_blocks",
         "mlx_cell_tiles",
+        "mlx_interaction32",
     }
 )
 
@@ -379,14 +380,14 @@ def _project_and_rescale_velocities(
     return velocities.astype(np.float32)
 
 
-def _production_tile_pme_eligible(
+def _production_accelerated_pme_eligible(
     system,
     lazy_terms,
     *,
     fixed_cell: bool,
     neighbor_skin: float,
 ) -> bool:
-    """Return whether the measured large fixed-cell PME tile envelope applies."""
+    """Return whether the measured large fixed-cell PME envelope applies."""
 
     if not fixed_cell or "gpu" not in str(mx.default_device()).lower():
         return False
@@ -407,7 +408,7 @@ def _production_tile_pme_eligible(
         atom_count = int(positions.shape[0])
     if not any(
         minimum <= atom_count <= maximum
-        for minimum, maximum in _PRODUCTION_TILE_PME_ATOM_WINDOWS
+        for minimum, maximum in _PRODUCTION_ACCELERATED_PME_ATOM_WINDOWS
     ):
         return False
     for term in pme_terms:
@@ -422,7 +423,7 @@ def _production_tile_pme_eligible(
             or int(getattr(config, "assignment_order", 0)) != 5
             or not np.isclose(
                 float(getattr(term, "cutoff", np.nan)),
-                _PRODUCTION_TILE_PME_CUTOFF,
+                _PRODUCTION_ACCELERATED_PME_CUTOFF,
                 rtol=1e-6,
                 atol=1e-7,
             )
@@ -502,25 +503,68 @@ def _production_neighbor_manager(
     ):
         msg = "production compact-neighbor force terms require one shared cutoff"
         raise ValueError(msg)
-    tile_eligible = uses_pme and _production_tile_pme_eligible(
+    accelerated_pme_eligible = uses_pme and _production_accelerated_pme_eligible(
         system,
         lazy_terms,
         fixed_cell=fixed_cell,
         neighbor_skin=neighbor_skin,
     )
+    pme_terms = tuple(
+        term for term in lazy_terms if getattr(term, "electrostatics", None) == "pme"
+    )
+    interaction32_term = pme_terms[0] if len(pme_terms) == 1 else None
+    system_positions = getattr(system, "positions", None)
+    system_atom_count = (
+        int(system_positions.shape[0])
+        if getattr(system_positions, "ndim", 0) == 2
+        else 0
+    )
+    interaction32_topology = getattr(interaction32_term, "topology", None)
+    interaction32_eligible = bool(
+        accelerated_pme_eligible
+        and len(lazy_terms) == 1
+        and interaction32_term is not None
+        and getattr(interaction32_term, "pme_plan", None) is not None
+        and getattr(interaction32_term, "_aligned_lj_exclusion_pairs", None) is not None
+        and getattr(interaction32_term, "_aligned_lj_one_four_pairs", None) is not None
+        and int(getattr(interaction32_topology, "n_atoms", 0)) == system_atom_count
+        and callable(
+            getattr(interaction32_term, "_prepare_interaction32_force_binding", None)
+        )
+    )
     selected_backend = (
-        "mlx_cell_tiles"
-        if tile_eligible
-        else ("mlx_cell_pairs" if uses_pme else "auto")
+        "mlx_interaction32"
+        if interaction32_eligible
+        else (
+            "mlx_cell_tiles"
+            if accelerated_pme_eligible
+            else ("mlx_cell_pairs" if uses_pme else "auto")
+        )
     )
     if recorded_backend is not None:
         if recorded_backend not in _CHECKPOINT_NEIGHBOR_BACKENDS:
             msg = f"resume checkpoint has unsupported neighbor backend {recorded_backend!r}"
             raise ValueError(msg)
-        if recorded_backend == "mlx_cell_tiles" and not tile_eligible:
+        if recorded_backend == "mlx_cell_tiles" and not accelerated_pme_eligible:
             msg = "resume checkpoint tile backend is outside the current production envelope"
             raise ValueError(msg)
+        if recorded_backend == "mlx_interaction32" and not interaction32_eligible:
+            msg = (
+                "resume checkpoint Interaction32 backend is outside the current "
+                "production envelope"
+            )
+            raise ValueError(msg)
         selected_backend = recorded_backend
+    interaction32_exclusion_pairs = (
+        getattr(interaction32_term, "_aligned_lj_exclusion_pairs", ())
+        if selected_backend == "mlx_interaction32"
+        else ()
+    )
+    interaction32_one_four_pairs = (
+        getattr(interaction32_term, "_aligned_lj_one_four_pairs", ())
+        if selected_backend == "mlx_interaction32"
+        else ()
+    )
     return NeighborListManager(
         system.cell,
         cutoff=reference_cutoff,
@@ -530,6 +574,8 @@ def _production_neighbor_manager(
         max_workers=GPCRMD_NEIGHBOR_WORKERS,
         backend=selected_backend,
         displacement_check_backend="mlx_scalar",
+        interaction32_exclusion_pairs=interaction32_exclusion_pairs,
+        interaction32_one_four_pairs=interaction32_one_four_pairs,
     )
 
 
@@ -659,7 +705,7 @@ def _runtime_execution_contract(
         "shared_direct_space_neighbors": bool(
             pme_term_count
             and neighbor_manager is not None
-            and representation_kind in {"blocks", "pairs", "tiles"}
+            and representation_kind in {"blocks", "interaction32", "pairs", "tiles"}
         ),
         "dense_or_tiled_fallback_used": bool(
             backend in {"dense_all_pairs", "tiled_all_pairs"} or fallback_reason

@@ -10,8 +10,8 @@ The default `local` suite contains two required cases:
 
 | Case | Atoms | Neighbor backend | Role |
 | --- | ---: | --- | --- |
-| `dhfr-5dfr-pme` | 23,558 | `mlx_cell_tiles` | Non-regression gate for fixed overhead, constraints, neighbor admission, and PME. |
-| `jac-94k-pme` | 94,232 | `mlx_cell_tiles` | Improvement gate for production-scale direct space, PME, memory traffic, and scheduling. |
+| `dhfr-5dfr-pme` | 23,558 | `mlx_interaction32` | Non-regression gate for fixed overhead, constraints, neighbor admission, and PME. |
+| `jac-94k-pme` | 94,232 | `mlx_interaction32` | Improvement gate for production-scale direct space, PME, memory traffic, and scheduling. |
 
 One case is deliberately insufficient. A candidate passes the default
 comparison only when 5DFR does not regress by more than 3% and JAC improves by
@@ -64,18 +64,18 @@ uv run python -m mlx_atomistic.benchmarks.md_suite compare \
   --out results/md-suite/comparison.json
 ```
 
-Evaluate the opt-in 32-atom backend without changing the committed production
-case contracts:
+Evaluate the previous tile route as an explicit control without changing the
+committed production case contracts:
 
 ```bash
 uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --suite local \
-  --neighbor-backend mlx_interaction32 \
+  --neighbor-backend mlx_cell_tiles \
   --repeats 3 \
   --rehearsal-steps 75 \
   --warmup-steps 10 \
   --measured-steps 750 \
-  --out results/md-suite/interaction32.json
+  --out results/md-suite/legacy-tiles.json
 ```
 
 Attribute non-overlapping synchronized stages inside its measured rebuilds:
@@ -139,12 +139,14 @@ The committed registry also defines:
 - the 92,001-atom GPCRmd 729 CHARMM workload.
 
 The neighbor backend is part of each case contract. All release PME cases use
-`mlx_cell_tiles`. GPCRmd selects the NBFIX-aware tile specialization, which
-looks up its CHARMM type-pair overrides without materializing compact pairs.
-`mlx_interaction32` is an opt-in device-built 32-atom force schedule. It retains
-capacity across Neighbor generations and creates production tiles lazily only
-at energy or virial diagnostic boundaries. `--neighbor-backend` is an explicit
-diagnostic override and changes comparison semantics.
+the promoted `mlx_interaction32` device-built 32-atom force schedule, including
+the CHARMM type-pair NBFIX specialization used by GPCRmd. It retains capacity
+across Neighbor generations and creates production tiles lazily only at energy
+or virial diagnostic boundaries. The 47,116-atom JAC scaling midpoint remains
+on `mlx_cell_tiles` because its low-power promotion measurement was unstable;
+the 23,558- and 94,232-atom endpoints use `mlx_interaction32`.
+`--neighbor-backend` is an explicit diagnostic override and changes comparison
+semantics.
 
 Generate the deterministic water artifacts without a reference engine:
 

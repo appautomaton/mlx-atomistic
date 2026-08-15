@@ -2,17 +2,18 @@
 
 ## Status
 
-The 32-atom engine is now an end-to-end experimental Molecular Dynamics (MD)
-backend named `mlx_interaction32`. It is opt-in and is not the default
-production route. The default still uses coarse 8-by-8 Neighbor search tiles,
-exact 4-by-4 force tiles, and 32 active-column Metal groups.
+The 32-atom engine is now the default Molecular Dynamics (MD) backend for the
+measured fixed-cell Metal PME envelope. It is named `mlx_interaction32` and
+uses a retained device-built schedule. Production keeps `mlx_cell_tiles` and
+`mlx_cell_pairs` as explicit, checkpoint-compatible fallback routes.
 
-The experimental backend owns retained device capacity, fail-closed overflow,
+The backend owns retained device capacity, fail-closed overflow,
 Neighbor generation identity, the recurring direct-force schedule, and lazy
-diagnostic tiles. It has now improved complete constrained Particle Mesh Ewald
-(PME) trajectories on 5DFR, JAC, and GPCRmd. Promotion remains separate: the
-backend stays opt-in until broader correctness and stability coverage supports
-changing the default case contracts.
+diagnostic tiles. It has improved complete constrained Particle Mesh Ewald
+(PME) trajectories across proteins, pure water, a membrane protein, a
+protein-lipid-water system, AMBER, and CHARMM NBFIX. The promotion envelope is
+deliberately bounded; unsupported devices, cells, PME settings, atom counts,
+or topology surfaces retain the previous routes.
 
 The sustained force gate was reopened on 2026-08-14. Earlier 16-call timing
 blocks showed only a small advantage and correctly blocked production work at
@@ -373,7 +374,7 @@ The candidate advances only in this order:
 
 ### Gate A: Inventory
 
-Status: passed for the bounded opt-in backend.
+Status: passed for the bounded production backend.
 
 Record schedule size, occupancy, sparse-pair fraction, bytes, and rebuild time
 on small Lennard-Jones, 5DFR, JAC, and GPCRmd systems. A host-built schedule is
@@ -381,7 +382,7 @@ diagnostic only and cannot pass this gate.
 
 ### Gate B: Force Kernel
 
-Status: passed and integrated into the opt-in runtime backend.
+Status: passed and integrated into the production runtime backend.
 
 Compare the production 4-by-4 route, a 32-atom atomic route, and any
 owner-computes variant on the same immutable schedule. Measure complete force
@@ -390,7 +391,7 @@ synthetic dense occupancy.
 
 ### Gate C: Device Builder
 
-Status: passed for the opt-in runtime backend.
+Status: passed for the production runtime backend.
 
 Build and reuse the schedule entirely on device. Include half-skin admission,
 periodic boundary cases, concentrated occupancy, logical-capacity overflow,
@@ -399,12 +400,34 @@ production engine.
 
 ### Gate D: Full Trajectory
 
-Status: initial three-system pass; default promotion remains pending.
+Status: passed; bounded default promotion completed.
 
 Run position-balanced, independent-process comparisons on 5DFR, JAC, and
 GPCRmd. Require stable complete-wall improvement, force parity, finite state,
 constraint checks, Neighbor completeness, memory bounds, and acceptable
 constant-particle-number, volume, and energy drift.
+
+The promotion follow-up ran all six release workloads for 750 measured steps.
+Every run passed the finite-state, constraint, topology, Neighbor,
+Particle Mesh Ewald plan-reuse, and memory checks, with 20--40 measured
+Neighbor rebuilds per system and no fallback. Direct-force parity across those
+six systems had root-mean-square deltas of `5.18e-5`--`6.85e-5` and maximum
+deltas of `4.27e-4`--`4.88e-4` kJ/mol/A.
+
+Independent low-power control/candidate/candidate/control runs added the
+previously uncovered release systems:
+
+| Workload | Direction 1 | Direction 2 |
+| --- | ---: | ---: |
+| 30k TIP3P water | 33.2% faster | 28.2% faster |
+| 90k TIP3P water | 30.9% faster | 33.8% faster |
+| ApoA1 | 27.6% faster | 17.4% faster |
+
+The 47,116-atom JAC midpoint was directionally non-regressing but unstable
+(0.5% and 23.1%), so it remains on `mlx_cell_tiles`. This is why the production
+selector admits the measured 23,000--31,000 and 90,000--100,000 atom windows
+rather than claiming one continuous range. Old checkpoints pin their recorded
+backend; new eligible runs select `mlx_interaction32`.
 
 Only Gate D permits promotion to the runtime path.
 

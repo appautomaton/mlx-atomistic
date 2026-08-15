@@ -57,7 +57,11 @@ class MDBenchmarkCase:
         if prepared_path.is_absolute() or not prepared_path.parts:
             raise ValueError(f"{case_id}: prepared_path must be repository-relative")
         neighbor_backend = str(payload.get("neighbor_backend", "mlx_cell_tiles"))
-        if neighbor_backend not in {"mlx_cell_pairs", "mlx_cell_tiles"}:
+        if neighbor_backend not in {
+            "mlx_cell_pairs",
+            "mlx_cell_tiles",
+            "mlx_interaction32",
+        }:
             raise ValueError(f"{case_id}: unsupported neighbor_backend {neighbor_backend!r}")
         return cls(
             case_id=case_id,

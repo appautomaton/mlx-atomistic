@@ -909,7 +909,7 @@ def build_gpcrmd_mlx_workload_manifest(
         }
         for name in (JSON_NAME, NPZ_NAME, VIEW_PDB_NAME)
     }
-    uses_tile_runtime = bool(
+    uses_interaction32_runtime = bool(
         90_000 <= prepared.atom_count <= 100_000
         and bool(protocol.get("fixed_cell", False))
         and int(prepared.nbfix_pairs.shape[0]) == 0
@@ -1093,9 +1093,13 @@ def build_gpcrmd_mlx_workload_manifest(
             "topology_pair_policy": "lazy",
             "eager_nonbonded_pair_limit": 0,
             "neighbor_backend": (
-                "mlx_cell_tiles" if uses_tile_runtime else "mlx_cell_pairs"
+                "mlx_interaction32"
+                if uses_interaction32_runtime
+                else "mlx_cell_pairs"
             ),
-            "neighbor_representation": "tiles" if uses_tile_runtime else "pairs",
+            "neighbor_representation": (
+                "interaction32" if uses_interaction32_runtime else "pairs"
+            ),
             "fixed_cell_pme_plan_reuse": True,
             "dense_or_tiled_fallback_allowed": False,
         },

@@ -538,14 +538,18 @@ def _source_protocol_settings(manifest: Mapping[str, Any]) -> dict[str, Any]:
     if pme.get("background_policy") != "reject_non_neutral":
         msg = "source-neutral GPCRmd PME must retain reject_non_neutral"
         raise ValueError(msg)
-    uses_tile_runtime = 90_000 <= atom_count <= 100_000
+    uses_interaction32_runtime = 90_000 <= atom_count <= 100_000
     expected_runtime = {
         "topology_pair_policy": "lazy",
         "eager_nonbonded_pair_limit": 0,
         "neighbor_backend": (
-            "mlx_cell_tiles" if uses_tile_runtime else "mlx_cell_pairs"
+            "mlx_interaction32"
+            if uses_interaction32_runtime
+            else "mlx_cell_pairs"
         ),
-        "neighbor_representation": "tiles" if uses_tile_runtime else "pairs",
+        "neighbor_representation": (
+            "interaction32" if uses_interaction32_runtime else "pairs"
+        ),
         "fixed_cell_pme_plan_reuse": True,
         "dense_or_tiled_fallback_allowed": False,
     }
