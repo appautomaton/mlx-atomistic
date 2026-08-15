@@ -27,6 +27,7 @@ git show <commit>:docs/benchmarks/<historical-file>.md
 | 2026-08-11 | Active-column force schedule | Compacting only non-empty right columns improved complete wall by 6.10% on 5DFR and 1.94% on JAC. | `ff94d19` |
 | 2026-08-13 | Packed column descriptor | Stored the four column membership bits in the existing `int32` descriptor, removing an indirect mask load without another schedule or dispatch. Cross-system gates passed. | `ff94d19` |
 | 2026-08-12 | Reciprocal complex-grid force path | Removed a full-grid real projection/scale and redundant position wrapping. Two equal-rebuild JAC pairs averaged a 2.47% throughput increase; 5DFR was neutral. | `f0f818c` |
+| 2026-08-15 | Reciprocal real half-spectrum force path | Replaced the recurring full complex transform with `rfftn`/`irfftn`, a last-axis half-spectrum influence view, and per-atom normalization in the Metal interpolation kernel. Same-process reciprocal-graph ABBA improved JAC by 55.96% and GPCRmd by 19.44%. Two 750-step canonical comparisons passed in both directions: 5DFR improved 2.91% and 23.29%, while JAC improved 28.09% and 19.86%. | `6d2a03d` |
 | 2026-08-12 | Neighbor wait attribution | Established that 72.5% of the 5DFR and 88.5% of the JAC admission boundary was completion of earlier GPU work, not displacement arithmetic. The attribution remains part of profiler interpretation. | `7f7b878` |
 | 2026-08-12 | Small constraint components | A component-owned Metal solver replaced roughly 60 full-array SHAKE/RATTLE layers per JAC step. The 750-step JAC median fell by 52.3%; unsupported graphs retain MLX fallback. | `d3b264b` |
 | 2026-08-13 | Spatial cell-task reuse | Reused immutable dense task geometry and coalesced independent schedule prefixes. Warm rebuild medians improved about 4% on both 5DFR and JAC; sustained gains were 2.03% and 0.31%. | `4da45d5` |
@@ -124,5 +125,14 @@ Three patterns recur across the rejected work:
 3. A 5DFR-only improvement is not sufficient for a general large-system route.
 
 New candidates should therefore start from a current whole-step profile and
-must pass position-balanced 5DFR, JAC, and GPCRmd gates when their force-field
-surface applies.
+must pass the position-balanced 5DFR/JAC canonical gate. GPCRmd is an
+additional required coverage surface when its machine-state spread admits a
+comparison; otherwise its whole-step claim remains explicitly blocked.
+
+The real half-spectrum PME change passed the required 5DFR/JAC canonical gate.
+GPCRmd force parity and its short same-process reciprocal graph also passed,
+but sustained whole-step attribution is blocked under the current machine
+state: repeated arms ranged from 11.92 to 27.63 ms/step and changed direction
+across the balanced pairs. No GPCRmd whole-step speedup or regression is claimed
+from that run. Raw local evidence is under
+`results/md-suite/pme-real-fft-*-2026-08-15/`.

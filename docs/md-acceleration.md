@@ -85,10 +85,14 @@ work over spatial tiles. It uses:
 
 The order-five reciprocal PME route retains one charge-spread Metal dispatch,
 MLX fast Fourier transforms, influence multiplication, and one analytic
-B-spline derivative interpolation dispatch. Its force-only route consumes the
-complex inverse-transform grid directly and avoids redundant outer position
-wrapping. Alternative spread launch geometries did not improve the complete
-reciprocal graph and were rejected.
+B-spline derivative interpolation dispatch. Its recurring force-only route now
+uses a real forward transform, stores only the last-axis half-spectrum, applies
+the matching half-spectrum influence view, and produces a normalized real
+inverse-transform grid. The Metal interpolation kernel applies the transform
+normalization once per atom instead of scaling the complete grid. Energy and
+diagnostic paths retain the conservative full complex transform. Alternative
+spread launch geometries did not improve the complete reciprocal graph and
+were rejected.
 
 Sparse PME exclusions, exceptions, and 1-4 corrections share the fused bonded
 Metal force buffer when that owner is available. The hottest Direct Space
@@ -158,6 +162,23 @@ The canonical local performance gate is documented in
 evidence remains in the JAC, GPCRmd, and same-workload reports indexed from the
 [benchmark directory](./benchmarks/README.md).
 
+The subsequent real-transform PME checkpoint reduced a `128x128x64` JAC force
+spectrum to `128x128x33`. Same-process old/new reciprocal-graph ABBA measured
+1.4438 to 0.6359 ms on JAC and 0.6349 to 0.5115 ms on GPCRmd, improvements of
+55.96% and 19.44%. Maximum force deltas against the former complex path were
+`2.50e-5` and `3.72e-5 kJ/(mol A)`, respectively. Even- and odd-sized mesh GPU
+parity tests also pass against the unchanged energy-plus-force path.
+
+Two independent 750-step canonical comparisons passed the complete-wall gate
+in both directions. Directional gains were 2.91% and 23.29% on 5DFR, and 28.09%
+and 19.86% on JAC. Absolute walls changed substantially with the machine's
+Metal performance state, so these figures are retained as directional evidence
+and are not averaged into a single expected speedup. GPCRmd whole-step arms
+were even less stable, ranging from 11.92 to 27.63 ms/step and changing
+direction across balanced pairs. Its reciprocal-graph improvement is retained,
+but no GPCRmd whole-step claim is made from that run. Raw JSON is under
+`results/md-suite/pme-real-fft-*-2026-08-15/`.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.
@@ -208,7 +229,16 @@ improved isolated 5DFR and 30k TIP3P blocks, but regressed ApoA1 and GPCRmd and
 changed sign across the two JAC 94k directions. The prototype was removed.
 Together with the earlier rejected owner-computes, lane-rotation, grouping, and
 special-write variants, this closes another Direct Space screen without
-claiming a runtime gain. Reciprocal PME is the next bounded profiling target.
+claiming a runtime gain. That evidence selected Reciprocal PME as the next
+bounded profiling target.
+
+That bounded PME target is now complete. The retained force-only route uses a
+real half-spectrum and a normalized-real Metal consumer. Because it reduces a
+previously secondary stage without changing Neighbor work, the next decision
+must begin with a fresh whole-step profile. Direct Space is expected to remain
+the leading shared candidate, but that expectation is not a substitute for the
+new profile. Builder capacity admission remains too small to justify native C++
+work.
 
 The 32-atom engine is now the default inside the bounded, measured fixed-cell
 Metal PME envelope. Existing checkpoints continue to pin their recorded
