@@ -179,6 +179,16 @@ direction across balanced pairs. Its reciprocal-graph improvement is retained,
 but no GPCRmd whole-step claim is made from that run. Raw JSON is under
 `results/md-suite/pme-real-fft-*-2026-08-15/`.
 
+The next Direct audit closed the remaining easy branches. Full,
+Lennard-Jones-only, and Coulomb-only kernels attributed 66--84% of elapsed time
+to common geometry, traversal, reduction, and force ownership. Morton ordering
+increased scheduled lanes by about 5%, while all six linear axis permutations
+stayed within 0.21% and did not select one cross-system winner. A useful-pair
+compaction prepass and cross-tile reduction batching both reduced their target
+work but lost more time to an extra pass or register pressure. The next bounded
+target is therefore the remaining reciprocal FFT cost, not another small Direct
+formula branch.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.
