@@ -506,11 +506,59 @@ class _DavidsonScheduler:
         self,
         tickets: Sequence[_DavidsonApplicationTicket],
     ) -> _DavidsonScheduleResult:
+        ready, failures = self._validate_tickets(tickets)
+        actions: dict[str, _CompactLaneState] = {}
+        groups: list[tuple[str, ...]] = []
+        compatibility_groups: list[tuple[str, ...]] = []
+        for compatible in self._compatible_batches(ready):
+            compatibility_groups.append(
+                tuple(ticket.lane_id for ticket in compatible)
+            )
+            plan = self._plan_compatible_group(compatible)
+            for lane_index, error in plan.failures.items():
+                failures[compatible[lane_index].lane_id] = error
+            for planned in plan.submissions:
+                submission = tuple(
+                    compatible[index] for index in planned.indices
+                )
+                prepared_batch = self._prepare_submission(
+                    submission,
+                    planned,
+                )
+                lane_ids = tuple(ticket.lane_id for ticket in submission)
+                groups.append(lane_ids)
+                (
+                    submission_index,
+                    batch_actions,
+                    submission_failures,
+                ) = self._submit(
+                    submission,
+                    prepared_batch,
+                )
+                actions.update(batch_actions)
+                failures.update(submission_failures)
+                self._notify_submission(
+                    "completed",
+                    submission_index,
+                    submission,
+                    prepared_batch,
+                    submission_failures,
+                )
+        return _DavidsonScheduleResult(
+            actions=actions,
+            failures=failures,
+            groups=tuple(groups),
+            compatibility_groups=tuple(compatibility_groups),
+        )
+
+    def _validate_tickets(
+        self,
+        tickets: Sequence[_DavidsonApplicationTicket],
+    ) -> tuple[list[_DavidsonApplicationTicket], dict[str, Exception]]:
         if not tickets:
             msg = "Davidson scheduler requires at least one application ticket"
             raise ValueError(msg)
         seen: set[str] = set()
-        ready: list[_DavidsonApplicationTicket] = []
         failures: dict[str, Exception] = {}
         validated: list[tuple[_DavidsonApplicationTicket, mx.array]] = []
         for ticket in tickets:
@@ -519,186 +567,240 @@ class _DavidsonScheduler:
                 raise ValueError(msg)
             seen.add(ticket.lane_id)
             try:
-                if ticket.purpose not in {"basis", "direct_validation"}:
-                    msg = "Davidson application purpose is invalid"
-                    raise ValueError(msg)
-                ticket.token.validate(
-                    ticket.operator,
-                    ticket.config,
-                    ticket.n_bands,
-                    ticket.rank_policy,
-                )
-                ticket.operator.basis._validate_state(ticket.vectors)
-                if ticket.vectors.kind != "coefficients":
-                    msg = "Davidson scheduler accepts coefficient blocks only"
-                    raise ValueError(msg)
-                validated.append((ticket, mx.all(mx.isfinite(ticket.vectors.values))))
+                finite = self._validate_ticket(ticket)
             except Exception as error:
                 failures[ticket.lane_id] = _detached_failure(error)
-        if validated:
-            try:
-                mx.eval(*(finite for _, finite in validated))
-            except Exception as error:
-                failure = _detached_failure(error)
-                failures.update({ticket.lane_id: failure for ticket, _ in validated})
             else:
-                for ticket, finite in validated:
-                    if bool(finite):
-                        ready.append(ticket)
-                    else:
-                        failures[ticket.lane_id] = ValueError(
-                            "Davidson application block must be finite"
-                        )
+                validated.append((ticket, finite))
+        ready: list[_DavidsonApplicationTicket] = []
+        if not validated:
+            return ready, failures
+        try:
+            mx.eval(*(finite for _, finite in validated))
+        except Exception as error:
+            failure = _detached_failure(error)
+            failures.update(
+                {ticket.lane_id: failure for ticket, _ in validated}
+            )
+            return ready, failures
+        for ticket, finite in validated:
+            if bool(finite):
+                ready.append(ticket)
+            else:
+                failures[ticket.lane_id] = ValueError(
+                    "Davidson application block must be finite"
+                )
+        return ready, failures
 
-        grouped: dict[tuple[object, ...], list[_DavidsonApplicationTicket]] = defaultdict(list)
-        for ticket in ready:
+    @staticmethod
+    def _validate_ticket(ticket: _DavidsonApplicationTicket) -> mx.array:
+        if ticket.purpose not in {"basis", "direct_validation"}:
+            msg = "Davidson application purpose is invalid"
+            raise ValueError(msg)
+        ticket.token.validate(
+            ticket.operator,
+            ticket.config,
+            ticket.n_bands,
+            ticket.rank_policy,
+        )
+        ticket.operator.basis._validate_state(ticket.vectors)
+        if ticket.vectors.kind != "coefficients":
+            msg = "Davidson scheduler accepts coefficient blocks only"
+            raise ValueError(msg)
+        return mx.all(mx.isfinite(ticket.vectors.values))
+
+    def _compatible_batches(
+        self,
+        tickets: Sequence[_DavidsonApplicationTicket],
+    ) -> list[list[_DavidsonApplicationTicket]]:
+        grouped: dict[
+            tuple[object, ...],
+            list[_DavidsonApplicationTicket],
+        ] = defaultdict(list)
+        for ticket in tickets:
             grouped[self._group_key(ticket)].append(ticket)
-
-        compatible_batches: list[list[_DavidsonApplicationTicket]] = []
+        batches: list[list[_DavidsonApplicationTicket]] = []
         for compatible in grouped.values():
             if self.shape_policy == "finite-buckets":
-                compatible_batches.extend(
+                batches.extend(
                     compatible[start : start + self.batch_cap]
-                    for start in range(0, len(compatible), self.batch_cap)
+                    for start in range(
+                        0,
+                        len(compatible),
+                        self.batch_cap,
+                    )
                 )
             else:
-                compatible_batches.append(compatible)
+                batches.append(compatible)
+        return batches
 
-        actions: dict[str, _CompactLaneState] = {}
-        groups: list[tuple[str, ...]] = []
-        compatibility_groups: list[tuple[str, ...]] = []
-        for compatible in compatible_batches:
-            compatibility_groups.append(tuple(ticket.lane_id for ticket in compatible))
-
-            def estimate_submission(
-                indices: tuple[int, ...],
-                batch: _CompactBatch,
-                *,
-                _compatible: list[_DavidsonApplicationTicket] = compatible,
-            ) -> int:
-                return PeriodicKohnShamOperator._estimated_batch_transient_bytes(
-                    [_compatible[index].operator for index in indices],
-                    batch,
-                )
-
-            bound_capacity = self._capacity_by_lane.get(compatible[0].lane_id)
-            if bound_capacity is not None and any(
-                self._capacity_by_lane.get(ticket.lane_id) != bound_capacity
-                for ticket in compatible
-            ):
-                msg = "Davidson stable-shape group has inconsistent capacities"
-                raise RuntimeError(msg)
-            capacity = bound_capacity
-            if capacity is not None and self.shape_policy == "finite-buckets":
-                capacity = _CompactBatchCapacity(
-                    lanes=_finite_lane_capacity(len(compatible), capacity.lanes),
-                    vectors=_finite_vector_capacity(
-                        compatible[0].vectors.vector_count,
-                        capacity.vectors,
-                    ),
-                    active=capacity.active,
-                )
-            plan = _plan_compact_submissions(
-                [ticket.vectors for ticket in compatible],
-                policy=self._policy,
-                batch_byte_estimator=estimate_submission,
-                capacity=capacity,
+    def _plan_compatible_group(
+        self,
+        compatible: list[_DavidsonApplicationTicket],
+    ) -> _CompactSubmissionPlan:
+        def estimate_submission(
+            indices: tuple[int, ...],
+            batch: _CompactBatch,
+        ) -> int:
+            return PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                [compatible[index].operator for index in indices],
+                batch,
             )
-            for lane_index, error in plan.failures.items():
-                failures[compatible[lane_index].lane_id] = error
-            for planned in plan.submissions:
-                submission = tuple(compatible[index] for index in planned.indices)
-                prepared_batch = _CompactBatch.from_states(
-                    [ticket.vectors for ticket in submission],
-                    policy=self._policy,
-                    lane_capacity=(None if planned.capacity is None else planned.capacity.lanes),
-                    vector_capacity=(
-                        None if planned.capacity is None else planned.capacity.vectors
-                    ),
-                    active_capacity=(None if planned.capacity is None else planned.capacity.active),
-                )
-                complete_transient_bytes = (
-                    PeriodicKohnShamOperator._estimated_batch_transient_bytes(
-                        [ticket.operator for ticket in submission],
-                        prepared_batch,
-                    )
-                )
-                runtime_observer = self._observer(submission[0])
-                if runtime_observer is not None:
-                    runtime_observer.record_peak_memory(
-                        "peak_temporary_bytes",
-                        complete_transient_bytes,
-                    )
-                lane_ids = tuple(ticket.lane_id for ticket in submission)
-                groups.append(lane_ids)
-                submission_index = self._submission_index
-                self._submission_index += 1
-                if self._submission_callback is not None:
-                    self._submission_callback(
-                        "started",
-                        submission_index,
-                        submission,
-                        prepared_batch,
-                        {},
-                    )
-                submission_failures: dict[str, Exception] = {}
-                try:
-                    if len(submission) == 1:
-                        ticket = submission[0]
-                        applied = ticket.operator._apply_compact(
-                            ticket.vectors,
-                            observer=ticket.observer,
-                            policy=self._policy,
-                            prepared_batch=prepared_batch,
-                        )
-                        batch_actions = {ticket.lane_id: applied}
-                    else:
-                        outcome = PeriodicKohnShamOperator._apply_compact_batch(
-                            tuple(ticket.operator for ticket in submission),
-                            tuple(ticket.vectors for ticket in submission),
-                            observer=self._observer(submission[0]),
-                            policy=self._policy,
-                            prepared_batch=prepared_batch,
-                        )
-                        batch_actions = {
-                            ticket.lane_id: outcome.actions[index]
-                            for index, ticket in enumerate(submission)
-                            if index in outcome.actions
-                        }
-                        submission_failures.update(
-                            {
-                                submission[index].lane_id: error
-                                for index, error in outcome.failures.items()
-                            }
-                        )
-                    for ticket in submission:
-                        applied = batch_actions.get(ticket.lane_id)
-                        if applied is None:
-                            continue
-                        actions[ticket.lane_id] = applied
-                        if ticket.purpose == "basis":
-                            add_observed_work(
-                                ticket.observer,
-                                {"davidson_hv_new_vectors": (ticket.vectors.vector_count)},
-                            )
-                except Exception as error:
-                    failure = _detached_failure(error)
-                    submission_failures.update({ticket.lane_id: failure for ticket in submission})
-                failures.update(submission_failures)
-                if self._submission_callback is not None:
-                    self._submission_callback(
-                        "completed",
-                        submission_index,
-                        submission,
-                        prepared_batch,
-                        submission_failures,
-                    )
-        return _DavidsonScheduleResult(
-            actions=actions,
-            failures=failures,
-            groups=tuple(groups),
-            compatibility_groups=tuple(compatibility_groups),
+
+        bound_capacity = self._capacity_by_lane.get(compatible[0].lane_id)
+        if bound_capacity is not None and any(
+            self._capacity_by_lane.get(ticket.lane_id) != bound_capacity
+            for ticket in compatible
+        ):
+            msg = "Davidson stable-shape group has inconsistent capacities"
+            raise RuntimeError(msg)
+        capacity = bound_capacity
+        if capacity is not None and self.shape_policy == "finite-buckets":
+            capacity = _CompactBatchCapacity(
+                lanes=_finite_lane_capacity(
+                    len(compatible),
+                    capacity.lanes,
+                ),
+                vectors=_finite_vector_capacity(
+                    compatible[0].vectors.vector_count,
+                    capacity.vectors,
+                ),
+                active=capacity.active,
+            )
+        return _plan_compact_submissions(
+            [ticket.vectors for ticket in compatible],
+            policy=self._policy,
+            batch_byte_estimator=estimate_submission,
+            capacity=capacity,
         )
+
+    def _prepare_submission(
+        self,
+        submission: tuple[_DavidsonApplicationTicket, ...],
+        planned: _CompactSubmission,
+    ) -> _CompactBatch:
+        prepared_batch = _CompactBatch.from_states(
+            [ticket.vectors for ticket in submission],
+            policy=self._policy,
+            lane_capacity=(
+                None if planned.capacity is None else planned.capacity.lanes
+            ),
+            vector_capacity=(
+                None if planned.capacity is None else planned.capacity.vectors
+            ),
+            active_capacity=(
+                None if planned.capacity is None else planned.capacity.active
+            ),
+        )
+        complete_transient_bytes = (
+            PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                [ticket.operator for ticket in submission],
+                prepared_batch,
+            )
+        )
+        runtime_observer = self._observer(submission[0])
+        if runtime_observer is not None:
+            runtime_observer.record_peak_memory(
+                "peak_temporary_bytes",
+                complete_transient_bytes,
+            )
+        return prepared_batch
+
+    def _submit(
+        self,
+        submission: tuple[_DavidsonApplicationTicket, ...],
+        prepared_batch: _CompactBatch,
+    ) -> tuple[
+        int,
+        dict[str, _CompactLaneState],
+        dict[str, Exception],
+    ]:
+        submission_index = self._submission_index
+        self._submission_index += 1
+        self._notify_submission(
+            "started",
+            submission_index,
+            submission,
+            prepared_batch,
+            {},
+        )
+        submission_failures: dict[str, Exception] = {}
+        accepted_actions: dict[str, _CompactLaneState] = {}
+        try:
+            batch_actions, submission_failures = self._apply_submission(
+                submission,
+                prepared_batch,
+            )
+            for ticket in submission:
+                applied = batch_actions.get(ticket.lane_id)
+                if applied is None:
+                    continue
+                accepted_actions[ticket.lane_id] = applied
+                if ticket.purpose == "basis":
+                    add_observed_work(
+                        ticket.observer,
+                        {
+                            "davidson_hv_new_vectors": (
+                                ticket.vectors.vector_count
+                            )
+                        },
+                    )
+        except Exception as error:
+            failure = _detached_failure(error)
+            submission_failures.update(
+                {ticket.lane_id: failure for ticket in submission}
+            )
+        return submission_index, accepted_actions, submission_failures
+
+    def _apply_submission(
+        self,
+        submission: tuple[_DavidsonApplicationTicket, ...],
+        prepared_batch: _CompactBatch,
+    ) -> tuple[dict[str, _CompactLaneState], dict[str, Exception]]:
+        if len(submission) == 1:
+            ticket = submission[0]
+            applied = ticket.operator._apply_compact(
+                ticket.vectors,
+                observer=ticket.observer,
+                policy=self._policy,
+                prepared_batch=prepared_batch,
+            )
+            return {ticket.lane_id: applied}, {}
+        outcome = PeriodicKohnShamOperator._apply_compact_batch(
+            tuple(ticket.operator for ticket in submission),
+            tuple(ticket.vectors for ticket in submission),
+            observer=self._observer(submission[0]),
+            policy=self._policy,
+            prepared_batch=prepared_batch,
+        )
+        actions = {
+            ticket.lane_id: outcome.actions[index]
+            for index, ticket in enumerate(submission)
+            if index in outcome.actions
+        }
+        failures = {
+            submission[index].lane_id: error
+            for index, error in outcome.failures.items()
+        }
+        return actions, failures
+
+    def _notify_submission(
+        self,
+        status: str,
+        submission_index: int,
+        submission: tuple[_DavidsonApplicationTicket, ...],
+        prepared_batch: _CompactBatch,
+        failures: dict[str, Exception],
+    ) -> None:
+        if self._submission_callback is not None:
+            self._submission_callback(
+                status,
+                submission_index,
+                submission,
+                prepared_batch,
+                failures,
+            )
+
 
 
 @dataclass(frozen=True)
@@ -2052,4 +2154,3 @@ def solve_periodic_eigenproblem(
     )
     engine = _DavidsonEngine(scheduler=_DavidsonScheduler())
     return engine.solve([request]).result_for(lane_id)
-
