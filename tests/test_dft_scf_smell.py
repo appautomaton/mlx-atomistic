@@ -50,7 +50,11 @@ def test_hpsi_shape_profile_ignores_started_events_and_selects_one_tail() -> Non
         {
             "event": "kpoint_batch",
             "status": "started",
+            "scf_iteration": 1,
+            "batch_index": 0,
+            "elapsed_seconds": 1.0,
             "logical_vector_counts": [2],
+            "purposes": ["correction"],
             "lane_capacity": 8,
             "vector_count": 16,
         },
@@ -58,11 +62,15 @@ def test_hpsi_shape_profile_ignores_started_events_and_selects_one_tail() -> Non
             {
                 "event": "kpoint_batch",
                 "status": "completed",
+                "scf_iteration": 1,
+                "batch_index": index,
+                "elapsed_seconds": 1.25 if index == 0 else 2.0 + index,
                 "logical_vector_counts": [2],
+                "purposes": ["correction"],
                 "lane_capacity": 8,
                 "vector_count": 16,
             }
-            for _ in range(4)
+            for index in range(4)
         ],
         {
             "event": "completion",
@@ -75,6 +83,20 @@ def test_hpsi_shape_profile_ignores_started_events_and_selects_one_tail() -> Non
     assert profile["baseline_calls"] == 4
     assert profile["baseline_logical_vector_equivalents"] == 8
     assert profile["baseline_submitted_vector_equivalents"] == 512
+    assert profile["purpose_totals"]["correction"] == {
+        "submissions": 4,
+        "lane_applications": 4,
+        "logical_vector_equivalents": 8,
+        "physical_lane_vector_equivalents": 64,
+        "inclusive_seconds": pytest.approx(0.25),
+        "lane_weighted_seconds": pytest.approx(0.25),
+    }
+    assert profile["scf_iteration_purpose_totals"] == [
+        {
+            "scf_iteration": 1,
+            "purpose_totals": profile["purpose_totals"],
+        }
+    ]
     assert profile["selected_tail_capacity"] == {"lanes": 1, "vectors": 4}
 
 
@@ -84,7 +106,11 @@ def test_hpsi_shape_profile_stops_when_no_tail_meets_reduction_gate() -> None:
             {
                 "event": "kpoint_batch",
                 "status": "completed",
+                "scf_iteration": 1,
+                "batch_index": 0,
+                "elapsed_seconds": 1.0,
                 "logical_vector_counts": [16] * 8,
+                "purposes": ["initial"] * 8,
                 "lane_capacity": 8,
                 "vector_count": 16,
             }

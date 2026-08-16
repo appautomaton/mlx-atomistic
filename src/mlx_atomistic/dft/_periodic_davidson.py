@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 import mlx.core as mx
 import numpy as np
@@ -460,7 +461,7 @@ class _DavidsonApplicationTicket:
     token: _FixedHamiltonianToken
     vectors: _CompactLaneState
     observer: RuntimeObserver | None
-    purpose: str = "basis"
+    purpose: Literal["initial", "correction", "direct_validation"] = "initial"
     capture_orbital_density: bool = False
 
 
@@ -711,7 +712,7 @@ class _DavidsonScheduler:
 
     @staticmethod
     def _validate_ticket(ticket: _DavidsonApplicationTicket) -> mx.array:
-        if ticket.purpose not in {"basis", "direct_validation"}:
+        if ticket.purpose not in {"initial", "correction", "direct_validation"}:
             msg = "Davidson application purpose is invalid"
             raise ValueError(msg)
         if type(ticket.capture_orbital_density) is not bool or (
@@ -878,7 +879,7 @@ class _DavidsonScheduler:
                 if applied is None:
                     continue
                 accepted_actions[ticket.lane_id] = applied
-                if ticket.purpose == "basis":
+                if ticket.purpose != "direct_validation":
                     add_observed_work(
                         ticket.observer,
                         {
@@ -1417,7 +1418,7 @@ class _DavidsonLaneRequest:
 class _DavidsonPendingAction:
     """One scheduled Davidson action and the state needed to consume it."""
 
-    purpose: str
+    purpose: Literal["correction", "direct_validation"]
     vectors: _CompactLaneState
     reused_width: int = 0
     ritz_pair: _DavidsonRitzPair | None = None
@@ -1543,7 +1544,7 @@ class _DavidsonEngine:
         progress: _DavidsonLaneProgress,
         vectors: _CompactLaneState,
         *,
-        purpose: str = "basis",
+        purpose: Literal["initial", "correction", "direct_validation"] = "initial",
     ) -> _DavidsonApplicationTicket:
         request = progress.request
         return _DavidsonApplicationTicket(
@@ -2303,11 +2304,7 @@ class _DavidsonEngine:
         return _DavidsonEngine._ticket(
             progress,
             pending.vectors,
-            purpose=(
-                "direct_validation"
-                if pending.purpose == "direct_validation"
-                else "basis"
-            ),
+            purpose=pending.purpose,
         )
 
     def _consume_pending_waves(

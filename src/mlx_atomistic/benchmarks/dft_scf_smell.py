@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -27,6 +27,7 @@ from mlx_atomistic.dft import (
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
 SCHEMA = "mlx-atomistic.dft-scf-smell.v1"
+type _HpsiSubmissionSignature = tuple[tuple[int, ...], tuple[str, ...], int, int]
 
 
 def _positive_integer(value: str) -> int:
@@ -81,24 +82,107 @@ def _owner_points(
     return owners[:representatives]
 
 
-def _hpsi_shape_profile(events: Sequence[dict[str, object]]) -> dict[str, object]:
-    """Summarize completed Hpsi submissions and select one bounded tail shape."""
+def _hpsi_purpose_totals(
+    submissions: Sequence[Mapping[str, object]],
+) -> dict[str, dict[str, int | float]]:
+    """Aggregate logical work, physical capacity, and time by Hpsi purpose."""
 
-    signatures: Counter[tuple[tuple[int, ...], int, int]] = Counter()
+    purpose_totals: dict[str, dict[str, int | float]] = {}
+    for row in submissions:
+        purposes = [str(value) for value in row["purposes"]]
+        logical = [int(value) for value in row["logical_vector_counts"]]
+        count = int(row["count"])
+        seconds = float(row["seconds"])
+        lane_count = len(purposes)
+        for purpose in sorted(set(purposes)):
+            lane_indices = [
+                index for index, value in enumerate(purposes) if value == purpose
+            ]
+            totals = purpose_totals.setdefault(
+                purpose,
+                {
+                    "submissions": 0,
+                    "lane_applications": 0,
+                    "logical_vector_equivalents": 0,
+                    "physical_lane_vector_equivalents": 0,
+                    "inclusive_seconds": 0.0,
+                    "lane_weighted_seconds": 0.0,
+                },
+            )
+            totals["submissions"] += count
+            totals["lane_applications"] += count * len(lane_indices)
+            totals["logical_vector_equivalents"] += count * sum(
+                logical[index] for index in lane_indices
+            )
+            totals["physical_lane_vector_equivalents"] += (
+                count * len(lane_indices) * int(row["physical_vector_capacity"])
+            )
+            totals["inclusive_seconds"] += seconds
+            totals["lane_weighted_seconds"] += (
+                0.0 if lane_count == 0 else seconds * len(lane_indices) / lane_count
+            )
+    return purpose_totals
+
+
+def _hpsi_shape_profile(events: Sequence[dict[str, object]]) -> dict[str, object]:
+    """Summarize Hpsi purpose, timing, and shape for bounded diagnostics."""
+
+    started_at: dict[tuple[int, int], float] = {}
+    signatures: Counter[_HpsiSubmissionSignature] = Counter()
+    signature_seconds: dict[_HpsiSubmissionSignature, float] = {}
+    iteration_submissions: dict[int, list[dict[str, object]]] = {}
     for event in events:
-        if event.get("event") != "kpoint_batch" or event.get("status") != "completed":
+        if event.get("event") != "kpoint_batch":
+            continue
+        submission_key = (int(event["scf_iteration"]), int(event["batch_index"]))
+        if event.get("status") == "started":
+            started_at[submission_key] = float(event["elapsed_seconds"])
+            continue
+        if event.get("status") != "completed":
             continue
         logical = tuple(int(value) for value in event["logical_vector_counts"])
-        signatures[(logical, int(event["lane_capacity"]), int(event["vector_count"]))] += 1
+        purposes = tuple(str(value) for value in event["purposes"])
+        if len(purposes) != len(logical):
+            msg = "Hpsi submission purposes must match its logical lanes"
+            raise ValueError(msg)
+        signature = (
+            logical,
+            purposes,
+            int(event["lane_capacity"]),
+            int(event["vector_count"]),
+        )
+        signatures[signature] += 1
+        started = started_at.pop(submission_key, None)
+        seconds = 0.0
+        if started is not None:
+            seconds = max(float(event["elapsed_seconds"]) - started, 0.0)
+            signature_seconds[signature] = signature_seconds.get(
+                signature,
+                0.0,
+            ) + seconds
+        iteration_submissions.setdefault(submission_key[0], []).append(
+            {
+                "logical_vector_counts": logical,
+                "purposes": purposes,
+                "physical_vector_capacity": int(event["vector_count"]),
+                "count": 1,
+                "seconds": seconds,
+            }
+        )
     submissions = [
         {
             "logical_vector_counts": list(logical),
+            "purposes": list(purposes),
             "logical_lane_count": len(logical),
             "physical_lane_capacity": lanes,
             "physical_vector_capacity": vectors,
             "count": count,
+            "seconds": signature_seconds.get(
+                (logical, purposes, lanes, vectors),
+                0.0,
+            ),
         }
-        for (logical, lanes, vectors), count in sorted(signatures.items())
+        for (logical, purposes, lanes, vectors), count in sorted(signatures.items())
     ]
     baseline_calls = sum(int(row["count"]) for row in submissions)
     baseline_submitted = sum(
@@ -112,6 +196,7 @@ def _hpsi_shape_profile(events: Sequence[dict[str, object]]) -> dict[str, object
         * int(row["count"])
         for row in submissions
     )
+    purpose_totals = _hpsi_purpose_totals(submissions)
     candidates: list[dict[str, int | float | bool]] = []
     for tail_lanes in (1, 2, 4):
         for tail_vectors in (4, 8, 16):
@@ -166,6 +251,14 @@ def _hpsi_shape_profile(events: Sequence[dict[str, object]]) -> dict[str, object
         "baseline_calls": baseline_calls,
         "baseline_logical_vector_equivalents": logical_vectors,
         "baseline_submitted_vector_equivalents": baseline_submitted,
+        "purpose_totals": purpose_totals,
+        "scf_iteration_purpose_totals": [
+            {
+                "scf_iteration": iteration,
+                "purpose_totals": _hpsi_purpose_totals(rows),
+            }
+            for iteration, rows in sorted(iteration_submissions.items())
+        ],
         "tail_candidates": candidates,
         "selected_tail_capacity": (
             None

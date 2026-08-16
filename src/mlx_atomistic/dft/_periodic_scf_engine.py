@@ -853,6 +853,7 @@ class _PeriodicSCFController:
                 "batch_size": len(tickets),
                 "lane_capacity": batch.lane_capacity,
                 "lane_ids": [ticket.lane_id for ticket in tickets],
+                "purposes": [ticket.purpose for ticket in tickets],
                 "reduced_kpoints": [
                     list(self.setup.kpoint_mesh.points[index].vector) for index in explicit_indices
                 ],

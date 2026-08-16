@@ -1023,6 +1023,12 @@ def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
         event["status"] for event in events
     ].count("completed")
     assert any(event["batch_size"] == 2 for event in events)
+    assert {purpose for event in events for purpose in event["purposes"]} == {
+        "initial",
+        "correction",
+        "direct_validation",
+    }
+    assert all(len(event["purposes"]) == event["batch_size"] for event in events)
     assert all("padding_elements" in event for event in events)
     assert all(
         event["estimated_transient_bytes"] >= event["compact_batch_transient_bytes"]
