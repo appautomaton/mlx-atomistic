@@ -252,6 +252,23 @@ with a 3.24% median reduction from 1.3702 to 1.3258 ms/step. This gain applies
 only when center-of-mass motion removal is enabled; it is not attributed to JAC
 or GPCRmd.
 
+Three execution-layout follow-ups did not pass. Generation-owned arrays for
+stable Interaction32 parameters and dispatch counts regressed a fixed-input JAC
+median by 3.17%. Transient spatial packing made the interaction itself about
+0.086 ms faster, but pack and scatter added about 0.50 ms; a same-schedule ABBA
+regressed in both positions. Finally, assigning Direct Space and reciprocal PME
+to separate MLX Metal streams increased fixed-input JAC calls by 27--65%.
+OpenMM's persistent records and separate PME stream remain architectural
+references, but neither maps to a per-step MLX copy or manual stream split.
+
+Constraint dispatch fusion also reached its boundary. Fixed-input attribution
+put the theoretical SETTLE/SHAKE launch-saving ceiling near 0.14--0.15 ms/step
+on JAC and GPCRmd. A combined Metal kernel produced bitwise-identical deltas,
+but complete 750-step ABBA runs did not retain that ceiling. GPCRmd's candidate
+median regressed 0.31%, while JAC's warm adjacent pair regressed 0.17%; the
+larger JAC median movement was a first-control power-state artifact. Separate
+family kernels therefore remain the production path under MLX's lazy graph.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.
