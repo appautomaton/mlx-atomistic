@@ -112,6 +112,7 @@ inverse and forward FFTs as 95.17% of the complete local-FFT median.
 | Multi-lane grouped CholeskyQR2 | The bounded eight-representative run regressed from 4.801 to 5.773 seconds because small grouped Gram operations were slower. | 2026-08-16 diagnostic |
 | Unconditional CholeskyQR1 | The bounded gate improved, but the complete run reached 80 cycles without meeting the final residual. | 2026-08-16 diagnostic |
 | Newton-Schulz orthogonal refinement | Cholesky normalizer calls fell from 703 to 525, but bounded median wall regressed from 5.816 to 5.868 seconds. | 2026-08-16 diagnostic |
+| Quantum ESPRESSO-style smooth Davidson denominator | The bounded adaptive run increased SCF cycles from 13 to 16, correction vectors from 5,349 to 5,999, and total Hpsi vectors from 7,717 to 8,895. A lower raw wall time was rejected as device-state drift because algorithmic work regressed. | 2026-08-16 diagnostic |
 | Smaller Davidson subspace, RMM-DIIS, and converged-subspace locking | Iteration counts or complete bounded wall increased. | pre-`2a56533` scheduler experiments |
 | One-dimensional compact Hpsi Metal boundary | Fixed-density wall improved 14.49%, narrowly below the frozen 14.72% dispersion gate. The candidate was removed. | `831e077` |
 | Three-dimensional scatter/gather Metal boundary | The isolated Hpsi boundary improved 17.33%, but complete fixed-density wall improved only 6.40%, below the same retention gate. The candidate was removed. | `9cd4ef6` |
