@@ -993,6 +993,44 @@ def test_interaction32_two_level_schedule_switches_before_outer_rebuild(monkeypa
 
 
 @pytest.mark.gpu
+def test_interaction32_two_level_admission_rejects_short_generations(monkeypatch):
+    """Repeated short generations return to the production outer builder."""
+
+    monkeypatch.setattr(
+        "mlx_atomistic.neighbors._INTERACTION32_TWO_LEVEL_MIN_ATOMS",
+        1,
+    )
+    positions = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    ).reshape((-1, 3)).astype(np.float32)
+    positions = 4.0 + 2.0 * positions
+    manager = NeighborListManager(
+        Cell.cubic(40.0),
+        cutoff=9.0,
+        skin=5.5,
+        check_interval=1,
+        backend="mlx_interaction32",
+    )
+    manager.update(positions)
+
+    moved = positions.copy()
+    for _ in range(3):
+        moved = moved.copy()
+        moved[0, 0] += 2.76
+        manager.update(moved)
+
+    assert manager.rebuild_count == 4
+    assert manager._interaction32_two_level_admitted is False
+    assert manager._interaction32_inner_neighbor_list is None
+    assert manager.neighbor_list is manager._interaction32_outer_neighbor_list
+    assert manager.neighbor_list is not None
+    assert manager.neighbor_list.stats.compaction_backend == (
+        "metal_interaction32_device_builder"
+    )
+
+
+@pytest.mark.gpu
 def test_fused_half32_nbfix_force_matches_production_tiles():
     """Fused 32-atom work applies the production NBFIX type table."""
 

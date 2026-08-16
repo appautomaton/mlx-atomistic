@@ -90,6 +90,8 @@ _INTERACTION32_TWO_LEVEL_MIN_ATOMS = 80_000
 _INTERACTION32_TWO_LEVEL_CUTOFF = 9.0
 _INTERACTION32_TWO_LEVEL_OUTER_SKIN = 5.5
 _INTERACTION32_TWO_LEVEL_INNER_SKIN = 3.0
+_INTERACTION32_TWO_LEVEL_ADMISSION_GENERATIONS = 3
+_INTERACTION32_TWO_LEVEL_MIN_GENERATION_UPDATES = 24
 # One Metal thread traverses all coarse blocks owned by a cell. Keep unusually
 # concentrated cells on the parallel compact-and-sort path so pathological
 # occupancy cannot serialize the direct-grouped scatter.
@@ -1008,6 +1010,30 @@ class NeighborListManager:
         repr=False,
         compare=False,
     )
+    _interaction32_two_level_admitted: bool | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction32_two_level_generation_updates: int = field(
+        default=0,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction32_two_level_observed_updates: int = field(
+        default=0,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction32_two_level_observed_generations: int = field(
+        default=0,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.check_interval <= 0:
@@ -1038,6 +1064,7 @@ class NeighborListManager:
 
         if (
             self.backend == "mlx_interaction32"
+            and self._interaction32_two_level_admitted is not False
             and atom_count >= _INTERACTION32_TWO_LEVEL_MIN_ATOMS
             and self.check_interval == 1
             and np.isclose(self.cutoff, _INTERACTION32_TWO_LEVEL_CUTOFF)
@@ -1045,6 +1072,28 @@ class NeighborListManager:
         ):
             return _INTERACTION32_TWO_LEVEL_INNER_SKIN
         return None
+
+    def _record_interaction32_two_level_updates(self, count: int) -> None:
+        """Record updates covered by the current two-level generation."""
+
+        if count < 0:
+            raise ValueError("interaction32 update count must be non-negative")
+        if self._interaction32_inner_neighbor_list is not None:
+            self._interaction32_two_level_generation_updates += count
+
+    def _finish_interaction32_two_level_generation(self) -> None:
+        """Disable two-level schedules when observed generations are too short."""
+
+        updates = self._interaction32_two_level_generation_updates
+        if self._interaction32_inner_neighbor_list is not None and updates > 0:
+            self._interaction32_two_level_observed_updates += updates
+            self._interaction32_two_level_observed_generations += 1
+            observed = self._interaction32_two_level_observed_generations
+            if observed >= _INTERACTION32_TWO_LEVEL_ADMISSION_GENERATIONS:
+                mean_updates = self._interaction32_two_level_observed_updates / observed
+                if mean_updates < _INTERACTION32_TWO_LEVEL_MIN_GENERATION_UPDATES:
+                    self._interaction32_two_level_admitted = False
+        self._interaction32_two_level_generation_updates = 0
 
     def _select_interaction32_schedule(self) -> None:
         """Select the inner schedule until its displacement margin expires."""
@@ -1151,6 +1200,7 @@ class NeighborListManager:
         """Force a neighbor-list rebuild from current positions."""
 
         self._release_pending_metal_cache()
+        self._finish_interaction32_two_level_generation()
         start = perf_counter()
         neighbor_list = (
             self._build_interaction32_neighbor_list(positions)
@@ -1322,6 +1372,8 @@ class NeighborListManager:
         self._interaction32_inner_threshold = (
             None if inner_skin is None else 0.5 * inner_skin
         )
+        if inner_neighbor_list is not None:
+            self._interaction32_two_level_admitted = True
         neighbor_list = (
             outer_neighbor_list if inner_neighbor_list is None else inner_neighbor_list
         )
@@ -1355,6 +1407,9 @@ class NeighborListManager:
         start = perf_counter()
         try:
             self._release_pending_metal_cache()
+            self._record_interaction32_two_level_updates(
+                int(self.neighbor_list is not None)
+            )
             if self.needs_rebuild(positions):
                 return self.rebuild(positions)
             if self.neighbor_list is None:
@@ -1369,6 +1424,7 @@ class NeighborListManager:
         self,
         max_displacement: mx.array,
         admissible: mx.array,
+        steps: int = 1,
     ) -> bool:
         """Commit one device-measured integration block when its list stayed valid.
 
@@ -1377,6 +1433,8 @@ class NeighborListManager:
                 in the proposed block.
             admissible: Scalar boolean that is true only when every proposed
                 position was finite and stayed within the rebuild threshold.
+            steps: Number of integration updates represented by the block.
+                Defaults to ``1``.
 
         Returns:
             ``True`` when the current neighbor list safely covers the whole
@@ -1385,6 +1443,7 @@ class NeighborListManager:
 
         start = perf_counter()
         try:
+            self._record_interaction32_two_level_updates(steps)
             mx.eval(max_displacement, admissible)
             if not bool(np.asarray(admissible)):
                 return False
@@ -1455,6 +1514,15 @@ class NeighborListManager:
         )
         candidate._interaction32_capacity = self._interaction32_capacity
         candidate._interaction32_topology = self._interaction32_topology
+        candidate._interaction32_two_level_admitted = (
+            self._interaction32_two_level_admitted
+        )
+        candidate._interaction32_two_level_observed_updates = (
+            self._interaction32_two_level_observed_updates
+        )
+        candidate._interaction32_two_level_observed_generations = (
+            self._interaction32_two_level_observed_generations
+        )
         candidate.rebuild(positions)
         return candidate
 
@@ -1511,6 +1579,18 @@ class NeighborListManager:
             candidate._interaction32_inner_neighbor_list
         )
         self._interaction32_inner_threshold = candidate._interaction32_inner_threshold
+        self._interaction32_two_level_admitted = (
+            candidate._interaction32_two_level_admitted
+        )
+        self._interaction32_two_level_generation_updates = (
+            candidate._interaction32_two_level_generation_updates
+        )
+        self._interaction32_two_level_observed_updates = (
+            candidate._interaction32_two_level_observed_updates
+        )
+        self._interaction32_two_level_observed_generations = (
+            candidate._interaction32_two_level_observed_generations
+        )
 
 
 def build_neighbor_list(

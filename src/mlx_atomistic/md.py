@@ -4154,6 +4154,7 @@ def _simulate_nvt(
                 if neighbor_manager._admit_block(
                     block_max_displacement,
                     block_admissible,
+                    n,
                 ):
                     pos = proposed_pos
                     vel = proposed_vel
