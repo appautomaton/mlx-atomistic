@@ -368,6 +368,14 @@ tokens, validated buffer donation, indirect dispatch, and the same fail-closed
 overflow contract. It must not create a private command queue or mutable global
 device state.
 
+Fresh clean host-clock attribution does not cross that gate. On three
+independent 1,500-step Low Power Mode runs, main-thread CPU was 0.408 ms/step on
+5DFR and 0.464 ms/step on JAC, or 31.9% and 10.3% of wall respectively. Those
+values include Python, MLX graph construction, dispatch, and synchronous host
+work and overlap GPU execution. The production-scale JAC ceiling is therefore
+too small and too broad to justify a nanobind/C++ boundary without a subsequent
+trace proving host queue starvation or a specific non-overlapped route.
+
 ## Promotion Gates
 
 The candidate advances only in this order:

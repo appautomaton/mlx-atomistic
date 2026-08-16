@@ -149,19 +149,31 @@ and a balanced control/candidate/candidate/control order. It is not a same-date
 OpenMM ratio. Reference-engine comparisons must use a matched
 manifest, platform, precision, protocol, power state, and measurement window.
 
-A fresh current-main snapshot on commit `503b571` measured sustained absolute
+A fresh current-main snapshot on commit `1bd476b` measured sustained absolute
 throughput under Low Power Mode. Each row used a 75-step rehearsal, three
 independent repeats, ten warmup steps, and 750 measured steps:
 
-| Workload | Atoms | Current wall | Current throughput | Timing spread |
+| Workload | Atoms | Wall | Throughput | Timing spread |
 | --- | ---: | ---: | ---: | ---: |
-| 5DFR | 23,558 | 4.8385 ms/step | 71.43 ns/day | 7.31% |
-| JAC 4-cell | 94,232 | 12.0885 ms/step | 28.59 ns/day | 7.15% |
-| GPCRmd 729 | 92,001 | 12.9714 ms/step | 26.64 ns/day | 4.64% |
+| 5DFR | 23,558 | 1.2533 ms/step | 275.75 ns/day | 1.60% |
+| JAC 4-cell | 94,232 | 4.2450 ms/step | 81.41 ns/day | 1.23% |
+| TIP3P 30k | 30,000 | 1.5720 ms/step | 219.85 ns/day | 1.11% |
+| TIP3P 90k | 90,000 | 4.3517 ms/step | 79.42 ns/day | 6.81% |
+| ApoA1 | 92,224 | 4.8183 ms/step | 71.73 ns/day | 5.18% |
+| GPCRmd 729 | 92,001 | 5.3984 ms/step | 64.02 ns/day | 0.97% |
 
-All three rows passed the 10% spread gate and every runtime correctness check.
-They describe the current throttled machine state, not a cross-date regression
-or an expected peak-throughput claim.
+Five rows passed in the release-suite run. JAC narrowly missed the spread gate
+at 10.42% because its first sample was slow; an immediate three-repeat
+supplement produced the passing row above. These numbers describe one
+throttled measurement window, not an expected peak-throughput claim.
+
+A separate manifest-matched JAC comparison in the same Low Power Mode window
+used 94,232 atoms, a 4 fs timestep, a 9 A cutoff, a `128x128x64` PME mesh, the
+same constraints and seed, and 750 measured steps. MLX measured 4.6834 ms/step
+and OpenMM OpenCL measured 2.4161 ms/step across two independent processes per
+engine. The remaining matched wall ratio was `1.9385x`, so MLX delivered 51.6%
+of OpenMM throughput on that protocol. This ratio is not transferred to any
+other row or power state.
 
 The promotion follow-up added force parity and a 750-step trajectory smoke gate
 for all six release systems. Every trajectory passed with no fallback and
@@ -283,6 +295,41 @@ sampled forces by only about 3e-7 relative to the largest force, but fixed-input
 timing regressed in both adjacent JAC comparisons and was unstable on GPCRmd.
 The precise `metal::exp` remains canonical because the approximation supplied no
 portable performance benefit.
+
+### Host and native-extension boundary
+
+The charged-PME runtime now records main-thread and whole-process CPU clocks
+around the clean measured interval. CPU clocks exclude time blocked on Metal
+completion, but overlap GPU execution. They are upper bounds on host activity,
+not additive pieces of trajectory wall and not direct speedup estimates.
+
+After a reported device-state change, a fresh Low Power Mode boundary used
+three independent 1,500-step repeats and twenty warmup steps:
+
+| Workload | Wall | Main-thread CPU | Main-thread/wall | Process CPU | Process/wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5DFR | 1.2883 ms/step | 0.4082 ms/step | 31.9% | 0.6376 ms/step | 49.9% |
+| JAC 4-cell | 4.4883 ms/step | 0.4635 ms/step | 10.3% | 0.7324 ms/step | 16.3% |
+
+The nearly fixed main-thread cost matters proportionally on the smaller 5DFR
+system, but it is not the primary production-scale JAC bottleneck. The JAC
+main-thread value includes Python, MLX graph construction, kernel submission,
+and synchronous MLX host work; eliminating all of it would still cap the
+theoretical gain near 10%, while a real C++ primitive could remove only part of
+that value. A Python `cProfile` run also assigned Metal completion waits inside
+`_needs_rebuild_mlx_scalar` to its Python caller, demonstrating why ordinary
+cumulative profiles cannot separate Python from device time. These measurements
+do not authorize a nanobind/C++ extension. Revisit that boundary only when a
+clean trace identifies host queue starvation or a specific Python/MLX graph
+route with a material, non-overlapped wall ceiling.
+
+One feature-specific Direct Space screen followed. GPCRmd has 83 atom types but
+only six participate in its five NBFIX overrides. Compressing the two dense
+NBFIX tables from `83x83` to `7x7` preserved the lookup contract, but a
+`control, candidate, candidate, control` 750-step run was neutral: the candidate
+was 0.16% slower in the first adjacent pair and 0.17% faster in the second. All
+arms passed, and the candidate was removed. The table footprint was not a
+measurable bottleneck on this workload; compaction is not the next Direct lever.
 
 ## Measurement Rules
 

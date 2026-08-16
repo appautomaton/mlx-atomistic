@@ -124,6 +124,14 @@ chaotic trajectories can separate while both runs remain individually valid.
 Each raw runtime must still pass its own finite-state, constraint, topology,
 neighbor, and execution checks.
 
+Clean charged-PME payloads also record `main_thread_cpu_seconds` and
+`process_cpu_seconds` for the measured interval, plus each value divided by
+wall time. The main-thread clock includes Python and synchronous MLX host work.
+The process clock additionally includes MLX runtime and driver worker threads.
+Both clocks exclude blocked CPU time and can overlap Metal execution, so they
+are host-activity upper bounds rather than additive stage timings or predicted
+C++ speedups.
+
 Keep power mode, thermal state, neighbor backend, and reporting cadence fixed.
 Low Power Mode is valid for a local relative comparison when it remains
 unchanged for both runs. Its absolute throughput must not be compared with a

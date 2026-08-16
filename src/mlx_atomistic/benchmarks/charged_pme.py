@@ -407,6 +407,8 @@ def runtime_payload(
             rebuild_profile_context = _profile_mlx_cell_tile_rebuilds()
         else:
             rebuild_profile_context = _profile_interaction32_rebuilds()
+        measured_thread_cpu_started = time.thread_time()
+        measured_process_cpu_started = time.process_time()
         measured_started = time.perf_counter()
         with rebuild_profile_context as rebuild_profiler:
             measured_result = simulate_nvt(
@@ -443,6 +445,12 @@ def runtime_payload(
             measured_result.final_state.forces,
         )
         measured_seconds = time.perf_counter() - measured_started
+        measured_main_thread_cpu_seconds = (
+            time.thread_time() - measured_thread_cpu_started
+        )
+        measured_process_cpu_seconds = (
+            time.process_time() - measured_process_cpu_started
+        )
         arrays = (
             np.asarray(measured_result.sampled_positions),
             np.asarray(measured_result.sampled_velocities),
@@ -605,6 +613,18 @@ def runtime_payload(
                 "warmup_seconds": warmup_seconds,
                 "measured_seconds": measured_seconds,
                 "seconds_per_measured_step": measured_seconds / steps,
+                # CPU clocks exclude time blocked on Metal completion. Main-thread
+                # CPU is an upper bound on Python plus synchronous MLX host work;
+                # process CPU also includes runtime and driver worker threads. The
+                # values overlap GPU execution and therefore are not additive to wall.
+                "main_thread_cpu_seconds": measured_main_thread_cpu_seconds,
+                "main_thread_cpu_to_wall_ratio": (
+                    measured_main_thread_cpu_seconds / measured_seconds
+                ),
+                "process_cpu_seconds": measured_process_cpu_seconds,
+                "process_cpu_to_wall_ratio": (
+                    measured_process_cpu_seconds / measured_seconds
+                ),
                 "plan_setup_seconds": final_plan["setup_seconds"],
                 "force_evaluation_seconds": measured_result.nonbonded_report.get(
                     "force_evaluation_wall_seconds"
