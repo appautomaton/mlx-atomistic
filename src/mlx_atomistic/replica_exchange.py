@@ -9,19 +9,18 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.force_evaluation import ForceTerm, _energy_forces_from_terms
 from mlx_atomistic.forcefields import NonbondedPotential, SoftCoreNonbondedPotential
 from mlx_atomistic.md import (
-    DistanceConstraints,
-    ForceTerm,
     LangevinThermostat,
-    NeighborListManager,
     RuntimeReporter,
     SimulationConfig,
     SimulationState,
-    _energy_forces_from_terms,
     simulate_nvt,
 )
+from mlx_atomistic.neighbors import NeighborListManager
 
 
 @dataclass(frozen=True)

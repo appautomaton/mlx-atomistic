@@ -10,8 +10,8 @@ import mlx.core as mx
 
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell
+from mlx_atomistic.force_evaluation import ForceTerm
 from mlx_atomistic.md import (
-    ForceTerm,
     LangevinThermostat,
     NVTResult,
     RuntimeReporter,

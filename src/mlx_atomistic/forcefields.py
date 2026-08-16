@@ -9,6 +9,13 @@ from types import NotImplementedType
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic._nonbonded_state import (
+    _left_pair_csr as _build_left_pair_csr,
+)
+from mlx_atomistic._nonbonded_state import (
+    _NonbondedConstructionSpec,
+    _prepare_nonbonded_state,
+)
 from mlx_atomistic.charmm_terms import (
     CHARMMCMAPPotential as CHARMMCMAPPotential,
 )
@@ -29,7 +36,6 @@ from mlx_atomistic.gbsa import GBSAForcePotential as GBSAForcePotential
 from mlx_atomistic.interaction_engine import (
     _DeviceFusedHalfSchedule32,
     _fused_half32_direct_force_only,
-    _interaction32_topology_digest,
 )
 from mlx_atomistic.metal_kernels import (
     _fused_bonded_force_only,
@@ -52,7 +58,6 @@ from mlx_atomistic.nonbonded import (
     ForceScopeReport,
     NonbondedBackend,
     NonbondedElectrostatics,
-    NonbondedExecutionConfig,
     choose_nonbonded_backend,
     dense_combined_energy_forces,
     diagonal_strain_virial,
@@ -172,34 +177,10 @@ def _norm2(vector: mx.array) -> mx.array:
     return mx.maximum(mx.sum(vector * vector, axis=-1), 1e-12)
 
 
-def _encoded_pairs(pairs: set[tuple[int, int]], n_atoms: int) -> np.ndarray:
-    if not pairs:
-        return np.empty((0,), dtype=np.int64)
-    array = np.asarray(tuple(pairs), dtype=np.int64)
-    left = np.minimum(array[:, 0], array[:, 1])
-    right = np.maximum(array[:, 0], array[:, 1])
-    return np.sort(left * np.int64(n_atoms) + right)
-
-
 def _left_pair_csr(pairs: np.ndarray, n_atoms: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return offsets and right atoms grouped by normalized left atom."""
+    """Preserve the original private construction-helper import contract."""
 
-    pair_array = np.asarray(pairs, dtype=np.int32)
-    if pair_array.size == 0:
-        return (
-            np.zeros((n_atoms + 1,), dtype=np.int32),
-            np.empty((0,), dtype=np.int32),
-        )
-    left = np.minimum(pair_array[:, 0], pair_array[:, 1])
-    right = np.maximum(pair_array[:, 0], pair_array[:, 1])
-    order = np.lexsort((right, left))
-    left = left[order]
-    right = right[order]
-    counts = np.bincount(left, minlength=n_atoms)
-    offsets = np.empty((n_atoms + 1,), dtype=np.int32)
-    offsets[0] = 0
-    np.cumsum(counts, dtype=np.int64, out=offsets[1:])
-    return offsets, right.astype(np.int32, copy=False)
+    return _build_left_pair_csr(pairs, n_atoms)
 
 
 def _isin_sorted_codes(codes: np.ndarray, sorted_codes: np.ndarray) -> np.ndarray:
@@ -1021,9 +1002,7 @@ class _FusedBondedForceBinding:
                 None if corrections is None else corrections.charge_products
             ),
             correction_lj_sigma=None if corrections is None else corrections.lj_sigma,
-            correction_lj_epsilon=(
-                None if corrections is None else corrections.lj_epsilon
-            ),
+            correction_lj_epsilon=(None if corrections is None else corrections.lj_epsilon),
             correction_coulomb_constant=(
                 0.0 if corrections is None else corrections.coulomb_constant
             ),
@@ -1328,516 +1307,45 @@ class NonbondedPotential:
     _dispersion_coefficient: float = field(init=False, default=0.0, repr=False)
 
     def __post_init__(self) -> None:
-        sigma = as_mx_array(self.sigma)
-        epsilon = as_mx_array(self.epsilon)
-        charges = as_mx_array(self.charges)
-        if sigma.ndim != 1 or epsilon.ndim != 1 or charges.ndim != 1:
-            msg = "sigma, epsilon, and charges must have shape (n_atoms,)"
-            raise ValueError(msg)
-        if sigma.shape != epsilon.shape or sigma.shape != charges.shape:
-            msg = "sigma, epsilon, and charges must have matching shapes"
-            raise ValueError(msg)
-        if bool(np.any(np.asarray(sigma) <= 0.0)):
-            msg = "sigma values must be positive"
-            raise ValueError(msg)
-        if bool(np.any(np.asarray(epsilon) < 0.0)):
-            msg = "epsilon values must be non-negative"
-            raise ValueError(msg)
-        if not bool(np.all(np.isfinite(np.asarray(charges)))):
-            msg = "charges must be finite"
-            raise ValueError(msg)
-        if not np.isfinite(float(self.coulomb_constant)):
-            msg = "coulomb_constant must be finite"
-            raise ValueError(msg)
-        if self.topology is not None and self.topology.n_atoms != sigma.shape[0]:
-            msg = "topology.n_atoms must match nonbonded parameter length"
-            raise ValueError(msg)
-        if self.cutoff is not None and self.cutoff <= 0.0:
-            msg = "cutoff must be positive"
-            raise ValueError(msg)
-        if self.switch_distance is not None:
-            if self.cutoff is None:
-                msg = "switch_distance requires a cutoff"
-                raise ValueError(msg)
-            if self.switch_distance < 0.0 or self.switch_distance >= self.cutoff:
-                msg = "switch_distance must be non-negative and smaller than cutoff"
-                raise ValueError(msg)
-        if self.lj_one_four_scale < 0.0 or self.coulomb_one_four_scale < 0.0:
-            msg = "1-4 scaling factors must be non-negative"
-            raise ValueError(msg)
-        for name, value in [
-            ("lambda_lj", self.lambda_lj),
-            ("lambda_electrostatics", self.lambda_electrostatics),
-        ]:
-            if not np.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
-                msg = f"{name} must be finite and in [0, 1]"
-                raise ValueError(msg)
-        exception_pairs = np.asarray(self.exception_pairs, dtype=np.int32)
-        if exception_pairs.size == 0:
-            exception_pairs = np.empty((0, 2), dtype=np.int32)
-        if exception_pairs.ndim != 2 or exception_pairs.shape[1] != 2:
-            msg = "exception_pairs must have shape (n, 2)"
-            raise ValueError(msg)
-        if exception_pairs.size and (
-            np.any(exception_pairs < 0) or np.any(exception_pairs >= sigma.shape[0])
-        ):
-            msg = "exception_pairs contain atom indices outside [0, n_atoms)"
-            raise ValueError(msg)
-        exception_count = exception_pairs.shape[0]
-        if self.exception_charge_products is None:
-            charge_products = np.asarray([], dtype=np.float32)
-        else:
-            charge_products = np.asarray(self.exception_charge_products, dtype=np.float32)
-        if self.exception_sigma is None:
-            exception_sigma = np.asarray([], dtype=np.float32)
-        else:
-            exception_sigma = np.asarray(self.exception_sigma, dtype=np.float32)
-        if self.exception_epsilon is None:
-            exception_epsilon = np.asarray([], dtype=np.float32)
-        else:
-            exception_epsilon = np.asarray(self.exception_epsilon, dtype=np.float32)
-        for name, values in [
-            ("exception_charge_products", charge_products),
-            ("exception_sigma", exception_sigma),
-            ("exception_epsilon", exception_epsilon),
-        ]:
-            if exception_count == 0 and values.size == 0:
-                values.resize((0,), refcheck=False)
-            if values.shape != (exception_count,):
-                msg = f"{name} must have shape ({exception_count},)"
-                raise ValueError(msg)
-        if np.any(exception_sigma < 0.0) or np.any(exception_epsilon < 0.0):
-            msg = "exception sigma and epsilon values must be non-negative"
-            raise ValueError(msg)
-        nbfix_pairs = np.asarray(self.nbfix_pairs, dtype=np.int32)
-        if nbfix_pairs.size == 0:
-            nbfix_pairs = np.empty((0, 2), dtype=np.int32)
-        if nbfix_pairs.ndim != 2 or nbfix_pairs.shape[1] != 2:
-            msg = "nbfix_pairs must have shape (n, 2)"
-            raise ValueError(msg)
-        if nbfix_pairs.size and (np.any(nbfix_pairs < 0) or np.any(nbfix_pairs >= sigma.shape[0])):
-            msg = "nbfix_pairs contain atom indices outside [0, n_atoms)"
-            raise ValueError(msg)
-        nbfix_pair_set: set[tuple[int, int]] = set()
-        for left, right in nbfix_pairs.tolist():
-            if left == right:
-                msg = "nbfix_pairs must not contain self pairs"
-                raise ValueError(msg)
-            pair = (min(int(left), int(right)), max(int(left), int(right)))
-            if pair in nbfix_pair_set:
-                msg = "nbfix_pairs must not contain duplicate pairs"
-                raise ValueError(msg)
-            nbfix_pair_set.add(pair)
-        nbfix_pair_count = nbfix_pairs.shape[0]
-        nbfix_sigma = (
-            np.asarray([], dtype=np.float32)
-            if self.nbfix_sigma is None
-            else np.asarray(self.nbfix_sigma, dtype=np.float32)
-        )
-        nbfix_epsilon = (
-            np.asarray([], dtype=np.float32)
-            if self.nbfix_epsilon is None
-            else np.asarray(self.nbfix_epsilon, dtype=np.float32)
-        )
-        for name, values in [
-            ("nbfix_sigma", nbfix_sigma),
-            ("nbfix_epsilon", nbfix_epsilon),
-        ]:
-            if nbfix_pair_count == 0 and values.size == 0:
-                values.resize((0,), refcheck=False)
-            if values.shape != (nbfix_pair_count,):
-                msg = f"{name} must have shape ({nbfix_pair_count},)"
-                raise ValueError(msg)
-        if np.any(~np.isfinite(nbfix_sigma)) or np.any(nbfix_sigma <= 0.0):
-            msg = "nbfix_sigma values must be finite and positive"
-            raise ValueError(msg)
-        if np.any(~np.isfinite(nbfix_epsilon)) or np.any(nbfix_epsilon < 0.0):
-            msg = "nbfix_epsilon values must be finite and non-negative"
-            raise ValueError(msg)
-
-        nbfix_type_pairs = np.asarray(self.nbfix_type_pairs, dtype=str)
-        if nbfix_type_pairs.size == 0:
-            nbfix_type_pairs = np.empty((0, 2), dtype=str)
-        if nbfix_type_pairs.ndim != 2 or nbfix_type_pairs.shape[1] != 2:
-            msg = "nbfix_type_pairs must have shape (n, 2)"
-            raise ValueError(msg)
-        nbfix_type_count = nbfix_type_pairs.shape[0]
-        nbfix_type_sigma = (
-            np.asarray([], dtype=np.float32)
-            if self.nbfix_type_sigma is None
-            else np.asarray(self.nbfix_type_sigma, dtype=np.float32)
-        )
-        nbfix_type_epsilon = (
-            np.asarray([], dtype=np.float32)
-            if self.nbfix_type_epsilon is None
-            else np.asarray(self.nbfix_type_epsilon, dtype=np.float32)
-        )
-        for name, values in [
-            ("nbfix_type_sigma", nbfix_type_sigma),
-            ("nbfix_type_epsilon", nbfix_type_epsilon),
-        ]:
-            if nbfix_type_count == 0 and values.size == 0:
-                values.resize((0,), refcheck=False)
-            if values.shape != (nbfix_type_count,):
-                msg = f"{name} must have shape ({nbfix_type_count},)"
-                raise ValueError(msg)
-        if np.any(~np.isfinite(nbfix_type_sigma)) or np.any(nbfix_type_sigma <= 0.0):
-            msg = "nbfix_type_sigma values must be finite and positive"
-            raise ValueError(msg)
-        if np.any(~np.isfinite(nbfix_type_epsilon)) or np.any(nbfix_type_epsilon < 0.0):
-            msg = "nbfix_type_epsilon values must be finite and non-negative"
-            raise ValueError(msg)
-        if nbfix_type_count > 0 and np.any(np.char.str_len(nbfix_type_pairs) == 0):
-            msg = "nbfix_type_pairs must not contain empty type names"
-            raise ValueError(msg)
-        seen_type_pairs: set[tuple[str, str]] = set()
-        for left, right in nbfix_type_pairs.tolist():
-            pair = tuple(sorted((str(left), str(right))))
-            if pair in seen_type_pairs:
-                msg = "nbfix_type_pairs must not contain duplicate type pairs"
-                raise ValueError(msg)
-            seen_type_pairs.add(pair)
-        atom_type_ids = np.empty((0,), dtype=np.int32)
-        nbfix_type_pair_ids = np.empty((0, 2), dtype=np.int32)
-        nbfix_type_count_total = 0
-        nbfix_type_sigma_table = np.empty((0,), dtype=np.float32)
-        nbfix_type_epsilon_table = np.empty((0,), dtype=np.float32)
-        if nbfix_type_count > 0:
-            if self.atom_types is None:
-                msg = "atom_types are required when nbfix_type_pairs are provided"
-                raise ValueError(msg)
-            atom_types = np.asarray(self.atom_types, dtype=str)
-            if atom_types.shape != (sigma.shape[0],):
-                msg = "atom_types must have shape (n_atoms,)"
-                raise ValueError(msg)
-            type_to_id = {
-                atom_type: index for index, atom_type in enumerate(sorted(set(atom_types)))
-            }
-            missing_type_names = sorted(
-                {
-                    str(atom_type)
-                    for pair in nbfix_type_pairs.tolist()
-                    for atom_type in pair
-                    if str(atom_type) not in type_to_id
-                }
+        state = _prepare_nonbonded_state(
+            _NonbondedConstructionSpec(
+                sigma=self.sigma,
+                epsilon=self.epsilon,
+                charges=self.charges,
+                coulomb_constant=self.coulomb_constant,
+                cutoff=self.cutoff,
+                switch_distance=self.switch_distance,
+                topology=self.topology,
+                lj_one_four_scale=self.lj_one_four_scale,
+                coulomb_one_four_scale=self.coulomb_one_four_scale,
+                exception_pairs=self.exception_pairs,
+                exception_charge_products=self.exception_charge_products,
+                exception_sigma=self.exception_sigma,
+                exception_epsilon=self.exception_epsilon,
+                atom_types=self.atom_types,
+                nbfix_pairs=self.nbfix_pairs,
+                nbfix_sigma=self.nbfix_sigma,
+                nbfix_epsilon=self.nbfix_epsilon,
+                nbfix_type_pairs=self.nbfix_type_pairs,
+                nbfix_type_sigma=self.nbfix_type_sigma,
+                nbfix_type_epsilon=self.nbfix_type_epsilon,
+                backend=self.backend,
+                electrostatics=self.electrostatics,
+                pme_config=self.pme_config,
+                pme_plan=self.pme_plan,
+                tile_size=self.tile_size,
+                memory_budget_bytes=self.memory_budget_bytes,
+                lambda_lj=self.lambda_lj,
+                lambda_electrostatics=self.lambda_electrostatics,
+                use_dispersion_correction=self.use_dispersion_correction,
             )
-            if missing_type_names:
-                msg = "nbfix_type_pairs reference atom types absent from atom_types: " + ", ".join(
-                    missing_type_names
-                )
-                raise ValueError(msg)
-            atom_type_ids = np.asarray(
-                [type_to_id[atom_type] for atom_type in atom_types],
-                dtype=np.int32,
-            )
-            nbfix_type_pair_ids = np.asarray(
-                [
-                    [type_to_id[str(left)], type_to_id[str(right)]]
-                    for left, right in nbfix_type_pairs.tolist()
-                ],
-                dtype=np.int32,
-            )
-            nbfix_type_count_total = len(type_to_id)
-            table_size = nbfix_type_count_total * nbfix_type_count_total
-            nbfix_type_sigma_table = np.zeros((table_size,), dtype=np.float32)
-            nbfix_type_epsilon_table = np.zeros((table_size,), dtype=np.float32)
-            for pair_ids, sigma_value, epsilon_value in zip(
-                nbfix_type_pair_ids,
-                nbfix_type_sigma,
-                nbfix_type_epsilon,
-                strict=True,
-            ):
-                left_id, right_id = (int(pair_ids[0]), int(pair_ids[1]))
-                forward = left_id * nbfix_type_count_total + right_id
-                reverse = right_id * nbfix_type_count_total + left_id
-                nbfix_type_sigma_table[[forward, reverse]] = sigma_value
-                nbfix_type_epsilon_table[[forward, reverse]] = epsilon_value
-        exception_pair_set = {
-            (min(int(i), int(j)), max(int(i), int(j))) for i, j in exception_pairs.tolist()
-        }
-        correction_pair_set = set(exception_pair_set)
-        if self.topology is not None:
-            correction_pair_set.update(self.topology.exclusion_set)
-        correction_pairs = np.asarray(
-            sorted(correction_pair_set),
-            dtype=np.int32,
-        ).reshape((-1, 2))
-        excluded_one_four_pairs = set(correction_pair_set)
-        one_four_pairs = np.asarray(
-            (
-                []
-                if self.topology is None or self.coulomb_one_four_scale == 1.0
-                else sorted(self.topology.one_four_set - excluded_one_four_pairs)
-            ),
-            dtype=np.int32,
-        ).reshape((-1, 2))
-        lj_one_four_pairs = np.asarray(
-            (
-                []
-                if self.topology is None or self.lj_one_four_scale == 1.0
-                else sorted(self.topology.one_four_set - excluded_one_four_pairs)
-            ),
-            dtype=np.int32,
-        ).reshape((-1, 2))
-        lj_exclusion_offsets, lj_exclusion_right = _left_pair_csr(
-            correction_pairs,
-            int(sigma.shape[0]),
         )
-        lj_one_four_offsets, lj_one_four_right = _left_pair_csr(
-            lj_one_four_pairs,
-            int(sigma.shape[0]),
-        )
-        correction_pairs_mx = mx.array(correction_pairs, dtype=mx.int32)
-        exception_pairs_mx = mx.array(exception_pairs, dtype=mx.int32)
-        exception_charge_products_mx = as_mx_array(charge_products)
-        exception_sigma_mx = as_mx_array(exception_sigma)
-        exception_epsilon_mx = as_mx_array(exception_epsilon)
-        one_four_pairs_mx = mx.array(one_four_pairs, dtype=mx.int32)
-        lj_one_four_pairs_mx = mx.array(lj_one_four_pairs, dtype=mx.int32)
-        correction_charge_products = -(
-            charges[correction_pairs_mx[:, 0]] * charges[correction_pairs_mx[:, 1]]
-        )
-        one_four_charge_products = (
-            (self.coulomb_one_four_scale - 1.0)
-            * charges[one_four_pairs_mx[:, 0]]
-            * charges[one_four_pairs_mx[:, 1]]
-        )
-        sparse_correction_pairs = mx.concatenate(
-            (correction_pairs_mx, exception_pairs_mx, one_four_pairs_mx),
-            axis=0,
-        )
-        sparse_correction_charge_products = mx.concatenate(
-            (
-                correction_charge_products,
-                exception_charge_products_mx,
-                one_four_charge_products,
-            ),
-            axis=0,
-        )
-        sparse_correction_lj_sigma = mx.concatenate(
-            (
-                mx.zeros((correction_pairs.shape[0],), dtype=mx.float32),
-                exception_sigma_mx,
-                mx.zeros((one_four_pairs.shape[0],), dtype=mx.float32),
-            ),
-            axis=0,
-        )
-        sparse_correction_lj_epsilon = mx.concatenate(
-            (
-                mx.zeros((correction_pairs.shape[0],), dtype=mx.float32),
-                exception_epsilon_mx,
-                mx.zeros((one_four_pairs.shape[0],), dtype=mx.float32),
-            ),
-            axis=0,
-        )
-        exceptions_excluded_by_topology = self.topology is not None and exception_pair_set.issubset(
-            self.topology.exclusion_set
-        )
-        config = NonbondedExecutionConfig(
-            backend=self.backend,
-            electrostatics=self.electrostatics,
-            tile_size=self.tile_size,
-            memory_budget_bytes=self.memory_budget_bytes,
-        )
-        if (
-            float(self.lambda_lj) < 1.0 or float(self.lambda_electrostatics) < 1.0
-        ) and config.electrostatics != "cutoff":
-            msg = "soft-core lambda scaling currently supports cutoff electrostatics only"
-            raise ValueError(msg)
-        if config.electrostatics == "pme":
-            if self.pme_config is None:
-                msg = "PME electrostatics requires pme_config"
-                raise ValueError(msg)
-            if not np.isfinite(float(self.pme_config.alpha)) or self.pme_config.alpha <= 0.0:
-                msg = "PME electrostatics requires finite positive pme_config.alpha"
-                raise ValueError(msg)
-            if self.pme_config.real_cutoff is not None and (
-                not np.isfinite(float(self.pme_config.real_cutoff))
-                or self.pme_config.real_cutoff <= 0.0
-            ):
-                msg = (
-                    "PME electrostatics requires finite positive "
-                    "pme_config.real_cutoff when provided"
-                )
-                raise ValueError(msg)
-            if (
-                not np.isfinite(float(self.pme_config.charge_tolerance))
-                or self.pme_config.charge_tolerance < 0.0
-            ):
-                msg = "PME electrostatics requires finite non-negative pme_config.charge_tolerance"
-                raise ValueError(msg)
-            net_charge = float(np.sum(np.asarray(charges, dtype=np.float64), dtype=np.float64))
-            if (
-                abs(net_charge) > self.pme_config.charge_tolerance
-                and self.pme_config.background_policy != "uniform_neutralizing_plasma"
-            ):
-                msg = (
-                    "PME electrostatics requires a neutral system unless "
-                    "background_policy='uniform_neutralizing_plasma'; "
-                    f"net_charge={net_charge:g}"
-                )
-                raise ValueError(msg)
-            if self.pme_plan is not None:
-                if not isinstance(self.pme_plan, PMEExecutionPlan):
-                    msg = "pme_plan must be a PMEExecutionPlan instance"
-                    raise TypeError(msg)
-                self.pme_plan.validate(
-                    self.pme_plan.cell,
-                    config=self.pme_config,
-                    coulomb_constant=self.coulomb_constant,
-                )
-        elif self.pme_plan is not None:
-            msg = "pme_plan requires electrostatics='pme'"
-            raise ValueError(msg)
-        object.__setattr__(self, "sigma", sigma)
-        object.__setattr__(self, "epsilon", epsilon)
-        object.__setattr__(self, "charges", charges)
-        object.__setattr__(self, "exception_pairs", exception_pairs_mx)
-        object.__setattr__(self, "exception_charge_products", exception_charge_products_mx)
-        object.__setattr__(self, "exception_sigma", exception_sigma_mx)
-        object.__setattr__(self, "exception_epsilon", exception_epsilon_mx)
-        object.__setattr__(self, "nbfix_pairs", mx.array(nbfix_pairs, dtype=mx.int32))
-        object.__setattr__(self, "nbfix_sigma", as_mx_array(nbfix_sigma))
-        object.__setattr__(self, "nbfix_epsilon", as_mx_array(nbfix_epsilon))
-        object.__setattr__(self, "nbfix_type_pairs", nbfix_type_pairs)
-        object.__setattr__(self, "nbfix_type_sigma", as_mx_array(nbfix_type_sigma))
-        object.__setattr__(self, "nbfix_type_epsilon", as_mx_array(nbfix_type_epsilon))
-        object.__setattr__(self, "_atom_type_ids", mx.array(atom_type_ids, dtype=mx.int32))
-        object.__setattr__(
-            self,
-            "_nbfix_type_pair_ids",
-            mx.array(nbfix_type_pair_ids, dtype=mx.int32),
-        )
-        object.__setattr__(self, "_nbfix_type_count", nbfix_type_count_total)
-        object.__setattr__(
-            self,
-            "_nbfix_type_sigma_table",
-            mx.array(nbfix_type_sigma_table, dtype=mx.float32),
-        )
-        object.__setattr__(
-            self,
-            "_nbfix_type_epsilon_table",
-            mx.array(nbfix_type_epsilon_table, dtype=mx.float32),
-        )
-        object.__setattr__(self, "_exception_pair_set", frozenset(exception_pair_set))
-        object.__setattr__(
-            self,
-            "_exception_pair_codes",
-            _encoded_pairs(exception_pair_set, sigma.shape[0]),
-        )
-        object.__setattr__(
-            self,
-            "_ewald_correction_pairs_cache",
-            correction_pairs_mx,
-        )
-        object.__setattr__(
-            self,
-            "_ewald_correction_charge_products",
-            correction_charge_products,
-        )
-        object.__setattr__(
-            self,
-            "_ewald_one_four_pairs_cache",
-            one_four_pairs_mx,
-        )
-        object.__setattr__(
-            self,
-            "_ewald_one_four_charge_products",
-            one_four_charge_products,
-        )
-        object.__setattr__(
-            self,
-            "_sparse_correction_pairs",
-            sparse_correction_pairs,
-        )
-        object.__setattr__(
-            self,
-            "_sparse_correction_charge_products",
-            sparse_correction_charge_products,
-        )
-        object.__setattr__(
-            self,
-            "_sparse_correction_lj_sigma",
-            sparse_correction_lj_sigma,
-        )
-        object.__setattr__(
-            self,
-            "_sparse_correction_lj_epsilon",
-            sparse_correction_lj_epsilon,
-        )
-        object.__setattr__(
-            self,
-            "_aligned_lj_exclusion_pairs",
-            correction_pairs_mx,
-        )
-        object.__setattr__(
-            self,
-            "_aligned_lj_one_four_pairs",
-            lj_one_four_pairs_mx,
-        )
-        object.__setattr__(
-            self,
-            "_interaction32_topology_digest",
-            _interaction32_topology_digest(
-                int(sigma.shape[0]),
-                correction_pairs,
-                lj_one_four_pairs,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "_aligned_lj_exclusion_offsets",
-            mx.array(lj_exclusion_offsets, dtype=mx.int32),
-        )
-        object.__setattr__(
-            self,
-            "_aligned_lj_exclusion_right",
-            mx.array(lj_exclusion_right, dtype=mx.int32),
-        )
-        object.__setattr__(
-            self,
-            "_aligned_lj_one_four_offsets",
-            mx.array(lj_one_four_offsets, dtype=mx.int32),
-        )
-        object.__setattr__(
-            self,
-            "_aligned_lj_one_four_right",
-            mx.array(lj_one_four_right, dtype=mx.int32),
-        )
-        object.__setattr__(
-            self,
-            "_exceptions_excluded_by_topology",
-            exceptions_excluded_by_topology,
-        )
-        object.__setattr__(self, "backend", config.backend)
-        object.__setattr__(self, "electrostatics", config.electrostatics)
-        object.__setattr__(self, "tile_size", config.tile_size)
-        object.__setattr__(self, "memory_budget_bytes", config.memory_budget_bytes)
-        object.__setattr__(self, "lambda_lj", float(self.lambda_lj))
-        object.__setattr__(self, "lambda_electrostatics", float(self.lambda_electrostatics))
-        if self.use_dispersion_correction and config.electrostatics != "pme":
-            msg = "LJ dispersion correction currently requires PME electrostatics"
-            raise ValueError(msg)
-        if self.use_dispersion_correction and self.switch_distance is not None:
-            msg = "analytic LJ dispersion correction does not support switching"
-            raise ValueError(msg)
+        state.install(self)
         object.__setattr__(
             self,
             "_dispersion_coefficient",
             self._openmm_dispersion_coefficient(),
         )
-        analytic_supported = (
-            config.electrostatics in {"cutoff", "pme"}
-            and float(self.lambda_lj) == 1.0
-            and float(self.lambda_electrostatics) == 1.0
-            and nbfix_pairs.shape[0] == 0
-            and nbfix_type_pairs.shape[0] == 0
-            and (
-                config.electrostatics != "pme"
-                or (self.pme_config is not None and self.pme_config.real_cutoff is not None)
-            )
-        )
-        object.__setattr__(self, "analytic_virial_supported", analytic_supported)
         object.__setattr__(self, "_pair_scale_cache", None)
         object.__setattr__(self, "_block_scale_cache", None)
         object.__setattr__(self, "_aligned_lj_scale_cache", None)
@@ -2326,10 +1834,7 @@ class NonbondedPotential:
                 lane_start = 32 * word_index
                 lane_stop = min(lane_start + 32, lanes_per_tile)
                 active[:, lane_start:lane_stop] = (
-                    (
-                        words[:, word_index, None]
-                        >> bit_indices[None, : lane_stop - lane_start]
-                    )
+                    (words[:, word_index, None] >> bit_indices[None, : lane_stop - lane_start])
                     & np.uint32(1)
                 ).astype(bool)
             block_pairs = tile_blocks[start:stop]
@@ -3943,14 +3448,10 @@ class NonbondedPotential:
                 self._atom_type_ids if int(self.nbfix_type_pairs.shape[0]) > 0 else None
             ),
             tile_nbfix_type_sigma=(
-                self._nbfix_type_sigma_table
-                if int(self.nbfix_type_pairs.shape[0]) > 0
-                else None
+                self._nbfix_type_sigma_table if int(self.nbfix_type_pairs.shape[0]) > 0 else None
             ),
             tile_nbfix_type_epsilon=(
-                self._nbfix_type_epsilon_table
-                if int(self.nbfix_type_pairs.shape[0]) > 0
-                else None
+                self._nbfix_type_epsilon_table if int(self.nbfix_type_pairs.shape[0]) > 0 else None
             ),
             tile_nbfix_type_count=self._nbfix_type_count,
             interaction32_schedule=schedule,
@@ -4099,14 +3600,10 @@ class NonbondedPotential:
                 self._atom_type_ids if int(self.nbfix_type_pairs.shape[0]) > 0 else None
             ),
             tile_nbfix_type_sigma=(
-                self._nbfix_type_sigma_table
-                if int(self.nbfix_type_pairs.shape[0]) > 0
-                else None
+                self._nbfix_type_sigma_table if int(self.nbfix_type_pairs.shape[0]) > 0 else None
             ),
             tile_nbfix_type_epsilon=(
-                self._nbfix_type_epsilon_table
-                if int(self.nbfix_type_pairs.shape[0]) > 0
-                else None
+                self._nbfix_type_epsilon_table if int(self.nbfix_type_pairs.shape[0]) > 0 else None
             ),
             tile_nbfix_type_count=self._nbfix_type_count,
             tile_decline_reason=(
@@ -4157,9 +3654,8 @@ class NonbondedPotential:
     ) -> _FusedSparsePMECorrectionBinding | None:
         """Expose validated sparse PME inputs to a shared Metal force dispatch."""
 
-        if (
-            "gpu" not in str(mx.default_device()).lower()
-            or not isinstance(binding, _NonbondedForceBinding)
+        if "gpu" not in str(mx.default_device()).lower() or not isinstance(
+            binding, _NonbondedForceBinding
         ):
             return None
         return _FusedSparsePMECorrectionBinding(

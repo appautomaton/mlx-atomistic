@@ -9,7 +9,7 @@ import numpy as np
 from scipy.optimize import minimize as scipy_minimize
 
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.md import ForceTerm, _energy_forces_from_terms
+from mlx_atomistic.force_evaluation import ForceTerm, _energy_forces_from_terms
 from mlx_atomistic.neighbors import NeighborListManager
 
 

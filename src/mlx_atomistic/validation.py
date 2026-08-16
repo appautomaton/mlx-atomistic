@@ -11,6 +11,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.force_evaluation import ForceTerm
 from mlx_atomistic.forcefields import (
     CoulombPotential,
     HarmonicAnglePotential,
@@ -18,7 +19,7 @@ from mlx_atomistic.forcefields import (
     NonbondedPotential,
     PeriodicDihedralPotential,
 )
-from mlx_atomistic.md import ForceTerm, LennardJonesPotential
+from mlx_atomistic.md import LennardJonesPotential
 from mlx_atomistic.runtime import get_platform_boundary_report
 
 

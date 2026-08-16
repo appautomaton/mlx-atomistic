@@ -12,7 +12,8 @@ from typing import Any
 import numpy as np
 
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.md import ForceTerm, ReporterEvent, SimulationState
+from mlx_atomistic.force_evaluation import ForceTerm
+from mlx_atomistic.md import ReporterEvent, SimulationState
 
 
 @dataclass(frozen=True)

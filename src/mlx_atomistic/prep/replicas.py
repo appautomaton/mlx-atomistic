@@ -791,7 +791,7 @@ def _make_constraint_projectors(
 
     compiled_positions = mx.compile(project_positions_vmap)
     compiled_velocities = mx.compile(project_velocities_vmap)
-    test_positions = mx.zeros((replicas, int(constraints._max_pair_index) + 1, 3))
+    test_positions = mx.zeros((replicas, int(masses.shape[0]), 3))
     try:
         projected, error = compiled_positions(test_positions)
         projected_velocities = compiled_velocities(test_positions, test_positions)

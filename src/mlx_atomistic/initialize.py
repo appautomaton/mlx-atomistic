@@ -7,8 +7,11 @@ from math import ceil
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic._md_thermodynamics import (
+    _remove_center_of_mass_velocity,
+    instantaneous_temperature,
+)
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.md import _remove_center_of_mass_velocity, instantaneous_temperature
 
 
 def simple_cubic_lattice(n_particles: int, *, density: float = 0.8) -> tuple[mx.array, Cell]:

@@ -9,23 +9,27 @@ from math import exp, sqrt
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic._md_thermodynamics import (
+    _temperature_degrees_of_freedom,
+    instantaneous_temperature,
+    kinetic_energy,
+)
 from mlx_atomistic.constraints import DistanceConstraints
 from mlx_atomistic.core import Cell, as_mx_array
-from mlx_atomistic.md import (
+from mlx_atomistic.force_evaluation import (
     ForceTerm,
-    LangevinThermostat,
-    SimulationConfig,
-    SimulationState,
     _as_force_terms,
     _dense_pair_count,
     _energy_forces_by_term,
     _energy_forces_from_terms,
-    _is_diagnostic_step,
     _named_force_terms,
-    _temperature_degrees_of_freedom,
+)
+from mlx_atomistic.md import (
+    LangevinThermostat,
+    SimulationConfig,
+    SimulationState,
+    _is_diagnostic_step,
     _zero_constraint_error,
-    instantaneous_temperature,
-    kinetic_energy,
 )
 from mlx_atomistic.neighbors import NeighborListManager
 

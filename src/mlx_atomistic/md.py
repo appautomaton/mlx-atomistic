@@ -7,11 +7,40 @@ from dataclasses import dataclass, field, replace
 from math import exp, sqrt
 from time import perf_counter
 from types import NotImplementedType
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic._md_state import (
+    BarostatProposal,
+    LangevinThermostat,
+    MonteCarloBarostat,
+    NoseHooverThermostat,
+    NPTResult,
+    NVEResult,
+    NVTResult,
+    ReporterEvent,
+    RuntimeReporter,
+    SimulationConfig,
+    SimulationResult,
+    SimulationState,
+    StepState,
+    Thermostat,
+    _barostat_axis_index,
+    _barostat_plane_axes,
+    _NVTBoundaryDiagnostics,
+    _validate_barostat_cell_support,
+)
+from mlx_atomistic._md_thermodynamics import (
+    _pressure_diagnostics_from_virial,
+    _remove_center_of_mass_velocity,
+    _temperature_degrees_of_freedom,
+    instantaneous_temperature,
+    kinetic_energy,
+    kinetic_pressure_tensor,
+    virial_tensor,
+)
 from mlx_atomistic.constraints import (
     CompositeConstraints,
     DistanceConstraints,
@@ -19,11 +48,24 @@ from mlx_atomistic.constraints import (
     _project_constraint_positions_unchecked,
 )
 from mlx_atomistic.core import Cell, as_mx_array
+from mlx_atomistic.force_evaluation import (
+    ForceTerm,
+    _dense_pair_count,
+    _energy_forces_by_term,
+    _energy_forces_from_terms,
+    _energy_from_term_demands,
+    _forces_from_term_demands,
+    _groupable_potential_terms,
+    _is_energy_component,
+    _named_force_terms,
+    _neighbor_evaluation_positions,
+)
 from mlx_atomistic.force_runtime import (
     _ExclusiveRouteProfiler,
     _PreparedForcePipeline,
 )
-from mlx_atomistic.metal_kernels import _fused_langevin_baoab_drift, fused_lj_forces
+from mlx_atomistic.lj import LennardJonesPotential
+from mlx_atomistic.metal_kernels import _fused_langevin_baoab_drift
 from mlx_atomistic.neighbors import (
     NeighborBlocks,
     NeighborList,
@@ -31,12 +73,6 @@ from mlx_atomistic.neighbors import (
     _bounded_metal_md_cache,
 )
 from mlx_atomistic.nonbonded import (
-    DEFAULT_DENSE_MEMORY_BUDGET_BYTES,
-    NonbondedBackend,
-    NonbondedExecutionConfig,
-    choose_nonbonded_backend,
-    dense_lj_energy_forces,
-    estimate_dense_nonbonded_bytes,
     molecularly_strained_positions,
     normalize_molecule_ids,
 )
@@ -47,7 +83,6 @@ from mlx_atomistic.runtime import (
     ReadinessReport,
     normalize_virial_support,
 )
-from mlx_atomistic.topology import Topology, _isin_sorted_codes
 from mlx_atomistic.virtual_sites import VirtualSiteManager
 
 RUNTIME_SYNC_REASONS = (
@@ -58,28 +93,6 @@ RUNTIME_SYNC_REASONS = (
     "failure_check",
     "explicit_user_output",
 )
-
-
-class ForceTerm(Protocol):
-    """Protocol for composable force terms."""
-
-    def energy_forces(
-        self,
-        positions: mx.array,
-        cell: Cell | None = None,
-        pairs: object | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        """Return potential energy and forces.
-
-        Args:
-            positions: Particle coordinates, shape ``(n_particles, 3)``.
-            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
-            pairs: Optional precomputed neighbor/pair structure. Defaults to ``None``.
-
-        Returns:
-            An ``(energy, forces)`` tuple: scalar potential energy and forces of
-                shape ``(n_particles, 3)``.
-        """
 
 
 _ForceEvaluationMode = Literal[
@@ -133,774 +146,6 @@ _FORCES_REQUEST = _ForceEvaluationRequest("forces")
 _ENERGY_FORCES_REQUEST = _ForceEvaluationRequest("energy_forces")
 _ENERGY_REQUEST = _ForceEvaluationRequest("energy")
 _DIAGNOSTIC_REQUEST = _ForceEvaluationRequest("diagnostic")
-
-
-@dataclass(frozen=True)
-class LennardJonesPotential:
-    """Naive all-pairs Lennard-Jones potential in reduced units."""
-
-    epsilon: float = 1.0
-    sigma: float = 1.0
-    cutoff: float | None = 2.5
-    shift: bool = True
-    topology: Topology | None = None
-    one_four_scale: float = 1.0
-    backend: NonbondedBackend = "auto"
-    tile_size: int = 512
-    memory_budget_bytes: int | None = DEFAULT_DENSE_MEMORY_BUDGET_BYTES
-    name: str = "lj"
-    supports_virial: bool = True
-    analytic_virial_supported: bool = False
-    use_fused_kernel: bool = False
-
-    def __post_init__(self) -> None:
-        if self.cutoff is not None and self.cutoff <= 0.0:
-            msg = "cutoff must be positive"
-            raise ValueError(msg)
-        if self.one_four_scale < 0.0:
-            msg = "one_four_scale must be non-negative"
-            raise ValueError(msg)
-        config = NonbondedExecutionConfig(
-            backend=self.backend,
-            tile_size=self.tile_size,
-            memory_budget_bytes=self.memory_budget_bytes,
-        )
-        object.__setattr__(self, "tile_size", config.tile_size)
-        object.__setattr__(self, "memory_budget_bytes", config.memory_budget_bytes)
-        object.__setattr__(self, "_pair_scale_cache", None)
-
-    def energy_forces(
-        self,
-        positions: mx.array,
-        cell: Cell | None = None,
-        pairs: object | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        """Return potential energy and forces for positions with shape ``(n_particles, 3)``.
-
-        Args:
-            positions: Particle coordinates, shape ``(n_particles, 3)``.
-            cell: Optional periodic cell for minimum-image distances. Defaults to ``None``.
-            pairs: Optional neighbor list, neighbor blocks, or dense pair array; the
-                nonbonded backend is chosen automatically. Defaults to ``None``.
-
-        Returns:
-            An ``(energy, forces)`` tuple: scalar LJ energy and forces of shape
-                ``(n_particles, 3)``.
-
-        Raises:
-            ValueError: If ``positions`` is not ``(n_particles, 3)`` or a lazy
-                topology is used without a runtime pair provider.
-        """
-
-        positions = as_mx_array(positions)
-        if positions.ndim != 2 or positions.shape[1] != 3:
-            msg = "positions must have shape (n_particles, 3)"
-            raise ValueError(msg)
-        if (
-            self.topology is not None
-            and pairs is None
-            and self.topology.nonbonded_pair_policy == "lazy"
-        ):
-            msg = (
-                "lazy topology requires a runtime nonbonded pair provider; "
-                "full dense pair materialization was not requested"
-            )
-            raise ValueError(msg)
-
-        estimated_bytes = estimate_dense_nonbonded_bytes(positions.shape[0], components="lj")
-        concrete_backend = choose_nonbonded_backend(
-            requested=self.backend,
-            n_atoms=positions.shape[0],
-            pairs_provided=pairs is not None,
-            estimated_dense_bytes=estimated_bytes,
-            memory_budget_bytes=self.memory_budget_bytes,
-        )
-        if concrete_backend in {"mlx_dense", "mlx_tiled"}:
-            return dense_lj_energy_forces(
-                positions,
-                epsilon=self.epsilon,
-                sigma=self.sigma,
-                cutoff=self.cutoff,
-                shift=self.shift,
-                cell=cell,
-                topology=self.topology,
-                one_four_scale=self.one_four_scale,
-                tile_size=self.tile_size if concrete_backend == "mlx_tiled" else None,
-            )
-
-        if isinstance(pairs, NeighborBlocks):
-            return self._block_energy_forces(positions, pairs, cell)
-        if self.topology is not None:
-            filtered_pairs, scales = self._topology_pairs_and_scales(pairs)
-            return self._pair_energy_forces(positions, filtered_pairs, cell, scales=scales)
-        if (
-            self.use_fused_kernel
-            and pairs is not None
-            and isinstance(pairs, mx.array)
-            and cell is not None
-            and cell.is_orthorhombic
-            and self.cutoff is not None
-        ):
-            return fused_lj_forces(
-                positions,
-                pairs,
-                mx.diag(cell.matrix),
-                epsilon=self.epsilon,
-                sigma=self.sigma,
-                cutoff=self.cutoff,
-                shift=self.shift,
-            )
-        if pairs is not None:
-            return self._pair_energy_forces(positions, pairs, cell)
-
-        displacement = positions[:, None, :] - positions[None, :, :]
-        if cell is not None:
-            displacement = cell.minimum_image(displacement)
-
-        r2 = mx.sum(displacement * displacement, axis=-1)
-        pair_mask = r2 > 0.0
-        if self.cutoff is not None:
-            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
-
-        safe_r2 = mx.where(pair_mask, r2, 1.0)
-        sigma2_over_r2 = (self.sigma * self.sigma) / safe_r2
-        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
-        inv_r12 = inv_r6 * inv_r6
-
-        pair_energy = 4.0 * self.epsilon * (inv_r12 - inv_r6)
-        if self.shift and self.cutoff is not None:
-            sigma2_over_rc2 = (self.sigma * self.sigma) / (self.cutoff * self.cutoff)
-            inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
-            inv_rc12 = inv_rc6 * inv_rc6
-            pair_energy = pair_energy - 4.0 * self.epsilon * (inv_rc12 - inv_rc6)
-        pair_energy = mx.where(pair_mask, pair_energy, 0.0)
-
-        scalar = 24.0 * self.epsilon * (2.0 * inv_r12 - inv_r6) / safe_r2
-        scalar = mx.where(pair_mask, scalar, 0.0)
-        forces = mx.sum(scalar[:, :, None] * displacement, axis=1)
-
-        energy = 0.5 * mx.sum(pair_energy)
-        return energy, forces
-
-    def _topology_pairs_and_scales(self, pairs) -> tuple[mx.array, mx.array]:
-        topology = self.topology
-        if topology is None:
-            msg = "topology is required"
-            raise ValueError(msg)
-        if pairs is None and topology.nonbonded_pair_policy == "lazy":
-            msg = (
-                "lazy topology requires a runtime nonbonded pair provider; "
-                "full dense pair materialization was not requested"
-            )
-            raise ValueError(msg)
-        if pairs is not None:
-            cache_key = (id(pairs), self.one_four_scale)
-            cache = self._pair_scale_cache
-            if cache is not None and cache[0] == cache_key:
-                return cache[1]
-        filtered_pairs = topology.nonbonded_pairs(pairs)
-        if float(self.one_four_scale) == 1.0:
-            scales = mx.array(1.0, dtype=mx.float32)
-        else:
-            scales = topology.pair_scales(
-                filtered_pairs,
-                one_four_scale=self.one_four_scale,
-            )
-        if pairs is not None:
-            object.__setattr__(self, "_pair_scale_cache", (cache_key, (filtered_pairs, scales)))
-        return filtered_pairs, scales
-
-    def _pair_energy_forces(
-        self,
-        positions: mx.array,
-        pairs: mx.array,
-        cell: Cell | None,
-        *,
-        scales: mx.array | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        pairs = as_mx_array(pairs, dtype=mx.int32)
-        forces = mx.zeros_like(positions)
-        if pairs.shape[0] == 0:
-            return mx.sum(positions[:, 0] * 0.0), forces
-        if scales is None:
-            scales = mx.array(1.0, dtype=mx.float32)
-
-        i = pairs[:, 0]
-        j = pairs[:, 1]
-        displacement = positions[i] - positions[j]
-        if cell is not None:
-            displacement = cell.minimum_image(displacement)
-
-        r2 = mx.sum(displacement * displacement, axis=-1)
-        pair_mask = r2 > 0.0
-        if self.cutoff is not None:
-            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
-
-        safe_r2 = mx.where(pair_mask, r2, 1.0)
-        sigma2_over_r2 = (self.sigma * self.sigma) / safe_r2
-        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
-        inv_r12 = inv_r6 * inv_r6
-
-        pair_energy = 4.0 * self.epsilon * (inv_r12 - inv_r6)
-        if self.shift and self.cutoff is not None:
-            sigma2_over_rc2 = (self.sigma * self.sigma) / (self.cutoff * self.cutoff)
-            inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
-            inv_rc12 = inv_rc6 * inv_rc6
-            pair_energy = pair_energy - 4.0 * self.epsilon * (inv_rc12 - inv_rc6)
-        pair_energy = mx.where(pair_mask, pair_energy * scales, 0.0)
-
-        scalar = 24.0 * self.epsilon * (2.0 * inv_r12 - inv_r6) / safe_r2
-        scalar = mx.where(pair_mask, scalar * scales, 0.0)
-        pair_forces = scalar[:, None] * displacement
-        forces = forces.at[i].add(pair_forces).at[j].add(-pair_forces)
-
-        return mx.sum(pair_energy), forces
-
-    def _block_mask_and_scales(self, blocks: NeighborBlocks) -> tuple[mx.array, mx.array]:
-        if self.topology is None:
-            return blocks.valid_mask, mx.array(1.0, dtype=mx.float32)
-
-        cache_key = ("blocks", id(blocks), self.one_four_scale)
-        cache = self._pair_scale_cache
-        if cache is not None and cache[0] == cache_key:
-            return cache[1]
-
-        left = np.asarray(blocks.left, dtype=np.int32).reshape(-1)
-        right = np.asarray(blocks.right, dtype=np.int32).reshape(-1)
-        valid = np.asarray(blocks.valid_mask, dtype=bool).reshape(-1)
-        n_atoms = self.topology.n_atoms
-        if np.any(left[valid] < 0) or np.any(right[valid] < 0):
-            msg = "pairs contain atom indices outside [0, n_atoms)"
-            raise ValueError(msg)
-        if np.any(left[valid] >= n_atoms) or np.any(right[valid] >= n_atoms):
-            msg = "pairs contain atom indices outside [0, n_atoms)"
-            raise ValueError(msg)
-
-        normalized_left = np.minimum(left, right).astype(np.int64, copy=False)
-        normalized_right = np.maximum(left, right).astype(np.int64, copy=False)
-        codes = normalized_left * np.int64(n_atoms) + normalized_right
-        keep = valid & ~_isin_sorted_codes(codes, self.topology._exclusion_codes)
-        mask = mx.array(keep.reshape(blocks.left.shape))
-        if float(self.one_four_scale) == 1.0 or self.topology._one_four_codes.size == 0:
-            scales = mx.array(1.0, dtype=mx.float32)
-        else:
-            one_four = _isin_sorted_codes(codes, self.topology._one_four_codes)
-            scales_np = np.where(one_four, float(self.one_four_scale), 1.0).astype(np.float32)
-            scales = mx.array(scales_np.reshape(blocks.left.shape), dtype=mx.float32)
-        object.__setattr__(self, "_pair_scale_cache", (cache_key, (mask, scales)))
-        return mask, scales
-
-    def _block_energy_forces(
-        self,
-        positions: mx.array,
-        blocks: NeighborBlocks,
-        cell: Cell | None,
-    ) -> tuple[mx.array, mx.array]:
-        forces = mx.zeros_like(positions)
-        if blocks.candidate_count == 0:
-            return mx.sum(positions[:, 0] * 0.0), forces
-
-        i = blocks.left
-        j = blocks.right
-        displacement = positions[i] - positions[j]
-        if cell is not None:
-            displacement = cell.minimum_image(displacement)
-
-        topology_mask, scales = self._block_mask_and_scales(blocks)
-        r2 = mx.sum(displacement * displacement, axis=-1)
-        pair_mask = topology_mask & (r2 > 0.0)
-        if self.cutoff is not None:
-            pair_mask = pair_mask & (r2 < self.cutoff * self.cutoff)
-
-        safe_r2 = mx.where(pair_mask, r2, 1.0)
-        sigma2_over_r2 = (self.sigma * self.sigma) / safe_r2
-        inv_r6 = sigma2_over_r2 * sigma2_over_r2 * sigma2_over_r2
-        inv_r12 = inv_r6 * inv_r6
-
-        pair_energy = 4.0 * self.epsilon * (inv_r12 - inv_r6)
-        if self.shift and self.cutoff is not None:
-            sigma2_over_rc2 = (self.sigma * self.sigma) / (self.cutoff * self.cutoff)
-            inv_rc6 = sigma2_over_rc2 * sigma2_over_rc2 * sigma2_over_rc2
-            inv_rc12 = inv_rc6 * inv_rc6
-            pair_energy = pair_energy - 4.0 * self.epsilon * (inv_rc12 - inv_rc6)
-        pair_energy = mx.where(pair_mask, pair_energy * scales, 0.0)
-
-        scalar = 24.0 * self.epsilon * (2.0 * inv_r12 - inv_r6) / safe_r2
-        scalar = mx.where(pair_mask, scalar * scales, 0.0)
-        pair_forces = scalar[..., None] * displacement
-        flat_i = mx.reshape(i, (-1,))
-        flat_j = mx.reshape(j, (-1,))
-        flat_forces = mx.reshape(pair_forces, (-1, 3))
-        forces = forces.at[flat_i].add(flat_forces).at[flat_j].add(-flat_forces)
-
-        return mx.sum(pair_energy), forces
-
-
-@dataclass(frozen=True)
-class StepState:
-    """Single MD state."""
-
-    positions: mx.array
-    velocities: mx.array
-    forces: mx.array
-    potential_energy: mx.array
-    kinetic_energy: mx.array
-
-    @property
-    def total_energy(self) -> mx.array:
-        """Potential plus kinetic energy."""
-
-        return self.potential_energy + self.kinetic_energy
-
-
-@dataclass(frozen=True)
-class SimulationResult:
-    """Trajectory and diagnostics from an MD run."""
-
-    positions: mx.array
-    velocities: mx.array
-    potential_energy: mx.array
-    kinetic_energy: mx.array
-    total_energy: mx.array
-    temperature: mx.array
-
-
-@dataclass(frozen=True)
-class SimulationConfig:
-    """Configuration for molecular dynamics."""
-
-    dt: float = 0.005
-    steps: int = 100
-    sample_interval: int = 1
-    kinetic_energy_scale: float = 1.0
-    force_to_acceleration_scale: float = 1.0
-    boltzmann_constant: float = 1.0
-    evaluation_interval: int = 25
-    diagnostic_interval: int = 1
-    compile_force_evaluator: bool = False
-    pressure_diagnostics: bool = True
-    pressure_virial_mode: str = VIRIAL_SUPPORT_FINITE_DIFFERENCE_ORACLE
-    initial_step: int = 0
-    initial_time: float = 0.0
-    virtual_sites: VirtualSiteManager | None = None
-    block_size: int = 1
-    center_of_mass_motion_interval: int | None = None
-    wrap_positions: bool = True
-    runtime_profile: bool = False
-
-    def __post_init__(self) -> None:
-        if self.dt <= 0.0:
-            msg = "dt must be positive"
-            raise ValueError(msg)
-        if self.steps < 0:
-            msg = "steps must be non-negative"
-            raise ValueError(msg)
-        if self.sample_interval <= 0:
-            msg = "sample_interval must be positive"
-            raise ValueError(msg)
-        if self.kinetic_energy_scale <= 0.0:
-            msg = "kinetic_energy_scale must be positive"
-            raise ValueError(msg)
-        if self.force_to_acceleration_scale <= 0.0:
-            msg = "force_to_acceleration_scale must be positive"
-            raise ValueError(msg)
-        if self.boltzmann_constant <= 0.0:
-            msg = "boltzmann_constant must be positive"
-            raise ValueError(msg)
-        pressure_virial_mode = normalize_virial_support(self.pressure_virial_mode)
-        if pressure_virial_mode == VIRIAL_SUPPORT_UNSUPPORTED:
-            msg = "pressure_virial_mode cannot be unsupported"
-            raise ValueError(msg)
-        object.__setattr__(self, "pressure_virial_mode", pressure_virial_mode)
-        if self.evaluation_interval <= 0:
-            msg = "evaluation_interval must be positive"
-            raise ValueError(msg)
-        if self.diagnostic_interval <= 0:
-            msg = "diagnostic_interval must be positive"
-            raise ValueError(msg)
-        if self.initial_step < 0:
-            msg = "initial_step must be non-negative"
-            raise ValueError(msg)
-        if self.initial_time < 0.0:
-            msg = "initial_time must be non-negative"
-            raise ValueError(msg)
-        if self.block_size < 1:
-            msg = "block_size must be a positive integer (1 = per-step execution)"
-            raise ValueError(msg)
-        if (
-            self.center_of_mass_motion_interval is not None
-            and self.center_of_mass_motion_interval <= 0
-        ):
-            msg = "center_of_mass_motion_interval must be positive or None"
-            raise ValueError(msg)
-
-
-@dataclass(frozen=True)
-class SimulationState:
-    """Current NVE simulation state."""
-
-    positions: mx.array
-    velocities: mx.array
-    masses: mx.array
-    forces: mx.array
-    step: int = 0
-    time: float = 0.0
-
-
-@dataclass(frozen=True)
-class ReporterEvent:
-    """State exposed to runtime reporter callbacks."""
-
-    ensemble: str
-    event_type: str
-    step: int
-    time: float
-    state: SimulationState
-    potential_energy: mx.array | None = None
-    kinetic_energy: mx.array | None = None
-    total_energy: mx.array | None = None
-    temperature: mx.array | None = None
-    energy_by_term: dict[str, mx.array] = field(default_factory=dict)
-    virial_tensor: mx.array | None = None
-    pressure_tensor: mx.array | None = None
-    pressure: mx.array | None = None
-    pair_count: int | mx.array | None = None
-    rebuild_count: int | mx.array | None = None
-    constraint_max_error: mx.array | None = None
-    thermostat: dict[str, Any] = field(default_factory=dict)
-    barostat: dict[str, Any] = field(default_factory=dict)
-
-
-class RuntimeReporter(Protocol):
-    """Callable observer for sampled frames and diagnostic state."""
-
-    def __call__(self, event: ReporterEvent) -> None:
-        """Observe one runtime event."""
-
-
-@dataclass(frozen=True)
-class NVEResult:
-    """Sparse trajectory and per-step diagnostics from an NVE simulation."""
-
-    sampled_positions: mx.array
-    sampled_velocities: mx.array
-    sampled_steps: mx.array
-    sampled_time: mx.array
-    diagnostic_steps: mx.array
-    diagnostic_time: mx.array
-    potential_energy: mx.array
-    kinetic_energy: mx.array
-    total_energy: mx.array
-    potential_energy_by_term: dict[str, mx.array]
-    temperature: mx.array
-    virial_tensor: mx.array
-    pressure_tensor: mx.array
-    pressure: mx.array
-    pair_count: mx.array
-    rebuild_count: mx.array
-    constraint_max_error: mx.array
-    final_state: SimulationState
-    nonbonded_report: dict[str, int | float | str | None] = field(default_factory=dict)
-    runtime_sync_report: dict[str, int | float] = field(default_factory=dict)
-
-    @property
-    def energy_drift(self) -> mx.array:
-        """Total energy minus the initial total energy for each diagnostic step."""
-
-        return self.total_energy - self.total_energy[0]
-
-    @property
-    def max_energy_drift(self) -> mx.array:
-        """Maximum absolute total-energy drift over the run."""
-
-        return mx.max(mx.abs(self.energy_drift))
-
-    @property
-    def relative_energy_drift(self) -> mx.array:
-        """Energy drift normalized by the absolute initial total energy."""
-
-        denominator = mx.maximum(mx.abs(self.total_energy[0]), 1e-12)
-        return self.energy_drift / denominator
-
-
-@dataclass(frozen=True)
-class LangevinThermostat:
-    """Langevin thermostat parameters in reduced units."""
-
-    temperature: float = 1.0
-    friction: float = 1.0
-    seed: int | None = None
-    rng_step_offset: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.temperature < 0.0:
-            msg = "temperature must be non-negative"
-            raise ValueError(msg)
-        if self.friction < 0.0:
-            msg = "friction must be non-negative"
-            raise ValueError(msg)
-        if self.rng_step_offset is not None and self.rng_step_offset < 0:
-            msg = "rng_step_offset must be non-negative when provided"
-            raise ValueError(msg)
-
-
-@dataclass(frozen=True)
-class NoseHooverThermostat:
-    """Deterministic single-variable Nose-Hoover thermostat parameters."""
-
-    temperature: float = 1.0
-    relaxation_time: float = 0.1
-    thermal_mass: float | None = None
-    chain_position: float = 0.0
-    chain_velocity: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.temperature <= 0.0:
-            msg = "temperature must be positive for Nose-Hoover"
-            raise ValueError(msg)
-        if self.relaxation_time <= 0.0:
-            msg = "relaxation_time must be positive"
-            raise ValueError(msg)
-        if self.thermal_mass is not None and self.thermal_mass <= 0.0:
-            msg = "thermal_mass must be positive when provided"
-            raise ValueError(msg)
-
-
-Thermostat = LangevinThermostat | NoseHooverThermostat
-
-
-@dataclass(frozen=True)
-class NVTResult:
-    """Sparse trajectory and per-step diagnostics from an NVT simulation."""
-
-    sampled_positions: mx.array
-    sampled_velocities: mx.array
-    sampled_steps: mx.array
-    sampled_time: mx.array
-    diagnostic_steps: mx.array
-    diagnostic_time: mx.array
-    potential_energy: mx.array
-    kinetic_energy: mx.array
-    total_energy: mx.array
-    potential_energy_by_term: dict[str, mx.array]
-    temperature: mx.array
-    virial_tensor: mx.array
-    pressure_tensor: mx.array
-    pressure: mx.array
-    pair_count: mx.array
-    rebuild_count: mx.array
-    constraint_max_error: mx.array
-    final_state: SimulationState
-    target_temperature: float
-    thermostat_metadata: dict[str, Any] = field(default_factory=dict)
-    nonbonded_report: dict[str, int | float | str | None] = field(default_factory=dict)
-    runtime_sync_report: dict[str, int | float] = field(default_factory=dict)
-    route_profile: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def temperature_error(self) -> mx.array:
-        """Instantaneous temperature minus the target thermostat temperature."""
-
-        return self.temperature - self.target_temperature
-
-
-@dataclass(frozen=True)
-class _NVTBoundaryDiagnostics:
-    """State and diagnostics already committed at an NPT segment boundary."""
-
-    potential_energy: mx.array
-    forces: mx.array
-    energy_by_term: dict[str, mx.array]
-    virial_tensor: mx.array
-    pressure_tensor: mx.array
-    pressure: mx.array
-    constraint_error: mx.array
-
-
-@dataclass(frozen=True)
-class MonteCarloBarostat:
-    """Monte Carlo barostat parameters for isotropic, anisotropic, and membrane NPT."""
-
-    pressure: float = 1.0
-    temperature: float = 1.0
-    interval: int = 25
-    max_log_volume_scale: float = 0.02
-    seed: int | None = 11
-    mode: str = "isotropic"
-    axes: tuple[bool, bool, bool] = (True, True, True)
-    membrane_plane: str = "xy"
-    normal_axis: str = "z"
-
-    def __post_init__(self) -> None:
-        if self.pressure < 0.0:
-            msg = "pressure must be non-negative"
-            raise ValueError(msg)
-        if self.temperature <= 0.0:
-            msg = "temperature must be positive"
-            raise ValueError(msg)
-        if self.interval <= 0:
-            msg = "barostat interval must be positive"
-            raise ValueError(msg)
-        if self.max_log_volume_scale <= 0.0:
-            msg = "max_log_volume_scale must be positive"
-            raise ValueError(msg)
-        if self.max_log_volume_scale >= float(np.log(2.0)):
-            msg = "max_log_volume_scale must be smaller than log(2)"
-            raise ValueError(msg)
-        mode = _normalize_barostat_mode(self.mode)
-        object.__setattr__(self, "mode", mode)
-        axes = tuple(bool(axis) for axis in self.axes)
-        if len(axes) != 3:
-            msg = "barostat axes must contain three booleans"
-            raise ValueError(msg)
-        object.__setattr__(self, "axes", axes)
-        if mode == "anisotropic" and not any(axes):
-            msg = "anisotropic barostat requires at least one enabled axis"
-            raise ValueError(msg)
-        plane_axes = _barostat_plane_axes(self.membrane_plane)
-        normal_axis = _barostat_axis_index(self.normal_axis)
-        if mode == "membrane" and normal_axis in plane_axes:
-            msg = "membrane normal_axis must be outside membrane_plane"
-            raise ValueError(msg)
-        object.__setattr__(self, "membrane_plane", "".join("xyz"[axis] for axis in plane_axes))
-        object.__setattr__(self, "normal_axis", "xyz"[normal_axis])
-
-
-@dataclass(frozen=True)
-class BarostatProposal:
-    """One explicit Monte Carlo cell proposal and its proposal-density ratio."""
-
-    scale_factors: tuple[float, float, float]
-    axis: int | None
-    log_reverse_over_forward: float
-    kernel: str
-    volume_step: float
-    source_pme_plan_fingerprints: tuple[str, ...] = ()
-    candidate_pme_plan_fingerprints: tuple[str, ...] = ()
-    delta_energy: float | None = None
-    log_acceptance: float | None = None
-    log_uniform_draw: float | None = None
-
-
-@dataclass(frozen=True)
-class NPTResult:
-    """NPT production result with delegated NVT trajectory fields."""
-
-    production: NVTResult
-    final_state: SimulationState
-    final_cell: Cell
-    final_force_terms: tuple[ForceTerm, ...]
-    cell_lengths: mx.array
-    cell_matrix: mx.array
-    volume: mx.array
-    target_pressure: float
-    barostat_attempts: int
-    barostat_accepted: int
-    barostat_metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __getattr__(self, name: str):
-        return getattr(self.production, name)
-
-    @property
-    def cell_history(self) -> mx.array:
-        """Return the sampled cell-matrix history for pressure-coupled runs."""
-
-        return self.cell_matrix
-
-
-def kinetic_energy(
-    velocities: mx.array,
-    masses: mx.array,
-    *,
-    kinetic_energy_scale: float = 1.0,
-) -> mx.array:
-    """Return the total kinetic energy in the configured unit system.
-
-    Args:
-        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
-        masses: Per-particle masses, shape ``(n_particles,)``.
-        kinetic_energy_scale: Multiplicative factor converting the raw kinetic
-            quantity into the configured energy unit. Defaults to ``1.0``.
-
-    Returns:
-        Scalar kinetic energy ``½ · scale · Σ_i m_i |v_i|²``.
-    """
-
-    velocities = as_mx_array(velocities)
-    masses = as_mx_array(masses)
-    return kinetic_energy_scale * 0.5 * mx.sum(masses[:, None] * velocities * velocities)
-
-
-def _remove_center_of_mass_velocity(
-    velocities: mx.array,
-    masses: mx.array,
-    *,
-    total_mass: mx.array | None = None,
-) -> mx.array:
-    if total_mass is None:
-        total_mass = mx.sum(masses)
-    center_velocity = mx.sum(masses[:, None] * velocities, axis=0) / total_mass
-    return velocities - center_velocity
-
-
-def instantaneous_temperature(
-    velocities: mx.array,
-    masses: mx.array,
-    *,
-    dof: int | None = None,
-    kinetic_energy_scale: float = 1.0,
-    boltzmann_constant: float = 1.0,
-) -> mx.array:
-    """Return the instantaneous temperature from the kinetic energy.
-
-    Args:
-        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
-        masses: Per-particle masses, shape ``(n_particles,)``.
-        dof: Degrees of freedom in the equipartition denominator; ``None``
-            uses ``velocities.size`` (no constraints removed). Defaults to ``None``.
-        kinetic_energy_scale: Energy-unit factor forwarded to
-            `kinetic_energy`. Defaults to ``1.0``.
-        boltzmann_constant: Boltzmann constant in the configured units.
-            Defaults to ``1.0`` (reduced units).
-
-    Returns:
-        Scalar temperature ``2·E_kin / (dof · k_B)``.
-    """
-
-    if dof is None:
-        dof = velocities.size
-    return (
-        2.0
-        * kinetic_energy(
-            velocities,
-            masses,
-            kinetic_energy_scale=kinetic_energy_scale,
-        )
-        / (dof * boltzmann_constant)
-    )
-
-
-def virial_tensor(positions: mx.array, forces: mx.array) -> mx.array:
-    """Return the non-periodic configurational virial tensor.
-
-    Args:
-        positions: Particle coordinates, shape ``(n_particles, 3)``.
-        forces: Forces on each particle, shape ``(n_particles, 3)``.
-
-    Returns:
-        The ``(3, 3)`` virial tensor ``positionsᵀ · forces``.
-
-    Raises:
-        ValueError: If ``positions`` and ``forces`` do not both have
-            shape ``(n_particles, 3)``.
-    """
-
-    positions = as_mx_array(positions)
-    forces = as_mx_array(forces)
-    if positions.shape != forces.shape or positions.ndim != 2 or positions.shape[1] != 3:
-        msg = "positions and forces must both have shape (n_particles, 3)"
-        raise ValueError(msg)
-    return mx.transpose(positions) @ forces
 
 
 def configurational_virial_tensor(
@@ -1187,70 +432,6 @@ def _potential_energy_for_virial(
     return energy
 
 
-def kinetic_pressure_tensor(
-    velocities: mx.array,
-    masses: mx.array,
-    *,
-    kinetic_energy_scale: float = 1.0,
-    molecule_ids: object | None = None,
-) -> mx.array:
-    """Return the kinetic (momentum-flux) tensor in the configured units.
-
-    Args:
-        velocities: Per-particle velocities, shape ``(n_particles, 3)``.
-        masses: Per-particle masses, shape ``(n_particles,)``.
-        kinetic_energy_scale: Multiplicative factor converting the raw kinetic
-            quantity into the configured energy unit. Defaults to ``1.0``.
-        molecule_ids: Optional contiguous per-particle molecule identifiers.
-            When present, the tensor uses molecular center-of-mass momenta.
-
-    Returns:
-        The ``(3, 3)`` tensor ``scale · Σ_i m_i v_i ⊗ v_i``.
-
-    Raises:
-        ValueError: If ``velocities`` is not ``(n_particles, 3)`` or
-            ``masses`` is not ``(n_particles,)``.
-    """
-
-    velocities = as_mx_array(velocities)
-    masses = as_mx_array(masses)
-    if velocities.ndim != 2 or velocities.shape[1] != 3:
-        msg = "velocities must have shape (n_particles, 3)"
-        raise ValueError(msg)
-    if masses.shape != (velocities.shape[0],):
-        msg = "masses must have shape (n_particles,)"
-        raise ValueError(msg)
-    if molecule_ids is not None:
-        ids = _normalize_pressure_molecule_ids(
-            molecule_ids,
-            particle_count=velocities.shape[0],
-        )
-        molecule_count = int(np.max(ids)) + 1
-        indices = mx.array(ids, dtype=mx.int32)
-        molecule_masses = (
-            mx.zeros(
-                (molecule_count,),
-                dtype=masses.dtype,
-            )
-            .at[indices]
-            .add(masses)
-        )
-        momenta = masses[:, None] * velocities
-        molecule_momenta = (
-            mx.zeros(
-                (molecule_count, 3),
-                dtype=velocities.dtype,
-            )
-            .at[indices]
-            .add(momenta)
-        )
-        molecule_velocities = molecule_momenta / molecule_masses[:, None]
-        weighted_velocities = molecule_masses[:, None] * molecule_velocities
-        return kinetic_energy_scale * mx.transpose(molecule_velocities) @ weighted_velocities
-    weighted_velocities = masses[:, None] * velocities
-    return kinetic_energy_scale * mx.transpose(velocities) @ weighted_velocities
-
-
 def pressure_tensor(
     positions: mx.array,
     velocities: mx.array,
@@ -1359,75 +540,6 @@ def _pressure_diagnostics(
         )
     zeros = mx.zeros((3, 3), dtype=positions.dtype)
     return zeros, zeros, mx.sum(positions[:, 0] * 0.0)
-
-
-def _pressure_diagnostics_from_virial(
-    virial: mx.array | None,
-    positions: mx.array,
-    velocities: mx.array,
-    masses: mx.array,
-    *,
-    cell: Cell | None,
-    kinetic_energy_scale: float,
-    enabled: bool,
-    molecule_ids: object | None = None,
-) -> tuple[mx.array, mx.array, mx.array]:
-    """Assemble pressure from a virial produced by the owning diagnostic evaluation."""
-
-    if not enabled:
-        zeros = mx.zeros((3, 3), dtype=positions.dtype)
-        return zeros, zeros, mx.sum(positions[:, 0] * 0.0)
-    if virial is None:
-        msg = "enabled pressure diagnostics require a configurational virial"
-        raise RuntimeError(msg)
-    if cell is None:
-        zeros = mx.zeros((3, 3), dtype=virial.dtype)
-        return virial, zeros, mx.sum(virial * 0.0)
-    volume = cell.volume
-    if float(np.asarray(volume)) <= 0.0:
-        msg = "pressure diagnostics require positive cell volume"
-        raise ValueError(msg)
-    kinetic_tensor = kinetic_pressure_tensor(
-        velocities,
-        masses,
-        kinetic_energy_scale=kinetic_energy_scale,
-        molecule_ids=molecule_ids,
-    )
-    tensor = (kinetic_tensor + virial) / volume
-    return virial, tensor, mx.trace(tensor) / 3.0
-
-
-def _temperature_degrees_of_freedom(
-    positions: mx.array,
-    constraints: DistanceConstraints | None,
-) -> int:
-    dof = int(positions.size)
-    if constraints is not None:
-        dof -= int(constraints.pairs.shape[0])
-    if positions.shape[0] > 1:
-        dof -= 3
-    return max(1, dof)
-
-
-def _as_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...]):
-    if isinstance(force_terms, (list, tuple)):
-        if not force_terms:
-            msg = "force_terms must not be empty"
-            raise ValueError(msg)
-        return tuple(force_terms)
-    return (force_terms,)
-
-
-def _named_force_terms(force_terms: ForceTerm | list[ForceTerm] | tuple[ForceTerm, ...]):
-    terms = _as_force_terms(force_terms)
-    seen: dict[str, int] = {}
-    named_terms = []
-    for term in terms:
-        base_name = str(getattr(term, "name", type(term).__name__))
-        seen[base_name] = seen.get(base_name, 0) + 1
-        name = base_name if seen[base_name] == 1 else f"{base_name}_{seen[base_name]}"
-        named_terms.append((name, term))
-    return tuple(named_terms)
 
 
 def virial_support_state(term: ForceTerm) -> str:
@@ -1681,209 +793,6 @@ def _evaluate_force_terms(
     )
 
 
-def _forces_from_term_demands(
-    positions: mx.array,
-    force_terms: tuple[ForceTerm, ...],
-    *,
-    cell: Cell | None,
-    pairs: object | None,
-    virtual_sites: VirtualSiteManager | None,
-) -> tuple[mx.array, int, int]:
-    real_positions = as_mx_array(positions)
-    eval_positions = _virtual_site_evaluation_positions(real_positions, virtual_sites)
-    grouped_terms = _groupable_potential_terms(force_terms, pairs)
-    grouped_ids = {id(term) for term in grouped_terms}
-    total_forces = mx.zeros_like(eval_positions)
-    optimized_terms = len(grouped_terms)
-    fallback_terms = 0
-    if grouped_terms:
-        total_forces = total_forces + _grouped_potential_forces(
-            eval_positions,
-            grouped_terms,
-            cell=cell,
-        )
-    for term in force_terms:
-        if id(term) in grouped_ids:
-            continue
-        force_method = getattr(term, "_runtime_forces", None)
-        forces = (
-            force_method(eval_positions, cell=cell, pairs=pairs)
-            if callable(force_method)
-            else NotImplemented
-        )
-        if forces is NotImplemented:
-            _, forces = term.energy_forces(eval_positions, cell, pairs=pairs)
-            fallback_terms += 1
-        else:
-            optimized_terms += 1
-        total_forces = total_forces + as_mx_array(forces)
-    if optimized_terms + fallback_terms == 0:
-        msg = "force_terms must not be empty"
-        raise ValueError(msg)
-    return (
-        _redistribute_virtual_site_forces(
-            total_forces,
-            eval_positions,
-            virtual_sites,
-        ),
-        optimized_terms,
-        fallback_terms,
-    )
-
-
-def _energy_from_term_demands(
-    positions: mx.array,
-    force_terms: tuple[ForceTerm, ...],
-    *,
-    cell: Cell | None,
-    pairs: object | None,
-    virtual_sites: VirtualSiteManager | None,
-) -> tuple[mx.array, int, int]:
-    real_positions = as_mx_array(positions)
-    eval_positions = _virtual_site_evaluation_positions(real_positions, virtual_sites)
-    grouped_terms = _groupable_potential_terms(force_terms, pairs)
-    grouped_ids = {id(term) for term in grouped_terms}
-    total_energy = None
-    optimized_terms = 0
-    fallback_terms = 0
-    for term in force_terms:
-        if id(term) in grouped_ids:
-            energy = term.potential_energy(eval_positions, cell)
-            optimized_terms += 1
-        else:
-            energy_method = getattr(term, "_runtime_energy", None)
-            energy = (
-                energy_method(eval_positions, cell=cell, pairs=pairs)
-                if callable(energy_method)
-                else NotImplemented
-            )
-            if energy is NotImplemented:
-                potential_energy = getattr(term, "potential_energy", None)
-                if pairs is None and callable(potential_energy):
-                    energy = potential_energy(eval_positions, cell)
-                    optimized_terms += 1
-                else:
-                    energy, _ = term.energy_forces(eval_positions, cell, pairs=pairs)
-                    fallback_terms += 1
-            else:
-                optimized_terms += 1
-        total_energy = energy if total_energy is None else total_energy + energy
-    if total_energy is None:
-        msg = "force_terms must not be empty"
-        raise ValueError(msg)
-    return total_energy, optimized_terms, fallback_terms
-
-
-def _energy_forces_from_terms(
-    positions: mx.array,
-    force_terms: tuple[ForceTerm, ...],
-    *,
-    cell: Cell | None,
-    pairs: object | None,
-    virtual_sites: VirtualSiteManager | None = None,
-) -> tuple[mx.array, mx.array]:
-    real_positions = as_mx_array(positions)
-    eval_positions = _virtual_site_evaluation_positions(real_positions, virtual_sites)
-    grouped_terms = _groupable_potential_terms(force_terms, pairs)
-    grouped_ids = {id(term) for term in grouped_terms}
-    total_energy = None
-    total_forces = mx.zeros_like(eval_positions)
-    if grouped_terms:
-        energy, forces = _grouped_potential_energy_forces(
-            eval_positions,
-            grouped_terms,
-            cell=cell,
-        )
-        total_energy = energy
-        total_forces = total_forces + forces
-    for term in force_terms:
-        if id(term) in grouped_ids:
-            continue
-        energy, forces = term.energy_forces(eval_positions, cell, pairs=pairs)
-        total_energy = energy if total_energy is None else total_energy + energy
-        total_forces = total_forces + forces
-
-    if total_energy is None:
-        msg = "force_terms must not be empty"
-        raise ValueError(msg)
-    return total_energy, _redistribute_virtual_site_forces(
-        total_forces,
-        eval_positions,
-        virtual_sites,
-    )
-
-
-def _energy_forces_by_term(
-    positions: mx.array,
-    force_terms: tuple[tuple[str, ForceTerm], ...],
-    *,
-    cell: Cell | None,
-    pairs: object | None,
-    virtual_sites: VirtualSiteManager | None = None,
-) -> tuple[mx.array, mx.array, dict[str, mx.array]]:
-    real_positions = as_mx_array(positions)
-    eval_positions = _virtual_site_evaluation_positions(real_positions, virtual_sites)
-    unnamed_terms = tuple(term for _, term in force_terms)
-    grouped_terms = _groupable_potential_terms(unnamed_terms, pairs)
-    grouped_ids = {id(term) for term in grouped_terms}
-    total_energy = None
-    total_forces = mx.zeros_like(eval_positions)
-    energy_by_term = {}
-    if grouped_terms:
-        energy, forces = _grouped_potential_energy_forces(
-            eval_positions,
-            grouped_terms,
-            cell=cell,
-        )
-        total_energy = energy
-        total_forces = total_forces + forces
-    for name, term in force_terms:
-        if id(term) in grouped_ids:
-            energy_by_term[name] = term.potential_energy(eval_positions, cell)
-            continue
-
-        combined_components = getattr(
-            term,
-            "_runtime_energy_forces_with_components",
-            None,
-        )
-        if not callable(combined_components):
-            combined_components = getattr(
-                term,
-                "energy_forces_with_components",
-                None,
-            )
-        if callable(combined_components):
-            energy, forces, components = combined_components(eval_positions, cell, pairs=pairs)
-            for component_name, component_energy in components.items():
-                if _is_energy_component(component_energy):
-                    energy_by_term[f"{name}.{component_name}"] = component_energy
-        else:
-            energy, forces = term.energy_forces(eval_positions, cell, pairs=pairs)
-            component_energies = getattr(term, "component_energies", None)
-            if callable(component_energies):
-                for component_name, component_energy in component_energies(
-                    eval_positions,
-                    cell=cell,
-                    pairs=pairs,
-                ).items():
-                    if _is_energy_component(component_energy):
-                        energy_by_term[f"{name}.{component_name}"] = component_energy
-            else:
-                energy_by_term[name] = energy
-        total_energy = energy if total_energy is None else total_energy + energy
-        total_forces = total_forces + forces
-
-    if total_energy is None:
-        msg = "force_terms must not be empty"
-        raise ValueError(msg)
-    return (
-        total_energy,
-        _redistribute_virtual_site_forces(total_forces, eval_positions, virtual_sites),
-        energy_by_term,
-    )
-
-
 def _analytic_diagnostic_by_term(
     positions: mx.array,
     force_terms: tuple[tuple[str, ForceTerm], ...],
@@ -2041,35 +950,6 @@ def _analytic_diagnostic_by_term(
         optimized_terms,
         fallback_terms,
     )
-
-
-def _virtual_site_evaluation_positions(
-    positions: mx.array,
-    virtual_sites: VirtualSiteManager | None,
-) -> mx.array:
-    if virtual_sites is None or virtual_sites.n_virtual_sites == 0:
-        return positions
-    if positions.shape[0] != virtual_sites.n_real_atoms:
-        msg = "positions must contain real atoms only when virtual sites are configured"
-        raise ValueError(msg)
-    return virtual_sites.extend_positions(positions)
-
-
-def _redistribute_virtual_site_forces(
-    forces: mx.array,
-    positions: mx.array,
-    virtual_sites: VirtualSiteManager | None,
-) -> mx.array:
-    if virtual_sites is None or virtual_sites.n_virtual_sites == 0:
-        return forces
-    return virtual_sites.redistribute_forces(forces, positions)
-
-
-def _neighbor_evaluation_positions(
-    positions: mx.array,
-    virtual_sites: VirtualSiteManager | None,
-) -> mx.array:
-    return _virtual_site_evaluation_positions(positions, virtual_sites)
 
 
 def _diagnostic_cutoff_strain_pairs(
@@ -2296,10 +1176,6 @@ def _make_forces_evaluator(
     return evaluate
 
 
-def _is_energy_component(value: object) -> bool:
-    return isinstance(value, (mx.array, int, float))
-
-
 def _make_energy_forces_evaluator(
     force_terms: tuple[ForceTerm, ...],
     *,
@@ -2325,66 +1201,6 @@ def _make_energy_forces_evaluator(
     if compile_evaluator and pairs is None and virtual_sites is None:
         return mx.compile(evaluate)
     return evaluate
-
-
-def _groupable_potential_terms(
-    force_terms: tuple[ForceTerm, ...],
-    pairs: object | None,
-) -> tuple[ForceTerm, ...]:
-    if pairs is not None:
-        return ()
-    # Production force terms provide analytical `energy_forces`; using those is
-    # faster than differentiating summed potential energies each MD step.
-    # Potential-only custom terms may opt into autograd grouping explicitly.
-    return tuple(
-        term
-        for term in force_terms
-        if bool(getattr(term, "use_autograd_forces", False))
-        and callable(getattr(term, "potential_energy", None))
-        and not callable(getattr(term, "energy_forces_with_components", None))
-    )
-
-
-def _grouped_potential_energy_forces(
-    positions: mx.array,
-    terms: tuple[ForceTerm, ...],
-    *,
-    cell: Cell | None,
-) -> tuple[mx.array, mx.array]:
-    def total_potential_energy(pos: mx.array) -> mx.array:
-        total = None
-        for term in terms:
-            energy = term.potential_energy(pos, cell)
-            total = energy if total is None else total + energy
-        if total is None:
-            return _zero_constraint_error(pos)
-        return total
-
-    energy, gradient = mx.value_and_grad(total_potential_energy)(positions)
-    return energy, -gradient
-
-
-def _grouped_potential_forces(
-    positions: mx.array,
-    terms: tuple[ForceTerm, ...],
-    *,
-    cell: Cell | None,
-) -> mx.array:
-    def total_potential_energy(pos: mx.array) -> mx.array:
-        total = None
-        for term in terms:
-            energy = term.potential_energy(pos, cell)
-            total = energy if total is None else total + energy
-        if total is None:
-            return _zero_constraint_error(pos)
-        return total
-
-    return -mx.grad(total_potential_energy)(positions)
-
-
-def _dense_pair_count(positions: mx.array) -> int:
-    n_particles = positions.shape[0]
-    return n_particles * (n_particles - 1) // 2
 
 
 def _zero_reason_ints() -> dict[str, int]:
@@ -2724,15 +1540,11 @@ def _nonbonded_runtime_report(
         "fallback_reason": neighbor_list.fallback_reason,
         "adaptation_reason": neighbor_list.adaptation_reason,
         "two_level_schedule_admitted": (
-            None
-            if neighbor_manager is None
-            else neighbor_manager._interaction32_two_level_admitted
+            None if neighbor_manager is None else neighbor_manager._interaction32_two_level_admitted
         ),
         "two_level_observed_generations": observed_generations,
         "two_level_mean_generation_updates": (
-            None
-            if observed_generations == 0
-            else observed_updates / observed_generations
+            None if observed_generations == 0 else observed_updates / observed_generations
         ),
         "neighbor_update_wall_seconds": (
             0.0 if neighbor_manager is None else neighbor_manager.update_wall_seconds
@@ -4429,9 +3241,7 @@ def _simulate_nvt(
         )
     )
     center_of_mass_total_mass = (
-        None
-        if config.center_of_mass_motion_interval is None
-        else mx.sum(masses)
+        None if config.center_of_mass_motion_interval is None else mx.sum(masses)
     )
     for local_step in step_range:
         integration_started = None if route_profiler is None else route_profiler.start()
@@ -5839,62 +4649,6 @@ def _validate_dynamic_cell_cutoffs(
         if float(cutoff) > half_minimum_length + 1.0e-7:
             msg = "dynamic-cell PME real_cutoff must not exceed half the minimum box length"
             raise ValueError(msg)
-
-
-def _normalize_barostat_mode(mode: str) -> str:
-    normalized = str(mode).strip().lower().replace("-", "_")
-    aliases = {
-        "isotropic": "isotropic",
-        "iso": "isotropic",
-        "anisotropic": "anisotropic",
-        "aniso": "anisotropic",
-        "membrane": "membrane",
-        "semi_isotropic": "membrane",
-        "semiisotropic": "membrane",
-    }
-    if normalized not in aliases:
-        msg = "barostat mode must be isotropic, anisotropic, or membrane"
-        raise ValueError(msg)
-    return aliases[normalized]
-
-
-def _barostat_axis_index(axis: str | int) -> int:
-    if isinstance(axis, int):
-        if axis in {0, 1, 2}:
-            return axis
-        msg = "barostat axis must be x, y, z, 0, 1, or 2"
-        raise ValueError(msg)
-    normalized = str(axis).strip().lower()
-    if normalized in {"x", "0"}:
-        return 0
-    if normalized in {"y", "1"}:
-        return 1
-    if normalized in {"z", "2"}:
-        return 2
-    msg = "barostat axis must be x, y, z, 0, 1, or 2"
-    raise ValueError(msg)
-
-
-def _barostat_plane_axes(plane: str | tuple[str | int, str | int]) -> tuple[int, int]:
-    if isinstance(plane, tuple):
-        axes = tuple(_barostat_axis_index(axis) for axis in plane)
-    else:
-        normalized = str(plane).strip().lower().replace("-", "").replace("_", "")
-        axes = tuple(_barostat_axis_index(axis) for axis in normalized)
-    if len(axes) != 2 or len(set(axes)) != 2:
-        msg = "membrane_plane must name two distinct axes"
-        raise ValueError(msg)
-    return tuple(sorted(axes))
-
-
-def _validate_barostat_cell_support(cell: Cell, barostat: MonteCarloBarostat) -> None:
-    volume = float(np.asarray(cell.volume))
-    if not np.isfinite(volume) or volume <= 0.0:
-        msg = "NPT barostat requires a positive finite cell volume"
-        raise ValueError(msg)
-    if barostat.mode == "anisotropic" and not any(barostat.axes):
-        msg = "anisotropic barostat requires at least one enabled axis"
-        raise ValueError(msg)
 
 
 def _barostat_proposal(
