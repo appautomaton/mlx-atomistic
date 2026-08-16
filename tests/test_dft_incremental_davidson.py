@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import mlx_atomistic.dft._periodic_davidson as periodic_davidson
+import mlx_atomistic.dft._periodic_orthonormalization as periodic_orthonormalization
 from mlx_atomistic.dft import (
     GTHProjectorChannel,
     PeriodicDavidsonConfig,
@@ -392,6 +393,7 @@ def test_restart_reuses_ritz_v_and_hv_without_reapplying_h(monkeypatch):
         locked_count=0,
         required_count=0,
         max_count=None,
+        single_pass_tolerance=None,
     ):
         rank_calls.append((int(values.shape[0]), locked_count, max_count))
         return original_orthonormalize(
@@ -400,6 +402,7 @@ def test_restart_reuses_ritz_v_and_hv_without_reapplying_h(monkeypatch):
             locked_count=locked_count,
             required_count=required_count,
             max_count=max_count,
+            single_pass_tolerance=single_pass_tolerance,
         )
 
     monkeypatch.setattr(PeriodicKohnShamOperator, "_apply_compact", recording_apply)
@@ -784,6 +787,39 @@ def test_complex64_rank_policy_preserves_relative_deflation_threshold(
     assert result.deflated_count == 2 - retained_count
 
 
+def test_complex64_rank_policy_reserves_choleskyqr2_for_tight_residuals():
+    policy = _Complex64RankPolicy()
+
+    assert (
+        policy.single_pass_tolerance(
+            residual_tolerance=8.0 * policy.relative_tolerance,
+            vector_count=64,
+        )
+        is None
+    )
+    assert policy.single_pass_tolerance(
+        residual_tolerance=1e-2,
+        vector_count=64,
+    ) == pytest.approx(policy.guard_tolerance(64))
+    assert policy.single_pass_tolerance(
+        residual_tolerance=1e-4,
+        vector_count=64,
+    ) == pytest.approx(5e-6)
+
+
+@pytest.mark.parametrize("residual_tolerance", [0.0, -1.0, np.nan, np.inf])
+def test_complex64_rank_policy_rejects_invalid_residual_tolerance(
+    residual_tolerance,
+):
+    policy = _Complex64RankPolicy()
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        policy.single_pass_tolerance(
+            residual_tolerance=residual_tolerance,
+            vector_count=16,
+        )
+
+
 def test_complex64_rank_policy_keeps_full_active_axis_on_mlx(monkeypatch):
     policy = _Complex64RankPolicy()
     rng = np.random.default_rng(123)
@@ -883,8 +919,21 @@ def test_complex64_rank_policy_falls_back_for_unstable_block_projection():
     )
 
 
-def test_complex64_rank_policy_admits_complex_choleskyqr2_append():
+def test_complex64_rank_policy_admits_complex_choleskyqr1_append(monkeypatch):
     policy = _Complex64RankPolicy()
+    original_normalizer = periodic_orthonormalization._cholesky_row_normalizer
+    normalizer_calls = 0
+
+    def recording_normalizer(*args, **kwargs):
+        nonlocal normalizer_calls
+        normalizer_calls += 1
+        return original_normalizer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        periodic_orthonormalization,
+        "_cholesky_row_normalizer",
+        recording_normalizer,
+    )
     rng = np.random.default_rng(2026)
     dimension = 64
     locked_count = 2
@@ -924,15 +973,19 @@ def test_complex64_rank_policy_admits_complex_choleskyqr2_append():
         )
     )
 
-    result = policy._try_batched_choleskyqr2(
+    result = policy._try_batched_choleskyqr(
         mx.array(stack_np),
         candidate_norms=candidate_norms,
         locked_count=locked_count,
         required_count=locked_count + candidate_count,
         limit=locked_count + candidate_count,
+        single_pass_tolerance=policy.guard_tolerance(
+            locked_count + candidate_count
+        ),
     )
 
     assert result is not None
+    assert normalizer_calls == 1
     assert result.values.shape == (locked_count + candidate_count, dimension)
     assert policy.overlap_error(result.values) <= policy.orthonormality_tolerance(
         locked_count + candidate_count
@@ -941,6 +994,45 @@ def test_complex64_rank_policy_admits_complex_choleskyqr2_append():
         np.asarray(result.values[:locked_count]),
         locked,
     )
+
+
+def test_complex64_rank_policy_repeats_choleskyqr_when_first_pass_needs_repair(
+    monkeypatch,
+):
+    policy = _Complex64RankPolicy()
+    stack = mx.array(np.eye(3, 8, dtype=np.complex64))
+    candidate_norms = mx.ones((2,), dtype=mx.float32)
+    original_normalizer = periodic_orthonormalization._cholesky_row_normalizer
+    normalizer_calls = 0
+
+    def perturb_first_normalizer(*args, **kwargs):
+        nonlocal normalizer_calls
+        normalizer_calls += 1
+        result = original_normalizer(*args, **kwargs)
+        assert result is not None
+        solve, lower = result
+        if normalizer_calls == 1:
+            solve = 1.01 * solve
+        return solve, lower
+
+    monkeypatch.setattr(
+        periodic_orthonormalization,
+        "_cholesky_row_normalizer",
+        perturb_first_normalizer,
+    )
+
+    result = policy._try_batched_choleskyqr(
+        stack,
+        candidate_norms=candidate_norms,
+        locked_count=1,
+        required_count=3,
+        limit=3,
+        single_pass_tolerance=policy.guard_tolerance(3),
+    )
+
+    assert result is not None
+    assert normalizer_calls == 2
+    assert policy.overlap_error(result.values) <= policy.orthonormality_tolerance(3)
 
 
 def test_engine_reuses_solver_validated_orthonormal_trial_without_reprocessing():

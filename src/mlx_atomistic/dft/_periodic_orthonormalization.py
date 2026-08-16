@@ -106,6 +106,27 @@ class _Complex64RankPolicy:
     def guard_tolerance(self, vector_count: int) -> float:
         return 8.0 * float(np.finfo(np.float32).eps) * max(vector_count, 1)
 
+    def single_pass_tolerance(
+        self,
+        *,
+        residual_tolerance: float,
+        vector_count: int,
+    ) -> float | None:
+        """Return a safe CholeskyQR1 gate for a loose Davidson solve."""
+
+        if not np.isfinite(residual_tolerance) or residual_tolerance <= 0.0:
+            msg = "Davidson residual tolerance must be finite and positive"
+            raise ValueError(msg)
+        # CholeskyQR1 is useful while the eigensolver target is loose, but its
+        # roundoff can impede the final complex64 residual. Reserve the second
+        # pass once the target approaches the rank-deflation scale.
+        if residual_tolerance <= 8.0 * self.relative_tolerance:
+            return None
+        return min(
+            self.guard_tolerance(vector_count),
+            0.05 * residual_tolerance,
+        )
+
     def overlap_error(self, values: mx.array) -> float:
         count = int(values.shape[0])
         overlap = values @ mx.conjugate(mx.transpose(values))
@@ -130,7 +151,7 @@ class _Complex64RankPolicy:
             raise ValueError(msg)
         return error
 
-    def _try_batched_choleskyqr2(
+    def _try_batched_choleskyqr(
         self,
         stack: mx.array,
         *,
@@ -138,8 +159,9 @@ class _Complex64RankPolicy:
         locked_count: int,
         required_count: int,
         limit: int,
+        single_pass_tolerance: float | None = None,
     ) -> _RankResult | None:
-        """Admit a well-resolved row block through CholeskyQR2."""
+        """Admit a well-resolved row block through adaptive CholeskyQR1/2."""
 
         input_count = int(stack.shape[0])
         candidate_count = min(input_count - locked_count, limit - locked_count)
@@ -191,6 +213,27 @@ class _Complex64RankPolicy:
         candidate_values = first_solve @ candidate_values
         candidate_transforms = first_solve @ candidate_transforms
 
+        tolerance = self.orthonormality_tolerance(retained_count)
+        if single_pass_tolerance is not None:
+            result_values = mx.concatenate(
+                [locked_values, candidate_values],
+                axis=0,
+            )
+            result_transform = mx.concatenate(
+                [locked_transforms, candidate_transforms],
+                axis=0,
+            )
+            overlap = result_values @ mx.conjugate(mx.transpose(result_values))
+            overlap_np = np.asarray(overlap, dtype=np.complex64)
+            if np.all(np.isfinite(overlap_np)) and float(
+                np.max(np.abs(overlap_np - np.eye(retained_count)))
+            ) <= min(tolerance, single_pass_tolerance):
+                return _RankResult(
+                    values=result_values,
+                    transform=result_transform,
+                    deflated_count=input_count - retained_count,
+                )
+
         second = _cholesky_row_normalizer(
             candidate_values,
             row_count=candidate_count,
@@ -209,7 +252,7 @@ class _Complex64RankPolicy:
             [locked_transforms, candidate_transforms],
             axis=0,
         )
-        if self.overlap_error(result_values) > self.orthonormality_tolerance(retained_count):
+        if self.overlap_error(result_values) > tolerance:
             return None
         return _RankResult(
             values=result_values,
@@ -351,8 +394,15 @@ class _Complex64RankPolicy:
         locked_count: int = 0,
         required_count: int = 0,
         max_count: int | None = None,
+        single_pass_tolerance: float | None = None,
     ) -> _RankResult:
-        """Twice reorthogonalize in complex64 and deterministically deflate."""
+        """Orthonormalize in complex64 and deterministically deflate."""
+
+        if single_pass_tolerance is not None and (
+            not np.isfinite(single_pass_tolerance) or single_pass_tolerance <= 0.0
+        ):
+            msg = "single_pass_tolerance must be finite and positive"
+            raise ValueError(msg)
 
         request = _validated_orthonormalization_request(
             values,
@@ -360,12 +410,13 @@ class _Complex64RankPolicy:
             required_count=required_count,
             max_count=max_count,
         )
-        batched = self._try_batched_choleskyqr2(
+        batched = self._try_batched_choleskyqr(
             request.stack,
             candidate_norms=request.candidate_norms,
             locked_count=request.locked_count,
             required_count=request.required_count,
             limit=request.limit,
+            single_pass_tolerance=single_pass_tolerance,
         )
         if batched is not None:
             return batched

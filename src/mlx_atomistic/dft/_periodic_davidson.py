@@ -89,7 +89,7 @@ def _hamiltonian_context(
         config.max_subspace_size,
         config.preconditioner_floor,
         n_bands,
-        "complex64-choleskyqr2-cgs2-mgs2-rank-v5",
+        "complex64-adaptive-choleskyqr-cgs2-mgs2-rank-v6",
         rank_policy.relative_tolerance,
     )
 
@@ -1716,6 +1716,10 @@ class _DavidsonEngine:
                 locked_count=paired.vector_count,
                 required_count=paired.vector_count,
                 max_count=request.config.max_subspace_size,
+                single_pass_tolerance=request.rank_policy.single_pass_tolerance(
+                    residual_tolerance=request.config.tolerance,
+                    vector_count=paired.vector_count + unconverged_count,
+                ),
             )
         add_observed_work(
             request.observer,
