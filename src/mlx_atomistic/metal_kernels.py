@@ -670,6 +670,19 @@ float mlx_atomistic_erfc_nonnegative(float a) {
     return 1.0f - r;
 }
 
+// Return erfc(a) and exp(-a*a) for a non-negative Ewald argument while
+// evaluating the exponential once.  The erfc approximation is the
+// Abramowitz-Stegun 7.1.26 form used by OpenMM's single-precision kernels.
+float2 mlx_atomistic_ewald_erfc_exp(float a) {
+    float exponential = metal::exp(-a * a);
+    float t = 1.0f / (1.0f + 0.3275911f * a);
+    float polynomial = metal::fma(1.061405429f, t, -1.453152027f);
+    polynomial = metal::fma(polynomial, t, 1.421413741f);
+    polynomial = metal::fma(polynomial, t, -0.284496736f);
+    polynomial = metal::fma(polynomial, t, 0.254829592f);
+    return float2(polynomial * t * exponential, exponential);
+}
+
 """
 
 _PARAMETERIZED_LJ_FORCE_SOURCE = r"""
