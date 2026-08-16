@@ -343,6 +343,26 @@ The source change was removed because it missed the 3% whole-step gate. The
 next Direct candidate must reduce useful-pair arithmetic or complete SIMD work,
 not merely move index traffic out of threadgroup memory.
 
+Three follow-up arithmetic screens tightened that boundary. Factoring the
+Lennard-Jones expression in OpenMM's form regressed the fixed-schedule JAC
+kernel by 0.97%. Replacing the shared screened-Coulomb expression with a 4,097
+entry, 16 KiB linear-interpolation table regressed it by 0.83%, despite a
+`9.8e-8` offline maximum force-factor error. Hoisting the invariant
+`coulomb_constant * right_charge` product regressed by 0.52%, indicating that
+the compiler already performs the useful loop-invariant motion. Every prototype
+preserved the existing force-parity scale and was removed before trajectory
+testing.
+
+The earlier component attribution explains the result: geometry, traversal,
+cutoff checks, SIMD reductions, and writes account for 66-84% of Direct time,
+whereas Lennard-Jones accounts for 13-23% and Coulomb for 3-15%. Atomic output
+attribution caps global force writes at 0.9-3.2%. A larger next design must
+therefore remove complete scheduled work. One bounded candidate is a two-level
+Verlet lifecycle: retain the current outer schedule for correctness, then build
+and reuse a smaller inner force schedule from those candidates. It should enter
+the kernel only if measured inner-build cost amortizes across enough steps to
+beat the current single schedule on both 5DFR and JAC.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.
