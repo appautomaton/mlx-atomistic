@@ -241,9 +241,13 @@ def test_adaptive_scf_records_the_tolerance_and_keeps_the_strict_final_gate():
     )
 
     tolerances = [float(row["eigensolver_tolerance"]) for row in result.history]
+    residual_sources = [str(row["orbital_residual_source"]) for row in result.history]
     assert tolerances[0] == 5e-2
     assert tolerances == sorted(tolerances, reverse=True)
     assert all(value >= config.davidson.tolerance for value in tolerances)
+    assert residual_sources[0] == "paired_subspace"
+    assert residual_sources[-1] == "direct_operator"
+    assert tolerances[-1] == config.davidson.tolerance
     assert result.converged
     assert max(point.eigen.residuals.item() for point in result.kpoints) <= (
         config.orbital_tolerance

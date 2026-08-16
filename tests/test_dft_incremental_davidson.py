@@ -1083,6 +1083,64 @@ def test_engine_returns_requested_final_orbital_density():
     )
 
 
+def test_engine_can_defer_direct_validation_without_changing_the_default():
+    basis, operator = _problem(lane_label="deferred-validation")
+    observer = RuntimeObserver()
+    request = _DavidsonLaneRequest(
+        lane_id="deferred-validation",
+        operator=operator,
+        n_bands=2,
+        config=PeriodicDavidsonConfig(
+            max_iterations=2,
+            tolerance=1e2,
+            max_subspace_size=4,
+        ),
+        trial=periodic_davidson._initial_coefficients(basis, 2),
+        observer=observer,
+        trial_is_orthonormal=True,
+        require_direct_validation=False,
+    )
+
+    outcome = _DavidsonEngine().solve((request,))
+    result = outcome.result_for(request.lane_id)
+    work = observer.snapshot()["work_counters"]
+    iteration_events = [
+        event
+        for event in observer.snapshot()["events"]
+        if event["event"] == "davidson_iteration"
+    ]
+
+    assert not outcome.failures
+    assert result.converged
+    assert work["hpsi_vector_equivalents"] == 2
+    assert work["davidson_hv_new_vectors"] == 2
+    assert iteration_events[-1]["residual_source"] == "paired_subspace"
+    with pytest.raises(ValueError, match="no orbital density"):
+        outcome.orbital_density_for(request.lane_id)
+
+
+def test_deferred_direct_validation_rejects_density_capture():
+    basis, operator = _problem(lane_label="deferred-density")
+    request = _DavidsonLaneRequest(
+        lane_id="deferred-density",
+        operator=operator,
+        n_bands=2,
+        config=PeriodicDavidsonConfig(max_iterations=2, max_subspace_size=4),
+        trial=periodic_davidson._initial_coefficients(basis, 2),
+        observer=None,
+        trial_is_orthonormal=True,
+        require_direct_validation=False,
+        capture_orbital_density=True,
+    )
+
+    outcome = _DavidsonEngine().solve((request,))
+
+    assert "deferred-density" in outcome.failures
+    assert str(outcome.failures["deferred-density"]) == (
+        "orbital density capture requires direct validation"
+    )
+
+
 def test_engine_emits_collective_round_progress_when_detail_is_disabled():
     basis, operator = _problem(lane_label="round-summary")
     observer = RuntimeObserver(detail_events=False)

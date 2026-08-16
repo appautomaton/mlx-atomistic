@@ -1411,6 +1411,7 @@ class _DavidsonLaneRequest:
     observer: RuntimeObserver | None
     rank_policy: _Complex64RankPolicy = _DAVIDSON_RANK_POLICY
     trial_is_orthonormal: bool = False
+    require_direct_validation: bool = True
     capture_orbital_density: bool = False
 
 
@@ -1535,8 +1536,14 @@ class _DavidsonEngine:
         if type(request.trial_is_orthonormal) is not bool:
             msg = "trial_is_orthonormal must be a bool"
             raise ValueError(msg)
+        if type(request.require_direct_validation) is not bool:
+            msg = "require_direct_validation must be a bool"
+            raise ValueError(msg)
         if type(request.capture_orbital_density) is not bool:
             msg = "capture_orbital_density must be a bool"
+            raise ValueError(msg)
+        if request.capture_orbital_density and not request.require_direct_validation:
+            msg = "orbital density capture requires direct validation"
             raise ValueError(msg)
 
     @staticmethod
@@ -1949,6 +1956,17 @@ class _DavidsonEngine:
             ritz_pair.max_residual <= request.config.tolerance
             or progress.iteration_count >= request.config.max_iterations
         ):
+            if not request.require_direct_validation:
+                progress.converged = (
+                    ritz_pair.max_residual <= request.config.tolerance
+                )
+                progress.done = True
+                _DavidsonEngine._emit_iteration(
+                    progress,
+                    ritz_pair,
+                    residual_source="paired_subspace",
+                )
+                return None
             return _DavidsonEngine._prepare_direct_validation(
                 progress,
                 ritz_pair,
@@ -2105,7 +2123,9 @@ class _DavidsonEngine:
         if paired is None or ritz_pair is None:
             msg = "Davidson solver produced no Ritz state"
             raise RuntimeError(msg)
-        if progress.pending_action is not None or not progress.direct_validated:
+        if progress.pending_action is not None or (
+            request.require_direct_validation and not progress.direct_validated
+        ):
             msg = "Davidson result was not sealed by a direct residual"
             raise RuntimeError(msg)
         if request.capture_orbital_density and progress.orbital_density is None:
@@ -2117,7 +2137,7 @@ class _DavidsonEngine:
         )
         final_max_residual = ritz_pair.max_residual
         if progress.converged != (final_max_residual <= request.config.tolerance):
-            msg = "Davidson convergence disagrees with its direct residual"
+            msg = "Davidson convergence disagrees with its final residual"
             raise RuntimeError(msg)
         return PeriodicEigenResult._from_compact(
             eigenvalues=ritz_pair.eigenvalues,

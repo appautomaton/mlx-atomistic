@@ -344,6 +344,7 @@ class _PeriodicSCFIterationResult:
     energy_delta: float | None
     energy_terms: dict[str, float]
     all_eigen_converged: bool
+    eigen_residuals_directly_validated: bool
 
 
 class _PeriodicSCFController:
@@ -633,6 +634,7 @@ class _PeriodicSCFController:
             owned_results,
             max_orbital_residual,
             orbital_densities,
+            eigen_residuals_directly_validated,
         ) = self._solve_owned_kpoints(
             iteration,
             effective_snapshot,
@@ -688,6 +690,7 @@ class _PeriodicSCFController:
             energy_delta=energy_delta,
             energy_terms=energy_terms,
             all_eigen_converged=all(result.eigen.converged for result in owned_results),
+            eigen_residuals_directly_validated=eigen_residuals_directly_validated,
         )
 
     def _effective_potential(self) -> tuple[mx.array, XCResult, mx.array]:
@@ -723,7 +726,8 @@ class _PeriodicSCFController:
     ) -> tuple[
         tuple[PeriodicKPointResult, ...],
         float,
-        tuple[mx.array, ...],
+        tuple[mx.array, ...] | None,
+        bool,
     ]:
         start = perf_counter()
         operators_by_index = {
@@ -743,6 +747,11 @@ class _PeriodicSCFController:
             self.setup.config.davidson,
             tolerance=self.progress.eigensolver_tolerance,
         )
+        require_direct_validation = (
+            not self.setup.config.adaptive_eigensolver_tolerance
+            or self.progress.eigensolver_tolerance
+            <= float(self.setup.config.davidson.tolerance)
+        )
         requests = tuple(
             _DavidsonLaneRequest(
                 lane_id=self.setup.bases[point_index]._layout.lane_id,
@@ -760,7 +769,8 @@ class _PeriodicSCFController:
                     or self.setup.resumed
                     or iteration > self.progress.iteration_start
                 ),
-                capture_orbital_density=True,
+                require_direct_validation=require_direct_validation,
+                capture_orbital_density=require_direct_validation,
             )
             for point_index in self.setup.owned_indices
         )
@@ -785,15 +795,18 @@ class _PeriodicSCFController:
                 eigen_outcome.failures,
             )
         owned_by_index: dict[int, PeriodicKPointResult] = {}
-        orbital_density_by_index: dict[int, mx.array] = {}
+        orbital_density_by_index: dict[int, mx.array] | None = (
+            {} if require_direct_validation else None
+        )
         max_orbital_residual = 0.0
         for point_index in self.setup.owned_indices:
             basis = self.setup.bases[point_index]
             entry = self.setup.ownership.entry_for(point_index)
             eigen = eigen_outcome.result_for(basis._layout.lane_id)
-            orbital_density_by_index[point_index] = eigen_outcome.orbital_density_for(
-                basis._layout.lane_id
-            )
+            if orbital_density_by_index is not None:
+                orbital_density_by_index[point_index] = (
+                    eigen_outcome.orbital_density_for(basis._layout.lane_id)
+                )
             add_observed_work(self.setup.observer, {"kpoint_lane_solves": 1})
             if entry.role == "owner":
                 add_observed_work(
@@ -813,7 +826,15 @@ class _PeriodicSCFController:
         return (
             tuple(owned_by_index[index] for index in self.setup.owned_indices),
             max_orbital_residual,
-            tuple(orbital_density_by_index[index] for index in self.setup.owned_indices),
+            (
+                None
+                if orbital_density_by_index is None
+                else tuple(
+                    orbital_density_by_index[index]
+                    for index in self.setup.owned_indices
+                )
+            ),
+            require_direct_validation,
         )
 
     def _submission_callback(
@@ -920,6 +941,11 @@ class _PeriodicSCFController:
                 "eigensolver_tolerance": self.progress.eigensolver_tolerance,
                 "eigensolver_method": "davidson",
                 "all_kpoints_converged": str(outcome.all_eigen_converged).lower(),
+                "orbital_residual_source": (
+                    "direct_operator"
+                    if outcome.eigen_residuals_directly_validated
+                    else "paired_subspace"
+                ),
             }
         )
         observer = self.setup.observer
@@ -935,6 +961,11 @@ class _PeriodicSCFController:
                 eigensolver_tolerance=self.progress.eigensolver_tolerance,
                 eigensolver_method="davidson",
                 all_kpoints_converged=outcome.all_eigen_converged,
+                orbital_residual_source=(
+                    "direct_operator"
+                    if outcome.eigen_residuals_directly_validated
+                    else "paired_subspace"
+                ),
             )
 
     def _accept_converged(
@@ -945,6 +976,7 @@ class _PeriodicSCFController:
         config = self.setup.config
         converged = (
             iteration >= config.min_iterations
+            and outcome.eigen_residuals_directly_validated
             and outcome.all_eigen_converged
             and outcome.density_residual <= config.density_tolerance
             and outcome.energy_delta is not None
