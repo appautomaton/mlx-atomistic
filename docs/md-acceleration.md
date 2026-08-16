@@ -269,6 +269,21 @@ median regressed 0.31%, while JAC's warm adjacent pair regressed 0.17%; the
 larger JAC median movement was a first-control power-state artifact. Separate
 family kernels therefore remain the production path under MLX's lazy graph.
 
+The same rule applies to force-array aggregation. Folding the Direct force
+array into the order-five PME interpolation write preserved force parity and
+removed one explicit full-array addition, but it made the interpolation depend
+on Direct Space earlier in the graph. Complete ABBA runs regressed 4.7% on
+5DFR, produced only a 0.8% warm adjacent gain on JAC, and were neutral on
+GPCRmd. The explicit lazy addition remains because it gives MLX more scheduling
+freedom than the apparently more fused kernel.
+
+Approximate arithmetic is also screened at the complete-kernel boundary before
+it reaches trajectories. `metal::fast::exp` in the shared Ewald helper changed
+sampled forces by only about 3e-7 relative to the largest force, but fixed-input
+timing regressed in both adjacent JAC comparisons and was unstable on GPCRmd.
+The precise `metal::exp` remains canonical because the approximation supplied no
+portable performance benefit.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.
