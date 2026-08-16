@@ -149,6 +149,20 @@ and a balanced control/candidate/candidate/control order. It is not a same-date
 OpenMM ratio. Reference-engine comparisons must use a matched
 manifest, platform, precision, protocol, power state, and measurement window.
 
+A fresh current-main snapshot on commit `503b571` measured sustained absolute
+throughput under Low Power Mode. Each row used a 75-step rehearsal, three
+independent repeats, ten warmup steps, and 750 measured steps:
+
+| Workload | Atoms | Current wall | Current throughput | Timing spread |
+| --- | ---: | ---: | ---: | ---: |
+| 5DFR | 23,558 | 4.8385 ms/step | 71.43 ns/day | 7.31% |
+| JAC 4-cell | 94,232 | 12.0885 ms/step | 28.59 ns/day | 7.15% |
+| GPCRmd 729 | 92,001 | 12.9714 ms/step | 26.64 ns/day | 4.64% |
+
+All three rows passed the 10% spread gate and every runtime correctness check.
+They describe the current throttled machine state, not a cross-date regression
+or an expected peak-throughput claim.
+
 The promotion follow-up added force parity and a 750-step trajectory smoke gate
 for all six release systems. Every trajectory passed with no fallback and
 20--40 measured Neighbor rebuilds. Isolated, position-balanced low-power runs
@@ -198,13 +212,45 @@ each atom's 125 interpolation reads across five workers regressed JAC by
 2.4--5.6% and GPCRmd by 5.2--13.0%. The retained one-thread interpolation and
 five-thread spread therefore remain the measured layouts.
 
-The apparent diagnostics share in the short whole-step profile is not a new
-per-step hotspot. `diagnostics_reporting` ran only twice in 75 measured steps,
-at the initial and final boundaries, and each call intentionally evaluated the
-full energy/force report. Its per-step contribution falls by roughly an order
-of magnitude in the 750-step canonical gate. The next runtime boundary is the
-interface between integration and constraints, where intermediate kicks and
-position corrections may be consumed by the existing Metal RATTLE kernels.
+The apparent diagnostics share in a short whole-step profile is not a new
+per-step hotspot. `diagnostics_reporting` runs only at the initial and final
+boundaries and intentionally evaluates the full energy/force report. Its
+per-step contribution falls by roughly an order of magnitude in the 750-step
+canonical gate.
+
+A subsequent six-system release profile changed the next-priority decision.
+Direct Space was the largest synchronized stage on every release workload and
+owned a 34.19% cross-system median share. Reciprocal PME followed at 14.04%,
+the Neighbor lifecycle at 11.31%, constraints at 10.95%, and integration at
+9.93%. Integration/constraint fusion therefore remains a secondary candidate.
+
+The next Direct experiment targeted complete SIMD work items rather than
+repeating rejected lane branches or formula specialization. Release schedules
+contained 41.1--44.4% more padded lanes than exact cutoff-plus-skin membership,
+but that builder padding was not itself removable force work. At a 9 A force
+cutoff, rebuild positions left 26.3--27.7% of ordinary groups fully inactive,
+or 14.8--15.3% of their scheduled lanes. Weighting the same test by the real
+750-step Neighbor lifecycle reduced the mean fully inactive-group lane share to
+1.84% on JAC and 1.98% on GPCRmd; the medians were only 0.05--0.06%. A static
+group-skip kernel would therefore have less than about 0.7% whole-step upside
+before paying for metadata and branching. The candidate is closed, and the
+next bounded attribution returns to the integration/constraint interface.
+
+That attribution split the three formerly aggregated integration barriers.
+On JAC, drift/thermostat and the final force kick measured 0.253 and 0.219
+ms/step, while the three constraint projections totaled 0.746 ms/step. On
+GPCRmd they measured 0.348, 0.267, and 1.017 ms/step respectively. The post-step
+state assembly was only 0.008--0.014 ms/step on those workloads. Replacing the
+pre-force dense write with a sparse SHAKE scatter changed direction in an ABBA
+screen and was rejected.
+
+5DFR exposed a separate protocol-specific cost because it runs
+`CMMotionRemover` every step. Its post-step route measured 0.224 ms/step.
+Reusing the invariant total mass removed one repeated reduction. Two
+independent-process 3,000-step pairs improved complete wall by 4.20% and 2.26%,
+with a 3.24% median reduction from 1.3702 to 1.3258 ms/step. This gain applies
+only when center-of-mass motion removal is enabled; it is not attributed to JAC
+or GPCRmd.
 
 ## Measurement Rules
 

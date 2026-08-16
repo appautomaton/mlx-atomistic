@@ -99,3 +99,23 @@ A retained performance report should include:
 
 Rejected micro-optimization reports are consolidated into the decision ledger.
 Git history preserves their former long-form records.
+
+## Local Artifact Retention
+
+`results/` is a disposable local workspace, not a historical archive. Keep the
+smallest set needed to reproduce current decisions:
+
+- current prepared fixtures and their source provenance;
+- the latest accepted clean and instrumented benchmark reports;
+- compact summaries that are not yet recorded in a committed ledger;
+- inputs that are expensive or impossible to reacquire.
+
+Once a decision and reproducer are committed, remove superseded raw repeats,
+rejected prototype directories, GPU traces, trajectory dumps, and restartable
+SCF array caches. A raw path must never be the only surviving record of a
+retained or rejected decision. Record the result, boundary, source commit, and
+reproducer in the appropriate ledger first.
+
+The repository `.gitignore` already excludes `results/`, `outputs/`, common
+array and trajectory formats, Python caches, macOS metadata, and generated site
+content. Do not add redundant per-experiment ignore rules.
