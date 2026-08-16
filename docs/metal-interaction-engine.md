@@ -437,6 +437,32 @@ selector admits the measured 23,000--31,000 and 90,000--100,000 atom windows
 rather than claiming one continuous range. Old checkpoints pin their recorded
 backend; new eligible runs select `mlx_interaction32`.
 
+### Two-level Verlet force schedule
+
+The production-scale route now retains an outer 14.5 A correctness schedule and
+compacts an inner 12.0 A force schedule from the same reference positions. A
+shared atom order lets two Metal passes classify and scatter outer right
+entries without rebuilding cell geometry. The force engine uses the inner
+schedule through 1.5 A maximum displacement, then switches to the
+same-generation outer schedule. Both are discarded at the existing 2.75 A
+outer rebuild threshold.
+
+This lifecycle is enabled only for the measured 80,000-atom-and-larger,
+9.0 A-cutoff, 5.5 A-skin contract. It also learns from motion: after three
+complete generations, a mean lifetime below 24 updates permanently returns the
+manager to the original single-schedule builder. The rule depends on observed
+generation lifetime, not a fixture name or force-field family.
+
+The sustained 750-step gate found a 5.43% two-arm JAC improvement before the
+adaptive follow-up, with both adjacent directions positive at 6.15% and 4.72%.
+The final adaptive JAC arm measured 4.091 ms/step against 4.362 and
+4.403 ms/step controls. GPCRmd's two-arm improvement was 3.39%; the final
+adaptive arm was 2.68% faster than its adjacent control. ApoA1 improved 2.50%.
+An atom-count-only prototype regressed 90k TIP3P water by 8.2%; generation
+admission reduced the final difference to a 0.33% regression, within the 3%
+release non-regression gate. All arms passed finite-state, constraint,
+topology, PME-plan reuse, memory, and timing-spread checks.
+
 Only Gate D permits promotion to the runtime path.
 
 ## Explicit Non-Goals

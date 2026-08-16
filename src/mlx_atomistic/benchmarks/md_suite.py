@@ -24,7 +24,8 @@ STAGE_PROFILE_SCHEMA = "mlx_atomistic.md_stage_profile.v1"
 DEFAULT_LOCAL_SUITE = "local"
 DEFAULT_REPEATS = 3
 DEFAULT_WARMUP_STEPS = 10
-DEFAULT_MEASURED_STEPS = 75
+DEFAULT_MEASURED_STEPS = 750
+DEFAULT_PROFILE_MEASURED_STEPS = 75
 DEFAULT_REHEARSAL_STEPS = 75
 DEFAULT_MAXIMUM_RELATIVE_SPREAD = 0.10
 
@@ -247,7 +248,7 @@ def profile_suite(
     case_ids: Sequence[str] = (),
     prepared_overrides: Mapping[str, str | Path] | None = None,
     warmup_steps: int = DEFAULT_WARMUP_STEPS,
-    measured_steps: int = DEFAULT_MEASURED_STEPS,
+    measured_steps: int = DEFAULT_PROFILE_MEASURED_STEPS,
     neighbor_backend: str | None = None,
     registry_path: str | Path = CASE_REGISTRY_PATH,
     runner: Callable[..., dict[str, Any]] = runtime_payload,
@@ -808,7 +809,11 @@ def main(argv: list[str] | None = None) -> int:
     profile_parser.add_argument("--case", action="append", default=[])
     profile_parser.add_argument("--prepared", action="append", default=[])
     profile_parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
-    profile_parser.add_argument("--measured-steps", type=int, default=DEFAULT_MEASURED_STEPS)
+    profile_parser.add_argument(
+        "--measured-steps",
+        type=int,
+        default=DEFAULT_PROFILE_MEASURED_STEPS,
+    )
     profile_parser.add_argument(
         "--neighbor-backend",
         choices=("mlx_cell_pairs", "mlx_cell_tiles", "mlx_interaction32"),

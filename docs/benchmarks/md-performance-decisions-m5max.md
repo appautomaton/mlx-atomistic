@@ -124,6 +124,22 @@ generation ownership, NBFIX support, and an immutable topology snapshot.
 Against production tiles, the topology-snapshot checkpoint improved complete
 750-step walls by 19.39% on 5DFR, 22.33% on JAC, and 23.09% on GPCRmd.
 
+The retained two-level Verlet schedule addresses the arithmetic-dominated
+Direct kernel by removing complete scheduled lanes rather than adding a
+divergent in-kernel test. At each eligible outer rebuild, two Metal passes
+compact a 3.0 A-skin inner schedule that shares the outer generation's atom
+order and special topology. The manager switches from inner to outer at 1.5 A
+maximum displacement and rebuilds both at the unchanged 2.75 A outer boundary.
+Three observed generations form a motion-based admission test: systems
+averaging fewer than 24 updates per generation return to the single outer
+schedule. Sustained 750-step JAC improved by 6.15% and 4.72% in the two balanced
+directions; GPCRmd improved by 3.83% and 2.96%. ApoA1 improved 2.50%. The first
+atom-count-only version regressed 90k TIP3P water by 8.2%, while adaptive
+admission reduced the final difference to 0.33%. Direct-force parity and the
+inner-to-outer lifecycle GPU tests passed. Implementation checkpoints are
+`e4c631d` and `8c029c2`; raw local evidence is under
+`results/md-suite/two-level-interaction32-2026-08-16/`.
+
 The bounded mode cache in `0066b58` removes the remaining repeated ordinary
 membership traversal for systems whose packed cache is at most 64 MiB. Larger
 systems retain the exact sparse two-pass builder, so this promotion does not

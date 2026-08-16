@@ -356,12 +356,33 @@ testing.
 The earlier component attribution explains the result: geometry, traversal,
 cutoff checks, SIMD reductions, and writes account for 66-84% of Direct time,
 whereas Lennard-Jones accounts for 13-23% and Coulomb for 3-15%. Atomic output
-attribution caps global force writes at 0.9-3.2%. A larger next design must
-therefore remove complete scheduled work. One bounded candidate is a two-level
-Verlet lifecycle: retain the current outer schedule for correctness, then build
-and reuse a smaller inner force schedule from those candidates. It should enter
-the kernel only if measured inner-build cost amortizes across enough steps to
-beat the current single schedule on both 5DFR and JAC.
+attribution caps global force writes at 0.9-3.2%. A larger design therefore had
+to remove complete scheduled work. The retained two-level Verlet lifecycle
+keeps the current 5.5 A outer schedule for correctness and compacts a 3.0 A
+inner force schedule once at the same generation reference. The force path uses
+the inner schedule only while the maximum displacement is at most 1.5 A, then
+falls back to the same-generation outer schedule until the ordinary 2.75 A
+rebuild boundary. It never derives a fresh inner list from stale outer
+candidates.
+
+The compactor is two Metal passes: one classifies outer right entries at the
+inner radius and caches their half-interaction mode, and one scatters retained
+entries into the generation-owned capacity. Both schedules share atom order,
+special topology, and generation identity. This removes about 40% of ordinary
+pair lanes from the early part of each large-system generation without adding
+a C++ build dependency.
+
+Generation lifetime is the runtime admission boundary. After at least three
+complete two-level generations, the engine evaluates their cumulative mean. If
+they average fewer than 24 updates, later rebuilds return to the original outer
+builder. This changed the
+90k TIP3P water result from an 8.2% regression to a 0.33% difference from
+control, while retaining sustained improvements on slower-generation systems.
+In 750-step runs, adaptive JAC measured 4.091 ms/step against adjacent controls
+at 4.362 and 4.403 ms/step; GPCRmd measured 5.267 ms/step against controls at
+5.412 ms/step. ApoA1 improved by 2.5% before the adaptive follow-up. The 5DFR
+case is below the 80,000-atom admission boundary and remains on its unchanged
+single schedule.
 
 ## Measurement Rules
 

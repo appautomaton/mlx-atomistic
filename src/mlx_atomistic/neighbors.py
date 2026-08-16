@@ -1330,7 +1330,11 @@ class NeighborListManager:
                 candidate_count=pair_lanes,
                 estimated_candidate_bytes=resident_schedule_bytes,
                 compaction_backend=compaction_backend,
-                fallback_reason=None,
+                fallback_reason=(
+                    "interaction32_two_level_short_generation"
+                    if self._interaction32_two_level_admitted is False
+                    else None
+                ),
             )
 
         outer_neighbor_list = NeighborList(

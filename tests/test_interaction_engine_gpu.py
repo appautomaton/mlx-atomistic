@@ -1028,6 +1028,9 @@ def test_interaction32_two_level_admission_rejects_short_generations(monkeypatch
     assert manager.neighbor_list.stats.compaction_backend == (
         "metal_interaction32_device_builder"
     )
+    assert manager.neighbor_list.stats.fallback_reason == (
+        "interaction32_two_level_short_generation"
+    )
 
 
 @pytest.mark.gpu

@@ -20,10 +20,19 @@ remain present and comparable.
 
 Every case first runs an unmeasured 75-step rehearsal. This reaches an ordinary
 neighbor rebuild on the local contracts and warms the recurring Metal shapes
-before three recorded repeats, each with ten warmup steps. The persisted metric
-is the median end-to-end seconds per measured step. A case is blocked when its
-recorded timing range exceeds 10% of the median. This prevents cold compilation,
-thermal transitions, or frequency drift from becoming an eligible speedup.
+before three recorded 750-step repeats, each with ten warmup steps. The longer
+window covers recurring Neighbor generations rather than one favorable phase of
+the Verlet lifecycle. The persisted metric is the median end-to-end seconds per
+measured step. A case is blocked when its recorded timing range exceeds 10% of
+the median. This prevents cold compilation, thermal transitions, or frequency
+drift from becoming an eligible speedup.
+
+The 750-step default replaced the former 75-step measurement after four
+position-balanced JAC arms each produced about 40% spread at the same repeat
+position and covered only one measured rebuild. Contemporaneous 750-step arms
+covered 19--41 rebuilds across the large-system cases and stayed below 5.1%
+spread. The 75-step window remains appropriate for intrusive structural
+profiles, but not for sustained throughput claims.
 
 A comparison is blocked when the case contract, rehearsal and measured step
 counts, repeat count, spread limit, or neighbor backend does not match. It also
@@ -47,7 +56,7 @@ uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --repeats 3 \
   --rehearsal-steps 75 \
   --warmup-steps 10 \
-  --measured-steps 75 \
+  --measured-steps 750 \
   --out results/md-suite/baseline.json
 
 uv run python -m mlx_atomistic.benchmarks.md_suite run \
@@ -55,7 +64,7 @@ uv run python -m mlx_atomistic.benchmarks.md_suite run \
   --repeats 3 \
   --rehearsal-steps 75 \
   --warmup-steps 10 \
-  --measured-steps 75 \
+  --measured-steps 750 \
   --out results/md-suite/candidate.json
 
 uv run python -m mlx_atomistic.benchmarks.md_suite compare \
