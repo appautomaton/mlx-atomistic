@@ -26,10 +26,7 @@ def _reciprocal_shift_if_close(
     atol: float = _TIME_REVERSAL_COORDINATE_ATOL,
 ) -> tuple[int, int, int] | None:
     shifts = tuple(int(round(float(value))) for value in values)
-    if all(
-        abs(float(value) - shift) <= atol
-        for value, shift in zip(values, shifts, strict=True)
-    ):
+    if all(abs(float(value) - shift) <= atol for value, shift in zip(values, shifts, strict=True)):
         return shifts
     return None
 
@@ -39,10 +36,7 @@ def _time_reversal_shift(
     second: Sequence[float],
 ) -> tuple[int, int, int] | None:
     return _reciprocal_shift_if_close(
-        tuple(
-            float(left) + float(right)
-            for left, right in zip(first, second, strict=True)
-        )
+        tuple(float(left) + float(right) for left, right in zip(first, second, strict=True))
     )
 
 
@@ -143,17 +137,13 @@ class TimeReversalOwnership:
     def representative_indices(self) -> tuple[int, ...]:
         """Return admitted time-reversal representative indices."""
 
-        return tuple(
-            entry.explicit_index for entry in self.entries if entry.role == "owner"
-        )
+        return tuple(entry.explicit_index for entry in self.entries if entry.role == "owner")
 
     @property
     def partner_indices(self) -> tuple[int, ...]:
         """Return explicit indices published from owner time-reversal views."""
 
-        return tuple(
-            entry.explicit_index for entry in self.entries if entry.role == "partner"
-        )
+        return tuple(entry.explicit_index for entry in self.entries if entry.role == "partner")
 
     @property
     def fallback_reasons(self) -> dict[int, str]:
@@ -224,6 +214,194 @@ def _independent_pair(
     )
 
 
+def _validated_reduced_mesh(
+    points: Sequence[KPoint],
+) -> tuple[list[tuple[float, float, float]], list[float]]:
+    vectors: list[tuple[float, float, float]] = []
+    weights: list[float] = []
+    for index, point in enumerate(points):
+        vector = tuple(float(value) for value in point.vector)
+        weight = float(point.weight)
+        if point.coordinate_system != "reduced":
+            msg = "time-reversal ownership requires reduced-coordinate k-points"
+            raise ValueError(msg)
+        if not np.isfinite(np.asarray(vector, dtype=np.float64)).all():
+            msg = f"k-point {index} has non-finite reduced coordinates"
+            raise ValueError(msg)
+        if not np.isfinite(weight) or weight <= 0.0:
+            msg = f"k-point {index} has a non-finite or non-positive weight"
+            raise ValueError(msg)
+        vectors.append(vector)
+        weights.append(weight)
+    return vectors, weights
+
+
+def _reject_duplicate_reduced_points(
+    vectors: Sequence[tuple[float, float, float]],
+) -> None:
+    for first in range(len(vectors)):
+        for second in range(first + 1, len(vectors)):
+            difference = tuple(
+                left - right for left, right in zip(vectors[first], vectors[second], strict=True)
+            )
+            if _reciprocal_shift_if_close(difference) is not None:
+                msg = (
+                    "ambiguous duplicate k-points modulo the reciprocal lattice: "
+                    f"{first} and {second}"
+                )
+                raise ValueError(msg)
+
+
+def _time_reversal_candidates(
+    vectors: Sequence[tuple[float, float, float]],
+) -> list[list[tuple[int, tuple[int, int, int]]]]:
+    partner_candidates: list[list[tuple[int, tuple[int, int, int]]]] = []
+    for index, vector in enumerate(vectors):
+        candidates = []
+        for candidate_index, candidate in enumerate(vectors):
+            shift = _time_reversal_shift(vector, candidate)
+            if shift is not None:
+                candidates.append((candidate_index, shift))
+        if len(candidates) > 1:
+            msg = f"k-point {index} has multiple time-reversal partners"
+            raise ValueError(msg)
+        partner_candidates.append(candidates)
+    return partner_candidates
+
+
+def _validate_partner_map(
+    partner_candidates: Sequence[Sequence[tuple[int, tuple[int, int, int]]]],
+) -> None:
+    for index, candidates in enumerate(partner_candidates):
+        if not candidates:
+            continue
+        partner_index, _ = candidates[0]
+        reverse = partner_candidates[partner_index]
+        if len(reverse) != 1 or reverse[0][0] != index:
+            msg = f"k-point {index} is multiply claimed by the partner map"
+            raise ValueError(msg)
+
+
+def _independent_ownership_entry(
+    index: int,
+    *,
+    vectors: Sequence[tuple[float, float, float]],
+    weights: Sequence[float],
+    partner_index: int | None,
+    shift: tuple[int, int, int] | None,
+    reason: str,
+) -> TimeReversalOwnershipEntry:
+    return TimeReversalOwnershipEntry(
+        explicit_index=index,
+        reduced_kpoint=vectors[index],
+        original_weight=weights[index],
+        owner_index=index,
+        partner_index=partner_index,
+        role="independent",
+        aggregated_weight=weights[index],
+        reciprocal_shift=shift,
+        fallback_reason=reason,
+    )
+
+
+def _self_inverse_ownership_entry(
+    index: int,
+    shift: tuple[int, int, int],
+    *,
+    vectors: Sequence[tuple[float, float, float]],
+    weights: Sequence[float],
+) -> TimeReversalOwnershipEntry:
+    return TimeReversalOwnershipEntry(
+        explicit_index=index,
+        reduced_kpoint=vectors[index],
+        original_weight=weights[index],
+        owner_index=index,
+        partner_index=index,
+        role="owner",
+        aggregated_weight=weights[index],
+        reciprocal_shift=shift,
+    )
+
+
+def _assign_paired_ownership_entries(
+    entries: list[TimeReversalOwnershipEntry | None],
+    index: int,
+    partner_index: int,
+    shift: tuple[int, int, int],
+    *,
+    vectors: Sequence[tuple[float, float, float]],
+    weights: Sequence[float],
+) -> None:
+    if not np.isclose(
+        weights[index],
+        weights[partner_index],
+        rtol=_TIME_REVERSAL_WEIGHT_RTOL,
+        atol=_TIME_REVERSAL_WEIGHT_ATOL,
+    ):
+        for affected, counterpart in ((index, partner_index), (partner_index, index)):
+            entries[affected] = _independent_ownership_entry(
+                affected,
+                vectors=vectors,
+                weights=weights,
+                partner_index=counterpart,
+                shift=shift,
+                reason="unequal_time_reversal_weight",
+            )
+        return
+    owner_index = min(index, partner_index)
+    aggregated_weight = weights[index] + weights[partner_index]
+    for affected, counterpart in ((index, partner_index), (partner_index, index)):
+        entries[affected] = TimeReversalOwnershipEntry(
+            explicit_index=affected,
+            reduced_kpoint=vectors[affected],
+            original_weight=weights[affected],
+            owner_index=owner_index,
+            partner_index=counterpart,
+            role="owner" if affected == owner_index else "partner",
+            aggregated_weight=aggregated_weight,
+            reciprocal_shift=shift,
+        )
+
+
+def _build_ownership_entries(
+    vectors: Sequence[tuple[float, float, float]],
+    weights: Sequence[float],
+    partner_candidates: Sequence[Sequence[tuple[int, tuple[int, int, int]]]],
+) -> tuple[TimeReversalOwnershipEntry, ...]:
+    entries: list[TimeReversalOwnershipEntry | None] = [None] * len(vectors)
+    for index, candidates in enumerate(partner_candidates):
+        if entries[index] is not None:
+            continue
+        if not candidates:
+            entries[index] = _independent_ownership_entry(
+                index,
+                vectors=vectors,
+                weights=weights,
+                partner_index=None,
+                shift=None,
+                reason="missing_time_reversal_partner",
+            )
+            continue
+        partner_index, shift = candidates[0]
+        if partner_index == index:
+            entries[index] = _self_inverse_ownership_entry(
+                index,
+                shift,
+                vectors=vectors,
+                weights=weights,
+            )
+            continue
+        _assign_paired_ownership_entries(
+            entries,
+            index,
+            partner_index,
+            shift,
+            vectors=vectors,
+            weights=weights,
+        )
+    return tuple(entry for entry in entries if entry is not None)
+
+
 def build_time_reversal_ownership(kpoint_mesh: KPointMesh) -> TimeReversalOwnership:
     """Build deterministic reduced-coordinate owner/partner topology.
 
@@ -243,129 +421,12 @@ def build_time_reversal_ownership(kpoint_mesh: KPointMesh) -> TimeReversalOwners
             ambiguous/multiply-claimed time-reversal map.
     """
 
-    points = kpoint_mesh.points
-    vectors: list[tuple[float, float, float]] = []
-    weights: list[float] = []
-    for index, point in enumerate(points):
-        vector = tuple(float(value) for value in point.vector)
-        weight = float(point.weight)
-        if point.coordinate_system != "reduced":
-            msg = "time-reversal ownership requires reduced-coordinate k-points"
-            raise ValueError(msg)
-        if not np.isfinite(np.asarray(vector, dtype=np.float64)).all():
-            msg = f"k-point {index} has non-finite reduced coordinates"
-            raise ValueError(msg)
-        if not np.isfinite(weight) or weight <= 0.0:
-            msg = f"k-point {index} has a non-finite or non-positive weight"
-            raise ValueError(msg)
-        vectors.append(vector)
-        weights.append(weight)
-
-    for first in range(len(points)):
-        for second in range(first + 1, len(points)):
-            difference = tuple(
-                left - right
-                for left, right in zip(vectors[first], vectors[second], strict=True)
-            )
-            if _reciprocal_shift_if_close(difference) is not None:
-                msg = (
-                    "ambiguous duplicate k-points modulo the reciprocal lattice: "
-                    f"{first} and {second}"
-                )
-                raise ValueError(msg)
-
-    partner_candidates: list[list[tuple[int, tuple[int, int, int]]]] = []
-    for index, vector in enumerate(vectors):
-        candidates = []
-        for candidate_index, candidate in enumerate(vectors):
-            shift = _time_reversal_shift(vector, candidate)
-            if shift is not None:
-                candidates.append((candidate_index, shift))
-        if len(candidates) > 1:
-            msg = f"k-point {index} has multiple time-reversal partners"
-            raise ValueError(msg)
-        partner_candidates.append(candidates)
-
-    for index, candidates in enumerate(partner_candidates):
-        if not candidates:
-            continue
-        partner_index, _ = candidates[0]
-        reverse = partner_candidates[partner_index]
-        if len(reverse) != 1 or reverse[0][0] != index:
-            msg = f"k-point {index} is multiply claimed by the partner map"
-            raise ValueError(msg)
-
-    entries: list[TimeReversalOwnershipEntry | None] = [None] * len(points)
-    for index in range(len(points)):
-        if entries[index] is not None:
-            continue
-        candidates = partner_candidates[index]
-        if not candidates:
-            entries[index] = TimeReversalOwnershipEntry(
-                explicit_index=index,
-                reduced_kpoint=vectors[index],
-                original_weight=weights[index],
-                owner_index=index,
-                partner_index=None,
-                role="independent",
-                aggregated_weight=weights[index],
-                reciprocal_shift=None,
-                fallback_reason="missing_time_reversal_partner",
-            )
-            continue
-        partner_index, shift = candidates[0]
-        if partner_index == index:
-            entries[index] = TimeReversalOwnershipEntry(
-                explicit_index=index,
-                reduced_kpoint=vectors[index],
-                original_weight=weights[index],
-                owner_index=index,
-                partner_index=index,
-                role="owner",
-                aggregated_weight=weights[index],
-                reciprocal_shift=shift,
-            )
-            continue
-        if not np.isclose(
-            weights[index],
-            weights[partner_index],
-            rtol=_TIME_REVERSAL_WEIGHT_RTOL,
-            atol=_TIME_REVERSAL_WEIGHT_ATOL,
-        ):
-            for affected, counterpart in (
-                (index, partner_index),
-                (partner_index, index),
-            ):
-                entries[affected] = TimeReversalOwnershipEntry(
-                    explicit_index=affected,
-                    reduced_kpoint=vectors[affected],
-                    original_weight=weights[affected],
-                    owner_index=affected,
-                    partner_index=counterpart,
-                    role="independent",
-                    aggregated_weight=weights[affected],
-                    reciprocal_shift=shift,
-                    fallback_reason="unequal_time_reversal_weight",
-                )
-            continue
-        owner_index = min(index, partner_index)
-        aggregated_weight = weights[index] + weights[partner_index]
-        for affected, counterpart in (
-            (index, partner_index),
-            (partner_index, index),
-        ):
-            entries[affected] = TimeReversalOwnershipEntry(
-                explicit_index=affected,
-                reduced_kpoint=vectors[affected],
-                original_weight=weights[affected],
-                owner_index=owner_index,
-                partner_index=counterpart,
-                role="owner" if affected == owner_index else "partner",
-                aggregated_weight=aggregated_weight,
-                reciprocal_shift=shift,
-            )
-
-    return TimeReversalOwnership(tuple(entry for entry in entries if entry is not None))
+    vectors, weights = _validated_reduced_mesh(kpoint_mesh.points)
+    _reject_duplicate_reduced_points(vectors)
+    partner_candidates = _time_reversal_candidates(vectors)
+    _validate_partner_map(partner_candidates)
+    entries = _build_ownership_entries(vectors, weights, partner_candidates)
+    return TimeReversalOwnership(entries)
 
 
 def _active_time_reversal_permutation(
@@ -374,8 +435,7 @@ def _active_time_reversal_permutation(
     shift: tuple[int, int, int],
 ) -> np.ndarray | None:
     if (
-        source_basis.reciprocal_grid.fingerprint
-        != target_basis.reciprocal_grid.fingerprint
+        source_basis.reciprocal_grid.fingerprint != target_basis.reciprocal_grid.fingerprint
         or source_basis.cutoff_hartree != target_basis.cutoff_hartree
     ):
         return None
@@ -383,10 +443,7 @@ def _active_time_reversal_permutation(
     target = target_basis._layout._active_integer_g_np
     if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
         return None
-    target_by_g = {
-        tuple(int(value) for value in row): index
-        for index, row in enumerate(target)
-    }
+    target_by_g = {tuple(int(value) for value in row): index for index, row in enumerate(target)}
     if len(target_by_g) != target.shape[0]:
         return None
     permutation = []
@@ -765,8 +822,10 @@ def run_band_structure(
     should_apply_nonlocal = (
         scf_result.nonlocal_applied if apply_nonlocal is None else bool(apply_nonlocal)
     )
-    if should_apply_nonlocal and nonlocal_available and any(
-        not _is_gamma(point) for point in band_path.points
+    if (
+        should_apply_nonlocal
+        and nonlocal_available
+        and any(not _is_gamma(point) for point in band_path.points)
     ):
         msg = "nonlocal band diagnostics are currently limited to Γ-point paths"
         raise ValueError(msg)
