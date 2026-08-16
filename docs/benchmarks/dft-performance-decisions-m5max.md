@@ -24,7 +24,8 @@ representatives.
 | Earlier retained implementation | 152.291 s | 13 | Historical baseline |
 | Adaptive-tolerance implementation | 73.743 s | 14 | Superseded baseline |
 | Finite Hpsi shape scheduler | 59.231 s | 14 | Retained production route |
-| Residual-aware CholeskyQR1/2 | 55.384 s paired median | 14 | Current route |
+| Residual-aware CholeskyQR1/2 | 55.384 s paired median | 14 | Retained route |
+| Davidson-to-density FFT reuse | 54.839 s paired diagnostic | 14 | Current route |
 
 The finite scheduler, introduced in `2a56533`, maps variable Davidson batches
 onto 12 reusable Metal shapes: lane capacities 1, 2, 4, or 8 crossed with
@@ -41,17 +42,26 @@ validation and a median wall of 55.384 seconds, compared with 56.855 seconds
 for the two CholeskyQR2 controls. These were same-session diagnostic runs; they
 are not a formal low-power publication pair.
 
+The current route retains each final Davidson inverse FFT long enough to form
+its occupied-orbital density. The density stage previously repeated the same
+inverse transform immediately after direct residual validation. A same-session
+complete A/B pair preserved the 14-cycle trajectory, final energy, density
+residual, and electron count exactly. It reduced FFT vector-equivalents from
+279,910 to 255,718, density time from 2.525 to 0.113 seconds, and complete
+elapsed time from 56.305 to 54.839 seconds. This is a 2.61% wall reduction, or
+1.027x speedup, under the diagnostic low-power protocol.
+
 The current complete-run attribution is approximately:
 
 | Phase | Time | Share |
 | --- | ---: | ---: |
-| Hpsi applications | 27.73 s | 50.1% |
-| Orthogonalization | 9.39 s | 17.0% |
-| Projected Rayleigh-Ritz solve | 2.39 s | 4.3% |
-| Eigensolver control | 5.03 s | 9.1% |
-| CPU small solves | 3.87 s | 7.0% |
-| Density | 2.51 s | 4.5% |
-| Setup, mixing, persistence, and unaccounted | 4.46 s | 8.1% |
+| Hpsi applications | 28.41 s | 51.8% |
+| Orthogonalization | 10.23 s | 18.7% |
+| Projected Rayleigh-Ritz solve | 2.55 s | 4.7% |
+| Eigensolver control | 5.27 s | 9.6% |
+| CPU small solves | 4.02 s | 7.3% |
+| Density | 0.11 s | 0.2% |
+| Setup, mixing, persistence, and unaccounted | 4.25 s | 7.7% |
 
 Hpsi is the Hamiltonian applied to a batch of wavefunctions. It remains the
 largest phase, but the measurements below show that not every Hpsi boundary is
@@ -63,6 +73,7 @@ large enough to justify a new runtime route.
 | --- | --- | --- |
 | Finite Hpsi shape scheduling | Reused a bounded set of GPU shapes and reduced complete Silicon SCF wall from 73.743 to 59.231 seconds. | `2a56533` |
 | Residual-aware CholeskyQR | Skips the second pass only for a validated loose-residual basis; paired complete diagnostics reduced median wall from 56.855 to 55.384 seconds. | `6e49877` |
+| Davidson-to-density FFT reuse | Reuses the final direct-validation real-space orbitals; a complete paired diagnostic removed 24,192 FFT vector-equivalents and reduced wall by 2.61% with an identical trajectory. | `a8e0b6b` |
 | Scientific EOS and band gates | Separated runtime convergence from equation-of-state (EOS) and band validation; Silicon admission was later recorded against all-electron references. | `78d4b9d`, `1972dce` |
 | Hpsi stage profiler | Separates local FFT, compact scatter/gather, kinetic, and Goedecker-Teter-Hutter (GTH) pseudopotential work using stable captured inputs. Profiles are diagnostic rather than production timings. | `9cd4ef6` |
 
@@ -93,13 +104,16 @@ calculation to maintain a separate production route.
 
 ## Current Direction
 
-Hpsi still consumes about half of the complete wall, and the 8-lane, 16-vector
-shape accounts for 947 of 1,388 complete-run calls. Its local path is almost
-entirely the MLX FFT pair. Reshaping or wrapping the same transforms did not
-improve the complete calculation. A future high-ceiling candidate must reduce
-algorithmic FFT applications or useful vector equivalents while preserving the
-convergence trajectory. Another C++ extension or narrow scatter/gather kernel
-is not justified by the retained evidence.
+Density construction is no longer an optimization target: its repeated inverse
+FFTs are gone and it now accounts for about 0.2% of complete wall. Hpsi still
+consumes about half of the calculation, and the 8-lane, 16-vector shape accounts
+for 947 of 1,388 complete-run calls. Its local path is almost entirely the MLX
+FFT pair. Reshaping or wrapping the same transforms did not improve the complete
+calculation. The next high-ceiling Hpsi candidate must reduce algorithmic FFT
+applications or useful vector-equivalents while preserving the convergence
+trajectory. Orthogonalization is the second measured target at 18.7%. Another
+C++ extension or narrow scatter/gather kernel is not justified by the retained
+evidence.
 
 Retrieve the retired detailed reports when auditing a historical result:
 

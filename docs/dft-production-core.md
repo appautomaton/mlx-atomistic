@@ -81,13 +81,15 @@ production-suite claim can be emitted.
 
 ## Hot-Path Recommendation
 
-The first future custom Metal kernel should target **Hamiltonian application**, specifically the combined kinetic + local + nonlocal application path used by Davidson and band calculations.
+Hamiltonian application remains the largest periodic DFT phase, but retained
+evidence does not justify another narrow custom Metal wrapper. One-dimensional
+and three-dimensional scatter/gather kernels improved isolated boundaries but
+did not clear the complete-run retention gate. A compiled local FFT wrapper
+also changed the convergence trajectory and regressed complete wall time.
 
-Reason:
-
-- Dense diagonalization is a reference path and should not be optimized first.
-- SCF and band workloads repeatedly apply `Hψ`.
-- Nonlocal projector application adds many grid reductions and scatter-like projector accumulations.
-- A fused Metal path can reduce Python-loop overhead before deeper eigensolver work.
-
-Second-tier targets are projector construction/interpolation and orthonormalization. FFT/Hartree should be measured carefully before replacing MLX/Accelerate-backed paths.
+The current route instead removes algorithmic work: the final Davidson
+direct-validation inverse FFT is reused by density construction. Further Hpsi
+work should likewise reduce FFT applications or useful vector-equivalents while
+preserving the exact SCF trajectory. Orthogonalization is the second measured
+target. The current measurements and rejected boundaries are maintained in the
+[DFT performance decision ledger](./benchmarks/dft-performance-decisions-m5max.md).
