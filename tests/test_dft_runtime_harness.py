@@ -13,6 +13,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mlx_atomistic.dft._periodic_davidson as periodic_davidson_module
 import mlx_atomistic.dft.periodic_scf as periodic_scf_module
 from mlx_atomistic import _artifact_identity as artifact_identity
 from mlx_atomistic._artifact_identity import (
@@ -2666,7 +2667,7 @@ def test_logical_hpsi_memory_scales_with_observed_vector_width():
     vector_count = 64
     projector_payload_bytes = grid_count * 8 * 5 * 8
     projector_elements = vector_count * projector_payload_bytes // 8
-    fft_workspace, peak_temporary = periodic_scf_module._logical_hpsi_memory(
+    fft_workspace, peak_temporary = periodic_davidson_module._logical_hpsi_memory(
         vector_count=vector_count,
         grid_count=grid_count,
         projector_elements=projector_elements,
@@ -2702,9 +2703,9 @@ def test_projected_eigh_uses_complex128_lapack_and_returns_runtime_precision(
         converted.append(array.dtype)
         return array
 
-    monkeypatch.setattr(periodic_scf_module.np.linalg, "eigh", capture_dtype)
-    monkeypatch.setattr(periodic_scf_module.mx, "array", capture_mlx_array)
-    values_mx, vectors_mx = periodic_scf_module._projected_eigh(matrix)
+    monkeypatch.setattr(periodic_davidson_module.np.linalg, "eigh", capture_dtype)
+    monkeypatch.setattr(periodic_davidson_module.mx, "array", capture_mlx_array)
+    values_mx, vectors_mx = periodic_davidson_module._projected_eigh(matrix)
     values = np.asarray(values_mx)
     vectors = np.asarray(vectors_mx)
     residual = matrix @ vectors - vectors * values[None, :]
@@ -2733,9 +2734,9 @@ def test_projected_eigh_batch_uses_one_complex128_lapack_bridge(monkeypatch):
         observed_shapes.append((projected.dtype, projected.shape))
         return lapack_eigh(projected)
 
-    monkeypatch.setattr(periodic_scf_module.np.linalg, "eigh", capture_batch)
+    monkeypatch.setattr(periodic_davidson_module.np.linalg, "eigh", capture_batch)
 
-    solved = periodic_scf_module._projected_eigh_batch(matrices)
+    solved = periodic_davidson_module._projected_eigh_batch(matrices)
 
     assert observed_shapes == [(np.dtype(np.complex128), (2, 3, 3))]
     for matrix, (values, vectors) in zip(matrices, solved, strict=True):
@@ -2759,7 +2760,7 @@ def test_projected_eigh_batch_uses_one_complex128_lapack_bridge(monkeypatch):
 )
 def test_projected_eigh_rejects_malformed_or_nonfinite_matrix(matrix, message):
     with pytest.raises(ValueError, match=message):
-        periodic_scf_module._projected_eigh(matrix)
+        periodic_davidson_module._projected_eigh(matrix)
 
 
 def test_periodic_davidson_observer_counts_hpsi_hooks_without_numerical_drift():

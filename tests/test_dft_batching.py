@@ -25,21 +25,23 @@ from mlx_atomistic.dft import (
     run_periodic_scf,
 )
 from mlx_atomistic.dft._compact import _CompactBatch, _CompactBatchPolicy
+from mlx_atomistic.dft._periodic_davidson import (
+    _DavidsonEngine,
+    _DavidsonLaneRequest,
+    _DavidsonScheduler,
+    _initial_coefficients,
+    _plan_compact_submissions,
+    _stable_compact_capacity_groups,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.mixing import PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
 from mlx_atomistic.dft.periodic_scf import (
     PeriodicEigenResult,
     PeriodicKPointResult,
-    _DavidsonEngine,
-    _DavidsonLaneRequest,
-    _DavidsonScheduler,
     _density_from_kpoints,
-    _initial_coefficients,
     _next_scf_eigensolver_tolerance,
-    _plan_compact_submissions,
     _scf_eigensolver_tolerance,
-    _stable_compact_capacity_groups,
 )
 from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
 

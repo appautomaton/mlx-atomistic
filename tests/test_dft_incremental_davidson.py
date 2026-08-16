@@ -7,7 +7,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-import mlx_atomistic.dft.periodic_scf as periodic_scf
+import mlx_atomistic.dft._periodic_davidson as periodic_davidson
 from mlx_atomistic.dft import (
     GTHProjectorChannel,
     PeriodicDavidsonConfig,
@@ -20,8 +20,7 @@ from mlx_atomistic.dft import (
     solve_periodic_eigenproblem,
 )
 from mlx_atomistic.dft._compact import _CompactBatchPolicy
-from mlx_atomistic.dft._runtime_observer import RuntimeObserver
-from mlx_atomistic.dft.periodic_scf import (
+from mlx_atomistic.dft._periodic_davidson import (
     _Complex64RankPolicy,
     _DavidsonApplicationTicket,
     _DavidsonEngine,
@@ -33,6 +32,7 @@ from mlx_atomistic.dft.periodic_scf import (
     _PairedDavidsonState,
     _RankResult,
 )
+from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
 
 class _FailureFrameSentinel:
@@ -72,7 +72,7 @@ def test_fixed_hamiltonian_snapshots_input_and_returns_fresh_potential_copies():
     basis, template = _problem(lane_label="potential:snapshot")
     source = template.effective_local_potential
     operator = PeriodicKohnShamOperator(basis, source)
-    seed = periodic_scf._initial_coefficients(basis, 2)
+    seed = periodic_davidson._initial_coefficients(basis, 2)
     expected = operator._apply_compact(seed)
     mx.eval(expected.values)
 
@@ -320,7 +320,7 @@ def test_incremental_hv_and_projected_blocks_are_reused(monkeypatch):
     application_widths: list[int] = []
     projected_widths: list[int] = []
     original_apply = PeriodicKohnShamOperator._apply_compact
-    original_project = periodic_scf._subspace_matrix
+    original_project = periodic_davidson._subspace_matrix
 
     def recording_apply(self, coefficients, *, observer=None, **kwargs):
         application_widths.append(coefficients.vector_count)
@@ -331,7 +331,7 @@ def test_incremental_hv_and_projected_blocks_are_reused(monkeypatch):
         return original_project(vectors, applied)
 
     monkeypatch.setattr(PeriodicKohnShamOperator, "_apply_compact", recording_apply)
-    monkeypatch.setattr(periodic_scf, "_subspace_matrix", recording_project)
+    monkeypatch.setattr(periodic_davidson, "_subspace_matrix", recording_project)
 
     result = solve_periodic_eigenproblem(
         operator,
@@ -528,7 +528,7 @@ def test_davidson_only_builds_corrections_for_unconverged_bands(monkeypatch):
 def test_ranked_rebase_keeps_authoritative_vectors_and_transforms_only_hv():
     basis, operator = _problem(lane_label="ranked-rebase")
     config = PeriodicDavidsonConfig(max_iterations=3, max_subspace_size=6)
-    vectors = periodic_scf._initial_coefficients(basis, 2)
+    vectors = periodic_davidson._initial_coefficients(basis, 2)
     applied = operator._apply_compact(vectors)
     token = _FixedHamiltonianToken.create(operator, config, 2)
     paired = _PairedDavidsonState.initialize(vectors, applied, token)
@@ -561,7 +561,7 @@ def test_fixed_hamiltonian_token_invalidates_hv_across_every_new_solve(monkeypat
     basis, operator = _problem(lane_label="token")
     config = PeriodicDavidsonConfig(max_iterations=3, max_subspace_size=6)
     rank_policy = _Complex64RankPolicy()
-    vectors = periodic_scf._initial_coefficients(basis, 2)
+    vectors = periodic_davidson._initial_coefficients(basis, 2)
     applied = operator._apply_compact(vectors)
     first = _FixedHamiltonianToken.create(operator, config, 2, rank_policy)
     paired = _PairedDavidsonState.initialize(vectors, applied, first)
@@ -646,7 +646,7 @@ def test_fixed_hamiltonian_token_invalidates_hv_across_every_new_solve(monkeypat
 
     original_device = str(mx.default_device())
     monkeypatch.setattr(
-        periodic_scf.mx,
+        periodic_davidson.mx,
         "default_device",
         lambda: f"changed:{original_device}",
     )
@@ -727,7 +727,7 @@ def test_complex64_rank_policy_deflates_or_fails_near_dependent_input():
         policy.orthonormalize(values[:2], required_count=2)
 
     basis, operator = _problem(lane_label="rank")
-    seed = periodic_scf._initial_coefficients(basis, 2)
+    seed = periodic_davidson._initial_coefficients(basis, 2)
     nearly_rank_one = basis._state_from_compact(
         mx.stack(
             [
@@ -946,7 +946,7 @@ def test_complex64_rank_policy_admits_complex_choleskyqr2_append():
 def test_engine_reuses_solver_validated_orthonormal_trial_without_reprocessing():
     basis, operator = _problem(lane_label="trusted-trial")
     observer = RuntimeObserver()
-    trial = periodic_scf._initial_coefficients(basis, 2)
+    trial = periodic_davidson._initial_coefficients(basis, 2)
     request = _DavidsonLaneRequest(
         lane_id="trusted-trial",
         operator=operator,
@@ -973,7 +973,7 @@ def test_engine_emits_collective_round_progress_when_detail_is_disabled():
             operator=operator,
             n_bands=1,
             config=config,
-            trial=periodic_scf._initial_coefficients(basis, 1),
+            trial=periodic_davidson._initial_coefficients(basis, 1),
             observer=observer,
             trial_is_orthonormal=True,
         )
@@ -998,8 +998,8 @@ def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():
     config = PeriodicDavidsonConfig(max_iterations=2, max_subspace_size=6)
     rank_policy = _Complex64RankPolicy()
     token = _FixedHamiltonianToken.create(operator, config, 2, rank_policy)
-    one = periodic_scf._initial_coefficients(basis, 1)
-    two = periodic_scf._initial_coefficients(basis, 2)
+    one = periodic_davidson._initial_coefficients(basis, 1)
+    two = periodic_davidson._initial_coefficients(basis, 2)
     nonfinite = basis._state_from_compact(mx.full((1, basis.active_count), complex(np.nan, 0.0)))
     observer = RuntimeObserver()
     scheduler = _DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=1))
@@ -1153,7 +1153,7 @@ def test_finite_bucket_scheduler_uses_only_smallest_fitting_physical_shapes():
             n_bands=16,
             rank_policy=rank_policy,
             token=token,
-            vectors=periodic_scf._initial_coefficients(basis, width),
+            vectors=periodic_davidson._initial_coefficients(basis, width),
             observer=observer,
         )
         for width in (1, 3, 5, 9)
@@ -1215,7 +1215,7 @@ def test_engine_tail_submission_reuses_solve_local_physical_shape(monkeypatch):
             observed_operator,
             1,
             config,
-            periodic_scf._initial_coefficients(basis, 1),
+            periodic_davidson._initial_coefficients(basis, 1),
             observer,
         )
         for lane_id in ("left", "middle", "tail")
@@ -1265,7 +1265,7 @@ def test_incremental_multilane_engine_progresses_ragged_lanes_and_submits_work()
                 tolerance=0.03,
                 max_subspace_size=5,
             ),
-            trial=periodic_scf._initial_coefficients(basis, 1),
+            trial=periodic_davidson._initial_coefficients(basis, 1),
             observer=observer,
         ),
         _DavidsonLaneRequest(
@@ -1277,7 +1277,7 @@ def test_incremental_multilane_engine_progresses_ragged_lanes_and_submits_work()
                 tolerance=1e-10,
                 max_subspace_size=4,
             ),
-            trial=periodic_scf._initial_coefficients(basis, 2),
+            trial=periodic_davidson._initial_coefficients(basis, 2),
             observer=observer,
         ),
         _DavidsonLaneRequest(
@@ -1365,7 +1365,7 @@ def test_incremental_multilane_engine_splits_ready_waves_at_real_batch_cap_one()
             operator=operator,
             n_bands=1,
             config=config,
-            trial=periodic_scf._initial_coefficients(basis, 1),
+            trial=periodic_davidson._initial_coefficients(basis, 1),
             observer=observer,
         )
         for lane_id in ("left", "right")
@@ -1408,21 +1408,21 @@ def test_incremental_multilane_initial_projection_failure_is_lane_local(monkeypa
         unobserved.effective_local_potential,
         observer=observer,
     )
-    original_project = periodic_scf._subspace_matrix
+    original_project = periodic_davidson._subspace_matrix
 
     def injected_projection(vectors, applied):
         if int(vectors.shape[0]) == 2:
             raise RuntimeError("injected projected-state failure")
         return original_project(vectors, applied)
 
-    monkeypatch.setattr(periodic_scf, "_subspace_matrix", injected_projection)
+    monkeypatch.setattr(periodic_davidson, "_subspace_matrix", injected_projection)
     requests = (
         _DavidsonLaneRequest(
             "healthy",
             operator,
             1,
             PeriodicDavidsonConfig(max_iterations=1, max_subspace_size=3),
-            periodic_scf._initial_coefficients(basis, 1),
+            periodic_davidson._initial_coefficients(basis, 1),
             observer,
         ),
         _DavidsonLaneRequest(
@@ -1430,7 +1430,7 @@ def test_incremental_multilane_initial_projection_failure_is_lane_local(monkeypa
             operator,
             2,
             PeriodicDavidsonConfig(max_iterations=1, max_subspace_size=4),
-            periodic_scf._initial_coefficients(basis, 2),
+            periodic_davidson._initial_coefficients(basis, 2),
             observer,
         ),
     )
@@ -1482,7 +1482,7 @@ def test_incremental_failure_records_release_frames_and_raise_fresh_errors(monke
             operator,
             1,
             config,
-            periodic_scf._initial_coefficients(basis, 1),
+            periodic_davidson._initial_coefficients(basis, 1),
             None,
         )
         for lane_id, operator in (
