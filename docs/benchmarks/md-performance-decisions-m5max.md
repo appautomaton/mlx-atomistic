@@ -149,6 +149,16 @@ safe margin. The active schedule decision is reported as `adaptation_reason`;
 `fallback_reason` remains reserved for an actual backend failure. Raw evidence
 is under `results/md-suite/post-two-level-whole-step-profile-2026-08-16/`.
 
+A fresh manifest-matched JAC 94,232-atom comparison at `12bc829` used 10
+warmup steps and 750 measured 4 fs fixed-cell NVT steps while macOS Low Power
+Mode was enabled. Current MLX with the adaptive Interaction32 route measured
+4.554 ms/step (75.90 ns/day); OpenMM 8.5.1.dev-f7fa0c2 with single-precision
+OpenCL measured 2.392 ms/step (144.48 ns/day). Every workload and runtime check
+passed, giving an MLX/OpenMM wall-time ratio of 1.904. The comparison is matched
+protocol throughput, not trajectory identity, because the engines use
+independent random-number implementations. Raw local evidence is under
+`results/md-suite/current-matched-openmm-12bc829-2026-08-16/`.
+
 The bounded mode cache in `0066b58` removes the remaining repeated ordinary
 membership traversal for systems whose packed cache is at most 64 MiB. Larger
 systems retain the exact sparse two-pass builder, so this promotion does not
