@@ -13,6 +13,69 @@ from mlx_atomistic.dft.potentials import LocalGaussianPseudopotential
 from mlx_atomistic.dft.pseudopotentials import IonCollection, LocalPseudopotentialField
 
 
+def _validated_grid_shape(grid_shape: Sequence[int]) -> tuple[int, int, int]:
+    shape = tuple(int(item) for item in grid_shape)
+    if len(shape) != 3 or any(item <= 0 for item in shape):
+        msg = "grid_shape must contain three positive dimensions"
+        raise ValueError(msg)
+    return shape
+
+
+def _resolved_pseudopotential(
+    *,
+    ions: IonCollection | None,
+    pseudopotential: LocalGaussianPseudopotential | LocalPseudopotentialField | None,
+    centers: Sequence[Sequence[float]] | None,
+    amplitudes: Sequence[float] | float | None,
+    widths: Sequence[float] | float | None,
+    electron_count: float | None,
+) -> tuple[
+    LocalGaussianPseudopotential | LocalPseudopotentialField,
+    float,
+]:
+    if ions is not None and (
+        pseudopotential is not None
+        or centers is not None
+        or amplitudes is not None
+        or widths is not None
+    ):
+        msg = "ions cannot be combined with explicit pseudopotential or Gaussian parameters"
+        raise ValueError(msg)
+    if ions is not None:
+        pseudopotential = LocalPseudopotentialField(ions)
+        if electron_count is None:
+            electron_count = ions.valence_electron_count
+    if pseudopotential is None:
+        if centers is None or amplitudes is None or widths is None:
+            msg = "centers, amplitudes, and widths are required without pseudopotential"
+            raise ValueError(msg)
+        pseudopotential = LocalGaussianPseudopotential(centers, amplitudes, widths)
+    if electron_count is None:
+        msg = "electron_count is required without ions"
+        raise ValueError(msg)
+    if electron_count <= 0.0:
+        msg = "electron_count must be positive"
+        raise ValueError(msg)
+    return pseudopotential, float(electron_count)
+
+
+def _resolved_center_charges(
+    pseudopotential: LocalGaussianPseudopotential | LocalPseudopotentialField,
+    *,
+    ions: IonCollection | None,
+    charges: Sequence[float] | None,
+) -> tuple[float, ...]:
+    center_count = int(pseudopotential.centers.shape[0])
+    if charges is not None:
+        if len(charges) != center_count:
+            msg = "charges length must match number of pseudopotential centers"
+            raise ValueError(msg)
+        return tuple(float(value) for value in charges)
+    if ions is not None:
+        return ions.charges
+    return tuple(float(-amplitude) for amplitude in np.array(pseudopotential.amplitudes))
+
+
 def center_center_energy(system: DFTSystem) -> float:
     """Return pairwise center-center Coulomb energy for toy DFT centers."""
 
@@ -77,50 +140,24 @@ class DFTSystem:
         ions: IonCollection | None = None,
     ):
         parsed_cell = cell if isinstance(cell, Cell) else Cell.orthorhombic(cell)
-        shape = tuple(int(item) for item in grid_shape)
-        if len(shape) != 3 or any(item <= 0 for item in shape):
-            msg = "grid_shape must contain three positive dimensions"
-            raise ValueError(msg)
-        if ions is not None and (
-            pseudopotential is not None
-            or centers is not None
-            or amplitudes is not None
-            or widths is not None
-        ):
-            msg = "ions cannot be combined with explicit pseudopotential or Gaussian parameters"
-            raise ValueError(msg)
-        if ions is not None:
-            pseudopotential = LocalPseudopotentialField(ions)
-            if electron_count is None:
-                electron_count = ions.valence_electron_count
-        if pseudopotential is None:
-            if centers is None or amplitudes is None or widths is None:
-                msg = "centers, amplitudes, and widths are required without pseudopotential"
-                raise ValueError(msg)
-            pseudopotential = LocalGaussianPseudopotential(centers, amplitudes, widths)
-        if electron_count is None:
-            msg = "electron_count is required without ions"
-            raise ValueError(msg)
-        if electron_count <= 0.0:
-            msg = "electron_count must be positive"
-            raise ValueError(msg)
-        n_centers = int(pseudopotential.centers.shape[0])
-        if charges is None:
-            if ions is None:
-                parsed_charges = tuple(
-                    float(-amplitude) for amplitude in np.array(pseudopotential.amplitudes)
-                )
-            else:
-                parsed_charges = ions.charges
-        else:
-            if len(charges) != n_centers:
-                msg = "charges length must match number of pseudopotential centers"
-                raise ValueError(msg)
-            parsed_charges = tuple(float(value) for value in charges)
+        shape = _validated_grid_shape(grid_shape)
+        pseudopotential, electron_count_value = _resolved_pseudopotential(
+            ions=ions,
+            pseudopotential=pseudopotential,
+            centers=centers,
+            amplitudes=amplitudes,
+            widths=widths,
+            electron_count=electron_count,
+        )
+        parsed_charges = _resolved_center_charges(
+            pseudopotential,
+            ions=ions,
+            charges=charges,
+        )
 
         object.__setattr__(self, "grid_shape", shape)
         object.__setattr__(self, "cell", parsed_cell)
-        object.__setattr__(self, "electron_count", float(electron_count))
+        object.__setattr__(self, "electron_count", electron_count_value)
         object.__setattr__(self, "pseudopotential", pseudopotential)
         object.__setattr__(self, "charges", parsed_charges)
         object.__setattr__(self, "ions", ions)

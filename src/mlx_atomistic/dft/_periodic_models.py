@@ -224,6 +224,11 @@ class PeriodicSCFConfig:
     eigensolver_tolerance_scale: float = 0.1
 
     def __post_init__(self) -> None:
+        self._validate_iteration_controls()
+        self._validate_eigensolver_controls()
+        self._compact_batch_policy()
+
+    def _validate_iteration_controls(self) -> None:
         if self.max_iterations <= 0:
             msg = "max_iterations must be positive"
             raise ValueError(msg)
@@ -242,6 +247,8 @@ class PeriodicSCFConfig:
         if self.mixer not in {"linear", "diis"}:
             msg = "mixer must be 'linear' or 'diis'"
             raise ValueError(msg)
+
+    def _validate_eigensolver_controls(self) -> None:
         if type(self.adaptive_eigensolver_tolerance) is not bool:
             msg = "adaptive_eigensolver_tolerance must be a bool"
             raise ValueError(msg)
@@ -260,7 +267,6 @@ class PeriodicSCFConfig:
                 "final Davidson tolerance"
             )
             raise ValueError(msg)
-        self._compact_batch_policy()
 
     def _compact_batch_policy(self) -> _CompactBatchPolicy:
         """Return the validated compact execution policy for this SCF run."""

@@ -65,6 +65,11 @@ class SCFConfig:
     eigensolver_config: EigensolverConfig = field(default_factory=EigensolverConfig)
 
     def __post_init__(self) -> None:
+        self._validate_iteration_controls()
+        self._validate_solver_controls()
+        self._validate_optional_tolerances()
+
+    def _validate_iteration_controls(self) -> None:
         if self.max_iterations <= 0:
             msg = "max_iterations must be positive"
             raise ValueError(msg)
@@ -77,6 +82,8 @@ class SCFConfig:
         if self.step_size <= 0.0:
             msg = "step_size must be positive"
             raise ValueError(msg)
+
+    def _validate_solver_controls(self) -> None:
         if self.solver not in {"auto", "dense", "gradient", "davidson"}:
             msg = "solver must be 'auto', 'dense', 'gradient', or 'davidson'"
             raise ValueError(msg)
@@ -92,6 +99,8 @@ class SCFConfig:
         if self.min_iterations <= 0:
             msg = "min_iterations must be positive"
             raise ValueError(msg)
+
+    def _validate_optional_tolerances(self) -> None:
         if self.potential_tolerance is not None and self.potential_tolerance <= 0.0:
             msg = "potential_tolerance must be positive when provided"
             raise ValueError(msg)
@@ -616,6 +625,202 @@ def _history_row(
     }
 
 
+def _scf_local_metadata(
+    local_input: LocalGaussianPseudopotential
+    | LocalPseudopotentialField
+    | mx.array
+    | Sequence[float],
+) -> tuple[str, int | None, float | None, bool]:
+    if isinstance(local_input, LocalGaussianPseudopotential):
+        return "gaussian", None, None, False
+    if isinstance(local_input, LocalPseudopotentialField):
+        formats = ",".join(sorted(set(local_input.ions.formats)))
+        return (
+            formats,
+            len(local_input.ions.ions),
+            local_input.ions.valence_electron_count,
+            local_input.nonlocal_available,
+        )
+    return "array", None, None, False
+
+
+def _scf_nonlocal_operator(
+    local_input: LocalGaussianPseudopotential
+    | LocalPseudopotentialField
+    | mx.array
+    | Sequence[float],
+    grid: RealSpaceGrid,
+    config: SCFConfig,
+    timings: dict[str, float],
+) -> tuple[NonlocalPseudopotentialOperator | None, int]:
+    if not (
+        config.apply_nonlocal
+        and isinstance(local_input, LocalPseudopotentialField)
+        and local_input.nonlocal_available
+    ):
+        return None, 0
+    start = perf_counter()
+    operator = NonlocalPseudopotentialOperator.from_ions(local_input.ions, grid)
+    _add_timing(timings, "nonlocal_ms", start, enabled=config.record_timing)
+    return operator, operator.projectors.count
+
+
+def _solve_scf_orbitals(
+    solver: str,
+    orbitals: mx.array,
+    density: mx.array,
+    effective_potential: mx.array,
+    *,
+    grid: RealSpaceGrid,
+    v_local: mx.array,
+    n_orbitals: int,
+    config: SCFConfig,
+    xc_functional: ExchangeCorrelationFunctional,
+    nonlocal_operator: NonlocalPseudopotentialOperator | None,
+    timings: dict[str, float],
+) -> tuple[mx.array, dict]:
+    start = perf_counter()
+    metadata: dict = {"solver": solver}
+    if solver == "dense":
+        next_orbitals = _dense_lowest_orbitals(
+            effective_potential,
+            grid,
+            n_orbitals=n_orbitals,
+            nonlocal_operator=nonlocal_operator,
+        )
+    elif solver == "davidson":
+        operator = KohnShamOperator.from_density(
+            grid,
+            v_local,
+            density,
+            xc_functional=xc_functional,
+            density_floor=config.density_floor,
+            nonlocal_operator=nonlocal_operator,
+        )
+        diagonalized = DavidsonDiagonalizer(config.eigensolver_config).solve(
+            operator,
+            n_orbitals=n_orbitals,
+            initial_orbitals=orbitals,
+        )
+        next_orbitals = diagonalized.orbitals
+        metadata = {
+            **diagonalized.metadata,
+            "eigensolver_converged": diagonalized.converged,
+            "max_eigensolver_residual": float(mx.max(diagonalized.residuals)),
+        }
+    else:
+        next_orbitals = _gradient_step_orbitals(
+            orbitals,
+            effective_potential,
+            grid,
+            step_size=config.step_size,
+        )
+    elapsed_ms = (perf_counter() - start) * 1000.0
+    if config.record_timing:
+        timings["solver_ms"] += elapsed_ms
+        if solver == "dense":
+            timings["diagonalization_ms"] += elapsed_ms
+        elif solver == "davidson":
+            timings["preconditioner_ms"] += elapsed_ms
+    return next_orbitals, metadata
+
+
+def _scf_iteration_transition(
+    iteration: int,
+    *,
+    config: SCFConfig,
+    density_residual: float,
+    potential_residual: float | None,
+    energy_delta: float | None,
+    orbital_residual: float | None,
+    orthonormality: float,
+) -> tuple[bool, bool, str, str | None]:
+    if orthonormality > config.max_orthonormality_error:
+        return True, False, "max_iterations", "orthonormality_loss"
+    if config.max_density_residual is not None and density_residual > config.max_density_residual:
+        return True, False, "max_iterations", "diverged"
+    converged = _converged(
+        iteration=iteration,
+        config=config,
+        density_residual=density_residual,
+        potential_residual=potential_residual,
+        energy_delta=energy_delta,
+        orbital_residual=orbital_residual,
+    )
+    if converged:
+        return True, True, config.convergence_mode, None
+    return False, False, "max_iterations", None
+
+
+def _scf_forces(
+    local_input: LocalGaussianPseudopotential
+    | LocalPseudopotentialField
+    | mx.array
+    | Sequence[float],
+    density: mx.array,
+    grid: RealSpaceGrid,
+    *,
+    system: DFTSystem | None,
+    orbitals: mx.array,
+    occupations: Sequence[float],
+    nonlocal_applied: bool,
+    timings: dict[str, float],
+    timing_enabled: bool,
+) -> tuple[mx.array | None, dict[str, bool] | None]:
+    if not isinstance(
+        local_input,
+        LocalGaussianPseudopotential | LocalPseudopotentialField,
+    ):
+        return None, None
+    start = perf_counter()
+    if isinstance(local_input, LocalGaussianPseudopotential):
+        forces = local_pseudopotential_forces(density, grid, local_input)
+        provenance = {
+            "local_analytic": True,
+            "nonlocal_finite_difference": False,
+            "center_center": system is not None,
+        }
+    else:
+        forces = local_input.forces(density, grid)
+        if nonlocal_applied and system is not None:
+            forces = forces + _nonlocal_force_correction(
+                system,
+                grid,
+                orbitals,
+                occupations=occupations,
+            )
+        provenance = {
+            "local_analytic": True,
+            "nonlocal_finite_difference": bool(nonlocal_applied),
+            "center_center": system is not None,
+        }
+    if system is not None:
+        forces = forces + mx.array(center_center_forces(system), dtype=forces.dtype)
+    _add_timing(timings, "force_ms", start, enabled=timing_enabled)
+    return forces, provenance
+
+
+def _final_scf_failure_reason(
+    history: Sequence[dict[str, float | int | str | None]],
+    *,
+    converged: bool,
+    failure_reason: str | None,
+) -> str | None:
+    if not history:
+        return "no_scf_iterations"
+    if not converged and failure_reason is None:
+        return "max_iterations_reached"
+    return failure_reason
+
+
+def _scf_status(converged: bool, failure_reason: str | None) -> str:
+    if converged:
+        return "converged"
+    if failure_reason == "max_iterations_reached":
+        return "max_iterations"
+    return "failed"
+
+
 def run_scf(
     system_or_grid: DFTSystem | RealSpaceGrid,
     local_potential: LocalGaussianPseudopotential
@@ -699,29 +904,18 @@ def run_scf(
     orbital_residual_values = None
     final_orthonormality_error = 0.0
     max_orbital_residual: float | None = None
-    pseudopotential_format = "array"
-    ion_count = None
-    valence_electron_count = None
-    nonlocal_available = False
-    if isinstance(local_input, LocalGaussianPseudopotential):
-        pseudopotential_format = "gaussian"
-    elif isinstance(local_input, LocalPseudopotentialField):
-        formats = sorted(set(local_input.ions.formats))
-        pseudopotential_format = ",".join(formats)
-        ion_count = len(local_input.ions.ions)
-        valence_electron_count = local_input.ions.valence_electron_count
-        nonlocal_available = local_input.nonlocal_available
-    nonlocal_operator = None
-    nonlocal_projector_count = 0
-    if (
-        config.apply_nonlocal
-        and isinstance(local_input, LocalPseudopotentialField)
-        and local_input.nonlocal_available
-    ):
-        start = perf_counter()
-        nonlocal_operator = NonlocalPseudopotentialOperator.from_ions(local_input.ions, grid)
-        nonlocal_projector_count = nonlocal_operator.projectors.count
-        _add_timing(timings, "nonlocal_ms", start, enabled=config.record_timing)
+    (
+        pseudopotential_format,
+        ion_count,
+        valence_electron_count,
+        nonlocal_available,
+    ) = _scf_local_metadata(local_input)
+    nonlocal_operator, nonlocal_projector_count = _scf_nonlocal_operator(
+        local_input,
+        grid,
+        config,
+        timings,
+    )
     nonlocal_applied = nonlocal_operator is not None and nonlocal_operator.available
     solver_metadata: dict = {"solver": solver}
 
@@ -744,48 +938,19 @@ def run_scf(
         previous_potential = effective_potential
         _assert_finite(effective_potential)
 
-        start = perf_counter()
-        if solver == "dense":
-            next_orbitals = _dense_lowest_orbitals(
-                effective_potential,
-                grid,
-                n_orbitals=n_occ_orbitals,
-                nonlocal_operator=nonlocal_operator,
-            )
-        elif solver == "davidson":
-            iteration_operator = KohnShamOperator.from_density(
-                grid,
-                v_local,
-                density,
-                xc_functional=xc_functional,
-                density_floor=config.density_floor,
-                nonlocal_operator=nonlocal_operator,
-            )
-            diagonalized = DavidsonDiagonalizer(config.eigensolver_config).solve(
-                iteration_operator,
-                n_orbitals=n_occ_orbitals,
-                initial_orbitals=orbitals,
-            )
-            next_orbitals = diagonalized.orbitals
-            solver_metadata = {
-                **diagonalized.metadata,
-                "eigensolver_converged": diagonalized.converged,
-                "max_eigensolver_residual": float(mx.max(diagonalized.residuals)),
-            }
-        else:
-            next_orbitals = _gradient_step_orbitals(
-                orbitals,
-                effective_potential,
-                grid,
-                step_size=config.step_size,
-            )
-        solver_elapsed_ms = (perf_counter() - start) * 1000.0
-        if config.record_timing:
-            timings["solver_ms"] += solver_elapsed_ms
-            if solver == "dense":
-                timings["diagonalization_ms"] += solver_elapsed_ms
-            elif solver == "davidson":
-                timings["preconditioner_ms"] += solver_elapsed_ms
+        next_orbitals, solver_metadata = _solve_scf_orbitals(
+            solver,
+            orbitals,
+            density,
+            effective_potential,
+            grid=grid,
+            v_local=v_local,
+            n_orbitals=n_occ_orbitals,
+            config=config,
+            xc_functional=xc_functional,
+            nonlocal_operator=nonlocal_operator,
+            timings=timings,
+        )
 
         next_density = density_from_orbitals(
             next_orbitals,
@@ -863,25 +1028,21 @@ def run_scf(
                 iteration_orthonormality_error,
             )
         )
-        if iteration_orthonormality_error > config.max_orthonormality_error:
-            failure_reason = "orthonormality_loss"
-            break
-        if (
-            config.max_density_residual is not None
-            and density_residual > config.max_density_residual
-        ):
-            failure_reason = "diverged"
-            break
-        if _converged(
-            iteration=iteration,
+        (
+            stop,
+            converged,
+            convergence_reason,
+            failure_reason,
+        ) = _scf_iteration_transition(
+            iteration,
             config=config,
             density_residual=density_residual,
             potential_residual=potential_residual,
             energy_delta=energy_delta,
             orbital_residual=max_orbital_residual,
-        ):
-            converged = True
-            convergence_reason = config.convergence_mode
+            orthonormality=iteration_orthonormality_error,
+        )
+        if stop:
             break
 
     density = density_from_orbitals(
@@ -921,33 +1082,17 @@ def run_scf(
     )
     _assert_finite(density, orbitals, effective_potential, *energy_terms.values())
 
-    forces = None
-    if isinstance(local_input, LocalGaussianPseudopotential | LocalPseudopotentialField):
-        start = perf_counter()
-        if isinstance(local_input, LocalGaussianPseudopotential):
-            forces = local_pseudopotential_forces(density, grid, local_input)
-            force_provenance = {
-                "local_analytic": True,
-                "nonlocal_finite_difference": False,
-                "center_center": system is not None,
-            }
-        else:
-            forces = local_input.forces(density, grid)
-            if nonlocal_applied and system is not None:
-                forces = forces + _nonlocal_force_correction(
-                    system,
-                    grid,
-                    orbitals,
-                    occupations=occupation_values,
-                )
-            force_provenance = {
-                "local_analytic": True,
-                "nonlocal_finite_difference": bool(nonlocal_applied),
-                "center_center": system is not None,
-            }
-        if system is not None:
-            forces = forces + mx.array(center_center_forces(system), dtype=forces.dtype)
-        _add_timing(timings, "force_ms", start, enabled=config.record_timing)
+    forces, force_provenance = _scf_forces(
+        local_input,
+        density,
+        grid,
+        system=system,
+        orbitals=orbitals,
+        occupations=occupation_values,
+        nonlocal_applied=nonlocal_applied,
+        timings=timings,
+        timing_enabled=config.record_timing,
+    )
 
     start = perf_counter()
     final_operator = KohnShamOperator.from_density(
@@ -968,10 +1113,11 @@ def run_scf(
 
     if config.record_timing:
         timings["total_scf_ms"] = (perf_counter() - total_start) * 1000.0
-    if not history:
-        failure_reason = "no_scf_iterations"
-    elif not converged and failure_reason is None:
-        failure_reason = "max_iterations_reached"
+    failure_reason = _final_scf_failure_reason(
+        history,
+        converged=converged,
+        failure_reason=failure_reason,
+    )
 
     energy_by_term = {name: float(value) for name, value in energy_terms.items()}
     electronic_energy = energy_by_term["total"]
@@ -980,12 +1126,7 @@ def run_scf(
     energy_by_term["total"] = electronic_energy + center_energy
     energy_by_term["local_pseudopotential"] = energy_by_term["local"]
     energy_by_term.setdefault("nonlocal_pseudopotential", 0.0)
-    if converged:
-        status = "converged"
-    elif failure_reason == "max_iterations_reached":
-        status = "max_iterations"
-    else:
-        status = "failed"
+    status = _scf_status(converged, failure_reason)
     return SCFResult(
         converged=converged,
         iterations=len(history),
@@ -1017,6 +1158,6 @@ def run_scf(
         nonlocal_available=nonlocal_available,
         nonlocal_applied=nonlocal_applied,
         nonlocal_projector_count=nonlocal_projector_count,
-        force_provenance=locals().get("force_provenance"),
+        force_provenance=force_provenance,
         solver_metadata=solver_metadata,
     )

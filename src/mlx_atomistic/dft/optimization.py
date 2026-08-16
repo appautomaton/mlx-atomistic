@@ -48,6 +48,11 @@ class GeometryOptimizationConfig:
     cell_step_size: float = 0.02
 
     def __post_init__(self) -> None:
+        self._validate_step_controls()
+        self._validate_line_search_controls()
+        self._validate_modes()
+
+    def _validate_step_controls(self) -> None:
         if self.max_steps <= 0:
             msg = "max_steps must be positive"
             raise ValueError(msg)
@@ -63,6 +68,8 @@ class GeometryOptimizationConfig:
         if self.max_step <= 0.0:
             msg = "max_step must be positive"
             raise ValueError(msg)
+
+    def _validate_line_search_controls(self) -> None:
         if not 0.0 < self.line_search_shrink < 1.0:
             msg = "line_search_shrink must be in the interval (0, 1)"
             raise ValueError(msg)
@@ -72,6 +79,8 @@ class GeometryOptimizationConfig:
         if self.max_line_search_iterations <= 0:
             msg = "max_line_search_iterations must be positive"
             raise ValueError(msg)
+
+    def _validate_modes(self) -> None:
         if self.optimizer not in {"lbfgs", "steepest_descent"}:
             msg = "optimizer must be 'lbfgs' or 'steepest_descent'"
             raise ValueError(msg)
@@ -231,132 +240,165 @@ class GeometryOptimizationRecord:
         }
 
 
-def optimize_geometry(
-    system: DFTSystem,
-    *,
-    config: GeometryOptimizationConfig | None = None,
-    xc_functional: ExchangeCorrelationFunctional | None = None,
-) -> GeometryOptimizationResult:
-    """Relax ion positions in a fixed orthorhombic cell using SCF forces."""
+@dataclass
+class _GeometryOptimizationController:
+    initial_system: DFTSystem
+    config: GeometryOptimizationConfig
+    scf_config: SCFConfig
+    xc_functional: ExchangeCorrelationFunctional
+    start: float
+    current_system: DFTSystem
+    current_scf: SCFResult | None
+    current_forces: np.ndarray | None
+    steps: list[GeometryOptimizationStep]
+    previous_gradient: np.ndarray | None
+    previous_positions: np.ndarray | None
+    s_history: list[np.ndarray]
+    y_history: list[np.ndarray]
+    status: GeometryStatus
+    convergence_reason: str
 
-    config = GeometryOptimizationConfig() if config is None else config
-    scf_config = _default_scf_config() if config.scf_config is None else config.scf_config
-    xc_functional = DiracExchange() if xc_functional is None else xc_functional
-    start = perf_counter()
-    steps: list[GeometryOptimizationStep] = []
-
-    current_system = system.with_centers(_wrapped_positions(system.centers, system.cell))
-    try:
-        current_scf = run_scf(current_system, config=scf_config, xc_functional=xc_functional)
-    except (FloatingPointError, ValueError):
-        return GeometryOptimizationResult(
-            status="scf_failed",
-            convergence_reason="initial_scf_failed",
+    @classmethod
+    def create(
+        cls,
+        system: DFTSystem,
+        *,
+        config: GeometryOptimizationConfig,
+        scf_config: SCFConfig,
+        xc_functional: ExchangeCorrelationFunctional,
+    ) -> _GeometryOptimizationController:
+        current = system.with_centers(_wrapped_positions(system.centers, system.cell))
+        return cls(
             initial_system=system,
-            final_system=current_system,
-            final_scf=None,
-            steps=tuple(steps),
-            config=config,
-            elapsed_ms=(perf_counter() - start) * 1000.0,
-        )
-    if not _scf_usable(current_scf):
-        status: GeometryStatus = "nonfinite" if not _energy_finite(current_scf) else "scf_failed"
-        return GeometryOptimizationResult(
-            status=status,
-            convergence_reason="initial_scf_unusable",
-            initial_system=system,
-            final_system=current_system,
-            final_scf=current_scf,
-            steps=tuple(steps),
-            config=config,
-            elapsed_ms=(perf_counter() - start) * 1000.0,
-        )
-
-    current_forces = _result_forces(current_scf)
-    if _max_force(current_forces) <= config.force_tolerance:
-        return GeometryOptimizationResult(
-            status="converged",
-            convergence_reason="force_tolerance",
-            initial_system=system,
-            final_system=current_system,
-            final_scf=current_scf,
-            steps=tuple(steps),
-            config=config,
-            elapsed_ms=(perf_counter() - start) * 1000.0,
-        )
-
-    previous_gradient: np.ndarray | None = None
-    previous_positions: np.ndarray | None = None
-    s_history: list[np.ndarray] = []
-    y_history: list[np.ndarray] = []
-
-    status: GeometryStatus = "max_steps"
-    convergence_reason = "max_steps"
-    for step_index in range(1, config.max_steps + 1):
-        if config.reuse_scf_state:
-            try:
-                refreshed_scf = run_scf(
-                    current_system,
-                    config=scf_config,
-                    initial_density=current_scf.density,
-                    initial_orbitals=current_scf.orbitals,
-                    xc_functional=xc_functional,
-                )
-            except (FloatingPointError, ValueError):
-                status = "scf_failed"
-                convergence_reason = "scf_continuation_failed"
-                break
-            if not _scf_usable(refreshed_scf):
-                status = "nonfinite" if not _energy_finite(refreshed_scf) else "scf_failed"
-                convergence_reason = "scf_continuation_unusable"
-                current_scf = refreshed_scf
-                break
-            current_scf = refreshed_scf
-            current_forces = _result_forces(current_scf)
-            if _max_force(current_forces) <= config.force_tolerance:
-                status = "converged"
-                convergence_reason = "force_tolerance"
-                break
-
-        positions = np.array(current_system.centers, dtype=np.float64)
-        gradient = -current_forces
-        direction = _search_direction(
-            gradient,
-            current_forces,
-            optimizer=config.optimizer,
-            s_history=s_history,
-            y_history=y_history,
-        )
-        direction = _clip_direction(direction, config.max_step)
-        if not np.isfinite(direction).all() or np.linalg.norm(direction) <= 1e-14:
-            direction = _clip_direction(current_forces, config.max_step)
-        if not np.isfinite(direction).all() or np.linalg.norm(direction) <= 1e-14:
-            status = "nonfinite"
-            convergence_reason = "invalid_search_direction"
-            break
-
-        candidate = _backtracking_line_search(
-            current_system=current_system,
-            current_scf=current_scf,
-            direction=direction,
             config=config,
             scf_config=scf_config,
             xc_functional=xc_functional,
+            start=perf_counter(),
+            current_system=current,
+            current_scf=None,
+            current_forces=None,
+            steps=[],
+            previous_gradient=None,
+            previous_positions=None,
+            s_history=[],
+            y_history=[],
+            status="max_steps",
+            convergence_reason="max_steps",
         )
-        if candidate is None:
-            status = "line_search_failed"
-            convergence_reason = "line_search_exhausted"
-            break
 
+    def run(self) -> GeometryOptimizationResult:
+        initial = self._initialize()
+        if initial is not None:
+            return initial
+        for step_index in range(1, self.config.max_steps + 1):
+            if not self._refresh_scf_state():
+                break
+            direction = self._search_direction()
+            if direction is None:
+                break
+            candidate = _backtracking_line_search(
+                current_system=self.current_system,
+                current_scf=self._current_scf(),
+                direction=direction,
+                config=self.config,
+                scf_config=self.scf_config,
+                xc_functional=self.xc_functional,
+            )
+            if candidate is None:
+                self._stop("line_search_failed", "line_search_exhausted")
+                break
+            self._accept_candidate(step_index, candidate)
+            if self._accepted_step_converged():
+                break
+        return self._result()
+
+    def _initialize(self) -> GeometryOptimizationResult | None:
+        try:
+            current_scf = run_scf(
+                self.current_system,
+                config=self.scf_config,
+                xc_functional=self.xc_functional,
+            )
+        except (FloatingPointError, ValueError):
+            self._stop("scf_failed", "initial_scf_failed")
+            return self._result()
+        self.current_scf = current_scf
+        if not _scf_usable(current_scf):
+            status: GeometryStatus = (
+                "nonfinite" if not _energy_finite(current_scf) else "scf_failed"
+            )
+            self._stop(status, "initial_scf_unusable")
+            return self._result()
+        self.current_forces = _result_forces(current_scf)
+        if _max_force(self.current_forces) <= self.config.force_tolerance:
+            self._stop("converged", "force_tolerance")
+            return self._result()
+        return None
+
+    def _refresh_scf_state(self) -> bool:
+        if not self.config.reuse_scf_state:
+            return True
+        current_scf = self._current_scf()
+        try:
+            refreshed = run_scf(
+                self.current_system,
+                config=self.scf_config,
+                initial_density=current_scf.density,
+                initial_orbitals=current_scf.orbitals,
+                xc_functional=self.xc_functional,
+            )
+        except (FloatingPointError, ValueError):
+            self._stop("scf_failed", "scf_continuation_failed")
+            return False
+        self.current_scf = refreshed
+        if not _scf_usable(refreshed):
+            status: GeometryStatus = "nonfinite" if not _energy_finite(refreshed) else "scf_failed"
+            self._stop(status, "scf_continuation_unusable")
+            return False
+        self.current_forces = _result_forces(refreshed)
+        if _max_force(self.current_forces) <= self.config.force_tolerance:
+            self._stop("converged", "force_tolerance")
+            return False
+        return True
+
+    def _search_direction(self) -> np.ndarray | None:
+        forces = self._current_forces()
+        gradient = -forces
+        direction = _search_direction(
+            gradient,
+            forces,
+            optimizer=self.config.optimizer,
+            s_history=self.s_history,
+            y_history=self.y_history,
+        )
+        direction = _clip_direction(direction, self.config.max_step)
+        if not np.isfinite(direction).all() or np.linalg.norm(direction) <= 1e-14:
+            direction = _clip_direction(forces, self.config.max_step)
+        if not np.isfinite(direction).all() or np.linalg.norm(direction) <= 1e-14:
+            self._stop("nonfinite", "invalid_search_direction")
+            return None
+        return direction
+
+    def _accept_candidate(
+        self,
+        step_index: int,
+        candidate: tuple[DFTSystem, SCFResult, float, int],
+    ) -> None:
         next_system, next_scf, accepted_step_size, line_search_iterations = candidate
+        current_scf = self._current_scf()
+        current_forces = self._current_forces()
+        positions = np.array(self.current_system.centers, dtype=np.float64)
+        gradient = -current_forces
         next_forces = _result_forces(next_scf)
         step_positions = np.array(next_system.centers, dtype=np.float64)
-        displacement = _minimum_image_delta(step_positions - positions, current_system.cell)
-        energy_delta = next_scf.total_energy - current_scf.total_energy
+        displacement = _minimum_image_delta(
+            step_positions - positions,
+            self.current_system.cell,
+        )
         step = GeometryOptimizationStep(
             index=step_index,
             energy=next_scf.total_energy,
-            energy_delta=energy_delta,
+            energy_delta=next_scf.total_energy - current_scf.total_energy,
             max_force=_max_force(next_forces),
             rms_force=_rms_force(next_forces),
             force_norm=float(np.linalg.norm(next_forces)),
@@ -371,41 +413,89 @@ def optimize_geometry(
             positions=step_positions,
             forces=next_forces,
         )
-        steps.append(step)
+        self.steps.append(step)
+        self._update_lbfgs_history(positions, gradient)
+        self.current_system = next_system
+        self.current_scf = next_scf
+        self.current_forces = next_forces
 
-        if previous_positions is not None and previous_gradient is not None:
-            s_vector = _flatten_minimum_image(positions - previous_positions, current_system.cell)
-            y_vector = (gradient - previous_gradient).reshape(-1)
+    def _update_lbfgs_history(
+        self,
+        positions: np.ndarray,
+        gradient: np.ndarray,
+    ) -> None:
+        if self.previous_positions is not None and self.previous_gradient is not None:
+            s_vector = _flatten_minimum_image(
+                positions - self.previous_positions,
+                self.current_system.cell,
+            )
+            y_vector = (gradient - self.previous_gradient).reshape(-1)
             if _valid_lbfgs_pair(s_vector, y_vector):
-                s_history.append(s_vector)
-                y_history.append(y_vector)
-                del s_history[:-5]
-                del y_history[:-5]
-        previous_positions = positions
-        previous_gradient = gradient
+                self.s_history.append(s_vector)
+                self.y_history.append(y_vector)
+                del self.s_history[:-5]
+                del self.y_history[:-5]
+        self.previous_positions = positions
+        self.previous_gradient = gradient
 
-        current_system = next_system
-        current_scf = next_scf
-        current_forces = next_forces
-        if step.max_force <= config.force_tolerance:
-            status = "converged"
-            convergence_reason = "force_tolerance"
-            break
-        if abs(step.energy_delta) <= config.energy_tolerance:
-            status = "converged"
-            convergence_reason = "energy_tolerance"
-            break
+    def _accepted_step_converged(self) -> bool:
+        step = self.steps[-1]
+        if step.max_force <= self.config.force_tolerance:
+            self._stop("converged", "force_tolerance")
+            return True
+        if abs(step.energy_delta) <= self.config.energy_tolerance:
+            self._stop("converged", "energy_tolerance")
+            return True
+        return False
 
-    return GeometryOptimizationResult(
-        status=status,
-        convergence_reason=convergence_reason,
-        initial_system=system,
-        final_system=current_system,
-        final_scf=current_scf,
-        steps=tuple(steps),
-        config=config,
-        elapsed_ms=(perf_counter() - start) * 1000.0,
+    def _current_scf(self) -> SCFResult:
+        if self.current_scf is None:
+            msg = "geometry optimization has no current SCF state"
+            raise RuntimeError(msg)
+        return self.current_scf
+
+    def _current_forces(self) -> np.ndarray:
+        if self.current_forces is None:
+            msg = "geometry optimization has no current force state"
+            raise RuntimeError(msg)
+        return self.current_forces
+
+    def _stop(self, status: GeometryStatus, reason: str) -> None:
+        self.status = status
+        self.convergence_reason = reason
+
+    def _result(self) -> GeometryOptimizationResult:
+        return GeometryOptimizationResult(
+            status=self.status,
+            convergence_reason=self.convergence_reason,
+            initial_system=self.initial_system,
+            final_system=self.current_system,
+            final_scf=self.current_scf,
+            steps=tuple(self.steps),
+            config=self.config,
+            elapsed_ms=(perf_counter() - self.start) * 1000.0,
+        )
+
+
+def optimize_geometry(
+    system: DFTSystem,
+    *,
+    config: GeometryOptimizationConfig | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
+) -> GeometryOptimizationResult:
+    """Relax ion positions in a fixed orthorhombic cell using SCF forces."""
+
+    resolved_config = GeometryOptimizationConfig() if config is None else config
+    scf_config = (
+        _default_scf_config() if resolved_config.scf_config is None else resolved_config.scf_config
     )
+    resolved_xc = DiracExchange() if xc_functional is None else xc_functional
+    return _GeometryOptimizationController.create(
+        system,
+        config=resolved_config,
+        scf_config=scf_config,
+        xc_functional=resolved_xc,
+    ).run()
 
 
 def save_geometry_optimization(
@@ -548,9 +638,7 @@ def _search_direction(
 ) -> np.ndarray:
     if optimizer == "steepest_descent" or not s_history:
         return forces.copy()
-    direction = _lbfgs_direction(gradient.reshape(-1), s_history, y_history).reshape(
-        forces.shape
-    )
+    direction = _lbfgs_direction(gradient.reshape(-1), s_history, y_history).reshape(forces.shape)
     if not np.isfinite(direction).all():
         return forces.copy()
     if float(np.sum(direction * forces)) <= 0.0:
@@ -663,9 +751,7 @@ def _system_summary(system: DFTSystem) -> dict[str, Any]:
         "charges": list(system.charges),
         "positions": np.array(system.centers, dtype=np.float64).tolist(),
         "pseudopotential_format": _pseudopotential_format(system),
-        "nonlocal_available": False
-        if system.ions is None
-        else system.ions.nonlocal_available,
+        "nonlocal_available": False if system.ions is None else system.ions.nonlocal_available,
     }
 
 
