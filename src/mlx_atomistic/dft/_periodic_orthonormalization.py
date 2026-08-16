@@ -14,6 +14,33 @@ def _all_finite(values: mx.array) -> bool:
     return bool(mx.all(mx.isfinite(values)))
 
 
+def _cholesky_row_normalizer(
+    values: mx.array,
+    *,
+    row_count: int,
+    additional_validity: mx.array | None = None,
+) -> tuple[mx.array, np.ndarray] | None:
+    gram = values @ mx.conjugate(mx.transpose(values))
+    if additional_validity is not None:
+        # Materialize the norm guard with the Gram matrix. The common fast path
+        # therefore crosses to the CPU once, not once for each check.
+        mx.eval(gram, additional_validity)
+        if not bool(additional_validity):
+            return None
+    gram_np = np.asarray(gram, dtype=np.complex64).astype(np.complex128)
+    if not np.all(np.isfinite(gram_np)):
+        return None
+    gram_np = 0.5 * (gram_np + np.conjugate(gram_np.T))
+    try:
+        lower = np.linalg.cholesky(gram_np)
+        solve = np.linalg.solve(lower, np.eye(row_count, dtype=np.complex128))
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(solve)):
+        return None
+    return mx.array(solve.astype(np.complex64)), lower
+
+
 @dataclass(frozen=True)
 class _RankResult:
     """Rank-filtered vectors and their row transform from the input stack."""
@@ -21,6 +48,50 @@ class _RankResult:
     values: mx.array
     transform: mx.array
     deflated_count: int
+
+
+@dataclass(frozen=True)
+class _OrthonormalizationRequest:
+    stack: mx.array
+    input_count: int
+    locked_count: int
+    required_count: int
+    limit: int
+    candidate_norms: mx.array
+
+
+def _validated_orthonormalization_request(
+    values: mx.array,
+    *,
+    locked_count: int,
+    required_count: int,
+    max_count: int | None,
+) -> _OrthonormalizationRequest:
+    stack = mx.array(values).astype(mx.complex64)
+    if len(stack.shape) != 2 or int(stack.shape[0]) == 0:
+        msg = "Davidson rank input must be a non-empty matrix"
+        raise ValueError(msg)
+    input_count = int(stack.shape[0])
+    if not 0 <= locked_count <= input_count:
+        msg = "locked Davidson rank must lie within the input stack"
+        raise ValueError(msg)
+    limit = input_count if max_count is None else int(max_count)
+    if limit < locked_count or limit <= 0:
+        msg = "Davidson rank limit cannot discard locked vectors"
+        raise ValueError(msg)
+    if required_count < 0 or required_count > limit:
+        msg = "required Davidson rank exceeds the rank limit"
+        raise ValueError(msg)
+    candidates = stack[locked_count:]
+    candidate_norms = mx.sqrt(mx.real(mx.sum(mx.conjugate(candidates) * candidates, axis=1)))
+    return _OrthonormalizationRequest(
+        stack=stack,
+        input_count=input_count,
+        locked_count=locked_count,
+        required_count=required_count,
+        limit=limit,
+        candidate_norms=candidate_norms,
+    )
 
 
 @dataclass(frozen=True)
@@ -100,37 +171,9 @@ class _Complex64RankPolicy:
         candidate_values = candidate_values / scale
         candidate_transforms = candidate_transforms / scale
 
-        def cholesky_step(
-            values: mx.array,
-            *,
-            additional_validity: mx.array | None = None,
-        ) -> tuple[mx.array, np.ndarray] | None:
-            gram = values @ mx.conjugate(mx.transpose(values))
-            if additional_validity is not None:
-                # Materialize the norm guard with the Gram matrix. The common
-                # fast path therefore crosses to the CPU once, not once for
-                # norms and again for the small Cholesky factorization.
-                mx.eval(gram, additional_validity)
-                if not bool(additional_validity):
-                    return None
-            gram_np = np.asarray(gram, dtype=np.complex64).astype(np.complex128)
-            if not np.all(np.isfinite(gram_np)):
-                return None
-            gram_np = 0.5 * (gram_np + np.conjugate(gram_np.T))
-            try:
-                lower = np.linalg.cholesky(gram_np)
-                solve = np.linalg.solve(
-                    lower,
-                    np.eye(candidate_count, dtype=np.complex128),
-                )
-            except np.linalg.LinAlgError:
-                return None
-            if not np.all(np.isfinite(solve)):
-                return None
-            return mx.array(solve.astype(np.complex64)), lower
-
-        first = cholesky_step(
+        first = _cholesky_row_normalizer(
             candidate_values,
+            row_count=candidate_count,
             additional_validity=norms_valid,
         )
         if first is None:
@@ -148,7 +191,10 @@ class _Complex64RankPolicy:
         candidate_values = first_solve @ candidate_values
         candidate_transforms = first_solve @ candidate_transforms
 
-        second = cholesky_step(candidate_values)
+        second = _cholesky_row_normalizer(
+            candidate_values,
+            row_count=candidate_count,
+        )
         if second is None:
             return None
         second_solve, _second_lower = second
@@ -169,6 +215,76 @@ class _Complex64RankPolicy:
             values=result_values,
             transform=result_transform,
             deflated_count=input_count - retained_count,
+        )
+
+    @staticmethod
+    def _project_candidate(
+        vector: mx.array,
+        transform: mx.array,
+        *,
+        accepted_values: mx.array,
+        accepted_transforms: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        for _ in range(2):
+            if int(accepted_values.shape[0]) == 0:
+                break
+            overlaps = mx.conjugate(accepted_values) @ mx.transpose(vector)
+            vector = vector - mx.transpose(overlaps) @ accepted_values
+            transform = transform - mx.transpose(overlaps) @ accepted_transforms
+        return vector, transform
+
+    def _incremental_cgs2(
+        self,
+        request: _OrthonormalizationRequest,
+        *,
+        original_norms: np.ndarray,
+    ) -> _RankResult | None:
+        stack = request.stack
+        identity = mx.eye(request.input_count, dtype=mx.float32).astype(mx.complex64)
+        accepted_values = stack[: request.locked_count]
+        accepted_transforms = identity[: request.locked_count]
+        deflated = 0
+        for index in range(request.locked_count, request.input_count):
+            if int(accepted_values.shape[0]) >= request.limit:
+                deflated += request.input_count - index
+                break
+            original_norm = float(original_norms[index])
+            if original_norm == 0.0:
+                deflated += 1
+                continue
+            vector, transform = self._project_candidate(
+                stack[index : index + 1],
+                identity[index : index + 1],
+                accepted_values=accepted_values,
+                accepted_transforms=accepted_transforms,
+            )
+            norm = float(mx.sqrt(mx.real(mx.sum(mx.conjugate(vector) * vector))))
+            if not np.isfinite(norm):
+                msg = "Davidson rank norm must be finite"
+                raise ValueError(msg)
+            if norm <= self.relative_tolerance * original_norm:
+                deflated += 1
+                continue
+            accepted_values = mx.concatenate(
+                [accepted_values, vector / norm],
+                axis=0,
+            )
+            accepted_transforms = mx.concatenate(
+                [accepted_transforms, transform / norm],
+                axis=0,
+            )
+        retained_count = int(accepted_values.shape[0])
+        if retained_count < request.required_count:
+            return None
+        if not _all_finite(accepted_values):
+            msg = "Davidson state must be finite"
+            raise ValueError(msg)
+        if self.overlap_error(accepted_values) > self.orthonormality_tolerance(retained_count):
+            return None
+        return _RankResult(
+            values=accepted_values,
+            transform=accepted_transforms,
+            deflated_count=deflated,
         )
 
     def _sequential_mgs2(
@@ -238,113 +354,39 @@ class _Complex64RankPolicy:
     ) -> _RankResult:
         """Twice reorthogonalize in complex64 and deterministically deflate."""
 
-        stack = mx.array(values).astype(mx.complex64)
-        if len(stack.shape) != 2 or int(stack.shape[0]) == 0:
-            msg = "Davidson rank input must be a non-empty matrix"
-            raise ValueError(msg)
-        input_count = int(stack.shape[0])
-        if not 0 <= locked_count <= input_count:
-            msg = "locked Davidson rank must lie within the input stack"
-            raise ValueError(msg)
-        limit = input_count if max_count is None else int(max_count)
-        if limit < locked_count or limit <= 0:
-            msg = "Davidson rank limit cannot discard locked vectors"
-            raise ValueError(msg)
-        if required_count < 0 or required_count > limit:
-            msg = "required Davidson rank exceeds the rank limit"
-            raise ValueError(msg)
-
-        candidate_stack = stack[locked_count:]
-        candidate_norms = mx.sqrt(
-            mx.real(mx.sum(mx.conjugate(candidate_stack) * candidate_stack, axis=1))
-        )
-
-        batched = self._try_batched_choleskyqr2(
-            stack,
-            candidate_norms=candidate_norms,
+        request = _validated_orthonormalization_request(
+            values,
             locked_count=locked_count,
             required_count=required_count,
-            limit=limit,
+            max_count=max_count,
+        )
+        batched = self._try_batched_choleskyqr2(
+            request.stack,
+            candidate_norms=request.candidate_norms,
+            locked_count=request.locked_count,
+            required_count=request.required_count,
+            limit=request.limit,
         )
         if batched is not None:
             return batched
-
-        candidate_norms_np = np.asarray(candidate_norms, dtype=np.float32)
+        candidate_norms_np = np.asarray(request.candidate_norms, dtype=np.float32)
         if not np.all(np.isfinite(candidate_norms_np)):
             msg = "Davidson rank input must be finite"
             raise ValueError(msg)
-        original_norms_np = np.ones((input_count,), dtype=np.float32)
-        original_norms_np[locked_count:] = candidate_norms_np
-
-        accepted_values = stack[:locked_count]
-
-        identity = mx.eye(input_count, dtype=mx.float32).astype(mx.complex64)
-        accepted_transforms = identity[:locked_count]
-
-        deflated = 0
-        for index in range(locked_count, input_count):
-            if int(accepted_values.shape[0]) >= limit:
-                deflated += input_count - index
-                break
-            original_norm = float(original_norms_np[index])
-            if original_norm == 0.0:
-                deflated += 1
-                continue
-            vector = stack[index : index + 1]
-            transform = identity[index : index + 1]
-            for _ in range(2):
-                if int(accepted_values.shape[0]) == 0:
-                    break
-                overlaps = mx.conjugate(accepted_values) @ mx.transpose(vector)
-                vector = vector - mx.transpose(overlaps) @ accepted_values
-                transform = transform - mx.transpose(overlaps) @ accepted_transforms
-            norm = float(mx.sqrt(mx.real(mx.sum(mx.conjugate(vector) * vector))))
-            if not np.isfinite(norm):
-                msg = "Davidson rank norm must be finite"
-                raise ValueError(msg)
-            if norm <= self.relative_tolerance * original_norm:
-                deflated += 1
-                continue
-            accepted_values = mx.concatenate(
-                [accepted_values, vector / norm],
-                axis=0,
-            )
-            accepted_transforms = mx.concatenate(
-                [accepted_transforms, transform / norm],
-                axis=0,
-            )
-
-        retained_count = int(accepted_values.shape[0])
-        if retained_count < required_count:
-            return self._sequential_mgs2(
-                stack,
-                original_norms=original_norms_np,
-                locked_count=locked_count,
-                required_count=required_count,
-                limit=limit,
-            )
-
-        result_transform = accepted_transforms
-        # Preserve the incrementally reorthogonalized values. Collapsing the
-        # accumulated transform into one complex64 matmul can reintroduce a
-        # deflated component through cancellation for nearly dependent rows.
-        result_values = accepted_values
-        if not _all_finite(result_values):
-            msg = "Davidson state must be finite"
-            raise ValueError(msg)
-        overlap_error = self.overlap_error(result_values)
-        if overlap_error > self.orthonormality_tolerance(retained_count):
-            return self._sequential_mgs2(
-                stack,
-                original_norms=original_norms_np,
-                locked_count=locked_count,
-                required_count=required_count,
-                limit=limit,
-            )
-        return _RankResult(
-            values=result_values,
-            transform=result_transform,
-            deflated_count=deflated,
+        original_norms = np.ones((request.input_count,), dtype=np.float32)
+        original_norms[request.locked_count :] = candidate_norms_np
+        incremental = self._incremental_cgs2(
+            request,
+            original_norms=original_norms,
+        )
+        if incremental is not None:
+            return incremental
+        return self._sequential_mgs2(
+            request.stack,
+            original_norms=original_norms,
+            locked_count=request.locked_count,
+            required_count=request.required_count,
+            limit=request.limit,
         )
 
 

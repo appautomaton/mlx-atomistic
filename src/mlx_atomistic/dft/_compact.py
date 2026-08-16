@@ -494,6 +494,123 @@ def _remap_initial_coefficients(
 
 
 @dataclass(frozen=True)
+class _CompactBatchPlan:
+    lane_capacity: int
+    vector_capacity: int
+    active_capacity: int
+    vector_counts: tuple[int, ...]
+    padding_elements: int
+    lane_padding_elements: int
+    vector_padding_elements: int
+    estimated_transient_bytes: int
+
+
+def _compact_batch_plan(
+    states: Sequence[_CompactLaneState],
+    *,
+    policy: _CompactBatchPolicy,
+    lane_capacity: int | None,
+    vector_capacity: int | None,
+    active_capacity: int | None,
+) -> _CompactBatchPlan:
+    if not states:
+        msg = "a compact batch requires at least one lane"
+        raise ValueError(msg)
+    reciprocal = states[0].layout.reciprocal
+    if any(state.layout.reciprocal is not reciprocal for state in states):
+        msg = "compact batch lanes must share one reciprocal descriptor"
+        raise ValueError(msg)
+    logical_lane_count = len(states)
+    lane_bucket = logical_lane_count if lane_capacity is None else lane_capacity
+    if type(lane_bucket) is not int or lane_bucket < logical_lane_count:
+        msg = "compact lane capacity must cover every logical lane"
+        raise ValueError(msg)
+    vector_counts = tuple(state.vector_count for state in states)
+    vector_bucket = max(vector_counts) if vector_capacity is None else vector_capacity
+    if type(vector_bucket) is not int or vector_bucket < max(vector_counts):
+        msg = "compact vector capacity must cover every logical vector"
+        raise ValueError(msg)
+    largest_active_count = max(state.layout.active_count for state in states)
+    active_bucket = largest_active_count if active_capacity is None else active_capacity
+    if type(active_bucket) is not int or active_bucket < largest_active_count:
+        msg = "compact active capacity must cover every logical coefficient"
+        raise ValueError(msg)
+    padding_elements = sum(active_bucket - state.layout.active_count for state in states)
+    worst_padding_fraction = max(
+        (active_bucket - state.layout.active_count) / active_bucket for state in states
+    )
+    if worst_padding_fraction > policy.max_padding_fraction:
+        msg = "compact batch active counts exceed the padding-fraction cap"
+        raise ValueError(msg)
+    lane_padding = (lane_bucket - logical_lane_count) * vector_bucket * active_bucket
+    vector_padding = sum(vector_bucket - count for count in vector_counts) * active_bucket
+    payload_bytes = lane_bucket * vector_bucket * active_bucket * 8
+    index_and_mask_bytes = lane_bucket * active_bucket * (4 + 1)
+    fft_workspace_bytes = 2 * lane_bucket * vector_bucket * states[0].layout.grid_size * 8
+    estimated_bytes = payload_bytes + index_and_mask_bytes + fft_workspace_bytes
+    if estimated_bytes > policy.max_transient_bytes:
+        msg = "compact batch exceeds the transient byte budget"
+        raise ValueError(msg)
+    return _CompactBatchPlan(
+        lane_capacity=lane_bucket,
+        vector_capacity=vector_bucket,
+        active_capacity=active_bucket,
+        vector_counts=vector_counts,
+        padding_elements=padding_elements,
+        lane_padding_elements=lane_padding,
+        vector_padding_elements=vector_padding,
+        estimated_transient_bytes=estimated_bytes,
+    )
+
+
+def _padded_compact_lane(
+    state: _CompactLaneState,
+    *,
+    active_capacity: int,
+    vector_capacity: int,
+) -> tuple[mx.array, mx.array, mx.array]:
+    count = state.layout.active_count
+    active_padding = active_capacity - count
+    values = state.values
+    if active_padding:
+        values = mx.concatenate(
+            [
+                values,
+                mx.zeros((state.vector_count, active_padding), dtype=mx.complex64),
+            ],
+            axis=1,
+        )
+        if state.layout._padding_flat_indices_np.size >= active_padding:
+            inactive = state.layout._padding_flat_indices[:active_padding]
+        else:
+            inactive = mx.array(
+                _first_inactive_indices(
+                    state.layout._active_flat_indices_np,
+                    grid_size=state.layout.grid_size,
+                    count=active_padding,
+                )
+            )
+        if int(inactive.size) < active_padding:
+            msg = "compact FFT bucket has insufficient distinct padding indices"
+            raise ValueError(msg)
+        indices = mx.concatenate([state.layout._active_flat_indices, inactive])
+        mask = mx.arange(active_capacity) < count
+    else:
+        indices = state.layout._active_flat_indices
+        mask = mx.ones((active_capacity,), dtype=mx.bool_)
+    vector_padding = vector_capacity - state.vector_count
+    if vector_padding:
+        values = mx.concatenate(
+            [
+                values,
+                mx.zeros((vector_padding, active_capacity), dtype=mx.complex64),
+            ],
+            axis=0,
+        )
+    return values, indices, mask
+
+
+@dataclass(frozen=True)
 class _CompactBatch:
     """Transient batch-first payload for compact plane-wave operators."""
 
@@ -524,117 +641,46 @@ class _CompactBatch:
     ) -> _CompactBatch:
         """Pack logical lane states into one capacity-stable transient batch."""
 
-        if not states:
-            msg = "a compact batch requires at least one lane"
-            raise ValueError(msg)
-        first = states[0]
-        reciprocal = first.layout.reciprocal
-        for state in states:
-            if state.layout.reciprocal is not reciprocal:
-                msg = "compact batch lanes must share one reciprocal descriptor"
-                raise ValueError(msg)
-        logical_lane_count = len(states)
-        lane_bucket = logical_lane_count if lane_capacity is None else lane_capacity
-        if type(lane_bucket) is not int or lane_bucket < logical_lane_count:
-            msg = "compact lane capacity must cover every logical lane"
-            raise ValueError(msg)
-        logical_vector_counts = tuple(state.vector_count for state in states)
-        vector_bucket = max(logical_vector_counts) if vector_capacity is None else vector_capacity
-        if type(vector_bucket) is not int or vector_bucket < max(logical_vector_counts):
-            msg = "compact vector capacity must cover every logical vector"
-            raise ValueError(msg)
-        largest_active_count = max(state.layout.active_count for state in states)
-        bucket = largest_active_count if active_capacity is None else active_capacity
-        if type(bucket) is not int or bucket < largest_active_count:
-            msg = "compact active capacity must cover every logical coefficient"
-            raise ValueError(msg)
-        padding_elements = sum(bucket - state.layout.active_count for state in states)
-        worst_padding_fraction = max(
-            (bucket - state.layout.active_count) / bucket for state in states
+        plan = _compact_batch_plan(
+            states,
+            policy=policy,
+            lane_capacity=lane_capacity,
+            vector_capacity=vector_capacity,
+            active_capacity=active_capacity,
         )
-        if worst_padding_fraction > policy.max_padding_fraction:
-            msg = "compact batch active counts exceed the padding-fraction cap"
-            raise ValueError(msg)
-        lane_padding_elements = (lane_bucket - logical_lane_count) * vector_bucket * bucket
-        vector_padding_elements = (
-            sum(vector_bucket - count for count in logical_vector_counts) * bucket
-        )
-        compact_payload_bytes = lane_bucket * vector_bucket * bucket * 8
-        index_and_mask_bytes = lane_bucket * bucket * (4 + 1)
-        fft_workspace_bytes = 2 * lane_bucket * vector_bucket * first.layout.grid_size * 8
-        estimated_transient_bytes = (
-            compact_payload_bytes + index_and_mask_bytes + fft_workspace_bytes
-        )
-        if estimated_transient_bytes > policy.max_transient_bytes:
-            msg = "compact batch exceeds the transient byte budget"
-            raise ValueError(msg)
         padded_values = []
         padded_indices: list[mx.array] = []
         masks: list[mx.array] = []
         for state in states:
-            count = state.layout.active_count
-            padding = bucket - count
-            values = state.values
-            if padding:
-                zeros = mx.zeros(
-                    (state.vector_count, padding),
+            values, indices, mask = _padded_compact_lane(
+                state,
+                active_capacity=plan.active_capacity,
+                vector_capacity=plan.vector_capacity,
+            )
+            padded_values.append(values)
+            padded_indices.append(indices)
+            masks.append(mask)
+        for _ in range(plan.lane_capacity - len(states)):
+            padded_values.append(
+                mx.zeros(
+                    (plan.vector_capacity, plan.active_capacity),
                     dtype=mx.complex64,
                 )
-                values = mx.concatenate([values, zeros], axis=1)
-                if state.layout._padding_flat_indices_np.size >= padding:
-                    inactive = state.layout._padding_flat_indices[:padding]
-                else:
-                    inactive = mx.array(
-                        _first_inactive_indices(
-                            state.layout._active_flat_indices_np,
-                            grid_size=state.layout.grid_size,
-                            count=padding,
-                        )
-                    )
-                if int(inactive.size) < padding:
-                    msg = "compact FFT bucket has insufficient distinct padding indices"
-                    raise ValueError(msg)
-                padded_indices.append(
-                    mx.concatenate(
-                        [
-                            state.layout._active_flat_indices,
-                            inactive,
-                        ]
-                    )
-                )
-                masks.append(mx.arange(bucket) < count)
-            else:
-                padded_indices.append(state.layout._active_flat_indices)
-                masks.append(mx.ones((bucket,), dtype=mx.bool_))
-            vector_padding = vector_bucket - state.vector_count
-            if vector_padding:
-                values = mx.concatenate(
-                    [
-                        values,
-                        mx.zeros(
-                            (vector_padding, bucket),
-                            dtype=mx.complex64,
-                        ),
-                    ],
-                    axis=0,
-                )
-            padded_values.append(values)
-        for _ in range(lane_bucket - logical_lane_count):
-            padded_values.append(mx.zeros((vector_bucket, bucket), dtype=mx.complex64))
+            )
             padded_indices.append(padded_indices[0])
-            masks.append(mx.zeros((bucket,), dtype=mx.bool_))
+            masks.append(mx.zeros((plan.active_capacity,), dtype=mx.bool_))
         return cls(
             values=mx.stack(padded_values, axis=0),
             layouts=tuple(state.layout for state in states),
             active_counts=tuple(state.layout.active_count for state in states),
-            vector_counts=logical_vector_counts,
+            vector_counts=plan.vector_counts,
             fft_indices=mx.stack(padded_indices, axis=0).astype(mx.int32),
             valid_mask=mx.stack(masks, axis=0),
             kinds=tuple(state.kind for state in states),
-            padding_elements=padding_elements,
-            lane_padding_elements=lane_padding_elements,
-            vector_padding_elements=vector_padding_elements,
-            estimated_transient_bytes=estimated_transient_bytes,
+            padding_elements=plan.padding_elements,
+            lane_padding_elements=plan.lane_padding_elements,
+            vector_padding_elements=plan.vector_padding_elements,
+            estimated_transient_bytes=plan.estimated_transient_bytes,
         )
 
     @property
