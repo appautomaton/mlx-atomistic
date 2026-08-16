@@ -115,6 +115,7 @@ micro-optimization.
 | Five-thread PME interpolation | Splitting each atom's 125 grid reads across five z-slice workers preserved force parity within `2.3e-5 kJ/(mol A)`, but two barriers and shared-memory traffic regressed 5DFR by 0.4-0.9%, JAC by 2.4-5.6%, and GPCRmd by 5.2-13.0%. | uncommitted prototype; `results/md-suite/pme-parallel-interpolation-screen-2026-08-15/` |
 | Computed left-order indices | Replacing a 256-512 byte per-threadgroup index buffer with the equivalent block/slice/slot expression preserved Interaction32, device-built fused-half, and CHARMM NBFIX force parity. Fixed-schedule blocks improved 15.6% on 5DFR, 1.5-6.7% on JAC, and 0.9-2.1% on GPCRmd, but the gain did not transfer to the trajectory gate: an isolated 1,500-step JAC candidate improved only 0.46% against a contemporaneous control, below the required 3%, while 5DFR was effectively neutral against the fresh pre-change baseline. The prototype was removed. | uncommitted prototype; `results/md-suite/direct-left-index-*-2026-08-16*` |
 | Local Direct arithmetic rewrites | Three ALU-motivated JAC screens all preserved force parity but failed the fixed-schedule gate. OpenMM-style Lennard-Jones factorization regressed 0.97%, a 4,097-entry screened-Coulomb table with a 16 KiB footprint and `9.8e-8` offline maximum factor error regressed 0.83%, and hoisting the invariant right-charge scale regressed 0.52%. The table traded arithmetic for irregular loads, while the compiler already optimized the simple invariant. All prototypes were removed before trajectory testing. | uncommitted prototypes; `results/md-suite/direct-{lj-factor,ewald-table,coulomb-charge-hoist}-screen-2026-08-16/` |
+| Fast Ewald reciprocal | OpenMM's Apple OpenCL backend can select `native_recip`, but replacing the shared Ewald helper's float division with Metal `fast::divide` did not transfer. Same-process JAC A/B regressed the 12 A inner schedule by 0.96%; the 14.5 A outer aggregate improved 0.77%, but its two timing directions disagreed at -1.27% and +1.83%. Force parity passed, the prototype was removed, and no trajectory gate was run. | uncommitted diagnostic; `results/md-suite/direct-fast-recip-screen-2026-08-16/` |
 
 ## Interaction32 Promotion
 
@@ -148,6 +149,17 @@ retained: lowering it cannot separate GPCRmd from the water regression with a
 safe margin. The active schedule decision is reported as `adaptation_reason`;
 `fallback_reason` remains reserved for an actual backend failure. Raw evidence
 is under `results/md-suite/post-two-level-whole-step-profile-2026-08-16/`.
+
+Current fixed-input component attribution confirms that ordinary traversal is
+the remaining Direct target. On JAC, the 12 A inner schedule carried 72.1
+million scheduled pair lanes and measured 2.530 ms/call, while the 14.5 A
+outer schedule carried 108.3 million lanes and measured 3.170 ms/call. After
+subtracting the same empty-output baseline, ordinary work measured 1.597 ms
+against 0.455 ms of special work on the inner schedule, and 1.995 ms against
+0.458 ms on the outer schedule. Special work is nearly invariant; the outer
+growth belongs to ordinary pair traversal. The reusable benchmark attribution
+is emitted as `component_timing`; raw evidence is under
+`results/md-suite/direct-current-attribution-2026-08-16/`.
 
 A fresh manifest-matched JAC 94,232-atom comparison at `12bc829` used 10
 warmup steps and 750 measured 4 fs fixed-cell NVT steps while macOS Low Power

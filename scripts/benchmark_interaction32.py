@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -111,6 +112,74 @@ def _sequential_block_samples(
         "candidate_speedup_fraction": 1.0 - candidate / control,
         "control_first": direction(0),
         "candidate_first": direction(1),
+    }
+
+
+def _named_block_samples(
+    calls,
+    *,
+    warmups: int,
+    samples: int,
+    block_count: int,
+) -> dict[str, object]:
+    """Measure several fixed-input calls in a position-balanced order."""
+
+    if block_count < 1:
+        raise ValueError("timing block count must be positive")
+    names = tuple(calls)
+    if not names:
+        raise ValueError("named timing requires at least one call")
+
+    def evaluate(call) -> float:
+        started = time.perf_counter()
+        for _ in range(block_count):
+            mx.eval(call())
+        return (time.perf_counter() - started) / block_count
+
+    for _ in range(warmups):
+        for name in names:
+            evaluate(calls[name])
+    raw = {name: [] for name in names}
+    for sample in range(samples):
+        rotation = (sample // 2) % len(names)
+        order = names[rotation:] + names[:rotation]
+        if sample % 2:
+            order = tuple(reversed(order))
+        for name in order:
+            raw[name].append(evaluate(calls[name]))
+    return {
+        "method": "position-balanced synchronized calls per timing block",
+        "block_count": block_count,
+        "samples": raw,
+        "median_seconds": {name: float(np.median(values)) for name, values in raw.items()},
+    }
+
+
+def _fused_half_component_schedules(schedule) -> dict[str, object]:
+    """Return full and work-isolated views of one device fused-half schedule."""
+
+    no_special = {
+        "special_work_left_blocks": schedule.special_work_left_blocks[:0],
+        "special_work_left_slices": schedule.special_work_left_slices[:0],
+        "special_work_right_atoms": schedule.special_work_right_atoms[:0],
+        "special_work_lj_enabled": schedule.special_work_lj_enabled[:0],
+        "special_work_lj_one_four": schedule.special_work_lj_one_four[:0],
+        "special_work_diagonal": schedule.special_work_diagonal[:0],
+    }
+    no_ordinary = {
+        "ordinary_tile_count": 0,
+        "ordinary_group_count": 0,
+        "ordinary_left_blocks": schedule.ordinary_left_blocks[:0],
+        "ordinary_right_atoms": schedule.ordinary_right_atoms[:0],
+        "ordinary_half_modes": schedule.ordinary_half_modes[:0],
+        "ordinary_group_starts": schedule.ordinary_group_starts[:0],
+        "ordinary_group_counts": schedule.ordinary_group_counts[:0],
+    }
+    return {
+        "full": schedule,
+        "ordinary_only": replace(schedule, **no_special),
+        "special_only": replace(schedule, **no_ordinary),
+        "empty": replace(schedule, **no_ordinary, **no_special),
     }
 
 
@@ -571,10 +640,10 @@ def benchmark(
 
     else:
 
-        def candidate_call():
+        def candidate_for_schedule(selected_schedule):
             return _fused_half32_direct_force_only(
                 system.positions,
-                device_schedule,
+                selected_schedule,
                 tile_binding.box_lengths_and_inverses,
                 tile_binding.half_sigma,
                 tile_binding.sqrt_epsilon,
@@ -591,6 +660,9 @@ def benchmark(
                 nbfix_type_count=tile_binding.tile_nbfix_type_count,
                 _simdgroups_per_threadgroup=simdgroups_per_threadgroup,
             )
+
+        def candidate_call():
+            return candidate_for_schedule(device_schedule)
 
     control = control_call()
     candidate = candidate_call()
@@ -619,16 +691,32 @@ def benchmark(
         samples=samples,
     )
     stage_timing = None
+    component_timing = None
     if architecture == "interaction32":
         stage_timing = _stage_samples(
             stage_call,
             warmups=max(1, warmups // 2),
             samples=samples,
         )
+    elif architecture in {"fused_half32", "device_fused_half32"}:
+        component_schedules = _fused_half_component_schedules(device_schedule)
+        component_timing = _named_block_samples(
+            {
+                name: (
+                    lambda selected_schedule=selected_schedule: candidate_for_schedule(
+                        selected_schedule
+                    )
+                )
+                for name, selected_schedule in component_schedules.items()
+            },
+            warmups=max(1, warmups // 2),
+            samples=samples,
+            block_count=timing_block_count,
+        )
     control_median = float(np.median(timings["control"]))
     candidate_median = float(np.median(timings["candidate"]))
     return {
-        "schema": "mlx_atomistic.interaction32_force_benchmark.v5",
+        "schema": "mlx_atomistic.interaction32_force_benchmark.v6",
         "prepared": str(prepared),
         "architecture": architecture,
         "atom_count": schedule.atom_count,
@@ -665,6 +753,7 @@ def benchmark(
         "steady_state_timing": steady_state,
         "marginal_timing": marginal,
         "stage_timing": stage_timing,
+        "component_timing": component_timing,
     }
 
 
