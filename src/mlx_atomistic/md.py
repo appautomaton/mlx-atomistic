@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
+from functools import partial
 from math import exp, sqrt
 from time import perf_counter
 from types import NotImplementedType
@@ -12,6 +13,11 @@ from typing import Any, Literal
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic._md_langevin import (
+    _LangevinBlockExecutor,
+    _LangevinBlockState,
+    _next_recording_local_step,
+)
 from mlx_atomistic._md_state import (
     BarostatProposal,
     LangevinThermostat,
@@ -2823,206 +2829,70 @@ def _simulate_nvt(
         neighbor_list=neighbor_list,
     )
     if _batched:
-        fscale = config.force_to_acceleration_scale
-        dt = config.dt
-        # Use the same arithmetic as the per-step loop below (division by the
-        # mass column, not multiply-by-reciprocal) so the batched trajectory is
-        # bit-for-bit identical, not just close.
-        sqrt_masses_col = mx.sqrt(masses)[:, None]
-
-        def _langevin_substep(pos, vel, forces, prng, block_pairs):
-            accel = fscale * forces / masses_col
-            vel_half = vel + 0.5 * dt * accel
-            pos = pos + 0.5 * dt * vel_half
-            if cell is not None and config.wrap_positions:
-                pos = cell.wrap(pos)
-            split_keys = mx.random.split(prng, 2)
-            prng = split_keys[0]
-            noise = mx.random.normal(vel.shape, key=split_keys[1])
-            middle = velocity_decay * vel_half + (noise_scale / sqrt_masses_col) * noise
-            pos = pos + 0.5 * dt * middle
-            if cell is not None and config.wrap_positions:
-                pos = cell.wrap(pos)
-            next_forces = _forces_from_terms(
-                pos, unnamed_terms, cell=cell, pairs=block_pairs, virtual_sites=None
-            )
-            next_accel = fscale * next_forces / masses_col
-            vel = middle + 0.5 * dt * next_accel
-            return pos, vel, next_forces, prng
-
-        _block_cache: dict[int, object] = {}
-
-        def _compiled_block(n_substeps: int):
-            cached = _block_cache.get(n_substeps)
-            if cached is not None:
-                return cached
-
-            def block(pos, vel, forces, prng, block_pairs, reference_positions):
-                block_max_displacement = mx.array(0.0, dtype=pos.dtype)
-                block_admissible = mx.array(True)
-                for _ in range(n_substeps):
-                    pos, vel, forces, prng = _langevin_substep(
-                        pos,
-                        vel,
-                        forces,
-                        prng,
-                        block_pairs,
-                    )
-                    displacement = cell.minimum_image(pos - reference_positions)
-                    distance2 = mx.sum(displacement * displacement, axis=1)
-                    step_max_displacement = (
-                        mx.array(0.0, dtype=pos.dtype)
-                        if pos.shape[0] == 0
-                        else mx.sqrt(mx.max(distance2))
-                    )
-                    block_max_displacement = mx.maximum(
-                        block_max_displacement,
-                        step_max_displacement,
-                    )
-                    block_admissible = (
-                        block_admissible
-                        & mx.all(mx.isfinite(pos))
-                        & (step_max_displacement <= neighbor_manager.rebuild_threshold)
-                    )
-                return (
-                    pos,
-                    vel,
-                    forces,
-                    prng,
-                    block_max_displacement,
-                    block_admissible,
-                )
-
-            compiled = mx.compile(block)
-            _block_cache[n_substeps] = compiled
-            return compiled
-
-        def _replay_langevin_block(
-            pos,
-            vel,
-            forces,
-            prng,
-            n_substeps: int,
+        if (
+            cell is None
+            or neighbor_manager is None
+            or neighbor_list is None
+            or key is None
+            or velocity_decay is None
+            or noise_scale is None
         ):
-            replay_pairs = pairs
-            replay_pair_count = pair_count
-            replay_rebuild_count = rebuild_count
-            for _ in range(n_substeps):
-                accel = fscale * forces / masses_col
-                vel_half = vel + 0.5 * dt * accel
-                pos = pos + 0.5 * dt * vel_half
-                if cell is not None and config.wrap_positions:
-                    pos = cell.wrap(pos)
-                split_keys = mx.random.split(prng, 2)
-                prng = split_keys[0]
-                noise = mx.random.normal(vel.shape, key=split_keys[1])
-                middle = velocity_decay * vel_half + (noise_scale / sqrt_masses_col) * noise
-                pos = pos + 0.5 * dt * middle
-                if cell is not None and config.wrap_positions:
-                    pos = cell.wrap(pos)
-
-                replay_neighbor_list = neighbor_manager.rebuild(pos)
-                replay_pairs = replay_neighbor_list.force_candidates(
-                    prefer_tiles=False,
-                )
-                replay_pair_count = replay_neighbor_list.pair_count
-                replay_rebuild_count = neighbor_manager.rebuild_count
-                if prepared_force_pipeline is None:
-                    forces = _forces_from_terms(
-                        pos,
-                        unnamed_terms,
-                        cell=cell,
-                        pairs=replay_pairs,
-                        virtual_sites=None,
-                    )
-                else:
-                    replay_binding = prepared_force_pipeline.bind(replay_neighbor_list)
-                    forces = replay_binding.forces(
-                        pos,
-                        evaluation_positions=pos,
-                    )
-                next_accel = fscale * forces / masses_col
-                vel = middle + 0.5 * dt * next_accel
-            return (
-                pos,
-                vel,
-                forces,
-                prng,
-                replay_pairs,
-                replay_pair_count,
-                replay_rebuild_count,
-            )
-
-        def _next_recording_local_step(local_step: int) -> int:
-            """Smallest local step > `local_step` that is a sampling, diagnostic,
-            or final step — so a block never steps past a recorded boundary."""
-            current = config.initial_step + local_step
-            next_sample = ((current // config.sample_interval) + 1) * config.sample_interval
-            next_diag = ((current // config.diagnostic_interval) + 1) * config.diagnostic_interval
-            next_step = min(next_sample, next_diag) - config.initial_step
-            return min(next_step, config.steps)
+            msg = "compiled Langevin blocks require initialized periodic runtime state"
+            raise RuntimeError(msg)
+        block_force_evaluator = partial(
+            _forces_from_terms,
+            force_terms=unnamed_terms,
+            cell=cell,
+            virtual_sites=None,
+        )
+        block_executor = _LangevinBlockExecutor(
+            cell=cell,
+            wrap_positions=config.wrap_positions,
+            dt=config.dt,
+            force_to_acceleration_scale=config.force_to_acceleration_scale,
+            masses=masses,
+            velocity_decay=velocity_decay,
+            noise_scale=noise_scale,
+            neighbor_manager=neighbor_manager,
+            force_evaluator=block_force_evaluator,
+            prepared_force_pipeline=prepared_force_pipeline,
+        )
 
         def _run_langevin_batched(
-            state, key, thermostat_metadata, pairs, pair_count, rebuild_count, fe_wall
+            state,
+            key,
+            thermostat_metadata,
+            neighbor_list,
+            pairs,
+            pair_count,
+            rebuild_count,
+            fe_wall,
         ):
-            pos, vel, forces = state.positions, state.velocities, state.forces
+            block_state = _LangevinBlockState(
+                positions=state.positions,
+                velocities=state.velocities,
+                forces=state.forces,
+                key=key,
+                pairs=pairs,
+                pair_count=pair_count,
+                rebuild_count=rebuild_count,
+                neighbor_list=neighbor_list,
+            )
             local_step = 0
             while local_step < config.steps:
-                n = min(config.block_size, _next_recording_local_step(local_step) - local_step)
-                block_start = (pos, vel, forces, key)
-                reference_positions = neighbor_manager.reference_positions
-                if reference_positions is None:
-                    msg = "compiled block execution requires neighbor reference positions"
-                    raise RuntimeError(msg)
-                (
-                    proposed_pos,
-                    proposed_vel,
-                    proposed_forces,
-                    proposed_key,
-                    block_max_displacement,
-                    block_admissible,
-                ) = _compiled_block(n)(
-                    pos,
-                    vel,
-                    forces,
-                    key,
-                    pairs,
-                    reference_positions,
-                )
-                if neighbor_manager._admit_block(
-                    block_max_displacement,
-                    block_admissible,
-                    n,
-                ):
-                    pos = proposed_pos
-                    vel = proposed_vel
-                    forces = proposed_forces
-                    key = proposed_key
-                    neighbor_list = neighbor_manager.neighbor_list
-                    if neighbor_list is None:
-                        msg = "admitted block lost its current neighbor list"
-                        raise RuntimeError(msg)
-                else:
-                    (
-                        pos,
-                        vel,
-                        forces,
-                        key,
-                        pairs,
-                        pair_count,
-                        rebuild_count,
-                    ) = _replay_langevin_block(*block_start, n)
-                    neighbor_list = neighbor_manager.neighbor_list
-                    if neighbor_list is None:
-                        msg = "replayed block lost its current neighbor list"
-                        raise RuntimeError(msg)
+                next_recording_step = _next_recording_local_step(config, local_step)
+                n = min(config.block_size, next_recording_step - local_step)
+                block_state = block_executor.advance(block_state, n)
                 local_step += n
                 current_step = config.initial_step + local_step
                 current_time = config.initial_time + local_step * config.dt
-
-                pairs = neighbor_list.force_candidates(prefer_tiles=False)
-                pair_count = neighbor_list.pair_count
-                rebuild_count = neighbor_manager.rebuild_count
+                pos = block_state.positions
+                vel = block_state.velocities
+                forces = block_state.forces
+                pairs = block_state.pairs
+                pair_count = block_state.pair_count
+                rebuild_count = block_state.rebuild_count
+                neighbor_list = block_state.neighbor_list
 
                 state = SimulationState(
                     positions=pos,
@@ -3201,10 +3071,10 @@ def _simulate_nvt(
                 # (every block_size steps) instead of per step. The manager
                 # update above already materialized positions; this covers the
                 # velocity/force/PRNG state carried into the next block.
-                runtime_sync.record_sync("failure_check", vel, forces, key)
+                runtime_sync.record_sync("failure_check", vel, forces, block_state.key)
             return (
                 state,
-                key,
+                block_state.key,
                 thermostat_metadata,
                 pairs,
                 pair_count,
@@ -3224,6 +3094,7 @@ def _simulate_nvt(
             state,
             key,
             thermostat_metadata,
+            neighbor_list,
             pairs,
             pair_count,
             rebuild_count,
