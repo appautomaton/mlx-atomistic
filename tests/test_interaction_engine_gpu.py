@@ -22,6 +22,7 @@ from mlx_atomistic.interaction_engine import (
     _build_owner_compute_schedule32,
     _cell_atom_order,
     _count_device_schedule_inventory32,
+    _filter_device_fused_half_schedule32,
     _fuse_interaction_halves32,
     _fused_half32_direct_force_only,
     _group_ordinary_tiles,
@@ -771,6 +772,79 @@ def test_device_schedule_capacity_overflow_retry_and_generation_ownership():
 
 
 @pytest.mark.gpu
+def test_device_inner_schedule_compaction_preserves_direct_force():
+    """A shared-order inner schedule preserves the outer schedule's force."""
+
+    grid = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    )
+    positions_np = 2.0 + 1.4 * grid.reshape((-1, 3)).astype(np.float32)
+    atom_count = positions_np.shape[0]
+    box_lengths = np.asarray([20.0, 20.0, 20.0], dtype=np.float32)
+    attempt = _try_build_device_fused_half_schedule32(
+        positions_np,
+        box_lengths,
+        search_radius=5.5,
+        capacity=None,
+        generation_value=9,
+        lj_exclusion_pairs=[[0, 40]],
+        lj_one_four_pairs=[[1, 41]],
+        ordering_search_radius=4.5,
+    )
+    admitted = _retry_device_fused_half_schedule32(attempt)
+    assert admitted.schedule is not None
+    inner = _filter_device_fused_half_schedule32(
+        positions_np,
+        admitted.inventory,
+        admitted.schedule,
+        search_radius=4.5,
+    )
+    assert inner.schedule.generation is not None
+    assert inner.schedule.generation.value == 9
+    assert inner.schedule.atom_order is admitted.schedule.atom_order
+    assert inner.logical_pair_lanes <= admitted.inventory.logical_pair_lanes
+
+    positions = mx.array(positions_np, dtype=mx.float32)
+    box = mx.concatenate(
+        (
+            mx.array(box_lengths, dtype=mx.float32),
+            1.0 / mx.array(box_lengths, dtype=mx.float32),
+        )
+    )
+    half_sigma = mx.full((atom_count,), 0.55, dtype=mx.float32)
+    sqrt_epsilon = mx.full((atom_count,), np.sqrt(0.2), dtype=mx.float32)
+    charges = mx.array(np.linspace(-0.5, 0.5, atom_count), dtype=mx.float32)
+
+    def direct_force(schedule):
+        return _fused_half32_direct_force_only(
+            positions,
+            schedule,
+            box,
+            half_sigma,
+            sqrt_epsilon,
+            charges,
+            cutoff=4.0,
+            shift=False,
+            switch_distance=None,
+            one_four_scale=0.5,
+            coulomb_constant=1389.35457644382,
+            alpha=0.35,
+            expected_generation=9,
+        )
+
+    outer_force = direct_force(admitted.schedule)
+    inner_force = direct_force(inner.schedule)
+    mx.eval(outer_force, inner_force)
+    np.testing.assert_allclose(
+        np.asarray(inner_force),
+        np.asarray(outer_force),
+        rtol=2.0e-5,
+        atol=2.0e-3,
+    )
+
+
+@pytest.mark.gpu
 def test_device_schedule_generation_fingerprints_topology_changes():
     """Generation metadata changes when canonical special topology changes."""
 
@@ -869,6 +943,53 @@ def test_interaction32_rebuild_stage_profile_reconciles_exact_inventory():
         _profile_interaction32_rebuilds(),
     ):
         pass
+
+
+@pytest.mark.gpu
+def test_interaction32_two_level_schedule_switches_before_outer_rebuild(monkeypatch):
+    """The inner schedule falls back to its same-generation outer schedule."""
+
+    monkeypatch.setattr(
+        "mlx_atomistic.neighbors._INTERACTION32_TWO_LEVEL_MIN_ATOMS",
+        1,
+    )
+    grid = np.stack(
+        np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+        axis=-1,
+    )
+    positions = 4.0 + 2.0 * grid.reshape((-1, 3)).astype(np.float32)
+    manager = NeighborListManager(
+        Cell.cubic(40.0),
+        cutoff=9.0,
+        skin=5.5,
+        check_interval=1,
+        backend="mlx_interaction32",
+    )
+
+    inner = manager.update(positions)
+    outer = manager._interaction32_outer_neighbor_list
+    assert manager._interaction32_inner_neighbor_list is inner
+    assert outer is not None
+    assert inner is not outer
+    assert inner.stats.compaction_backend == "metal_interaction32_outer_inner_compactor"
+    assert manager.rebuild_count == 1
+
+    within_inner = positions.copy()
+    within_inner[0, 0] += 1.49
+    assert manager.update(within_inner) is inner
+    assert manager.rebuild_count == 1
+
+    beyond_inner = positions.copy()
+    beyond_inner[0, 0] += 1.51
+    assert manager.update(beyond_inner) is outer
+    assert manager.rebuild_count == 1
+
+    beyond_outer = positions.copy()
+    beyond_outer[0, 0] += 2.76
+    rebuilt_inner = manager.update(beyond_outer)
+    assert rebuilt_inner is manager._interaction32_inner_neighbor_list
+    assert rebuilt_inner is not inner
+    assert manager.rebuild_count == 2
 
 
 @pytest.mark.gpu

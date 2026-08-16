@@ -23,6 +23,7 @@ from mlx_atomistic.cell_list import (
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.interaction_engine import (
     _DeviceFusedHalfSchedule32,
+    _filter_device_fused_half_schedule32,
     _interaction32_profile_finish_build,
     _interaction32_profile_finish_stage,
     _interaction32_profile_start,
@@ -85,6 +86,10 @@ DEFAULT_MLX_CELL_TILE_BATCH = 65_536
 # grouping avoids the superlinear global sort. The 3M crossover is conservative
 # relative to the measured 2.3M tie point on M5 Max.
 _MLX_CELL_TILE_LEFT_GROUPED_SCATTER_MIN_CANDIDATES = 3_000_000
+_INTERACTION32_TWO_LEVEL_MIN_ATOMS = 80_000
+_INTERACTION32_TWO_LEVEL_CUTOFF = 9.0
+_INTERACTION32_TWO_LEVEL_OUTER_SKIN = 5.5
+_INTERACTION32_TWO_LEVEL_INNER_SKIN = 3.0
 # One Metal thread traverses all coarse blocks owned by a cell. Keep unusually
 # concentrated cells on the parallel compact-and-sort path so pathological
 # occupancy cannot serialize the direct-grouped scatter.
@@ -985,6 +990,24 @@ class NeighborListManager:
         repr=False,
         compare=False,
     )
+    _interaction32_outer_neighbor_list: NeighborList | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction32_inner_neighbor_list: NeighborList | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction32_inner_threshold: float | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.check_interval <= 0:
@@ -1009,6 +1032,29 @@ class NeighborListManager:
         """Maximum displacement before the Verlet list must be rebuilt."""
 
         return 0.5 * self.skin
+
+    def _interaction32_inner_skin(self, atom_count: int) -> float | None:
+        """Return the admitted two-level inner skin for this manager."""
+
+        if (
+            self.backend == "mlx_interaction32"
+            and atom_count >= _INTERACTION32_TWO_LEVEL_MIN_ATOMS
+            and self.check_interval == 1
+            and np.isclose(self.cutoff, _INTERACTION32_TWO_LEVEL_CUTOFF)
+            and np.isclose(self.skin, _INTERACTION32_TWO_LEVEL_OUTER_SKIN)
+        ):
+            return _INTERACTION32_TWO_LEVEL_INNER_SKIN
+        return None
+
+    def _select_interaction32_schedule(self) -> None:
+        """Select the inner schedule until its displacement margin expires."""
+
+        inner = self._interaction32_inner_neighbor_list
+        outer = self._interaction32_outer_neighbor_list
+        threshold = self._interaction32_inner_threshold
+        if inner is None or outer is None or threshold is None:
+            return
+        self.neighbor_list = inner if self.last_max_displacement <= threshold else outer
 
     def needs_rebuild(self, positions) -> bool:
         """Return true when positions have moved too far from the reference frame."""
@@ -1132,6 +1178,7 @@ class NeighborListManager:
             "metal_spatial_prefix_scan",
             "metal_spatial_tile_prefix_scan",
             "metal_interaction32_device_builder",
+            "metal_interaction32_outer_inner_compactor",
         }
         return self.neighbor_list
 
@@ -1147,6 +1194,10 @@ class NeighborListManager:
         positions_mx = as_mx_array(positions, dtype=mx.float32)
         box_lengths = np.asarray(np.diag(np.asarray(self.cell.matrix)), dtype=np.float32)
         search_radius = self.cutoff + self.skin
+        inner_skin = self._interaction32_inner_skin(int(positions_mx.shape[0]))
+        inner_search_radius = (
+            None if inner_skin is None else self.cutoff + inner_skin
+        )
         generation = self.rebuild_count + 1
         build_started = _interaction32_profile_start()
         attempt = _try_build_device_fused_half_schedule32(
@@ -1159,6 +1210,7 @@ class NeighborListManager:
             lj_one_four_pairs=self.interaction32_one_four_pairs,
             ordinary_tiles_per_group=self.interaction32_ordinary_tiles_per_group,
             topology=self._interaction32_topology,
+            ordering_search_radius=inner_search_radius,
         )
         self._interaction32_topology = attempt.topology
         overflow_retry = attempt.overflow
@@ -1186,39 +1238,92 @@ class NeighborListManager:
         mx.eval(*arrays)
         self._interaction32_capacity = schedule.generation.capacity
         inventory = attempt.inventory
-        scheduled_pair_lanes = (
+        inner_build = (
+            None
+            if inner_search_radius is None
+            else _filter_device_fused_half_schedule32(
+                positions_mx,
+                inventory,
+                schedule,
+                search_radius=inner_search_radius,
+            )
+        )
+        outer_pair_lanes = (
             inventory.logical_pair_lanes
             + schedule.special_work_count * 16 * 32
         )
         cell_counts = inventory.geometry.cell_counts
         cell_count = int(np.prod(np.asarray(cell_counts), dtype=np.int64))
-        stats = PairListStats(
-            pair_count=scheduled_pair_lanes,
-            n_cells=cell_counts,
-            cell_count=cell_count,
-            occupied_cell_count=inventory.occupied_cell_count,
-            search_radius=search_radius,
-            estimated_pair_bytes=schedule.estimated_bytes,
-            estimated_cell_list_bytes=(
-                positions_mx.shape[0] * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
-                + cell_count * 2 * _INT_BYTES
-            ),
-            backend="mlx_interaction32",
-            representation_kind="interaction32",
-            candidate_count=scheduled_pair_lanes,
-            estimated_candidate_bytes=schedule.estimated_bytes,
-            compaction_backend="metal_interaction32_device_builder",
-            fallback_reason=None,
+        resident_schedule_bytes = schedule.estimated_bytes + (
+            0 if inner_build is None else inner_build.schedule.estimated_bytes
         )
-        neighbor_list = NeighborList(
+        estimated_cell_bytes = (
+            positions_mx.shape[0] * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
+            + cell_count * 2 * _INT_BYTES
+        )
+
+        def make_stats(
+            pair_lanes: int,
+            radius: float,
+            compaction_backend: str,
+        ) -> PairListStats:
+            return PairListStats(
+                pair_count=pair_lanes,
+                n_cells=cell_counts,
+                cell_count=cell_count,
+                occupied_cell_count=inventory.occupied_cell_count,
+                search_radius=radius,
+                estimated_pair_bytes=resident_schedule_bytes,
+                estimated_cell_list_bytes=estimated_cell_bytes,
+                backend="mlx_interaction32",
+                representation_kind="interaction32",
+                candidate_count=pair_lanes,
+                estimated_candidate_bytes=resident_schedule_bytes,
+                compaction_backend=compaction_backend,
+                fallback_reason=None,
+            )
+
+        outer_neighbor_list = NeighborList(
             None,
             cutoff=self.cutoff,
             skin=self.skin,
-            stats=stats,
+            stats=make_stats(
+                outer_pair_lanes,
+                search_radius,
+                "metal_interaction32_device_builder",
+            ),
             interaction32=schedule,
             sort_diagnostic_pairs=self.sort_pairs,
             reference_positions=positions_mx,
             cell=self.cell,
+        )
+        inner_neighbor_list = None
+        if inner_build is not None and inner_search_radius is not None:
+            inner_pair_lanes = (
+                inner_build.logical_pair_lanes
+                + inner_build.schedule.special_work_count * 16 * 32
+            )
+            inner_neighbor_list = NeighborList(
+                None,
+                cutoff=self.cutoff,
+                skin=self.skin,
+                stats=make_stats(
+                    inner_pair_lanes,
+                    inner_search_radius,
+                    "metal_interaction32_outer_inner_compactor",
+                ),
+                interaction32=inner_build.schedule,
+                sort_diagnostic_pairs=self.sort_pairs,
+                reference_positions=positions_mx,
+                cell=self.cell,
+            )
+        self._interaction32_outer_neighbor_list = outer_neighbor_list
+        self._interaction32_inner_neighbor_list = inner_neighbor_list
+        self._interaction32_inner_threshold = (
+            None if inner_skin is None else 0.5 * inner_skin
+        )
+        neighbor_list = (
+            outer_neighbor_list if inner_neighbor_list is None else inner_neighbor_list
         )
         _interaction32_profile_finish_stage(
             "schedule_completion",
@@ -1255,6 +1360,7 @@ class NeighborListManager:
             if self.neighbor_list is None:
                 msg = "neighbor list manager has no current neighbor list"
                 raise RuntimeError(msg)
+            self._select_interaction32_schedule()
             return self.neighbor_list
         finally:
             self.update_wall_seconds += perf_counter() - start
@@ -1285,7 +1391,13 @@ class NeighborListManager:
             displacement = float(np.asarray(max_displacement))
             if not np.isfinite(displacement):
                 return False
-            if displacement > self.rebuild_threshold:
+            active_threshold = self.rebuild_threshold
+            if (
+                self.neighbor_list is self._interaction32_inner_neighbor_list
+                and self._interaction32_inner_threshold is not None
+            ):
+                active_threshold = self._interaction32_inner_threshold
+            if displacement > active_threshold:
                 return False
             if self.neighbor_list is None or self.reference_positions is None:
                 msg = "neighbor list manager has no current neighbor list"
@@ -1391,6 +1503,14 @@ class NeighborListManager:
         self.update_wall_seconds = candidate.update_wall_seconds
         self._cache_clear_pending = candidate._cache_clear_pending
         self._interaction32_capacity = candidate._interaction32_capacity
+        self._interaction32_topology = candidate._interaction32_topology
+        self._interaction32_outer_neighbor_list = (
+            candidate._interaction32_outer_neighbor_list
+        )
+        self._interaction32_inner_neighbor_list = (
+            candidate._interaction32_inner_neighbor_list
+        )
+        self._interaction32_inner_threshold = candidate._interaction32_inner_threshold
 
 
 def build_neighbor_list(

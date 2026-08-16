@@ -20,6 +20,8 @@ from mlx_atomistic.metal_kernels import (
     _interaction32_fused_half_pme_direct_force_only,
     _interaction32_ordinary_mode_counts,
     _interaction32_ordinary_scatter_sized,
+    _interaction32_outer_inner_mode_counts,
+    _interaction32_outer_inner_mode_scatter_sized,
     _interaction32_pme_direct_force_only,
     _interaction32_special_blocks_sized,
     _interaction32_special_work_two_halves,
@@ -663,6 +665,17 @@ class _DeviceScheduleBuildAttempt32:
 
 
 @dataclass(frozen=True)
+class _DeviceInnerScheduleBuild32:
+    """One inner schedule compacted from a shared-order outer generation."""
+
+    schedule: _DeviceFusedHalfSchedule32
+    right_entry_count: int
+    logical_pair_lanes: int
+    tile_count: int
+    group_count: int
+
+
+@dataclass(frozen=True)
 class _FusedHalfSchedule32:
     atom_count: int
     search_radius: float
@@ -847,6 +860,7 @@ def _build_device_block_geometry32(
     box_lengths: object,
     *,
     search_radius: float,
+    ordering_search_radius: float | None = None,
 ) -> _DeviceBlockGeometry32:
     """Build the spatial atom order and periodic 32-atom block bounds on device."""
 
@@ -863,8 +877,12 @@ def _build_device_block_geometry32(
         raise ValueError("search_radius must be finite and positive")
     if 2.0 * float(search_radius) >= float(np.min(box)):
         raise ValueError("search_radius must be smaller than half the shortest box length")
+    if ordering_search_radius is None:
+        ordering_search_radius = search_radius
+    if not isfinite(float(ordering_search_radius)) or ordering_search_radius <= 0.0:
+        raise ValueError("ordering_search_radius must be finite and positive")
 
-    cell_width = float(search_radius) / 3.0
+    cell_width = float(ordering_search_radius) / 3.0
     cell_counts = np.maximum(np.floor(box / cell_width).astype(np.int64), 1)
     cell_count = int(np.prod(cell_counts, dtype=np.int64))
     if cell_count > np.iinfo(np.int32).max:
@@ -1017,7 +1035,7 @@ def _count_device_schedule_inventory32(
     ) // ordinary_tiles_per_group
     mode_group_prefix = mx.cumsum(mode_group_counts)
     logical_pair_lanes = mx.sum(
-        mode_entry_counts
+        mode_entry_counts.reshape((-1, 3))
         * mx.array([16, 16, 32], dtype=mx.int32)[None, :]
     )
     inventory = mx.stack(
@@ -1421,6 +1439,7 @@ def _try_build_device_fused_half_schedule32(
     lj_one_four_pairs: object = (),
     ordinary_tiles_per_group: int = _DEFAULT_ORDINARY_TILES_PER_GROUP,
     topology: _PreparedInteraction32Topology | None = None,
+    ordering_search_radius: float | None = None,
 ) -> _DeviceScheduleBuildAttempt32:
     """Count one candidate generation and stop before scatter on overflow."""
 
@@ -1431,6 +1450,7 @@ def _try_build_device_fused_half_schedule32(
         positions,
         box_lengths,
         search_radius=search_radius,
+        ordering_search_radius=ordering_search_radius,
     )
     _interaction32_profile_finish_stage(
         "geometry_validation_and_sort",
@@ -1529,6 +1549,136 @@ def _retry_device_fused_half_schedule32(
         topology=attempt.topology,
         capacity=selected,
         generation_value=attempt.generation_value,
+    )
+
+
+def _filter_device_fused_half_schedule32(
+    positions: object,
+    outer_inventory: _DeviceScheduleInventory32,
+    outer_schedule: _DeviceFusedHalfSchedule32,
+    *,
+    search_radius: float,
+) -> _DeviceInnerScheduleBuild32:
+    """Compact one inner force schedule from a shared-order outer generation."""
+
+    generation = outer_schedule.generation
+    if generation is None:
+        raise ValueError("outer schedule must own a retained-capacity generation")
+    geometry = outer_inventory.geometry
+    if (
+        outer_schedule.atom_count != geometry.atom_count
+        or outer_schedule.padded_atom_count != geometry.padded_atom_count
+        or generation.value < 0
+    ):
+        raise ValueError("outer schedule and inventory must share one generation")
+    if not isfinite(float(search_radius)) or search_radius <= 0.0:
+        raise ValueError("search_radius must be finite and positive")
+    if float(search_radius) >= float(outer_schedule.search_radius):
+        raise ValueError("inner search_radius must be smaller than the outer radius")
+    positions_mx = as_mx_array(positions, dtype=mx.float32)
+    if positions_mx.shape != (geometry.atom_count, 3):
+        raise ValueError(f"positions must have shape ({geometry.atom_count}, 3)")
+    box_mx = mx.array(geometry.box_lengths, dtype=mx.float32)
+    box_lengths_and_inverses = mx.concatenate((box_mx, 1.0 / box_mx))
+    mode_entry_counts, cached_modes = _interaction32_outer_inner_mode_counts(
+        positions_mx,
+        geometry.atom_order,
+        geometry.block_traversal,
+        outer_schedule.ordinary_right_atoms,
+        outer_inventory.mode_tile_counts,
+        outer_inventory.mode_tile_prefix,
+        box_lengths_and_inverses,
+        search_radius=float(search_radius),
+    )
+    mode_tile_counts = (mode_entry_counts + _INTERACTION_TILE_SIZE - 1) // (
+        _INTERACTION_TILE_SIZE
+    )
+    mode_tile_prefix = mx.cumsum(mode_tile_counts)
+    mode_group_counts = (
+        mode_tile_counts + outer_inventory.ordinary_tiles_per_group - 1
+    ) // outer_inventory.ordinary_tiles_per_group
+    mode_group_prefix = mx.cumsum(mode_group_counts)
+    logical_pair_lanes = mx.sum(
+        mode_entry_counts.reshape((-1, 3))
+        * mx.array([16, 16, 32], dtype=mx.int32)[None, :]
+    )
+    inner_inventory = mx.stack(
+        (
+            mx.sum(mode_entry_counts),
+            mode_tile_prefix[-1],
+            mode_group_prefix[-1],
+            logical_pair_lanes,
+        )
+    )
+    mx.eval(inner_inventory)
+    right_entry_count, tile_count, group_count, pair_lanes = (
+        int(value) for value in np.asarray(inner_inventory)
+    )
+    capacity = generation.capacity
+    if tile_count > capacity.ordinary_tiles or group_count > capacity.ordinary_groups:
+        raise RuntimeError("inner schedule exceeded its outer generation capacity")
+    inner_left_blocks, inner_right_atoms, inner_half_modes = (
+        _interaction32_outer_inner_mode_scatter_sized(
+            geometry.atom_order,
+            geometry.block_traversal,
+            outer_schedule.ordinary_right_atoms,
+            cached_modes,
+            outer_inventory.mode_tile_counts,
+            outer_inventory.mode_tile_prefix,
+            mode_tile_counts,
+            mode_tile_prefix,
+            accepted_tile_count=capacity.ordinary_tiles,
+        )
+    )
+    inner_group_starts, inner_group_sizes = _neighbor_tile_force_groups_sized(
+        mode_tile_counts,
+        mode_tile_prefix,
+        mode_group_counts,
+        mode_group_prefix,
+        accepted_count=capacity.ordinary_groups,
+        items_per_group=outer_inventory.ordinary_tiles_per_group,
+    )
+    mx.eval(
+        inner_left_blocks,
+        inner_right_atoms,
+        inner_half_modes,
+        inner_group_starts,
+        inner_group_sizes,
+    )
+    inner_generation = _Interaction32Generation(
+        value=generation.value,
+        atom_count=generation.atom_count,
+        box_lengths=generation.box_lengths,
+        search_radius=float(search_radius),
+        topology_digest=generation.topology_digest,
+        capacity=capacity,
+    )
+    schedule = _DeviceFusedHalfSchedule32(
+        atom_count=outer_schedule.atom_count,
+        search_radius=float(search_radius),
+        padded_atom_count=outer_schedule.padded_atom_count,
+        ordinary_tile_count=tile_count,
+        ordinary_group_count=group_count,
+        atom_order=outer_schedule.atom_order,
+        ordinary_left_blocks=inner_left_blocks,
+        ordinary_right_atoms=inner_right_atoms,
+        ordinary_half_modes=inner_half_modes,
+        ordinary_group_starts=inner_group_starts,
+        ordinary_group_counts=inner_group_sizes,
+        special_work_left_blocks=outer_schedule.special_work_left_blocks,
+        special_work_left_slices=outer_schedule.special_work_left_slices,
+        special_work_right_atoms=outer_schedule.special_work_right_atoms,
+        special_work_lj_enabled=outer_schedule.special_work_lj_enabled,
+        special_work_lj_one_four=outer_schedule.special_work_lj_one_four,
+        special_work_diagonal=outer_schedule.special_work_diagonal,
+        generation=inner_generation,
+    )
+    return _DeviceInnerScheduleBuild32(
+        schedule=schedule,
+        right_entry_count=right_entry_count,
+        logical_pair_lanes=pair_lanes,
+        tile_count=tile_count,
+        group_count=group_count,
     )
 
 

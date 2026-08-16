@@ -198,6 +198,7 @@ def benchmark(
     *,
     architecture: str,
     skin: float,
+    control_skin: float | None,
     warmups: int,
     samples: int,
     ordinary_tiles_per_group: int,
@@ -208,6 +209,9 @@ def benchmark(
     builder_rebuild_samples: int = 3,
 ) -> dict[str, object]:
     _activate_metal()
+    resolved_control_skin = skin if control_skin is None else control_skin
+    if not np.isfinite(resolved_control_skin) or resolved_control_skin < 0.0:
+        raise ValueError("control skin must be finite and non-negative")
     artifact = load_prepared_mlx_artifact(prepared, require_production=True)
     system, force_terms, _ = build_mlx_system_from_artifact(
         artifact,
@@ -223,7 +227,7 @@ def benchmark(
     tile_manager = NeighborListManager(
         system.cell,
         cutoff=cutoff,
-        skin=skin,
+        skin=resolved_control_skin,
         check_interval=1,
         sort_pairs=False,
         backend="mlx_cell_tiles",
@@ -636,6 +640,7 @@ def benchmark(
             "nbfix_type_count": tile_binding.tile_nbfix_type_count,
         },
         "production": {
+            "skin_angstrom": resolved_control_skin,
             "block_size": tiles.block_size,
             "tile_count": tiles.tile_count,
             "force_group_count": tiles.force_group_count,
@@ -677,6 +682,14 @@ def main() -> None:
         default="interaction32",
     )
     parser.add_argument("--skin", type=float, default=5.5)
+    parser.add_argument(
+        "--control-skin",
+        type=float,
+        help=(
+            "Production tile reference skin. Defaults to --skin; set it independently "
+            "when screening an inner schedule against a validated outer schedule."
+        ),
+    )
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--ordinary-tiles-per-group", type=int, default=3)
@@ -695,6 +708,7 @@ def main() -> None:
         args.prepared,
         architecture=args.architecture,
         skin=args.skin,
+        control_skin=args.control_skin,
         warmups=args.warmups,
         samples=args.samples,
         ordinary_tiles_per_group=args.ordinary_tiles_per_group,

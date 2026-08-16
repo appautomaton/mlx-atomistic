@@ -455,6 +455,8 @@ _interaction32_ordinary_count_kernel_singleton = None
 _interaction32_ordinary_cached_count_kernel_singleton = None
 _interaction32_ordinary_scatter_kernel_singleton = None
 _interaction32_ordinary_cached_scatter_kernel_singleton = None
+_interaction32_outer_inner_mode_count_kernel_singleton = None
+_interaction32_outer_inner_mode_scatter_kernel_singleton = None
 _interaction32_special_block_scatter_kernel_singleton = None
 _interaction32_special_work_kernel_singleton = None
 _owner_compute32_force_kernel_singleton = None
@@ -1820,6 +1822,122 @@ _INTERACTION32_ORDINARY_SCATTER_SOURCE = r"""
         seen1 += count1;
         seen2 += count2;
         seen3 += count3;
+    }
+"""
+
+_INTERACTION32_OUTER_INNER_MODE_COUNT_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint traversal_index = threadgroup_position_in_grid.x;
+    uint block_count = (uint)counts[0];
+    uint padded_count = (uint)counts[1];
+    if (traversal_index >= block_count) {
+        return;
+    }
+    uint left_block = (uint)block_traversal[traversal_index];
+    threadgroup int left_atoms[32];
+    threadgroup float left_positions[96];
+    int left_atom = atom_order[32u * left_block + lane];
+    int safe_left = max(left_atom, 0);
+    left_atoms[lane] = left_atom;
+    left_positions[3u * lane + 0u] = positions[3 * safe_left + 0];
+    left_positions[3u * lane + 1u] = positions[3 * safe_left + 1];
+    left_positions[3u * lane + 2u] = positions[3 * safe_left + 2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_box[6];
+    for (uint axis = 0u; axis < 6u; axis++) {
+        local_box[axis] = box[axis];
+    }
+    uint counts_by_mode[3] = {0u, 0u, 0u};
+    uint run_base = 3u * traversal_index;
+    for (uint outer_mode = 0u; outer_mode < 3u; outer_mode++) {
+        uint run = run_base + outer_mode;
+        int tile_count = outer_tile_counts[run];
+        int tile_start = outer_tile_prefix[run] - tile_count;
+        for (int local_tile = 0; local_tile < tile_count; local_tile++) {
+            uint tile = (uint)(tile_start + local_tile);
+            int right_ordered = outer_right_atoms[32u * tile + lane];
+            int right_atom = right_ordered >= 0 && right_ordered < (int)padded_count
+                ? atom_order[right_ordered]
+                : -1;
+            uint mode = mlx_atomistic_interaction32_half_mode(
+                right_atom,
+                positions,
+                left_atoms,
+                left_positions,
+                local_box,
+                params[0]
+            );
+            cached_modes[32u * tile + lane] = mode;
+            counts_by_mode[0] += simd_sum(mode == 1u ? 1u : 0u);
+            counts_by_mode[1] += simd_sum(mode == 2u ? 1u : 0u);
+            counts_by_mode[2] += simd_sum(mode == 3u ? 1u : 0u);
+        }
+    }
+    if (lane == 0u) {
+        mode_counts[run_base + 0u] = (int)counts_by_mode[0];
+        mode_counts[run_base + 1u] = (int)counts_by_mode[1];
+        mode_counts[run_base + 2u] = (int)counts_by_mode[2];
+    }
+"""
+
+_INTERACTION32_OUTER_INNER_MODE_SCATTER_SOURCE = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint traversal_index = threadgroup_position_in_grid.x;
+    uint block_count = (uint)counts[0];
+    if (traversal_index >= block_count) {
+        return;
+    }
+    uint left_block = (uint)block_traversal[traversal_index];
+    uint run_base = 3u * traversal_index;
+    if (lane == 0u) {
+        for (uint mode_slot = 0u; mode_slot < 3u; mode_slot++) {
+            uint run = run_base + mode_slot;
+            int tile_count = inner_tile_counts[run];
+            int tile_start = inner_tile_prefix[run] - tile_count;
+            for (int local_tile = 0; local_tile < tile_count; local_tile++) {
+                int tile = tile_start + local_tile;
+                inner_left_blocks[tile] = (int)left_block;
+                inner_half_modes[tile] = (int)mode_slot + 1;
+            }
+        }
+    }
+
+    uint seen1 = 0u;
+    uint seen2 = 0u;
+    uint seen3 = 0u;
+    for (uint outer_mode = 0u; outer_mode < 3u; outer_mode++) {
+        uint outer_run = run_base + outer_mode;
+        int outer_tile_count = outer_tile_counts[outer_run];
+        int outer_tile_start = outer_tile_prefix[outer_run] - outer_tile_count;
+        for (int local_tile = 0; local_tile < outer_tile_count; local_tile++) {
+            uint tile = (uint)(outer_tile_start + local_tile);
+            int right_ordered = outer_right_atoms[32u * tile + lane];
+            uint mode = cached_modes[32u * tile + lane];
+            uint is1 = mode == 1u ? 1u : 0u;
+            uint is2 = mode == 2u ? 1u : 0u;
+            uint is3 = mode == 3u ? 1u : 0u;
+            uint rank1 = simd_prefix_exclusive_sum(is1);
+            uint rank2 = simd_prefix_exclusive_sum(is2);
+            uint rank3 = simd_prefix_exclusive_sum(is3);
+            uint count1 = simd_sum(is1);
+            uint count2 = simd_sum(is2);
+            uint count3 = simd_sum(is3);
+            uint local_entry = mode == 1u
+                ? seen1 + rank1
+                : (mode == 2u ? seen2 + rank2 : seen3 + rank3);
+            if (mode != 0u) {
+                uint inner_run = run_base + mode - 1u;
+                int inner_tile_count = inner_tile_counts[inner_run];
+                int inner_tile_start = inner_tile_prefix[inner_run] - inner_tile_count;
+                uint output_tile = (uint)inner_tile_start + local_entry / 32u;
+                uint output_slot = local_entry & 31u;
+                inner_right_atoms[32u * output_tile + output_slot] = right_ordered;
+            }
+            seen1 += count1;
+            seen2 += count2;
+            seen3 += count3;
+        }
     }
 """
 
@@ -4479,6 +4597,58 @@ def _interaction32_ordinary_cached_scatter_kernel():
             header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
         )
     return _interaction32_ordinary_cached_scatter_kernel_singleton
+
+
+def _interaction32_outer_inner_mode_count_kernel():
+    """Return the outer-schedule inner-membership count kernel."""
+
+    global _interaction32_outer_inner_mode_count_kernel_singleton
+    if _interaction32_outer_inner_mode_count_kernel_singleton is None:
+        _interaction32_outer_inner_mode_count_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_outer_inner_mode_count",
+            input_names=[
+                "positions",
+                "atom_order",
+                "block_traversal",
+                "outer_right_atoms",
+                "outer_tile_counts",
+                "outer_tile_prefix",
+                "box",
+                "params",
+                "counts",
+            ],
+            output_names=["mode_counts", "cached_modes"],
+            source=_INTERACTION32_OUTER_INNER_MODE_COUNT_SOURCE,
+            header=_INTERACTION32_ORDINARY_COMMON_SOURCE,
+        )
+    return _interaction32_outer_inner_mode_count_kernel_singleton
+
+
+def _interaction32_outer_inner_mode_scatter_kernel():
+    """Return the cached outer-to-inner mode scatter kernel."""
+
+    global _interaction32_outer_inner_mode_scatter_kernel_singleton
+    if _interaction32_outer_inner_mode_scatter_kernel_singleton is None:
+        _interaction32_outer_inner_mode_scatter_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_outer_inner_mode_scatter",
+            input_names=[
+                "block_traversal",
+                "outer_right_atoms",
+                "cached_modes",
+                "outer_tile_counts",
+                "outer_tile_prefix",
+                "inner_tile_counts",
+                "inner_tile_prefix",
+                "counts",
+            ],
+            output_names=[
+                "inner_left_blocks",
+                "inner_right_atoms",
+                "inner_half_modes",
+            ],
+            source=_INTERACTION32_OUTER_INNER_MODE_SCATTER_SOURCE,
+        )
+    return _interaction32_outer_inner_mode_scatter_kernel_singleton
 
 
 def _interaction32_special_block_scatter_kernel():
@@ -8407,6 +8577,134 @@ def _interaction32_ordinary_scatter_sized(
             box,
             mx.array([radius, radius * radius], dtype=mx.float32),
             mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
+        ],
+        output_shapes=[
+            (accepted_tile_count,),
+            (accepted_tile_count, 32),
+            (accepted_tile_count,),
+        ],
+        output_dtypes=[mx.int32, mx.int32, mx.int32],
+        grid=(block_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        init_value=int(atom_order.shape[0]),
+    )
+
+
+def _interaction32_outer_inner_mode_counts(
+    positions: mx.array,
+    atom_order: mx.array,
+    block_traversal: mx.array,
+    outer_right_atoms: mx.array,
+    outer_tile_counts: mx.array,
+    outer_tile_prefix: mx.array,
+    box_lengths_and_inverses: mx.array,
+    *,
+    search_radius: float,
+) -> tuple[mx.array, mx.array]:
+    """Classify outer-schedule right entries at a smaller search radius."""
+
+    positions = as_mx_array(positions, dtype=mx.float32)
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
+    outer_right_atoms = as_mx_array(outer_right_atoms, dtype=mx.int32)
+    outer_tile_counts = as_mx_array(outer_tile_counts, dtype=mx.int32)
+    outer_tile_prefix = as_mx_array(outer_tile_prefix, dtype=mx.int32)
+    box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (n_atoms, 3)")
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    block_count = int(atom_order.shape[0]) // 32
+    if block_traversal.shape != (block_count,):
+        raise ValueError("block_traversal must have shape (n_blocks,)")
+    if outer_right_atoms.ndim != 2 or outer_right_atoms.shape[1] != 32:
+        raise ValueError("outer_right_atoms must have shape (n_tiles, 32)")
+    run_shape = (3 * block_count,)
+    if outer_tile_counts.shape != run_shape or outer_tile_prefix.shape != run_shape:
+        raise ValueError("outer tile counts and prefixes must have shape (3*n_blocks,)")
+    if box.shape != (6,):
+        raise ValueError("box_lengths_and_inverses must have shape (6,)")
+    if not isfinite(float(search_radius)) or search_radius <= 0.0:
+        raise ValueError("search_radius must be finite and positive")
+    radius = float(search_radius)
+    return _interaction32_outer_inner_mode_count_kernel()(
+        inputs=[
+            positions,
+            atom_order,
+            block_traversal,
+            outer_right_atoms,
+            outer_tile_counts,
+            outer_tile_prefix,
+            box,
+            mx.array([radius * radius], dtype=mx.float32),
+            mx.array([block_count, int(atom_order.shape[0])], dtype=mx.int32),
+        ],
+        output_shapes=[run_shape, outer_right_atoms.shape],
+        output_dtypes=[mx.int32, mx.uint32],
+        grid=(block_count * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        init_value=0,
+    )
+
+
+def _interaction32_outer_inner_mode_scatter_sized(
+    atom_order: mx.array,
+    block_traversal: mx.array,
+    outer_right_atoms: mx.array,
+    cached_modes: mx.array,
+    outer_tile_counts: mx.array,
+    outer_tile_prefix: mx.array,
+    inner_tile_counts: mx.array,
+    inner_tile_prefix: mx.array,
+    *,
+    accepted_tile_count: int,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Scatter cached inner modes into one retained outer-sized capacity."""
+
+    atom_order = as_mx_array(atom_order, dtype=mx.int32)
+    block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
+    outer_right_atoms = as_mx_array(outer_right_atoms, dtype=mx.int32)
+    cached_modes = as_mx_array(cached_modes, dtype=mx.uint32)
+    outer_tile_counts = as_mx_array(outer_tile_counts, dtype=mx.int32)
+    outer_tile_prefix = as_mx_array(outer_tile_prefix, dtype=mx.int32)
+    inner_tile_counts = as_mx_array(inner_tile_counts, dtype=mx.int32)
+    inner_tile_prefix = as_mx_array(inner_tile_prefix, dtype=mx.int32)
+    if atom_order.ndim != 1 or atom_order.shape[0] % 32 != 0:
+        raise ValueError("atom_order must be a padded vector divisible by 32")
+    block_count = int(atom_order.shape[0]) // 32
+    if block_traversal.shape != (block_count,):
+        raise ValueError("block_traversal must have shape (n_blocks,)")
+    if outer_right_atoms.ndim != 2 or outer_right_atoms.shape[1] != 32:
+        raise ValueError("outer_right_atoms must have shape (n_tiles, 32)")
+    if cached_modes.shape != outer_right_atoms.shape:
+        raise ValueError("cached_modes must match outer_right_atoms")
+    run_shape = (3 * block_count,)
+    run_arrays = (
+        outer_tile_counts,
+        outer_tile_prefix,
+        inner_tile_counts,
+        inner_tile_prefix,
+    )
+    if any(array.shape != run_shape for array in run_arrays):
+        raise ValueError("outer and inner tile metadata must have shape (3*n_blocks,)")
+    if accepted_tile_count < 0:
+        raise ValueError("accepted_tile_count must be non-negative")
+    if accepted_tile_count == 0:
+        return (
+            mx.zeros((0,), dtype=mx.int32),
+            mx.zeros((0, 32), dtype=mx.int32),
+            mx.zeros((0,), dtype=mx.int32),
+        )
+    return _interaction32_outer_inner_mode_scatter_kernel()(
+        inputs=[
+            block_traversal,
+            outer_right_atoms,
+            cached_modes,
+            outer_tile_counts,
+            outer_tile_prefix,
+            inner_tile_counts,
+            inner_tile_prefix,
+            mx.array([block_count], dtype=mx.int32),
         ],
         output_shapes=[
             (accepted_tile_count,),
