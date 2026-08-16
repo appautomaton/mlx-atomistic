@@ -62,7 +62,7 @@ large enough to justify a new runtime route.
 | Change | Decision evidence | Commit |
 | --- | --- | --- |
 | Finite Hpsi shape scheduling | Reused a bounded set of GPU shapes and reduced complete Silicon SCF wall from 73.743 to 59.231 seconds. | `2a56533` |
-| Residual-aware CholeskyQR | Skips the second pass only for a validated loose-residual basis; paired complete diagnostics reduced median wall from 56.855 to 55.384 seconds. | this change |
+| Residual-aware CholeskyQR | Skips the second pass only for a validated loose-residual basis; paired complete diagnostics reduced median wall from 56.855 to 55.384 seconds. | `6e49877` |
 | Scientific EOS and band gates | Separated runtime convergence from equation-of-state (EOS) and band validation; Silicon admission was later recorded against all-electron references. | `78d4b9d`, `1972dce` |
 | Hpsi stage profiler | Separates local FFT, compact scatter/gather, kinetic, and Goedecker-Teter-Hutter (GTH) pseudopotential work using stable captured inputs. Profiles are diagnostic rather than production timings. | `9cd4ef6` |
 
@@ -80,9 +80,12 @@ inverse and forward FFTs as 95.17% of the complete local-FFT median.
 | Predictive Gram admission and ragged projected solves | Bounded timings regressed or introduced extra Hpsi work. | pre-`2a56533` scheduler experiments |
 | Multi-lane grouped CholeskyQR2 | The bounded eight-representative run regressed from 4.801 to 5.773 seconds because small grouped Gram operations were slower. | 2026-08-16 diagnostic |
 | Unconditional CholeskyQR1 | The bounded gate improved, but the complete run reached 80 cycles without meeting the final residual. | 2026-08-16 diagnostic |
+| Newton-Schulz orthogonal refinement | Cholesky normalizer calls fell from 703 to 525, but bounded median wall regressed from 5.816 to 5.868 seconds. | 2026-08-16 diagnostic |
 | Smaller Davidson subspace, RMM-DIIS, and converged-subspace locking | Iteration counts or complete bounded wall increased. | pre-`2a56533` scheduler experiments |
 | One-dimensional compact Hpsi Metal boundary | Fixed-density wall improved 14.49%, narrowly below the frozen 14.72% dispersion gate. The candidate was removed. | `831e077` |
 | Three-dimensional scatter/gather Metal boundary | The isolated Hpsi boundary improved 17.33%, but complete fixed-density wall improved only 6.40%, below the same retention gate. The candidate was removed. | `9cd4ef6` |
+| Flattened leading FFT dimensions | The dominant 8-lane, 16-vector local FFT regressed from 27.57 to 33.23 milliseconds. | 2026-08-16 diagnostic |
+| Compiled local FFT wrapper | A compiled graph reduced time per Hpsi, but changed complex64 rounding and increased complete-run Hpsi calls from 1,388 to 1,449; wall regressed from 72.408 to 75.046 seconds. | 2026-08-16 diagnostic |
 
 The custom-kernel results establish a useful boundary: Metal can accelerate
 scatter and gather locally, but that boundary is too diluted in the complete
@@ -90,12 +93,13 @@ calculation to maintain a separate production route.
 
 ## Current Direction
 
-Hpsi still consumes about half of the complete wall, and isolated profiles
-attribute most of Hpsi to the local FFT pair. The next candidate should measure
-the inverse and forward transforms separately under current production shapes,
-then reduce useful FFT work or submissions without multiplying compiled shapes.
-Another C++ extension or narrow scatter/gather kernel is not justified by the
-retained evidence.
+Hpsi still consumes about half of the complete wall, and the 8-lane, 16-vector
+shape accounts for 947 of 1,388 complete-run calls. Its local path is almost
+entirely the MLX FFT pair. Reshaping or wrapping the same transforms did not
+improve the complete calculation. A future high-ceiling candidate must reduce
+algorithmic FFT applications or useful vector equivalents while preserving the
+convergence trajectory. Another C++ extension or narrow scatter/gather kernel
+is not justified by the retained evidence.
 
 Retrieve the retired detailed reports when auditing a historical result:
 
