@@ -30,7 +30,7 @@ from mlx_atomistic.dft._compact import (
     _CompactLaneState,
     _remap_initial_coefficients,
 )
-from mlx_atomistic.dft._periodic_scf_engine import _density_from_kpoints
+from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import KPoint, KPointMesh
 from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
@@ -616,9 +616,7 @@ def test_scf_projector_cache_closes_when_runtime_context_raises(monkeypatch):
     import importlib
 
     periodic_scf = importlib.import_module("mlx_atomistic.dft.periodic_scf")
-    periodic_scf_engine = importlib.import_module(
-        "mlx_atomistic.dft._periodic_scf_engine"
-    )
+    periodic_scf_engine = importlib.import_module("mlx_atomistic.dft._periodic_scf_engine")
     captured: dict[str, _GTHProjectorCache] = {}
 
     def fail_with_cache(*args, projector_cache, **kwargs):

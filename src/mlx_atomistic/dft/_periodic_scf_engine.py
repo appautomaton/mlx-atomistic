@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from time import perf_counter
@@ -10,8 +9,8 @@ from time import perf_counter
 import mlx.core as mx
 import numpy as np
 
+import mlx_atomistic.dft._periodic_resume as _periodic_resume
 from mlx_atomistic.dft._compact import (
-    _DEFAULT_COMPACT_BATCH_POLICY,
     _CompactBatch,
     _CompactBatchPolicy,
     _CompactLaneState,
@@ -25,9 +24,8 @@ from mlx_atomistic.dft._periodic_davidson import (
     _DavidsonLaneRequest,
     _DavidsonScheduler,
     _initial_trial,
-    _plan_compact_submissions,
-    _stable_compact_capacity_groups,
 )
+from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._periodic_execution import _detached_failure
 from mlx_atomistic.dft._periodic_hamiltonian import PeriodicKohnShamOperator
 from mlx_atomistic.dft._periodic_models import (
@@ -116,125 +114,6 @@ def _scf_eigensolver_tolerance(
             electron_count,
         )
     return tolerance
-
-
-def _density_from_kpoints(
-    results: Sequence[PeriodicKPointResult],
-    *,
-    occupation: float,
-    policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
-    observer: RuntimeObserver | None = None,
-) -> mx.array:
-    if not results:
-        msg = "density construction requires at least one k-point result"
-        raise ValueError(msg)
-    grid_shape = results[0].basis.grid.shape
-    states: list[_CompactLaneState] = []
-    for result in results:
-        if result.basis.grid.shape != grid_shape:
-            msg = "density k-point results must share one real-space grid"
-            raise ValueError(msg)
-        compact = result.eigen._compact_coefficients
-        if not isinstance(compact, _CompactLaneState):
-            msg = "density construction requires owned compact k-point states"
-            raise ValueError(msg)
-        states.append(compact)
-
-    def estimate_density_batch(
-        _indices: tuple[int, ...],
-        batch: _CompactBatch,
-    ) -> int:
-        return (
-            batch.estimated_transient_bytes
-            + batch.lane_capacity * batch.grid_size * 4
-            + batch.grid_size * 4
-        )
-
-    density = mx.zeros(grid_shape, dtype=mx.float32)
-    compatible: dict[tuple[object, ...], list[int]] = defaultdict(list)
-    for index, state in enumerate(states):
-        compatible[(id(state.layout.reciprocal), state.layout.grid_shape)].append(index)
-    for compatible_indices in compatible.values():
-        vector_capacity = max(states[index].vector_count for index in compatible_indices)
-        capacity_groups = _stable_compact_capacity_groups(
-            states,
-            compatible_indices,
-            lane_capacity=policy.batch_cap,
-            vector_capacity=vector_capacity,
-            max_padding_fraction=policy.max_padding_fraction,
-        )
-        for capacity_indices, capacity in capacity_groups:
-            capacity_states = [states[index] for index in capacity_indices]
-            plan = _plan_compact_submissions(
-                capacity_states,
-                policy=policy,
-                batch_byte_estimator=estimate_density_batch,
-                capacity=capacity,
-            )
-            if plan.failures:
-                failed_index = min(plan.failures)
-                raise _detached_failure(plan.failures[failed_index]) from None
-            for submission in plan.submissions:
-                logical_indices = tuple(capacity_indices[index] for index in submission.indices)
-                batch = _CompactBatch.from_states(
-                    [states[index] for index in logical_indices],
-                    policy=policy,
-                    lane_capacity=capacity.lanes,
-                    vector_capacity=capacity.vectors,
-                    active_capacity=capacity.active,
-                )
-                estimated_transient_bytes = estimate_density_batch(
-                    logical_indices,
-                    batch,
-                )
-                if estimated_transient_bytes > policy.max_transient_bytes:
-                    msg = "density batch exceeds the complete transient byte budget"
-                    raise ValueError(msg)
-                orbitals = batch.to_real()
-                weights = mx.array(
-                    np.asarray(
-                        [
-                            results[index].integration_weight * occupation
-                            for index in logical_indices
-                        ],
-                        dtype=np.float32,
-                    )
-                )
-                if batch.lane_capacity > batch.lane_count:
-                    weights = mx.concatenate(
-                        [
-                            weights,
-                            mx.zeros(
-                                (batch.lane_capacity - batch.lane_count,),
-                                dtype=mx.float32,
-                            ),
-                        ]
-                    )
-                weighted_density = weights[:, None, None, None] * mx.sum(
-                    mx.abs(orbitals) ** 2,
-                    axis=1,
-                )
-                density = density + mx.sum(weighted_density, axis=0)
-                mx.eval(density)
-                add_observed_work(
-                    observer,
-                    {
-                        "fft_submissions": 1,
-                        "fft_vector_equivalents": batch.logical_vector_count,
-                        "padding_elements": batch.padding_elements,
-                    },
-                )
-                if observer is not None:
-                    observer.record_peak_memory(
-                        "fft_workspace_bytes",
-                        batch.lane_capacity * batch.vector_count * batch.grid_size * 8,
-                    )
-                    observer.record_peak_memory(
-                        "peak_temporary_bytes",
-                        estimated_transient_bytes,
-                    )
-
-    return mx.real(density)
 
 
 def _density_residual(current: mx.array, target: mx.array, grid: RealSpaceGrid) -> float:
@@ -404,214 +283,6 @@ def _publish_explicit_kpoints(
     return tuple(explicit)
 
 
-def _owned_device_copy(values: mx.array, *, dtype: mx.Dtype) -> mx.array:
-    source = mx.array(values).astype(dtype)
-    copied = (source + mx.zeros_like(source)).astype(dtype)
-    mx.eval(copied)
-    return copied
-
-
-def _continuation_state_from_boundary(
-    *,
-    completed_iteration: int,
-    density: mx.array,
-    owned_results: Sequence[PeriodicKPointResult],
-    previous_energy: float,
-    energy_by_term: dict[str, float],
-    history: Sequence[dict[str, float | int | str | None]],
-    mixer: LinearMixer | PulayDIISMixer,
-    ownership: TimeReversalOwnership,
-    lineage: tuple[str, ...],
-) -> _PeriodicSCFContinuationState:
-    owned_coefficients: list[tuple[int, mx.array]] = []
-    owned_lanes: list[dict[str, object]] = []
-    for result in owned_results:
-        if result.explicit_index is None:
-            msg = "checkpoint state requires explicit owner indices"
-            raise RuntimeError(msg)
-        compact = result.eigen._compact_coefficients
-        if not isinstance(compact, _CompactLaneState):
-            msg = "checkpoint state requires compact owner coefficients"
-            raise RuntimeError(msg)
-        owned_coefficients.append(
-            (
-                result.explicit_index,
-                _owned_device_copy(compact.values, dtype=mx.complex64),
-            )
-        )
-        owned_lanes.append(
-            {
-                "owner_index": result.explicit_index,
-                "reduced_kpoint": list(result.reduced_kpoint),
-                "active_count": result.basis.active_count,
-                "basis_fingerprint": result.basis.basis_fingerprint,
-                "basis_order_fingerprint": result.basis.order_fingerprint,
-                "lane_id": result.basis.lane_id,
-            }
-        )
-    return _PeriodicSCFContinuationState(
-        completed_iteration=completed_iteration,
-        density=_owned_device_copy(density, dtype=mx.float32),
-        owned_coefficients=tuple(owned_coefficients),
-        owned_lanes=tuple(owned_lanes),
-        previous_energy=float(previous_energy),
-        energy_by_term=dict(energy_by_term),
-        history=tuple(dict(row) for row in history),
-        mixer_state=mixer._checkpoint_state(),
-        ownership=ownership.to_dict(),
-        lineage=lineage,
-    )
-
-
-def _resume_ownership(
-    rebuilt: TimeReversalOwnership,
-    stored: dict[str, object],
-) -> TimeReversalOwnership:
-    if rebuilt.to_dict() == stored:
-        return rebuilt
-    stored_entries = stored.get("entries")
-    if not isinstance(stored_entries, list) or len(stored_entries) != len(rebuilt.entries):
-        msg = "periodic resume ownership payload is malformed"
-        raise ValueError(msg)
-    candidate = rebuilt
-    for index, rebuilt_entry in enumerate(rebuilt.entries):
-        stored_entry = stored_entries[index]
-        if not isinstance(stored_entry, dict):
-            msg = "periodic resume ownership entry is malformed"
-            raise ValueError(msg)
-        if (
-            rebuilt_entry.role in {"owner", "partner"}
-            and stored_entry.get("role") == "independent"
-            and stored_entry.get("fallback_reason") == "initial_coefficients_time_reversal_mismatch"
-        ):
-            candidate = _independent_pair(
-                candidate,
-                index,
-                "initial_coefficients_time_reversal_mismatch",
-            )
-    if candidate.to_dict() != stored:
-        msg = "periodic resume ownership is not a valid stored fallback refinement"
-        raise ValueError(msg)
-    return candidate
-
-
-def _restore_continuation_state(
-    state: _PeriodicSCFContinuationState,
-    *,
-    bases: Sequence[PlaneWaveBasis],
-    ownership: TimeReversalOwnership,
-    occupied_bands: int,
-    grid: RealSpaceGrid,
-    electron_count: float,
-    mixer: LinearMixer | PulayDIISMixer,
-) -> tuple[
-    mx.array,
-    dict[int, _CompactLaneState],
-    float,
-    list[dict[str, float | int | str | None]],
-    dict[str, float],
-]:
-    if state.completed_iteration <= 0:
-        msg = "periodic resume iteration must be positive"
-        raise ValueError(msg)
-    if state.ownership != ownership.to_dict():
-        msg = "periodic resume ownership does not match the rebuilt topology"
-        raise ValueError(msg)
-    if len(state.history) != state.completed_iteration or any(
-        row.get("iteration") != index for index, row in enumerate(state.history, start=1)
-    ):
-        msg = "periodic resume history does not match its iteration cursor"
-        raise ValueError(msg)
-    if not np.isfinite(state.previous_energy):
-        msg = "periodic resume energy must be finite"
-        raise ValueError(msg)
-    if (
-        not state.history
-        or not np.isclose(
-            float(state.history[-1]["total_energy_hartree"]),
-            state.previous_energy,
-            rtol=0.0,
-            atol=1e-12,
-        )
-        or not np.isclose(
-            float(state.energy_by_term.get("total", float("nan"))),
-            state.previous_energy,
-            rtol=0.0,
-            atol=1e-12,
-        )
-    ):
-        msg = "periodic resume energy state is internally inconsistent"
-        raise ValueError(msg)
-
-    density = mx.array(state.density)
-    if density.shape != grid.shape or density.dtype != mx.float32:
-        msg = "periodic resume density has incompatible shape or dtype"
-        raise ValueError(msg)
-    density_finite = mx.all(mx.isfinite(density))
-    density_minimum = mx.min(density)
-    density_count = mx.sum(density) * grid.dv
-    mx.eval(density, density_finite, density_minimum, density_count)
-    if (
-        not bool(density_finite)
-        or float(density_minimum) < -1e-7
-        or abs(float(density_count) - electron_count) > 1e-4
-    ):
-        msg = "periodic resume density is non-finite, negative, or misnormalized"
-        raise ValueError(msg)
-    density = _owned_device_copy(density, dtype=mx.float32)
-
-    coefficient_map = state.coefficient_map
-    if len(coefficient_map) != len(state.owned_coefficients) or set(coefficient_map) != set(
-        ownership.owned_indices
-    ):
-        msg = "periodic resume owner coefficient inventory is inconsistent"
-        raise ValueError(msg)
-    lane_map = {
-        int(lane["owner_index"]): lane
-        for lane in state.owned_lanes
-        if isinstance(lane, dict) and "owner_index" in lane
-    }
-    if len(lane_map) != len(state.owned_lanes) or set(lane_map) != set(ownership.owned_indices):
-        msg = "periodic resume owner lane inventory is inconsistent"
-        raise ValueError(msg)
-    previous_states: dict[int, _CompactLaneState] = {}
-    finite_checks: list[mx.array] = []
-    for owner_index in ownership.owned_indices:
-        basis = bases[owner_index]
-        lane = lane_map[owner_index]
-        expected_lane = {
-            "owner_index": owner_index,
-            "reduced_kpoint": list(ownership.entry_for(owner_index).reduced_kpoint),
-            "active_count": basis.active_count,
-            "basis_fingerprint": basis.basis_fingerprint,
-            "basis_order_fingerprint": basis.order_fingerprint,
-            "lane_id": basis.lane_id,
-        }
-        if lane != expected_lane:
-            msg = "periodic resume owner lane identity does not match rebuilt bases"
-            raise ValueError(msg)
-        values = mx.array(coefficient_map[owner_index])
-        if values.dtype != mx.complex64 or values.shape != (occupied_bands, basis.active_count):
-            msg = "periodic resume owner coefficients have incompatible shape or dtype"
-            raise ValueError(msg)
-        copied = _owned_device_copy(values, dtype=mx.complex64)
-        finite_checks.append(mx.all(mx.isfinite(copied)))
-        previous_states[owner_index] = basis._state_from_compact(copied)
-    mx.eval(*finite_checks)
-    if not all(bool(finite) for finite in finite_checks):
-        msg = "periodic resume owner coefficients must be finite"
-        raise ValueError(msg)
-
-    mixer._restore_checkpoint_state(state.mixer_state, expected_shape=grid.shape)
-    return (
-        density,
-        previous_states,
-        float(state.previous_energy),
-        [dict(row) for row in state.history],
-        dict(state.energy_by_term),
-    )
-
-
 @dataclass(frozen=True)
 class _PeriodicSCFSetup:
     """Immutable system and execution resources shared by every iteration."""
@@ -712,11 +383,7 @@ class _PeriodicSCFController:
         scf_config = PeriodicSCFConfig() if config is None else config
         compact_policy = scf_config._compact_batch_policy()
         xc = ProductionPBEExchangeCorrelation() if xc_functional is None else xc_functional
-        occupied_bands = (
-            int(round(system.electron_count / 2.0))
-            if n_bands is None
-            else n_bands
-        )
+        occupied_bands = int(round(system.electron_count / 2.0)) if n_bands is None else n_bands
         cls._validate_request(
             system,
             kpoint_mesh=kpoint_mesh,
@@ -755,7 +422,10 @@ class _PeriodicSCFController:
                     n_bands=occupied_bands,
                 )
             else:
-                ownership = _resume_ownership(ownership, resume_state.ownership)
+                ownership = _periodic_resume._resume_ownership(
+                    ownership,
+                    resume_state.ownership,
+                )
             owned_indices = ownership.owned_indices
             gamma_basis = PlaneWaveBasis(
                 system.grid,
@@ -796,7 +466,7 @@ class _PeriodicSCFController:
                     restored_energy,
                     history,
                     energy_terms,
-                ) = _restore_continuation_state(
+                ) = _periodic_resume._restore_continuation_state(
                     resume_state,
                     bases=bases,
                     ownership=ownership,
@@ -864,20 +534,14 @@ class _PeriodicSCFController:
         resume_state: _PeriodicSCFContinuationState | None,
         config: PeriodicSCFConfig,
     ) -> None:
-        if occupied_bands <= 0 or abs(
-            2.0 * occupied_bands - system.electron_count
-        ) > 1e-8:
-            msg = (
-                "the bounded spin-unpolarized path requires two electrons "
-                "per occupied band"
-            )
+        if occupied_bands <= 0 or abs(2.0 * occupied_bands - system.electron_count) > 1e-8:
+            msg = "the bounded spin-unpolarized path requires two electrons per occupied band"
             raise ValueError(msg)
         if any(point.coordinate_system != "reduced" for point in kpoint_mesh.points):
             msg = "periodic SCF requires reduced-coordinate k-points"
             raise ValueError(msg)
-        if (
-            initial_coefficients is not None
-            and len(initial_coefficients) != len(kpoint_mesh.points)
+        if initial_coefficients is not None and len(initial_coefficients) != len(
+            kpoint_mesh.points
         ):
             msg = "initial_coefficients length must match the k-point mesh"
             raise ValueError(msg)
@@ -886,10 +550,7 @@ class _PeriodicSCFController:
         ):
             msg = "periodic resume state is mutually exclusive with public initial guesses"
             raise ValueError(msg)
-        if (
-            resume_state is not None
-            and resume_state.completed_iteration >= config.max_iterations
-        ):
+        if resume_state is not None and resume_state.completed_iteration >= config.max_iterations:
             msg = "periodic resume state has no remaining SCF iteration"
             raise ValueError(msg)
 
@@ -928,9 +589,7 @@ class _PeriodicSCFController:
             status="completed",
             active_counts=[basis.active_count for basis in setup.bases],
             owned_indices=list(setup.owned_indices),
-            owned_active_counts=[
-                setup.bases[index].active_count for index in setup.owned_indices
-            ],
+            owned_active_counts=[setup.bases[index].active_count for index in setup.owned_indices],
             representative_count=len(setup.ownership.representative_indices),
             fallback_reasons=setup.ownership.fallback_reasons,
             batch_policy=setup.config.batch_policy(),
@@ -982,9 +641,7 @@ class _PeriodicSCFController:
                 observer=self.setup.observer,
             )
             target_count = float(mx.sum(target_density) * self.setup.system.grid.dv)
-            target_density = target_density * (
-                self.setup.system.electron_count / target_count
-            )
+            target_density = target_density * (self.setup.system.electron_count / target_count)
             density_residual = _density_residual(
                 self.progress.density,
                 target_density,
@@ -999,15 +656,10 @@ class _PeriodicSCFController:
         )
         xc_energy = float(xc_result.total_energy)
         density_xc = float(
-            mx.sum(self.progress.density * xc_result.potential)
-            * self.setup.system.grid.dv
+            mx.sum(self.progress.density * xc_result.potential) * self.setup.system.grid.dv
         )
         total_energy = (
-            band_energy
-            - hartree_energy
-            + xc_energy
-            - density_xc
-            + self.setup.ewald_energy
+            band_energy - hartree_energy + xc_energy - density_xc + self.setup.ewald_energy
         )
         energy_delta = (
             None
@@ -1030,9 +682,7 @@ class _PeriodicSCFController:
             max_orbital_residual=max_orbital_residual,
             energy_delta=energy_delta,
             energy_terms=energy_terms,
-            all_eigen_converged=all(
-                result.eigen.converged for result in owned_results
-            ),
+            all_eigen_converged=all(result.eigen.converged for result in owned_results),
         )
 
     def _effective_potential(self) -> tuple[mx.array, XCResult, mx.array]:
@@ -1045,9 +695,7 @@ class _PeriodicSCFController:
             self.setup.system.grid,
         )
         self.progress.timings["xc"] += (perf_counter() - start) * 1000.0
-        effective_snapshot = mx.array(
-            self.setup.local_potential + hartree + xc_result.potential
-        )
+        effective_snapshot = mx.array(self.setup.local_potential + hartree + xc_result.potential)
         xc_finite = (
             mx.all(mx.isfinite(xc_result.energy_density))
             & mx.all(mx.isfinite(xc_result.potential))
@@ -1177,14 +825,10 @@ class _PeriodicSCFController:
             observer = self.setup.observer
             if observer is None or not observer.detail_events:
                 return
-            explicit_indices = [
-                lane_to_index[ticket.lane_id] for ticket in tickets
-            ]
-            complete_transient_bytes = (
-                PeriodicKohnShamOperator._estimated_batch_transient_bytes(
-                    [ticket.operator for ticket in tickets],
-                    batch,
-                )
+            explicit_indices = [lane_to_index[ticket.lane_id] for ticket in tickets]
+            complete_transient_bytes = PeriodicKohnShamOperator._estimated_batch_transient_bytes(
+                [ticket.operator for ticket in tickets],
+                batch,
             )
             fields: dict[str, object] = {
                 "status": status,
@@ -1194,8 +838,7 @@ class _PeriodicSCFController:
                 "lane_capacity": batch.lane_capacity,
                 "lane_ids": [ticket.lane_id for ticket in tickets],
                 "reduced_kpoints": [
-                    list(self.setup.kpoint_mesh.points[index].vector)
-                    for index in explicit_indices
+                    list(self.setup.kpoint_mesh.points[index].vector) for index in explicit_indices
                 ],
                 "explicit_indices": explicit_indices,
                 "active_counts": list(batch.active_counts),
@@ -1211,9 +854,7 @@ class _PeriodicSCFController:
                 "synchronized": observer.synchronize is not None,
             }
             if failures:
-                fields["failed_explicit_indices"] = [
-                    lane_to_index[lane_id] for lane_id in failures
-                ]
+                fields["failed_explicit_indices"] = [lane_to_index[lane_id] for lane_id in failures]
                 fields["failure_messages"] = {
                     lane_id: str(error) for lane_id, error in failures.items()
                 }
@@ -1234,12 +875,8 @@ class _PeriodicSCFController:
                 "failure",
                 stage="eigensolver",
                 scf_iteration=iteration,
-                failed_explicit_indices=[
-                    lane_to_index[lane_id] for lane_id in failures
-                ],
-                failure_messages={
-                    lane_id: str(error) for lane_id, error in failures.items()
-                },
+                failed_explicit_indices=[lane_to_index[lane_id] for lane_id in failures],
+                failure_messages={lane_id: str(error) for lane_id, error in failures.items()},
             )
         first_failed_lane = next(
             request.lane_id for request in requests if request.lane_id in failures
@@ -1265,9 +902,7 @@ class _PeriodicSCFController:
                 "max_orbital_residual": outcome.max_orbital_residual,
                 "eigensolver_tolerance": self.progress.eigensolver_tolerance,
                 "eigensolver_method": "davidson",
-                "all_kpoints_converged": str(
-                    outcome.all_eigen_converged
-                ).lower(),
+                "all_kpoints_converged": str(outcome.all_eigen_converged).lower(),
             }
         )
         observer = self.setup.observer
@@ -1348,13 +983,9 @@ class _PeriodicSCFController:
             ):
                 msg = "SCF mixer produced a non-finite, negative, or empty density"
                 raise ValueError(msg)
-            normalized_density = mixed * (
-                self.setup.system.electron_count / mixed_count
-            )
+            normalized_density = mixed * (self.setup.system.electron_count / mixed_count)
             normalized_finite = mx.all(mx.isfinite(normalized_density))
-            normalized_count_array = (
-                mx.sum(normalized_density) * self.setup.system.grid.dv
-            )
+            normalized_count_array = mx.sum(normalized_density) * self.setup.system.grid.dv
             mx.eval(
                 normalized_density,
                 normalized_finite,
@@ -1378,8 +1009,7 @@ class _PeriodicSCFController:
 
     def _checkpoint(self, iteration: int) -> bool:
         if self.checkpoint_callback is None or (
-            self.checkpoint_iteration is not None
-            and self.checkpoint_iteration != iteration
+            self.checkpoint_iteration is not None and self.checkpoint_iteration != iteration
         ):
             return False
         observer = self.setup.observer
@@ -1392,7 +1022,7 @@ class _PeriodicSCFController:
             )
         try:
             with observed_phase(observer, "persistence"):
-                checkpoint_state = _continuation_state_from_boundary(
+                checkpoint_state = _periodic_resume._continuation_state_from_boundary(
                     completed_iteration=iteration,
                     density=self.progress.density,
                     owned_results=self.progress.final_owned_results,
@@ -1404,9 +1034,7 @@ class _PeriodicSCFController:
                     lineage=self.progress.lineage,
                 )
                 self.progress.final_checkpoint_state = checkpoint_state
-                stop_after_checkpoint = bool(
-                    self.checkpoint_callback(checkpoint_state)
-                )
+                stop_after_checkpoint = bool(self.checkpoint_callback(checkpoint_state))
         except Exception as error:
             if observer is not None:
                 observer.emit(
@@ -1438,9 +1066,7 @@ class _PeriodicSCFController:
             final_owned_by_index,
             self.setup.observer,
         )
-        electron_count = float(
-            mx.sum(self.progress.density) * self.setup.system.grid.dv
-        )
+        electron_count = float(mx.sum(self.progress.density) * self.setup.system.grid.dv)
         self._emit_completion(iteration)
         result_status = self._result_status()
         timing_admission_status = (
@@ -1472,9 +1098,7 @@ class _PeriodicSCFController:
             system_fingerprint=self.setup.system.fingerprint,
             _owned_kpoints=self.progress.final_owned_results,
             _checkpoint_state=(
-                None
-                if self.progress.converged
-                else self.progress.final_checkpoint_state
+                None if self.progress.converged else self.progress.final_checkpoint_state
             ),
         )
 
@@ -1490,9 +1114,7 @@ class _PeriodicSCFController:
         observer.record_memory("persistent_coefficient_bytes", coefficient_bytes)
         observer.record_memory("coefficient_payload_bytes", coefficient_bytes)
         observation = observer.snapshot()
-        traffic_elements = int(
-            observation["work_counters"]["projector_traffic_elements"]
-        )
+        traffic_elements = int(observation["work_counters"]["projector_traffic_elements"])
         observer.record_memory("projector_traffic_bytes", traffic_elements * 8)
         observer.emit(
             "completion",
@@ -1508,9 +1130,6 @@ class _PeriodicSCFController:
         if self.progress.stopped_for_checkpoint:
             return "checkpointed"
         return "max_iterations"
-
-
-
 
 
 def _run_periodic_scf_with_projector_cache(

@@ -136,9 +136,7 @@ def _execution_context(
             "davidson": calculation["config"]["davidson"],
             "scf": {
                 "density_tolerance": calculation["config"]["density_tolerance"],
-                "energy_tolerance_hartree": calculation["config"][
-                    "energy_tolerance_hartree"
-                ],
+                "energy_tolerance_hartree": calculation["config"]["energy_tolerance_hartree"],
                 "max_iterations": calculation["config"]["max_iterations"],
                 "min_iterations": calculation["config"]["min_iterations"],
                 "mixer": calculation["config"]["mixer"],
@@ -150,9 +148,7 @@ def _execution_context(
                 "initial_eigensolver_tolerance": calculation["config"][
                     "initial_eigensolver_tolerance"
                 ],
-                "eigensolver_tolerance_scale": calculation["config"][
-                    "eigensolver_tolerance_scale"
-                ],
+                "eigensolver_tolerance_scale": calculation["config"]["eigensolver_tolerance_scale"],
             },
         },
         "initialization": periodic_scf_initialization_identity(
@@ -368,9 +364,7 @@ def test_shared_envelope_and_shared_publisher_checkpoint_serialization(tmp_path)
     }
     assert len(metadata["owned_lanes"]) == 1
     assert metadata["ownership"]["explicit_count"] == 2
-    coefficient_files = [
-        path.name for path in checkpoint.joinpath("owned").glob("*.npy")
-    ]
+    coefficient_files = [path.name for path in checkpoint.joinpath("owned").glob("*.npy")]
     assert coefficient_files == ["0000-coefficients.npy"]
     assert not any("partner" in record["path"] for record in manifest["files"])
     assert len(metadata["history"]) == 2
@@ -808,10 +802,7 @@ def test_path_independent_identity_excludes_output_resume_locator_and_git_state(
     first_metadata = json.loads((first / PERIODIC_SCF_CHECKPOINT_PAYLOAD).read_bytes())
     second_metadata = json.loads((second / PERIODIC_SCF_CHECKPOINT_PAYLOAD).read_bytes())
     assert first_manifest["identity"] == second_manifest["identity"]
-    assert (
-        first_metadata["calculation_fingerprint"]
-        == second_metadata["calculation_fingerprint"]
-    )
+    assert first_metadata["calculation_fingerprint"] == second_metadata["calculation_fingerprint"]
     semantic_bytes = canonical_json_bytes(
         {
             "identity": first_manifest["identity"],
@@ -827,9 +818,7 @@ def test_path_independent_execution_identity_revalidates_nested_mutation(tmp_pat
     identity = PeriodicSCFExecutionIdentity.from_context(context)
     original_fingerprint = identity.execution_contract_fingerprint
     context["execution_contract"]["environment"]["precision"] = "mutated-caller"
-    assert identity.execution_contract["environment"]["precision"] == (
-        "complex64/float32"
-    )
+    assert identity.execution_contract["environment"]["precision"] == ("complex64/float32")
     identity.execution_contract["environment"]["precision"] = "mutated-instance"
     with pytest.raises(ValueError, match="fingerprint"):
         run_periodic_scf_checkpointed(
@@ -890,7 +879,7 @@ def test_implicit_resume_is_never_attempted_and_invalid_explicit_has_no_fallback
 def test_implicit_resume_and_serialization_do_not_touch_ordinary_runtime(
     monkeypatch,
 ):
-    import mlx_atomistic.dft._periodic_scf_engine as periodic_scf_engine
+    import mlx_atomistic.dft._periodic_resume as periodic_resume
 
     system, mesh, config = _problem(mixer="linear")
     short_config = replace(config, max_iterations=1, min_iterations=1)
@@ -900,7 +889,7 @@ def test_implicit_resume_and_serialization_do_not_touch_ordinary_runtime(
         raise AssertionError("ordinary SCF materialized checkpoint state")
 
     monkeypatch.setattr(
-        periodic_scf_engine,
+        periodic_resume,
         "_continuation_state_from_boundary",
         forbidden_capture,
     )
@@ -928,7 +917,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
     tmp_path,
     monkeypatch,
 ):
-    import mlx_atomistic.dft._periodic_scf_engine as periodic_scf_engine
+    import mlx_atomistic.dft._periodic_resume as periodic_resume
 
     system, mesh, config = _problem(mixer="linear")
     context = _execution_context(system, mesh, config)
@@ -937,7 +926,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
         synchronize=mx.synchronize,
         callback=delivered_events.append,
     )
-    original = periodic_scf_engine._continuation_state_from_boundary
+    original = periodic_resume._continuation_state_from_boundary
     saw_started_event = []
 
     def observed_materialization(*args, **kwargs):
@@ -950,7 +939,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        periodic_scf_engine,
+        periodic_resume,
         "_continuation_state_from_boundary",
         observed_materialization,
     )
@@ -968,9 +957,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
     snapshot = observer.snapshot()
     assert saw_started_event == [True]
     assert snapshot["phase_seconds"]["persistence"] > 0.0
-    persistence_events = [
-        event for event in snapshot["events"] if event["event"] == "persistence"
-    ]
+    persistence_events = [event for event in snapshot["events"] if event["event"] == "persistence"]
     assert [event["status"] for event in persistence_events] == [
         "started",
         "completed",

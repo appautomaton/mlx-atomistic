@@ -33,8 +33,8 @@ from mlx_atomistic.dft._periodic_davidson import (
     _plan_compact_submissions,
     _stable_compact_capacity_groups,
 )
+from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._periodic_scf_engine import (
-    _density_from_kpoints,
     _next_scf_eigensolver_tolerance,
     _scf_eigensolver_tolerance,
 )
@@ -249,9 +249,7 @@ def test_adaptive_scf_records_the_tolerance_and_keeps_the_strict_final_gate():
         config.orbital_tolerance
     )
     iteration_events = [
-        event
-        for event in observer.snapshot()["events"]
-        if event["event"] == "scf_iteration"
+        event for event in observer.snapshot()["events"] if event["event"] == "scf_iteration"
     ]
     assert [event["eigensolver_tolerance"] for event in iteration_events[::2]] == tolerances
     assert [event["eigensolver_tolerance"] for event in iteration_events[1::2]] == tolerances
