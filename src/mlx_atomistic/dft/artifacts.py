@@ -75,9 +75,7 @@ def _validate_complete_execution_contract(contract: Mapping[str, object]) -> Non
     if any(not isinstance(contract.get(field_name), Mapping) for field_name in mapping_fields):
         msg = "periodic checkpoint execution contract is missing a required object"
         raise ValueError(msg)
-    if not isinstance(contract.get("synchronization"), str) or not contract.get(
-        "synchronization"
-    ):
+    if not isinstance(contract.get("synchronization"), str) or not contract.get("synchronization"):
         msg = "periodic checkpoint execution synchronization identity is missing"
         raise ValueError(msg)
 
@@ -152,9 +150,7 @@ class PeriodicSCFExecutionIdentity:
     execution_contract: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        values = {
-            field_name: getattr(self, field_name) for field_name in _SHA256_FIELDS
-        }
+        values = {field_name: getattr(self, field_name) for field_name in _SHA256_FIELDS}
         if not all(_is_sha256(value) for value in values.values()):
             msg = "periodic checkpoint identity fields must be lowercase SHA-256 values"
             raise ValueError(msg)
@@ -203,9 +199,7 @@ class PeriodicSCFExecutionIdentity:
             workload_fingerprint=str(contract.get("workload_fingerprint", "")),
             protocol_fingerprint=str(context.get("protocol_fingerprint", "")),
             runtime_fingerprint=str(context.get("runtime_fingerprint", "")),
-            execution_contract_fingerprint=str(
-                context.get("execution_contract_fingerprint", "")
-            ),
+            execution_contract_fingerprint=str(context.get("execution_contract_fingerprint", "")),
             execution_contract=dict(contract),
         )
 
@@ -307,23 +301,15 @@ def _solver_identity(config_payload: Mapping[str, object]) -> dict[str, object]:
         "davidson": dict(config_payload["davidson"]),
         "scf": {
             "density_tolerance": config_payload["density_tolerance"],
-            "energy_tolerance_hartree": config_payload[
-                "energy_tolerance_hartree"
-            ],
+            "energy_tolerance_hartree": config_payload["energy_tolerance_hartree"],
             "max_iterations": config_payload["max_iterations"],
             "min_iterations": config_payload["min_iterations"],
             "mixer": config_payload["mixer"],
             "mixing_beta": config_payload["mixing_beta"],
             "orbital_tolerance": config_payload["orbital_tolerance"],
-            "adaptive_eigensolver_tolerance": config_payload[
-                "adaptive_eigensolver_tolerance"
-            ],
-            "initial_eigensolver_tolerance": config_payload[
-                "initial_eigensolver_tolerance"
-            ],
-            "eigensolver_tolerance_scale": config_payload[
-                "eigensolver_tolerance_scale"
-            ],
+            "adaptive_eigensolver_tolerance": config_payload["adaptive_eigensolver_tolerance"],
+            "initial_eigensolver_tolerance": config_payload["initial_eigensolver_tolerance"],
+            "eigensolver_tolerance_scale": config_payload["eigensolver_tolerance_scale"],
         },
     }
 
@@ -334,11 +320,7 @@ def _array_input_identity(values: object) -> dict[str, object]:
     except (TypeError, ValueError) as error:
         msg = "periodic checkpoint initial state must contain concrete arrays"
         raise ValueError(msg) from error
-    if (
-        array.dtype.hasobject
-        or array.dtype.kind not in "biufc"
-        or not np.all(np.isfinite(array))
-    ):
+    if array.dtype.hasobject or array.dtype.kind not in "biufc" or not np.all(np.isfinite(array)):
         msg = "periodic checkpoint initial arrays must be finite numeric values"
         raise ValueError(msg)
     header = {
@@ -375,9 +357,7 @@ def periodic_scf_initialization_identity(
     if initial_coefficients is not None:
         coefficient_identity = {
             "kind": "caller-supplied-explicit-kpoint-coefficients",
-            "lanes": [
-                _array_input_identity(values) for values in initial_coefficients
-            ],
+            "lanes": [_array_input_identity(values) for values in initial_coefficients],
         }
     return {
         "density": density_identity,
@@ -534,9 +514,7 @@ def periodic_scf_calculation_contract(
 
     scf_config = PeriodicSCFConfig() if config is None else config
     bands = int(round(system.electron_count / 2.0)) if n_bands is None else n_bands
-    if xc_functional is not None and type(xc_functional) is not (
-        ProductionPBEExchangeCorrelation
-    ):
+    if xc_functional is not None and type(xc_functional) is not (ProductionPBEExchangeCorrelation):
         msg = "periodic checkpointing supports only the stable production PBE path"
         raise ValueError(msg)
     return {
@@ -655,9 +633,7 @@ def _publish_checkpoint_state(
         "lineage": list(state.lineage),
         "statuses": {
             "numerical_status": "accepted_iteration",
-            "resume_integrity_status": (
-                "validated_parent" if state.lineage else "fresh"
-            ),
+            "resume_integrity_status": ("validated_parent" if state.lineage else "fresh"),
             "timing_admission_status": "not_a_timing_sample",
         },
         "provenance": dict(provenance or {}),
@@ -739,8 +715,7 @@ def publish_periodic_scf_checkpoint(
     _validate_execution_calculation_binding(identity, calculation)
     calculation_fingerprint = _calculation_fingerprint(calculation)
     if (
-        result._artifact_execution_contract_fingerprint
-        != identity.execution_contract_fingerprint
+        result._artifact_execution_contract_fingerprint != identity.execution_contract_fingerprint
         or result._artifact_calculation_fingerprint != calculation_fingerprint
     ):
         msg = "periodic SCF result is not bound to the supplied artifact identity"
@@ -842,11 +817,8 @@ def _validate_metadata_identity(
     return identity
 
 
-def _validated_checkpoint_metadata(
+def _load_checkpoint_metadata(
     artifact: str | Path,
-    *,
-    expected_identity: PeriodicSCFExecutionIdentity | None = None,
-    expected_calculation: Mapping[str, object] | None = None,
 ) -> tuple[Path, dict[str, object], dict[str, object]]:
     manifest = inspect_generation(artifact)
     if (
@@ -863,9 +835,10 @@ def _validated_checkpoint_metadata(
     if metadata.get("schema_version") != PERIODIC_SCF_CHECKPOINT_SCHEMA:
         msg = "unsupported periodic SCF checkpoint payload schema"
         raise ArtifactIntegrityError(msg)
-    if metadata.get("status") != "accepted_iteration" or metadata.get(
-        "resume_eligible"
-    ) is not True:
+    if (
+        metadata.get("status") != "accepted_iteration"
+        or metadata.get("resume_eligible") is not True
+    ):
         msg = "periodic SCF checkpoint is not an accepted resume boundary"
         raise ArtifactIntegrityError(msg)
     expected_envelope_metadata = {
@@ -878,6 +851,16 @@ def _validated_checkpoint_metadata(
     if manifest.get("metadata") != expected_envelope_metadata:
         msg = "periodic checkpoint envelope and payload metadata differ"
         raise ArtifactIntegrityError(msg)
+    return root, dict(manifest), metadata
+
+
+def _validate_checkpoint_calculation(
+    manifest: Mapping[str, object],
+    metadata: Mapping[str, object],
+    *,
+    expected_identity: PeriodicSCFExecutionIdentity | None,
+    expected_calculation: Mapping[str, object] | None,
+) -> dict[str, object]:
     stored_execution_identity = _validate_metadata_identity(
         manifest,
         metadata,
@@ -897,20 +880,18 @@ def _validated_checkpoint_metadata(
     if metadata.get("calculation_fingerprint") != observed_calculation:
         msg = "periodic checkpoint calculation fingerprint is inconsistent"
         raise ArtifactIntegrityError(msg)
-    comparison_calculation = _upgrade_legacy_calculation_contract(calculation)
-    if (
-        expected_calculation is not None
-        and comparison_calculation != dict(expected_calculation)
-    ):
+    comparison = _upgrade_legacy_calculation_contract(calculation)
+    if expected_calculation is not None and comparison != dict(expected_calculation):
         msg = "periodic checkpoint calculation settings do not match the current run"
         raise ArtifactIntegrityError(msg)
     try:
-        _validate_execution_calculation_binding(
-            stored_execution_identity,
-            comparison_calculation,
-        )
+        _validate_execution_calculation_binding(stored_execution_identity, comparison)
     except ValueError as error:
         raise ArtifactIntegrityError(str(error)) from error
+    return calculation
+
+
+def _validate_checkpoint_cursor(metadata: Mapping[str, object]) -> None:
     try:
         completed_iteration = int(metadata["completed_iteration"])
         next_iteration = int(metadata["next_iteration"])
@@ -932,11 +913,23 @@ def _validated_checkpoint_metadata(
     ):
         msg = "periodic checkpoint history does not match its iteration cursor"
         raise ArtifactIntegrityError(msg)
+
+
+def _validate_checkpoint_owner_inventory(
+    metadata: Mapping[str, object],
+) -> list[object]:
     owned_lanes = _require_sequence(metadata.get("owned_lanes"), "owned lanes")
     ownership = _require_mapping(metadata.get("ownership"), "ownership")
     if ownership.get("owned_count") != len(owned_lanes):
         msg = "periodic checkpoint ownership and owner payload counts differ"
         raise ArtifactIntegrityError(msg)
+    return owned_lanes
+
+
+def _validate_checkpoint_mixer(
+    metadata: Mapping[str, object],
+    calculation: Mapping[str, object],
+) -> dict[str, object]:
     mixer = _require_mapping(metadata.get("mixer"), "mixer")
     density_files = _require_sequence(mixer.get("density_files"), "mixer density files")
     residual_files = _require_sequence(
@@ -964,10 +957,34 @@ def _validated_checkpoint_metadata(
         msg = "periodic checkpoint mixer metadata is inconsistent"
         raise ArtifactIntegrityError(msg)
     configured = _require_mapping(calculation.get("config"), "configured SCF controls")
+    if not _mixer_matches_config(
+        mixer,
+        configured,
+        stored=stored,
+        history_size=history_size,
+        beta=beta,
+        regularization=regularization,
+        last_coefficients=last_coefficients,
+    ):
+        msg = "periodic checkpoint mixer state does not match configured SCF controls"
+        raise ArtifactIntegrityError(msg)
+    return mixer
+
+
+def _mixer_matches_config(
+    mixer: Mapping[str, object],
+    configured: Mapping[str, object],
+    *,
+    stored: int,
+    history_size: int,
+    beta: float,
+    regularization: float,
+    last_coefficients: Sequence[float],
+) -> bool:
     configured_mixer = configured.get("mixer")
     configured_beta = configured.get("mixing_beta")
     if configured_mixer == "linear":
-        mixer_matches_config = (
+        return (
             mixer.get("name") == "linear"
             and beta == configured_beta
             and history_size == 0
@@ -975,20 +992,19 @@ def _validated_checkpoint_metadata(
             and stored == 0
             and not last_coefficients
         )
-    elif configured_mixer == "diis":
-        allowed_coefficient_counts = {1, stored} if stored else {0}
-        mixer_matches_config = (
-            mixer.get("name") == "pulay-diis"
-            and beta == configured_beta
-            and history_size == 6
-            and regularization == 1e-10
-            and len(last_coefficients) in allowed_coefficient_counts
-        )
-    else:
-        mixer_matches_config = False
-    if not mixer_matches_config:
-        msg = "periodic checkpoint mixer state does not match configured SCF controls"
-        raise ArtifactIntegrityError(msg)
+    if configured_mixer != "diis":
+        return False
+    allowed_coefficient_counts = {1, stored} if stored else {0}
+    return (
+        mixer.get("name") == "pulay-diis"
+        and beta == configured_beta
+        and history_size == 6
+        and regularization == 1e-10
+        and len(last_coefficients) in allowed_coefficient_counts
+    )
+
+
+def _validate_checkpoint_status(metadata: Mapping[str, object]) -> None:
     statuses = _require_mapping(metadata.get("statuses"), "statuses")
     if (
         statuses.get("numerical_status") != "accepted_iteration"
@@ -1005,17 +1021,25 @@ def _validated_checkpoint_metadata(
         msg = "periodic checkpoint lineage and resume status differ"
         raise ArtifactIntegrityError(msg)
 
+
+def _validate_checkpoint_payload_references(
+    root: Path,
+    manifest: Mapping[str, object],
+    metadata: Mapping[str, object],
+    *,
+    owned_lanes: Sequence[object],
+    mixer: Mapping[str, object],
+) -> None:
     declared_paths = _declared_payload_paths(manifest)
     if PERIODIC_SCF_CHECKPOINT_PAYLOAD not in declared_paths:
         msg = "periodic checkpoint metadata payload is absent from the manifest"
         raise ArtifactIntegrityError(msg)
     references: list[object] = [metadata.get("density_file")]
     references.extend(
-        _require_mapping(lane, "owned lane").get("coefficient_file")
-        for lane in owned_lanes
+        _require_mapping(lane, "owned lane").get("coefficient_file") for lane in owned_lanes
     )
-    references.extend(density_files)
-    references.extend(residual_files)
+    references.extend(_require_sequence(mixer.get("density_files"), "mixer density files"))
+    references.extend(_require_sequence(mixer.get("residual_files"), "mixer residual files"))
     for reference in references:
         if not isinstance(reference, str) or reference not in declared_paths:
             msg = "periodic checkpoint references an undeclared payload"
@@ -1029,15 +1053,39 @@ def _validated_checkpoint_metadata(
     if set(payload_roles) != declared_paths - {PERIODIC_SCF_CHECKPOINT_PAYLOAD}:
         msg = "periodic checkpoint semantic payload roles are incomplete"
         raise ArtifactIntegrityError(msg)
+
+
+def _validated_checkpoint_metadata(
+    artifact: str | Path,
+    *,
+    expected_identity: PeriodicSCFExecutionIdentity | None = None,
+    expected_calculation: Mapping[str, object] | None = None,
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    root, manifest, metadata = _load_checkpoint_metadata(artifact)
+    calculation = _validate_checkpoint_calculation(
+        manifest,
+        metadata,
+        expected_identity=expected_identity,
+        expected_calculation=expected_calculation,
+    )
+    _validate_checkpoint_cursor(metadata)
+    owned_lanes = _validate_checkpoint_owner_inventory(metadata)
+    mixer = _validate_checkpoint_mixer(metadata, calculation)
+    _validate_checkpoint_status(metadata)
+    _validate_checkpoint_payload_references(
+        root,
+        manifest,
+        metadata,
+        owned_lanes=owned_lanes,
+        mixer=mixer,
+    )
     return root, dict(manifest), metadata
 
 
 def inspect_periodic_scf_checkpoint(
     artifact: str | Path,
     *,
-    expected_execution_context: (
-        PeriodicSCFExecutionIdentity | Mapping[str, object] | None
-    ) = None,
+    expected_execution_context: (PeriodicSCFExecutionIdentity | Mapping[str, object] | None) = None,
 ) -> dict[str, object]:
     """Validate checkpoint integrity and identity metadata without array loading.
 
@@ -1054,9 +1102,7 @@ def inspect_periodic_scf_checkpoint(
     """
 
     expected = (
-        None
-        if expected_execution_context is None
-        else _coerce_identity(expected_execution_context)
+        None if expected_execution_context is None else _coerce_identity(expected_execution_context)
     )
     _, manifest, metadata = _validated_checkpoint_metadata(
         artifact,
@@ -1075,6 +1121,176 @@ def inspect_periodic_scf_checkpoint(
         "statuses": dict(metadata["statuses"]),
         "lineage": list(metadata["lineage"]),
     }
+
+
+def _load_checkpoint_density(
+    root: Path,
+    metadata: Mapping[str, object],
+    *,
+    declared_paths: set[str],
+    grid_shape: tuple[int, int, int],
+) -> np.ndarray:
+    density = _read_npy(
+        root,
+        metadata.get("density_file"),
+        declared_paths=declared_paths,
+    )
+    if (
+        density.dtype != np.float32
+        or density.shape != grid_shape
+        or not np.all(np.isfinite(density))
+    ):
+        msg = "periodic checkpoint density has invalid dtype, shape, or values"
+        raise ArtifactIntegrityError(msg)
+    return density
+
+
+def _load_checkpoint_owners(
+    root: Path,
+    metadata: Mapping[str, object],
+    *,
+    declared_paths: set[str],
+) -> tuple[tuple[dict[str, object], ...], tuple[tuple[int, mx.array], ...]]:
+    payloads = _require_sequence(metadata.get("owned_lanes"), "owned lanes")
+    owned_lanes: list[dict[str, object]] = []
+    owned_coefficients: list[tuple[int, mx.array]] = []
+    seen_owners: set[int] = set()
+    for raw_lane in payloads:
+        lane = _require_mapping(raw_lane, "owned lane")
+        try:
+            owner_index = int(lane["owner_index"])
+        except (KeyError, TypeError, ValueError) as error:
+            msg = "periodic checkpoint owner index is invalid"
+            raise ArtifactIntegrityError(msg) from error
+        if owner_index in seen_owners:
+            msg = "periodic checkpoint owner indices must be unique"
+            raise ArtifactIntegrityError(msg)
+        seen_owners.add(owner_index)
+        values = _read_npy(
+            root,
+            lane.get("coefficient_file"),
+            declared_paths=declared_paths,
+        )
+        expected_shape = tuple(lane.get("coefficient_shape", ()))
+        if (
+            values.dtype != np.complex64
+            or values.shape != expected_shape
+            or lane.get("coefficient_dtype") != "complex64"
+            or not np.all(np.isfinite(values))
+        ):
+            msg = "periodic checkpoint coefficients have invalid dtype, shape, or values"
+            raise ArtifactIntegrityError(msg)
+        owned_lanes.append(
+            {
+                key: value
+                for key, value in lane.items()
+                if key
+                not in {
+                    "coefficient_file",
+                    "coefficient_dtype",
+                    "coefficient_shape",
+                }
+            }
+        )
+        owned_coefficients.append((owner_index, mx.array(values)))
+    return tuple(owned_lanes), tuple(owned_coefficients)
+
+
+def _load_checkpoint_mixer_state(
+    root: Path,
+    metadata: Mapping[str, object],
+    *,
+    declared_paths: set[str],
+    grid_shape: tuple[int, int, int],
+) -> _MixerCheckpointState:
+    payload = _require_mapping(metadata.get("mixer"), "mixer")
+    density_files = _require_sequence(
+        payload.get("density_files"),
+        "mixer density files",
+    )
+    residual_files = _require_sequence(
+        payload.get("residual_files"),
+        "mixer residual files",
+    )
+    densities = tuple(
+        _read_npy(root, path, declared_paths=declared_paths) for path in density_files
+    )
+    residuals = tuple(
+        _read_npy(root, path, declared_paths=declared_paths) for path in residual_files
+    )
+    if any(
+        values.dtype != np.float32 or values.shape != grid_shape or not np.all(np.isfinite(values))
+        for values in (*densities, *residuals)
+    ):
+        msg = "periodic checkpoint mixer arrays have invalid dtype, shape, or values"
+        raise ArtifactIntegrityError(msg)
+    try:
+        return _MixerCheckpointState(
+            name=str(payload["name"]),
+            beta=float(payload["beta"]),
+            history_size=int(payload["history_size"]),
+            regularization=float(payload["regularization"]),
+            densities=tuple(mx.array(values) for values in densities),
+            residuals=tuple(mx.array(values) for values in residuals),
+            last_coefficients=tuple(float(value) for value in payload["last_coefficients"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        msg = "periodic checkpoint scalar state is invalid"
+        raise ArtifactIntegrityError(msg) from error
+
+
+@dataclass(frozen=True)
+class _LoadedCheckpointScalars:
+    completed_iteration: int
+    previous_energy: float
+    energy_terms: dict[str, float]
+    history: tuple[dict[str, object], ...]
+    ownership: dict[str, object]
+    lineage: tuple[str, ...]
+
+
+def _load_checkpoint_scalars(
+    metadata: Mapping[str, object],
+) -> _LoadedCheckpointScalars:
+    try:
+        completed_iteration = int(metadata["completed_iteration"])
+        next_iteration = int(metadata["next_iteration"])
+        previous_energy = float(metadata["previous_energy_hartree"])
+    except (KeyError, TypeError, ValueError) as error:
+        msg = "periodic checkpoint scalar state is invalid"
+        raise ArtifactIntegrityError(msg) from error
+    if completed_iteration <= 0 or next_iteration != completed_iteration + 1:
+        msg = "periodic checkpoint iteration cursor is inconsistent"
+        raise ArtifactIntegrityError(msg)
+    history = _require_sequence(metadata.get("history"), "history")
+    history_rows = tuple(_require_mapping(row, "history row") for row in history)
+    ownership = _require_mapping(metadata.get("ownership"), "ownership")
+    energy_terms_raw = _require_mapping(
+        metadata.get("energy_by_term_hartree"),
+        "energy terms",
+    )
+    try:
+        energy_terms = {key: float(value) for key, value in energy_terms_raw.items()}
+    except (TypeError, ValueError) as error:
+        msg = "periodic checkpoint energy terms must be numeric"
+        raise ArtifactIntegrityError(msg) from error
+    if not np.isfinite(previous_energy) or not np.all(
+        np.isfinite(np.asarray(list(energy_terms.values()), dtype=np.float64))
+    ):
+        msg = "periodic checkpoint energy state must be finite"
+        raise ArtifactIntegrityError(msg)
+    lineage = tuple(str(item) for item in _require_sequence(metadata.get("lineage"), "lineage"))
+    if not all(_is_sha256(item) for item in lineage):
+        msg = "periodic checkpoint lineage entries must be SHA-256 values"
+        raise ArtifactIntegrityError(msg)
+    return _LoadedCheckpointScalars(
+        completed_iteration=completed_iteration,
+        previous_energy=previous_energy,
+        energy_terms=energy_terms,
+        history=history_rows,
+        ownership=ownership,
+        lineage=lineage,
+    )
 
 
 def load_periodic_scf_checkpoint(
@@ -1123,137 +1339,35 @@ def load_periodic_scf_checkpoint(
         expected_calculation=calculation,
     )
     declared_paths = _declared_payload_paths(manifest)
-    density = _read_npy(
+    density = _load_checkpoint_density(
         root,
-        metadata.get("density_file"),
+        metadata,
+        declared_paths=declared_paths,
+        grid_shape=system.grid.shape,
+    )
+    owned_lanes, owned_coefficients = _load_checkpoint_owners(
+        root,
+        metadata,
         declared_paths=declared_paths,
     )
-    if density.dtype != np.float32 or density.shape != system.grid.shape or not np.all(
-        np.isfinite(density)
-    ):
-        msg = "periodic checkpoint density has invalid dtype, shape, or values"
-        raise ArtifactIntegrityError(msg)
-
-    owned_lane_payloads = _require_sequence(metadata.get("owned_lanes"), "owned lanes")
-    owned_lanes: list[dict[str, object]] = []
-    owned_coefficients: list[tuple[int, mx.array]] = []
-    seen_owners: set[int] = set()
-    for raw_lane in owned_lane_payloads:
-        lane = _require_mapping(raw_lane, "owned lane")
-        try:
-            owner_index = int(lane["owner_index"])
-        except (KeyError, TypeError, ValueError) as error:
-            msg = "periodic checkpoint owner index is invalid"
-            raise ArtifactIntegrityError(msg) from error
-        if owner_index in seen_owners:
-            msg = "periodic checkpoint owner indices must be unique"
-            raise ArtifactIntegrityError(msg)
-        seen_owners.add(owner_index)
-        values = _read_npy(
-            root,
-            lane.get("coefficient_file"),
-            declared_paths=declared_paths,
-        )
-        expected_shape = tuple(lane.get("coefficient_shape", ()))
-        if (
-            values.dtype != np.complex64
-            or values.shape != expected_shape
-            or lane.get("coefficient_dtype") != "complex64"
-            or not np.all(np.isfinite(values))
-        ):
-            msg = "periodic checkpoint coefficients have invalid dtype, shape, or values"
-            raise ArtifactIntegrityError(msg)
-        owned_lanes.append(
-            {
-                key: value
-                for key, value in lane.items()
-                if key
-                not in {
-                    "coefficient_file",
-                    "coefficient_dtype",
-                    "coefficient_shape",
-                }
-            }
-        )
-        owned_coefficients.append((owner_index, mx.array(values)))
-
-    mixer_payload = _require_mapping(metadata.get("mixer"), "mixer")
-    density_files = _require_sequence(
-        mixer_payload.get("density_files"),
-        "mixer density files",
+    mixer_state = _load_checkpoint_mixer_state(
+        root,
+        metadata,
+        declared_paths=declared_paths,
+        grid_shape=system.grid.shape,
     )
-    residual_files = _require_sequence(
-        mixer_payload.get("residual_files"),
-        "mixer residual files",
-    )
-    mixer_densities = tuple(
-        _read_npy(root, path, declared_paths=declared_paths) for path in density_files
-    )
-    mixer_residuals = tuple(
-        _read_npy(root, path, declared_paths=declared_paths) for path in residual_files
-    )
-    if any(
-        values.dtype != np.float32
-        or values.shape != system.grid.shape
-        or not np.all(np.isfinite(values))
-        for values in (*mixer_densities, *mixer_residuals)
-    ):
-        msg = "periodic checkpoint mixer arrays have invalid dtype, shape, or values"
-        raise ArtifactIntegrityError(msg)
-    try:
-        mixer_state = _MixerCheckpointState(
-            name=str(mixer_payload["name"]),
-            beta=float(mixer_payload["beta"]),
-            history_size=int(mixer_payload["history_size"]),
-            regularization=float(mixer_payload["regularization"]),
-            densities=tuple(mx.array(values) for values in mixer_densities),
-            residuals=tuple(mx.array(values) for values in mixer_residuals),
-            last_coefficients=tuple(
-                float(value) for value in mixer_payload["last_coefficients"]
-            ),
-        )
-        completed_iteration = int(metadata["completed_iteration"])
-        next_iteration = int(metadata["next_iteration"])
-        previous_energy = float(metadata["previous_energy_hartree"])
-    except (KeyError, TypeError, ValueError) as error:
-        msg = "periodic checkpoint scalar state is invalid"
-        raise ArtifactIntegrityError(msg) from error
-    if completed_iteration <= 0 or next_iteration != completed_iteration + 1:
-        msg = "periodic checkpoint iteration cursor is inconsistent"
-        raise ArtifactIntegrityError(msg)
-    history = _require_sequence(metadata.get("history"), "history")
-    history_rows = tuple(_require_mapping(row, "history row") for row in history)
-    ownership = _require_mapping(metadata.get("ownership"), "ownership")
-    energy_terms_raw = _require_mapping(
-        metadata.get("energy_by_term_hartree"),
-        "energy terms",
-    )
-    try:
-        energy_terms = {key: float(value) for key, value in energy_terms_raw.items()}
-    except (TypeError, ValueError) as error:
-        msg = "periodic checkpoint energy terms must be numeric"
-        raise ArtifactIntegrityError(msg) from error
-    if not np.isfinite(previous_energy) or not np.all(
-        np.isfinite(np.asarray(list(energy_terms.values()), dtype=np.float64))
-    ):
-        msg = "periodic checkpoint energy state must be finite"
-        raise ArtifactIntegrityError(msg)
-    lineage_raw = _require_sequence(metadata.get("lineage"), "lineage")
-    lineage = tuple(str(item) for item in lineage_raw)
-    if not all(_is_sha256(item) for item in lineage):
-        msg = "periodic checkpoint lineage entries must be SHA-256 values"
-        raise ArtifactIntegrityError(msg)
+    scalars = _load_checkpoint_scalars(metadata)
     state = _PeriodicSCFContinuationState(
-        completed_iteration=completed_iteration,
+        completed_iteration=scalars.completed_iteration,
         density=mx.array(density),
-        owned_coefficients=tuple(owned_coefficients),
-        owned_lanes=tuple(owned_lanes),
-        previous_energy=previous_energy,
-        energy_by_term=energy_terms,
-        history=history_rows,
+        owned_coefficients=owned_coefficients,
+        owned_lanes=owned_lanes,
+        previous_energy=scalars.previous_energy,
+        energy_by_term=scalars.energy_terms,
+        history=scalars.history,
         mixer_state=mixer_state,
-        ownership=ownership,
-        lineage=(*lineage, str(manifest["manifest_sha256"])),
+        ownership=scalars.ownership,
+        lineage=(*scalars.lineage, str(manifest["manifest_sha256"])),
     )
     return PeriodicSCFCheckpoint(
         root=root,
@@ -1396,8 +1510,6 @@ def run_periodic_scf_checkpointed(
         raise ValueError(msg)
     return replace(
         result,
-        _artifact_execution_contract_fingerprint=(
-            identity.execution_contract_fingerprint
-        ),
+        _artifact_execution_contract_fingerprint=(identity.execution_contract_fingerprint),
         _artifact_calculation_fingerprint=_calculation_fingerprint(calculation),
     )
