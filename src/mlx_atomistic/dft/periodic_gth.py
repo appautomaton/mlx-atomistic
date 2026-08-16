@@ -195,10 +195,7 @@ def periodic_gth_local_forces(
         )
         force = mx.real(
             mx.sum(
-                density_reciprocal[..., None]
-                * imaginary
-                * vectors
-                * coefficients[..., None],
+                density_reciprocal[..., None] * imaginary * vectors * coefficients[..., None],
                 axis=(0, 1, 2),
             )
             * basis.grid.dv
@@ -606,15 +603,30 @@ class PeriodicGTHNonlocalOperator:
         return estimate
 
     @staticmethod
-    def _apply_compact_batch(
+    def _initial_batch_metrics(state: _CompactLaneState) -> dict[str, int]:
+        return {
+            "projector_payload_elements": 0,
+            "projector_elements_generated": 0,
+            "projector_elements_loaded": 0,
+            "projector_traffic_elements": 0,
+            "projector_cache_hits": 0,
+            "projector_cache_misses": 0,
+            "projector_cache_evictions": 0,
+            "projector_cache_bytes": 0,
+            "projector_peak_workspace_bytes": (state.vector_count * state.layout.active_count * 8),
+        }
+
+    @staticmethod
+    def _validated_batch_lanes(
         operators: Sequence[PeriodicGTHNonlocalOperator],
         coefficients: Sequence[_CompactLaneState],
-        *,
         batch: _CompactBatch,
-        evaluate: bool = True,
-    ) -> tuple[tuple[_CompactLaneState, ...], tuple[dict[str, int], ...]]:
-        """Apply GTH projectors with one padded k-lane matrix path."""
-
+    ) -> tuple[
+        PeriodicGTHNonlocalOperator,
+        list[tuple[PeriodicGTHNonlocalOperator, mx.array]],
+        list[dict[str, int]],
+        dict[int, tuple[_GTHProjectorCache, set[tuple[object, ...]]]],
+    ]:
         if not operators or len(operators) != len(coefficients):
             msg = "GTH batches require matching non-empty operator lanes"
             raise ValueError(msg)
@@ -622,10 +634,8 @@ class PeriodicGTHNonlocalOperator:
             msg = "GTH batch lane count does not match its operators"
             raise ValueError(msg)
         reference = operators[0]
-        context_identity = reference._context_identity
-        vector_count = batch.vector_count
-        lane_data = []
-        metrics = []
+        lane_data: list[tuple[PeriodicGTHNonlocalOperator, mx.array]] = []
+        metrics: list[dict[str, int]] = []
         protected_by_cache: dict[
             int,
             tuple[_GTHProjectorCache, set[tuple[object, ...]]],
@@ -636,7 +646,7 @@ class PeriodicGTHNonlocalOperator:
             batch.layouts,
             strict=True,
         ):
-            if operator._context_identity != context_identity:
+            if operator._context_identity != reference._context_identity:
                 msg = "GTH batch operators must share one physical context"
                 raise ValueError(msg)
             if layout is not state.layout:
@@ -647,136 +657,142 @@ class PeriodicGTHNonlocalOperator:
             if state.kind != "coefficients":
                 msg = "GTH input must be coefficient state"
                 raise ValueError(msg)
-            if state.vector_count > vector_count:
+            if state.vector_count > batch.vector_count:
                 msg = "GTH batch coefficient width exceeds its capacity"
                 raise ValueError(msg)
-            vectors = operator.basis._layout._active_shifted_vectors
-            lane_data.append((operator, vectors))
-            metrics.append(
-                {
-                    "projector_payload_elements": 0,
-                    "projector_elements_generated": 0,
-                    "projector_elements_loaded": 0,
-                    "projector_traffic_elements": 0,
-                    "projector_cache_hits": 0,
-                    "projector_cache_misses": 0,
-                    "projector_cache_evictions": 0,
-                    "projector_cache_bytes": 0,
-                    "projector_peak_workspace_bytes": (
-                        state.vector_count * state.layout.active_count * 8
-                    ),
-                }
-            )
+            lane_data.append((operator, operator.basis._layout._active_shifted_vectors))
+            metrics.append(PeriodicGTHNonlocalOperator._initial_batch_metrics(state))
             protected_by_cache.setdefault(
                 id(operator._cache),
                 (operator._cache, set()),
             )
+        return reference, lane_data, metrics, protected_by_cache
 
-        flattened_projectors = []
-        group_count = sum(
-            2 * channel.angular_momentum + 1
-            for pseudopotential in reference.pseudopotentials
+    def _generate_flattened_projectors(
+        self,
+        vectors: mx.array,
+    ) -> mx.array:
+        q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
+        harmonics = {
+            channel.angular_momentum: _real_spherical_harmonics(
+                channel.angular_momentum,
+                vectors,
+                q,
+            )
+            for pseudopotential in self.pseudopotentials
             for channel in pseudopotential.gth_channels
-        )
-        for lane_index, (operator, vectors) in enumerate(lane_data):
-            cache, protected_keys = protected_by_cache[id(operator._cache)]
-            key = operator._flattened_cache_key()
-            beta = cache.get(key)
-            lane_metrics = metrics[lane_index]
-            payload_elements = operator._projector_count * operator.basis.active_count
-            lane_metrics["projector_payload_elements"] = payload_elements
-            lane_metrics["projector_elements_loaded"] = (
-                2 * coefficients[lane_index].vector_count * payload_elements
-            )
-            if beta is None:
-                lane_metrics["projector_cache_misses"] = group_count
-                q = mx.sqrt(mx.sum(vectors * vectors, axis=-1))
-                harmonics = {
-                    channel.angular_momentum: _real_spherical_harmonics(
-                        channel.angular_momentum,
-                        vectors,
-                        q,
+        }
+        rows = []
+        for position, pseudopotential in zip(
+            self.positions,
+            self.pseudopotentials,
+            strict=True,
+        ):
+            for channel in pseudopotential.gth_channels:
+                for harmonic in harmonics[channel.angular_momentum]:
+                    rows.append(
+                        self._projector_group(
+                            position,
+                            channel,
+                            harmonic,
+                            vectors,
+                            q,
+                        )
                     )
-                    for pseudopotential in operator.pseudopotentials
-                    for channel in pseudopotential.gth_channels
-                }
-                rows = []
-                for position, pseudopotential in zip(
-                    operator.positions,
-                    operator.pseudopotentials,
-                    strict=True,
-                ):
-                    for channel in pseudopotential.gth_channels:
-                        for harmonic in harmonics[channel.angular_momentum]:
-                            rows.append(
-                                operator._projector_group(
-                                    position,
-                                    channel,
-                                    harmonic,
-                                    vectors,
-                                    q,
-                                )
-                            )
-                beta = mx.concatenate(rows, axis=0)
-                lane_metrics["projector_elements_generated"] = payload_elements
-                evictions, inserted = cache.put(
-                    key,
-                    beta,
-                    protected_keys=protected_keys,
-                )
-                lane_metrics["projector_cache_evictions"] = evictions
-                if inserted:
-                    protected_keys.add(key)
-            else:
-                lane_metrics["projector_cache_hits"] = group_count
-                protected_keys.add(key)
-            if int(beta.shape[0]) != reference._projector_count:
-                msg = "flattened GTH projector count is inconsistent"
-                raise RuntimeError(msg)
-            padding = batch.bucket_size - operator.basis.active_count
-            if padding:
-                beta = mx.concatenate(
-                    [
-                        beta,
-                        mx.zeros(
-                            (operator._projector_count, padding),
-                            dtype=mx.complex64,
-                        ),
-                    ],
-                    axis=1,
-                )
-            flattened_projectors.append(beta)
-            lane_metrics["projector_peak_workspace_bytes"] = max(
-                lane_metrics["projector_peak_workspace_bytes"],
-                (
-                    reference._projector_count * batch.bucket_size
-                    + 4 * reference._projector_count * vector_count
-                    + vector_count * batch.bucket_size
-                )
-                * 8,
-            )
-        beta_batch = mx.stack(flattened_projectors, axis=0)
-        lane_padding = batch.lane_capacity - batch.lane_count
-        if lane_padding:
-            beta_batch = mx.concatenate(
-                [
-                    beta_batch,
-                    mx.zeros(
-                        (
-                            lane_padding,
-                            reference._projector_count,
-                            batch.bucket_size,
-                        ),
-                        dtype=mx.complex64,
-                    ),
-                ],
-                axis=0,
-            )
+        return mx.concatenate(rows, axis=0)
 
+    @staticmethod
+    def _projectors_for_batch_lane(
+        operator: PeriodicGTHNonlocalOperator,
+        state: _CompactLaneState,
+        vectors: mx.array,
+        *,
+        batch: _CompactBatch,
+        projector_count: int,
+        group_count: int,
+        protected_by_cache: dict[
+            int,
+            tuple[_GTHProjectorCache, set[tuple[object, ...]]],
+        ],
+        metrics: dict[str, int],
+    ) -> mx.array:
+        cache, protected_keys = protected_by_cache[id(operator._cache)]
+        key = operator._flattened_cache_key()
+        beta = cache.get(key)
+        payload_elements = operator._projector_count * operator.basis.active_count
+        metrics["projector_payload_elements"] = payload_elements
+        metrics["projector_elements_loaded"] = 2 * state.vector_count * payload_elements
+        if beta is None:
+            metrics["projector_cache_misses"] = group_count
+            beta = operator._generate_flattened_projectors(vectors)
+            metrics["projector_elements_generated"] = payload_elements
+            evictions, inserted = cache.put(
+                key,
+                beta,
+                protected_keys=protected_keys,
+            )
+            metrics["projector_cache_evictions"] = evictions
+            if inserted:
+                protected_keys.add(key)
+        else:
+            metrics["projector_cache_hits"] = group_count
+            protected_keys.add(key)
+        if int(beta.shape[0]) != projector_count:
+            msg = "flattened GTH projector count is inconsistent"
+            raise RuntimeError(msg)
+        padding = batch.bucket_size - operator.basis.active_count
+        if padding:
+            beta = mx.concatenate(
+                [
+                    beta,
+                    mx.zeros((operator._projector_count, padding), dtype=mx.complex64),
+                ],
+                axis=1,
+            )
+        metrics["projector_peak_workspace_bytes"] = max(
+            metrics["projector_peak_workspace_bytes"],
+            (
+                projector_count * batch.bucket_size
+                + 4 * projector_count * batch.vector_count
+                + batch.vector_count * batch.bucket_size
+            )
+            * 8,
+        )
+        return beta
+
+    @staticmethod
+    def _padded_projector_batch(
+        projectors: Sequence[mx.array],
+        *,
+        batch: _CompactBatch,
+        projector_count: int,
+    ) -> mx.array:
+        beta_batch = mx.stack(projectors, axis=0)
+        lane_padding = batch.lane_capacity - batch.lane_count
+        if not lane_padding:
+            return beta_batch
+        return mx.concatenate(
+            [
+                beta_batch,
+                mx.zeros(
+                    (lane_padding, projector_count, batch.bucket_size),
+                    dtype=mx.complex64,
+                ),
+            ],
+            axis=0,
+        )
+
+    @staticmethod
+    def _compensated_projector_overlaps(
+        beta_batch: mx.array,
+        batch: _CompactBatch,
+        *,
+        projector_count: int,
+    ) -> mx.array:
         overlap_shape = (
             batch.lane_capacity,
-            reference._projector_count,
-            vector_count,
+            projector_count,
+            batch.vector_count,
         )
         overlaps = mx.zeros(overlap_shape, dtype=mx.complex64)
         compensation = mx.zeros_like(overlaps)
@@ -790,12 +806,13 @@ class PeriodicGTHNonlocalOperator:
             updated = overlaps + adjusted
             compensation = (updated - overlaps) - adjusted
             overlaps = updated
-        mixed = mx.matmul(reference._flattened_coupling[None, :, :], overlaps)
-        output = mx.matmul(mx.transpose(mixed, (0, 2, 1)), beta_batch)
+        return overlaps
 
-        actions = batch.unpad(output, kind="hamiltonian_action")
-        if evaluate:
-            mx.eval(*(action.values for action in actions))
+    @staticmethod
+    def _finalize_batch_metrics(
+        lane_data: Sequence[tuple[PeriodicGTHNonlocalOperator, mx.array]],
+        metrics: Sequence[dict[str, int]],
+    ) -> None:
         for lane_index, (operator, _) in enumerate(lane_data):
             lane_metrics = metrics[lane_index]
             lane_metrics["projector_traffic_elements"] = (
@@ -803,6 +820,62 @@ class PeriodicGTHNonlocalOperator:
                 + lane_metrics["projector_elements_loaded"]
             )
             lane_metrics["projector_cache_bytes"] = operator._cache.current_bytes
+
+    @staticmethod
+    def _apply_compact_batch(
+        operators: Sequence[PeriodicGTHNonlocalOperator],
+        coefficients: Sequence[_CompactLaneState],
+        *,
+        batch: _CompactBatch,
+        evaluate: bool = True,
+    ) -> tuple[tuple[_CompactLaneState, ...], tuple[dict[str, int], ...]]:
+        """Apply GTH projectors with one padded k-lane matrix path."""
+
+        (
+            reference,
+            lane_data,
+            metrics,
+            protected_by_cache,
+        ) = PeriodicGTHNonlocalOperator._validated_batch_lanes(
+            operators,
+            coefficients,
+            batch,
+        )
+        group_count = sum(
+            2 * channel.angular_momentum + 1
+            for pseudopotential in reference.pseudopotentials
+            for channel in pseudopotential.gth_channels
+        )
+        flattened_projectors = [
+            PeriodicGTHNonlocalOperator._projectors_for_batch_lane(
+                operator,
+                coefficients[lane_index],
+                vectors,
+                batch=batch,
+                projector_count=reference._projector_count,
+                group_count=group_count,
+                protected_by_cache=protected_by_cache,
+                metrics=metrics[lane_index],
+            )
+            for lane_index, (operator, vectors) in enumerate(lane_data)
+        ]
+        beta_batch = PeriodicGTHNonlocalOperator._padded_projector_batch(
+            flattened_projectors,
+            batch=batch,
+            projector_count=reference._projector_count,
+        )
+        overlaps = PeriodicGTHNonlocalOperator._compensated_projector_overlaps(
+            beta_batch,
+            batch,
+            projector_count=reference._projector_count,
+        )
+        mixed = mx.matmul(reference._flattened_coupling[None, :, :], overlaps)
+        output = mx.matmul(mx.transpose(mixed, (0, 2, 1)), beta_batch)
+
+        actions = batch.unpad(output, kind="hamiltonian_action")
+        if evaluate:
+            mx.eval(*(action.values for action in actions))
+        PeriodicGTHNonlocalOperator._finalize_batch_metrics(lane_data, metrics)
         return actions, tuple(metrics)
 
     def apply(self, coefficients: mx.array) -> mx.array:
@@ -901,9 +974,7 @@ class PeriodicGTHNonlocalOperator:
             overlaps = mx.matmul(mx.conjugate(beta), coefficient_matrix)
             mixed = mx.matmul(coupling, overlaps)
             derivative_bras = (
-                imaginary
-                * mx.transpose(vectors)[:, None, :]
-                * mx.conjugate(beta)[None, :, :]
+                imaginary * mx.transpose(vectors)[:, None, :] * mx.conjugate(beta)[None, :, :]
             )
             derivative_overlaps = mx.matmul(
                 derivative_bras,
@@ -969,9 +1040,7 @@ class PeriodicGTHNonlocalOperator:
             Channel, projector, angular, ion, and k-point metadata.
         """
 
-        fingerprints = [
-            _pseudopotential_fingerprint(value) for value in self.pseudopotentials
-        ]
+        fingerprints = [_pseudopotential_fingerprint(value) for value in self.pseudopotentials]
         radial_by_ion = [
             sum(channel.projector_count for channel in value.gth_channels)
             for value in self.pseudopotentials
@@ -987,21 +1056,215 @@ class PeriodicGTHNonlocalOperator:
         return {
             "ion_count": int(self.positions.shape[0]),
             "species_count": len(set(fingerprints)),
-            "channel_count": (
-                len(self.pseudopotentials[0].gth_channels) if homogeneous else None
-            ),
-            "channel_count_total": sum(
-                len(value.gth_channels) for value in self.pseudopotentials
-            ),
-            "radial_projector_count_per_ion": (
-                radial_by_ion[0] if homogeneous else radial_by_ion
-            ),
+            "channel_count": (len(self.pseudopotentials[0].gth_channels) if homogeneous else None),
+            "channel_count_total": sum(len(value.gth_channels) for value in self.pseudopotentials),
+            "radial_projector_count_per_ion": (radial_by_ion[0] if homogeneous else radial_by_ion),
             "angular_projector_count_per_ion": (
                 angular_by_ion[0] if homogeneous else angular_by_ion
             ),
             "angular_projector_count_total": sum(angular_by_ion),
             "kpoint_cartesian_bohr_inverse": list(self.basis.kpoint_cartesian),
         }
+
+
+@dataclass(frozen=True)
+class _EwaldParameters:
+    charge: np.ndarray
+    centers: np.ndarray
+    lengths: np.ndarray
+    eta: float
+    real_cutoff: float
+    real_ranges: tuple[range, ...]
+    reciprocal_cutoff: float
+    max_indices: np.ndarray
+    volume: float
+
+
+def _validated_ewald_parameters(
+    charge: np.ndarray,
+    centers: np.ndarray,
+    cell_lengths: Sequence[float],
+    *,
+    eta: float | None,
+    tolerance: float,
+) -> _EwaldParameters:
+    lengths = np.asarray(cell_lengths, dtype=np.float64)
+    if charge.shape != (centers.shape[0],):
+        msg = "charges length must match positions"
+        raise ValueError(msg)
+    if lengths.shape != (3,) or np.any(lengths <= 0.0):
+        msg = "cell_lengths must contain three positive values"
+        raise ValueError(msg)
+    if tolerance <= 0.0 or tolerance >= 1.0:
+        msg = "tolerance must lie in (0, 1)"
+        raise ValueError(msg)
+    eta_value = float(eta) if eta is not None else 5.0 / float(np.min(lengths))
+    if eta_value <= 0.0:
+        msg = "eta must be positive"
+        raise ValueError(msg)
+    cutoff_factor = sqrt(-np.log(tolerance))
+    real_cutoff = cutoff_factor / eta_value
+    real_ranges = tuple(
+        range(
+            -int(np.ceil(real_cutoff / length)) - 1,
+            int(np.ceil(real_cutoff / length)) + 2,
+        )
+        for length in lengths
+    )
+    reciprocal_cutoff = 2.0 * eta_value * cutoff_factor
+    return _EwaldParameters(
+        charge=charge,
+        centers=centers,
+        lengths=lengths,
+        eta=eta_value,
+        real_cutoff=real_cutoff,
+        real_ranges=real_ranges,
+        reciprocal_cutoff=reciprocal_cutoff,
+        max_indices=np.ceil(reciprocal_cutoff * lengths / (2.0 * pi)).astype(int),
+        volume=float(np.prod(lengths)),
+    )
+
+
+def _ewald_translation(
+    parameters: _EwaldParameters,
+    image: tuple[int, ...],
+) -> np.ndarray:
+    return np.array(
+        [parameters.real_ranges[axis][image[axis]] * parameters.lengths[axis] for axis in range(3)]
+    )
+
+
+def _ewald_real_energy(parameters: _EwaldParameters) -> float:
+    energy = 0.0
+    for ion_index, first in enumerate(parameters.centers):
+        for other_index, second in enumerate(parameters.centers):
+            for image in np.ndindex(*(len(values) for values in parameters.real_ranges)):
+                displacement = first - second + _ewald_translation(parameters, image)
+                distance = float(np.linalg.norm(displacement))
+                if distance <= 1e-14 or distance > parameters.real_cutoff:
+                    continue
+                energy += (
+                    parameters.charge[ion_index]
+                    * parameters.charge[other_index]
+                    * erfc(parameters.eta * distance)
+                    / distance
+                )
+    return 0.5 * energy
+
+
+def _ewald_reciprocal_energy(parameters: _EwaldParameters) -> float:
+    energy = 0.0
+    maximum = parameters.max_indices
+    for h in range(-int(maximum[0]), int(maximum[0]) + 1):
+        for k in range(-int(maximum[1]), int(maximum[1]) + 1):
+            for l_value in range(-int(maximum[2]), int(maximum[2]) + 1):
+                if h == 0 and k == 0 and l_value == 0:
+                    continue
+                vector = 2.0 * pi * np.array([h, k, l_value], dtype=np.float64) / parameters.lengths
+                g2 = float(np.dot(vector, vector))
+                if sqrt(g2) > parameters.reciprocal_cutoff:
+                    continue
+                structure = np.sum(parameters.charge * np.exp(-1j * (parameters.centers @ vector)))
+                energy += (
+                    np.exp(-g2 / (4.0 * parameters.eta * parameters.eta))
+                    * float(abs(structure) ** 2)
+                    / g2
+                )
+    return energy * 2.0 * pi / parameters.volume
+
+
+def _ewald_analytic_forces(parameters: _EwaldParameters) -> np.ndarray:
+    forces = _ewald_real_forces(parameters)
+    return _add_ewald_reciprocal_forces(parameters, forces)
+
+
+def _ewald_real_forces(parameters: _EwaldParameters) -> np.ndarray:
+    forces = np.zeros_like(parameters.centers)
+    for ion_index, first in enumerate(parameters.centers):
+        for other_index, second in enumerate(parameters.centers):
+            for image in np.ndindex(*(len(values) for values in parameters.real_ranges)):
+                displacement = first - second + _ewald_translation(parameters, image)
+                distance = float(np.linalg.norm(displacement))
+                if distance <= 1e-14 or distance > parameters.real_cutoff:
+                    continue
+                coefficient = (
+                    erfc(parameters.eta * distance) / distance**3
+                    + 2.0
+                    * parameters.eta
+                    / sqrt(pi)
+                    * np.exp(-((parameters.eta * distance) ** 2))
+                    / distance**2
+                )
+                forces[ion_index] += (
+                    parameters.charge[ion_index]
+                    * parameters.charge[other_index]
+                    * coefficient
+                    * displacement
+                )
+    return forces
+
+
+def _add_ewald_reciprocal_forces(
+    parameters: _EwaldParameters,
+    forces: np.ndarray,
+) -> np.ndarray:
+    maximum = parameters.max_indices
+    for h in range(-int(maximum[0]), int(maximum[0]) + 1):
+        for k in range(-int(maximum[1]), int(maximum[1]) + 1):
+            for l_value in range(-int(maximum[2]), int(maximum[2]) + 1):
+                if h == 0 and k == 0 and l_value == 0:
+                    continue
+                vector = 2.0 * pi * np.array([h, k, l_value], dtype=np.float64) / parameters.lengths
+                g2 = float(np.dot(vector, vector))
+                if sqrt(g2) > parameters.reciprocal_cutoff:
+                    continue
+                damping = np.exp(-g2 / (4.0 * parameters.eta * parameters.eta)) / g2
+                structure = np.sum(parameters.charge * np.exp(-1j * (parameters.centers @ vector)))
+                phase_imaginary = np.imag(np.exp(1j * (parameters.centers @ vector)) * structure)
+                forces += (
+                    4.0
+                    * pi
+                    / parameters.volume
+                    * damping
+                    * parameters.charge[:, None]
+                    * phase_imaginary[:, None]
+                    * vector[None, :]
+                )
+    return forces
+
+
+def _ewald_finite_difference_forces(
+    charges: Sequence[float],
+    centers: np.ndarray,
+    cell_lengths: Sequence[float],
+    *,
+    displacement: float,
+    eta: float | None,
+    tolerance: float,
+) -> np.ndarray:
+    forces = np.zeros_like(centers)
+    for ion_index in range(centers.shape[0]):
+        for axis in range(3):
+            plus = centers.copy()
+            minus = centers.copy()
+            plus[ion_index, axis] += displacement
+            minus[ion_index, axis] -= displacement
+            e_plus = periodic_ewald_energy(
+                charges,
+                plus,
+                cell_lengths,
+                eta=eta,
+                tolerance=tolerance,
+            )
+            e_minus = periodic_ewald_energy(
+                charges,
+                minus,
+                cell_lengths,
+                eta=eta,
+                tolerance=tolerance,
+            )
+            forces[ion_index, axis] = -(e_plus - e_minus) / (2.0 * displacement)
+    return forces
 
 
 def periodic_ewald_energy(
@@ -1027,67 +1290,18 @@ def periodic_ewald_energy(
     """
 
     charge = np.asarray(charges, dtype=np.float64)
-    centers = _positions(positions)
-    lengths = np.asarray(cell_lengths, dtype=np.float64)
-    if charge.shape != (centers.shape[0],):
-        msg = "charges length must match positions"
-        raise ValueError(msg)
-    if lengths.shape != (3,) or np.any(lengths <= 0.0):
-        msg = "cell_lengths must contain three positive values"
-        raise ValueError(msg)
-    if tolerance <= 0.0 or tolerance >= 1.0:
-        msg = "tolerance must lie in (0, 1)"
-        raise ValueError(msg)
-    eta_value = float(eta) if eta is not None else 5.0 / float(np.min(lengths))
-    if eta_value <= 0.0:
-        msg = "eta must be positive"
-        raise ValueError(msg)
-    cutoff_factor = sqrt(-np.log(tolerance))
-    real_cutoff = cutoff_factor / eta_value
-    real_ranges = [
-        range(
-            -int(np.ceil(real_cutoff / length)) - 1,
-            int(np.ceil(real_cutoff / length)) + 2,
-        )
-        for length in lengths
-    ]
-    real_energy = 0.0
-    for ion_index, first in enumerate(centers):
-        for other_index, second in enumerate(centers):
-            for image in np.ndindex(*(len(values) for values in real_ranges)):
-                translation = np.array(
-                    [real_ranges[axis][image[axis]] * lengths[axis] for axis in range(3)]
-                )
-                displacement = first - second + translation
-                distance = float(np.linalg.norm(displacement))
-                if distance <= 1e-14 or distance > real_cutoff:
-                    continue
-                real_energy += (
-                    charge[ion_index] * charge[other_index] * erfc(eta_value * distance) / distance
-                )
-    real_energy *= 0.5
-
-    reciprocal_cutoff = 2.0 * eta_value * cutoff_factor
-    max_indices = np.ceil(reciprocal_cutoff * lengths / (2.0 * pi)).astype(int)
-    reciprocal_energy = 0.0
-    for h in range(-int(max_indices[0]), int(max_indices[0]) + 1):
-        for k in range(-int(max_indices[1]), int(max_indices[1]) + 1):
-            for l_value in range(-int(max_indices[2]), int(max_indices[2]) + 1):
-                if h == 0 and k == 0 and l_value == 0:
-                    continue
-                vector = 2.0 * pi * np.array([h, k, l_value], dtype=np.float64) / lengths
-                g2 = float(np.dot(vector, vector))
-                if sqrt(g2) > reciprocal_cutoff:
-                    continue
-                structure = np.sum(charge * np.exp(-1j * (centers @ vector)))
-                reciprocal_energy += (
-                    np.exp(-g2 / (4.0 * eta_value * eta_value)) * float(abs(structure) ** 2) / g2
-                )
-    volume = float(np.prod(lengths))
-    reciprocal_energy *= 2.0 * pi / volume
-    self_energy = -eta_value / sqrt(pi) * float(np.sum(charge * charge))
+    parameters = _validated_ewald_parameters(
+        charge,
+        _positions(positions),
+        cell_lengths,
+        eta=eta,
+        tolerance=tolerance,
+    )
+    real_energy = _ewald_real_energy(parameters)
+    reciprocal_energy = _ewald_reciprocal_energy(parameters)
+    self_energy = -parameters.eta / sqrt(pi) * float(np.sum(charge * charge))
     total_charge = float(np.sum(charge))
-    background = -pi * total_charge * total_charge / (2.0 * eta_value**2 * volume)
+    background = -pi * total_charge * total_charge / (2.0 * parameters.eta**2 * parameters.volume)
     return float(real_energy + reciprocal_energy + self_energy + background)
 
 
@@ -1125,125 +1339,20 @@ def periodic_ewald_forces(
         msg = "method must be 'analytic' or 'finite_difference'"
         raise ValueError(msg)
     centers = _positions(positions)
-    if method == "analytic":
-        charge = np.asarray(charges, dtype=np.float64)
-        lengths = np.asarray(cell_lengths, dtype=np.float64)
-        if charge.shape != (centers.shape[0],):
-            msg = "charges length must match positions"
-            raise ValueError(msg)
-        if lengths.shape != (3,) or np.any(lengths <= 0.0):
-            msg = "cell_lengths must contain three positive values"
-            raise ValueError(msg)
-        if tolerance <= 0.0 or tolerance >= 1.0:
-            msg = "tolerance must lie in (0, 1)"
-            raise ValueError(msg)
-        eta_value = float(eta) if eta is not None else 5.0 / float(np.min(lengths))
-        if eta_value <= 0.0:
-            msg = "eta must be positive"
-            raise ValueError(msg)
-
-        cutoff_factor = sqrt(-np.log(tolerance))
-        real_cutoff = cutoff_factor / eta_value
-        real_ranges = [
-            range(
-                -int(np.ceil(real_cutoff / length)) - 1,
-                int(np.ceil(real_cutoff / length)) + 2,
-            )
-            for length in lengths
-        ]
-        forces = np.zeros_like(centers)
-        for ion_index, first in enumerate(centers):
-            for other_index, second in enumerate(centers):
-                for image in np.ndindex(
-                    *(len(values) for values in real_ranges)
-                ):
-                    translation = np.array(
-                        [
-                            real_ranges[axis][image[axis]] * lengths[axis]
-                            for axis in range(3)
-                        ]
-                    )
-                    displacement_vector = first - second + translation
-                    distance = float(np.linalg.norm(displacement_vector))
-                    if distance <= 1e-14 or distance > real_cutoff:
-                        continue
-                    coefficient = (
-                        erfc(eta_value * distance) / distance**3
-                        + 2.0
-                        * eta_value
-                        / sqrt(pi)
-                        * np.exp(-(eta_value * distance) ** 2)
-                        / distance**2
-                    )
-                    forces[ion_index] += (
-                        charge[ion_index]
-                        * charge[other_index]
-                        * coefficient
-                        * displacement_vector
-                    )
-
-        reciprocal_cutoff = 2.0 * eta_value * cutoff_factor
-        max_indices = np.ceil(
-            reciprocal_cutoff * lengths / (2.0 * pi)
-        ).astype(int)
-        volume = float(np.prod(lengths))
-        for h in range(-int(max_indices[0]), int(max_indices[0]) + 1):
-            for k in range(-int(max_indices[1]), int(max_indices[1]) + 1):
-                for l_value in range(
-                    -int(max_indices[2]),
-                    int(max_indices[2]) + 1,
-                ):
-                    if h == 0 and k == 0 and l_value == 0:
-                        continue
-                    vector = (
-                        2.0
-                        * pi
-                        * np.array([h, k, l_value], dtype=np.float64)
-                        / lengths
-                    )
-                    g2 = float(np.dot(vector, vector))
-                    if sqrt(g2) > reciprocal_cutoff:
-                        continue
-                    damping = np.exp(
-                        -g2 / (4.0 * eta_value * eta_value)
-                    ) / g2
-                    structure = np.sum(
-                        charge * np.exp(-1j * (centers @ vector))
-                    )
-                    phase_imaginary = np.imag(
-                        np.exp(1j * (centers @ vector)) * structure
-                    )
-                    forces += (
-                        4.0
-                        * pi
-                        / volume
-                        * damping
-                        * charge[:, None]
-                        * phase_imaginary[:, None]
-                        * vector[None, :]
-                    )
-        return forces
-
-    forces = np.zeros_like(centers)
-    for ion_index in range(centers.shape[0]):
-        for axis in range(3):
-            plus = centers.copy()
-            minus = centers.copy()
-            plus[ion_index, axis] += displacement
-            minus[ion_index, axis] -= displacement
-            e_plus = periodic_ewald_energy(
-                charges,
-                plus,
-                cell_lengths,
-                eta=eta,
-                tolerance=tolerance,
-            )
-            e_minus = periodic_ewald_energy(
-                charges,
-                minus,
-                cell_lengths,
-                eta=eta,
-                tolerance=tolerance,
-            )
-            forces[ion_index, axis] = -(e_plus - e_minus) / (2.0 * displacement)
-    return forces
+    if method == "finite_difference":
+        return _ewald_finite_difference_forces(
+            charges,
+            centers,
+            cell_lengths,
+            displacement=displacement,
+            eta=eta,
+            tolerance=tolerance,
+        )
+    parameters = _validated_ewald_parameters(
+        np.asarray(charges, dtype=np.float64),
+        centers,
+        cell_lengths,
+        eta=eta,
+        tolerance=tolerance,
+    )
+    return _ewald_analytic_forces(parameters)

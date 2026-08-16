@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -10,7 +11,11 @@ import numpy as np
 
 from mlx_atomistic.dft._compact import _CompactLaneState
 from mlx_atomistic.dft._memory import _bounded_dft_allocator
-from mlx_atomistic.dft._periodic_models import PeriodicDFTSystem, PeriodicSCFResult
+from mlx_atomistic.dft._periodic_models import (
+    PeriodicDFTSystem,
+    PeriodicKPointResult,
+    PeriodicSCFResult,
+)
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
@@ -70,6 +75,102 @@ class PeriodicForceResult:
         }
 
 
+def _validated_periodic_force_state(
+    system: PeriodicDFTSystem,
+    result: PeriodicSCFResult,
+) -> tuple[mx.array, tuple[PeriodicKPointResult, ...]]:
+    if not result.converged:
+        msg = "periodic forces require a converged SCF result"
+        raise ValueError(msg)
+    if result.system_fingerprint != system.fingerprint:
+        msg = "SCF result does not match the periodic force system"
+        raise ValueError(msg)
+    if result.density.shape != system.grid.shape:
+        msg = "SCF density shape does not match the periodic force system"
+        raise ValueError(msg)
+    if not np.isclose(
+        result.electron_count,
+        system.electron_count,
+        rtol=0.0,
+        atol=1e-4,
+    ):
+        msg = "SCF electron count does not match the periodic force system"
+        raise ValueError(msg)
+    owned = result.owned_kpoints
+    if not owned:
+        msg = "periodic forces require retained occupied k-point states"
+        raise ValueError(msg)
+    if any(
+        point.basis.grid.shape != system.grid.shape
+        or not np.array_equal(
+            np.asarray(point.basis.grid.cell.matrix, dtype=np.float64),
+            np.asarray(system.grid.cell.matrix, dtype=np.float64),
+        )
+        for point in owned
+    ):
+        msg = "SCF k-point bases do not match the periodic force system"
+        raise ValueError(msg)
+    density = mx.real(mx.array(result.density)).astype(mx.float32)
+    density_finite = mx.all(mx.isfinite(density))
+    density_count = mx.sum(density) * system.grid.dv
+    mx.eval(density, density_finite, density_count)
+    if not bool(density_finite) or not np.isclose(
+        float(density_count),
+        system.electron_count,
+        rtol=0.0,
+        atol=1e-4,
+    ):
+        msg = "SCF density is non-finite or has the wrong electron count"
+        raise ValueError(msg)
+    return density, owned
+
+
+def _periodic_nonlocal_forces(
+    system: PeriodicDFTSystem,
+    owned: Sequence[PeriodicKPointResult],
+    *,
+    projector_cache: _GTHProjectorCache,
+) -> mx.array:
+    force = mx.zeros((system.ion_count, 3), dtype=mx.float32)
+    for point in owned:
+        compact = point.eigen._compact_coefficients
+        if not isinstance(compact, _CompactLaneState):
+            msg = "periodic forces require compact occupied k-point states"
+            raise ValueError(msg)
+        operator = PeriodicGTHNonlocalOperator(
+            system.pseudopotentials,
+            point.basis,
+            system.positions,
+            cache=projector_cache,
+        )
+        point_force = operator._forces_compact(
+            compact,
+            occupations=[2.0] * compact.vector_count,
+        )
+        force = force + float(point.integration_weight) * point_force
+        mx.eval(force)
+    return force
+
+
+def _validated_force_sum(
+    local: mx.array,
+    nonlocal_force: mx.array,
+    ion_ewald: mx.array,
+) -> mx.array:
+    forces = (local + nonlocal_force + ion_ewald).astype(mx.float32)
+    finite = (
+        mx.all(mx.isfinite(local))
+        & mx.all(mx.isfinite(nonlocal_force))
+        & mx.all(mx.isfinite(ion_ewald))
+        & mx.all(mx.isfinite(forces))
+    )
+    mx.eval(forces, finite)
+    if not bool(finite):
+        msg = "periodic force evaluation produced a non-finite value"
+        raise ValueError(msg)
+    return forces
+
+
 def periodic_scf_forces(
     system: PeriodicDFTSystem,
     result: PeriodicSCFResult,
@@ -104,54 +205,7 @@ def periodic_scf_forces(
     if not isinstance(result, PeriodicSCFResult):
         msg = "result must be PeriodicSCFResult"
         raise TypeError(msg)
-    if not result.converged:
-        msg = "periodic forces require a converged SCF result"
-        raise ValueError(msg)
-    if result.system_fingerprint != system.fingerprint:
-        msg = "SCF result does not match the periodic force system"
-        raise ValueError(msg)
-    if result.density.shape != system.grid.shape:
-        msg = "SCF density shape does not match the periodic force system"
-        raise ValueError(msg)
-    if not np.isclose(
-        result.electron_count,
-        system.electron_count,
-        rtol=0.0,
-        atol=1e-4,
-    ):
-        msg = "SCF electron count does not match the periodic force system"
-        raise ValueError(msg)
-    owned = result.owned_kpoints
-    if not owned:
-        msg = "periodic forces require retained occupied k-point states"
-        raise ValueError(msg)
-    if any(
-        point.basis.grid.shape != system.grid.shape
-        or not np.array_equal(
-            np.asarray(point.basis.grid.cell.matrix, dtype=np.float64),
-            np.asarray(system.grid.cell.matrix, dtype=np.float64),
-        )
-        for point in owned
-    ):
-        msg = "SCF k-point bases do not match the periodic force system"
-        raise ValueError(msg)
-
-    density = mx.real(mx.array(result.density)).astype(mx.float32)
-    density_finite = mx.all(mx.isfinite(density))
-    density_count = mx.sum(density) * system.grid.dv
-    mx.eval(density, density_finite, density_count)
-    if (
-        not bool(density_finite)
-        or not np.isclose(
-            float(density_count),
-            system.electron_count,
-            rtol=0.0,
-            atol=1e-4,
-        )
-    ):
-        msg = "SCF density is non-finite or has the wrong electron count"
-        raise ValueError(msg)
-
+    density, owned = _validated_periodic_force_state(system, result)
     timings = {
         "local": 0.0,
         "nonlocal": 0.0,
@@ -170,31 +224,11 @@ def periodic_scf_forces(
         timings["local"] = (perf_counter() - phase_start) * 1000.0
 
         phase_start = perf_counter()
-        nonlocal_force = mx.zeros(
-            (system.ion_count, 3),
-            dtype=mx.float32,
+        nonlocal_force = _periodic_nonlocal_forces(
+            system,
+            owned,
+            projector_cache=projector_cache,
         )
-        for point in owned:
-            compact = point.eigen._compact_coefficients
-            if not isinstance(compact, _CompactLaneState):
-                msg = "periodic forces require compact occupied k-point states"
-                raise ValueError(msg)
-            operator = PeriodicGTHNonlocalOperator(
-                system.pseudopotentials,
-                point.basis,
-                system.positions,
-                cache=projector_cache,
-            )
-            occupations = [2.0] * compact.vector_count
-            point_force = operator._forces_compact(
-                compact,
-                occupations=occupations,
-            )
-            nonlocal_force = (
-                nonlocal_force
-                + float(point.integration_weight) * point_force
-            )
-            mx.eval(nonlocal_force)
         timings["nonlocal"] = (perf_counter() - phase_start) * 1000.0
 
     phase_start = perf_counter()
@@ -210,17 +244,7 @@ def periodic_scf_forces(
     mx.eval(ion_ewald)
     timings["ion_ewald"] = (perf_counter() - phase_start) * 1000.0
 
-    forces = (local + nonlocal_force + ion_ewald).astype(mx.float32)
-    finite = (
-        mx.all(mx.isfinite(local))
-        & mx.all(mx.isfinite(nonlocal_force))
-        & mx.all(mx.isfinite(ion_ewald))
-        & mx.all(mx.isfinite(forces))
-    )
-    mx.eval(forces, finite)
-    if not bool(finite):
-        msg = "periodic force evaluation produced a non-finite value"
-        raise ValueError(msg)
+    forces = _validated_force_sum(local, nonlocal_force, ion_ewald)
     timings["total"] = (perf_counter() - total_start) * 1000.0
     return PeriodicForceResult(
         forces=forces,
