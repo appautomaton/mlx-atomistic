@@ -331,6 +331,18 @@ was 0.16% slower in the first adjacent pair and 0.17% faster in the second. All
 arms passed, and the candidate was removed. The table footprint was not a
 measurable bottleneck on this workload; compaction is not the next Direct lever.
 
+An Xcode GPU Replay then resolved the current Interaction32 compiler profile.
+Two JAC force dispatches took 1.95 ms each, and the 382-instruction profile was
+dominated by arithmetic logic unit work rather than memory, control flow, or
+synchronization. Xcode did not expose occupancy or a usable live-register peak
+for the just-in-time MLX custom kernel. Removing one derived-index threadgroup
+buffer nevertheless tested the memory hypothesis directly. It preserved force
+parity and improved fixed-schedule blocks on all three systems, but an isolated
+1,500-step JAC trajectory improved only 0.46% against a contemporaneous control.
+The source change was removed because it missed the 3% whole-step gate. The
+next Direct candidate must reduce useful-pair arithmetic or complete SIMD work,
+not merely move index traffic out of threadgroup memory.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.

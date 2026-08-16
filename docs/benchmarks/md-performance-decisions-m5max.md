@@ -62,6 +62,16 @@ These capabilities were introduced with `6dd355d`, `4122577`, and later
 Neighbor commits. The runnable contract is documented in
 [`md-suite.md`](./md-suite.md).
 
+A 2026-08-16 Xcode GPU Replay of the current JAC Interaction32 force path
+measured two identical 2,307,200-thread dispatches at 1.95 ms each. Xcode
+reported 382 compiler instructions and an instruction mix dominated by
+arithmetic logic unit work, with much smaller memory, control-flow, and
+synchronization components. It did not report Maximum Theoretical Occupancy or
+a usable live-register peak for this just-in-time MLX custom kernel. These are
+compiler-profile boundaries, not runtime utilization percentages; they direct
+new work toward useful-pair arithmetic rather than another memory or barrier
+micro-optimization.
+
 ## Rejected Directions
 
 | Candidate | Why it was rejected | Historical commit |
@@ -103,6 +113,7 @@ Neighbor commits. The runnable contract is documented in
 | Cross-tile SIMD reduction batching | Accumulating two or three right tiles before reducing left forces lowered the nominal reduction count but increased register pressure. Both timing directions regressed by 17.6-20.3% on 5DFR; a vector-form `simd_sum` was also neutral to slower. | uncommitted prototypes; `results/md-suite/direct-common-work-screen-2026-08-15.json` |
 | Shared-weight PME spread | Computing order-five B-spline weights once per atom removed four of five repeated weight evaluations, but the required threadgroup barrier did not transfer. Directional timings changed sign on all three systems, and the combined change stayed below 1% on 5DFR and GPCRmd. | uncommitted prototype; `results/md-suite/pme-shared-spread-screen-2026-08-15/` |
 | Five-thread PME interpolation | Splitting each atom's 125 grid reads across five z-slice workers preserved force parity within `2.3e-5 kJ/(mol A)`, but two barriers and shared-memory traffic regressed 5DFR by 0.4-0.9%, JAC by 2.4-5.6%, and GPCRmd by 5.2-13.0%. | uncommitted prototype; `results/md-suite/pme-parallel-interpolation-screen-2026-08-15/` |
+| Computed left-order indices | Replacing a 256-512 byte per-threadgroup index buffer with the equivalent block/slice/slot expression preserved Interaction32, device-built fused-half, and CHARMM NBFIX force parity. Fixed-schedule blocks improved 15.6% on 5DFR, 1.5-6.7% on JAC, and 0.9-2.1% on GPCRmd, but the gain did not transfer to the trajectory gate: an isolated 1,500-step JAC candidate improved only 0.46% against a contemporaneous control, below the required 3%, while 5DFR was effectively neutral against the fresh pre-change baseline. The prototype was removed. | uncommitted prototype; `results/md-suite/direct-left-index-*-2026-08-16*` |
 
 ## Interaction32 Promotion
 
