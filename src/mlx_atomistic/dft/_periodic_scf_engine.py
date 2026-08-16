@@ -629,7 +629,11 @@ class _PeriodicSCFController:
 
     def _evaluate_iteration(self, iteration: int) -> _PeriodicSCFIterationResult:
         hartree, xc_result, effective_snapshot = self._effective_potential()
-        owned_results, max_orbital_residual = self._solve_owned_kpoints(
+        (
+            owned_results,
+            max_orbital_residual,
+            orbital_densities,
+        ) = self._solve_owned_kpoints(
             iteration,
             effective_snapshot,
         )
@@ -639,6 +643,7 @@ class _PeriodicSCFController:
                 occupation=2.0,
                 policy=self.setup.compact_policy,
                 observer=self.setup.observer,
+                orbital_densities=orbital_densities,
             )
             target_count = float(mx.sum(target_density) * self.setup.system.grid.dv)
             target_density = target_density * (self.setup.system.electron_count / target_count)
@@ -715,7 +720,11 @@ class _PeriodicSCFController:
         self,
         iteration: int,
         effective_snapshot: mx.array,
-    ) -> tuple[tuple[PeriodicKPointResult, ...], float]:
+    ) -> tuple[
+        tuple[PeriodicKPointResult, ...],
+        float,
+        tuple[mx.array, ...],
+    ]:
         start = perf_counter()
         operators_by_index = {
             point_index: PeriodicKohnShamOperator._from_shared_potential(
@@ -751,6 +760,7 @@ class _PeriodicSCFController:
                     or self.setup.resumed
                     or iteration > self.progress.iteration_start
                 ),
+                capture_orbital_density=True,
             )
             for point_index in self.setup.owned_indices
         )
@@ -775,11 +785,15 @@ class _PeriodicSCFController:
                 eigen_outcome.failures,
             )
         owned_by_index: dict[int, PeriodicKPointResult] = {}
+        orbital_density_by_index: dict[int, mx.array] = {}
         max_orbital_residual = 0.0
         for point_index in self.setup.owned_indices:
             basis = self.setup.bases[point_index]
             entry = self.setup.ownership.entry_for(point_index)
             eigen = eigen_outcome.result_for(basis._layout.lane_id)
+            orbital_density_by_index[point_index] = eigen_outcome.orbital_density_for(
+                basis._layout.lane_id
+            )
             add_observed_work(self.setup.observer, {"kpoint_lane_solves": 1})
             if entry.role == "owner":
                 add_observed_work(
@@ -799,6 +813,7 @@ class _PeriodicSCFController:
         return (
             tuple(owned_by_index[index] for index in self.setup.owned_indices),
             max_orbital_residual,
+            tuple(orbital_density_by_index[index] for index in self.setup.owned_indices),
         )
 
     def _submission_callback(
@@ -829,6 +844,7 @@ class _PeriodicSCFController:
             complete_transient_bytes = PeriodicKohnShamOperator._estimated_batch_transient_bytes(
                 [ticket.operator for ticket in tickets],
                 batch,
+                captured_density_lanes=sum(ticket.capture_orbital_density for ticket in tickets),
             )
             fields: dict[str, object] = {
                 "status": status,

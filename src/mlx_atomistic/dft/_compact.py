@@ -814,8 +814,13 @@ class _CompactBatch:
         potential: mx.array,
         *,
         scattered: mx.array | None = None,
+        real_orbitals: mx.array | None = None,
     ) -> mx.array:
         """Apply lane-local or shared potentials with one FFT pair."""
+
+        if scattered is not None and real_orbitals is not None:
+            msg = "local application accepts either scattered or real orbitals"
+            raise ValueError(msg)
 
         field = mx.array(potential)
         if field.shape == self.grid_shape:
@@ -839,7 +844,15 @@ class _CompactBatch:
         else:
             msg = "local potential must be shared grid-shaped or lane-batched"
             raise ValueError(msg)
-        real = self.to_real(scattered=scattered)
+        real = (
+            self.to_real(scattered=scattered)
+            if real_orbitals is None
+            else mx.array(real_orbitals).astype(mx.complex64)
+        )
+        expected = (self.lane_capacity, self.vector_count, *self.grid_shape)
+        if real.shape != expected:
+            msg = "real-space orbital batch has the wrong shape"
+            raise ValueError(msg)
         return self.from_real(real * batched_field)
 
     def unpad(self, values: mx.array, *, kind: str | None = None) -> tuple[_CompactLaneState, ...]:

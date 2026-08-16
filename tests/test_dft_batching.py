@@ -323,6 +323,41 @@ def test_compact_hpsi_batches_ragged_lanes_with_one_fft_pair(monkeypatch):
     assert work["padding_elements"] == abs(first.active_count - second.active_count)
 
 
+def test_compact_hpsi_captures_only_requested_orbital_density():
+    first, second = _bases()
+    states = (
+        _state(first, vectors=1, seed=110),
+        _state(second, vectors=2, seed=111),
+    )
+    potential = mx.full(first.grid.shape, 0.35, dtype=mx.float32)
+    operators = tuple(
+        PeriodicKohnShamOperator._from_shared_potential(basis, potential)
+        for basis in (first, second)
+    )
+    reference_batch = _CompactBatch.from_states(states)
+    reference_orbitals = reference_batch.to_real()
+    reference_density = mx.sum(
+        mx.abs(reference_orbitals[0, : states[0].vector_count]) ** 2,
+        axis=0,
+    )
+
+    outcome = PeriodicKohnShamOperator._apply_compact_batch(
+        operators,
+        states,
+        capture_orbital_densities=(True, False),
+    )
+
+    assert not outcome.failures
+    assert set(outcome.orbital_densities) == {0}
+    np.testing.assert_allclose(
+        np.asarray(outcome.orbital_density_for(0)),
+        np.asarray(reference_density),
+        atol=3e-6,
+    )
+    with pytest.raises(ValueError, match="no orbital density"):
+        outcome.orbital_density_for(1)
+
+
 def test_compact_hpsi_stable_capacity_masks_lane_vector_and_active_padding():
     first, second = _bases()
     states = (
@@ -734,6 +769,7 @@ def test_density_batch_one_and_many_have_the_same_ordered_sum():
     )
     singleton_observer = RuntimeObserver()
     batched_observer = RuntimeObserver()
+    cached_observer = RuntimeObserver()
     singleton = _density_from_kpoints(
         results,
         occupation=2.0,
@@ -746,14 +782,32 @@ def test_density_batch_one_and_many_have_the_same_ordered_sum():
         policy=_CompactBatchPolicy(batch_cap=2),
         observer=batched_observer,
     )
+    orbital_densities = tuple(
+        mx.sum(
+            mx.abs(_CompactBatch.from_states((state,)).to_real()[0, : state.vector_count]) ** 2,
+            axis=0,
+        ).astype(mx.float32)
+        for state in states
+    )
+    cached = _density_from_kpoints(
+        results,
+        occupation=2.0,
+        policy=_CompactBatchPolicy(batch_cap=2),
+        observer=cached_observer,
+        orbital_densities=orbital_densities,
+    )
 
     np.testing.assert_allclose(np.asarray(batched), np.asarray(singleton), atol=3e-6)
+    np.testing.assert_allclose(np.asarray(cached), np.asarray(batched), atol=3e-6)
     singleton_work = singleton_observer.snapshot()["work_counters"]
     batched_work = batched_observer.snapshot()["work_counters"]
     assert singleton_work["fft_submissions"] == 2
     assert batched_work["fft_submissions"] == 1
     assert singleton_work["fft_vector_equivalents"] == 4
     assert batched_work["fft_vector_equivalents"] == 4
+    cached_work = cached_observer.snapshot()["work_counters"]
+    assert cached_work["fft_submissions"] == 0
+    assert cached_work["fft_vector_equivalents"] == 0
 
 
 def test_pulay_diis_only_moves_the_small_gram_matrix_to_numpy(monkeypatch):
@@ -983,6 +1037,7 @@ def test_representative_scf_k_batch_one_and_many_match_trajectory_and_events():
     assert batched_work["hpsi_calls"] < singleton_work["hpsi_calls"]
     assert batched_work["hpsi_vector_equivalents"] == singleton_work["hpsi_vector_equivalents"]
     assert batched_work["fft_submissions"] < singleton_work["fft_submissions"]
+    assert batched_work["fft_vector_equivalents"] == (2 * batched_work["hpsi_vector_equivalents"])
 
 
 def test_finite_hpsi_buckets_preserve_small_scf_trajectory():

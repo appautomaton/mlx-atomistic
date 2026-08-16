@@ -402,7 +402,6 @@ def _plan_compact_submissions(
     ).plan()
 
 
-
 def _stable_compact_capacity_groups(
     states: Sequence[_CompactLaneState],
     indices: Sequence[int],
@@ -462,6 +461,7 @@ class _DavidsonApplicationTicket:
     vectors: _CompactLaneState
     observer: RuntimeObserver | None
     purpose: str = "basis"
+    capture_orbital_density: bool = False
 
 
 _DavidsonSubmissionCallback = Callable[
@@ -481,6 +481,7 @@ class _DavidsonScheduleResult:
     """Per-lane actions plus compatible and actually submitted groups."""
 
     actions: dict[str, _CompactLaneState]
+    orbital_densities: dict[str, mx.array]
     failures: dict[str, Exception]
     groups: tuple[tuple[str, ...], ...]
     compatibility_groups: tuple[tuple[str, ...], ...]
@@ -497,6 +498,18 @@ class _DavidsonScheduleResult:
             return self.actions[lane_id]
         except KeyError as error:
             msg = f"Davidson scheduler has no result for lane {lane_id!r}"
+            raise ValueError(msg) from error
+
+    def orbital_density_for(self, lane_id: str) -> mx.array:
+        """Return the captured final-orbital density for one lane."""
+
+        failure = self.failures.get(lane_id)
+        if failure is not None:
+            raise _detached_failure(failure) from None
+        try:
+            return self.orbital_densities[lane_id]
+        except KeyError as error:
+            msg = f"Davidson scheduler has no orbital density for lane {lane_id!r}"
             raise ValueError(msg) from error
 
 
@@ -608,6 +621,7 @@ class _DavidsonScheduler:
     ) -> _DavidsonScheduleResult:
         ready, failures = self._validate_tickets(tickets)
         actions: dict[str, _CompactLaneState] = {}
+        orbital_densities: dict[str, mx.array] = {}
         groups: list[tuple[str, ...]] = []
         compatibility_groups: list[tuple[str, ...]] = []
         for compatible in self._compatible_batches(ready):
@@ -630,12 +644,14 @@ class _DavidsonScheduler:
                 (
                     submission_index,
                     batch_actions,
+                    batch_densities,
                     submission_failures,
                 ) = self._submit(
                     submission,
                     prepared_batch,
                 )
                 actions.update(batch_actions)
+                orbital_densities.update(batch_densities)
                 failures.update(submission_failures)
                 self._notify_submission(
                     "completed",
@@ -646,6 +662,7 @@ class _DavidsonScheduler:
                 )
         return _DavidsonScheduleResult(
             actions=actions,
+            orbital_densities=orbital_densities,
             failures=failures,
             groups=tuple(groups),
             compatibility_groups=tuple(compatibility_groups),
@@ -697,6 +714,11 @@ class _DavidsonScheduler:
         if ticket.purpose not in {"basis", "direct_validation"}:
             msg = "Davidson application purpose is invalid"
             raise ValueError(msg)
+        if type(ticket.capture_orbital_density) is not bool or (
+            ticket.capture_orbital_density and ticket.purpose != "direct_validation"
+        ):
+            msg = "orbital density can only be captured for direct validation"
+            raise ValueError(msg)
         ticket.token.validate(
             ticket.operator,
             ticket.config,
@@ -745,6 +767,9 @@ class _DavidsonScheduler:
             return PeriodicKohnShamOperator._estimated_batch_transient_bytes(
                 [compatible[index].operator for index in indices],
                 batch,
+                captured_density_lanes=sum(
+                    compatible[index].capture_orbital_density for index in indices
+                ),
             )
 
         bound_capacity = self._capacity_by_lane.get(compatible[0].lane_id)
@@ -796,6 +821,9 @@ class _DavidsonScheduler:
             PeriodicKohnShamOperator._estimated_batch_transient_bytes(
                 [ticket.operator for ticket in submission],
                 prepared_batch,
+                captured_density_lanes=sum(
+                    ticket.capture_orbital_density for ticket in submission
+                ),
             )
         )
         runtime_observer = self._observer(submission[0])
@@ -813,6 +841,7 @@ class _DavidsonScheduler:
     ) -> tuple[
         int,
         dict[str, _CompactLaneState],
+        dict[str, mx.array],
         dict[str, Exception],
     ]:
         submission_index = self._submission_index
@@ -826,11 +855,24 @@ class _DavidsonScheduler:
         )
         submission_failures: dict[str, Exception] = {}
         accepted_actions: dict[str, _CompactLaneState] = {}
+        accepted_densities: dict[str, mx.array] = {}
         try:
-            batch_actions, submission_failures = self._apply_submission(
+            (
+                batch_actions,
+                batch_densities,
+                submission_failures,
+            ) = self._apply_submission(
                 submission,
                 prepared_batch,
             )
+            for ticket in submission:
+                if (
+                    ticket.capture_orbital_density
+                    and ticket.lane_id in batch_actions
+                    and ticket.lane_id not in batch_densities
+                ):
+                    msg = "direct validation did not capture its orbital density"
+                    raise RuntimeError(msg)
             for ticket in submission:
                 applied = batch_actions.get(ticket.lane_id)
                 if applied is None:
@@ -845,19 +887,32 @@ class _DavidsonScheduler:
                             )
                         },
                     )
+                if ticket.capture_orbital_density:
+                    accepted_densities[ticket.lane_id] = batch_densities[ticket.lane_id]
         except Exception as error:
             failure = _detached_failure(error)
+            accepted_actions.clear()
+            accepted_densities.clear()
             submission_failures.update(
                 {ticket.lane_id: failure for ticket in submission}
             )
-        return submission_index, accepted_actions, submission_failures
+        return (
+            submission_index,
+            accepted_actions,
+            accepted_densities,
+            submission_failures,
+        )
 
     def _apply_submission(
         self,
         submission: tuple[_DavidsonApplicationTicket, ...],
         prepared_batch: _CompactBatch,
-    ) -> tuple[dict[str, _CompactLaneState], dict[str, Exception]]:
-        if len(submission) == 1:
+    ) -> tuple[
+        dict[str, _CompactLaneState],
+        dict[str, mx.array],
+        dict[str, Exception],
+    ]:
+        if len(submission) == 1 and not submission[0].capture_orbital_density:
             ticket = submission[0]
             applied = ticket.operator._apply_compact(
                 ticket.vectors,
@@ -865,13 +920,16 @@ class _DavidsonScheduler:
                 policy=self._policy,
                 prepared_batch=prepared_batch,
             )
-            return {ticket.lane_id: applied}, {}
+            return {ticket.lane_id: applied}, {}, {}
         outcome = PeriodicKohnShamOperator._apply_compact_batch(
             tuple(ticket.operator for ticket in submission),
             tuple(ticket.vectors for ticket in submission),
             observer=self._observer(submission[0]),
             policy=self._policy,
             prepared_batch=prepared_batch,
+            capture_orbital_densities=tuple(
+                ticket.capture_orbital_density for ticket in submission
+            ),
         )
         actions = {
             ticket.lane_id: outcome.actions[index]
@@ -882,7 +940,11 @@ class _DavidsonScheduler:
             submission[index].lane_id: error
             for index, error in outcome.failures.items()
         }
-        return actions, failures
+        orbital_densities = {
+            submission[index].lane_id: density
+            for index, density in outcome.orbital_densities.items()
+        }
+        return actions, orbital_densities, failures
 
     def _notify_submission(
         self,
@@ -900,7 +962,6 @@ class _DavidsonScheduler:
                 prepared_batch,
                 failures,
             )
-
 
 
 @dataclass(frozen=True)
@@ -1349,6 +1410,7 @@ class _DavidsonLaneRequest:
     observer: RuntimeObserver | None
     rank_policy: _Complex64RankPolicy = _DAVIDSON_RANK_POLICY
     trial_is_orthonormal: bool = False
+    capture_orbital_density: bool = False
 
 
 @dataclass(frozen=True)
@@ -1388,6 +1450,7 @@ class _DavidsonLaneProgress:
     restart_count: int = 0
     correction_width: int = 0
     pending_action: _DavidsonPendingAction | None = None
+    orbital_density: mx.array | None = None
     direct_validated: bool = False
     converged: bool = False
     done: bool = False
@@ -1399,6 +1462,7 @@ class _DavidsonEngineResult:
     """Independent lane outcomes and actual shared-engine scheduling evidence."""
 
     results: dict[str, PeriodicEigenResult]
+    orbital_densities: dict[str, mx.array]
     failures: dict[str, Exception]
     ready_rounds: tuple[tuple[str, ...], ...]
     compatibility_groups: tuple[tuple[str, ...], ...]
@@ -1413,6 +1477,18 @@ class _DavidsonEngineResult:
             return self.results[lane_id]
         except KeyError as error:
             msg = f"Davidson engine has no result for lane {lane_id!r}"
+            raise ValueError(msg) from error
+
+    def orbital_density_for(self, lane_id: str) -> mx.array:
+        """Return the captured final-orbital density for one lane."""
+
+        failure = self.failures.get(lane_id)
+        if failure is not None:
+            raise _detached_failure(failure) from None
+        try:
+            return self.orbital_densities[lane_id]
+        except KeyError as error:
+            msg = f"Davidson engine has no orbital density for lane {lane_id!r}"
             raise ValueError(msg) from error
 
 
@@ -1458,6 +1534,9 @@ class _DavidsonEngine:
         if type(request.trial_is_orthonormal) is not bool:
             msg = "trial_is_orthonormal must be a bool"
             raise ValueError(msg)
+        if type(request.capture_orbital_density) is not bool:
+            msg = "capture_orbital_density must be a bool"
+            raise ValueError(msg)
 
     @staticmethod
     def _ticket(
@@ -1477,6 +1556,9 @@ class _DavidsonEngine:
             vectors=vectors,
             observer=request.observer,
             purpose=purpose,
+            capture_orbital_density=(
+                request.capture_orbital_density and purpose == "direct_validation"
+            ),
         )
 
     def _schedule(
@@ -1948,6 +2030,7 @@ class _DavidsonEngine:
         applied: _CompactLaneState,
         *,
         direct_pair: _DavidsonRitzPair | None = None,
+        orbital_density: mx.array | None = None,
     ) -> _DavidsonPendingAction | None:
         pending = progress.pending_action
         if pending is None or pending.vectors is not ticket.vectors:
@@ -1955,6 +2038,9 @@ class _DavidsonEngine:
             raise RuntimeError(msg)
         progress.pending_action = None
         if pending.purpose == "correction":
+            if orbital_density is not None:
+                msg = "Davidson correction unexpectedly captured orbital density"
+                raise RuntimeError(msg)
             paired = progress.paired
             if paired is None:
                 msg = "Davidson lane lost paired V/HV state"
@@ -1975,6 +2061,14 @@ class _DavidsonEngine:
         if candidate is None:
             msg = "Davidson direct validation lost its Ritz state"
             raise RuntimeError(msg)
+        if ticket.capture_orbital_density:
+            if orbital_density is None:
+                msg = "Davidson direct validation lost its orbital density"
+                raise RuntimeError(msg)
+            progress.orbital_density = orbital_density
+        elif orbital_density is not None:
+            msg = "Davidson direct validation captured an unrequested orbital density"
+            raise RuntimeError(msg)
         if direct_pair is None:
             direct_pair = _ritz_pair_with_direct_action(candidate, applied)
         elif direct_pair.applied is not applied:
@@ -1992,6 +2086,7 @@ class _DavidsonEngine:
             progress.done = True
             return None
 
+        progress.orbital_density = None
         progress.paired = _PairedDavidsonState.initialize(
             candidate.vectors,
             applied,
@@ -2011,6 +2106,9 @@ class _DavidsonEngine:
             raise RuntimeError(msg)
         if progress.pending_action is not None or not progress.direct_validated:
             msg = "Davidson result was not sealed by a direct residual"
+            raise RuntimeError(msg)
+        if request.capture_orbital_density and progress.orbital_density is None:
+            msg = "Davidson result has no final-orbital density"
             raise RuntimeError(msg)
         orthonormality = request.rank_policy.validate(
             ritz_pair.vectors.values,
@@ -2047,8 +2145,14 @@ class _DavidsonEngine:
                 failures,
             )
         results = self._finalize_lanes(progress_by_lane, failures)
+        orbital_densities = {
+            lane_id: progress.orbital_density
+            for lane_id, progress in progress_by_lane.items()
+            if lane_id in results and progress.orbital_density is not None
+        }
         return _DavidsonEngineResult(
             results=results,
+            orbital_densities=orbital_densities,
             failures=failures,
             ready_rounds=tuple(self._ready_rounds),
             compatibility_groups=tuple(self._compatibility_groups),
@@ -2259,6 +2363,11 @@ class _DavidsonEngine:
                     ticket,
                     scheduled.action_for(lane_id),
                     direct_pair=direct_pairs.get(lane_id),
+                    orbital_density=(
+                        scheduled.orbital_density_for(lane_id)
+                        if ticket.capture_orbital_density
+                        else None
+                    ),
                 )
                 if followup is not None:
                     followup_tickets.append(
@@ -2282,9 +2391,6 @@ class _DavidsonEngine:
             except Exception as error:
                 self._fail_lane(progress, failures, error)
         return results
-
-
-
 
 
 def solve_periodic_eigenproblem(

@@ -20,7 +20,7 @@ from mlx_atomistic.dft import (
     RealSpaceGrid,
     solve_periodic_eigenproblem,
 )
-from mlx_atomistic.dft._compact import _CompactBatchPolicy
+from mlx_atomistic.dft._compact import _CompactBatch, _CompactBatchPolicy
 from mlx_atomistic.dft._periodic_davidson import (
     _Complex64RankPolicy,
     _DavidsonApplicationTicket,
@@ -1053,6 +1053,34 @@ def test_engine_reuses_solver_validated_orthonormal_trial_without_reprocessing()
 
     assert progress.initial_vectors is trial
     assert observer.snapshot()["work_counters"]["orthogonalization_vectors"] == 0
+
+
+def test_engine_returns_requested_final_orbital_density():
+    basis, operator = _problem(lane_label="captured-density")
+    request = _DavidsonLaneRequest(
+        lane_id="captured-density",
+        operator=operator,
+        n_bands=2,
+        config=PeriodicDavidsonConfig(max_iterations=2, max_subspace_size=4),
+        trial=periodic_davidson._initial_coefficients(basis, 2),
+        observer=None,
+        trial_is_orthonormal=True,
+        capture_orbital_density=True,
+    )
+
+    outcome = _DavidsonEngine().solve((request,))
+    result = outcome.result_for(request.lane_id)
+    reference_orbitals = _CompactBatch.from_states((result._compact_coefficients,)).to_real()[
+        0, : result._compact_coefficients.vector_count
+    ]
+    reference_density = mx.sum(mx.abs(reference_orbitals) ** 2, axis=0)
+
+    assert not outcome.failures
+    np.testing.assert_allclose(
+        np.asarray(outcome.orbital_density_for(request.lane_id)),
+        np.asarray(reference_density),
+        atol=3e-6,
+    )
 
 
 def test_engine_emits_collective_round_progress_when_detail_is_disabled():

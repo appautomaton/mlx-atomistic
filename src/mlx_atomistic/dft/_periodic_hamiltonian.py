@@ -42,6 +42,7 @@ class _CompactHamiltonianBatchResult:
     """Lane-local outcomes from one physical compact Hamiltonian batch."""
 
     actions: dict[int, _CompactLaneState]
+    orbital_densities: dict[int, mx.array]
     failures: dict[int, Exception]
     batch: _CompactBatch | None
 
@@ -55,10 +56,24 @@ class _CompactHamiltonianBatchResult:
             msg = f"compact Hamiltonian batch has no lane {lane_index}"
             raise ValueError(msg) from error
 
+    def orbital_density_for(self, lane_index: int) -> mx.array:
+        """Return one requested lane's captured real-space orbital density."""
+
+        failure = self.failures.get(lane_index)
+        if failure is not None:
+            raise _detached_failure(failure) from None
+        try:
+            return self.orbital_densities[lane_index]
+        except KeyError as error:
+            msg = f"compact Hamiltonian batch has no orbital density for lane {lane_index}"
+            raise ValueError(msg) from error
+
 
 def _estimated_batch_transient_bytes(
     operators: Sequence[PeriodicKohnShamOperator],
     batch: _CompactBatch,
+    *,
+    captured_density_lanes: int = 0,
 ) -> int:
     """Return the complete logical transient bound for one Hpsi batch."""
 
@@ -68,7 +83,15 @@ def _estimated_batch_transient_bytes(
     lane_count = batch.lane_capacity
     padded_complex_bytes = lane_count * batch.vector_count * batch.bucket_size * 8
     kinetic_index_bytes = lane_count * batch.bucket_size * 4
-    estimate = batch.estimated_transient_bytes + 5 * padded_complex_bytes + kinetic_index_bytes
+    if not 0 <= captured_density_lanes <= len(operators):
+        msg = "captured density lane count must match the Hamiltonian operators"
+        raise ValueError(msg)
+    estimate = (
+        batch.estimated_transient_bytes
+        + 5 * padded_complex_bytes
+        + kinetic_index_bytes
+        + captured_density_lanes * batch.grid_size * 4
+    )
     first_potential = operators[0]._effective_local_potential
     if not all(operator._effective_local_potential is first_potential for operator in operators):
         estimate += lane_count * batch.grid_size * 8
@@ -99,6 +122,7 @@ class _CompactHamiltonianExecutor:
         observer: RuntimeObserver | None,
         policy: _CompactBatchPolicy,
         prepared_batch: _CompactBatch | None,
+        capture_orbital_densities: Sequence[bool] | None,
     ) -> None:
         if not operators or len(operators) != len(coefficients):
             msg = "compact Hamiltonian batches require matching non-empty lanes"
@@ -108,8 +132,19 @@ class _CompactHamiltonianExecutor:
         self.observer = self._resolve_observer(observer)
         self.policy = policy
         self.prepared_batch = prepared_batch
+        self.capture_orbital_densities = (
+            (False,) * len(self.operators)
+            if capture_orbital_densities is None
+            else tuple(capture_orbital_densities)
+        )
+        if len(self.capture_orbital_densities) != len(self.operators) or any(
+            type(value) is not bool for value in self.capture_orbital_densities
+        ):
+            msg = "orbital-density capture flags must match the Hamiltonian operators"
+            raise ValueError(msg)
         self.failures: dict[int, Exception] = {}
         self.actions: dict[int, _CompactLaneState] = {}
+        self.orbital_densities: dict[int, mx.array] = {}
         self.ready_indices: list[int] = []
         self.projector_actions: dict[int, _CompactLaneState] = {}
         self.projector_metrics: dict[int, dict[str, int]] = {}
@@ -141,11 +176,13 @@ class _CompactHamiltonianExecutor:
                 except Exception as error:
                     failure = _detached_failure(error)
                     self.actions = {}
+                    self.orbital_densities = {}
                     for lane_index in self.ready_indices:
                         self.failures[lane_index] = failure
         self._record_execution()
         return _CompactHamiltonianBatchResult(
             actions=self.actions,
+            orbital_densities=self.orbital_densities,
             failures=self.failures,
             batch=self.batch if self.executed_fft else None,
         )
@@ -191,6 +228,9 @@ class _CompactHamiltonianExecutor:
         self.estimated_transient_bytes = _estimated_batch_transient_bytes(
             ready_operators,
             self.batch,
+            captured_density_lanes=sum(
+                self.capture_orbital_densities[index] for index in self.ready_indices
+            ),
         )
         if self.estimated_transient_bytes > self.policy.max_transient_bytes:
             msg = "compact Hpsi batch exceeds the complete transient byte budget"
@@ -272,9 +312,10 @@ class _CompactHamiltonianExecutor:
         scattered = self.batch.scatter()
         kinetic_values, nonlocal_values = self._padded_kinetic_and_nonlocal(ready_states)
         kinetic_action = self.batch.values * kinetic_values[:, None, :]
+        real_orbitals = self.batch.to_real(scattered=scattered)
         local_action = self.batch.apply_local(
             self._batched_potentials(),
-            scattered=scattered,
+            real_orbitals=real_orbitals,
         )
         self.executed_fft = True
         states = self.batch.unpad(
@@ -282,9 +323,20 @@ class _CompactHamiltonianExecutor:
             kind="hamiltonian_action",
         )
         finite = [mx.all(mx.isfinite(state.values)) for state in states]
+        captured_densities = {
+            lane_index: mx.sum(
+                mx.abs(real_orbitals[batch_index, : state.vector_count]) ** 2,
+                axis=0,
+            ).astype(mx.float32)
+            for batch_index, (lane_index, state) in enumerate(
+                zip(self.ready_indices, ready_states, strict=True)
+            )
+            if self.capture_orbital_densities[lane_index] and lane_index not in self.failures
+        }
         _materialize(
             self.observer,
             *(state.values for state in states),
+            *captured_densities.values(),
             *finite,
         )
         for lane_index, state, is_finite in zip(
@@ -301,6 +353,11 @@ class _CompactHamiltonianExecutor:
                 self.failures[lane_index] = ValueError(
                     "Davidson Hamiltonian action must be finite"
                 )
+        self.orbital_densities = {
+            lane_index: density
+            for lane_index, density in captured_densities.items()
+            if lane_index in self.actions
+        }
 
     def _padded_kinetic_and_nonlocal(
         self,
@@ -574,8 +631,14 @@ class PeriodicKohnShamOperator:
     def _estimated_batch_transient_bytes(
         operators: Sequence[PeriodicKohnShamOperator],
         batch: _CompactBatch,
+        *,
+        captured_density_lanes: int = 0,
     ) -> int:
-        return _estimated_batch_transient_bytes(operators, batch)
+        return _estimated_batch_transient_bytes(
+            operators,
+            batch,
+            captured_density_lanes=captured_density_lanes,
+        )
 
     @staticmethod
     def _apply_compact_batch(
@@ -585,6 +648,7 @@ class PeriodicKohnShamOperator:
         observer: RuntimeObserver | None = None,
         policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
         prepared_batch: _CompactBatch | None = None,
+        capture_orbital_densities: Sequence[bool] | None = None,
     ) -> _CompactHamiltonianBatchResult:
         """Apply one bounded batch-first Hamiltonian submission."""
 
@@ -594,6 +658,7 @@ class PeriodicKohnShamOperator:
             observer=observer,
             policy=policy,
             prepared_batch=prepared_batch,
+            capture_orbital_densities=capture_orbital_densities,
         ).execute()
 
     def rayleigh_quotients(

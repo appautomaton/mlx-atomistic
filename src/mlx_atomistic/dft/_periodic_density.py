@@ -33,6 +33,10 @@ def _density_batch_bytes(batch: _CompactBatch) -> int:
     )
 
 
+def _cached_density_batch_bytes(*, lane_capacity: int, grid_size: int) -> int:
+    return (lane_capacity + 1) * grid_size * 4
+
+
 def _validated_density_states(
     results: Sequence[PeriodicKPointResult],
 ) -> tuple[tuple[int, int, int], tuple[_CompactLaneState, ...]]:
@@ -72,6 +76,7 @@ class _PeriodicDensityBuilder:
     observer: RuntimeObserver | None
     grid_shape: tuple[int, int, int]
     states: tuple[_CompactLaneState, ...]
+    orbital_densities: tuple[mx.array, ...] | None
     density: mx.array
 
     @classmethod
@@ -82,9 +87,15 @@ class _PeriodicDensityBuilder:
         occupation: float,
         policy: _CompactBatchPolicy,
         observer: RuntimeObserver | None,
+        orbital_densities: Sequence[mx.array] | None,
     ) -> _PeriodicDensityBuilder:
         owned_results = tuple(results)
         grid_shape, states = _validated_density_states(owned_results)
+        cached_densities = cls._validated_orbital_densities(
+            orbital_densities,
+            count=len(owned_results),
+            grid_shape=grid_shape,
+        )
         return cls(
             results=owned_results,
             occupation=occupation,
@@ -92,8 +103,30 @@ class _PeriodicDensityBuilder:
             observer=observer,
             grid_shape=grid_shape,
             states=states,
+            orbital_densities=cached_densities,
             density=mx.zeros(grid_shape, dtype=mx.float32),
         )
+
+    @staticmethod
+    def _validated_orbital_densities(
+        orbital_densities: Sequence[mx.array] | None,
+        *,
+        count: int,
+        grid_shape: tuple[int, int, int],
+    ) -> tuple[mx.array, ...] | None:
+        if orbital_densities is None:
+            return None
+        densities = tuple(mx.array(density) for density in orbital_densities)
+        if len(densities) != count:
+            msg = "cached orbital densities must match the k-point results"
+            raise ValueError(msg)
+        if any(density.shape != grid_shape for density in densities):
+            msg = "cached orbital densities must match the real-space grid"
+            raise ValueError(msg)
+        if any(density.dtype != mx.float32 for density in densities):
+            msg = "cached orbital densities must use float32 storage"
+            raise ValueError(msg)
+        return densities
 
     def build(self) -> mx.array:
         """Accumulate every compatible state group into one real density."""
@@ -116,7 +149,7 @@ class _PeriodicDensityBuilder:
             plan = _plan_compact_submissions(
                 capacity_states,
                 policy=self.policy,
-                batch_byte_estimator=lambda _indices, batch: _density_batch_bytes(batch),
+                batch_byte_estimator=self._batch_bytes,
                 capacity=capacity,
             )
             if plan.failures:
@@ -126,11 +159,26 @@ class _PeriodicDensityBuilder:
                 logical_indices = tuple(capacity_indices[index] for index in submission.indices)
                 self._accumulate_submission(logical_indices, capacity)
 
+    def _batch_bytes(
+        self,
+        _indices: tuple[int, ...],
+        batch: _CompactBatch,
+    ) -> int:
+        if self.orbital_densities is None:
+            return _density_batch_bytes(batch)
+        return _cached_density_batch_bytes(
+            lane_capacity=batch.lane_capacity,
+            grid_size=batch.grid_size,
+        )
+
     def _accumulate_submission(
         self,
         indices: tuple[int, ...],
         capacity: _CompactBatchCapacity,
     ) -> None:
+        if self.orbital_densities is not None:
+            self._accumulate_cached_submission(indices, capacity)
+            return
         batch = _CompactBatch.from_states(
             [self.states[index] for index in indices],
             policy=self.policy,
@@ -151,6 +199,45 @@ class _PeriodicDensityBuilder:
         self.density = self.density + mx.sum(weighted_density, axis=0)
         mx.eval(self.density)
         self._record_submission(batch, estimated_transient_bytes)
+
+    def _accumulate_cached_submission(
+        self,
+        indices: tuple[int, ...],
+        capacity: _CompactBatchCapacity,
+    ) -> None:
+        if self.orbital_densities is None:
+            msg = "cached density submission requires captured orbitals"
+            raise RuntimeError(msg)
+        densities = mx.stack(
+            [self.orbital_densities[index] for index in indices],
+            axis=0,
+        )
+        padding = capacity.lanes - len(indices)
+        if padding:
+            densities = mx.concatenate(
+                [
+                    densities,
+                    mx.zeros(
+                        (padding, *self.grid_shape),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=0,
+            )
+        weights = self._padded_weights(indices, capacity.lanes)
+        self.density = self.density + mx.sum(
+            weights[:, None, None, None] * densities,
+            axis=0,
+        )
+        mx.eval(self.density)
+        if self.observer is not None:
+            self.observer.record_peak_memory(
+                "peak_temporary_bytes",
+                _cached_density_batch_bytes(
+                    lane_capacity=capacity.lanes,
+                    grid_size=int(np.prod(self.grid_shape)),
+                ),
+            )
 
     def _padded_weights(self, indices: tuple[int, ...], lane_capacity: int) -> mx.array:
         weights = mx.array(
@@ -195,10 +282,12 @@ def _density_from_kpoints(
     occupation: float,
     policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
     observer: RuntimeObserver | None = None,
+    orbital_densities: Sequence[mx.array] | None = None,
 ) -> mx.array:
     return _PeriodicDensityBuilder.create(
         results,
         occupation=occupation,
         policy=policy,
         observer=observer,
+        orbital_densities=orbital_densities,
     ).build()
