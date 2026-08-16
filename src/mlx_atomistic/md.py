@@ -2685,11 +2685,25 @@ def _nonbonded_runtime_report(
             "estimated_candidate_memory_bytes": 0,
             "compaction_backend": None,
             "fallback_reason": None,
+            "adaptation_reason": None,
+            "two_level_schedule_admitted": None,
+            "two_level_observed_generations": 0,
+            "two_level_mean_generation_updates": None,
             "neighbor_update_wall_seconds": 0.0,
             "neighbor_rebuild_wall_seconds": 0.0,
             "force_evaluation_wall_seconds": force_evaluation_wall_seconds,
         }
         return _with_runtime_sync_report(report, runtime_sync_report)
+    observed_generations = (
+        0
+        if neighbor_manager is None
+        else neighbor_manager._interaction32_two_level_observed_generations
+    )
+    observed_updates = (
+        0
+        if neighbor_manager is None
+        else neighbor_manager._interaction32_two_level_observed_updates
+    )
     report = {
         "backend": neighbor_list.backend,
         "pair_count": neighbor_list.pair_count,
@@ -2708,6 +2722,18 @@ def _nonbonded_runtime_report(
         "estimated_candidate_memory_bytes": neighbor_list.estimated_candidate_bytes,
         "compaction_backend": neighbor_list.compaction_backend,
         "fallback_reason": neighbor_list.fallback_reason,
+        "adaptation_reason": neighbor_list.adaptation_reason,
+        "two_level_schedule_admitted": (
+            None
+            if neighbor_manager is None
+            else neighbor_manager._interaction32_two_level_admitted
+        ),
+        "two_level_observed_generations": observed_generations,
+        "two_level_mean_generation_updates": (
+            None
+            if observed_generations == 0
+            else observed_updates / observed_generations
+        ),
         "neighbor_update_wall_seconds": (
             0.0 if neighbor_manager is None else neighbor_manager.update_wall_seconds
         ),

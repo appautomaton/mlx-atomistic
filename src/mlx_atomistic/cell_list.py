@@ -57,6 +57,7 @@ class PairListStats:
     estimated_candidate_bytes: int = 0
     compaction_backend: str | None = None
     fallback_reason: str | None = None
+    adaptation_reason: str | None = None
 
 
 def estimate_pair_list_bytes(pair_count: int) -> int:

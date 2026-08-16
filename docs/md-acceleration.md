@@ -384,6 +384,22 @@ at 4.362 and 4.403 ms/step; GPCRmd measured 5.267 ms/step against controls at
 case is below the 80,000-atom admission boundary and remains on its unchanged
 single schedule.
 
+A fresh post-promotion whole-step profile at `e334398` keeps Direct Space as
+the next target. Its synchronized wall fractions were 19.06%, 29.17%, and
+32.34% on 5DFR, JAC, and GPCRmd. The corresponding reciprocal PME fractions
+were 10.26%, 10.79%, and 9.08%; Neighbor lifecycle fractions were 9.13%,
+10.01%, and 14.85%. Direct Space therefore has a 29.17% cross-system median,
+about 2.8 times the 10.26% reciprocal-PME median.
+
+The same run now reports the adaptive boundary explicitly. A 750-step probe
+kept JAC admitted at 34.76 updates per observed generation. GPCRmd and 90k
+TIP3P water returned to the single outer schedule after means of 21.67 and
+20.00 updates. Their close lifetimes rule out lowering the 24-update threshold
+to retain GPCRmd without risking the measured water regression. The next
+Direct experiment must therefore improve work shared by the admitted inner and
+production outer schedules; another admission-threshold adjustment is not a
+valid optimization target.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.

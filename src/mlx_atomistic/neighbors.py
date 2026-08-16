@@ -942,6 +942,12 @@ class NeighborList:
 
         return None if self.stats is None else self.stats.fallback_reason
 
+    @property
+    def adaptation_reason(self) -> str | None:
+        """Reason the active backend selected a different internal schedule."""
+
+        return None if self.stats is None else self.stats.adaptation_reason
+
 
 @dataclass
 class NeighborListManager:
@@ -1330,7 +1336,8 @@ class NeighborListManager:
                 candidate_count=pair_lanes,
                 estimated_candidate_bytes=resident_schedule_bytes,
                 compaction_backend=compaction_backend,
-                fallback_reason=(
+                fallback_reason=None,
+                adaptation_reason=(
                     "interaction32_two_level_short_generation"
                     if self._interaction32_two_level_admitted is False
                     else None

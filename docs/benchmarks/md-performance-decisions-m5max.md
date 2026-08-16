@@ -140,6 +140,15 @@ inner-to-outer lifecycle GPU tests passed. Implementation checkpoints are
 `e4c631d` and `8c029c2`; raw local evidence is under
 `results/md-suite/two-level-interaction32-2026-08-16/`.
 
+The post-promotion profile kept Direct Space dominant at 19.06% on 5DFR,
+29.17% on JAC, and 32.34% on GPCRmd, against 9.08--10.79% reciprocal PME.
+Explicit admission diagnostics measured 34.76 updates per JAC generation,
+21.67 for GPCRmd, and 20.00 for 90k TIP3P water. The 24-update threshold is
+retained: lowering it cannot separate GPCRmd from the water regression with a
+safe margin. The active schedule decision is reported as `adaptation_reason`;
+`fallback_reason` remains reserved for an actual backend failure. Raw evidence
+is under `results/md-suite/post-two-level-whole-step-profile-2026-08-16/`.
+
 The bounded mode cache in `0066b58` removes the remaining repeated ordinary
 membership traversal for systems whose packed cache is at most 64 MiB. Larger
 systems retain the exact sparse two-pass builder, so this promotion does not

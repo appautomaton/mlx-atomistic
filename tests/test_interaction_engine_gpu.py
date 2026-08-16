@@ -37,7 +37,12 @@ from mlx_atomistic.interaction_engine import (
     _special_block_codes,
     _try_build_device_fused_half_schedule32,
 )
-from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
+from mlx_atomistic.md import (
+    LangevinThermostat,
+    SimulationConfig,
+    _nonbonded_runtime_report,
+    simulate_nvt,
+)
 from mlx_atomistic.metal_kernels import _prepared_parameterized_pme_direct_force_only
 from mlx_atomistic.neighbors import NeighborListManager, build_neighbor_list
 from mlx_atomistic.pme import PMEConfig
@@ -1028,9 +1033,20 @@ def test_interaction32_two_level_admission_rejects_short_generations(monkeypatch
     assert manager.neighbor_list.stats.compaction_backend == (
         "metal_interaction32_device_builder"
     )
-    assert manager.neighbor_list.stats.fallback_reason == (
+    assert manager.neighbor_list.stats.fallback_reason is None
+    assert manager.neighbor_list.stats.adaptation_reason == (
         "interaction32_two_level_short_generation"
     )
+    report = _nonbonded_runtime_report(
+        mx.array(moved),
+        neighbor_manager=manager,
+        neighbor_list=manager.neighbor_list,
+    )
+    assert report["fallback_reason"] is None
+    assert report["adaptation_reason"] == "interaction32_two_level_short_generation"
+    assert report["two_level_schedule_admitted"] is False
+    assert report["two_level_observed_generations"] == 3
+    assert report["two_level_mean_generation_updates"] == pytest.approx(1.0)
 
 
 @pytest.mark.gpu
