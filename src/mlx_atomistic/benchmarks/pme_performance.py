@@ -20,6 +20,7 @@ from mlx_atomistic.benchmarks import (
     normalize_benchmark_payload,
     normalize_benchmark_row,
 )
+from mlx_atomistic.benchmarks._paths import PME_PROFILE_OUTPUT_ROOT
 from mlx_atomistic.benchmarks.gpcrmd_runtime import max_rss_mb
 from mlx_atomistic.benchmarks.pme_validation import manifest_hash
 from mlx_atomistic.forcefields import NonbondedPotential
@@ -42,7 +43,7 @@ from mlx_atomistic.pme import (
 )
 from mlx_atomistic.runtime import get_runtime_info
 
-DEFAULT_OUTPUT_DIR = Path("outputs/benchmarks/pme-profile")
+DEFAULT_OUTPUT_DIR = PME_PROFILE_OUTPUT_ROOT
 MISSING_FIXTURE_LABEL = Path("user-provided-pme-fixture")
 SYNC_TIMING_BLOCKER = (
     "PME exposes stage-level mx.eval barriers in the profiler, but exact "

@@ -33,12 +33,13 @@ FORBIDDEN_UNIGNORED_OUTPUT_ROOTS = (
     "pme-profile-output",
     "dhfr-artifacts",
 )
-IGNORED_GENERATED_OUTPUT_PREFIX = "outputs/benchmarks/"
+IGNORED_GENERATED_OUTPUT_PREFIX = "results/"
 REFERENCE_POLICY_TEXT_FILES = {
     Path("src/mlx_atomistic/benchmarks/dhfr.py"),
     Path("src/mlx_atomistic/runtime.py"),
     Path("src/mlx_atomistic/dft/references.py"),
 }
+BENCHMARK_OUTPUT_POLICY_FILE = Path("src/mlx_atomistic/benchmarks/_paths.py")
 
 
 def _python_files(root: Path, excluded_parts: set[str] | None = None) -> list[Path]:
@@ -169,6 +170,8 @@ def test_installed_package_does_not_hardcode_reference_tree_paths():
 def test_installed_package_does_not_hardcode_unignored_output_roots():
     offenders: dict[Path, list[str]] = {}
     for path in _python_files(ROOT / "src/mlx_atomistic"):
+        if path.relative_to(ROOT) == BENCHMARK_OUTPUT_POLICY_FILE:
+            continue
         matches = sorted(
             {
                 fragment
@@ -183,14 +186,32 @@ def test_installed_package_does_not_hardcode_unignored_output_roots():
     assert offenders == {}
 
 
+def test_benchmark_output_policy_stays_under_results():
+    from mlx_atomistic.benchmarks._paths import (
+        DHFR_ARTIFACT_ROOT,
+        LJ_SCALING_OUTPUT_ROOT,
+        PME_PROFILE_OUTPUT_ROOT,
+        SAME_WORKLOAD_OUTPUT_ROOT,
+    )
+
+    roots = (
+        DHFR_ARTIFACT_ROOT,
+        LJ_SCALING_OUTPUT_ROOT,
+        PME_PROFILE_OUTPUT_ROOT,
+        SAME_WORKLOAD_OUTPUT_ROOT,
+    )
+    assert all(path != Path("results") for path in roots)
+    assert all(path.is_relative_to("results") for path in roots)
+
+
 def test_default_generated_benchmark_paths_are_gitignored():
     paths = [
-        "outputs/benchmarks/pme-profile/pme-profile.json",
-        "outputs/benchmarks/dhfr-artifacts/dhfr-implicit/prepared_system.json",
-        "outputs/benchmarks/dhfr-artifacts/"
+        "results/pme-profile/pme-profile.json",
+        "results/dhfr-artifacts/dhfr-implicit/prepared_system.json",
+        "results/dhfr-artifacts/"
         "dhfr-amber20-jac-pme/prepared_system.json",
-        "outputs/benchmarks/same-workload-openmm-comparison/mlx-dhfr-implicit.json",
-        "outputs/benchmarks/same-workload-lj-scaling/summary.json",
+        "results/same-workload-openmm-comparison/mlx-dhfr-implicit.json",
+        "results/same-workload-lj-scaling/summary.json",
     ]
     result = subprocess.run(
         ["git", "check-ignore", *paths],

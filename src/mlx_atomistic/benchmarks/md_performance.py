@@ -21,6 +21,7 @@ from mlx_atomistic.benchmarks import (
     normalize_benchmark_payload,
     normalize_benchmark_row,
 )
+from mlx_atomistic.benchmarks._paths import SAME_WORKLOAD_OUTPUT_ROOT
 from mlx_atomistic.initialize import fcc_lattice, thermal_velocities
 from mlx_atomistic.io import load_npz_trajectory
 from mlx_atomistic.md import (
@@ -44,7 +45,7 @@ from mlx_atomistic.validation import build_platform_validation_evidence
 BenchmarkMode = Literal["auto", "dense", "dynamic-neighbor"]
 S5_LARGE_BENCHMARK_SIZES: tuple[int, ...] = (5000,)
 COMMAND = default_benchmark_command("md_performance")
-COMPARISON_OUTPUT_ROOT = "outputs/benchmarks/same-workload-openmm-comparison"
+COMPARISON_OUTPUT_ROOT = SAME_WORKLOAD_OUTPUT_ROOT.as_posix()
 
 
 @dataclass(frozen=True)

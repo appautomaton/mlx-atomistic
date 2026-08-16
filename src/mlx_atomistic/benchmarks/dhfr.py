@@ -25,6 +25,10 @@ from mlx_atomistic.benchmarks import (
     get_hardware_info,
     normalize_benchmark_payload,
 )
+from mlx_atomistic.benchmarks._paths import (
+    DHFR_ARTIFACT_ROOT,
+    SAME_WORKLOAD_OUTPUT_ROOT,
+)
 from mlx_atomistic.md import LangevinThermostat, SimulationConfig, simulate_nvt
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import PMEConfig, pme_readiness_report
@@ -34,7 +38,7 @@ from mlx_atomistic.runtime import get_runtime_info
 
 COMMAND = default_benchmark_command("dhfr")
 
-DEFAULT_ARTIFACT_ROOT = Path("outputs/benchmarks/dhfr-artifacts")
+DEFAULT_ARTIFACT_ROOT = DHFR_ARTIFACT_ROOT
 AMBER20_JAC_CASE = "dhfr-amber20-jac-pme"
 OPENMM_DHFR_SOLVATED = Path(
     "vendors/openmm/examples/benchmarks/5dfr_solv-cube_equil.pdb"
@@ -206,7 +210,7 @@ def readiness_payload(
         blocker=blocker,
         command=COMMAND,
         raw_output_path=(
-            f"outputs/benchmarks/same-workload-openmm-comparison/mlx-{case_spec.case}.json"
+            f"{SAME_WORKLOAD_OUTPUT_ROOT.as_posix()}/mlx-{case_spec.case}.json"
         ),
     )
 

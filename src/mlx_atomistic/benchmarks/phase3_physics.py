@@ -19,6 +19,7 @@ from mlx_atomistic.benchmarks import (
     normalize_benchmark_payload,
     normalize_benchmark_row,
 )
+from mlx_atomistic.benchmarks._paths import SAME_WORKLOAD_OUTPUT_ROOT
 from mlx_atomistic.forcefields import NonbondedPotential
 from mlx_atomistic.gbsa import GBSAForcePotential
 from mlx_atomistic.md import SimulationConfig, SimulationState
@@ -27,7 +28,7 @@ from mlx_atomistic.runtime import get_runtime_info
 from mlx_atomistic.virtual_sites import VirtualSiteManager, tip4p_ew_virtual_site
 
 COMMAND = default_benchmark_command("phase3_physics")
-COMPARISON_OUTPUT_ROOT = "outputs/benchmarks/same-workload-openmm-comparison"
+COMPARISON_OUTPUT_ROOT = SAME_WORKLOAD_OUTPUT_ROOT.as_posix()
 
 
 COMPARISON_PAIR_METADATA = {

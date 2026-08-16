@@ -186,7 +186,7 @@ def _assert_mlx_comparison_fields(row, *, pair_id, metric_family):
     assert row["comparison_metric_family"] == metric_family
     assert row["comparison_command"].startswith("uv run python -m mlx_atomistic.benchmarks.")
     assert row["comparison_raw_output_path"].startswith(
-        "outputs/benchmarks/same-workload-openmm-comparison/mlx-"
+        "results/same-workload-openmm-comparison/mlx-"
     )
 
 
@@ -234,7 +234,7 @@ def test_dhfr_implicit_prepare_blocks_without_explicit_inputs():
     assert payload["prepare"] is True
     assert payload["artifact_status"] == "not_attempted"
     assert payload["electrostatics_model"] == "gbsa_obc"
-    assert payload["artifact_path"].startswith("outputs/benchmarks/dhfr-artifacts/")
+    assert payload["artifact_path"].startswith("results/dhfr-artifacts/")
     assert "caller-provided DHFR input path" in payload["blocker"]
 
 
@@ -245,7 +245,7 @@ def test_jac_explicit_prepare_reports_amber_or_pme_gate():
     _assert_normalized_payload(payload, timing_metric="ns_per_day", status="blocked")
     assert payload["prepare"] is True
     assert payload["electrostatics_model"] == "pme"
-    assert payload["artifact_path"] == ("outputs/benchmarks/dhfr-artifacts/dhfr-amber20-jac-pme")
+    assert payload["artifact_path"] == ("results/dhfr-artifacts/dhfr-amber20-jac-pme")
     assert payload["force_term_required_arrays"] == [
         "pme_mesh_shape",
         "pme_alpha",
