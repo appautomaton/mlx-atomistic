@@ -25,7 +25,8 @@ representatives.
 | Adaptive-tolerance implementation | 73.743 s | 14 | Superseded baseline |
 | Finite Hpsi shape scheduler | 59.231 s | 14 | Retained production route |
 | Residual-aware CholeskyQR1/2 | 55.384 s paired median | 14 | Retained route |
-| Davidson-to-density FFT reuse | 54.839 s paired diagnostic | 14 | Current route |
+| Davidson-to-density FFT reuse | 54.839 s paired diagnostic | 14 | Retained route |
+| Deferred adaptive residual validation | 44.914 s paired diagnostic | 14 | Current route |
 
 The finite scheduler, introduced in `2a56533`, maps variable Davidson batches
 onto 12 reusable Metal shapes: lane capacities 1, 2, 4, or 8 crossed with
@@ -51,17 +52,35 @@ residual, and electron count exactly. It reduced FFT vector-equivalents from
 elapsed time from 56.305 to 54.839 seconds. This is a 2.61% wall reduction, or
 1.027x speedup, under the diagnostic low-power protocol.
 
+Adaptive SCF now defers direct-operator residual validation while the requested
+Davidson tolerance is looser than its final tolerance. Those inexact cycles use
+the paired subspace residual and rebuild density with a separate inverse FFT.
+Fixed-tolerance solves, standalone eigensolves, and every final-tolerance SCF
+cycle retain direct validation; an SCF result cannot converge without that final
+direct residual. This follows a measured middle path between Quantum ESPRESSO,
+which accepts projected convergence without a final Hamiltonian reapplication,
+and CP2K block Davidson, which constructs direct residuals from the current
+orbitals.
+
+A same-session low-power A/B/B/A diagnostic reduced mean complete wall from
+48.801 to 44.914 seconds, a 7.97% reduction or 1.087x speedup. Both candidate
+runs completed 14 cycles with identical candidate results and final direct
+residuals. Against the controls, the final energy changed by 2.87e-7 Hartree,
+the density residual by 7.10e-9, and the maximum orbital residual by 1.81e-9.
+Hpsi vector-equivalents fell from 127,859 to 110,118 and FFT
+vector-equivalents from 255,718 to 237,516.
+
 The current complete-run attribution is approximately:
 
 | Phase | Time | Share |
 | --- | ---: | ---: |
-| Hpsi applications | 28.41 s | 51.8% |
-| Orthogonalization | 10.23 s | 18.7% |
-| Projected Rayleigh-Ritz solve | 2.55 s | 4.7% |
-| Eigensolver control | 5.27 s | 9.6% |
-| CPU small solves | 4.02 s | 7.3% |
-| Density | 0.11 s | 0.2% |
-| Setup, mixing, persistence, and unaccounted | 4.25 s | 7.7% |
+| Hpsi applications | 22.86 s | 50.9% |
+| Orthogonalization | 9.59 s | 21.4% |
+| Projected Rayleigh-Ritz solve | 2.27 s | 5.1% |
+| Eigensolver control | 3.22 s | 7.2% |
+| CPU small solves | 3.56 s | 7.9% |
+| Density | 2.18 s | 4.9% |
+| Setup, mixing, persistence, and unaccounted | 1.24 s | 2.8% |
 
 Hpsi is the Hamiltonian applied to a batch of wavefunctions. It remains the
 largest phase, but the measurements below show that not every Hpsi boundary is
@@ -74,6 +93,7 @@ large enough to justify a new runtime route.
 | Finite Hpsi shape scheduling | Reused a bounded set of GPU shapes and reduced complete Silicon SCF wall from 73.743 to 59.231 seconds. | `2a56533` |
 | Residual-aware CholeskyQR | Skips the second pass only for a validated loose-residual basis; paired complete diagnostics reduced median wall from 56.855 to 55.384 seconds. | `6e49877` |
 | Davidson-to-density FFT reuse | Reuses the final direct-validation real-space orbitals; a complete paired diagnostic removed 24,192 FFT vector-equivalents and reduced wall by 2.61% with an identical trajectory. | `a8e0b6b` |
+| Deferred adaptive residual validation | Uses paired residuals only during inexact adaptive cycles, restores direct validation at the final tolerance, and reduced complete diagnostic wall by 7.97%. | `1c92075` |
 | Scientific EOS and band gates | Separated runtime convergence from equation-of-state (EOS) and band validation; Silicon admission was later recorded against all-electron references. | `78d4b9d`, `1972dce` |
 | Hpsi stage profiler | Separates local FFT, compact scatter/gather, kinetic, and Goedecker-Teter-Hutter (GTH) pseudopotential work using stable captured inputs. Profiles are diagnostic rather than production timings. | `9cd4ef6` |
 
@@ -104,16 +124,14 @@ calculation to maintain a separate production route.
 
 ## Current Direction
 
-Density construction is no longer an optimization target: its repeated inverse
-FFTs are gone and it now accounts for about 0.2% of complete wall. Hpsi still
-consumes about half of the calculation, and the 8-lane, 16-vector shape accounts
-for 947 of 1,388 complete-run calls. Its local path is almost entirely the MLX
-FFT pair. Reshaping or wrapping the same transforms did not improve the complete
-calculation. The next high-ceiling Hpsi candidate must reduce algorithmic FFT
-applications or useful vector-equivalents while preserving the convergence
-trajectory. Orthogonalization is the second measured target at 18.7%. Another
-C++ extension or narrow scatter/gather kernel is not justified by the retained
-evidence.
+The current route deliberately trades early direct Hpsi applications for
+density-only inverse FFTs. Density therefore rises from 0.2% to 4.9% of wall,
+while the more expensive Hpsi phase falls by about four seconds and remains the
+largest phase at 50.9%. The next high-ceiling target is correction-vector Hpsi,
+which accounted for 16.15 seconds in the control attribution, followed by
+orthogonalization at 21.4% of current wall. Reshaping or wrapping the same FFTs
+did not improve the complete calculation, so another C++ extension or narrow
+scatter/gather kernel is not justified by the retained evidence.
 
 Retrieve the retired detailed reports when auditing a historical result:
 

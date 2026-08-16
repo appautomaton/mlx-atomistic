@@ -31,6 +31,12 @@ Periodic SCF and bands use the MLX-native block-Davidson/Rayleigh-Ritz solver
 without building the full plane-wave Hamiltonian. Diagnostics expose residuals,
 orthonormality error, subspace work, and convergence metadata.
 
+Adaptive periodic SCF uses paired subspace residuals only while its requested
+eigensolver tolerance is looser than the final Davidson tolerance. It restores
+direct-operator residual validation at the final tolerance, and SCF convergence
+requires that directly validated result. Fixed-tolerance and standalone
+eigensolves always retain direct validation.
+
 ## Spin, Occupations, k-Points, And Bands
 
 The new spin layer is collinear only:
@@ -87,9 +93,11 @@ and three-dimensional scatter/gather kernels improved isolated boundaries but
 did not clear the complete-run retention gate. A compiled local FFT wrapper
 also changed the convergence trajectory and regressed complete wall time.
 
-The current route instead removes algorithmic work: the final Davidson
-direct-validation inverse FFT is reused by density construction. Further Hpsi
-work should likewise reduce FFT applications or useful vector-equivalents while
-preserving the exact SCF trajectory. Orthogonalization is the second measured
-target. The current measurements and rejected boundaries are maintained in the
+The current route instead removes algorithmic work. Final-tolerance Davidson
+inverse FFTs are reused by density construction, while earlier adaptive cycles
+defer direct validation and perform only the inverse FFT needed for density.
+Further Hpsi work should likewise reduce FFT applications or useful
+vector-equivalents while preserving final direct-residual validation.
+Orthogonalization is the second measured target. The current measurements and
+rejected boundaries are maintained in the
 [DFT performance decision ledger](./benchmarks/dft-performance-decisions-m5max.md).
