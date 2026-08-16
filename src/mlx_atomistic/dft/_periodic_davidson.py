@@ -1932,6 +1932,30 @@ class _DavidsonEngine:
         self,
         requests: Sequence[_DavidsonLaneRequest],
     ) -> _DavidsonEngineResult:
+        self._reset_solve(requests)
+        failures: dict[str, Exception] = {}
+        progress_by_lane = self._initialize_lanes(requests, failures)
+        while active := self._active_lanes(progress_by_lane, failures):
+            pending_tickets = self._prepare_round(active, failures)
+            self._consume_pending_waves(
+                pending_tickets,
+                progress_by_lane,
+                failures,
+            )
+        results = self._finalize_lanes(progress_by_lane, failures)
+        return _DavidsonEngineResult(
+            results=results,
+            failures=failures,
+            ready_rounds=tuple(self._ready_rounds),
+            compatibility_groups=tuple(self._compatibility_groups),
+            submission_groups=tuple(self._submission_groups),
+            scheduler_calls=self._scheduler_calls,
+        )
+
+    def _reset_solve(
+        self,
+        requests: Sequence[_DavidsonLaneRequest],
+    ) -> None:
         self.scheduler.reset()
         self._ready_rounds.clear()
         self._compatibility_groups.clear()
@@ -1945,153 +1969,206 @@ class _DavidsonEngine:
             msg = "Davidson engine lane IDs must be unique"
             raise ValueError(msg)
 
+    def _initialize_lanes(
+        self,
+        requests: Sequence[_DavidsonLaneRequest],
+        failures: dict[str, Exception],
+    ) -> dict[str, _DavidsonLaneProgress]:
         progress_by_lane: dict[str, _DavidsonLaneProgress] = {}
-        failures: dict[str, Exception] = {}
         initial_tickets: list[_DavidsonApplicationTicket] = []
         for request in requests:
             try:
                 progress = self._prepare_lane(request)
                 progress_by_lane[request.lane_id] = progress
-                initial_tickets.append(self._ticket(progress, progress.initial_vectors))
+                initial_tickets.append(
+                    self._ticket(progress, progress.initial_vectors)
+                )
             except Exception as error:
                 failures[request.lane_id] = _detached_failure(error)
-
-        if initial_tickets:
-            self.scheduler.bind(initial_tickets)
-            initial_schedule = self._schedule(initial_tickets)
-            for ticket in initial_tickets:
-                lane_id = ticket.lane_id
-                progress = progress_by_lane[lane_id]
-                try:
-                    progress.paired = _PairedDavidsonState.initialize(
-                        progress.initial_vectors,
-                        initial_schedule.action_for(lane_id),
-                        progress.token,
-                    )
-                except Exception as error:
-                    self._fail_lane(progress, failures, error)
-
-        while True:
-            active = [
-                progress
-                for lane_id, progress in progress_by_lane.items()
-                if lane_id not in failures and not progress.done
-            ]
-            if not active:
-                break
-            pending_tickets: list[_DavidsonApplicationTicket] = []
-            ritz_pairs, ritz_failures = self._batched_ritz_pairs(active)
-            summarized_observers = {
-                id(progress.request.observer): progress.request.observer
-                for progress in active
-                if progress.request.observer is not None
-                and not progress.request.observer.detail_events
-            }
-            for summarized in summarized_observers.values():
-                summarized_progress = [
-                    progress
-                    for progress in active
-                    if progress.request.observer is summarized
-                    and progress.request.lane_id in ritz_pairs
-                ]
-                if summarized_progress:
-                    summarized.emit(
-                        "davidson_round",
-                        iteration_min=min(
-                            progress.iteration_count + 1
-                            for progress in summarized_progress
-                        ),
-                        iteration_max=max(
-                            progress.iteration_count + 1
-                            for progress in summarized_progress
-                        ),
-                        active_lane_count=len(summarized_progress),
-                        maximum_subspace_size=max(
-                            progress.paired.vector_count
-                            for progress in summarized_progress
-                            if progress.paired is not None
-                        ),
-                        maximum_residual=max(
-                            ritz_pairs[progress.request.lane_id].max_residual
-                            for progress in summarized_progress
-                        ),
-                        converged_candidate_count=sum(
-                            ritz_pairs[progress.request.lane_id].max_residual
-                            <= progress.request.config.tolerance
-                            for progress in summarized_progress
-                        ),
-                        residual_source="paired_subspace",
-                    )
-            for progress in active:
-                lane_id = progress.request.lane_id
-                failure = ritz_failures.get(lane_id)
-                if failure is not None:
-                    self._fail_lane(progress, failures, failure)
-                    continue
-                try:
-                    pending = self._advance_lane(
-                        progress,
-                        ritz_pair=ritz_pairs[lane_id],
-                    )
-                    if pending is not None:
-                        pending_tickets.append(
-                            self._ticket(
-                                progress,
-                                pending.vectors,
-                                purpose=(
-                                    "direct_validation"
-                                    if pending.purpose == "direct_validation"
-                                    else "basis"
-                                ),
-                            )
-                        )
-                except Exception as error:
-                    self._fail_lane(progress, failures, error)
-            if not pending_tickets:
-                continue
-
-            while pending_tickets:
-                scheduled = self._schedule(pending_tickets)
-                direct_pairs, direct_failures = self._batched_direct_pairs(
-                    pending_tickets,
-                    scheduled,
-                    progress_by_lane,
+        if not initial_tickets:
+            return progress_by_lane
+        self.scheduler.bind(initial_tickets)
+        initial_schedule = self._schedule(initial_tickets)
+        for ticket in initial_tickets:
+            progress = progress_by_lane[ticket.lane_id]
+            try:
+                progress.paired = _PairedDavidsonState.initialize(
+                    progress.initial_vectors,
+                    initial_schedule.action_for(ticket.lane_id),
+                    progress.token,
                 )
-                followup_tickets: list[_DavidsonApplicationTicket] = []
-                for ticket in pending_tickets:
-                    lane_id = ticket.lane_id
-                    failure = scheduled.failures.get(lane_id) or direct_failures.get(lane_id)
-                    if failure is not None:
-                        self._fail_lane(
-                            progress_by_lane[lane_id],
-                            failures,
-                            failure,
-                        )
-                        continue
-                    progress = progress_by_lane[lane_id]
-                    try:
-                        followup = self._consume_action(
-                            progress,
-                            ticket,
-                            scheduled.action_for(lane_id),
-                            direct_pair=direct_pairs.get(lane_id),
-                        )
-                        if followup is not None:
-                            followup_tickets.append(
-                                self._ticket(
-                                    progress,
-                                    followup.vectors,
-                                    purpose=(
-                                        "direct_validation"
-                                        if followup.purpose == "direct_validation"
-                                        else "basis"
-                                    ),
-                                )
-                            )
-                    except Exception as error:
-                        self._fail_lane(progress, failures, error)
-                pending_tickets = followup_tickets
+            except Exception as error:
+                self._fail_lane(progress, failures, error)
+        return progress_by_lane
 
+    @staticmethod
+    def _active_lanes(
+        progress_by_lane: dict[str, _DavidsonLaneProgress],
+        failures: dict[str, Exception],
+    ) -> list[_DavidsonLaneProgress]:
+        return [
+            progress
+            for lane_id, progress in progress_by_lane.items()
+            if lane_id not in failures and not progress.done
+        ]
+
+    def _prepare_round(
+        self,
+        active: Sequence[_DavidsonLaneProgress],
+        failures: dict[str, Exception],
+    ) -> list[_DavidsonApplicationTicket]:
+        ritz_pairs, ritz_failures = self._batched_ritz_pairs(active)
+        self._emit_summarized_rounds(active, ritz_pairs)
+        pending_tickets: list[_DavidsonApplicationTicket] = []
+        for progress in active:
+            lane_id = progress.request.lane_id
+            failure = ritz_failures.get(lane_id)
+            if failure is not None:
+                self._fail_lane(progress, failures, failure)
+                continue
+            try:
+                pending = self._advance_lane(
+                    progress,
+                    ritz_pair=ritz_pairs[lane_id],
+                )
+                if pending is not None:
+                    pending_tickets.append(
+                        self._ticket_for_pending(progress, pending)
+                    )
+            except Exception as error:
+                self._fail_lane(progress, failures, error)
+        return pending_tickets
+
+    @staticmethod
+    def _emit_summarized_rounds(
+        active: Sequence[_DavidsonLaneProgress],
+        ritz_pairs: dict[str, _DavidsonRitzPair],
+    ) -> None:
+        summarized_observers = {
+            id(progress.request.observer): progress.request.observer
+            for progress in active
+            if progress.request.observer is not None
+            and not progress.request.observer.detail_events
+        }
+        for observer in summarized_observers.values():
+            summarized_progress = [
+                progress
+                for progress in active
+                if progress.request.observer is observer
+                and progress.request.lane_id in ritz_pairs
+            ]
+            if not summarized_progress:
+                continue
+            observer.emit(
+                "davidson_round",
+                iteration_min=min(
+                    progress.iteration_count + 1
+                    for progress in summarized_progress
+                ),
+                iteration_max=max(
+                    progress.iteration_count + 1
+                    for progress in summarized_progress
+                ),
+                active_lane_count=len(summarized_progress),
+                maximum_subspace_size=max(
+                    progress.paired.vector_count
+                    for progress in summarized_progress
+                    if progress.paired is not None
+                ),
+                maximum_residual=max(
+                    ritz_pairs[progress.request.lane_id].max_residual
+                    for progress in summarized_progress
+                ),
+                converged_candidate_count=sum(
+                    ritz_pairs[progress.request.lane_id].max_residual
+                    <= progress.request.config.tolerance
+                    for progress in summarized_progress
+                ),
+                residual_source="paired_subspace",
+            )
+
+    @staticmethod
+    def _ticket_for_pending(
+        progress: _DavidsonLaneProgress,
+        pending: _DavidsonPendingAction,
+    ) -> _DavidsonApplicationTicket:
+        return _DavidsonEngine._ticket(
+            progress,
+            pending.vectors,
+            purpose=(
+                "direct_validation"
+                if pending.purpose == "direct_validation"
+                else "basis"
+            ),
+        )
+
+    def _consume_pending_waves(
+        self,
+        pending_tickets: list[_DavidsonApplicationTicket],
+        progress_by_lane: dict[str, _DavidsonLaneProgress],
+        failures: dict[str, Exception],
+    ) -> None:
+        current_tickets = pending_tickets
+        while current_tickets:
+            scheduled = self._schedule(current_tickets)
+            direct_pairs, direct_failures = self._batched_direct_pairs(
+                current_tickets,
+                scheduled,
+                progress_by_lane,
+            )
+            current_tickets = self._consume_scheduled_wave(
+                current_tickets,
+                scheduled,
+                direct_pairs,
+                direct_failures,
+                progress_by_lane,
+                failures,
+            )
+
+    def _consume_scheduled_wave(
+        self,
+        tickets: Sequence[_DavidsonApplicationTicket],
+        scheduled: _DavidsonScheduleResult,
+        direct_pairs: dict[str, _DavidsonRitzPair],
+        direct_failures: dict[str, Exception],
+        progress_by_lane: dict[str, _DavidsonLaneProgress],
+        failures: dict[str, Exception],
+    ) -> list[_DavidsonApplicationTicket]:
+        followup_tickets: list[_DavidsonApplicationTicket] = []
+        for ticket in tickets:
+            lane_id = ticket.lane_id
+            failure = (
+                scheduled.failures.get(lane_id)
+                or direct_failures.get(lane_id)
+            )
+            if failure is not None:
+                self._fail_lane(
+                    progress_by_lane[lane_id],
+                    failures,
+                    failure,
+                )
+                continue
+            progress = progress_by_lane[lane_id]
+            try:
+                followup = self._consume_action(
+                    progress,
+                    ticket,
+                    scheduled.action_for(lane_id),
+                    direct_pair=direct_pairs.get(lane_id),
+                )
+                if followup is not None:
+                    followup_tickets.append(
+                        self._ticket_for_pending(progress, followup)
+                    )
+            except Exception as error:
+                self._fail_lane(progress, failures, error)
+        return followup_tickets
+
+    def _finalize_lanes(
+        self,
+        progress_by_lane: dict[str, _DavidsonLaneProgress],
+        failures: dict[str, Exception],
+    ) -> dict[str, PeriodicEigenResult]:
         results: dict[str, PeriodicEigenResult] = {}
         for lane_id, progress in progress_by_lane.items():
             if lane_id in failures:
@@ -2100,14 +2177,8 @@ class _DavidsonEngine:
                 results[lane_id] = self._finalize_lane(progress)
             except Exception as error:
                 self._fail_lane(progress, failures, error)
-        return _DavidsonEngineResult(
-            results=results,
-            failures=failures,
-            ready_rounds=tuple(self._ready_rounds),
-            compatibility_groups=tuple(self._compatibility_groups),
-            submission_groups=tuple(self._submission_groups),
-            scheduler_calls=self._scheduler_calls,
-        )
+        return results
+
 
 
 
