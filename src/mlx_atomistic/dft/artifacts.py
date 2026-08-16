@@ -27,11 +27,11 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicSCFResult,
     _eigensolve_provenance,
 )
+from mlx_atomistic.dft._periodic_scf_engine import _run_periodic_scf_controlled
 from mlx_atomistic.dft._periodic_state import _PeriodicSCFContinuationState
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import KPointMesh
 from mlx_atomistic.dft.mixing import _MixerCheckpointState
-from mlx_atomistic.dft.periodic_scf import _run_periodic_scf_controlled
 from mlx_atomistic.dft.pseudopotentials import PseudopotentialData, PseudopotentialFormat
 from mlx_atomistic.dft.runtime_state import _npy_bytes
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional

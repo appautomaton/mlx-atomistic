@@ -33,15 +33,17 @@ from mlx_atomistic.dft._periodic_davidson import (
     _plan_compact_submissions,
     _stable_compact_capacity_groups,
 )
+from mlx_atomistic.dft._periodic_scf_engine import (
+    _density_from_kpoints,
+    _next_scf_eigensolver_tolerance,
+    _scf_eigensolver_tolerance,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.mixing import PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
 from mlx_atomistic.dft.periodic_scf import (
     PeriodicEigenResult,
     PeriodicKPointResult,
-    _density_from_kpoints,
-    _next_scf_eigensolver_tolerance,
-    _scf_eigensolver_tolerance,
 )
 from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
 

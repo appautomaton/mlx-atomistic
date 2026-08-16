@@ -29,11 +29,11 @@ from mlx_atomistic.dft import (
     run_periodic_scf,
     solve_periodic_eigenproblem,
 )
+from mlx_atomistic.dft._periodic_scf_engine import _admit_initial_time_reversal
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import _independent_pair
 from mlx_atomistic.dft.periodic_scf import (
     PeriodicEigenResult,
-    _admit_initial_time_reversal,
 )
 from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
 
@@ -662,7 +662,7 @@ def test_mismatched_initial_coefficients_preserve_and_solve_both_explicit_lanes(
 
 
 def test_representative_and_independent_small_scf_trajectories_match(monkeypatch):
-    import mlx_atomistic.dft.periodic_scf as periodic_scf
+    import mlx_atomistic.dft._periodic_scf_engine as periodic_scf
 
     representative_observer = RuntimeObserver(synchronize=mx.synchronize)
     representative = run_periodic_scf(

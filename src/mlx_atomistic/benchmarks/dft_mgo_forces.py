@@ -323,7 +323,7 @@ def _load_initial_guesses(
     import mlx.core as mx
 
     from mlx_atomistic.dft import PlaneWaveBasis, ReciprocalGrid
-    from mlx_atomistic.dft.periodic_scf import _TimeReversalContinuationSeed
+    from mlx_atomistic.dft._periodic_models import _TimeReversalContinuationSeed
 
     path = Path(seed_path).resolve()
     seed = _load_seed_metadata(path)

@@ -890,7 +890,7 @@ def test_implicit_resume_is_never_attempted_and_invalid_explicit_has_no_fallback
 def test_implicit_resume_and_serialization_do_not_touch_ordinary_runtime(
     monkeypatch,
 ):
-    import mlx_atomistic.dft.periodic_scf as periodic_scf_module
+    import mlx_atomistic.dft._periodic_scf_engine as periodic_scf_engine
 
     system, mesh, config = _problem(mixer="linear")
     short_config = replace(config, max_iterations=1, min_iterations=1)
@@ -900,7 +900,7 @@ def test_implicit_resume_and_serialization_do_not_touch_ordinary_runtime(
         raise AssertionError("ordinary SCF materialized checkpoint state")
 
     monkeypatch.setattr(
-        periodic_scf_module,
+        periodic_scf_engine,
         "_continuation_state_from_boundary",
         forbidden_capture,
     )
@@ -928,7 +928,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
     tmp_path,
     monkeypatch,
 ):
-    import mlx_atomistic.dft.periodic_scf as periodic_scf_module
+    import mlx_atomistic.dft._periodic_scf_engine as periodic_scf_engine
 
     system, mesh, config = _problem(mixer="linear")
     context = _execution_context(system, mesh, config)
@@ -937,7 +937,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
         synchronize=mx.synchronize,
         callback=delivered_events.append,
     )
-    original = periodic_scf_module._continuation_state_from_boundary
+    original = periodic_scf_engine._continuation_state_from_boundary
     saw_started_event = []
 
     def observed_materialization(*args, **kwargs):
@@ -950,7 +950,7 @@ def test_timing_admission_persistence_event_precedes_state_serialization(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        periodic_scf_module,
+        periodic_scf_engine,
         "_continuation_state_from_boundary",
         observed_materialization,
     )
