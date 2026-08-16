@@ -14,6 +14,11 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic._neighbor_interaction32 import (
+    _build_interaction32_neighbor_generation,
+    _Interaction32NeighborBuildSpec,
+    _Interaction32NeighborLifecycle,
+)
 from mlx_atomistic.cell_list import (
     PairListStats,
     build_periodic_cell_list,
@@ -23,14 +28,6 @@ from mlx_atomistic.cell_list import (
 from mlx_atomistic.core import Cell, as_mx_array
 from mlx_atomistic.interaction_engine import (
     _DeviceFusedHalfSchedule32,
-    _filter_device_fused_half_schedule32,
-    _interaction32_profile_finish_build,
-    _interaction32_profile_finish_stage,
-    _interaction32_profile_start,
-    _Interaction32ScheduleCapacity,
-    _PreparedInteraction32Topology,
-    _retry_device_fused_half_schedule32,
-    _try_build_device_fused_half_schedule32,
 )
 from mlx_atomistic.metal_kernels import (
     _TILE_PME_COLUMN_DESCRIPTOR_INDEX_MASK,
@@ -986,56 +983,8 @@ class NeighborListManager:
         repr=False,
         compare=False,
     )
-    _interaction32_capacity: _Interaction32ScheduleCapacity | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_topology: _PreparedInteraction32Topology | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_outer_neighbor_list: NeighborList | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_inner_neighbor_list: NeighborList | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_inner_threshold: float | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_two_level_admitted: bool | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_two_level_generation_updates: int = field(
-        default=0,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_two_level_observed_updates: int = field(
-        default=0,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _interaction32_two_level_observed_generations: int = field(
-        default=0,
+    _interaction32: _Interaction32NeighborLifecycle = field(
+        default_factory=_Interaction32NeighborLifecycle,
         init=False,
         repr=False,
         compare=False,
@@ -1070,7 +1019,7 @@ class NeighborListManager:
 
         if (
             self.backend == "mlx_interaction32"
-            and self._interaction32_two_level_admitted is not False
+            and self._interaction32.two_level_admitted is not False
             and atom_count >= _INTERACTION32_TWO_LEVEL_MIN_ATOMS
             and self.check_interval == 1
             and np.isclose(self.cutoff, _INTERACTION32_TWO_LEVEL_CUTOFF)
@@ -1078,38 +1027,6 @@ class NeighborListManager:
         ):
             return _INTERACTION32_TWO_LEVEL_INNER_SKIN
         return None
-
-    def _record_interaction32_two_level_updates(self, count: int) -> None:
-        """Record updates covered by the current two-level generation."""
-
-        if count < 0:
-            raise ValueError("interaction32 update count must be non-negative")
-        if self._interaction32_inner_neighbor_list is not None:
-            self._interaction32_two_level_generation_updates += count
-
-    def _finish_interaction32_two_level_generation(self) -> None:
-        """Disable two-level schedules when observed generations are too short."""
-
-        updates = self._interaction32_two_level_generation_updates
-        if self._interaction32_inner_neighbor_list is not None and updates > 0:
-            self._interaction32_two_level_observed_updates += updates
-            self._interaction32_two_level_observed_generations += 1
-            observed = self._interaction32_two_level_observed_generations
-            if observed >= _INTERACTION32_TWO_LEVEL_ADMISSION_GENERATIONS:
-                mean_updates = self._interaction32_two_level_observed_updates / observed
-                if mean_updates < _INTERACTION32_TWO_LEVEL_MIN_GENERATION_UPDATES:
-                    self._interaction32_two_level_admitted = False
-        self._interaction32_two_level_generation_updates = 0
-
-    def _select_interaction32_schedule(self) -> None:
-        """Select the inner schedule until its displacement margin expires."""
-
-        inner = self._interaction32_inner_neighbor_list
-        outer = self._interaction32_outer_neighbor_list
-        threshold = self._interaction32_inner_threshold
-        if inner is None or outer is None or threshold is None:
-            return
-        self.neighbor_list = inner if self.last_max_displacement <= threshold else outer
 
     def needs_rebuild(self, positions) -> bool:
         """Return true when positions have moved too far from the reference frame."""
@@ -1206,7 +1123,10 @@ class NeighborListManager:
         """Force a neighbor-list rebuild from current positions."""
 
         self._release_pending_metal_cache()
-        self._finish_interaction32_two_level_generation()
+        self._interaction32.finish_generation(
+            admission_generations=_INTERACTION32_TWO_LEVEL_ADMISSION_GENERATIONS,
+            minimum_generation_updates=_INTERACTION32_TWO_LEVEL_MIN_GENERATION_UPDATES,
+        )
         start = perf_counter()
         neighbor_list = (
             self._build_interaction32_neighbor_list(positions)
@@ -1241,176 +1161,54 @@ class NeighborListManager:
     def _build_interaction32_neighbor_list(self, positions) -> NeighborList:
         """Build one retained-capacity Interaction32 neighbor generation."""
 
-        if not _uses_metal_device():
-            msg = "mlx_interaction32 requires the Metal device"
-            raise ValueError(msg)
-        if not self.cell.is_orthorhombic:
-            msg = "mlx_interaction32 requires an orthorhombic periodic cell"
-            raise ValueError(msg)
         positions_mx = as_mx_array(positions, dtype=mx.float32)
-        box_lengths = np.asarray(np.diag(np.asarray(self.cell.matrix)), dtype=np.float32)
-        search_radius = self.cutoff + self.skin
         inner_skin = self._interaction32_inner_skin(int(positions_mx.shape[0]))
-        inner_search_radius = (
-            None if inner_skin is None else self.cutoff + inner_skin
-        )
-        generation = self.rebuild_count + 1
-        build_started = _interaction32_profile_start()
-        attempt = _try_build_device_fused_half_schedule32(
-            positions_mx,
-            box_lengths,
-            search_radius=search_radius,
-            capacity=self._interaction32_capacity,
-            generation_value=generation,
-            lj_exclusion_pairs=self.interaction32_exclusion_pairs,
-            lj_one_four_pairs=self.interaction32_one_four_pairs,
-            ordinary_tiles_per_group=self.interaction32_ordinary_tiles_per_group,
-            topology=self._interaction32_topology,
-            ordering_search_radius=inner_search_radius,
-        )
-        self._interaction32_topology = attempt.topology
-        overflow_retry = attempt.overflow
-        if attempt.overflow:
-            attempt = _retry_device_fused_half_schedule32(attempt)
-        schedule = attempt.schedule
-        if schedule is None or schedule.generation is None:
-            msg = "Interaction32 schedule build did not commit a generation"
-            raise RuntimeError(msg)
-        completion_started = _interaction32_profile_start()
-        arrays = (
-            schedule.atom_order,
-            schedule.ordinary_left_blocks,
-            schedule.ordinary_right_atoms,
-            schedule.ordinary_half_modes,
-            schedule.ordinary_group_starts,
-            schedule.ordinary_group_counts,
-            schedule.special_work_left_blocks,
-            schedule.special_work_left_slices,
-            schedule.special_work_right_atoms,
-            schedule.special_work_lj_enabled,
-            schedule.special_work_lj_one_four,
-            schedule.special_work_diagonal,
-        )
-        mx.eval(*arrays)
-        self._interaction32_capacity = schedule.generation.capacity
-        inventory = attempt.inventory
-        inner_build = (
-            None
-            if inner_search_radius is None
-            else _filter_device_fused_half_schedule32(
-                positions_mx,
-                inventory,
-                schedule,
-                search_radius=inner_search_radius,
+        build = _build_interaction32_neighbor_generation(
+            _Interaction32NeighborBuildSpec(
+                positions=positions_mx,
+                cell=self.cell,
+                cutoff=self.cutoff,
+                outer_skin=self.skin,
+                inner_skin=inner_skin,
+                generation=self.rebuild_count + 1,
+                exclusion_pairs=self.interaction32_exclusion_pairs,
+                one_four_pairs=self.interaction32_one_four_pairs,
+                ordinary_tiles_per_group=self.interaction32_ordinary_tiles_per_group,
+                capacity=self._interaction32.capacity,
+                topology=self._interaction32.topology,
+                two_level_admitted=self._interaction32.two_level_admitted,
             )
         )
-        outer_pair_lanes = (
-            inventory.logical_pair_lanes
-            + schedule.special_work_count * 16 * 32
-        )
-        cell_counts = inventory.geometry.cell_counts
-        cell_count = int(np.prod(np.asarray(cell_counts), dtype=np.int64))
-        resident_schedule_bytes = schedule.estimated_bytes + (
-            0 if inner_build is None else inner_build.schedule.estimated_bytes
-        )
-        estimated_cell_bytes = (
-            positions_mx.shape[0] * (3 * _FLOAT_BYTES + 2 * _INT_BYTES)
-            + cell_count * 2 * _INT_BYTES
-        )
-
-        def make_stats(
-            pair_lanes: int,
-            radius: float,
-            compaction_backend: str,
-        ) -> PairListStats:
-            return PairListStats(
-                pair_count=pair_lanes,
-                n_cells=cell_counts,
-                cell_count=cell_count,
-                occupied_cell_count=inventory.occupied_cell_count,
-                search_radius=radius,
-                estimated_pair_bytes=resident_schedule_bytes,
-                estimated_cell_list_bytes=estimated_cell_bytes,
-                backend="mlx_interaction32",
-                representation_kind="interaction32",
-                candidate_count=pair_lanes,
-                estimated_candidate_bytes=resident_schedule_bytes,
-                compaction_backend=compaction_backend,
-                fallback_reason=None,
-                adaptation_reason=(
-                    "interaction32_two_level_short_generation"
-                    if self._interaction32_two_level_admitted is False
-                    else None
-                ),
-            )
-
         outer_neighbor_list = NeighborList(
             None,
             cutoff=self.cutoff,
             skin=self.skin,
-            stats=make_stats(
-                outer_pair_lanes,
-                search_radius,
-                "metal_interaction32_device_builder",
-            ),
-            interaction32=schedule,
+            stats=build.outer_stats,
+            interaction32=build.outer_schedule,
             sort_diagnostic_pairs=self.sort_pairs,
-            reference_positions=positions_mx,
+            reference_positions=build.positions,
             cell=self.cell,
         )
-        inner_neighbor_list = None
-        if inner_build is not None and inner_search_radius is not None:
-            inner_pair_lanes = (
-                inner_build.logical_pair_lanes
-                + inner_build.schedule.special_work_count * 16 * 32
-            )
-            inner_neighbor_list = NeighborList(
+        inner_neighbor_list = (
+            None
+            if build.inner_schedule is None or build.inner_stats is None
+            else NeighborList(
                 None,
                 cutoff=self.cutoff,
                 skin=self.skin,
-                stats=make_stats(
-                    inner_pair_lanes,
-                    inner_search_radius,
-                    "metal_interaction32_outer_inner_compactor",
-                ),
-                interaction32=inner_build.schedule,
+                stats=build.inner_stats,
+                interaction32=build.inner_schedule,
                 sort_diagnostic_pairs=self.sort_pairs,
-                reference_positions=positions_mx,
+                reference_positions=build.positions,
                 cell=self.cell,
             )
-        self._interaction32_outer_neighbor_list = outer_neighbor_list
-        self._interaction32_inner_neighbor_list = inner_neighbor_list
-        self._interaction32_inner_threshold = (
-            None if inner_skin is None else 0.5 * inner_skin
         )
-        if inner_neighbor_list is not None:
-            self._interaction32_two_level_admitted = True
-        neighbor_list = (
-            outer_neighbor_list if inner_neighbor_list is None else inner_neighbor_list
+        return self._interaction32.install_generation(
+            build,
+            outer_neighbor_list=outer_neighbor_list,
+            inner_neighbor_list=inner_neighbor_list,
+            inner_skin=inner_skin,
         )
-        _interaction32_profile_finish_stage(
-            "schedule_completion",
-            completion_started,
-        )
-        capacity = schedule.generation.capacity
-        _interaction32_profile_finish_build(
-            build_started,
-            inventory={
-                "atom_count": inventory.geometry.atom_count,
-                "occupied_cell_count": inventory.occupied_cell_count,
-                "ordinary_right_entry_count": inventory.right_entry_count,
-                "ordinary_logical_pair_lanes": inventory.logical_pair_lanes,
-                "ordinary_tile_count": inventory.ordinary_tile_count,
-                "ordinary_group_count": inventory.ordinary_group_count,
-                "special_tile_count": inventory.special_tile_count,
-                "mode_cache_bytes": inventory.mode_cache_bytes,
-                "ordinary_tile_capacity": capacity.ordinary_tiles,
-                "ordinary_group_capacity": capacity.ordinary_groups,
-                "special_tile_capacity": capacity.special_tiles,
-                "overflow_retry_count": int(overflow_retry),
-            },
-        )
-        return neighbor_list
 
     def update(self, positions) -> NeighborList:
         """Return a current neighbor list, rebuilding if needed."""
@@ -1418,15 +1216,15 @@ class NeighborListManager:
         start = perf_counter()
         try:
             self._release_pending_metal_cache()
-            self._record_interaction32_two_level_updates(
-                int(self.neighbor_list is not None)
-            )
+            self._interaction32.record_updates(int(self.neighbor_list is not None))
             if self.needs_rebuild(positions):
                 return self.rebuild(positions)
             if self.neighbor_list is None:
                 msg = "neighbor list manager has no current neighbor list"
                 raise RuntimeError(msg)
-            self._select_interaction32_schedule()
+            selected = self._interaction32.select_schedule(self.last_max_displacement)
+            if selected is not None:
+                self.neighbor_list = selected
             return self.neighbor_list
         finally:
             self.update_wall_seconds += perf_counter() - start
@@ -1454,19 +1252,17 @@ class NeighborListManager:
 
         start = perf_counter()
         try:
-            self._record_interaction32_two_level_updates(steps)
+            self._interaction32.record_updates(steps)
             mx.eval(max_displacement, admissible)
             if not bool(np.asarray(admissible)):
                 return False
             displacement = float(np.asarray(max_displacement))
             if not np.isfinite(displacement):
                 return False
-            active_threshold = self.rebuild_threshold
-            if (
-                self.neighbor_list is self._interaction32_inner_neighbor_list
-                and self._interaction32_inner_threshold is not None
-            ):
-                active_threshold = self._interaction32_inner_threshold
+            active_threshold = self._interaction32.active_rebuild_threshold(
+                self.neighbor_list,
+                self.rebuild_threshold,
+            )
             if displacement > active_threshold:
                 return False
             if self.neighbor_list is None or self.reference_positions is None:
@@ -1523,17 +1319,7 @@ class NeighborListManager:
             rebuild_wall_seconds=self.rebuild_wall_seconds,
             update_wall_seconds=self.update_wall_seconds,
         )
-        candidate._interaction32_capacity = self._interaction32_capacity
-        candidate._interaction32_topology = self._interaction32_topology
-        candidate._interaction32_two_level_admitted = (
-            self._interaction32_two_level_admitted
-        )
-        candidate._interaction32_two_level_observed_updates = (
-            self._interaction32_two_level_observed_updates
-        )
-        candidate._interaction32_two_level_observed_generations = (
-            self._interaction32_two_level_observed_generations
-        )
+        candidate._interaction32 = self._interaction32.fork_build_candidate()
         candidate.rebuild(positions)
         return candidate
 
@@ -1581,27 +1367,7 @@ class NeighborListManager:
         self.rebuild_wall_seconds = candidate.rebuild_wall_seconds
         self.update_wall_seconds = candidate.update_wall_seconds
         self._cache_clear_pending = candidate._cache_clear_pending
-        self._interaction32_capacity = candidate._interaction32_capacity
-        self._interaction32_topology = candidate._interaction32_topology
-        self._interaction32_outer_neighbor_list = (
-            candidate._interaction32_outer_neighbor_list
-        )
-        self._interaction32_inner_neighbor_list = (
-            candidate._interaction32_inner_neighbor_list
-        )
-        self._interaction32_inner_threshold = candidate._interaction32_inner_threshold
-        self._interaction32_two_level_admitted = (
-            candidate._interaction32_two_level_admitted
-        )
-        self._interaction32_two_level_generation_updates = (
-            candidate._interaction32_two_level_generation_updates
-        )
-        self._interaction32_two_level_observed_updates = (
-            candidate._interaction32_two_level_observed_updates
-        )
-        self._interaction32_two_level_observed_generations = (
-            candidate._interaction32_two_level_observed_generations
-        )
+        self._interaction32 = candidate._interaction32
 
 
 def build_neighbor_list(

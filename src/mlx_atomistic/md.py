@@ -1519,12 +1519,12 @@ def _nonbonded_runtime_report(
     observed_generations = (
         0
         if neighbor_manager is None
-        else neighbor_manager._interaction32_two_level_observed_generations
+        else neighbor_manager._interaction32.observed_generations
     )
     observed_updates = (
         0
         if neighbor_manager is None
-        else neighbor_manager._interaction32_two_level_observed_updates
+        else neighbor_manager._interaction32.observed_updates
     )
     report = {
         "backend": neighbor_list.backend,
@@ -1546,7 +1546,9 @@ def _nonbonded_runtime_report(
         "fallback_reason": neighbor_list.fallback_reason,
         "adaptation_reason": neighbor_list.adaptation_reason,
         "two_level_schedule_admitted": (
-            None if neighbor_manager is None else neighbor_manager._interaction32_two_level_admitted
+            None
+            if neighbor_manager is None
+            else neighbor_manager._interaction32.two_level_admitted
         ),
         "two_level_observed_generations": observed_generations,
         "two_level_mean_generation_updates": (

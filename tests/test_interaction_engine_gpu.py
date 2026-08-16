@@ -906,11 +906,11 @@ def test_interaction32_rebuild_stage_profile_reconciles_exact_inventory():
 
     with _profile_interaction32_rebuilds() as profiler:
         first = manager.rebuild(positions)
-        first_topology = manager._interaction32_topology
+        first_topology = manager._interaction32.topology
         moved = positions.copy()
         moved[0, 0] += 0.01
         second = manager.rebuild(moved)
-        assert manager._interaction32_topology is first_topology
+        assert manager._interaction32.topology is first_topology
 
     report = profiler.report()
     assert report["schema"] == "mlx_atomistic.interaction32_rebuild_profile.v1"
@@ -933,7 +933,7 @@ def test_interaction32_rebuild_stage_profile_reconciles_exact_inventory():
 
     manager.interaction32_exclusion_pairs = [[0, 1], [5, 6], [40, 80]]
     changed = manager.rebuild(moved)
-    assert manager._interaction32_topology is not first_topology
+    assert manager._interaction32.topology is not first_topology
     assert changed.interaction32 is not None
     assert first.interaction32.generation is not None
     assert changed.interaction32.generation is not None
@@ -972,8 +972,8 @@ def test_interaction32_two_level_schedule_switches_before_outer_rebuild(monkeypa
     )
 
     inner = manager.update(positions)
-    outer = manager._interaction32_outer_neighbor_list
-    assert manager._interaction32_inner_neighbor_list is inner
+    outer = manager._interaction32.outer_neighbor_list
+    assert manager._interaction32.inner_neighbor_list is inner
     assert outer is not None
     assert inner is not outer
     assert inner.stats.compaction_backend == "metal_interaction32_outer_inner_compactor"
@@ -992,7 +992,7 @@ def test_interaction32_two_level_schedule_switches_before_outer_rebuild(monkeypa
     beyond_outer = positions.copy()
     beyond_outer[0, 0] += 2.76
     rebuilt_inner = manager.update(beyond_outer)
-    assert rebuilt_inner is manager._interaction32_inner_neighbor_list
+    assert rebuilt_inner is manager._interaction32.inner_neighbor_list
     assert rebuilt_inner is not inner
     assert manager.rebuild_count == 2
 
@@ -1026,9 +1026,9 @@ def test_interaction32_two_level_admission_rejects_short_generations(monkeypatch
         manager.update(moved)
 
     assert manager.rebuild_count == 4
-    assert manager._interaction32_two_level_admitted is False
-    assert manager._interaction32_inner_neighbor_list is None
-    assert manager.neighbor_list is manager._interaction32_outer_neighbor_list
+    assert manager._interaction32.two_level_admitted is False
+    assert manager._interaction32.inner_neighbor_list is None
+    assert manager.neighbor_list is manager._interaction32.outer_neighbor_list
     assert manager.neighbor_list is not None
     assert manager.neighbor_list.stats.compaction_backend == (
         "metal_interaction32_device_builder"
