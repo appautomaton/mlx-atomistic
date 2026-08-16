@@ -288,7 +288,7 @@ def _is_sha256(value: object) -> bool:
 def _runtime_environment() -> dict[str, object]:
     import mlx.core as mx
 
-    from mlx_atomistic.dft.periodic_scf import _eigensolve_provenance
+    from mlx_atomistic.dft._periodic_models import _eigensolve_provenance
     from mlx_atomistic.runtime import get_runtime_info
 
     runtime = get_runtime_info()
@@ -621,8 +621,8 @@ def _fixed_density_sample(
         read_gth,
         solve_periodic_eigenproblem,
     )
+    from mlx_atomistic.dft._periodic_models import _eigensolve_provenance
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
-    from mlx_atomistic.dft.periodic_scf import _eigensolve_provenance
     from mlx_atomistic.dft.runtime_state import fixed_density_state_metrics
 
     track_metal_memory = bool(mx.metal.is_available())

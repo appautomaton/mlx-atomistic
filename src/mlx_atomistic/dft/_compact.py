@@ -6,11 +6,50 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from math import ceil, sqrt
+from typing import ClassVar
 
 import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft.grids import ReciprocalGrid
+
+_COMPACT_DEFAULT_MAX_PADDING_FRACTION = 0.25
+_COMPACT_DEFAULT_MAX_TRANSIENT_BYTES = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _CompactBatchPolicy:
+    """Validated physical bounds for compact DFT batch submissions."""
+
+    batch_cap: int = 1
+    max_padding_fraction: float = _COMPACT_DEFAULT_MAX_PADDING_FRACTION
+    max_transient_bytes: int = _COMPACT_DEFAULT_MAX_TRANSIENT_BYTES
+    shape_policy: str = "stable"
+
+    LANE_CAPACITY_BUCKETS: ClassVar[tuple[int, ...]] = (1, 2, 4, 8)
+    VECTOR_CAPACITY_BUCKETS: ClassVar[tuple[int, ...]] = (4, 8, 16)
+
+    def __post_init__(self) -> None:
+        if type(self.batch_cap) is not int or self.batch_cap <= 0:
+            msg = "compact batch_cap must be a positive non-bool integer"
+            raise ValueError(msg)
+        if (
+            not isinstance(self.max_padding_fraction, int | float)
+            or isinstance(self.max_padding_fraction, bool)
+            or not np.isfinite(float(self.max_padding_fraction))
+            or not 0.0 <= float(self.max_padding_fraction) < 1.0
+        ):
+            msg = "compact max_padding_fraction must be finite and lie in [0, 1)"
+            raise ValueError(msg)
+        if type(self.max_transient_bytes) is not int or self.max_transient_bytes <= 0:
+            msg = "compact max_transient_bytes must be a positive non-bool integer"
+            raise ValueError(msg)
+        if self.shape_policy not in {"stable", "finite-buckets"}:
+            msg = "compact shape_policy must be 'stable' or 'finite-buckets'"
+            raise ValueError(msg)
+
+
+_DEFAULT_COMPACT_BATCH_POLICY = _CompactBatchPolicy()
 
 
 def _update_array_digest(digest: object, values: np.ndarray) -> None:
@@ -470,16 +509,15 @@ class _CompactBatch:
     vector_padding_elements: int
     estimated_transient_bytes: int
 
-    _DEFAULT_MAX_PADDING_FRACTION = 0.25
-    _DEFAULT_MAX_TRANSIENT_BYTES = 512 * 1024 * 1024
+    _DEFAULT_MAX_PADDING_FRACTION = _COMPACT_DEFAULT_MAX_PADDING_FRACTION
+    _DEFAULT_MAX_TRANSIENT_BYTES = _COMPACT_DEFAULT_MAX_TRANSIENT_BYTES
 
     @classmethod
     def from_states(
         cls,
         states: Sequence[_CompactLaneState],
         *,
-        max_padding_fraction: float = _DEFAULT_MAX_PADDING_FRACTION,
-        max_transient_bytes: int = _DEFAULT_MAX_TRANSIENT_BYTES,
+        policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
         lane_capacity: int | None = None,
         vector_capacity: int | None = None,
         active_capacity: int | None = None,
@@ -488,12 +526,6 @@ class _CompactBatch:
 
         if not states:
             msg = "a compact batch requires at least one lane"
-            raise ValueError(msg)
-        if not 0.0 <= max_padding_fraction < 1.0:
-            msg = "max_padding_fraction must lie in [0, 1)"
-            raise ValueError(msg)
-        if max_transient_bytes <= 0:
-            msg = "max_transient_bytes must be positive"
             raise ValueError(msg)
         first = states[0]
         reciprocal = first.layout.reciprocal
@@ -520,7 +552,7 @@ class _CompactBatch:
         worst_padding_fraction = max(
             (bucket - state.layout.active_count) / bucket for state in states
         )
-        if worst_padding_fraction > max_padding_fraction:
+        if worst_padding_fraction > policy.max_padding_fraction:
             msg = "compact batch active counts exceed the padding-fraction cap"
             raise ValueError(msg)
         lane_padding_elements = (lane_bucket - logical_lane_count) * vector_bucket * bucket
@@ -533,7 +565,7 @@ class _CompactBatch:
         estimated_transient_bytes = (
             compact_payload_bytes + index_and_mask_bytes + fft_workspace_bytes
         )
-        if estimated_transient_bytes > max_transient_bytes:
+        if estimated_transient_bytes > policy.max_transient_bytes:
             msg = "compact batch exceeds the transient byte budget"
             raise ValueError(msg)
         padded_values = []

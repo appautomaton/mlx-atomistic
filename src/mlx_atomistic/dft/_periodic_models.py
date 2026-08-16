@@ -12,6 +12,7 @@ import numpy as np
 
 from mlx_atomistic.dft._compact import (
     _CompactBatch,
+    _CompactBatchPolicy,
     _CompactLaneState,
     _CompatibilityCoefficientState,
 )
@@ -23,7 +24,7 @@ from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.pseudopotentials import PseudopotentialData
 
 if TYPE_CHECKING:
-    from mlx_atomistic.dft.periodic_scf import _PeriodicSCFContinuationState
+    from mlx_atomistic.dft._periodic_state import _PeriodicSCFContinuationState
 
 
 def _eigensolve_provenance() -> dict[str, str]:
@@ -259,34 +260,29 @@ class PeriodicSCFConfig:
                 "final Davidson tolerance"
             )
             raise ValueError(msg)
-        if type(self.kpoint_batch_size) is not int or self.kpoint_batch_size <= 0:
-            msg = "kpoint_batch_size must be a positive non-bool integer"
-            raise ValueError(msg)
-        if (
-            not isinstance(self.max_batch_padding_fraction, int | float)
-            or isinstance(self.max_batch_padding_fraction, bool)
-            or not np.isfinite(float(self.max_batch_padding_fraction))
-            or not 0.0 <= float(self.max_batch_padding_fraction) < 1.0
-        ):
-            msg = "max_batch_padding_fraction must be finite and lie in [0, 1)"
-            raise ValueError(msg)
-        if type(self.max_batch_transient_bytes) is not int or self.max_batch_transient_bytes <= 0:
-            msg = "max_batch_transient_bytes must be a positive non-bool integer"
-            raise ValueError(msg)
-        if self.hpsi_shape_policy not in {"stable", "finite-buckets"}:
-            msg = "hpsi_shape_policy must be 'stable' or 'finite-buckets'"
-            raise ValueError(msg)
+        self._compact_batch_policy()
+
+    def _compact_batch_policy(self) -> _CompactBatchPolicy:
+        """Return the validated compact execution policy for this SCF run."""
+
+        return _CompactBatchPolicy(
+            batch_cap=self.kpoint_batch_size,
+            max_padding_fraction=self.max_batch_padding_fraction,
+            max_transient_bytes=self.max_batch_transient_bytes,
+            shape_policy=self.hpsi_shape_policy,
+        )
 
     def batch_policy(self) -> dict[str, int | float | str | list[int]]:
         """Return the exact bounded compact-batch policy."""
 
+        policy = self._compact_batch_policy()
         return {
-            "kpoint_batch_size": self.kpoint_batch_size,
-            "max_batch_padding_fraction": float(self.max_batch_padding_fraction),
-            "max_batch_transient_bytes": self.max_batch_transient_bytes,
-            "hpsi_shape_policy": self.hpsi_shape_policy,
-            "hpsi_lane_capacity_buckets": [1, 2, 4, 8],
-            "hpsi_vector_capacity_buckets": [4, 8, 16],
+            "kpoint_batch_size": policy.batch_cap,
+            "max_batch_padding_fraction": float(policy.max_padding_fraction),
+            "max_batch_transient_bytes": policy.max_transient_bytes,
+            "hpsi_shape_policy": policy.shape_policy,
+            "hpsi_lane_capacity_buckets": list(policy.LANE_CAPACITY_BUCKETS),
+            "hpsi_vector_capacity_buckets": list(policy.VECTOR_CAPACITY_BUCKETS),
         }
 
 

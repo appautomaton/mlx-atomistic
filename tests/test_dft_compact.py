@@ -26,6 +26,7 @@ from mlx_atomistic.dft import (
 )
 from mlx_atomistic.dft._compact import (
     _CompactBatch,
+    _CompactBatchPolicy,
     _CompactLaneState,
     _remap_initial_coefficients,
 )
@@ -227,7 +228,7 @@ def test_compact_batch_memory_rejects_unbounded_padding_and_transient_bytes():
     with pytest.raises(ValueError, match="transient byte budget"):
         _CompactBatch.from_states(
             (narrow_state,),
-            max_transient_bytes=1,
+            policy=_CompactBatchPolicy(max_transient_bytes=1),
         )
 
 

@@ -24,7 +24,7 @@ from mlx_atomistic.dft import (
     XCResult,
     run_periodic_scf,
 )
-from mlx_atomistic.dft._compact import _CompactBatch
+from mlx_atomistic.dft._compact import _CompactBatch, _CompactBatchPolicy
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.mixing import PulayDIISMixer
 from mlx_atomistic.dft.periodic_gth import _GTHProjectorCache
@@ -413,9 +413,11 @@ def test_compact_submission_planner_respects_byte_and_padding_bounds():
     two_lane_budget = _CompactBatch.from_states(equal_states[:2]).estimated_transient_bytes
     byte_bounded = _plan_compact_submissions(
         equal_states,
-        batch_cap=3,
-        max_padding_fraction=0.25,
-        max_transient_bytes=two_lane_budget,
+        policy=_CompactBatchPolicy(
+            batch_cap=3,
+            max_padding_fraction=0.25,
+            max_transient_bytes=two_lane_budget,
+        ),
     )
 
     assert not byte_bounded.failures
@@ -433,9 +435,7 @@ def test_compact_submission_planner_respects_byte_and_padding_bounds():
     )
     padding_bounded = _plan_compact_submissions(
         (_state(narrow, vectors=1, seed=23), _state(second, vectors=1, seed=24)),
-        batch_cap=2,
-        max_padding_fraction=0.25,
-        max_transient_bytes=_CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        policy=_CompactBatchPolicy(batch_cap=2),
     )
 
     assert not padding_bounded.failures
@@ -553,9 +553,10 @@ def test_gth_projectors_use_one_k_batched_matrix_path_and_batch_cache_guard(
     assert bounded_bytes < complete_bytes
     bounded_plan = _plan_compact_submissions(
         states,
-        batch_cap=2,
-        max_padding_fraction=0.25,
-        max_transient_bytes=bounded_bytes,
+        policy=_CompactBatchPolicy(
+            batch_cap=2,
+            max_transient_bytes=bounded_bytes,
+        ),
         batch_byte_estimator=lambda indices, batch: (
             PeriodicKohnShamOperator._estimated_batch_transient_bytes(
                 [operators[index] for index in indices],
@@ -571,7 +572,7 @@ def test_gth_projectors_use_one_k_batched_matrix_path_and_batch_cache_guard(
         operators,
         states,
         observer=observer,
-        max_transient_bytes=bounded_bytes,
+        policy=_CompactBatchPolicy(max_transient_bytes=bounded_bytes),
         prepared_batch=prepared,
     )
     assert not rejected.actions
@@ -694,7 +695,9 @@ def test_batched_davidson_keeps_divergent_lane_restart_and_convergence_local():
             observer=observer,
         ),
     )
-    outcome = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=2)).solve(requests)
+    outcome = _DavidsonEngine(
+        scheduler=_DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=2))
+    ).solve(requests)
 
     assert not outcome.failures
     assert outcome.result_for("fast").converged
@@ -732,13 +735,13 @@ def test_density_batch_one_and_many_have_the_same_ordered_sum():
     singleton = _density_from_kpoints(
         results,
         occupation=2.0,
-        batch_cap=1,
+        policy=_CompactBatchPolicy(batch_cap=1),
         observer=singleton_observer,
     )
     batched = _density_from_kpoints(
         results,
         occupation=2.0,
-        batch_cap=2,
+        policy=_CompactBatchPolicy(batch_cap=2),
         observer=batched_observer,
     )
 

@@ -10,8 +10,8 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft._compact import _CompactLaneState
+from mlx_atomistic.dft._periodic_models import PeriodicBandStructureResult
 from mlx_atomistic.dft.kpoints import BandPath, KPoint
-from mlx_atomistic.dft.periodic_scf import PeriodicBandStructureResult
 
 
 def _cell_matrix(cell: Sequence[Sequence[float]], *, name: str) -> np.ndarray:

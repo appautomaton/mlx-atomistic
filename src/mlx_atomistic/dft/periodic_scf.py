@@ -11,7 +11,9 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft._compact import (
+    _DEFAULT_COMPACT_BATCH_POLICY,
     _CompactBatch,
+    _CompactBatchPolicy,
     _CompactLaneState,
     _remap_initial_coefficients,
     _require_layout,
@@ -39,6 +41,7 @@ from mlx_atomistic.dft._periodic_orthonormalization import (
     _Complex64RankPolicy,
     _RankResult,
 )
+from mlx_atomistic.dft._periodic_state import _PeriodicSCFContinuationState
 from mlx_atomistic.dft._runtime_observer import (
     RuntimeObserver,
     add_observed_work,
@@ -58,7 +61,6 @@ from mlx_atomistic.dft.kpoints import (
 from mlx_atomistic.dft.mixing import (
     LinearMixer,
     PulayDIISMixer,
-    _MixerCheckpointState,
 )
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
@@ -162,24 +164,6 @@ def _scf_eigensolver_tolerance(
             electron_count,
         )
     return tolerance
-
-
-@dataclass(frozen=True)
-class _PeriodicSCFContinuationState:
-    completed_iteration: int
-    density: mx.array
-    owned_coefficients: tuple[tuple[int, mx.array], ...]
-    owned_lanes: tuple[dict[str, object], ...]
-    previous_energy: float
-    energy_by_term: dict[str, float]
-    history: tuple[dict[str, float | int | str | None], ...]
-    mixer_state: _MixerCheckpointState
-    ownership: dict[str, object]
-    lineage: tuple[str, ...] = ()
-
-    @property
-    def coefficient_map(self) -> dict[int, mx.array]:
-        return dict(self.owned_coefficients)
 
 
 def _logical_hpsi_memory(
@@ -315,16 +299,14 @@ class PeriodicKohnShamOperator:
         coefficients: _CompactLaneState,
         *,
         observer: RuntimeObserver | None = None,
-        max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
-        max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
         prepared_batch: _CompactBatch | None = None,
     ) -> _CompactLaneState:
         outcome = self._apply_compact_batch(
             (self,),
             (coefficients,),
             observer=observer,
-            max_padding_fraction=max_padding_fraction,
-            max_transient_bytes=max_transient_bytes,
+            policy=policy,
             prepared_batch=prepared_batch,
         )
         return outcome.action_for(0)
@@ -369,25 +351,13 @@ class PeriodicKohnShamOperator:
         coefficients: Sequence[_CompactLaneState],
         *,
         observer: RuntimeObserver | None = None,
-        max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
-        max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+        policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
         prepared_batch: _CompactBatch | None = None,
     ) -> _CompactHamiltonianBatchResult:
         """Apply one bounded batch-first Hamiltonian submission."""
 
         if not operators or len(operators) != len(coefficients):
             msg = "compact Hamiltonian batches require matching non-empty lanes"
-            raise ValueError(msg)
-        if (
-            not isinstance(max_padding_fraction, int | float)
-            or isinstance(max_padding_fraction, bool)
-            or not np.isfinite(float(max_padding_fraction))
-            or not 0.0 <= float(max_padding_fraction) < 1.0
-        ):
-            msg = "max_padding_fraction must be finite and lie in [0, 1)"
-            raise ValueError(msg)
-        if type(max_transient_bytes) is not int or max_transient_bytes <= 0:
-            msg = "max_transient_bytes must be a positive non-bool integer"
             raise ValueError(msg)
         operator_observers = {
             id(operator.observer): operator.observer
@@ -461,19 +431,19 @@ class PeriodicKohnShamOperator:
                         and prepared_batch.kinds == tuple(state.kind for state in ready_states)
                         and prepared_batch.vector_counts
                         == tuple(state.vector_count for state in ready_states)
-                        and prepared_batch.estimated_transient_bytes <= max_transient_bytes
+                        and prepared_batch.estimated_transient_bytes
+                        <= policy.max_transient_bytes
                         and max(
                             (prepared_batch.bucket_size - count) / prepared_batch.bucket_size
                             for count in prepared_batch.active_counts
                         )
-                        <= max_padding_fraction
+                        <= policy.max_padding_fraction
                     ):
                         batch = prepared_batch
                     else:
                         batch = _CompactBatch.from_states(
                             ready_states,
-                            max_padding_fraction=max_padding_fraction,
-                            max_transient_bytes=max_transient_bytes,
+                            policy=policy,
                         )
                     ready_operators = [operators[index] for index in ready_indices]
                     estimated_transient_bytes = (
@@ -482,7 +452,7 @@ class PeriodicKohnShamOperator:
                             batch,
                         )
                     )
-                    if estimated_transient_bytes > max_transient_bytes:
+                    if estimated_transient_bytes > policy.max_transient_bytes:
                         msg = "compact Hpsi batch exceeds the complete transient byte budget"
                         raise ValueError(msg)
                     grouped_gth: dict[str, list[int]] = defaultdict(list)
@@ -500,8 +470,7 @@ class PeriodicKohnShamOperator:
                         else:
                             gth_batch = _CompactBatch.from_states(
                                 gth_states,
-                                max_padding_fraction=max_padding_fraction,
-                                max_transient_bytes=max_transient_bytes,
+                                policy=policy,
                             )
                         try:
                             gth_actions, gth_metrics = (
@@ -949,28 +918,12 @@ class _CompactSubmissionPlan:
 def _plan_compact_submissions(
     states: Sequence[_CompactLaneState],
     *,
-    batch_cap: int,
-    max_padding_fraction: float,
-    max_transient_bytes: int,
+    policy: _CompactBatchPolicy,
     batch_byte_estimator: Callable[[tuple[int, ...], _CompactBatch], int] | None = None,
     capacity: _CompactBatchCapacity | None = None,
 ) -> _CompactSubmissionPlan:
     """Build deterministic active-count buckets within hard batch bounds."""
 
-    if type(batch_cap) is not int or batch_cap <= 0:
-        msg = "compact batch_cap must be a positive non-bool integer"
-        raise ValueError(msg)
-    if (
-        not isinstance(max_padding_fraction, int | float)
-        or isinstance(max_padding_fraction, bool)
-        or not np.isfinite(float(max_padding_fraction))
-        or not 0.0 <= float(max_padding_fraction) < 1.0
-    ):
-        msg = "compact max_padding_fraction must be finite and lie in [0, 1)"
-        raise ValueError(msg)
-    if type(max_transient_bytes) is not int or max_transient_bytes <= 0:
-        msg = "compact max_transient_bytes must be a positive non-bool integer"
-        raise ValueError(msg)
     if capacity is not None and (
         type(capacity.lanes) is not int
         or type(capacity.vectors) is not int
@@ -978,7 +931,7 @@ def _plan_compact_submissions(
         or capacity.lanes <= 0
         or capacity.vectors <= 0
         or capacity.active <= 0
-        or capacity.lanes > batch_cap
+        or capacity.lanes > policy.batch_cap
     ):
         msg = "compact capacity must contain positive bounded integers"
         raise ValueError(msg)
@@ -991,8 +944,7 @@ def _plan_compact_submissions(
         if capacity is None:
             candidate_batch = _CompactBatch.from_states(
                 selected,
-                max_padding_fraction=float(max_padding_fraction),
-                max_transient_bytes=max_transient_bytes,
+                policy=policy,
             )
         else:
             if len(selected) > capacity.lanes:
@@ -1002,7 +954,7 @@ def _plan_compact_submissions(
                 state.vector_count > capacity.vectors
                 or state.layout.active_count > capacity.active
                 or (capacity.active - state.layout.active_count) / capacity.active
-                > max_padding_fraction
+                > policy.max_padding_fraction
                 for state in selected
             ):
                 msg = "compact candidate exceeds its stable shape policy"
@@ -1010,8 +962,7 @@ def _plan_compact_submissions(
             if capacity_prototype is None:
                 capacity_prototype = _CompactBatch.from_states(
                     selected[:1],
-                    max_padding_fraction=float(max_padding_fraction),
-                    max_transient_bytes=max_transient_bytes,
+                    policy=policy,
                     lane_capacity=capacity.lanes,
                     vector_capacity=capacity.vectors,
                     active_capacity=capacity.active,
@@ -1022,7 +973,7 @@ def _plan_compact_submissions(
             if batch_byte_estimator is None
             else batch_byte_estimator(tuple(indices), candidate_batch)
         )
-        if estimated_bytes > max_transient_bytes:
+        if estimated_bytes > policy.max_transient_bytes:
             msg = "compact batch exceeds the complete transient byte budget"
             raise ValueError(msg)
         return candidate_batch
@@ -1049,7 +1000,7 @@ def _plan_compact_submissions(
         current: list[int] = []
         current_batch: _CompactBatch | None = None
         for index in ordered:
-            if len(current) == batch_cap:
+            if len(current) == policy.batch_cap:
                 if current_batch is None:
                     msg = "compact submission planner lost its active batch"
                     raise RuntimeError(msg)
@@ -1193,44 +1144,25 @@ class _DavidsonScheduler:
     def __init__(
         self,
         *,
-        batch_cap: int = 1,
-        max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
-        max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
-        shape_policy: str = "stable",
+        policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
         submission_callback: _DavidsonSubmissionCallback | None = None,
     ) -> None:
-        _plan_compact_submissions(
-            (),
-            batch_cap=batch_cap,
-            max_padding_fraction=max_padding_fraction,
-            max_transient_bytes=max_transient_bytes,
-        )
-        self._batch_cap = batch_cap
-        self._max_padding_fraction = float(max_padding_fraction)
-        self._max_transient_bytes = max_transient_bytes
-        if shape_policy not in {"stable", "finite-buckets"}:
-            msg = "Davidson shape_policy must be 'stable' or 'finite-buckets'"
-            raise ValueError(msg)
-        self._shape_policy = shape_policy
+        self._policy = policy
         self._submission_callback = submission_callback
         self._submission_index = 0
         self._capacity_by_lane: dict[str, _CompactBatchCapacity] = {}
 
     @property
     def batch_cap(self) -> int:
-        return self._batch_cap
+        return self._policy.batch_cap
 
     @property
     def max_padding_fraction(self) -> float:
-        return self._max_padding_fraction
-
-    @property
-    def max_transient_bytes(self) -> int:
-        return self._max_transient_bytes
+        return self._policy.max_padding_fraction
 
     @property
     def shape_policy(self) -> str:
-        return self._shape_policy
+        return self._policy.shape_policy
 
     def reset(self) -> None:
         """Reset solve-local submission numbering."""
@@ -1406,9 +1338,7 @@ class _DavidsonScheduler:
                 )
             plan = _plan_compact_submissions(
                 [ticket.vectors for ticket in compatible],
-                batch_cap=self.batch_cap,
-                max_padding_fraction=self.max_padding_fraction,
-                max_transient_bytes=self.max_transient_bytes,
+                policy=self._policy,
                 batch_byte_estimator=estimate_submission,
                 capacity=capacity,
             )
@@ -1418,8 +1348,7 @@ class _DavidsonScheduler:
                 submission = tuple(compatible[index] for index in planned.indices)
                 prepared_batch = _CompactBatch.from_states(
                     [ticket.vectors for ticket in submission],
-                    max_padding_fraction=self.max_padding_fraction,
-                    max_transient_bytes=self.max_transient_bytes,
+                    policy=self._policy,
                     lane_capacity=(None if planned.capacity is None else planned.capacity.lanes),
                     vector_capacity=(
                         None if planned.capacity is None else planned.capacity.vectors
@@ -1454,22 +1383,11 @@ class _DavidsonScheduler:
                 try:
                     if len(submission) == 1:
                         ticket = submission[0]
-                        apply_kwargs: dict[str, object] = {
-                            "observer": ticket.observer,
-                            "prepared_batch": prepared_batch,
-                        }
-                        if (
-                            self.max_padding_fraction != _CompactBatch._DEFAULT_MAX_PADDING_FRACTION
-                            or self.max_transient_bytes
-                            != _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES
-                        ):
-                            apply_kwargs.update(
-                                max_padding_fraction=self.max_padding_fraction,
-                                max_transient_bytes=self.max_transient_bytes,
-                            )
                         applied = ticket.operator._apply_compact(
                             ticket.vectors,
-                            **apply_kwargs,
+                            observer=ticket.observer,
+                            policy=self._policy,
+                            prepared_batch=prepared_batch,
                         )
                         batch_actions = {ticket.lane_id: applied}
                     else:
@@ -1477,8 +1395,7 @@ class _DavidsonScheduler:
                             tuple(ticket.operator for ticket in submission),
                             tuple(ticket.vectors for ticket in submission),
                             observer=self._observer(submission[0]),
-                            max_padding_fraction=self.max_padding_fraction,
-                            max_transient_bytes=self.max_transient_bytes,
+                            policy=self._policy,
                             prepared_batch=prepared_batch,
                         )
                         batch_actions = {
@@ -2039,7 +1956,7 @@ class _DavidsonEngine:
     """Advance ragged Davidson lanes and collectively schedule ready H blocks."""
 
     def __init__(self, *, scheduler: _DavidsonScheduler | None = None) -> None:
-        self.scheduler = _DavidsonScheduler(batch_cap=1) if scheduler is None else scheduler
+        self.scheduler = _DavidsonScheduler() if scheduler is None else scheduler
         self._ready_rounds: list[tuple[str, ...]] = []
         self._compatibility_groups: list[tuple[str, ...]] = []
         self._submission_groups: list[tuple[str, ...]] = []
@@ -2871,7 +2788,7 @@ def solve_periodic_eigenproblem(
         observer=runtime_observer,
         trial_is_orthonormal=initial_coefficients is None,
     )
-    engine = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=1))
+    engine = _DavidsonEngine(scheduler=_DavidsonScheduler())
     return engine.solve([request]).result_for(lane_id)
 
 
@@ -2879,9 +2796,7 @@ def _density_from_kpoints(
     results: Sequence[PeriodicKPointResult],
     *,
     occupation: float,
-    batch_cap: int = 1,
-    max_padding_fraction: float = _CompactBatch._DEFAULT_MAX_PADDING_FRACTION,
-    max_transient_bytes: int = _CompactBatch._DEFAULT_MAX_TRANSIENT_BYTES,
+    policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
     observer: RuntimeObserver | None = None,
 ) -> mx.array:
     if not results:
@@ -2918,17 +2833,15 @@ def _density_from_kpoints(
         capacity_groups = _stable_compact_capacity_groups(
             states,
             compatible_indices,
-            lane_capacity=batch_cap,
+            lane_capacity=policy.batch_cap,
             vector_capacity=vector_capacity,
-            max_padding_fraction=max_padding_fraction,
+            max_padding_fraction=policy.max_padding_fraction,
         )
         for capacity_indices, capacity in capacity_groups:
             capacity_states = [states[index] for index in capacity_indices]
             plan = _plan_compact_submissions(
                 capacity_states,
-                batch_cap=batch_cap,
-                max_padding_fraction=max_padding_fraction,
-                max_transient_bytes=max_transient_bytes,
+                policy=policy,
                 batch_byte_estimator=estimate_density_batch,
                 capacity=capacity,
             )
@@ -2939,8 +2852,7 @@ def _density_from_kpoints(
                 logical_indices = tuple(capacity_indices[index] for index in submission.indices)
                 batch = _CompactBatch.from_states(
                     [states[index] for index in logical_indices],
-                    max_padding_fraction=max_padding_fraction,
-                    max_transient_bytes=max_transient_bytes,
+                    policy=policy,
                     lane_capacity=capacity.lanes,
                     vector_capacity=capacity.vectors,
                     active_capacity=capacity.active,
@@ -2949,7 +2861,7 @@ def _density_from_kpoints(
                     logical_indices,
                     batch,
                 )
-                if estimated_transient_bytes > max_transient_bytes:
+                if estimated_transient_bytes > policy.max_transient_bytes:
                     msg = "density batch exceeds the complete transient byte budget"
                     raise ValueError(msg)
                 orbitals = batch.to_real()
@@ -3415,6 +3327,7 @@ def _run_periodic_scf_with_projector_cache(
     """
 
     scf_config = PeriodicSCFConfig() if config is None else config
+    compact_policy = scf_config._compact_batch_policy()
     xc = ProductionPBEExchangeCorrelation() if xc_functional is None else xc_functional
     occupied_bands = int(round(system.electron_count / 2.0)) if n_bands is None else n_bands
     if occupied_bands <= 0 or abs(2.0 * occupied_bands - system.electron_count) > 1e-8:
@@ -3686,10 +3599,7 @@ def _run_periodic_scf_with_projector_cache(
         )
         def new_scheduler() -> _DavidsonScheduler:
             return _DavidsonScheduler(
-                batch_cap=scf_config.kpoint_batch_size,
-                max_padding_fraction=scf_config.max_batch_padding_fraction,
-                max_transient_bytes=scf_config.max_batch_transient_bytes,
-                shape_policy=scf_config.hpsi_shape_policy,
+                policy=compact_policy,
                 submission_callback=emit_submission,
             )
         with observed_phase(
@@ -3743,9 +3653,7 @@ def _run_periodic_scf_with_projector_cache(
             target_density = _density_from_kpoints(
                 final_owned_results,
                 occupation=2.0,
-                batch_cap=scf_config.kpoint_batch_size,
-                max_padding_fraction=scf_config.max_batch_padding_fraction,
-                max_transient_bytes=scf_config.max_batch_transient_bytes,
+                policy=compact_policy,
                 observer=observer,
             )
             target_count = float(mx.sum(target_density) * system.grid.dv)

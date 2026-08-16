@@ -19,6 +19,7 @@ from mlx_atomistic.dft import (
     RealSpaceGrid,
     solve_periodic_eigenproblem,
 )
+from mlx_atomistic.dft._compact import _CompactBatchPolicy
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.periodic_scf import (
     _Complex64RankPolicy,
@@ -980,7 +981,7 @@ def test_engine_emits_collective_round_progress_when_detail_is_disabled():
     )
 
     result = _DavidsonEngine(
-        scheduler=_DavidsonScheduler(batch_cap=2)
+        scheduler=_DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=2))
     ).solve(requests)
     events = observer.snapshot()["events"]
 
@@ -1001,7 +1002,7 @@ def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():
     two = periodic_scf._initial_coefficients(basis, 2)
     nonfinite = basis._state_from_compact(mx.full((1, basis.active_count), complex(np.nan, 0.0)))
     observer = RuntimeObserver()
-    scheduler = _DavidsonScheduler(batch_cap=1)
+    scheduler = _DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=1))
 
     result = scheduler.apply(
         [
@@ -1067,7 +1068,7 @@ def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():
     assert work["fft_submissions"] == 2 * result.submission_count
 
     before_batch = observer.snapshot()["work_counters"]
-    batched = _DavidsonScheduler(batch_cap=2).apply(
+    batched = _DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=2)).apply(
         [
             _DavidsonApplicationTicket(
                 lane_id=lane_id,
@@ -1089,7 +1090,7 @@ def test_scheduler_groups_batch_one_and_many_but_failure_stays_lane_local():
     assert after_batch["fft_submissions"] - before_batch["fft_submissions"] == 2
 
     with pytest.raises(ValueError, match="positive non-bool integer"):
-        _DavidsonScheduler(batch_cap=True)
+        _CompactBatchPolicy(batch_cap=True)
 
     singleton = scheduler.apply(
         [
@@ -1157,7 +1158,12 @@ def test_finite_bucket_scheduler_uses_only_smallest_fitting_physical_shapes():
         )
         for width in (1, 3, 5, 9)
     )
-    scheduler = _DavidsonScheduler(batch_cap=8, shape_policy="finite-buckets")
+    scheduler = _DavidsonScheduler(
+        policy=_CompactBatchPolicy(
+            batch_cap=8,
+            shape_policy="finite-buckets",
+        )
+    )
     scheduler.bind(tickets)
 
     outcome = scheduler.apply(tickets)
@@ -1175,9 +1181,9 @@ def test_finite_bucket_scheduler_uses_only_smallest_fitting_physical_shapes():
     assert work["hpsi_submitted_vector_equivalents"] == 32
 
 
-def test_scheduler_rejects_unknown_shape_policy():
+def test_compact_batch_policy_rejects_unknown_shape_policy():
     with pytest.raises(ValueError, match="shape_policy"):
-        _DavidsonScheduler(shape_policy="unbounded")
+        _CompactBatchPolicy(shape_policy="unbounded")
 
 
 def test_engine_tail_submission_reuses_solve_local_physical_shape(monkeypatch):
@@ -1215,7 +1221,9 @@ def test_engine_tail_submission_reuses_solve_local_physical_shape(monkeypatch):
         for lane_id in ("left", "middle", "tail")
     )
 
-    outcome = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=2)).solve(requests)
+    outcome = _DavidsonEngine(
+        scheduler=_DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=2))
+    ).solve(requests)
 
     assert not outcome.failures
     assert set(outcome.results) == {"left", "middle", "tail"}
@@ -1282,7 +1290,9 @@ def test_incremental_multilane_engine_progresses_ragged_lanes_and_submits_work()
         ),
     )
 
-    outcome = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=1)).solve(requests)
+    outcome = _DavidsonEngine(
+        scheduler=_DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=1))
+    ).solve(requests)
 
     assert set(outcome.results) == {"one-band", "two-band"}
     assert set(outcome.failures) == {"nonfinite"}
@@ -1361,7 +1371,9 @@ def test_incremental_multilane_engine_splits_ready_waves_at_real_batch_cap_one()
         for lane_id in ("left", "right")
     )
 
-    outcome = _DavidsonEngine(scheduler=_DavidsonScheduler(batch_cap=1)).solve(requests)
+    outcome = _DavidsonEngine(
+        scheduler=_DavidsonScheduler(policy=_CompactBatchPolicy(batch_cap=1))
+    ).solve(requests)
 
     assert outcome.ready_rounds == (
         ("left", "right"),

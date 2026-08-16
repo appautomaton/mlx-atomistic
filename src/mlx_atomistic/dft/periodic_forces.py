@@ -10,13 +10,13 @@ import numpy as np
 
 from mlx_atomistic.dft._compact import _CompactLaneState
 from mlx_atomistic.dft._memory import _bounded_dft_allocator
+from mlx_atomistic.dft._periodic_models import PeriodicDFTSystem, PeriodicSCFResult
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
     periodic_ewald_forces,
     periodic_gth_local_forces,
 )
-from mlx_atomistic.dft.periodic_scf import PeriodicDFTSystem, PeriodicSCFResult
 
 
 @dataclass(frozen=True)
