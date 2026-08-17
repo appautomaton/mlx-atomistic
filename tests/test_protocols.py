@@ -100,6 +100,23 @@ def test_run_minimize_then_nvt_fails_closed_before_npt_force_evaluation():
     assert exc_info.value.blockers == ("barostat", "unsupported_proof_mode")
 
 
+def test_minimize_then_nvt_protocol_rejects_supported_npt_runtime_request():
+    protocol = MinimizeThenNVTProtocol(
+        ensemble="NPT",
+        proof_mode="short_npt",
+        barostat="monte_carlo",
+        npt_barostat=True,
+    )
+
+    report = protocol.compatibility_report()
+
+    assert report.accepted is False
+    assert report.blockers == ("npt_requires_simulate_npt",)
+    assert report.metadata["required_entry_point"] == "simulate_npt"
+    with pytest.raises(ProtocolCompatibilityError, match="npt_requires_simulate_npt"):
+        protocol.compatibility_report(raise_on_blockers=True)
+
+
 def test_run_minimize_then_nvt_exposes_nvt_protocol_metadata():
     positions, velocities, masses, cell, potential = _small_periodic_fixture()
 

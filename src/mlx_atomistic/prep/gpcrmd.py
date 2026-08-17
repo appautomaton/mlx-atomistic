@@ -222,6 +222,7 @@ class GPCRmdMLXCompatibilityReport:
     unsupported_physics: tuple[str, ...]
     runtime_risk: dict[str, Any]
     next_engine_slice: str
+    validation_gaps: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     extra_fields: dict[str, Any] = field(default_factory=dict)
 
@@ -233,6 +234,7 @@ class GPCRmdMLXCompatibilityReport:
             "supported_now": list(self.supported_now),
             "missing_input": list(self.missing_input),
             "unsupported_physics": list(self.unsupported_physics),
+            "validation_gaps": list(self.validation_gaps),
             "runtime_risk": dict(self.runtime_risk),
             "next_engine_slice": self.next_engine_slice,
             "warnings": list(self.warnings),
@@ -286,6 +288,7 @@ class GPCRmdReadinessInventory:
     protocol_requirements: dict[str, Any]
     first_engine_blockers: tuple[dict[str, Any], ...]
     missing_input: tuple[str, ...]
+    validation_gaps: tuple[str, ...] = field(default_factory=tuple)
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -305,6 +308,7 @@ class GPCRmdReadinessInventory:
             "first_engine_blockers": [
                 dict(item) for item in self.first_engine_blockers
             ],
+            "validation_gaps": list(self.validation_gaps),
             "missing_input": list(self.missing_input),
         }
 
@@ -1228,8 +1232,9 @@ def gpcrmd_mlx_compatibility_report(
     target = inspection.target
     missing_input = _missing_input_items(inspection)
     unsupported_physics = _unsupported_physics_items(target)
+    validation_gaps = _validation_gap_items(target)
     runtime_risk = _runtime_risk(target)
-    runnable_now = not missing_input and not unsupported_physics
+    runnable_now = not missing_input and not unsupported_physics and not validation_gaps
     return GPCRmdMLXCompatibilityReport(
         target_id=target.target_id,
         dynamics_id=target.dynamics_id,
@@ -1237,8 +1242,13 @@ def gpcrmd_mlx_compatibility_report(
         supported_now=_supported_now_items(target),
         missing_input=tuple(missing_input),
         unsupported_physics=tuple(unsupported_physics),
+        validation_gaps=tuple(validation_gaps),
         runtime_risk=runtime_risk,
-        next_engine_slice=_next_engine_slice(missing_input, unsupported_physics),
+        next_engine_slice=_next_engine_slice(
+            missing_input,
+            unsupported_physics,
+            validation_gaps,
+        ),
         warnings=(
             "GPCRmd reference trajectories are comparison context, not MLX-generated results.",
             "This report is metadata-level until topology/parameter files are parsed.",
@@ -1266,6 +1276,7 @@ def gpcrmd_mlx_readiness_inventory(
         exceptions=_exception_inventory(target),
         protocol_requirements=_protocol_inventory(target),
         first_engine_blockers=tuple(_first_engine_blockers(compatibility)),
+        validation_gaps=compatibility.validation_gaps,
         missing_input=compatibility.missing_input,
     )
 
@@ -1507,8 +1518,7 @@ def _protocol_inventory(target: GPCRmdTarget) -> dict[str, Any]:
     requirements = ["nvt_thermostat"]
     blockers: list[str] = []
     if "npt" in target.ensemble.lower():
-        requirements.append("barostat")
-        blockers.append("npt_barostat")
+        requirements.append("monte_carlo_barostat")
     if target.time_step_fs >= 3.0:
         requirements.append("4_fs_constraint_or_hmr_policy")
         blockers.append("hmr_or_virtual_site_policy_required")
@@ -1519,8 +1529,10 @@ def _protocol_inventory(target: GPCRmdTarget) -> dict[str, Any]:
         "frame_stride_ns": target.frame_stride_ns,
         "accumulated_time_us": target.accumulated_time_us,
         "software": target.software,
+        "runtime_status": "proof-level",
         "requirements": requirements,
         "blockers": blockers,
+        "validation_gaps": _validation_gap_items(target),
     }
 
 
@@ -1567,10 +1579,6 @@ def _first_engine_blockers(
                 "policy before runtime"
             ),
         },
-        "npt_barostat": {
-            "first_slice": "Slice 8 plus Slice 9",
-            "reason": "pressure control requires virial diagnostics and the selected barostat path",
-        },
     }
     return [
         {
@@ -1585,11 +1593,15 @@ def _first_engine_blockers(
 
 def _unsupported_physics_items(target: GPCRmdTarget) -> list[str]:
     unsupported: list[str] = []
-    if "npt" in target.ensemble.lower():
-        unsupported.append("npt_barostat")
     if target.time_step_fs >= 3.0:
         unsupported.append("hmr_or_virtual_site_policy_required")
     return unsupported
+
+
+def _validation_gap_items(target: GPCRmdTarget) -> list[str]:
+    if "npt" in target.ensemble.lower():
+        return ["npt_workload_certification"]
+    return []
 
 
 def _requires_mesh_pme(target: GPCRmdTarget) -> bool:
@@ -1620,6 +1632,8 @@ def _supported_now_items(target: GPCRmdTarget) -> tuple[str, ...]:
     ]
     if target.solvent_type.upper() == "TIP3P":
         supported.append("tip3p_metadata")
+    if "npt" in target.ensemble.lower():
+        supported.append("monte_carlo_npt_runtime_proof")
     molecule_names = {name.lower() for name in target.molecule_counts}
     if target.periodic_box_expected and "water" in molecule_names:
         if _requires_mesh_pme(target):
@@ -1629,7 +1643,11 @@ def _supported_now_items(target: GPCRmdTarget) -> tuple[str, ...]:
     return tuple(supported)
 
 
-def _next_engine_slice(missing_input: Sequence[str], unsupported_physics: Sequence[str]) -> str:
+def _next_engine_slice(
+    missing_input: Sequence[str],
+    unsupported_physics: Sequence[str],
+    validation_gaps: Sequence[str],
+) -> str:
     if missing_input:
         return "download_or_mount_complete_gpcrmd_package_before_import"
     if "pme_mesh_periodic_electrostatics" in unsupported_physics:
@@ -1646,6 +1664,8 @@ def _next_engine_slice(missing_input: Sequence[str], unsupported_physics: Sequen
         return "parse_gpcrmd_constraints_hmr_or_virtual_sites_policy"
     if unsupported_physics:
         return "resolve_unsupported_gpcrmd_physics"
+    if "npt_workload_certification" in validation_gaps:
+        return "validate_gpcrmd_npt_workload"
     return "run_short_mlx_nvt_probe"
 
 
@@ -1726,6 +1746,7 @@ def _compatibility_with_prepared_force_terms(
     runnable_now = (
         not compatibility.missing_input
         and not unsupported_physics
+        and not compatibility.validation_gaps
         and not prepared_blockers
     )
     supported_now = list(compatibility.supported_now)
@@ -1746,7 +1767,11 @@ def _compatibility_with_prepared_force_terms(
         next_engine_slice=(
             "ready_for_bounded_mlx_execution"
             if runnable_now
-            else _next_engine_slice(compatibility.missing_input, unsupported_physics)
+            else _next_engine_slice(
+                compatibility.missing_input,
+                unsupported_physics,
+                compatibility.validation_gaps,
+            )
         ),
         warnings=(
             "GPCRmd reference trajectories are comparison context, not MLX-generated results.",
@@ -3078,6 +3103,7 @@ def _baseline_mismatch(name: str, parsed: object, expected: object) -> str:
 def _import_blockers(report: GPCRmdMLXCompatibilityReport) -> list[str]:
     blockers = [f"missing_input:{item}" for item in report.missing_input]
     blockers.extend(f"unsupported_physics:{item}" for item in report.unsupported_physics)
+    blockers.extend(f"validation_gap:{item}" for item in report.validation_gaps)
     if report.runnable_now:
         blockers.append("gpcrmd_topology_parameter_parser_not_implemented")
     return blockers

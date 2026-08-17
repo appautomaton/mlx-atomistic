@@ -687,6 +687,27 @@ def test_gpcrmd_small_periodic_fixture_uses_ewald_reference_without_pme_blocker(
     assert report.next_engine_slice == "run_short_mlx_nvt_probe"
 
 
+def test_gpcrmd_npt_is_proof_level_with_a_separate_validation_gap(tmp_path: Path):
+    target = replace(_small_periodic_soluble_target(), ensemble="NPT")
+    cache = tmp_path / "complete-cache"
+    _write_complete_cache(cache, target)
+
+    inspection = inspect_gpcrmd_cache(cache, targets=[target])
+    report = gpcrmd_mlx_compatibility_report(inspection)
+    inventory = gpcrmd_mlx_readiness_inventory(inspection).to_json_dict()
+
+    assert report.runnable_now is False
+    assert report.unsupported_physics == ()
+    assert report.validation_gaps == ("npt_workload_certification",)
+    assert "monte_carlo_npt_runtime_proof" in report.supported_now
+    assert report.next_engine_slice == "validate_gpcrmd_npt_workload"
+    assert inventory["validation_gaps"] == ["npt_workload_certification"]
+    assert inventory["protocol_requirements"]["runtime_status"] == "proof-level"
+    assert inventory["protocol_requirements"]["blockers"] == []
+    assert inventory["protocol_requirements"]["validation_gaps"] == ["npt_workload_certification"]
+    assert "npt_barostat" not in {item["name"] for item in inventory["first_engine_blockers"]}
+
+
 def test_gpcrmd_reference_trajectory_alone_cannot_pass_compatibility(tmp_path: Path):
     target = default_gpcrmd_targets()[0]
     cache = tmp_path / "trajectory-only"

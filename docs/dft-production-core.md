@@ -52,7 +52,10 @@ non-self-consistently along a high-symmetry path.
 
 ## Stress, Relaxation, And Restart
 
-Finite-difference stress estimates diagonal orthorhombic stress by changing cell lengths and rerunning SCF. Geometry optimization remains ion-position-first by default, with config fields now prepared for cell and coupled relaxation modes.
+Finite-difference stress estimates diagonal orthorhombic stress by changing
+cell lengths and rerunning SCF. Geometry optimization supports fixed-cell ion
+relaxation only. `GeometryOptimizationConfig` rejects variable-cell and coupled
+ion/cell modes instead of silently accepting settings the optimizer cannot use.
 
 Dense SCF restart files store density, orbitals, ion positions, cell lengths, spin metadata, and Γ k-point metadata for small-system continuation workflows.
 

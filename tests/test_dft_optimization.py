@@ -30,6 +30,11 @@ def test_geometry_optimization_config_validation():
         GeometryOptimizationConfig(line_search_shrink=1.0)
     with pytest.raises(ValueError, match="optimizer"):
         GeometryOptimizationConfig(optimizer="bad")  # type: ignore[arg-type]
+    for mode in ("cell", "ions_cell"):
+        with pytest.raises(ValueError, match="variable-cell relaxation is not implemented"):
+            GeometryOptimizationConfig(
+                relaxation_mode=mode,  # type: ignore[arg-type]
+            )
 
 
 @pytest.mark.slow

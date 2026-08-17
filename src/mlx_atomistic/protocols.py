@@ -79,9 +79,9 @@ class MinimizeThenNVTProtocol:
         *,
         raise_on_blockers: bool = False,
     ) -> ProtocolCompatibilityReport:
-        """Return the fail-closed GPCRmd proof compatibility decision."""
+        """Return the fail-closed compatibility decision for this NVT runner."""
 
-        return validate_gpcrmd_protocol_request(
+        report = validate_gpcrmd_protocol_request(
             {
                 "ensemble": self.ensemble,
                 "proof_mode": self.proof_mode,
@@ -89,8 +89,25 @@ class MinimizeThenNVTProtocol:
                 "npt_barostat": self.npt_barostat,
                 "membrane_barostat": self.membrane_barostat,
             },
-            raise_on_blockers=raise_on_blockers,
+            raise_on_blockers=False,
         )
+        if report.accepted and report.ensemble == "NPT":
+            blocker = "npt_requires_simulate_npt"
+            report = ProtocolCompatibilityReport(
+                accepted=False,
+                ensemble=report.ensemble,
+                proof_mode=report.proof_mode,
+                barostat=report.barostat,
+                blockers=(blocker,),
+                metadata={
+                    **report.metadata,
+                    "required_entry_point": "simulate_npt",
+                    "unsupported_protocol_blockers": [blocker],
+                },
+            )
+        if report.blockers and raise_on_blockers:
+            raise ProtocolCompatibilityError(report)
+        return report
 
     def protocol_metadata(self) -> dict[str, Any]:
         """Return normalized metadata for accepted NVT proof runs."""
