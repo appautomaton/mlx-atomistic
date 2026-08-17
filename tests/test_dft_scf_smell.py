@@ -6,9 +6,12 @@ import argparse
 
 import pytest
 
+from mlx_atomistic.benchmarks._dft_scf_gate_cases import (
+    _generated_owner_mesh,
+    _owner_points,
+)
 from mlx_atomistic.benchmarks.dft_scf_smell import (
     _hpsi_shape_profile,
-    _owner_points,
     _parser,
     _positive_integer,
 )
@@ -17,6 +20,22 @@ from mlx_atomistic.benchmarks.dft_scf_smell import (
 def test_smell_parser_requires_explicit_science_inputs() -> None:
     with pytest.raises(SystemExit):
         _parser().parse_args(["--mode", "adaptive"])
+
+
+def test_non_silicon_case_does_not_require_external_gth_source() -> None:
+    arguments = _parser().parse_args(
+        [
+            "--case",
+            "carbon",
+            "--manifest",
+            "workload.json",
+            "--mode",
+            "adaptive",
+        ]
+    )
+
+    assert arguments.case == "carbon"
+    assert arguments.gth_source is None
 
 
 def test_positive_integer_rejects_zero() -> None:
@@ -43,6 +62,14 @@ def test_owner_points_fails_closed_when_request_exceeds_manifest() -> None:
 
     with pytest.raises(ValueError, match="contains only 1 owners"):
         _owner_points(workload, 2)
+
+
+def test_generated_owner_mesh_matches_time_reversal_order() -> None:
+    mesh, indices = _generated_owner_mesh((2, 2, 2), 3)
+
+    assert indices == (0, 1, 2)
+    assert len(mesh.points) == 3
+    assert sum(point.weight for point in mesh.points) == pytest.approx(1.0)
 
 
 def test_hpsi_shape_profile_ignores_started_events_and_selects_one_tail() -> None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -12,21 +11,21 @@ from time import perf_counter
 from typing import Any
 
 import mlx.core as mx
-import numpy as np
 
 from mlx_atomistic._artifact_identity import canonical_json_bytes, sha256_bytes
-from mlx_atomistic.dft import (
-    KPoint,
-    KPointMesh,
-    PeriodicDavidsonConfig,
-    PeriodicDFTSystem,
-    PeriodicSCFConfig,
-    read_gth,
-    run_periodic_scf,
+from mlx_atomistic.benchmarks._dft_scf_gate_cases import (
+    CASE_NAMES,
+    load_scf_gate_case,
+    scf_gate_config,
 )
+from mlx_atomistic.benchmarks.dft_runtime_contract import (
+    build_source_fingerprints,
+    collect_host_provenance,
+)
+from mlx_atomistic.dft import run_periodic_scf
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
-SCHEMA = "mlx-atomistic.dft-scf-smell.v1"
+SCHEMA = "mlx-atomistic.dft-scf-smell.v2"
 type _HpsiSubmissionSignature = tuple[tuple[int, ...], tuple[str, ...], int, int]
 
 
@@ -46,8 +45,13 @@ def _parser() -> argparse.ArgumentParser:
             "216-explicit/108-representative-k-point production result."
         ),
     )
+    parser.add_argument("--case", choices=CASE_NAMES, default="silicon")
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--gth-source", type=Path, required=True)
+    parser.add_argument(
+        "--gth-source",
+        type=Path,
+        help="Required only for the silicon runtime workload.",
+    )
     parser.add_argument("--mode", choices=("fixed", "adaptive"), required=True)
     parser.add_argument(
         "--hpsi-shape-policy",
@@ -63,23 +67,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
-
-
-def _owner_points(
-    workload: dict[str, Any], representatives: int
-) -> list[dict[str, Any]]:
-    owners = [
-        point
-        for point in workload["physics"]["kpoints"]
-        if point["role"] == "owner"
-    ]
-    if representatives > len(owners):
-        msg = (
-            f"requested {representatives} representative k-points, but the "
-            f"manifest contains only {len(owners)} owners"
-        )
-        raise ValueError(msg)
-    return owners[:representatives]
 
 
 def _hpsi_purpose_totals(
@@ -269,61 +256,29 @@ def _hpsi_shape_profile(events: Sequence[dict[str, object]]) -> dict[str, object
 
 
 def _run(arguments: argparse.Namespace) -> dict[str, Any]:
-    workload_bytes = arguments.manifest.read_bytes()
-    workload = json.loads(workload_bytes)
-    system_values = workload["system"]
-    physics = workload["physics"]
-    lattice = float(system_values["lattice_constant_bohr"])
-    selected = _owner_points(workload, arguments.representatives)
-    system = PeriodicDFTSystem(
-        (lattice, lattice, lattice),
-        physics["fft_shape"],
-        np.asarray(system_values["fractional_positions"], dtype=np.float64)
-        * lattice,
-        read_gth(arguments.gth_source, element="Si", name="GTH-PBE-q4"),
-        electron_count=float(system_values["electron_count"]),
-    )
-    mesh = KPointMesh(
-        [
-            KPoint(
-                point["reduced_coordinates"],
-                weight=float(point["weight"]["numerator"])
-                / float(point["weight"]["denominator"]),
-                coordinate_system="reduced",
-            )
-            for point in selected
-        ]
+    sources = build_source_fingerprints()
+    host = collect_host_provenance()
+    case = load_scf_gate_case(
+        arguments.case,
+        arguments.manifest,
+        gth_source=arguments.gth_source,
+        representatives=arguments.representatives,
     )
     observer = RuntimeObserver(
         synchronize=mx.synchronize,
         detail_events=arguments.shape_profile,
     )
-    config = PeriodicSCFConfig(
-        max_iterations=80,
-        min_iterations=2,
-        density_tolerance=1e-6,
-        energy_tolerance=8e-6,
-        orbital_tolerance=1e-6,
-        mixing_beta=0.35,
-        mixer="diis",
-        adaptive_eigensolver_tolerance=arguments.mode == "adaptive",
-        initial_eigensolver_tolerance=1e-2,
-        eigensolver_tolerance_scale=0.1,
-        davidson=PeriodicDavidsonConfig(
-            max_iterations=48,
-            tolerance=1e-6,
-            max_subspace_size=64,
-            preconditioner_floor=0.25,
-        ),
-        kpoint_batch_size=8,
+    config = scf_gate_config(
+        case,
+        mode=arguments.mode,
         hpsi_shape_policy=arguments.hpsi_shape_policy,
     )
     started = perf_counter()
     result = run_periodic_scf(
-        system,
-        cutoff_hartree=float(physics["kinetic_cutoff_hartree"]),
-        kpoint_mesh=mesh,
-        n_bands=int(system_values["occupied_band_count"]),
+        case.system,
+        cutoff_hartree=case.cutoff_hartree,
+        kpoint_mesh=case.kpoint_mesh,
+        n_bands=case.occupied_band_count,
         config=config,
         observer=observer,
     )
@@ -334,28 +289,46 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         float(mx.max(point.eigen.residuals)) for point in result.kpoints
     )
     maximum_overlap = max(point.eigen.orthonormality_error for point in result.kpoints)
+    electron_error = abs(result.electron_count - case.system.electron_count)
+    gates = case.manifest["numerical_gates"]
+    numerical_passed = bool(
+        result.converged
+        and electron_error <= float(gates["electron_count_abs_per_cell"])
+        and maximum_overlap <= float(gates["orthonormality_max"])
+        and maximum_residual <= float(case.manifest["solver"]["davidson"]["tolerance"])
+    )
     report = {
         "schema": SCHEMA,
         "scope": "partial-brillouin-zone-development-gate",
         "production_full_scf_result": False,
         "includes_scf_density_loop": True,
         "includes_persistence": False,
+        "case": case.name,
+        "profile": case.profile,
+        "target_id": case.target_id,
         "manifest": str(arguments.manifest),
-        "manifest_sha256": sha256_bytes(workload_bytes),
-        "gth_source": str(arguments.gth_source),
+        "manifest_sha256": sha256_bytes(case.manifest_bytes),
+        "workload_fingerprint": case.workload_fingerprint,
+        "runtime_fingerprint": sources["runtime_fingerprint"],
+        "host": host,
+        "resources": case.resource_records(),
+        "protocol": {
+            "cutoff_hartree": case.cutoff_hartree,
+            "fft_shape": list(case.system.grid.shape),
+            "occupied_band_count": case.occupied_band_count,
+            "max_batch_transient_bytes": case.max_batch_transient_bytes,
+        },
         "mode": arguments.mode,
         "hpsi_shape_policy": arguments.hpsi_shape_policy,
         "elapsed_seconds": elapsed,
         "converged": result.converged,
+        "numerical_passed": numerical_passed,
         "iterations": result.iterations,
         "representative_kpoints": len(result.kpoints),
-        "selected_owner_indices": [point["index"] for point in selected],
+        "selected_owner_indices": list(case.selected_owner_indices),
         "total_energy_hartree": result.total_energy,
-        "energy_hartree_per_atom": result.total_energy
-        / int(system_values["atom_count"]),
-        "electron_error": abs(
-            result.electron_count - float(system_values["electron_count"])
-        ),
+        "energy_hartree_per_atom": result.total_energy / case.atom_count,
+        "electron_error": electron_error,
         "density_residual": result.density_residual,
         "maximum_orbital_residual": maximum_residual,
         "maximum_overlap_error": maximum_overlap,
@@ -393,7 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{report['representative_kpoints']} representative k-points",
             flush=True,
         )
-    return 0 if report["converged"] else 2
+    return 0 if report["numerical_passed"] else 2
 
 
 if __name__ == "__main__":

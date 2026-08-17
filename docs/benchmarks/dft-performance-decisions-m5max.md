@@ -1,6 +1,6 @@
 # DFT Performance Decision Ledger on Apple M5 Max
 
-Date: 2026-08-16
+Date: 2026-08-17
 
 This ledger preserves the transferable performance decisions for the periodic
 Density Functional Theory (DFT) runtime. It replaces separate Silicon runtime,
@@ -86,6 +86,26 @@ Hpsi is the Hamiltonian applied to a batch of wavefunctions. It remains the
 largest phase, but the measurements below show that not every Hpsi boundary is
 large enough to justify a new runtime route.
 
+## Current Transfer Gates
+
+The bounded self-consistent field development gate now resolves three validated
+material workloads through one runner. These partial Brillouin-zone runs are
+performance and numerical transfer gates, not production energies. All three
+rows below ran on Battery Power with Low Power Mode enabled and passed their
+convergence, electron-count, orbital-residual, and orthonormality gates.
+
+| Case | Production-derived profile | Representatives | Wall | SCF cycles | Hpsi vectors |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Silicon | 25 Ha, 56³ FFT | 8 | 6.260 s | 13 | 7,681 |
+| Carbon | 40 Ha, 48³ FFT | 4 | 4.701 s | 12 | 4,031 |
+| MgO | q2, 70 Ha, 68³ FFT | 4 | 12.096 s | 17 | 4,362 |
+
+The shared runtime fingerprint was
+`aafe45de34718f46201ccfadab9d957e5ce0b63d33db4ef9aae6146a5d4a101d`.
+Candidate comparisons must use the same case, representative count, power
+state, and runner mode. A complete Silicon run remains the final performance
+and numerical gate for a candidate that passes this ladder.
+
 ## Retained Infrastructure
 
 | Change | Decision evidence | Commit |
@@ -112,6 +132,7 @@ inverse and forward FFTs as 95.17% of the complete local-FFT median.
 | Multi-lane grouped CholeskyQR2 | The bounded eight-representative run regressed from 4.801 to 5.773 seconds because small grouped Gram operations were slower. | 2026-08-16 diagnostic |
 | Unconditional CholeskyQR1 | The bounded gate improved, but the complete run reached 80 cycles without meeting the final residual. | 2026-08-16 diagnostic |
 | Newton-Schulz orthogonal refinement | Cholesky normalizer calls fell from 703 to 525, but bounded median wall regressed from 5.816 to 5.868 seconds. | 2026-08-16 diagnostic |
+| Nonorthogonal Davidson with generalized Rayleigh-Ritz | The batched-overlap version reduced orthogonalization vectors from 5,345 to 1,478 and orthogonalization time from 1.158 to 0.325 seconds, but added one SCF cycle, increased padded Hpsi submissions from 14,464 to 15,488 vectors, and regressed the Silicon gate from 6.023 to 6.570 seconds. The prototype was removed before Carbon, MgO, or complete-run admission. | 2026-08-17 diagnostic |
 | Quantum ESPRESSO-style smooth Davidson denominator | The bounded adaptive run increased SCF cycles from 13 to 16, correction vectors from 5,349 to 5,999, and total Hpsi vectors from 7,717 to 8,895. A lower raw wall time was rejected as device-state drift because algorithmic work regressed. | 2026-08-16 diagnostic |
 | Smaller Davidson subspace, RMM-DIIS, and converged-subspace locking | Iteration counts or complete bounded wall increased. | pre-`2a56533` scheduler experiments |
 | One-dimensional compact Hpsi Metal boundary | Fixed-density wall improved 14.49%, narrowly below the frozen 14.72% dispersion gate. The candidate was removed. | `831e077` |
