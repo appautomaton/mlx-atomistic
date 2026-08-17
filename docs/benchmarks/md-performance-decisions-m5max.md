@@ -40,6 +40,7 @@ git show <commit>:docs/benchmarks/<historical-file>.md
 | 2026-08-15 | Bounded Interaction32 mode cache | The count kernel retains each right atom's two-bit half-membership mode, so ordinary scatter no longer repeats periodic geometry and 32-by-32 membership work. A 64 MiB admission limit preserves the original sparse fallback. Position-balanced 750-step walls improved 2.78-4.80% on 5DFR, 1.53-2.04% on JAC, and 2.57-3.03% on GPCRmd. | `0066b58` |
 | 2026-08-15 | Topology-recovered rigid water | When molecule identifiers are absent, a fail-closed constraint-graph proof recovers only complete disjoint O-H-H water triangles. GPCRmd moves 19,944 waters from a 20-iteration small-component route to analytical SETTLE. Same-context 1,000-step pairs improved 5.31% and 32.37%; the retained claim is the conservative 5.1-5.3% complete-wall gain because independent processes changed Metal performance states. | `7b93553` |
 | 2026-08-15 | Reused center-of-mass total mass | A run segment now computes the invariant total mass once instead of reducing the mass vector in every `CMMotionRemover` step. Independent-process 3,000-step ABBA pairs on 5DFR improved complete wall by 4.20% and 2.26%; the median fell from 1.3702 to 1.3258 ms/step, or 3.24%. Every arm passed the runtime checks, with 97-99 Neighbor rebuilds. | `6dea505` |
+| 2026-08-17 | Packed Interaction32 mode collectives | Three mutually exclusive mode counts and ranks now share one six-bit-field SIMD collective; the mode cache is packed by two disjoint reductions instead of sixteen shuffles per lane. Low-power 750-step A/B/B/A walls improved 0.01% and 3.68% on 5DFR, 2.24% and 6.08% on JAC, and 1.99% and 3.13% on GPCRmd. Rebuild counts matched in every adjacent pair, while measured rebuild wall fell 5.7-6.3%, 22.4-29.3%, and 27.0-29.6%, respectively. | `97ea8d2` |
 
 The adaptive scatter retains its own
 [boundary report](./md-left-grouped-neighbor-scatter-m5max.md) because it is the
@@ -107,6 +108,8 @@ micro-optimization.
 | Combined SETTLE/SHAKE dispatch | One Metal dispatch produced bitwise-identical SETTLE and SHAKE deltas, but the saved launch did not transfer through the complete lazy graph. GPCRmd regressed from a 5.074 to 5.090 ms/step median, with opposite adjacent directions (+0.75% and -0.12%). JAC's apparent 6.18% median gain came entirely from a slow first control; its warm adjacent pair regressed by 0.17%. The prototype was removed. | uncommitted prototype; `results/md-suite/fused-constraint-family-2026-08-15/` |
 | PME interpolation adds Direct force | Reading the Direct force in the order-five PME interpolation kernel removed a separate full-array addition and preserved force parity. It also introduced an earlier Direct-to-PME graph dependency. The 750-step median regressed 4.7% on 5DFR, JAC's warm adjacent gain was only 0.8%, and GPCRmd changed direction (+0.44% and -0.37%) with a neutral 0.04% median. The prototype was removed. | uncommitted prototype; `results/md-suite/pme-inline-aggregation-2026-08-15/` |
 | Fast exponential in the shared Ewald helper | Replacing `metal::exp` with `metal::fast::exp` preserved finite forces with a maximum sampled absolute delta of 1.83e-4, about 3e-7 relative to the largest force. Fixed-schedule ABBA timing did not transfer across systems: JAC regressed in both adjacent directions, and GPCRmd had one large regression plus one drift-sized gain. The candidate never entered the product source or full trajectories. | uncommitted diagnostic; `results/md-suite/interaction32-fast-exp-2026-08-15/` |
+| Fast reciprocal square root in Direct Space | `metal::fast::rsqrt` improved fixed-schedule calls by 2.3-6.5% across 5DFR, JAC, and GPCRmd with maximum sampled force deltas below `3.4e-4 kJ/(mol A)`. The 750-step JAC C/A/C trajectory changed direction and the candidate mean was 0.33% slower, so the exact reciprocal square root remains. | uncommitted diagnostic; `results/md-suite/direct-fast-rsqrt-*-2026-08-17/` |
+| Forced two-level schedules for short generations | Lowering the 24-update admission threshold made GPCRmd build an inner schedule that could not amortize its compaction cost. Both adjacent 750-step directions regressed, including one large 42.6% loss, so the motion-based admission boundary remains unchanged. | uncommitted diagnostic; `results/md-suite/lane-aware-admission-screen-2026-08-17/` |
 | Active-right prepass and compaction | Compacting useful right entries made the force kernel 10.5% faster on 5DFR, but the 1.416 ms prepass cost exceeded the 0.253 ms saved from the force call. The complete two-pass candidate regressed 18.6%. | uncommitted prototype; `results/md-suite/direct-common-work-screen-2026-08-15.json` |
 | Direct arithmetic-only specialization | Full, Lennard-Jones-only, and Coulomb-only kernels attributed 66-84% of Direct time to shared geometry, pair traversal, reduction, and writes. The isolated formulas were too small and too system-dependent to justify another specialization. | uncommitted diagnostic; `results/md-suite/direct-common-work-screen-2026-08-15.json` |
 | Morton and axis-permuted atom order | Morton ordering enlarged scheduled lanes by 4.68-5.26% across 5DFR, JAC, and GPCRmd. The best linear-axis permutation changed scheduled lanes by only 0.02-0.21%, with a different winner per system, so the existing periodic cell order remains canonical. | uncommitted diagnostic; `results/md-suite/axis-ordering-screen-2026-08-15/` |
@@ -161,15 +164,15 @@ growth belongs to ordinary pair traversal. The reusable benchmark attribution
 is emitted as `component_timing`; raw evidence is under
 `results/md-suite/direct-current-attribution-2026-08-16/`.
 
-A fresh manifest-matched JAC 94,232-atom comparison at `12bc829` used 10
+A fresh manifest-matched JAC 94,232-atom comparison at `97ea8d2` used 10
 warmup steps and 750 measured 4 fs fixed-cell NVT steps while macOS Low Power
-Mode was enabled. Current MLX with the adaptive Interaction32 route measured
-4.554 ms/step (75.90 ns/day); OpenMM 8.5.1.dev-f7fa0c2 with single-precision
-OpenCL measured 2.392 ms/step (144.48 ns/day). Every workload and runtime check
-passed, giving an MLX/OpenMM wall-time ratio of 1.904. The comparison is matched
-protocol throughput, not trajectory identity, because the engines use
-independent random-number implementations. Raw local evidence is under
-`results/md-suite/current-matched-openmm-12bc829-2026-08-16/`.
+Mode was enabled. Current MLX with the packed-collective adaptive Interaction32
+route measured 4.813 ms/step (71.81 ns/day); OpenMM 8.5.1.dev-f7fa0c2 with
+single-precision OpenCL measured 2.699 ms/step (128.03 ns/day). Every workload
+and runtime check passed, giving an MLX/OpenMM wall-time ratio of 1.783. The
+comparison is matched protocol throughput, not trajectory identity, because
+the engines use independent random-number implementations. Raw local evidence
+is under `results/md-suite/current-matched-openmm-97ea8d2-2026-08-17/`.
 
 The bounded mode cache in `0066b58` removes the remaining repeated ordinary
 membership traversal for systems whose packed cache is at most 64 MiB. Larger
