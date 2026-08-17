@@ -28,9 +28,12 @@ const KEYWORDS = [
 // Stable @id fragments connect the entities into one knowledge graph (the
 // @graph + @id pattern recommended for 2026: define core entities once,
 // reference by @id elsewhere).
-const ORG_ID = `${ORIGIN}/#organization`;
+// The fragments are not free choices. The catalog at the origin already names
+// the organization `#org` and this project `#project`, and an @id that differs
+// by one word is a second entity rather than a second mention of the first.
+const ORG_ID = `${ORIGIN}/#org`;
 const SITE_ID = `${SITE}/#website`;
-const SOFTWARE_ID = `${SITE}/#software`;
+const SOFTWARE_ID = `${SITE}/#project`;
 
 export const jsonLd = {
   "@context": "https://schema.org",
@@ -57,6 +60,9 @@ export const jsonLd = {
       "@type": "SoftwareSourceCode",
       "@id": SOFTWARE_ID,
       name: "mlx-atomistic",
+      // The written forms of the same name. `mlx atomistic` does not match
+      // `mlx-atomistic` on anything that respects the hyphen.
+      alternateName: ["MLX Atomistic", "mlx atomistic"],
       description: DESCRIPTION,
       url: `${SITE}/`,
       codeRepository: REPO,
