@@ -1623,18 +1623,21 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
             local_box,
             search_radius2
         );
-        mode1_count += simd_sum(mode == 1u ? 1u : 0u);
-        mode2_count += simd_sum(mode == 2u ? 1u : 0u);
-        mode3_count += simd_sum(mode == 3u ? 1u : 0u);
+        // One 32-lane count fits in six bits, so one collective carries all modes.
+        uint packed_count = simd_sum(
+            mode == 1u ? 1u : (mode == 2u ? 64u : (mode == 3u ? 4096u : 0u))
+        );
+        mode1_count += packed_count & 63u;
+        mode2_count += (packed_count >> 6u) & 63u;
+        mode3_count += (packed_count >> 12u) & 63u;
 #ifdef MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES
-        uint packed_modes = 0u;
-        uint first_lane = 16u * (lane >> 4u);
-        for (uint offset = 0u; offset < 16u; offset++) {
-            uint source_mode = simd_shuffle(mode, first_lane + offset);
-            packed_modes |= source_mode << (2u * offset);
-        }
-        if (lane == 0u || lane == 16u) {
-            mode_words[2u * pair_index + (lane >> 4u)] = packed_modes;
+        // Each lane owns a disjoint two-bit field, making these sums exact packs.
+        uint mode_shift = 2u * (lane & 15u);
+        uint packed_low = simd_sum(lane < 16u ? mode << mode_shift : 0u);
+        uint packed_high = simd_sum(lane >= 16u ? mode << mode_shift : 0u);
+        if (lane == 0u) {
+            mode_words[2u * pair_index + 0u] = packed_low;
+            mode_words[2u * pair_index + 1u] = packed_high;
         }
 #endif
     }
@@ -1685,12 +1688,16 @@ _INTERACTION32_ORDINARY_CACHED_SCATTER_SOURCE = r"""
         uint is1 = mode == 1u ? 1u : 0u;
         uint is2 = mode == 2u ? 1u : 0u;
         uint is3 = mode == 3u ? 1u : 0u;
-        uint rank1 = simd_prefix_exclusive_sum(is1);
-        uint rank2 = simd_prefix_exclusive_sum(is2);
-        uint rank3 = simd_prefix_exclusive_sum(is3);
-        uint count1 = simd_sum(is1);
-        uint count2 = simd_sum(is2);
-        uint count3 = simd_sum(is3);
+        // Six-bit fields keep all three ranks and counts in one collective.
+        uint packed_flags = is1 | (is2 << 6u) | (is3 << 12u);
+        uint packed_rank = simd_prefix_exclusive_sum(packed_flags);
+        uint packed_count = simd_sum(packed_flags);
+        uint rank1 = packed_rank & 63u;
+        uint rank2 = (packed_rank >> 6u) & 63u;
+        uint rank3 = (packed_rank >> 12u) & 63u;
+        uint count1 = packed_count & 63u;
+        uint count2 = (packed_count >> 6u) & 63u;
+        uint count3 = (packed_count >> 12u) & 63u;
         uint local_entry = mode == 1u
             ? seen1 + rank1
             : (mode == 2u ? seen2 + rank2 : seen3 + rank3);
@@ -1802,12 +1809,16 @@ _INTERACTION32_ORDINARY_SCATTER_SOURCE = r"""
         uint is1 = mode == 1u ? 1u : 0u;
         uint is2 = mode == 2u ? 1u : 0u;
         uint is3 = mode == 3u ? 1u : 0u;
-        uint rank1 = simd_prefix_exclusive_sum(is1);
-        uint rank2 = simd_prefix_exclusive_sum(is2);
-        uint rank3 = simd_prefix_exclusive_sum(is3);
-        uint count1 = simd_sum(is1);
-        uint count2 = simd_sum(is2);
-        uint count3 = simd_sum(is3);
+        // Six-bit fields keep all three ranks and counts in one collective.
+        uint packed_flags = is1 | (is2 << 6u) | (is3 << 12u);
+        uint packed_rank = simd_prefix_exclusive_sum(packed_flags);
+        uint packed_count = simd_sum(packed_flags);
+        uint rank1 = packed_rank & 63u;
+        uint rank2 = (packed_rank >> 6u) & 63u;
+        uint rank3 = (packed_rank >> 12u) & 63u;
+        uint count1 = packed_count & 63u;
+        uint count2 = (packed_count >> 6u) & 63u;
+        uint count3 = (packed_count >> 12u) & 63u;
         uint local_entry = mode == 1u
             ? seen1 + rank1
             : (mode == 2u ? seen2 + rank2 : seen3 + rank3);
@@ -1869,9 +1880,15 @@ _INTERACTION32_OUTER_INNER_MODE_COUNT_SOURCE = r"""
                 params[0]
             );
             cached_modes[32u * tile + lane] = mode;
-            counts_by_mode[0] += simd_sum(mode == 1u ? 1u : 0u);
-            counts_by_mode[1] += simd_sum(mode == 2u ? 1u : 0u);
-            counts_by_mode[2] += simd_sum(mode == 3u ? 1u : 0u);
+            // One 32-lane count fits in six bits, so one collective carries all modes.
+            uint packed_count = simd_sum(
+                mode == 1u
+                    ? 1u
+                    : (mode == 2u ? 64u : (mode == 3u ? 4096u : 0u))
+            );
+            counts_by_mode[0] += packed_count & 63u;
+            counts_by_mode[1] += (packed_count >> 6u) & 63u;
+            counts_by_mode[2] += (packed_count >> 12u) & 63u;
         }
     }
     if (lane == 0u) {
@@ -1917,12 +1934,16 @@ _INTERACTION32_OUTER_INNER_MODE_SCATTER_SOURCE = r"""
             uint is1 = mode == 1u ? 1u : 0u;
             uint is2 = mode == 2u ? 1u : 0u;
             uint is3 = mode == 3u ? 1u : 0u;
-            uint rank1 = simd_prefix_exclusive_sum(is1);
-            uint rank2 = simd_prefix_exclusive_sum(is2);
-            uint rank3 = simd_prefix_exclusive_sum(is3);
-            uint count1 = simd_sum(is1);
-            uint count2 = simd_sum(is2);
-            uint count3 = simd_sum(is3);
+            // Six-bit fields keep all three ranks and counts in one collective.
+            uint packed_flags = is1 | (is2 << 6u) | (is3 << 12u);
+            uint packed_rank = simd_prefix_exclusive_sum(packed_flags);
+            uint packed_count = simd_sum(packed_flags);
+            uint rank1 = packed_rank & 63u;
+            uint rank2 = (packed_rank >> 6u) & 63u;
+            uint rank3 = (packed_rank >> 12u) & 63u;
+            uint count1 = packed_count & 63u;
+            uint count2 = (packed_count >> 6u) & 63u;
+            uint count3 = (packed_count >> 12u) & 63u;
             uint local_entry = mode == 1u
                 ? seen1 + rank1
                 : (mode == 2u ? seen2 + rank2 : seen3 + rank3);
