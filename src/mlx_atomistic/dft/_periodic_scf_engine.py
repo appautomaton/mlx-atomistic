@@ -55,11 +55,11 @@ from mlx_atomistic.dft.kpoints import (
     build_time_reversal_ownership,
 )
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.periodic_electrostatics import periodic_ewald_energy
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
     gth_local_potential_grid,
-    periodic_ewald_energy,
 )
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import hartree_potential
