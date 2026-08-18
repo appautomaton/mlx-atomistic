@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import mlx_atomistic.dft._periodic_davidson as periodic_davidson
+import mlx_atomistic.dft._periodic_davidson_subspace as periodic_davidson_subspace
 import mlx_atomistic.dft._periodic_orthonormalization as periodic_orthonormalization
 from mlx_atomistic.dft import (
     GTHProjectorChannel,
@@ -23,16 +24,20 @@ from mlx_atomistic.dft import (
 from mlx_atomistic.dft._compact import _CompactBatch, _CompactBatchPolicy
 from mlx_atomistic.dft._periodic_davidson import (
     _Complex64RankPolicy,
-    _DavidsonApplicationTicket,
     _DavidsonEngine,
     _DavidsonLaneRequest,
-    _DavidsonScheduler,
+)
+from mlx_atomistic.dft._periodic_davidson_planner import (
     _finite_lane_capacity,
     _finite_vector_capacity,
-    _FixedHamiltonianToken,
-    _PairedDavidsonState,
-    _RankResult,
 )
+from mlx_atomistic.dft._periodic_davidson_scheduler import (
+    _DavidsonApplicationTicket,
+    _DavidsonScheduler,
+    _FixedHamiltonianToken,
+)
+from mlx_atomistic.dft._periodic_davidson_subspace import _PairedDavidsonState
+from mlx_atomistic.dft._periodic_orthonormalization import _RankResult
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
 
@@ -321,7 +326,7 @@ def test_incremental_hv_and_projected_blocks_are_reused(monkeypatch):
     application_widths: list[int] = []
     projected_widths: list[int] = []
     original_apply = PeriodicKohnShamOperator._apply_compact
-    original_project = periodic_davidson._subspace_matrix
+    original_project = periodic_davidson_subspace._subspace_matrix
 
     def recording_apply(self, coefficients, *, observer=None, **kwargs):
         application_widths.append(coefficients.vector_count)
@@ -332,7 +337,11 @@ def test_incremental_hv_and_projected_blocks_are_reused(monkeypatch):
         return original_project(vectors, applied)
 
     monkeypatch.setattr(PeriodicKohnShamOperator, "_apply_compact", recording_apply)
-    monkeypatch.setattr(periodic_davidson, "_subspace_matrix", recording_project)
+    monkeypatch.setattr(
+        periodic_davidson_subspace,
+        "_subspace_matrix",
+        recording_project,
+    )
 
     result = solve_periodic_eigenproblem(
         operator,
@@ -1586,14 +1595,18 @@ def test_incremental_multilane_initial_projection_failure_is_lane_local(monkeypa
         unobserved.effective_local_potential,
         observer=observer,
     )
-    original_project = periodic_davidson._subspace_matrix
+    original_project = periodic_davidson_subspace._subspace_matrix
 
     def injected_projection(vectors, applied):
         if int(vectors.shape[0]) == 2:
             raise RuntimeError("injected projected-state failure")
         return original_project(vectors, applied)
 
-    monkeypatch.setattr(periodic_davidson, "_subspace_matrix", injected_projection)
+    monkeypatch.setattr(
+        periodic_davidson_subspace,
+        "_subspace_matrix",
+        injected_projection,
+    )
     requests = (
         _DavidsonLaneRequest(
             "healthy",

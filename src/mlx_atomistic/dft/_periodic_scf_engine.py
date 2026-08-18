@@ -19,11 +19,13 @@ from mlx_atomistic.dft._compact import (
 )
 from mlx_atomistic.dft._memory import _bounded_dft_allocator
 from mlx_atomistic.dft._periodic_davidson import (
-    _DavidsonApplicationTicket,
     _DavidsonEngine,
     _DavidsonLaneRequest,
-    _DavidsonScheduler,
     _initial_trial,
+)
+from mlx_atomistic.dft._periodic_davidson_scheduler import (
+    _DavidsonApplicationTicket,
+    _DavidsonScheduler,
 )
 from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._periodic_execution import _detached_failure
