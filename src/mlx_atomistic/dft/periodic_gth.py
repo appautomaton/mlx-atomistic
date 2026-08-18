@@ -921,6 +921,7 @@ class PeriodicGTHNonlocalOperator:
         coefficients: _CompactLaneState,
         *,
         occupations: Sequence[float],
+        evaluate: bool = True,
     ) -> mx.array:
         """Return analytic per-ion nonlocal forces for compact orbitals."""
 
@@ -989,7 +990,8 @@ class PeriodicGTHNonlocalOperator:
             )
             forces.append(-derivative_energy)
         result = mx.stack(forces, axis=0).astype(mx.float32)
-        mx.eval(result)
+        if evaluate:
+            mx.eval(result)
         return result
 
     def forces(

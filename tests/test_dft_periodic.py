@@ -324,6 +324,37 @@ def test_periodic_gth_nonlocal_operator_is_cell_translation_invariant():
     assert shifted_energy == pytest.approx(first_energy, abs=2e-5)
 
 
+def test_periodic_gth_nonlocal_force_can_defer_materialization(monkeypatch):
+    grid = RealSpaceGrid((6, 6, 6), (6.0, 6.0, 6.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 2.0, (0.25, 0.0, 0.0))
+    coefficients = basis._state_from_compact(
+        mx.eye(1, basis.active_count, dtype=mx.float32).astype(mx.complex64)
+    )
+    operator = PeriodicGTHNonlocalOperator(
+        _silicon_gth(),
+        basis,
+        ((1.0, 2.0, 3.0),),
+    )
+    original_eval = mx.eval
+    evaluations = []
+
+    def record_eval(*values):
+        evaluations.append(len(values))
+        return original_eval(*values)
+
+    monkeypatch.setattr(mx, "eval", record_eval)
+    deferred = operator._forces_compact(
+        coefficients,
+        occupations=[2.0],
+        evaluate=False,
+    )
+
+    assert evaluations == []
+    eager = operator._forces_compact(coefficients, occupations=[2.0])
+    assert evaluations == [1]
+    np.testing.assert_array_equal(np.asarray(deferred), np.asarray(eager))
+
+
 def test_periodic_gth_nonlocal_forces_match_fixed_orbital_energy_derivative():
     grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
     basis = PlaneWaveBasis.from_reduced_kpoint(
