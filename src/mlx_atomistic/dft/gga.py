@@ -3,13 +3,14 @@
 The defining idea: a GGA energy is ``E_xc = ∫ ε(ρ, ∇ρ) dr``, and its potential is
 the functional derivative ``v_xc = δE_xc/δρ = ∂ε/∂ρ - ∇·(∂ε/∂∇ρ)``. The gradient
 term is the part that is famously error-prone to hand-derive. Here we write *only*
-the energy density and obtain ``v_xc`` from ``mx.grad`` of the total energy — the
-autodiff machinery reconstructs the divergence term automatically, provided the
-density gradient is built with a differentiable (MLX-native) FFT.
+the energy density and obtain ``v_xc`` with ``mx.value_and_grad``. The autodiff
+machinery reconstructs the divergence term automatically, provided the density
+gradient is built with a differentiable (MLX-native) FFT.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import log, pi
 
@@ -24,6 +25,8 @@ _KAPPA = 0.804
 _MU = 0.2195149727645171
 _BETA = 0.06672455060314922
 _GAMMA = (1.0 - log(2.0)) / (pi * pi)
+
+_EnergyDensityFunction = Callable[[mx.array, RealSpaceGrid, float], mx.array]
 
 
 def density_gradient(rho: mx.array, grid: RealSpaceGrid) -> mx.array:
@@ -61,6 +64,30 @@ def _pbe_correlation_energy_density(
     reduced_gradient_term = z / (a * (1.0 - z + z * z))
     h = _GAMMA * mx.log1p((_BETA / _GAMMA) * reduced_gradient_term)
     return rho * (eps_c_unif + h)
+
+
+def _evaluate_pbe(
+    name: str,
+    energy_density_function: _EnergyDensityFunction,
+    density: mx.array,
+    grid: RealSpaceGrid,
+    density_floor: float,
+) -> XCResult:
+    """Evaluate one PBE variant without repeating its forward energy graph."""
+
+    rho = mx.maximum(mx.array(density), density_floor)
+
+    def energy_and_density(field: mx.array) -> tuple[mx.array, mx.array]:
+        energy_density = energy_density_function(field, grid, density_floor)
+        return mx.sum(energy_density) * grid.dv, energy_density
+
+    (total_energy, energy_density), derivative = mx.value_and_grad(energy_and_density)(rho)
+    return XCResult(
+        name=name,
+        energy_density=energy_density,
+        potential=derivative / grid.dv,
+        total_energy=total_energy,
+    )
 
 
 @dataclass(frozen=True)
@@ -113,18 +140,12 @@ class PBEExchangeCorrelation:
         if grid is None:
             msg = "PBE (GGA) requires a real-space grid to evaluate the density gradient"
             raise ValueError(msg)
-        rho = mx.maximum(mx.array(density), density_floor)
-
-        def total_energy(field: mx.array) -> mx.array:
-            return mx.sum(self._energy_density(field, grid, density_floor)) * grid.dv
-
-        potential = mx.grad(total_energy)(rho) / grid.dv
-        energy_density = self._energy_density(rho, grid, density_floor)
-        return XCResult(
-            name=self.name,
-            energy_density=energy_density,
-            potential=potential,
-            total_energy=mx.sum(energy_density) * grid.dv,
+        return _evaluate_pbe(
+            self.name,
+            self._energy_density,
+            density,
+            grid,
+            density_floor,
         )
 
 
@@ -173,16 +194,10 @@ class ProductionPBEExchangeCorrelation:
         if grid is None:
             msg = "production PBE requires a real-space grid"
             raise ValueError(msg)
-        rho = mx.maximum(mx.array(density), density_floor)
-
-        def total_energy(field: mx.array) -> mx.array:
-            return mx.sum(self._energy_density(field, grid, density_floor)) * grid.dv
-
-        energy_density = self._energy_density(rho, grid, density_floor)
-        potential = mx.grad(total_energy)(rho) / grid.dv
-        return XCResult(
-            name=self.name,
-            energy_density=energy_density,
-            potential=potential,
-            total_energy=mx.sum(energy_density) * grid.dv,
+        return _evaluate_pbe(
+            self.name,
+            self._energy_density,
+            density,
+            grid,
+            density_floor,
         )

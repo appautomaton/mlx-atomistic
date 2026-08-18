@@ -1,4 +1,4 @@
-"""Spin-unpolarized Γ-point plane-wave DFT prototype."""
+"""Legacy Γ-point reference and periodic plane-wave DFT runtimes."""
 
 from mlx_atomistic.dft.artifacts import (
     PERIODIC_SCF_CHECKPOINT_KIND,
