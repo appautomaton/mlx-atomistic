@@ -31,6 +31,10 @@ Periodic SCF and bands use the MLX-native block-Davidson/Rayleigh-Ritz solver
 without building the full plane-wave Hamiltonian. Diagnostics expose residuals,
 orthonormality error, subspace work, and convergence metadata.
 
+Periodic SCF reports one device-inclusive `effective_potential` timing for the
+independent Hartree and exchange-correlation branches. They share a single MLX
+materialization boundary so phase accounting does not serialize the runtime.
+
 Adaptive periodic SCF uses paired subspace residuals only while its requested
 eigensolver tolerance is looser than the final Davidson tolerance. It restores
 direct-operator residual validation at the final tolerance, and SCF convergence

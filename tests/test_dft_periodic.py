@@ -20,6 +20,7 @@ from mlx_atomistic.dft import (
     PseudopotentialData,
     PseudopotentialFormat,
     RealSpaceGrid,
+    RuntimeObserver,
     gth_local_potential_grid,
     gth_local_reciprocal_coefficients,
     periodic_ewald_energy,
@@ -30,6 +31,12 @@ from mlx_atomistic.dft import (
     solve_periodic_eigenproblem,
 )
 from mlx_atomistic.dft.kpoints import KPoint, KPointMesh
+
+
+def test_runtime_observer_is_available_from_public_dft_api():
+    observer = RuntimeObserver(detail_events=False)
+
+    assert observer.detail_events is False
 
 
 def test_plane_wave_basis_mask_and_metadata_are_deterministic():
@@ -526,3 +533,5 @@ def test_weighted_periodic_scf_conserves_electrons_without_dense_fallback():
     assert all(item.eigen.to_dict()["dense_full_hamiltonian"] is False for item in result.kpoints)
     assert all(item.eigen.converged for item in result.kpoints)
     assert np.isfinite(result.total_energy)
+    assert set(result.timings) == {"effective_potential", "eigensolver", "total"}
+    assert 0.0 < result.timings["effective_potential"] <= result.timings["total"]

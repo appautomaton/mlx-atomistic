@@ -1,5 +1,6 @@
 """Legacy Γ-point reference and periodic plane-wave DFT runtimes."""
 
+from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.artifacts import (
     PERIODIC_SCF_CHECKPOINT_KIND,
     PERIODIC_SCF_CHECKPOINT_SCHEMA,
@@ -224,6 +225,7 @@ __all__ = [
     "ReciprocalGrid",
     "ReferenceComparisonResult",
     "ReferenceDFTCase",
+    "RuntimeObserver",
     "SCFConfig",
     "SCFForceConsistencyResult",
     "SCFResult",

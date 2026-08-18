@@ -323,9 +323,10 @@ class _PeriodicSCFProgress:
     density_residual: float = float("inf")
     energy_delta: float | None = None
     timings: dict[str, float] = field(
+        # Keep the independent Hartree/XC branches behind one synchronized
+        # boundary so timing remains device-inclusive without serializing them.
         default_factory=lambda: {
-            "hartree": 0.0,
-            "xc": 0.0,
+            "effective_potential": 0.0,
             "eigensolver": 0.0,
             "total": 0.0,
         }
@@ -696,13 +697,10 @@ class _PeriodicSCFController:
     def _effective_potential(self) -> tuple[mx.array, XCResult, mx.array]:
         start = perf_counter()
         hartree = hartree_potential(self.progress.density, self.setup.system.grid)
-        self.progress.timings["hartree"] += (perf_counter() - start) * 1000.0
-        start = perf_counter()
         xc_result = self.setup.xc.evaluate(
             self.progress.density,
             self.setup.system.grid,
         )
-        self.progress.timings["xc"] += (perf_counter() - start) * 1000.0
         effective_snapshot = mx.array(self.setup.local_potential + hartree + xc_result.potential)
         xc_finite = (
             mx.all(mx.isfinite(xc_result.energy_density))
@@ -711,6 +709,9 @@ class _PeriodicSCFController:
         )
         effective_finite = mx.all(mx.isfinite(effective_snapshot))
         mx.eval(effective_snapshot, xc_finite, effective_finite)
+        self.progress.timings["effective_potential"] += (
+            perf_counter() - start
+        ) * 1000.0
         if not bool(xc_finite):
             msg = "SCF exchange-correlation result is non-finite"
             raise ValueError(msg)
