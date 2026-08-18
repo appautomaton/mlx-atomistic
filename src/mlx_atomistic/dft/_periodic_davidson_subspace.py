@@ -9,7 +9,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft._compact import _CompactLaneState, _require_layout
-from mlx_atomistic.dft._periodic_davidson_scheduler import _FixedHamiltonianToken
+from mlx_atomistic.dft._periodic_davidson_context import _FixedHamiltonianToken
 from mlx_atomistic.dft._periodic_execution import _to_numpy
 from mlx_atomistic.dft._periodic_orthonormalization import _RankResult
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver

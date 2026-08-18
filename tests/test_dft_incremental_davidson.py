@@ -27,6 +27,7 @@ from mlx_atomistic.dft._periodic_davidson import (
     _DavidsonEngine,
     _DavidsonLaneRequest,
 )
+from mlx_atomistic.dft._periodic_davidson_context import _FixedHamiltonianToken
 from mlx_atomistic.dft._periodic_davidson_planner import (
     _finite_lane_capacity,
     _finite_vector_capacity,
@@ -34,7 +35,6 @@ from mlx_atomistic.dft._periodic_davidson_planner import (
 from mlx_atomistic.dft._periodic_davidson_scheduler import (
     _DavidsonApplicationTicket,
     _DavidsonScheduler,
-    _FixedHamiltonianToken,
 )
 from mlx_atomistic.dft._periodic_davidson_subspace import _PairedDavidsonState
 from mlx_atomistic.dft._periodic_orthonormalization import _RankResult

@@ -15,11 +15,11 @@ from mlx_atomistic.dft._compact import (
     _remap_initial_coefficients,
     _require_layout,
 )
+from mlx_atomistic.dft._periodic_davidson_context import _FixedHamiltonianToken
 from mlx_atomistic.dft._periodic_davidson_scheduler import (
     _DavidsonApplicationTicket,
     _DavidsonScheduler,
     _DavidsonScheduleResult,
-    _FixedHamiltonianToken,
 )
 from mlx_atomistic.dft._periodic_davidson_subspace import (
     _DavidsonRitzCandidate,
