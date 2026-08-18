@@ -260,17 +260,32 @@ class _PeriodicBandController:
         total_start = perf_counter()
         with _bounded_dft_allocator(), _GTHProjectorCache() as projector_cache:
             reciprocal, effective_potential = self._build_effective_potential()
-            points = tuple(
-                self._solve_point(
-                    point_index,
-                    point,
-                    reciprocal=reciprocal,
-                    effective_potential=effective_potential,
-                    projector_cache=projector_cache,
-                )
-                for point_index, point in enumerate(self.request.band_path.points)
-            )
-        return self._finalize(points, total_start=total_start)
+            points: list[PeriodicBandPointResult] = []
+            solved_points: dict[
+                tuple[float, float, float],
+                tuple[int, PeriodicBandPointResult],
+            ] = {}
+            for point_index, point in enumerate(self.request.band_path.points):
+                cached = solved_points.get(point.vector)
+                if cached is None:
+                    result = self._solve_point(
+                        point_index,
+                        point,
+                        reciprocal=reciprocal,
+                        effective_potential=effective_potential,
+                        projector_cache=projector_cache,
+                    )
+                    solved_points[point.vector] = (point_index, result)
+                else:
+                    source_index, source = cached
+                    result = self._reuse_point(
+                        point_index,
+                        point,
+                        source_index=source_index,
+                        source=source,
+                    )
+                points.append(result)
+        return self._finalize(tuple(points), total_start=total_start)
 
     def _build_effective_potential(self) -> tuple[ReciprocalGrid, mx.array]:
         start = perf_counter()
@@ -384,6 +399,28 @@ class _PeriodicBandController:
             restart_count=eigen.restart_count,
         )
 
+    def _reuse_point(
+        self,
+        point_index: int,
+        point: KPoint,
+        *,
+        source_index: int,
+        source: PeriodicBandPointResult,
+    ) -> PeriodicBandPointResult:
+        """Reuse an exact earlier k-point eigenspace within this path."""
+
+        self._emit_point_started(point_index, point)
+        self._emit_point_completed(
+            point_index,
+            source.eigen,
+            reused_from_point_index=source_index,
+        )
+        return PeriodicBandPointResult(
+            requested_kpoint=point,
+            basis=source.basis,
+            eigen=source.eigen,
+        )
+
     @staticmethod
     def _validate_point_result(
         point_index: int,
@@ -418,16 +455,20 @@ class _PeriodicBandController:
         self,
         point_index: int,
         eigen: PeriodicEigenResult,
+        *,
+        reused_from_point_index: int | None = None,
     ) -> None:
         observer = self.request.observer
         if observer is not None:
-            observer.emit(
-                "band_kpoint",
-                status="completed",
-                point_index=point_index,
-                iterations=eigen.iterations,
-                worst_residual=float(mx.max(eigen.residuals)),
-            )
+            fields: dict[str, object] = {
+                "status": "completed",
+                "point_index": point_index,
+                "iterations": eigen.iterations,
+                "worst_residual": float(mx.max(eigen.residuals)),
+            }
+            if reused_from_point_index is not None:
+                fields["reused_from_point_index"] = reused_from_point_index
+            observer.emit("band_kpoint", **fields)
 
     def _finalize(
         self,
