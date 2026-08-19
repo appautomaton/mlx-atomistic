@@ -175,7 +175,7 @@ def get_platform_boundary_report(
             status="proof-level",
             local_concepts=(
                 "MinimizeThenNVTProtocol",
-                "validate_gpcrmd_protocol_request",
+                "validate_md_protocol_request",
                 "simulate_nve/simulate_nvt/simulate_npt",
                 "NoseHooverThermostat",
             ),

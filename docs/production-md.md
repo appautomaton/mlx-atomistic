@@ -43,6 +43,13 @@ continuation. GPCRmd readiness reports this runtime capability separately from
 the `npt_workload_certification` validation gap; it is not classified as
 unsupported physics. Unsupported production cases remain blockers.
 
+Project-defined NPT transfer runs use `run_mlx(..., protocol_overrides=...)`
+instead of rewriting prepared source metadata. Trajectories and checkpoints
+record the raw and resolved source protocol, the effective validation protocol,
+and their exact diff. Resume fails closed when that protocol identity changes.
+The GPCRmd 729 source workload remains fixed-cell NVT; an NPT transfer run is a
+separate validation protocol, not a source-protocol reproduction.
+
 ## Bounded GPCRmd 729 Fixed-Cell Result
 
 The fresh production-readiness row uses

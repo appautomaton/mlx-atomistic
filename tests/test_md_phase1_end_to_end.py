@@ -12,7 +12,7 @@ from mlx_atomistic.md import (
     simulate_nvt,
 )
 from mlx_atomistic.minimize import minimize_energy
-from mlx_atomistic.protocols import validate_gpcrmd_protocol_request
+from mlx_atomistic.protocols import validate_md_protocol_request
 
 pytestmark = [pytest.mark.slow, pytest.mark.integration]
 
@@ -126,7 +126,7 @@ def test_phase1_minimize_nose_hoover_nvt_anisotropic_npt_records_finite_state():
             axes=(True, False, True),
         ),
     )
-    protocol_report = validate_gpcrmd_protocol_request(
+    protocol_report = validate_md_protocol_request(
         {"ensemble": "NPT", "barostat": "monte_carlo"},
         raise_on_blockers=True,
     )

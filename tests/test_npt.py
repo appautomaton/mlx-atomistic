@@ -20,7 +20,7 @@ from mlx_atomistic.md import (
 )
 from mlx_atomistic.neighbors import NeighborListManager
 from mlx_atomistic.pme import PMEConfig
-from mlx_atomistic.protocols import validate_gpcrmd_protocol_request
+from mlx_atomistic.protocols import validate_md_protocol_request
 from mlx_atomistic.topology import Topology
 
 
@@ -1384,7 +1384,7 @@ def test_barostat_acceptance_uses_molecule_count_and_proposal_ratio():
 
 
 def test_protocol_gate_accepts_first_monte_carlo_npt_path():
-    report = validate_gpcrmd_protocol_request(
+    report = validate_md_protocol_request(
         {"ensemble": "NPT", "barostat": "monte_carlo"},
         raise_on_blockers=True,
     )
@@ -1397,7 +1397,7 @@ def test_protocol_gate_accepts_first_monte_carlo_npt_path():
 
 
 def test_protocol_gate_accepts_membrane_monte_carlo_npt_path():
-    report = validate_gpcrmd_protocol_request(
+    report = validate_md_protocol_request(
         {"ensemble": "NPT", "barostat": "monte_carlo", "membrane_barostat": "xy"},
         raise_on_blockers=True,
     )
@@ -1409,7 +1409,7 @@ def test_protocol_gate_accepts_membrane_monte_carlo_npt_path():
 
 
 def test_protocol_gate_rejects_npt_with_nvt_proof_mode():
-    report = validate_gpcrmd_protocol_request(
+    report = validate_md_protocol_request(
         {"ensemble": "NPT", "barostat": "monte_carlo", "proof_mode": "short_nvt"},
     )
 

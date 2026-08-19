@@ -9,6 +9,7 @@ from mlx_atomistic.protocols import (
     protocol_readiness_report,
     run_minimize_then_nvt,
     validate_gpcrmd_protocol_request,
+    validate_md_protocol_request,
 )
 
 
@@ -43,6 +44,66 @@ def test_gpcrmd_protocol_gate_accepts_short_nvt_metadata():
     assert report.metadata["barostat_status"] == "not_required_for_nvt_proof"
     assert report.metadata["npt_barostat"] is False
     assert report.metadata["membrane_barostat"] is False
+    assert report.metadata["required_entry_point"] == "simulate_nvt"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"ensemble": "NVT"},
+        {
+            "ensemble": "NPT",
+            "proof_mode": "short_npt",
+            "barostat": "anisotropic",
+            "npt_barostat": True,
+        },
+        {
+            "ensemble": "NPT",
+            "proof_mode": "short_npt",
+            "barostat": "monte_carlo",
+            "membrane_barostat": "xy",
+        },
+    ],
+)
+def test_gpcrmd_compatibility_name_matches_shared_md_gate(metadata):
+    shared = validate_md_protocol_request(metadata)
+    compatibility = validate_gpcrmd_protocol_request(metadata)
+
+    assert compatibility == shared
+    assert shared.metadata["required_entry_point"] == (
+        "simulate_npt" if shared.ensemble == "NPT" else "simulate_nvt"
+    )
+
+
+def test_shared_protocol_gate_normalizes_semiisotropic_as_membrane_geometry():
+    report = validate_md_protocol_request(
+        {
+            "ensemble": "NPT",
+            "proof_mode": "short_npt",
+            "barostat": "semiisotropic",
+        }
+    )
+
+    assert report.accepted is True
+    assert report.metadata["barostat_mode"] == "membrane"
+    assert report.metadata["required_entry_point"] == "simulate_npt"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "blocker"),
+    [
+        ({"ensemble": "not-npt", "barostat": "monte_carlo"}, "unsupported_ensemble"),
+        (
+            {"ensemble": "NVT", "barostat": "monte_carlo", "npt_barostat": True},
+            "ensemble_barostat_mismatch",
+        ),
+    ],
+)
+def test_shared_protocol_gate_rejects_ambiguous_ensemble_requests(metadata, blocker):
+    report = validate_md_protocol_request(metadata)
+
+    assert report.accepted is False
+    assert blocker in report.blockers
 
 
 def test_protocol_readiness_report_uses_shared_schema():

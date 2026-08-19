@@ -403,26 +403,17 @@ def test_production_pme_checkpoint_split_matches_uninterrupted_run(tmp_path):
 def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path):
     from mlx_atomistic.prep.runner import run_mlx
 
-    fixture = _production_pme_checkpoint_fixture()
+    source = _production_pme_checkpoint_fixture()
     prepared = replace(
-        fixture,
-        molecule_ids=np.zeros((fixture.atom_count,), dtype=np.int32),
-        metadata=replace(
-            fixture.metadata,
-            protocol_metadata={
-                **fixture.metadata.protocol_metadata,
-                "ensemble": "NPT",
-                "proof_mode": "short_npt",
-                "barostat": "anisotropic",
-                "npt_barostat": True,
-                "center_of_mass_motion": {
-                    "enabled": True,
-                    "force": "CMMotionRemover",
-                    "frequency_steps": 1,
-                },
-            },
-        ),
+        source,
+        molecule_ids=np.zeros((source.atom_count,), dtype=np.int32),
     )
+    protocol_overrides = {
+        "ensemble": "NPT",
+        "proof_mode": "short_npt",
+        "barostat": "anisotropic",
+        "npt_barostat": True,
+    }
     common = {
         "require_production": True,
         "sample_interval": 1,
@@ -440,6 +431,7 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
         "minimize_steps": 0,
         "equilibration_steps": 0,
         "eager_nonbonded_pair_limit": 0,
+        "protocol_overrides": protocol_overrides,
     }
     continuous = run_mlx(
         prepared,
@@ -489,6 +481,16 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
     assert continuous_record.metadata["barostat_interval"] == 2
     assert continuous_record.metadata["barostat_mode"] == "anisotropic"
     assert continuous_record.metadata["barostat_axes"] == [True, True, True]
+    protocol_identity = continuous_record.metadata["protocol_identity"]
+    assert protocol_identity["kind"] == "project_defined_validation"
+    assert "ensemble" not in protocol_identity["source_protocol"]
+    assert protocol_identity["source_protocol_resolved"]["ensemble"] == "NVT"
+    assert protocol_identity["validation_protocol"]["ensemble"] == "NPT"
+    assert protocol_identity["validation_protocol_resolved"]["ensemble"] == "NPT"
+    assert protocol_identity["protocol_diff"]["ensemble"] == {
+        "source": None,
+        "validation": "NPT",
+    }
     for name in ("sampled_positions", "sampled_velocities", "cell_history"):
         combined = np.concatenate(
             (
@@ -507,6 +509,7 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
     resumed_checkpoint = load_simulation_checkpoint(
         tmp_path / "npt-resumed-checkpoint.npz"
     )
+    assert resumed_checkpoint.metadata["protocol_identity"] == protocol_identity
     assert first_checkpoint.metadata["fixed_cell"] is False
     assert first_checkpoint.cell_history_cursor == 3
     assert first_checkpoint.neighbor_reference_positions.shape == (3, 3)
@@ -515,7 +518,7 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
     assert resumed_checkpoint.cell_history_cursor == 6
     np.testing.assert_array_equal(
         first_checkpoint.molecule_ids,
-        np.zeros((fixture.atom_count,), dtype=np.int32),
+        np.zeros((source.atom_count,), dtype=np.int32),
     )
     assert resumed_checkpoint.barostat["attempts"] == continuous.barostat_attempts
     assert resumed_checkpoint.barostat["final_pme_plan_fingerprints"]
@@ -524,8 +527,36 @@ def test_production_pme_npt_checkpoint_split_matches_uninterrupted_run(tmp_path)
         assert result.nonbonded_report["pme_execution_plan_count"] == 1
         assert np.all(np.isfinite(np.asarray(result.pressure)))
 
+    with pytest.raises(ValueError, match="protocol identity"):
+        run_mlx(
+            prepared,
+            out=tmp_path / "npt-mismatched-resume.npz",
+            resume_checkpoint=split_checkpoint,
+            steps=1,
+            **{
+                **common,
+                "barostat_mode": "isotropic",
+                "protocol_overrides": {
+                    **protocol_overrides,
+                    "barostat": "monte_carlo",
+                },
+            },
+        )
 
-def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
+
+@pytest.mark.parametrize(
+    ("mode", "mode_options"),
+    [
+        ("isotropic", {}),
+        ("anisotropic", {"axes": (True, True, True)}),
+        ("membrane", {"membrane_plane": "xy", "normal_axis": "z"}),
+    ],
+)
+def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(
+    tmp_path,
+    mode,
+    mode_options,
+):
     positions = np.array(
         [[1.0, 1.0, 1.0], [2.1, 1.0, 1.0], [1.0, 2.2, 1.0]],
         dtype=np.float32,
@@ -540,8 +571,8 @@ def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
         interval=2,
         seed=4,
         max_log_volume_scale=0.01,
-        mode="anisotropic",
-        axes=(True, True, True),
+        mode=mode,
+        **mode_options,
     )
 
     continuous = simulate_npt(
@@ -590,13 +621,13 @@ def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
         },
         barostat=first.barostat_metadata,
         molecule_ids=molecule_ids,
-        neighbor_policy={"ensemble": "NPT", "barostat": "monte_carlo"},
+        neighbor_policy={"ensemble": "NPT", "barostat": mode},
         force_terms=("lj",),
         diagnostic_cursor=first.final_state.step,
         cell_history_cursor=3,
         metadata={
             "ensemble": "NPT",
-            "barostat": "monte_carlo",
+            "barostat": mode,
             "barostat_attempts": first.barostat_attempts,
             "barostat_accepted": first.barostat_accepted,
         },
@@ -658,13 +689,14 @@ def test_npt_checkpoint_preserves_final_cell_for_restart_continuation(tmp_path):
 
     assert checkpoint.step == first.final_state.step
     assert checkpoint.thermostat["rng_step_offset"] == first.final_state.step
-    assert checkpoint.neighbor_policy == {"ensemble": "NPT", "barostat": "monte_carlo"}
+    assert checkpoint.neighbor_policy == {"ensemble": "NPT", "barostat": mode}
     assert checkpoint.cell_history_cursor == 3
     np.testing.assert_array_equal(checkpoint.molecule_ids, molecule_ids)
     assert checkpoint.metadata["ensemble"] == "NPT"
     assert checkpoint.metadata["barostat_attempts"] == 1
     assert resumed.barostat_attempts == continuous.barostat_attempts
     assert resumed.barostat_accepted == continuous.barostat_accepted
+    assert resumed.barostat_metadata["mode"] == mode
     assert resumed.barostat_metadata["axis_attempts"] == continuous.barostat_metadata[
         "axis_attempts"
     ]
