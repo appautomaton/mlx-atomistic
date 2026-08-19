@@ -555,7 +555,7 @@ def test_resume_rejects_execution_identity_mismatch_before_array_decode(
     field,
     value,
 ):
-    import mlx_atomistic.dft.artifacts as checkpoint_module
+    import mlx_atomistic.dft._periodic_checkpoint_codec as checkpoint_module
 
     system, mesh, config, context, checkpoint, _ = _run_to_checkpoint(tmp_path)
     mismatched = _mutated_context(context, field, value)
@@ -577,7 +577,7 @@ def test_resume_rejects_execution_identity_mismatch_before_array_decode(
 
 
 def test_resume_rejects_solver_batch_and_pseudopotential_mismatch(tmp_path, monkeypatch):
-    import mlx_atomistic.dft.artifacts as checkpoint_module
+    import mlx_atomistic.dft._periodic_checkpoint_codec as checkpoint_module
 
     system, mesh, config, context, checkpoint, _ = _run_to_checkpoint(tmp_path)
 
@@ -666,7 +666,7 @@ def test_checksum_completion_and_unknown_schema_fail_before_array_decode(
     tmp_path,
     monkeypatch,
 ):
-    import mlx_atomistic.dft.artifacts as checkpoint_module
+    import mlx_atomistic.dft._periodic_checkpoint_codec as checkpoint_module
 
     system, mesh, config, context, checkpoint, _ = _run_to_checkpoint(tmp_path)
     coefficient = next(checkpoint.joinpath("owned").glob("*.npy"))
@@ -836,7 +836,7 @@ def test_implicit_resume_is_never_attempted_and_invalid_explicit_has_no_fallback
     tmp_path,
     monkeypatch,
 ):
-    import mlx_atomistic.dft.artifacts as checkpoint_module
+    import mlx_atomistic.dft._periodic_checkpoint_runner as checkpoint_module
 
     system, mesh, config = _problem(mixer="linear")
     short_config = replace(config, max_iterations=1, min_iterations=1)

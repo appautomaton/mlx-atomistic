@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import mlx_atomistic.dft._periodic_davidson as periodic_davidson_module
+import mlx_atomistic.dft._periodic_davidson_subspace as davidson_subspace_module
 import mlx_atomistic.dft.periodic_scf as periodic_scf_module
 from mlx_atomistic import _artifact_identity as artifact_identity
 from mlx_atomistic._artifact_identity import (
@@ -2703,9 +2704,9 @@ def test_projected_eigh_uses_complex128_lapack_and_returns_runtime_precision(
         converted.append(array.dtype)
         return array
 
-    monkeypatch.setattr(periodic_davidson_module.np.linalg, "eigh", capture_dtype)
-    monkeypatch.setattr(periodic_davidson_module.mx, "array", capture_mlx_array)
-    values_mx, vectors_mx = periodic_davidson_module._projected_eigh(matrix)
+    monkeypatch.setattr(davidson_subspace_module.np.linalg, "eigh", capture_dtype)
+    monkeypatch.setattr(davidson_subspace_module.mx, "array", capture_mlx_array)
+    values_mx, vectors_mx = davidson_subspace_module._projected_eigh(matrix)
     values = np.asarray(values_mx)
     vectors = np.asarray(vectors_mx)
     residual = matrix @ vectors - vectors * values[None, :]
@@ -2734,9 +2735,9 @@ def test_projected_eigh_batch_uses_one_complex128_lapack_bridge(monkeypatch):
         observed_shapes.append((projected.dtype, projected.shape))
         return lapack_eigh(projected)
 
-    monkeypatch.setattr(periodic_davidson_module.np.linalg, "eigh", capture_batch)
+    monkeypatch.setattr(davidson_subspace_module.np.linalg, "eigh", capture_batch)
 
-    solved = periodic_davidson_module._projected_eigh_batch(matrices)
+    solved = davidson_subspace_module._projected_eigh_batch(matrices)
 
     assert observed_shapes == [(np.dtype(np.complex128), (2, 3, 3))]
     for matrix, (values, vectors) in zip(matrices, solved, strict=True):
@@ -2760,7 +2761,7 @@ def test_projected_eigh_batch_uses_one_complex128_lapack_bridge(monkeypatch):
 )
 def test_projected_eigh_rejects_malformed_or_nonfinite_matrix(matrix, message):
     with pytest.raises(ValueError, match=message):
-        periodic_davidson_module._projected_eigh(matrix)
+        davidson_subspace_module._projected_eigh(matrix)
 
 
 def test_periodic_davidson_observer_counts_hpsi_hooks_without_numerical_drift():

@@ -19,11 +19,13 @@ from mlx_atomistic.dft._compact import (
 )
 from mlx_atomistic.dft._memory import _bounded_dft_allocator
 from mlx_atomistic.dft._periodic_davidson import (
-    _DavidsonApplicationTicket,
     _DavidsonEngine,
     _DavidsonLaneRequest,
-    _DavidsonScheduler,
     _initial_trial,
+)
+from mlx_atomistic.dft._periodic_davidson_scheduler import (
+    _DavidsonApplicationTicket,
+    _DavidsonScheduler,
 )
 from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._periodic_execution import _detached_failure
@@ -55,11 +57,11 @@ from mlx_atomistic.dft.kpoints import (
     build_time_reversal_ownership,
 )
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
+from mlx_atomistic.dft.periodic_electrostatics import periodic_ewald_energy
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
     gth_local_potential_grid,
-    periodic_ewald_energy,
 )
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import hartree_potential

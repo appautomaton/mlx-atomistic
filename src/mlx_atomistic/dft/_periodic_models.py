@@ -16,10 +16,10 @@ from mlx_atomistic.dft._compact import (
     _CompactLaneState,
     _CompatibilityCoefficientState,
 )
+from mlx_atomistic.dft._pseudopotential_identity import _pseudopotential_fingerprint
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver, add_observed_work
 from mlx_atomistic.dft.grids import RealSpaceGrid
 from mlx_atomistic.dft.kpoints import KPoint, TimeReversalOwnership
-from mlx_atomistic.dft.periodic_gth import _pseudopotential_fingerprint
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.pseudopotentials import PseudopotentialData
 

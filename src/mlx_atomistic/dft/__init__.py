@@ -84,6 +84,10 @@ from mlx_atomistic.dft.optimization import (
     optimize_geometry,
     save_geometry_optimization,
 )
+from mlx_atomistic.dft.periodic_electrostatics import (
+    periodic_ewald_energy,
+    periodic_ewald_forces,
+)
 from mlx_atomistic.dft.periodic_forces import (
     PeriodicForceResult,
     periodic_scf_forces,
@@ -92,8 +96,6 @@ from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     gth_local_potential_grid,
     gth_local_reciprocal_coefficients,
-    periodic_ewald_energy,
-    periodic_ewald_forces,
     periodic_gth_local_forces,
 )
 from mlx_atomistic.dft.periodic_scf import (

@@ -587,6 +587,14 @@ class PeriodicKohnShamOperator:
         mx.eval(potential)
         return potential
 
+    def _nonlocal_batch_compatibility_key(self) -> object:
+        nonlocal_operator = self.nonlocal_operator
+        if nonlocal_operator is None:
+            return None
+        if isinstance(nonlocal_operator, PeriodicGTHNonlocalOperator):
+            return ("gth", nonlocal_operator._context_identity)
+        return ("custom", id(nonlocal_operator))
+
     def apply(
         self,
         coefficients: mx.array,

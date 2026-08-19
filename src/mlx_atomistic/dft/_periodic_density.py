@@ -15,7 +15,7 @@ from mlx_atomistic.dft._compact import (
     _CompactBatchPolicy,
     _CompactLaneState,
 )
-from mlx_atomistic.dft._periodic_davidson import (
+from mlx_atomistic.dft._periodic_davidson_planner import (
     _CompactBatchCapacity,
     _plan_compact_submissions,
     _stable_compact_capacity_groups,

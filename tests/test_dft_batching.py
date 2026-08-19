@@ -28,11 +28,13 @@ from mlx_atomistic.dft._compact import _CompactBatch, _CompactBatchPolicy
 from mlx_atomistic.dft._periodic_davidson import (
     _DavidsonEngine,
     _DavidsonLaneRequest,
-    _DavidsonScheduler,
     _initial_coefficients,
+)
+from mlx_atomistic.dft._periodic_davidson_planner import (
     _plan_compact_submissions,
     _stable_compact_capacity_groups,
 )
+from mlx_atomistic.dft._periodic_davidson_scheduler import _DavidsonScheduler
 from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._periodic_scf_engine import (
     _next_scf_eigensolver_tolerance,

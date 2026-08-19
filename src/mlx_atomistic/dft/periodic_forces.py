@@ -16,10 +16,10 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicKPointResult,
     PeriodicSCFResult,
 )
+from mlx_atomistic.dft.periodic_electrostatics import periodic_ewald_forces
 from mlx_atomistic.dft.periodic_gth import (
     PeriodicGTHNonlocalOperator,
     _GTHProjectorCache,
-    periodic_ewald_forces,
     periodic_gth_local_forces,
 )
 
