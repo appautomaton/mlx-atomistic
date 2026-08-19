@@ -11,6 +11,7 @@
 
 # Python environments and local config
 .venv/
+.uv-cache/
 .env
 .env.*
 !.env.example
@@ -60,6 +61,8 @@ tmp/
 *.hdf5
 *.xyz
 *.traj
+*.dcd
+*.xtc
 notebooks/ligand-receptor-motion/data/cache/
 notebooks/ligand-receptor-motion/data/gpcrmd-cache/
 notebooks/ligand-receptor-motion/data/gpcrmd-mlx/

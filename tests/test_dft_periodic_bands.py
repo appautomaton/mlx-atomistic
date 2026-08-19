@@ -17,6 +17,7 @@ from mlx_atomistic.dft import (
     PeriodicSCFConfig,
     PseudopotentialData,
     PseudopotentialFormat,
+    RuntimeObserver,
     fold_band_path_to_supercell,
     run_periodic_band_structure,
     run_periodic_scf,
@@ -143,6 +144,52 @@ def test_periodic_short_path_matches_portable_frozen_density(converged_gamma_scf
     assert from_density.density_source == "frozen_density"
     assert all(point.basis.active_count > 2 for point in from_density.points)
     assert all(point.eigen.converged for point in from_density.points)
+
+
+def test_periodic_band_path_reuses_exact_kpoint_eigensolve(
+    converged_gamma_scf,
+    monkeypatch,
+):
+    from mlx_atomistic.dft import _periodic_band
+
+    system, scf_result = converged_gamma_scf
+    path = BandPath(
+        [
+            KPoint((0.0, 0.0, 0.0), label="first", coordinate_system="reduced"),
+            KPoint((0.1, 0.0, 0.0), coordinate_system="reduced"),
+            KPoint((0.0, 0.0, 0.0), label="repeat", coordinate_system="reduced"),
+        ]
+    )
+    solve_calls = 0
+    original_solve = _periodic_band.solve_periodic_eigenproblem
+
+    def counted_solve(*args, **kwargs):
+        nonlocal solve_calls
+        solve_calls += 1
+        return original_solve(*args, **kwargs)
+
+    monkeypatch.setattr(_periodic_band, "solve_periodic_eigenproblem", counted_solve)
+    events: list[dict[str, object]] = []
+    bands = run_periodic_band_structure(
+        system,
+        scf_result,
+        path,
+        n_bands=2,
+        config=_solver_config(),
+        observer=RuntimeObserver(callback=events.append),
+    )
+
+    completed = [
+        event
+        for event in events
+        if event["event"] == "band_kpoint" and event["status"] == "completed"
+    ]
+    assert solve_calls == 2
+    assert bands.points[0].basis is bands.points[2].basis
+    assert bands.points[0].eigen is bands.points[2].eigen
+    assert bands.points[2].requested_kpoint.label == "repeat"
+    assert len(completed) == 3
+    assert completed[2]["reused_from_point_index"] == 0
 
 
 def test_periodic_guard_bands_are_solved_but_not_published(converged_gamma_scf):

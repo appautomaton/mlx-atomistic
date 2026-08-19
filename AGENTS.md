@@ -26,6 +26,12 @@ Read this section first. These hold everywhere in the repo.
   `results/` is local generated output and gitignored. Neither is a dependency,
   package input, or build target unless a task explicitly moves that boundary.
 - Do not add heavyweight chemistry or ML packages without a concrete need.
+- For scientific and performance claims, trust evidence in this order: source
+  inputs and parsed manifests, source-bound contracts and reports, committed
+  scientific summaries, then catalog, readiness, or narrative metadata.
+- Label evidence as source, project-derived, historical-frozen, or
+  current-verified. Missing raw evidence or a source-fingerprint mismatch is
+  never current verification.
 
 ## Repository layout
 
@@ -132,6 +138,11 @@ Isolate agents that edit files in parallel into their own worktrees so changes
 never collide, then merge back through normal Git history. Keep the `vendors/`
 boundary in every worktree. Use worktrees only when parallel branch isolation is
 worth the extra setup.
+
+One coordinator worktree owns the active `.agent` lifecycle state. Parallel
+worktrees are disposable execution surfaces; do not switch branches in a
+worktree used by another active session. Serialize formal Metal and reference
+measurements even when their source edits are isolated.
 
 From the repository root:
 

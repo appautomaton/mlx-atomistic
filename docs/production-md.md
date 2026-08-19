@@ -35,10 +35,20 @@ unsupported or incomplete PME/barostat requests, virtual sites,
 Drude/polarizable terms, and other terms the MLX engine cannot yet represent
 faithfully. Fixed-cell orthorhombic PME is a bounded production surface:
 accepted artifacts must provide complete configuration/readiness metadata and
-must fit the measured atom/mesh/cutoff/cell envelope. First-path NPT remains a
-proof surface: `simulate_npt()` currently completes its NVT steps and makes one
-terminal cell proposal rather than scheduling repeated proposals inside the MD
-loop. Unsupported production cases remain blockers.
+must fit the measured atom/mesh/cutoff/cell envelope. NPT remains a proof
+surface: `simulate_npt()` schedules molecule-aware Monte Carlo cell proposals
+at exact in-loop intervals, transactionally rebuilds cell-bound force and
+Neighbor state, and persists barostat state for deterministic MLX checkpoint
+continuation. GPCRmd readiness reports this runtime capability separately from
+the `npt_workload_certification` validation gap; it is not classified as
+unsupported physics. Unsupported production cases remain blockers.
+
+Project-defined NPT transfer runs use `run_mlx(..., protocol_overrides=...)`
+instead of rewriting prepared source metadata. Trajectories and checkpoints
+record the raw and resolved source protocol, the effective validation protocol,
+and their exact diff. Resume fails closed when that protocol identity changes.
+The GPCRmd 729 source workload remains fixed-cell NVT; an NPT transfer run is a
+separate validation protocol, not a source-protocol reproduction.
 
 ## Bounded GPCRmd 729 Fixed-Cell Result
 
@@ -226,7 +236,7 @@ evidence for a complete membrane-production workflow.
 For GPCRmd 729, the selected fixed-cell NVT fixture now has source-backed
 preparation, independent parity, bounded finite execution, saved output, and
 checkpoint continuation. The next gaps are larger than this closure:
-production NPT and cell changes, analytic PME virial, triclinic PME,
-production-length stability, broader GPCRmd coverage, and a general
-membrane-production readiness claim. No OpenMM/MLX throughput ratio is valid
-until both engines run a matching runtime manifest.
+at-scale production NPT certification, workload-validated cell changes and
+analytic PME virial, triclinic PME, production-length stability, broader GPCRmd
+coverage, and a general membrane-production readiness claim. No OpenMM/MLX
+throughput ratio is valid until both engines run a matching runtime manifest.

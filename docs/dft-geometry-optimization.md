@@ -14,6 +14,10 @@ from mlx_atomistic.dft import GeometryOptimizationConfig, optimize_geometry
 result = optimize_geometry(system, config=GeometryOptimizationConfig(max_steps=5))
 ```
 
+`relaxation_mode="ions"` is the only admitted mode. Requests for variable-cell
+or coupled ion/cell relaxation fail during configuration validation; they are
+not silently reduced to fixed-cell work.
+
 Each geometry step does:
 
 1. Run SCF at the current ion positions.
@@ -82,3 +86,5 @@ This milestone is still a proof-level fixed-cell relaxation workflow, not a
 chemically certified production materials optimizer. Spin/k-point diagnostics,
 nonlocal projectors, finite-difference stress, and geometry optimization exist as
 prototype surfaces; production validation and cell relaxation remain out of scope.
+Unsupported cell-relaxation modes fail closed at the public configuration
+boundary.

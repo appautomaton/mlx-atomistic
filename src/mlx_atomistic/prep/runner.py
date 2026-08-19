@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,7 +65,7 @@ from mlx_atomistic.protocols import (
     ProtocolCompatibilityError,
     protocol_readiness_report,
     run_minimize_then_nvt,
-    validate_gpcrmd_protocol_request,
+    validate_md_protocol_request,
 )
 from mlx_atomistic.runtime import get_platform_boundary_report
 from mlx_atomistic.steering import SteeredCOMBiasPotential, simulate_steered_nvt
@@ -75,6 +77,15 @@ TRAJECTORY_NAME = "trajectory.npz"
 STEERED_TRAJECTORY_NAME = "steered_trajectory.npz"
 GPCRMD_RUN_REPORT_NAME = "gpcrmd_mlx_run_report.json"
 PRESSURE_DIAGNOSTIC_ATOM_LIMIT = 50_000
+_PROTOCOL_OVERRIDE_FIELDS = frozenset(
+    {
+        "ensemble",
+        "proof_mode",
+        "barostat",
+        "npt_barostat",
+        "membrane_barostat",
+    }
+)
 # The fixed-cell task cache changed the short-run optimum, but the decisive
 # matched 750-step JAC run remained faster at 5.5 A (18.036 versus 18.472 s at
 # 4.0 A) because it rebuilt 15 fewer times. Both runs preserved cutoff physics.
@@ -929,6 +940,7 @@ def run_mlx(
     neighbor_check_interval: int = 1,
     eager_nonbonded_pair_limit: int | None = DEFAULT_EAGER_NONBONDED_PAIR_LIMIT,
     rescale_initial_velocities: bool = True,
+    protocol_overrides: Mapping[str, Any] | None = None,
     metadata_overrides: dict[str, Any] | None = None,
     runtime_electrostatics_model: str | None = None,
     reporters: RuntimeReporter | list[RuntimeReporter] | tuple[RuntimeReporter, ...] | None = None,
@@ -958,8 +970,12 @@ def run_mlx(
             prepared_system,
             require_production=require_production,
         )
-    protocol_report = validate_gpcrmd_protocol_request(
+    effective_protocol, protocol_identity = _protocol_with_overrides(
         prepared_system.metadata.protocol_metadata,
+        protocol_overrides,
+    )
+    protocol_report = validate_md_protocol_request(
+        effective_protocol,
         raise_on_blockers=True,
     )
     selected_barostat_mode = (
@@ -984,7 +1000,7 @@ def run_mlx(
         arrays=artifact.arrays,
     )
     protocol_readiness = protocol_readiness_report(
-        prepared_system.metadata.protocol_metadata,
+        effective_protocol,
     )
     platform_boundary = _platform_boundary_metadata()
     if diagnostic_interval is None:
@@ -1093,6 +1109,13 @@ def run_mlx(
         ),
     )
     if checkpoint is not None:
+        checkpoint_protocol_identity = checkpoint.metadata.get("protocol_identity")
+        if (
+            checkpoint_protocol_identity is not None
+            and checkpoint_protocol_identity != protocol_identity
+        ):
+            msg = "resume checkpoint protocol identity does not match the requested run"
+            raise ValueError(msg)
         _restore_checkpoint_neighbor_state(
             checkpoint,
             neighbor_manager=neighbor_manager,
@@ -1324,6 +1347,7 @@ def run_mlx(
                 ),
                 "resumed_from": None if checkpoint is None else str(resume_checkpoint),
                 "run_metadata": dict(metadata_overrides or {}),
+                "protocol_identity": protocol_identity,
                 "platform_readiness": {
                     "artifact": artifact_readiness.to_dict(),
                     "protocol": protocol_readiness.to_dict(),
@@ -1417,6 +1441,7 @@ def run_mlx(
         if metadata_overrides:
             metadata.update(metadata_overrides)
         metadata.update(protocol_report.metadata)
+        metadata["protocol_identity"] = protocol_identity
         if use_npt:
             metadata["kind"] = "mlx_atomistic.prep_npt"
             metadata["barostat_attempts"] = result.barostat_attempts
@@ -1475,6 +1500,37 @@ def run_mlx(
                     file_format=output_format,
                 )
     return result
+
+
+def _protocol_with_overrides(
+    source_protocol: Mapping[str, Any],
+    overrides: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source = deepcopy(dict(source_protocol))
+    requested = {} if overrides is None else deepcopy(dict(overrides))
+    unknown = sorted(set(requested) - _PROTOCOL_OVERRIDE_FIELDS)
+    if unknown:
+        msg = "unsupported protocol override fields: " + ", ".join(unknown)
+        raise ValueError(msg)
+    effective = {**source, **requested}
+    source_decision = validate_md_protocol_request(source)
+    validation_decision = validate_md_protocol_request(effective)
+    differences = {
+        name: {
+            "source": deepcopy(source.get(name)),
+            "validation": deepcopy(effective[name]),
+        }
+        for name in sorted(requested)
+        if source.get(name) != effective[name]
+    }
+    return effective, {
+        "kind": "project_defined_validation" if overrides is not None else "source",
+        "source_protocol": source,
+        "source_protocol_resolved": deepcopy(source_decision.metadata),
+        "validation_protocol": deepcopy(effective),
+        "validation_protocol_resolved": deepcopy(validation_decision.metadata),
+        "protocol_diff": differences,
+    }
 
 
 def _trajectory_topology_path(
@@ -2139,7 +2195,7 @@ def run_steered_mlx(
         prepared_dir = None
         prepared_system = prepared
         artifact = _artifact_from_prepared_system(prepared_system, require_production=False)
-    protocol_report = validate_gpcrmd_protocol_request(
+    protocol_report = validate_md_protocol_request(
         prepared_system.metadata.protocol_metadata,
         raise_on_blockers=True,
     )

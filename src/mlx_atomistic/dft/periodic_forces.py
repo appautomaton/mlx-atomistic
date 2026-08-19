@@ -23,6 +23,8 @@ from mlx_atomistic.dft.periodic_gth import (
     periodic_gth_local_forces,
 )
 
+_FORCE_KPOINT_MATERIALIZATION_BATCH_SIZE = 8
+
 
 @dataclass(frozen=True)
 class PeriodicForceResult:
@@ -132,7 +134,7 @@ def _periodic_nonlocal_forces(
     projector_cache: _GTHProjectorCache,
 ) -> mx.array:
     force = mx.zeros((system.ion_count, 3), dtype=mx.float32)
-    for point in owned:
+    for point_index, point in enumerate(owned, start=1):
         compact = point.eigen._compact_coefficients
         if not isinstance(compact, _CompactLaneState):
             msg = "periodic forces require compact occupied k-point states"
@@ -146,8 +148,13 @@ def _periodic_nonlocal_forces(
         point_force = operator._forces_compact(
             compact,
             occupations=[2.0] * compact.vector_count,
+            evaluate=False,
         )
         force = force + float(point.integration_weight) * point_force
+        # Bound the lazy projector graph without serializing every k-point.
+        if point_index % _FORCE_KPOINT_MATERIALIZATION_BATCH_SIZE == 0:
+            mx.eval(force)
+    if len(owned) % _FORCE_KPOINT_MATERIALIZATION_BATCH_SIZE:
         mx.eval(force)
     return force
 

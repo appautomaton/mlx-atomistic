@@ -18,7 +18,7 @@ from mlx_atomistic.dft.system import DFTSystem
 from mlx_atomistic.dft.xc import DiracExchange, ExchangeCorrelationFunctional
 
 GeometryOptimizer = Literal["lbfgs", "steepest_descent"]
-GeometryRelaxationMode = Literal["ions", "cell", "ions_cell"]
+GeometryRelaxationMode = Literal["ions"]
 GeometryStatus = Literal[
     "converged",
     "max_steps",
@@ -30,7 +30,11 @@ GeometryStatus = Literal[
 
 @dataclass(frozen=True)
 class GeometryOptimizationConfig:
-    """Configuration for fixed-cell ion-position relaxation."""
+    """Configuration for fixed-cell ion-position relaxation.
+
+    Variable-cell and coupled ion/cell relaxation requests fail closed during
+    configuration validation.
+    """
 
     max_steps: int = 25
     force_tolerance: float = 1e-3
@@ -44,13 +48,11 @@ class GeometryOptimizationConfig:
     scf_config: SCFConfig | None = None
     reuse_scf_state: bool = True
     relaxation_mode: GeometryRelaxationMode = "ions"
-    stress_tolerance: float = 1e-3
-    cell_step_size: float = 0.02
 
     def __post_init__(self) -> None:
         self._validate_step_controls()
         self._validate_line_search_controls()
-        self._validate_modes()
+        self._validate_optimizer_and_relaxation_mode()
 
     def _validate_step_controls(self) -> None:
         if self.max_steps <= 0:
@@ -80,18 +82,15 @@ class GeometryOptimizationConfig:
             msg = "max_line_search_iterations must be positive"
             raise ValueError(msg)
 
-    def _validate_modes(self) -> None:
+    def _validate_optimizer_and_relaxation_mode(self) -> None:
         if self.optimizer not in {"lbfgs", "steepest_descent"}:
             msg = "optimizer must be 'lbfgs' or 'steepest_descent'"
             raise ValueError(msg)
-        if self.relaxation_mode not in {"ions", "cell", "ions_cell"}:
-            msg = "relaxation_mode must be 'ions', 'cell', or 'ions_cell'"
-            raise ValueError(msg)
-        if self.stress_tolerance <= 0.0:
-            msg = "stress_tolerance must be positive"
-            raise ValueError(msg)
-        if self.cell_step_size <= 0.0:
-            msg = "cell_step_size must be positive"
+        if self.relaxation_mode != "ions":
+            msg = (
+                "only relaxation_mode='ions' is supported; "
+                "variable-cell relaxation is not implemented"
+            )
             raise ValueError(msg)
 
 
@@ -774,8 +773,6 @@ def _config_summary(config: GeometryOptimizationConfig) -> dict[str, Any]:
         "optimizer": config.optimizer,
         "reuse_scf_state": config.reuse_scf_state,
         "relaxation_mode": config.relaxation_mode,
-        "stress_tolerance": config.stress_tolerance,
-        "cell_step_size": config.cell_step_size,
         "scf_config": None if config.scf_config is None else _scf_config_summary(config.scf_config),
     }
 

@@ -114,8 +114,18 @@ and numerical gate for a candidate that passes this ladder.
 | Residual-aware CholeskyQR | Skips the second pass only for a validated loose-residual basis; paired complete diagnostics reduced median wall from 56.855 to 55.384 seconds. | `6e49877` |
 | Davidson-to-density FFT reuse | Reuses the final direct-validation real-space orbitals; a complete paired diagnostic removed 24,192 FFT vector-equivalents and reduced wall by 2.61% with an identical trajectory. | `a8e0b6b` |
 | Deferred adaptive residual validation | Uses paired residuals only during inexact adaptive cycles, restores direct validation at the final tolerance, and reduced complete diagnostic wall by 7.97%. | `1c92075` |
+| Device-inclusive effective-potential timing | Replaces lazy graph-construction clocks for the independent Hartree and exchange-correlation branches with one combined materialization boundary, preserving concurrency without reporting enqueue time as device work. | `5f94bc0` |
+| Exact repeated band-point reuse | Reuses an immutable eigenspace only when an earlier path point has the exact same reduced supercell vector; requested point identity and primitive-cell unfolding remain point-specific. | `b3d009b` |
 | Scientific EOS and band gates | Separated runtime convergence from equation-of-state (EOS) and band validation; Silicon admission was later recorded against all-electron references. | `78d4b9d`, `1972dce` |
 | Hpsi stage profiler | Separates local FFT, compact scatter/gather, kinetic, and Goedecker-Teter-Hutter (GTH) pseudopotential work using stable captured inputs. Profiles are diagnostic rather than production timings. | `9cd4ef6` |
+
+The repeated-point candidate used a same-process A/B/B/A Metal diagnostic with
+the Silicon folded-path topology and a bounded two-atom fixed-density proxy.
+The three-point short path reduced exact eigensolves from three to two and mean
+wall from 42.88 to 29.34 milliseconds. The 41-point full path reduced solves
+from 41 to 39 and mean wall from 547.12 to 517.83 milliseconds. Maximum
+eigenvalue differences were zero in both profiles. These are project-derived
+retention measurements, not formal Silicon production timings.
 
 The stable 64-vector profiler attributed 72.60% of independently synchronized
 Hpsi time to the local FFT path, 23.30% to compact scatter, and 5.60% to GTH.
