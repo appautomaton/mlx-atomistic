@@ -946,6 +946,15 @@ class NeighborList:
         return None if self.stats is None else self.stats.adaptation_reason
 
 
+@dataclass(frozen=True)
+class _NeighborUpdateProbe:
+    """Own one asynchronously submitted MLX displacement check."""
+
+    positions: mx.array
+    finite: mx.array
+    max_displacement: mx.array
+
+
 @dataclass
 class NeighborListManager:
     """Manage Verlet neighbor-list rebuilds during an MD trajectory."""
@@ -1100,24 +1109,83 @@ class NeighborListManager:
             return False
         self.updates_since_check = 0
 
-        reference = as_mx_array(self.reference_positions)
-        if reference.shape != positions_mx.shape:
-            msg = "positions must match the neighbor-list reference shape"
-            raise ValueError(msg)
-        finite = mx.all(mx.isfinite(positions_mx))
-        if positions_mx.shape[0] == 0:
-            max_displacement = mx.array(0.0, dtype=mx.float32)
-        else:
-            displacement = positions_mx - reference
-            displacement = self.cell.minimum_image(displacement)
-            distance2 = mx.sum(displacement * displacement, axis=1)
-            max_displacement = mx.sqrt(mx.max(distance2))
+        finite, max_displacement = self._mlx_scalar_displacement_values(positions_mx)
         mx.eval(finite, max_displacement)
         if not bool(np.asarray(finite)):
             msg = "positions must be finite"
             raise ValueError(msg)
         self.last_max_displacement = float(np.asarray(max_displacement))
         return self.last_max_displacement > self.rebuild_threshold
+
+    def _mlx_scalar_displacement_values(
+        self,
+        positions: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """Build finite-state and maximum-displacement scalar values."""
+
+        reference = as_mx_array(self.reference_positions)
+        if reference.shape != positions.shape:
+            msg = "positions must match the neighbor-list reference shape"
+            raise ValueError(msg)
+        finite = mx.all(mx.isfinite(positions))
+        if positions.shape[0] == 0:
+            return finite, mx.array(0.0, dtype=mx.float32)
+        displacement = positions - reference
+        displacement = self.cell.minimum_image(displacement)
+        distance2 = mx.sum(displacement * displacement, axis=1)
+        return finite, mx.sqrt(mx.max(distance2))
+
+    def _begin_speculative_update(self, positions) -> _NeighborUpdateProbe | None:
+        """Submit a current-list displacement check before speculative force work."""
+
+        if (
+            self.displacement_check_backend != "mlx_scalar"
+            or self.check_interval != 1
+            or self.neighbor_list is None
+            or self.reference_positions is None
+        ):
+            return None
+        started = perf_counter()
+        try:
+            self._release_pending_metal_cache()
+            positions_mx = as_mx_array(positions)
+            if positions_mx.ndim != 2 or positions_mx.shape[1] != 3:
+                msg = "positions must have shape (n_particles, 3)"
+                raise ValueError(msg)
+            self._interaction32.record_updates(1)
+            self.updates_since_check = 0
+            finite, max_displacement = self._mlx_scalar_displacement_values(positions_mx)
+            mx.async_eval(finite, max_displacement)
+            return _NeighborUpdateProbe(
+                positions=positions_mx,
+                finite=finite,
+                max_displacement=max_displacement,
+            )
+        finally:
+            self.update_wall_seconds += perf_counter() - started
+
+    def _finish_speculative_update(self, probe: _NeighborUpdateProbe) -> NeighborList:
+        """Commit an asynchronous displacement probe and select its exact schedule."""
+
+        started = perf_counter()
+        try:
+            mx.eval(probe.finite, probe.max_displacement)
+            if not bool(np.asarray(probe.finite)):
+                msg = "positions must be finite"
+                raise ValueError(msg)
+            displacement = float(np.asarray(probe.max_displacement))
+            self.last_max_displacement = displacement
+            if displacement > self.rebuild_threshold:
+                return self.rebuild(probe.positions)
+            if self.neighbor_list is None:
+                msg = "neighbor list manager has no current neighbor list"
+                raise RuntimeError(msg)
+            selected = self._interaction32.select_schedule(displacement)
+            if selected is not None:
+                self.neighbor_list = selected
+            return self.neighbor_list
+        finally:
+            self.update_wall_seconds += perf_counter() - started
 
     def rebuild(self, positions) -> NeighborList:
         """Force a neighbor-list rebuild from current positions."""
