@@ -22,17 +22,25 @@ A constrained Langevin step currently follows this ownership order:
 
 1. Drift positions and apply position constraints.
 2. Apply the pre-force velocity projection.
-3. Admit or rebuild the Neighbor generation.
-4. Rebind the prepared force pipeline only when that generation changes.
-5. Submit direct nonbonded, reciprocal PME, bonded, and sparse correction work.
-6. Apply the final kick and velocity constraints.
-7. Materialize state only for an explicit diagnostic, sample, failure check, or
+3. On ordinary prepared Metal steps, submit the device displacement probe and
+   then queue force work against the current Neighbor generation.
+4. Commit the exact Neighbor decision. Reuse the queued force when the binding
+   is unchanged; otherwise rebuild or switch schedules, rebind, and recompute.
+5. Apply the final kick and velocity constraints.
+6. Materialize state only for an explicit diagnostic, sample, failure check, or
    final result.
 
 Prepared PME plans, constraint schedules, force parameters, and topology
 records persist across steps. Runtime synchronization is recorded by reason so
 an apparent Neighbor wait can be separated from completion of earlier Metal
 work.
+
+This ordering removes the idle queue gap before ordinary force submission
+without weakening the Verlet decision or accumulating multi-step graphs. A
+three-repeat 750-step comparison improved throughput by 37.92% on 5DFR, 8.77%
+on JAC, and 7.75% on GPCRmd. The six-system release suite and 53 related Metal
+tests passed. Raw evidence is under
+`results/md-suite/speculative-admission-{screen,release}-2026-08-20/`.
 
 ## Neighbor Representations
 
