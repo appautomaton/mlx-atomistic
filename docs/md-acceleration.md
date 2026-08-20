@@ -400,6 +400,19 @@ Direct experiment must therefore improve work shared by the admitted inner and
 production outer schedules; another admission-threshold adjustment is not a
 valid optimization target.
 
+The retained inline active-right compaction does that without another schedule
+or dispatch. Each ordinary SIMD group unwraps its current left slice, proves
+right atoms outside the cutoff from the left axis-aligned bounding box, compacts
+the survivors in threadgroup memory, and transposes the pair loop. Pair
+arithmetic and column reductions therefore follow active right records instead
+of the 32-lane padded row. Special topology work keeps its existing masks and
+ownership. Fixed-input Direct blocks improved 23.1-28.3% across 5DFR, JAC,
+GPCRmd, 30k/90k water, and ApoA1. Both 750-step 5DFR/JAC A-B-A comparisons
+passed; throughput improved 12.78% and 7.24% in the two 5DFR directions, and
+3.93% and 8.86% on JAC. The final six-system release run passed every runtime
+check with at most 2.9% within-case timing spread. Raw evidence is under
+`results/md-suite/inline-active-compaction-{fixed,admission,release}-2026-08-19/`.
+
 ## Measurement Rules
 
 - Measure complete trajectory wall before retaining a kernel optimization.

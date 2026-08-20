@@ -124,13 +124,23 @@ The minimum useful family is:
 3. `find_interaction_blocks_32` prunes candidate blocks, evaluates exact
    membership, compacts 32 right atoms, and reports overflow without host-built
    schedules.
-4. `compute_ordinary_interactions_32` evaluates recurring Lennard-Jones and
-   screened Coulomb work with SIMD rotation and register accumulation. Its
-   canonical-record specialization applies the same optional NBFIX type table
-   as the production tile kernel.
+4. `compute_ordinary_interactions_32` unwraps each current left slice, rejects
+   right atoms outside its cutoff-bounded axis-aligned box, compacts the active
+   records inside the SIMD group, and transposes Lennard-Jones and screened
+   Coulomb accumulation so reductions follow active work. Its canonical-record
+   specialization applies the same optional NBFIX type table as the production
+   tile kernel.
 5. `compute_special_interactions_32` handles sparse topology-owned work.
 6. `scatter_ordered_force_32` is optional for diagnostics when the force buffer
    uses packed atom order.
+
+The active-right compaction is inline in the force kernel. It adds no Neighbor
+schedule, global prepass, dispatch, or host synchronization. Fixed-input Direct
+blocks improved 23.1-28.3% across the six release systems. Position-balanced
+750-step comparisons passed in both directions on 5DFR and JAC, and the final
+six-system release run passed every runtime check with at most 2.9% within-case
+timing spread. Evidence remains local under
+`results/md-suite/inline-active-compaction-{fixed,admission,release}-2026-08-19/`.
 
 The first prototype may use global atomics, but they must occur after useful
 register accumulation. A no-atomic owner-computes variant is not automatically
