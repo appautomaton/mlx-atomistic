@@ -2101,6 +2101,14 @@ _INTERACTION32_FORCE_SOURCE = r"""
 #ifdef MLX_ATOMISTIC_NBFIX
     threadgroup int left_type_buffer[32 * GROUPS_PER_TG];
 #endif
+#ifdef MLX_ATOMISTIC_INTERACTION32_ACTIVE_COMPACTION
+    threadgroup int active_right_atom_buffer[32 * GROUPS_PER_TG];
+    threadgroup float active_right_posq_buffer[128 * GROUPS_PER_TG];
+    threadgroup float active_right_lj_buffer[64 * GROUPS_PER_TG];
+#ifdef MLX_ATOMISTIC_NBFIX
+    threadgroup int active_right_type_buffer[32 * GROUPS_PER_TG];
+#endif
+#endif
     if (lane < left_slice_size) {
         int left_ordered = 32 * left_block
             + (int)left_slice_size * (int)left_slice + (int)lane;
@@ -2161,6 +2169,243 @@ _INTERACTION32_FORCE_SOURCE = r"""
     int nbfix_type_count = (int)params[11];
 #endif
     float3 owned_left_force = float3(0.0f);
+#ifdef MLX_ATOMISTIC_INTERACTION32_ACTIVE_COMPACTION
+    if (!special) {
+        // The Verlet schedule intentionally retains a wide shell.  Cull right
+        // atoms against the current left-slice AABB, compact the survivors
+        // inside this SIMD group, and transpose the pair loop so the number of
+        // column reductions follows useful right work instead of padded width.
+        uint safe_left_lane = min(lane, left_slice_size - 1u);
+        bool owned_left_valid = work_active
+            && lane < left_slice_size
+            && left_valid_buffer[left_base + safe_left_lane] != 0u;
+        int owned_left_atom = left_atom_buffer[left_base + safe_left_lane];
+        float4 owned_left_posq = float4(
+            left_posq_buffer[posq_base + 4u * safe_left_lane + 0u],
+            left_posq_buffer[posq_base + 4u * safe_left_lane + 1u],
+            left_posq_buffer[posq_base + 4u * safe_left_lane + 2u],
+            left_posq_buffer[posq_base + 4u * safe_left_lane + 3u]
+        );
+        float2 owned_left_lj = float2(
+            left_lj_buffer[lj_base + 2u * safe_left_lane + 0u],
+            left_lj_buffer[lj_base + 2u * safe_left_lane + 1u]
+        );
+#ifdef MLX_ATOMISTIC_NBFIX
+        int owned_left_type = left_type_buffer[left_base + safe_left_lane];
+#endif
+        float3 left_reference = float3(
+            simd_broadcast(left_posq_buffer[posq_base + 0u], 0u),
+            simd_broadcast(left_posq_buffer[posq_base + 1u], 0u),
+            simd_broadcast(left_posq_buffer[posq_base + 2u], 0u)
+        );
+        float3 left_delta = owned_left_posq.xyz - left_reference;
+        left_delta.x -= box_lx * rint(left_delta.x * box_ix);
+        left_delta.y -= box_ly * rint(left_delta.y * box_iy);
+        left_delta.z -= box_lz * rint(left_delta.z * box_iz);
+        float3 left_unwrapped = left_reference + left_delta;
+        float3 left_minimum = float3(
+            simd_min(owned_left_valid ? left_unwrapped.x : 1.0e20f),
+            simd_min(owned_left_valid ? left_unwrapped.y : 1.0e20f),
+            simd_min(owned_left_valid ? left_unwrapped.z : 1.0e20f)
+        );
+        float3 left_maximum = float3(
+            simd_max(owned_left_valid ? left_unwrapped.x : -1.0e20f),
+            simd_max(owned_left_valid ? left_unwrapped.y : -1.0e20f),
+            simd_max(owned_left_valid ? left_unwrapped.z : -1.0e20f)
+        );
+
+        for (uint interaction = 0u; interaction < interaction_count; interaction++) {
+            uint tile = (uint)ordinary_start + interaction;
+            int owned_right_ordered = ordinary_right_atoms[32 * tile + lane];
+            bool owned_right_valid = work_active
+                && owned_right_ordered >= 0
+                && owned_right_ordered < counts[2]
+                && atom_order[owned_right_ordered] >= 0;
+            int owned_right_atom = owned_right_valid
+                ? atom_order[owned_right_ordered]
+                : 0;
+            float4 owned_right_posq = float4(
+                positions[3 * owned_right_atom + 0],
+                positions[3 * owned_right_atom + 1],
+                positions[3 * owned_right_atom + 2],
+                charges[owned_right_atom]
+            );
+            float2 owned_right_lj = float2(
+                half_sigma[owned_right_atom],
+                sqrt_epsilon[owned_right_atom]
+            );
+#ifdef MLX_ATOMISTIC_NBFIX
+            int owned_right_type = atom_type_ids[owned_right_atom];
+#endif
+            float3 right_delta = owned_right_posq.xyz - left_reference;
+            right_delta.x -= box_lx * rint(right_delta.x * box_ix);
+            right_delta.y -= box_ly * rint(right_delta.y * box_iy);
+            right_delta.z -= box_lz * rint(right_delta.z * box_iz);
+            float3 right_unwrapped = left_reference + right_delta;
+            float3 aabb_gap = max(
+                max(left_minimum - right_unwrapped, right_unwrapped - left_maximum),
+                float3(0.0f)
+            );
+            uint right_active = (
+                owned_right_valid && dot(aabb_gap, aabb_gap) < cutoff2
+            ) ? 1u : 0u;
+            uint active_rank = simd_prefix_exclusive_sum(right_active);
+            uint active_count = simd_sum(right_active);
+            if (right_active != 0u) {
+                active_right_atom_buffer[left_base + active_rank] = owned_right_atom;
+                active_right_posq_buffer[posq_base + 4u * active_rank + 0u] =
+                    owned_right_posq.x;
+                active_right_posq_buffer[posq_base + 4u * active_rank + 1u] =
+                    owned_right_posq.y;
+                active_right_posq_buffer[posq_base + 4u * active_rank + 2u] =
+                    owned_right_posq.z;
+                active_right_posq_buffer[posq_base + 4u * active_rank + 3u] =
+                    owned_right_posq.w;
+                active_right_lj_buffer[lj_base + 2u * active_rank + 0u] =
+                    owned_right_lj.x;
+                active_right_lj_buffer[lj_base + 2u * active_rank + 1u] =
+                    owned_right_lj.y;
+#ifdef MLX_ATOMISTIC_NBFIX
+                active_right_type_buffer[left_base + active_rank] = owned_right_type;
+#endif
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint right_slot = 0u; right_slot < active_count; right_slot++) {
+                int right_atom = active_right_atom_buffer[left_base + right_slot];
+                float4 right_posq = float4(
+                    active_right_posq_buffer[posq_base + 4u * right_slot + 0u],
+                    active_right_posq_buffer[posq_base + 4u * right_slot + 1u],
+                    active_right_posq_buffer[posq_base + 4u * right_slot + 2u],
+                    active_right_posq_buffer[posq_base + 4u * right_slot + 3u]
+                );
+                float2 right_lj = float2(
+                    active_right_lj_buffer[lj_base + 2u * right_slot + 0u],
+                    active_right_lj_buffer[lj_base + 2u * right_slot + 1u]
+                );
+#ifdef MLX_ATOMISTIC_NBFIX
+                int right_type = active_right_type_buffer[left_base + right_slot];
+#endif
+                float3 pair_force = float3(0.0f);
+                if (owned_left_valid) {
+                    float dx = owned_left_posq.x - right_posq.x;
+                    float dy = owned_left_posq.y - right_posq.y;
+                    float dz = owned_left_posq.z - right_posq.z;
+                    dx -= box_lx * rint(dx * box_ix);
+                    dy -= box_ly * rint(dy * box_iy);
+                    dz -= box_lz * rint(dz * box_iz);
+                    float r2 = dx * dx + dy * dy + dz * dz;
+                    if (r2 > 0.0f && r2 < cutoff2) {
+                        float inv_distance = rsqrt(r2);
+                        float inv_r2 = inv_distance * inv_distance;
+                        float distance = r2 * inv_distance;
+                        float sigma_ij = owned_left_lj.x + right_lj.x;
+                        float epsilon_ij = owned_left_lj.y * right_lj.y;
+#ifdef MLX_ATOMISTIC_NBFIX
+                        int nbfix_index = owned_left_type * nbfix_type_count + right_type;
+                        float nbfix_sigma_value = nbfix_sigma[nbfix_index];
+                        if (nbfix_sigma_value > 0.0f) {
+                            sigma_ij = nbfix_sigma_value;
+                            epsilon_ij = nbfix_epsilon[nbfix_index];
+                        }
+#endif
+                        float sigma2_over_r2 = sigma_ij * sigma_ij * inv_r2;
+                        float inv_r6 = sigma2_over_r2
+                            * sigma2_over_r2 * sigma2_over_r2;
+                        float inv_r12 = inv_r6 * inv_r6;
+                        float unswitched_energy = 0.0f;
+                        float switch_value = 1.0f;
+                        float switch_derivative = 0.0f;
+                        if (switch_flag > 0.5f) {
+                            unswitched_energy = 4.0f * epsilon_ij
+                                * (inv_r12 - inv_r6);
+                            if (shift_flag > 0.5f) {
+                                float sigma2_over_rc2 = sigma_ij * sigma_ij / cutoff2;
+                                float inv_rc6 = sigma2_over_rc2
+                                    * sigma2_over_rc2 * sigma2_over_rc2;
+                                unswitched_energy -= 4.0f * epsilon_ij
+                                    * (inv_rc6 * inv_rc6 - inv_rc6);
+                            }
+                            float x = clamp(
+                                (distance - switch_start) * inv_switch_width,
+                                0.0f,
+                                1.0f
+                            );
+                            float x2 = x * x;
+                            float x3 = x2 * x;
+                            float x4 = x3 * x;
+                            float x5 = x4 * x;
+                            switch_value = 1.0f
+                                - (10.0f * x3 - 15.0f * x4 + 6.0f * x5);
+                            if (distance > switch_start && distance < switch_end) {
+                                switch_derivative = -(
+                                    30.0f * x2 - 60.0f * x3 + 30.0f * x4
+                                ) * inv_switch_width;
+                            }
+                        }
+                        float scalar =
+                            24.0f * epsilon_ij * (2.0f * inv_r12 - inv_r6)
+                                * inv_r2 * switch_value
+                            - unswitched_energy * switch_derivative * inv_distance;
+                        float qij = owned_left_posq.w * right_posq.w;
+                        float2 ewald_terms =
+                            mlx_atomistic_ewald_erfc_exp(ewald_alpha * distance);
+                        scalar += coulomb * qij * (
+                            ewald_terms.x * inv_r2 * inv_distance
+                            + ewald_self * ewald_terms.y * inv_r2
+                        );
+                        pair_force = float3(
+                            scalar * dx,
+                            scalar * dy,
+                            scalar * dz
+                        );
+                    }
+                }
+                owned_left_force += pair_force;
+                float3 right_force = -float3(
+                    simd_sum(pair_force.x),
+                    simd_sum(pair_force.y),
+                    simd_sum(pair_force.z)
+                );
+                if (lane == 0u && any(right_force != float3(0.0f))) {
+                    atomic_fetch_add_explicit(
+                        &ordered_forces[3 * right_atom + 0],
+                        right_force.x,
+                        memory_order_relaxed
+                    );
+                    atomic_fetch_add_explicit(
+                        &ordered_forces[3 * right_atom + 1],
+                        right_force.y,
+                        memory_order_relaxed
+                    );
+                    atomic_fetch_add_explicit(
+                        &ordered_forces[3 * right_atom + 2],
+                        right_force.z,
+                        memory_order_relaxed
+                    );
+                }
+            }
+        }
+        if (owned_left_valid && any(owned_left_force != float3(0.0f))) {
+            atomic_fetch_add_explicit(
+                &ordered_forces[3 * owned_left_atom + 0],
+                owned_left_force.x,
+                memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &ordered_forces[3 * owned_left_atom + 1],
+                owned_left_force.y,
+                memory_order_relaxed
+            );
+            atomic_fetch_add_explicit(
+                &ordered_forces[3 * owned_left_atom + 2],
+                owned_left_force.z,
+                memory_order_relaxed
+            );
+        }
+        return;
+    }
+#endif
     for (uint interaction = 0u; interaction < interaction_count; interaction++) {
         uint tile = special ? group : (uint)ordinary_start + interaction;
         int owned_right = special
@@ -4824,6 +5069,7 @@ def _interaction32_fused_half_canonical_force_kernel():
                 "#define MLX_ATOMISTIC_INTERACTION32_CANONICAL 1\n"
                 "#define MLX_ATOMISTIC_INTERACTION32_FUSED_HALF 1\n"
                 "#define MLX_ATOMISTIC_INTERACTION32_SHARED_EWALD_EXP 1\n"
+                "#define MLX_ATOMISTIC_INTERACTION32_ACTIVE_COMPACTION 1\n"
                 + _INTERACTION32_FORCE_SOURCE
             ),
             header=_ERF_HEADER,
@@ -4869,6 +5115,7 @@ def _interaction32_fused_half_nbfix_canonical_force_kernel():
                     "#define MLX_ATOMISTIC_INTERACTION32_CANONICAL 1\n"
                     "#define MLX_ATOMISTIC_INTERACTION32_FUSED_HALF 1\n"
                     "#define MLX_ATOMISTIC_INTERACTION32_SHARED_EWALD_EXP 1\n"
+                    "#define MLX_ATOMISTIC_INTERACTION32_ACTIVE_COMPACTION 1\n"
                     "#define MLX_ATOMISTIC_NBFIX 1\n"
                     + _INTERACTION32_FORCE_SOURCE
                 ),
