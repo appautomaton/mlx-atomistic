@@ -980,6 +980,72 @@ def test_neighbor_list_manager_mlx_scalar_rebuild_policy_matches_numpy():
     assert exercise("mlx_scalar") == exercise("numpy")
 
 
+def test_neighbor_list_manager_speculative_probe_preserves_update_semantics(monkeypatch):
+    positions = as_mx_array(
+        [
+            [1.0, 1.0, 1.0],
+            [2.2, 1.0, 1.0],
+            [1.0, 2.2, 1.0],
+        ]
+    )
+    manager = NeighborListManager(
+        Cell.cubic(6.0),
+        cutoff=1.5,
+        skin=0.4,
+        displacement_check_backend="mlx_scalar",
+    )
+    initial = manager.update(positions)
+    submitted = []
+    original_async_eval = mx.async_eval
+
+    def record_async_eval(*values):
+        submitted.append(values)
+        return original_async_eval(*values)
+
+    monkeypatch.setattr(mx, "async_eval", record_async_eval)
+    small_probe = manager._begin_speculative_update(
+        positions + mx.array([[0.05, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    )
+    assert small_probe is not None
+    assert manager._finish_speculative_update(small_probe) is initial
+
+    large_probe = manager._begin_speculative_update(
+        positions + mx.array([[0.25, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    )
+    assert large_probe is not None
+    rebuilt = manager._finish_speculative_update(large_probe)
+
+    assert len(submitted) == 2
+    assert rebuilt is not initial
+    assert manager.rebuild_count == 2
+    assert manager.last_max_displacement == 0.0
+
+
+def test_neighbor_list_manager_speculative_probe_rejects_non_finite_positions():
+    positions = as_mx_array(
+        [
+            [1.0, 1.0, 1.0],
+            [2.2, 1.0, 1.0],
+            [1.0, 2.2, 1.0],
+        ]
+    )
+    manager = NeighborListManager(
+        Cell.cubic(6.0),
+        cutoff=1.5,
+        skin=0.4,
+        displacement_check_backend="mlx_scalar",
+    )
+    initial = manager.update(positions)
+    invalid = positions.at[0, 0].add(mx.array(float("nan"), dtype=mx.float32))
+    probe = manager._begin_speculative_update(invalid)
+
+    assert probe is not None
+    with pytest.raises(ValueError, match="positions must be finite"):
+        manager._finish_speculative_update(probe)
+    assert manager.neighbor_list is initial
+    assert manager.rebuild_count == 1
+
+
 def test_neighbor_list_manager_rejects_non_finite_positions_after_valid_build():
     positions = np.array(
         [

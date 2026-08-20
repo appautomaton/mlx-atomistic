@@ -3237,11 +3237,39 @@ def _simulate_nvt(
                     route_profiler,
                 )
 
-        neighbor_started = None if route_profiler is None else route_profiler.start()
         eval_positions = _neighbor_evaluation_positions(next_positions, virtual_sites)
-        neighbor_list = (
-            neighbor_manager.update(eval_positions) if neighbor_manager is not None else None
-        )
+        deferred_final = defer_final_diagnostics and local_step == config.steps
+        full_diagnostic_step = diagnostic_step and not deferred_final
+        speculative_probe = None
+        speculative_forces = None
+        speculative_binding = None
+        # Queue the displacement probe before current-generation force work.
+        # The host can commit the exact Neighbor decision while Metal has useful
+        # work queued; a generation change discards and recomputes that force.
+        if (
+            async_force_submission
+            and not full_diagnostic_step
+            and not deferred_final
+            and neighbor_manager is not None
+            and force_binding is not None
+        ):
+            speculative_probe = neighbor_manager._begin_speculative_update(eval_positions)
+            if speculative_probe is not None:
+                speculative_binding = force_binding
+                speculative_started = perf_counter()
+                speculative_forces = force_binding.forces(
+                    next_positions,
+                    evaluation_positions=eval_positions,
+                )
+                mx.async_eval(speculative_forces)
+                force_evaluation_wall_seconds += perf_counter() - speculative_started
+        neighbor_started = None if route_profiler is None else route_profiler.start()
+        if neighbor_manager is None:
+            neighbor_list = None
+        elif speculative_probe is None:
+            neighbor_list = neighbor_manager.update(eval_positions)
+        else:
+            neighbor_list = neighbor_manager._finish_speculative_update(speculative_probe)
         if neighbor_started is not None:
             route_profiler.finish(
                 "neighbor_update_rebuild",
@@ -3258,8 +3286,6 @@ def _simulate_nvt(
                     "neighbor_force_binding",
                     binding_started,
                 )
-        deferred_final = defer_final_diagnostics and local_step == config.steps
-        full_diagnostic_step = diagnostic_step and not deferred_final
         if neighbor_list is None:
             pairs = None
         elif (
@@ -3336,6 +3362,10 @@ def _simulate_nvt(
                 virtual_sites=virtual_sites,
             )
             energy_by_term = None
+        elif speculative_forces is not None and force_binding is speculative_binding:
+            potential_energy = None
+            next_forces = speculative_forces
+            energy_by_term = None
         else:
             potential_energy = None
             next_forces = (
@@ -3379,6 +3409,7 @@ def _simulate_nvt(
             and neighbor_list.supports_async_force_submission
             and not full_diagnostic_step
             and not deferred_final
+            and next_forces is not speculative_forces
         ):
             mx.async_eval(next_forces)
         final_integration_started = None if route_profiler is None else route_profiler.start()

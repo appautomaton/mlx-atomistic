@@ -757,43 +757,70 @@ def test_unchecked_constraint_projection_skips_error_graph_and_matches_checked_p
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("neighbor_backend", ["mlx_cell_tiles", "mlx_interaction32"])
 def test_spatial_constrained_nvt_async_submission_is_guarded_and_state_preserving(
     monkeypatch,
+    neighbor_backend,
 ):
     """One async force submission overlaps only ordinary prepared Metal steps."""
 
-    positions = np.asarray(
-        [
-            [1.0, 1.0, 1.0],
-            [2.0, 1.0, 1.0],
-            [1.0, 2.3, 1.0],
-            [2.4, 2.2, 1.1],
-            [4.0, 4.0, 4.0],
-            [5.1, 4.0, 4.0],
-            [4.0, 5.2, 4.0],
-            [5.2, 5.1, 4.2],
-        ],
-        dtype=np.float32,
-    )
+    if neighbor_backend == "mlx_interaction32":
+        grid = np.stack(
+            np.meshgrid(np.arange(4), np.arange(4), np.arange(6), indexing="ij"),
+            axis=-1,
+        )
+        positions = 1.5 + 1.35 * grid.reshape((-1, 3)).astype(np.float32)
+        cell = Cell.cubic(20.0)
+        cutoff = 4.0
+        skin = 0.5
+    else:
+        positions = np.asarray(
+            [
+                [1.0, 1.0, 1.0],
+                [2.0, 1.0, 1.0],
+                [1.0, 2.3, 1.0],
+                [2.4, 2.2, 1.1],
+                [4.0, 4.0, 4.0],
+                [5.1, 4.0, 4.0],
+                [4.0, 5.2, 4.0],
+                [5.2, 5.1, 4.2],
+            ],
+            dtype=np.float32,
+        )
+        cell = Cell.cubic(8.0)
+        cutoff = 2.5
+        skin = 0.4
     velocities = np.zeros_like(positions)
     masses = np.ones((positions.shape[0],), dtype=np.float32)
-    cell = Cell.cubic(8.0)
-    constraints = DistanceConstraints([(0, 1)], distances=[1.0], max_iterations=8)
+    constraint_distance = float(np.linalg.norm(positions[1] - positions[0]))
+    constraints = DistanceConstraints(
+        [(0, 1)],
+        distances=[constraint_distance],
+        max_iterations=8,
+    )
 
     def run(*, runtime_profile=False):
         potential = NonbondedPotential(
             sigma=np.full((positions.shape[0],), 0.8, dtype=np.float32),
             epsilon=np.full((positions.shape[0],), 0.05, dtype=np.float32),
             charges=np.zeros((positions.shape[0],), dtype=np.float32),
-            cutoff=2.5,
+            cutoff=cutoff,
+            topology=Topology.from_sequences(
+                n_atoms=positions.shape[0],
+                exclusions=[(0, positions.shape[0] // 2)],
+                one_four_pairs=[(1, positions.shape[0] // 2 + 1)],
+                eager_nonbonded_pair_limit=0,
+            ),
         )
         manager = NeighborListManager(
             cell,
-            cutoff=2.5,
-            skin=0.4,
+            cutoff=cutoff,
+            skin=skin,
             check_interval=1,
-            backend="mlx_cell_tiles",
+            backend=neighbor_backend,
             displacement_check_backend="mlx_scalar",
+            interaction32_exclusion_pairs=potential._aligned_lj_exclusion_pairs,
+            interaction32_one_four_pairs=potential._aligned_lj_one_four_pairs,
         )
         return simulate_nvt(
             positions,
@@ -823,11 +850,12 @@ def test_spatial_constrained_nvt_async_submission_is_guarded_and_state_preservin
 
     monkeypatch.setattr(mx, "async_eval", record_async_eval)
     asynchronous = run()
-    assert len(submissions) == 2
+    assert len(submissions) == 4
+    assert all(len(values) in {1, 2} for values in submissions)
 
     profiled = run(runtime_profile=True)
     assert profiled.route_profile["reconciled"] is True
-    assert len(submissions) == 2
+    assert len(submissions) == 4
 
     monkeypatch.setattr(
         md_module,
