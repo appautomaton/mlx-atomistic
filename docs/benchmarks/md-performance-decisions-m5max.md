@@ -76,6 +76,22 @@ compiler-profile boundaries, not runtime utilization percentages; they direct
 new work toward useful-pair arithmetic rather than another memory or barrier
 micro-optimization.
 
+## Current Verified Snapshot
+
+The 2026-08-24 post-bitset normal-power baseline at `a219226` passed three
+independent 750-step repeats per system. Median throughput was 0.5694 ms/step
+on 5DFR, 1.8169 ms/step on JAC, and 1.9479 ms/step on GPCRmd; every timing
+spread was below 1%. The synchronized structural profile ranks Direct Space
+first at 25.75% of JAC and 28.36% of GPCRmd wall, followed by constraints and
+reciprocal PME. These fractions are not additive clean-wall timings.
+
+A fresh manifest-matched JAC comparison used the middle MLX baseline repeat
+and an OpenMM 8.5.1.dev-f7fa0c2 single-precision OpenCL run with the same ten
+warmups, 750 measured 4 fs steps, PME mesh, alpha, cutoff, thermostat, and
+fixed cell. MLX measured 1.8150 ms/step and OpenMM measured 1.2221 ms/step, a
+1.485 MLX/OpenMM wall ratio. Raw evidence is under
+`results/md-suite/post-bitset-current-2026-08-24/`.
+
 ## Rejected Directions
 
 | Candidate | Why it was rejected | Historical commit |
@@ -123,6 +139,9 @@ micro-optimization.
 | Compile-time Lennard-Jones switch variants | Specializing the Interaction32 fused-half kernel into switch and no-switch variants preserved ordinary and NBFIX force parity and improved fixed-input calls by 15.9% on 5DFR, 21.0% on JAC, and 1.8% on GPCRmd. The first stable 750-step control/candidate comparison transferred only 0.75% on 5DFR and 0.26% on JAC, below the 3% JAC retention gate. A following control shifted by 15.3% and 10.5%, respectively, so its apparent larger gain was ineligible. Four extra kernel variants were not retained. | unmerged prototype; `results/md-suite/switch-specialization-admission-2026-08-19/` |
 | Local Direct arithmetic rewrites | Three ALU-motivated JAC screens all preserved force parity but failed the fixed-schedule gate. OpenMM-style Lennard-Jones factorization regressed 0.97%, a 4,097-entry screened-Coulomb table with a 16 KiB footprint and `9.8e-8` offline maximum factor error regressed 0.83%, and hoisting the invariant right-charge scale regressed 0.52%. The table traded arithmetic for irregular loads, while the compiler already optimized the simple invariant. All prototypes were removed before trajectory testing. | uncommitted prototypes; `results/md-suite/direct-{lj-factor,ewald-table,coulomb-charge-hoist}-screen-2026-08-16/` |
 | Fast Ewald reciprocal | OpenMM's Apple OpenCL backend can select `native_recip`, but replacing the shared Ewald helper's float division with Metal `fast::divide` did not transfer. Same-process JAC A/B regressed the 12 A inner schedule by 0.96%; the 14.5 A outer aggregate improved 0.77%, but its two timing directions disagreed at -1.27% and +1.83%. Force parity passed, the prototype was removed, and no trajectory gate was run. | uncommitted diagnostic; `results/md-suite/direct-fast-recip-screen-2026-08-16/` |
+| Bounded Ewald force polynomial | A degree-17 float32 polynomial removed the per-pair exponential and reciprocal while keeping the JAC maximum force delta at `3.43e-4 kJ/(mol A)`. The current fixed-input Interaction32 call regressed from 1.1128 to 1.1657 ms, or 4.75%, so the prototype was removed before trajectory testing. | uncommitted prototype; `results/md-suite/direct-bounded-ewald-polynomial-2026-08-24/` |
+| Fused position/pre-force constraint pipeline | A generation-independent Metal path removed one dense full-atom write and one critical-path dispatch. Fixed-input JAC improved 11.64%, with bitwise-identical positions and a `1.19e-7` maximum velocity delta. The complete 750-step screen transferred only 2.76% on 5DFR and 1.00% on JAC, while GPCRmd regressed 1.55%. The roughly 450-line prototype was removed. | uncommitted prototype; `results/md-suite/fused-position-pre-force-screen-2026-08-24/` |
+| Generation-bound compiled force graph | `mx.compile` successfully captured bonded, Direct, PME, correction, and aggregation custom-kernel work, but each new Neighbor binding owned a new compiled closure. A 750-step JAC screen regressed from the 1.8169 ms/step current baseline to 1.8920 ms/step, or 4.14%; trace cost did not amortize over the generation lifetime. Cross-generation dynamic state, not another Python binding wrapper, is the remaining compilation boundary. | uncommitted prototype; `results/md-suite/compiled-force-graph-screen-2026-08-24/` |
 
 ## Interaction32 Promotion
 
