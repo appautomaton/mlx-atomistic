@@ -58,7 +58,8 @@ def run_periodic_scf_checkpointed(
         cutoff_hartree: Plane-wave kinetic cutoff in Hartree.
         kpoint_mesh: Weighted reduced-coordinate k-point mesh.
         execution_context: Complete current execution context or validated identity.
-        n_bands: Occupied band count. Defaults to half the electron count.
+        n_bands: Computed band count. Fixed occupations default to half the
+            electron count; smearing requires additional empty bands.
         config: Exact SCF controls. Defaults to ``PeriodicSCFConfig``.
         xc_functional: Exchange-correlation functional. Defaults to production PBE.
         initial_density: Optional fresh-run starting density.
@@ -169,5 +170,4 @@ def run_periodic_scf_checkpointed(
         _artifact_execution_contract_fingerprint=(identity.execution_contract_fingerprint),
         _artifact_calculation_fingerprint=_calculation_fingerprint(calculation),
     )
-
 

@@ -6,7 +6,8 @@ spin, occupation, finite-difference stress, and restart diagnostics. The
 periodic `PeriodicDFTSystem`/`run_periodic_scf` surface supplies the
 materials-workload path: PBE-PW92, reciprocal-space GTH operators,
 Monkhorst-Pack integration, block-Davidson/Rayleigh-Ritz solves,
-frozen-density band paths, and periodic forces.
+fixed or Fermi-Dirac occupations, frozen-density band paths, and periodic
+forces.
 
 The periodic implementation has verified results for specific workloads, but
 is not broadly chemically certified. Capability claims are tied to the
@@ -49,8 +50,27 @@ The new spin layer is collinear only:
 - `polarized`: separate `ρ↑(r)` and `ρ↓(r)` diagnostics.
 
 The legacy layer exposes fixed and Fermi-Dirac occupation diagnostics. The
-periodic layer uses reduced-coordinate Monkhorst-Pack meshes and
-`0.5|G + k|²`, including Bloch-phase local and nonlocal GTH evaluation.
+periodic layer supports two complete occupation paths:
+
+- The default fixed path computes exactly `N/2` doubly occupied bands. It
+  retains the cached-density fast path used by the verified insulating
+  workloads.
+- `PeriodicFermiDiracSmearing(width_hartree=...)` resolves one global chemical
+  potential over the weighted k-point mesh. The caller supplies enough
+  computed bands that `2 * n_bands > electron_count`.
+
+The smeared density and band energy use the resolved occupation of every band,
+not a post-hoc scalar density correction. SCF convergence follows the
+variational electronic free energy `F = E - (k_B T) S`; `PeriodicSCFResult`
+separately reports internal energy, chemical potential, dimensionless electronic
+entropy,
+and smearing width. Checkpoints bind the smearing method and width and reproduce
+the same occupations after resume. Periodic nonlocal forces also consume those
+occupations, so a converged smeared result yields the stationary free-energy
+force.
+
+Both paths use reduced-coordinate Monkhorst-Pack meshes and `0.5|G + k|²`,
+including Bloch-phase local and nonlocal GTH evaluation.
 `run_periodic_band_structure` reuses a converged SCF density and solves
 non-self-consistently along a high-symmetry path.
 
@@ -75,7 +95,7 @@ boundary.
 
 | Feature | Local Status | Reference Family |
 | --- | --- | --- |
-| Plane-wave SCF core | verified (bulk-Si EOS) | CP2K Quickstep, QE PWscf |
+| Plane-wave SCF core | verified for fixed-occupation bulk-Si EOS; Fermi-Dirac path numerically validated | CP2K Quickstep, QE PWscf |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
 | Geometry relaxation and finite-difference stress | proof-level | CP2K MOTION/GEO_OPT, QE relax |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
@@ -87,6 +107,11 @@ Plane-wave SCF core is `verified` only for the bulk-silicon PBE equation of stat
 against an all-electron (FLEUR/WIEN2k) reference (Lejaeghere Δ factor
 1.942 meV/atom); broader chemistry stays proof-level, and the separate
 MLX-versus-QE PWscf cross-engine parity is still diagnostic, not closed.
+Periodic Fermi-Dirac occupations remove the former fixed-occupation algorithmic
+blocker for metals and odd electron counts. They do not, by themselves,
+establish a material-level metallic accuracy claim; that requires a
+source-bound metal workload with matching pseudopotential, smearing convention,
+k-point mesh, and free-energy definition.
 
 `dft_qm_scope_readiness_report()` returns a shared readiness payload for these
 features. Deferred, anti-goal, and unknown features report blockers before any

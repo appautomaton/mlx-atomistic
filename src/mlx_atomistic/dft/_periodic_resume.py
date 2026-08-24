@@ -209,7 +209,7 @@ def _restore_owner_states(
     *,
     bases: Sequence[PlaneWaveBasis],
     ownership: TimeReversalOwnership,
-    occupied_bands: int,
+    band_count: int,
 ) -> dict[int, _CompactLaneState]:
     coefficient_map = state.coefficient_map
     lane_map = _validated_lane_map(state, ownership)
@@ -223,7 +223,7 @@ def _restore_owner_states(
             raise ValueError(msg)
         values = mx.array(coefficient_map[owner_index])
         if values.dtype != mx.complex64 or values.shape != (
-            occupied_bands,
+            band_count,
             basis.active_count,
         ):
             msg = "periodic resume owner coefficients have incompatible shape or dtype"
@@ -243,7 +243,7 @@ def _restore_continuation_state(
     *,
     bases: Sequence[PlaneWaveBasis],
     ownership: TimeReversalOwnership,
-    occupied_bands: int,
+    band_count: int,
     grid: RealSpaceGrid,
     electron_count: float,
     mixer: LinearMixer | PulayDIISMixer,
@@ -260,7 +260,7 @@ def _restore_continuation_state(
         state,
         bases=bases,
         ownership=ownership,
-        occupied_bands=occupied_bands,
+        band_count=band_count,
     )
     mixer._restore_checkpoint_state(state.mixer_state, expected_shape=grid.shape)
     return (

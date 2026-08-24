@@ -29,6 +29,9 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicEigenResult as PeriodicEigenResult,
 )
 from mlx_atomistic.dft._periodic_models import (
+    PeriodicFermiDiracSmearing as PeriodicFermiDiracSmearing,
+)
+from mlx_atomistic.dft._periodic_models import (
     PeriodicFrozenDensity as PeriodicFrozenDensity,
 )
 from mlx_atomistic.dft._periodic_models import (
@@ -69,7 +72,9 @@ def run_periodic_scf(
         system: Periodic GTH system.
         cutoff_hartree: Kinetic cutoff in Hartree.
         kpoint_mesh: Weighted reduced-coordinate k-point mesh.
-        n_bands: Number of occupied bands. Defaults to half the electron count.
+        n_bands: Number of computed bands. Fixed occupations default to half
+            the electron count. Smearing requires enough additional bands to
+            retain at least one partially empty state.
         config: SCF controls. Defaults to `PeriodicSCFConfig`.
         xc_functional: Exchange-correlation functional. Defaults to production PBE.
         initial_density: Optional starting density on the FFT grid.

@@ -206,7 +206,8 @@ def publish_periodic_scf_checkpoint(
         cutoff_hartree: Plane-wave kinetic cutoff in Hartree.
         kpoint_mesh: Weighted reduced-coordinate k-point mesh.
         execution_context: Existing complete execution context or validated identity.
-        n_bands: Occupied band count. Defaults to half the electron count.
+        n_bands: Computed band count. Fixed occupations default to half the
+            electron count; smearing requires additional empty bands.
         config: Exact SCF controls. Defaults to ``PeriodicSCFConfig``.
         xc_functional: Exchange-correlation functional. Defaults to production PBE.
         provenance: Optional non-identity Git or caller provenance.
@@ -837,7 +838,8 @@ def load_periodic_scf_checkpoint(
         cutoff_hartree: Current plane-wave cutoff in Hartree.
         kpoint_mesh: Current weighted reduced-coordinate k-point mesh.
         execution_context: Current complete execution context or validated identity.
-        n_bands: Current occupied band count. Defaults to half the electron count.
+        n_bands: Current computed band count. Fixed occupations default to half
+            the electron count; smearing requires additional empty bands.
         config: Current exact SCF controls. Defaults to ``PeriodicSCFConfig``.
         xc_functional: Current exchange-correlation functional.
 
@@ -900,4 +902,3 @@ def load_periodic_scf_checkpoint(
         metadata=metadata,
         _state=state,
     )
-

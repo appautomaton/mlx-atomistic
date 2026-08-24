@@ -145,9 +145,15 @@ def _periodic_nonlocal_forces(
             system.positions,
             cache=projector_cache,
         )
+        occupations = point.occupations
+        if occupations is None:
+            occupations = (2.0,) * compact.vector_count
+        if len(occupations) != compact.vector_count:
+            msg = "periodic force occupations must match the retained band count"
+            raise ValueError(msg)
         point_force = operator._forces_compact(
             compact,
-            occupations=[2.0] * compact.vector_count,
+            occupations=occupations,
             evaluate=False,
         )
         force = force + float(point.integration_weight) * point_force
@@ -189,7 +195,8 @@ def periodic_scf_forces(
     The local and nonlocal electron-ion terms use analytic derivatives of the
     GTH phase factors. The ion-ion term uses the analytic Ewald derivative.
     There is no ionic Pulay term because the fixed-cell plane-wave basis does
-    not depend on ion positions.
+    not depend on ion positions. Finite-temperature results use their resolved
+    occupations, yielding the stationary electronic free-energy force.
 
     Args:
         system: Exact periodic system used for the SCF calculation.

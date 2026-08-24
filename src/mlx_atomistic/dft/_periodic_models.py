@@ -204,6 +204,22 @@ class PeriodicDavidsonConfig:
 
 
 @dataclass(frozen=True)
+class PeriodicFermiDiracSmearing:
+    """Finite-temperature occupations for periodic metallic SCF.
+
+    Args:
+        width_hartree: Electronic temperature ``k_B T`` in Hartree.
+    """
+
+    width_hartree: float
+
+    def __post_init__(self) -> None:
+        if not _is_finite_positive_control(self.width_hartree):
+            msg = "width_hartree must be finite and positive"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
 class PeriodicSCFConfig:
     """Controls for weighted k-point self-consistent field iteration."""
 
@@ -222,10 +238,17 @@ class PeriodicSCFConfig:
     adaptive_eigensolver_tolerance: bool = False
     initial_eigensolver_tolerance: float = 1e-2
     eigensolver_tolerance_scale: float = 0.1
+    smearing: PeriodicFermiDiracSmearing | None = None
 
     def __post_init__(self) -> None:
         self._validate_iteration_controls()
         self._validate_eigensolver_controls()
+        if self.smearing is not None and not isinstance(
+            self.smearing,
+            PeriodicFermiDiracSmearing,
+        ):
+            msg = "smearing must be PeriodicFermiDiracSmearing or None"
+            raise TypeError(msg)
         self._compact_batch_policy()
 
     def _validate_iteration_controls(self) -> None:
@@ -541,6 +564,7 @@ class PeriodicKPointResult:
     aggregated_weight: float | None = None
     ownership_role: str = "independent"
     fallback_reason: str | None = None
+    occupations: tuple[float, ...] | None = None
 
     @property
     def integration_weight(self) -> float:
@@ -555,12 +579,15 @@ class PeriodicKPointResult:
             Reduced k-point, weight, basis metadata, and eigensolver summary.
         """
 
-        return {
+        payload = {
             "reduced_kpoint": list(self.reduced_kpoint),
             "weight": self.weight,
             "basis": self.basis.to_dict(),
             "eigensolver": self.eigen.to_dict(),
         }
+        if self.occupations is not None:
+            payload["occupations"] = list(self.occupations)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -570,7 +597,12 @@ class _TimeReversalContinuationSeed:
 
 @dataclass(frozen=True)
 class PeriodicSCFResult:
-    """Result bundle for a weighted periodic plane-wave SCF calculation."""
+    """Result bundle for a weighted periodic plane-wave SCF calculation.
+
+    ``total_energy`` is the variational free energy when smearing is active and
+    the internal energy otherwise. ``internal_energy`` always excludes the
+    electronic entropy correction.
+    """
 
     converged: bool
     status: str
@@ -591,6 +623,10 @@ class PeriodicSCFResult:
     timing_admission_status: str = "fresh"
     lineage: tuple[str, ...] = ()
     system_fingerprint: str | None = None
+    internal_energy: float | None = None
+    chemical_potential: float | None = None
+    electronic_entropy: float = 0.0
+    smearing_width_hartree: float | None = None
     _owned_kpoints: tuple[PeriodicKPointResult, ...] | None = field(
         default=None,
         repr=False,
@@ -656,7 +692,13 @@ class PeriodicSCFResult:
             "status": self.status,
             "iterations": self.iterations,
             "total_energy_hartree": self.total_energy,
+            "internal_energy_hartree": (
+                self.total_energy if self.internal_energy is None else self.internal_energy
+            ),
             "electron_count": self.electron_count,
+            "chemical_potential_hartree": self.chemical_potential,
+            "electronic_entropy": self.electronic_entropy,
+            "smearing_width_hartree": self.smearing_width_hartree,
             "density_residual": self.density_residual,
             "energy_delta_hartree": self.energy_delta,
             "kpoints": [result.to_dict() for result in self.kpoints],

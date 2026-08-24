@@ -26,3 +26,12 @@ installed, imported, or executed by the MLX runtime or routine CI.
 These rows prove the listed fixed workloads. They do not establish metallic or
 spin-polarized chemistry, broad pseudopotential transferability, cell
 relaxation, or universal periodic DFT accuracy.
+
+The periodic runtime now has a numerically validated Fermi-Dirac occupation and
+free-energy path, including weighted k-points, odd electron counts, checkpoints,
+and analytic-force occupation propagation. A bounded four-atom fcc Aluminum
+smoke test uses the CP2K `Al GTH-PBE-q3` parameters to exercise a real metallic
+band manifold. It is an execution test, not an accuracy row. The repository
+does not yet contain a source-bound metal energy reference that matches the
+local GTH pseudopotential and Fermi-Dirac protocol. Capability and material
+accuracy remain separate claims.

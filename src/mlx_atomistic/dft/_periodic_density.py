@@ -71,7 +71,7 @@ class _PeriodicDensityBuilder:
     """Build one density while preserving deterministic compact-batch order."""
 
     results: tuple[PeriodicKPointResult, ...]
-    occupation: float
+    occupation: float | None
     policy: _CompactBatchPolicy
     observer: RuntimeObserver | None
     grid_shape: tuple[int, int, int]
@@ -84,7 +84,7 @@ class _PeriodicDensityBuilder:
         cls,
         results: Sequence[PeriodicKPointResult],
         *,
-        occupation: float,
+        occupation: float | None,
         policy: _CompactBatchPolicy,
         observer: RuntimeObserver | None,
         orbital_densities: Sequence[mx.array] | None,
@@ -96,6 +96,12 @@ class _PeriodicDensityBuilder:
             count=len(owned_results),
             grid_shape=grid_shape,
         )
+        cls._validate_occupations(
+            owned_results,
+            states,
+            occupation=occupation,
+            orbital_densities=cached_densities,
+        )
         return cls(
             results=owned_results,
             occupation=occupation,
@@ -106,6 +112,33 @@ class _PeriodicDensityBuilder:
             orbital_densities=cached_densities,
             density=mx.zeros(grid_shape, dtype=mx.float32),
         )
+
+    @staticmethod
+    def _validate_occupations(
+        results: Sequence[PeriodicKPointResult],
+        states: Sequence[_CompactLaneState],
+        *,
+        occupation: float | None,
+        orbital_densities: Sequence[mx.array] | None,
+    ) -> None:
+        if occupation is not None:
+            value = float(occupation)
+            if not np.isfinite(value) or not 0.0 <= value <= 2.0:
+                msg = "uniform periodic occupation must be finite and lie in [0, 2]"
+                raise ValueError(msg)
+            return
+        if orbital_densities is not None:
+            msg = "cached orbital-density sums require one uniform occupation"
+            raise ValueError(msg)
+        for result, state in zip(results, states, strict=True):
+            values = result.occupations
+            if values is None or len(values) != state.vector_count:
+                msg = "resolved occupations must match every k-point band count"
+                raise ValueError(msg)
+            array = np.asarray(values, dtype=np.float64)
+            if not np.all(np.isfinite(array)) or np.any(array < 0.0) or np.any(array > 2.0):
+                msg = "resolved periodic occupations must be finite and lie in [0, 2]"
+                raise ValueError(msg)
 
     @staticmethod
     def _validated_orbital_densities(
@@ -190,12 +223,23 @@ class _PeriodicDensityBuilder:
         if estimated_transient_bytes > self.policy.max_transient_bytes:
             msg = "density batch exceeds the complete transient byte budget"
             raise ValueError(msg)
-        weights = self._padded_weights(indices, batch.lane_capacity)
-        orbitals = batch.to_real()
-        weighted_density = weights[:, None, None, None] * mx.sum(
-            mx.abs(orbitals) ** 2,
-            axis=1,
+        weights = self._padded_weights(
+            indices,
+            batch.lane_capacity,
+            vector_capacity=batch.vector_count,
         )
+        orbitals = batch.to_real()
+        orbital_density = mx.abs(orbitals) ** 2
+        if self.occupation is None:
+            weighted_density = mx.sum(
+                weights[:, :, None, None, None] * orbital_density,
+                axis=1,
+            )
+        else:
+            weighted_density = weights[:, None, None, None] * mx.sum(
+                orbital_density,
+                axis=1,
+            )
         self.density = self.density + mx.sum(weighted_density, axis=0)
         mx.eval(self.density)
         self._record_submission(batch, estimated_transient_bytes)
@@ -239,7 +283,28 @@ class _PeriodicDensityBuilder:
                 ),
             )
 
-    def _padded_weights(self, indices: tuple[int, ...], lane_capacity: int) -> mx.array:
+    def _padded_weights(
+        self,
+        indices: tuple[int, ...],
+        lane_capacity: int,
+        *,
+        vector_capacity: int | None = None,
+    ) -> mx.array:
+        if self.occupation is None:
+            if vector_capacity is None:
+                msg = "band-resolved density weights require a vector capacity"
+                raise RuntimeError(msg)
+            weights = np.zeros((lane_capacity, vector_capacity), dtype=np.float32)
+            for lane, index in enumerate(indices):
+                occupations = self.results[index].occupations
+                if occupations is None:
+                    msg = "resolved periodic occupations are unavailable"
+                    raise RuntimeError(msg)
+                weights[lane, : len(occupations)] = (
+                    self.results[index].integration_weight
+                    * np.asarray(occupations, dtype=np.float32)
+                )
+            return mx.array(weights)
         weights = mx.array(
             np.asarray(
                 [self.results[index].integration_weight * self.occupation for index in indices],
@@ -279,7 +344,7 @@ class _PeriodicDensityBuilder:
 def _density_from_kpoints(
     results: Sequence[PeriodicKPointResult],
     *,
-    occupation: float,
+    occupation: float | None = None,
     policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
     observer: RuntimeObserver | None = None,
     orbital_densities: Sequence[mx.array] | None = None,
