@@ -24,6 +24,7 @@ from mlx_atomistic.metal_kernels import (
     _interaction32_outer_inner_mode_scatter_sized,
     _interaction32_pme_direct_force_only,
     _interaction32_special_blocks_sized,
+    _interaction32_special_pair_words,
     _interaction32_special_work_two_halves,
     _Interaction32ForceStages,
     _neighbor_tile_force_groups_sized,
@@ -563,6 +564,7 @@ class _DeviceSpecialBlockInventory32:
     one_four_pairs: mx.array
     block_codes: mx.array
     block_code_unique: mx.array
+    special_pair_words: mx.array
     special_count: mx.array
     topology_offsets: mx.array
     topology_neighbors: mx.array
@@ -977,6 +979,11 @@ def _build_device_special_block_inventory32(
             (block_codes[1:] != block_codes[:-1]).astype(mx.int32),
         )
     )
+    special_pair_words = _interaction32_special_pair_words(
+        block_codes,
+        block_code_unique,
+        block_count=block_count,
+    )
     special_count = mx.sum(block_code_unique).astype(mx.int32)
     return _DeviceSpecialBlockInventory32(
         atom_count=atom_count,
@@ -985,6 +992,7 @@ def _build_device_special_block_inventory32(
         one_four_pairs=one_four_pairs,
         block_codes=block_codes,
         block_code_unique=block_code_unique,
+        special_pair_words=special_pair_words,
         special_count=special_count,
         topology_offsets=topology.topology_offsets,
         topology_neighbors=topology.topology_neighbors,
@@ -1020,7 +1028,7 @@ def _count_device_schedule_inventory32(
         geometry.center_radius,
         geometry.half_extent,
         geometry.block_traversal,
-        special.block_codes,
+        special.special_pair_words,
         box_lengths_and_inverses,
         search_radius=geometry.search_radius,
         retain_modes=0 < mode_cache_bytes <= _mode_cache_limit_bytes,
@@ -1101,7 +1109,7 @@ def _materialize_device_ordinary_schedule32(
             geometry.center_radius,
             geometry.half_extent,
             geometry.block_traversal,
-            inventory.special.block_codes,
+            inventory.special.special_pair_words,
             inventory.mode_words,
             inventory.mode_tile_counts,
             inventory.mode_tile_prefix,
@@ -1495,6 +1503,7 @@ def _try_build_device_fused_half_schedule32(
         special.one_four_pairs,
         special.block_codes,
         special.block_code_unique,
+        special.special_pair_words,
         special.special_count,
         special.topology_offsets,
         special.topology_neighbors,

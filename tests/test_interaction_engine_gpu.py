@@ -296,6 +296,7 @@ def test_device_special_block_inventory_matches_host_oracle():
         geometry.inverse_order,
         inventory.block_codes,
         inventory.block_code_unique,
+        inventory.special_pair_words,
         inventory.special_count,
     )
 
@@ -307,6 +308,10 @@ def test_device_special_block_inventory_matches_host_oracle():
     )
     observed = np.unique(np.asarray(inventory.block_codes)).astype(np.int64)
     np.testing.assert_array_equal(observed, expected)
+    words = np.asarray(inventory.special_pair_words, dtype=np.uint32)
+    all_codes = np.arange(geometry.block_count**2, dtype=np.uint32)
+    present = ((words[all_codes >> 5] >> (all_codes & 31)) & 1).astype(bool)
+    np.testing.assert_array_equal(np.flatnonzero(present), expected)
     assert int(np.asarray(inventory.special_count)) == expected.shape[0]
 
 

@@ -457,6 +457,7 @@ _interaction32_ordinary_scatter_kernel_singleton = None
 _interaction32_ordinary_cached_scatter_kernel_singleton = None
 _interaction32_outer_inner_mode_count_kernel_singleton = None
 _interaction32_outer_inner_mode_scatter_kernel_singleton = None
+_interaction32_special_pair_words_kernel_singleton = None
 _interaction32_special_block_scatter_kernel_singleton = None
 _interaction32_special_work_kernel_singleton = None
 _owner_compute32_force_kernel_singleton = None
@@ -1538,7 +1539,6 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
     uint lane = thread_position_in_threadgroup.x;
     uint traversal_index = threadgroup_position_in_grid.x;
     uint block_count = (uint)counts[0];
-    uint special_code_count = (uint)counts[1];
     if (traversal_index >= block_count) {
         return;
     }
@@ -1580,18 +1580,10 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
         int block_code = (int)(low_block * block_count + high_block);
         bool include_lane = false;
         if (lane == 0u) {
-            uint low = 0u;
-            uint high = special_code_count;
-            while (low < high) {
-                uint middle = low + (high - low) / 2u;
-                if (special_codes[middle] < block_code) {
-                    low = middle + 1u;
-                } else {
-                    high = middle;
-                }
-            }
-            bool special = low < special_code_count
-                && special_codes[low] == block_code;
+            uint special_word = special_pair_words[(uint)block_code >> 5u];
+            bool special = (
+                (special_word >> ((uint)block_code & 31u)) & 1u
+            ) != 0u;
             if (!special) {
                 include_lane = mlx_atomistic_interaction32_blocks_may_interact(
                     left_block,
@@ -1606,11 +1598,6 @@ _INTERACTION32_ORDINARY_COUNT_SOURCE = r"""
         }
         bool include = simd_broadcast(include_lane, 0u);
         if (!include) {
-#ifdef MLX_ATOMISTIC_INTERACTION32_RETAIN_MODES
-            if (lane == 0u || lane == 16u) {
-                mode_words[2u * pair_index + (lane >> 4u)] = 0u;
-            }
-#endif
             continue;
         }
         int right_ordered = 32 * (int)right_block + (int)lane;
@@ -1719,7 +1706,6 @@ _INTERACTION32_ORDINARY_SCATTER_SOURCE = r"""
     uint lane = thread_position_in_threadgroup.x;
     uint traversal_index = threadgroup_position_in_grid.x;
     uint block_count = (uint)counts[0];
-    uint special_code_count = (uint)counts[1];
     if (traversal_index >= block_count) {
         return;
     }
@@ -1768,18 +1754,10 @@ _INTERACTION32_ORDINARY_SCATTER_SOURCE = r"""
         int block_code = (int)(low_block * block_count + high_block);
         bool include_lane = false;
         if (lane == 0u) {
-            uint low = 0u;
-            uint high = special_code_count;
-            while (low < high) {
-                uint middle = low + (high - low) / 2u;
-                if (special_codes[middle] < block_code) {
-                    low = middle + 1u;
-                } else {
-                    high = middle;
-                }
-            }
-            bool special = low < special_code_count
-                && special_codes[low] == block_code;
+            uint special_word = special_pair_words[(uint)block_code >> 5u];
+            bool special = (
+                (special_word >> ((uint)block_code & 31u)) & 1u
+            ) != 0u;
             if (!special) {
                 include_lane = mlx_atomistic_interaction32_blocks_may_interact(
                     left_block,
@@ -1960,6 +1938,19 @@ _INTERACTION32_OUTER_INNER_MODE_SCATTER_SOURCE = r"""
             seen3 += count3;
         }
     }
+"""
+
+_INTERACTION32_SPECIAL_PAIR_WORDS_SOURCE = r"""
+    uint index = thread_position_in_grid.x;
+    if (index >= (uint)counts[0] || special_unique[index] == 0) {
+        return;
+    }
+    uint code = (uint)special_codes[index];
+    atomic_fetch_or_explicit(
+        &special_pair_words[code >> 5u],
+        1u << (code & 31u),
+        memory_order_relaxed
+    );
 """
 
 _INTERACTION32_SPECIAL_BLOCK_SCATTER_SOURCE = r"""
@@ -4769,7 +4760,7 @@ def _interaction32_ordinary_count_kernel():
                 "center_radius",
                 "half_extent",
                 "block_traversal",
-                "special_codes",
+                "special_pair_words",
                 "box",
                 "params",
                 "counts",
@@ -4794,7 +4785,7 @@ def _interaction32_ordinary_cached_count_kernel():
                 "center_radius",
                 "half_extent",
                 "block_traversal",
-                "special_codes",
+                "special_pair_words",
                 "box",
                 "params",
                 "counts",
@@ -4822,7 +4813,7 @@ def _interaction32_ordinary_scatter_kernel():
                 "center_radius",
                 "half_extent",
                 "block_traversal",
-                "special_codes",
+                "special_pair_words",
                 "mode_tile_counts",
                 "mode_tile_prefix",
                 "box",
@@ -4915,6 +4906,21 @@ def _interaction32_outer_inner_mode_scatter_kernel():
             source=_INTERACTION32_OUTER_INNER_MODE_SCATTER_SOURCE,
         )
     return _interaction32_outer_inner_mode_scatter_kernel_singleton
+
+
+def _interaction32_special_pair_words_kernel():
+    """Return the atomic special-block bitset Metal kernel."""
+
+    global _interaction32_special_pair_words_kernel_singleton
+    if _interaction32_special_pair_words_kernel_singleton is None:
+        _interaction32_special_pair_words_kernel_singleton = mx.fast.metal_kernel(
+            name="interaction32_special_pair_words",
+            input_names=["special_codes", "special_unique", "counts"],
+            output_names=["special_pair_words"],
+            source=_INTERACTION32_SPECIAL_PAIR_WORDS_SOURCE,
+            atomic_outputs=True,
+        )
+    return _interaction32_special_pair_words_kernel_singleton
 
 
 def _interaction32_special_block_scatter_kernel():
@@ -8687,7 +8693,7 @@ def _interaction32_ordinary_mode_counts(
     center_radius: mx.array,
     half_extent: mx.array,
     block_traversal: mx.array,
-    special_codes: mx.array,
+    special_pair_words: mx.array,
     box_lengths_and_inverses: mx.array,
     *,
     search_radius: float,
@@ -8700,7 +8706,7 @@ def _interaction32_ordinary_mode_counts(
     center_radius = as_mx_array(center_radius, dtype=mx.float32)
     half_extent = as_mx_array(half_extent, dtype=mx.float32)
     block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
-    special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    special_pair_words = as_mx_array(special_pair_words, dtype=mx.uint32)
     box = as_mx_array(box_lengths_and_inverses, dtype=mx.float32)
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ValueError("positions must have shape (n_atoms, 3)")
@@ -8713,8 +8719,9 @@ def _interaction32_ordinary_mode_counts(
         raise ValueError("half_extent must have shape (n_blocks, 3)")
     if block_traversal.shape != (block_count,):
         raise ValueError("block_traversal must have shape (n_blocks,)")
-    if special_codes.ndim != 1 or special_codes.shape[0] < block_count:
-        raise ValueError("special_codes must contain sorted diagonal block codes")
+    special_word_shape = ((block_count * block_count + 31) // 32,)
+    if special_pair_words.shape != special_word_shape:
+        raise ValueError("special_pair_words must cover the dense block-code space")
     if box.shape != (6,):
         raise ValueError("box_lengths_and_inverses must have shape (6,)")
     if not isfinite(float(search_radius)) or search_radius <= 0.0:
@@ -8727,10 +8734,10 @@ def _interaction32_ordinary_mode_counts(
         center_radius,
         half_extent,
         block_traversal,
-        special_codes,
+        special_pair_words,
         box,
         mx.array([radius, radius * radius], dtype=mx.float32),
-        mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
+        mx.array([block_count], dtype=mx.int32),
     ]
     if retain_modes:
         mode_counts, mode_words = _interaction32_ordinary_cached_count_kernel()(
@@ -8759,7 +8766,7 @@ def _interaction32_ordinary_scatter_sized(
     center_radius: mx.array,
     half_extent: mx.array,
     block_traversal: mx.array,
-    special_codes: mx.array,
+    special_pair_words: mx.array,
     mode_words: mx.array | None,
     mode_tile_counts: mx.array,
     mode_tile_prefix: mx.array,
@@ -8775,7 +8782,7 @@ def _interaction32_ordinary_scatter_sized(
     center_radius = as_mx_array(center_radius, dtype=mx.float32)
     half_extent = as_mx_array(half_extent, dtype=mx.float32)
     block_traversal = as_mx_array(block_traversal, dtype=mx.int32)
-    special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    special_pair_words = as_mx_array(special_pair_words, dtype=mx.uint32)
     if mode_words is not None:
         mode_words = as_mx_array(mode_words, dtype=mx.uint32)
     mode_tile_counts = as_mx_array(mode_tile_counts, dtype=mx.int32)
@@ -8796,8 +8803,9 @@ def _interaction32_ordinary_scatter_sized(
         raise ValueError("half_extent must have shape (n_blocks, 3)")
     if block_traversal.shape != (block_count,):
         raise ValueError("block_traversal must have shape (n_blocks,)")
-    if special_codes.ndim != 1 or special_codes.shape[0] < block_count:
-        raise ValueError("special_codes must contain sorted diagonal block codes")
+    special_word_shape = ((block_count * block_count + 31) // 32,)
+    if special_pair_words.shape != special_word_shape:
+        raise ValueError("special_pair_words must cover the dense block-code space")
     if mode_words is not None and mode_words.shape != (2 * block_pair_count,):
         raise ValueError("mode_words must store two packed words per block pair")
     if box.shape != (6,):
@@ -8839,12 +8847,12 @@ def _interaction32_ordinary_scatter_sized(
             center_radius,
             half_extent,
             block_traversal,
-            special_codes,
+            special_pair_words,
             mode_tile_counts,
             mode_tile_prefix,
             box,
             mx.array([radius, radius * radius], dtype=mx.float32),
-            mx.array([block_count, int(special_codes.shape[0])], dtype=mx.int32),
+            mx.array([block_count], dtype=mx.int32),
         ],
         output_shapes=[
             (accepted_tile_count,),
@@ -8984,6 +8992,39 @@ def _interaction32_outer_inner_mode_scatter_sized(
         threadgroup=(32, 1, 1),
         init_value=int(atom_order.shape[0]),
     )
+
+
+def _interaction32_special_pair_words(
+    special_codes: mx.array,
+    special_unique: mx.array,
+    *,
+    block_count: int,
+) -> mx.array:
+    """Pack special block codes into a constant-time membership bitset."""
+
+    special_codes = as_mx_array(special_codes, dtype=mx.int32)
+    special_unique = as_mx_array(special_unique, dtype=mx.int32)
+    if special_codes.ndim != 1 or special_unique.shape != special_codes.shape:
+        raise ValueError("special codes and unique flags must be matching vectors")
+    if block_count <= 0:
+        raise ValueError("block_count must be positive")
+    code_count = int(special_codes.shape[0])
+    word_count = (block_count * block_count + 31) // 32
+    if code_count == 0:
+        return mx.zeros((word_count,), dtype=mx.uint32)
+    (words,) = _interaction32_special_pair_words_kernel()(
+        inputs=[
+            special_codes,
+            special_unique,
+            mx.array([code_count], dtype=mx.int32),
+        ],
+        output_shapes=[(word_count,)],
+        output_dtypes=[mx.uint32],
+        grid=(code_count, 1, 1),
+        threadgroup=(min(256, code_count), 1, 1),
+        init_value=0,
+    )
+    return words
 
 
 def _interaction32_special_blocks_sized(

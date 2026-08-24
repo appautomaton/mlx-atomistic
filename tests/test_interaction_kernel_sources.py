@@ -35,3 +35,31 @@ def test_fused_half_kernels_enable_inline_active_right_compaction(monkeypatch):
     assert all("simd_prefix_exclusive_sum(right_active)" in call["source"] for call in calls)
     assert "#define MLX_ATOMISTIC_NBFIX 1\n" not in calls[0]["source"]
     assert "#define MLX_ATOMISTIC_NBFIX 1\n" in calls[1]["source"]
+
+
+def test_ordinary_builder_kernels_use_constant_time_special_membership(monkeypatch):
+    """Count and fallback scatter share the generation-owned special bitset."""
+
+    calls = []
+
+    def fake_metal_kernel(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(kernels.mx.fast, "metal_kernel", fake_metal_kernel)
+    for name in (
+        "_interaction32_ordinary_count_kernel_singleton",
+        "_interaction32_ordinary_cached_count_kernel_singleton",
+        "_interaction32_ordinary_scatter_kernel_singleton",
+    ):
+        monkeypatch.setattr(kernels, name, None)
+
+    kernels._interaction32_ordinary_count_kernel()
+    kernels._interaction32_ordinary_cached_count_kernel()
+    kernels._interaction32_ordinary_scatter_kernel()
+
+    assert len(calls) == 3
+    assert all("special_pair_words" in call["input_names"] for call in calls)
+    assert all("special_word >>" in call["source"] for call in calls)
+    assert all("while (low < high)" not in call["source"] for call in calls)
+    assert "lane == 0u || lane == 16u" not in calls[1]["source"]
