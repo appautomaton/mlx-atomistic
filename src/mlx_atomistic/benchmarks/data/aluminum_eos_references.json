@@ -1,0 +1,90 @@
+{
+  "schema_version": "mlx-atomistic.aluminum-eos-references.v1",
+  "material": {
+    "cell": "fcc-aluminum",
+    "functional": "PBE",
+    "spin": "unpolarized"
+  },
+  "protocol": {
+    "central_conventional_lattice_angstrom": 4.040422065345,
+    "volume_factors": [
+      0.94,
+      0.96,
+      0.98,
+      1.0,
+      1.02,
+      1.04,
+      1.06
+    ],
+    "reference_method": "ACWF verification-PBE-v1",
+    "local_method": "Fermi-Dirac Helmholtz free energy",
+    "smearing_width_hartree": 0.00225,
+    "maximum_kpoint_spacing_inverse_angstrom": 0.06,
+    "method_difference": "The primary target is the all-electron EOS fit. The CP2K context uses the same GTH-PBE-q3 pseudopotential family with a TZV2P Gaussian orbital basis and a GPW integration grid; the local calculation uses a separately converged plane-wave basis and Gamma-centered weighted mesh. Absolute energies and unlike numeric cutoffs are not compared."
+  },
+  "sources": {
+    "archive": {
+      "record": "yf0rj-w3r97",
+      "url": "https://archive.materialscloud.org/records/yf0rj-w3r97",
+      "doi": "10.24435/materialscloud:s4-3h",
+      "file": "ACWF-verification-data-and-scripts.zip",
+      "md5": "6bd97a883b439507d0be4638c1bc7514"
+    },
+    "structure": {
+      "file": "Al-FCC.xsf",
+      "sha256": "c4446a6d46475e4cca8067169330284c17c031b97477010b2a433bbf85be25ac"
+    },
+    "all_electron_file": {
+      "file": "results-unaries-verification-PBE-v1-AE-average.json",
+      "sha256": "d7844caa127eae860fe5087ead42f80d1b6b5eb952a686ff4b912ddaed7db48b"
+    },
+    "cp2k_file": {
+      "file": "results-unaries-verification-PBE-v1-cp2k_TZV2P.json",
+      "sha256": "3a787c7197cc50e003b38494c4b489b72eeb553e8ca0da3a4505ed08f96e9b6e"
+    },
+    "protocol_reconstruction": {
+      "repository": "https://github.com/aiidateam/aiida-common-workflows",
+      "release": "v1.0.1",
+      "commit": "c08c3f2f7babcb78c7b0a1ddaa28f2fb1d0d8d39"
+    }
+  },
+  "references": {
+    "all_electron_average": {
+      "role": "primary",
+      "source": "Materials Cloud ACWF curated FLEUR/WIEN2k average",
+      "primitive_cell_atoms": 1,
+      "fit": {
+        "equilibrium_volume_angstrom3": 16.49535905981626,
+        "bulk_modulus_ev_angstrom3": 0.4837908557795412,
+        "bulk_derivative": 4.623179033235038
+      }
+    },
+    "cp2k_gth": {
+      "role": "same-pseudopotential-family",
+      "source": "Materials Cloud ACWF CP2K Quickstep TZV2P/GTH",
+      "primitive_cell_atoms": 1,
+      "fit": {
+        "equilibrium_volume_angstrom3": 16.437017660642258,
+        "bulk_modulus_ev_angstrom3": 0.48951774655729935,
+        "bulk_derivative": 4.514335571200874
+      },
+      "eos_volume_energy_ev": [
+        [15.500584138516746, -56.403618325988],
+        [15.830383801037938, -56.412287842685],
+        [16.160183463560365, -56.416984850579],
+        [16.48998312608165, -56.418121909537],
+        [16.81978278860265, -56.4160706297],
+        [17.149582451124544, -56.411166430269],
+        [17.479382113646345, -56.403712807909]
+      ]
+    }
+  },
+  "local_pseudopotential": {
+    "name": "Al GTH-PBE-q3",
+    "extracted_entry_sha256": "06adc20c53ad6ff2eb7e1111c4b2437bd70ad520cdd6e5735dbb9cd09c1d381d"
+  },
+  "license": {
+    "identifier": "CC-BY-4.0",
+    "attribution": "Bosoni et al., How to verify the precision of density-functional-theory implementations via reproducible and universal workflows, Nature Reviews Physics 6, 45-58 (2024)."
+  }
+}

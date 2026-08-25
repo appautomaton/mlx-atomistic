@@ -1,4 +1,4 @@
-"""Scientific equation-of-state validation for rock-salt magnesium oxide."""
+"""Scientific equation-of-state validation for periodic fcc Aluminum."""
 
 from __future__ import annotations
 
@@ -20,24 +20,24 @@ from mlx_atomistic.benchmarks.dft_eos import (
     reference_fit,
 )
 
-REFERENCE_SCHEMA = "mlx-atomistic.mgo-eos-references.v1"
-REFERENCE_SHA256 = "ad4e262690181b6f009e5683eadb8402ee47c73acee32ca96873c95cf1c3e5ea"
-EOS_REPORT_SCHEMA = "mlx-atomistic.mgo-eos-report.v1"
+REFERENCE_SCHEMA = "mlx-atomistic.aluminum-eos-references.v1"
+REFERENCE_SHA256 = "eebfe487557fcff52b1934ced8924844c307e0cfe30c739987e36734890a6788"
+EOS_REPORT_SCHEMA = "mlx-atomistic.aluminum-eos-report.v1"
 
 
 def _reference_path() -> Path:
-    return Path(__file__).with_name("data") / "mgo_eos_references.json"
+    return Path(__file__).with_name("data") / "aluminum_eos_references.json"
 
 
-def load_mgo_eos_references() -> dict[str, Any]:
-    """Load the pinned, source-attributed rock-salt MgO reference bundle."""
+def load_aluminum_eos_references() -> dict[str, Any]:
+    """Load the pinned, source-attributed fcc Aluminum reference bundle."""
 
     return load_eos_reference_bundle(
         _reference_path(),
         expected_sha256=REFERENCE_SHA256,
         expected_schema=REFERENCE_SCHEMA,
         expected_material={
-            "cell": "rocksalt-mgo",
+            "cell": "fcc-aluminum",
             "functional": "PBE",
             "spin": "unpolarized",
         },
@@ -49,21 +49,21 @@ def validation_lattice_constants(
 ) -> list[float]:
     """Return the seven conventional-cell lattice constants for validation."""
 
-    payload = load_mgo_eos_references() if references is None else references
+    payload = load_aluminum_eos_references() if references is None else references
     return cubic_validation_lattice_constants(payload)
 
 
-def fit_cubic_mgo_eos(
+def fit_cubic_aluminum_eos(
     lattice_constants_angstrom: Sequence[float],
-    total_energies_hartree: Sequence[float],
+    free_energies_hartree: Sequence[float],
     *,
-    atom_count: int = 8,
+    atom_count: int = 4,
 ) -> dict[str, Any]:
-    """Fit a conventional cubic-cell rock-salt MgO EOS."""
+    """Fit a conventional cubic-cell Aluminum EOS from free energies."""
 
     return fit_cubic_eos(
         lattice_constants_angstrom,
-        total_energies_hartree,
+        free_energies_hartree,
         atom_count=atom_count,
     )
 
@@ -79,8 +79,8 @@ __all__ = [
     "compare_fit_to_reference",
     "delta_factor_mev_per_atom",
     "fit_birch_murnaghan",
-    "fit_cubic_mgo_eos",
-    "load_mgo_eos_references",
+    "fit_cubic_aluminum_eos",
+    "load_aluminum_eos_references",
     "reference_fit",
     "validation_lattice_constants",
 ]

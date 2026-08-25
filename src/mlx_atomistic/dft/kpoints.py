@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from itertools import permutations, product
 from typing import Any
 
 import mlx.core as mx
@@ -677,6 +678,212 @@ class MonkhorstPackGrid(KPointMesh):
             points.append(KPoint(vector, weight=1.0 / total, coordinate_system="reduced"))
         KPointMesh.__init__(self, points)
         object.__setattr__(self, "size", parsed)
+
+
+@dataclass(frozen=True)
+class GammaCenteredGrid(KPointMesh):
+    """Regular reduced-coordinate mesh that includes the Γ point.
+
+    Args:
+        size: Number of points along each reciprocal lattice vector.
+    """
+
+    size: tuple[int, int, int] = (1, 1, 1)
+
+    def __init__(self, size: Sequence[int]):
+        parsed = tuple(int(value) for value in size)
+        if len(parsed) != 3 or any(value <= 0 for value in parsed):
+            msg = "GammaCenteredGrid size must contain three positive integers"
+            raise ValueError(msg)
+        points = []
+        total = int(np.prod(parsed))
+        for indices in np.ndindex(parsed):
+            vector = tuple(
+                (index if index <= count // 2 else index - count) / count
+                for index, count in zip(indices, parsed, strict=True)
+            )
+            points.append(KPoint(vector, weight=1.0 / total, coordinate_system="reduced"))
+        KPointMesh.__init__(self, points)
+        object.__setattr__(self, "size", parsed)
+
+
+def cubic_reciprocal_symmetry_operations() -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Return the 48 signed axis permutations of the full cubic point group.
+
+    Returns:
+        Integer reciprocal-coordinate operations, including inversion.
+    """
+
+    operations = []
+    for axes in permutations(range(3)):
+        for signs in product((-1, 1), repeat=3):
+            operation = np.zeros((3, 3), dtype=np.int64)
+            for row, column in enumerate(axes):
+                operation[row, column] = signs[row]
+            operations.append(tuple(tuple(int(value) for value in row) for row in operation))
+    return tuple(operations)
+
+
+def _reduced_coordinate_key(
+    vector: Sequence[float] | np.ndarray,
+    *,
+    atol: float,
+) -> tuple[int, int, int]:
+    wrapped = np.remainder(np.asarray(vector, dtype=np.float64), 1.0)
+    wrapped[np.abs(wrapped - 1.0) <= atol] = 0.0
+    return tuple(int(value) for value in np.rint(wrapped / atol))
+
+
+def _validated_reciprocal_operations(
+    operations: Sequence[Sequence[Sequence[int | float]]],
+    *,
+    atol: float,
+) -> tuple[np.ndarray, ...]:
+    if not operations:
+        raise ValueError("reciprocal symmetry reduction requires at least one operation")
+    validated: list[np.ndarray] = []
+    seen: set[tuple[int, ...]] = set()
+    for index, operation in enumerate(operations):
+        values = np.asarray(operation, dtype=np.float64)
+        if values.shape != (3, 3) or not np.isfinite(values).all():
+            msg = f"reciprocal symmetry operation {index} must be a finite 3 x 3 matrix"
+            raise ValueError(msg)
+        rounded = np.rint(values)
+        if not np.allclose(values, rounded, rtol=0.0, atol=atol):
+            msg = f"reciprocal symmetry operation {index} must contain integers"
+            raise ValueError(msg)
+        integer = rounded.astype(np.int64)
+        determinant = int(round(float(np.linalg.det(integer))))
+        if abs(determinant) != 1:
+            msg = f"reciprocal symmetry operation {index} must be unimodular"
+            raise ValueError(msg)
+        key = tuple(int(value) for value in integer.flat)
+        if key not in seen:
+            seen.add(key)
+            validated.append(integer)
+    return tuple(validated)
+
+
+def _reduced_mesh_lookup(
+    vectors: Sequence[Sequence[float]],
+    *,
+    atol: float,
+) -> dict[tuple[int, int, int], int]:
+    lookup: dict[tuple[int, int, int], int] = {}
+    for index, vector in enumerate(vectors):
+        key = _reduced_coordinate_key(vector, atol=atol)
+        if key in lookup:
+            msg = (
+                "ambiguous duplicate k-points modulo the reciprocal lattice: "
+                f"{lookup[key]} and {index}"
+            )
+            raise ValueError(msg)
+        lookup[key] = index
+    return lookup
+
+
+def _reciprocal_symmetry_orbit(
+    representative: int,
+    vectors: Sequence[Sequence[float]],
+    lookup: Mapping[tuple[int, int, int], int],
+    symmetry: Sequence[np.ndarray],
+    *,
+    atol: float,
+) -> set[int]:
+    orbit = {representative}
+    pending = [representative]
+    while pending:
+        current = pending.pop()
+        vector = np.asarray(vectors[current], dtype=np.float64)
+        for operation in symmetry:
+            transformed = operation @ vector
+            match = lookup.get(_reduced_coordinate_key(transformed, atol=atol))
+            if match is None:
+                msg = f"k-point mesh is not closed under reciprocal symmetry: point {current}"
+                raise ValueError(msg)
+            difference = transformed - np.asarray(vectors[match], dtype=np.float64)
+            difference -= np.rint(difference)
+            if float(np.max(np.abs(difference))) > atol:
+                raise ValueError("reciprocal symmetry coordinate match exceeded tolerance")
+            if match not in orbit:
+                orbit.add(match)
+                pending.append(match)
+    return orbit
+
+
+def reduce_kpoint_mesh_by_symmetry(
+    kpoint_mesh: KPointMesh,
+    operations: Sequence[Sequence[Sequence[int | float]]],
+    *,
+    coordinate_atol: float = 1.0e-10,
+    weight_rtol: float = 1.0e-12,
+    weight_atol: float = 1.0e-15,
+) -> KPointMesh:
+    """Aggregate a reduced-coordinate mesh into explicit symmetry orbits.
+
+    This function validates the mesh action but cannot prove that the supplied
+    operations are symmetries of a particular cell, ionic structure, or
+    Hamiltonian. Callers must establish that scientific precondition.
+
+    Args:
+        kpoint_mesh: Full weighted reduced-coordinate mesh.
+        operations: Integer unimodular matrices acting on reduced k-point
+            column vectors.
+        coordinate_atol: Absolute modulo-lattice matching tolerance.
+        weight_rtol: Relative tolerance for symmetry-related input weights.
+        weight_atol: Absolute tolerance for symmetry-related input weights.
+
+    Returns:
+        Deterministic representative points with orbit-aggregated weights.
+
+    Raises:
+        ValueError: If inputs are invalid, duplicated, not closed under the
+            operations, or have unequal weights inside an orbit.
+    """
+
+    if not np.isfinite(coordinate_atol) or coordinate_atol <= 0.0:
+        raise ValueError("coordinate_atol must be finite and positive")
+    if not np.isfinite(weight_rtol) or weight_rtol < 0.0:
+        raise ValueError("weight_rtol must be finite and non-negative")
+    if not np.isfinite(weight_atol) or weight_atol < 0.0:
+        raise ValueError("weight_atol must be finite and non-negative")
+    symmetry = _validated_reciprocal_operations(operations, atol=coordinate_atol)
+    vectors, weights = _validated_reduced_mesh(kpoint_mesh.points)
+    lookup = _reduced_mesh_lookup(vectors, atol=coordinate_atol)
+
+    remaining = set(range(len(vectors)))
+    reduced = []
+    while remaining:
+        representative = min(remaining)
+        orbit = _reciprocal_symmetry_orbit(
+            representative,
+            vectors,
+            lookup,
+            symmetry,
+            atol=coordinate_atol,
+        )
+        reference_weight = weights[representative]
+        if any(
+            not np.isclose(
+                weights[index],
+                reference_weight,
+                rtol=weight_rtol,
+                atol=weight_atol,
+            )
+            for index in orbit
+        ):
+            msg = "symmetry-related k-points must have equal input weights"
+            raise ValueError(msg)
+        reduced.append(
+            KPoint(
+                vectors[representative],
+                weight=sum(weights[index] for index in orbit),
+                label=kpoint_mesh.points[representative].label,
+                coordinate_system="reduced",
+            )
+        )
+        remaining.difference_update(orbit)
+    return KPointMesh(reduced)
 
 
 @dataclass(frozen=True)

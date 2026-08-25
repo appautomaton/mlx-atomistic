@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -14,9 +12,11 @@ from mlx_atomistic.benchmarks.dft_eos import (
     birch_murnaghan_energy,
     compare_eos_convergence,
     compare_fit_to_reference,
+    cubic_validation_lattice_constants,
     delta_factor_mev_per_atom,
     fit_birch_murnaghan,
     fit_cubic_eos,
+    load_eos_reference_bundle,
     reference_fit,
 )
 
@@ -32,29 +32,16 @@ def _reference_path() -> Path:
 def load_carbon_eos_references() -> dict[str, Any]:
     """Load the pinned, source-attributed diamond-carbon reference bundle."""
 
-    raw = _reference_path().read_bytes()
-    if hashlib.sha256(raw).hexdigest() != REFERENCE_SHA256:
-        raise ValueError("carbon EOS reference bundle hash mismatch")
-    payload = json.loads(raw)
-    if payload.get("schema_version") != REFERENCE_SCHEMA:
-        raise ValueError("unsupported carbon EOS reference schema")
-    if payload.get("material") != {
-        "cell": "diamond-carbon",
-        "functional": "PBE",
-        "spin": "unpolarized",
-    }:
-        raise ValueError("carbon EOS reference material identity mismatch")
-    if payload.get("protocol", {}).get("volume_factors") != [
-        0.94,
-        0.96,
-        0.98,
-        1.0,
-        1.02,
-        1.04,
-        1.06,
-    ]:
-        raise ValueError("carbon EOS reference volume protocol mismatch")
-    return payload
+    return load_eos_reference_bundle(
+        _reference_path(),
+        expected_sha256=REFERENCE_SHA256,
+        expected_schema=REFERENCE_SCHEMA,
+        expected_material={
+            "cell": "diamond-carbon",
+            "functional": "PBE",
+            "spin": "unpolarized",
+        },
+    )
 
 
 def validation_lattice_constants(
@@ -63,11 +50,7 @@ def validation_lattice_constants(
     """Return the seven conventional-cell lattice constants for validation."""
 
     payload = load_carbon_eos_references() if references is None else references
-    protocol = payload["protocol"]
-    center = float(protocol["central_conventional_lattice_angstrom"])
-    return [
-        center * float(volume_factor) ** (1.0 / 3.0) for volume_factor in protocol["volume_factors"]
-    ]
+    return cubic_validation_lattice_constants(payload)
 
 
 def fit_cubic_carbon_eos(

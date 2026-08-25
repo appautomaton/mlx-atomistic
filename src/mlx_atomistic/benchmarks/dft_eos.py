@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -29,6 +32,41 @@ CONVERGENCE_THRESHOLDS = {
     "bulk_modulus_relative": 0.03,
     "bulk_derivative_relative": 0.10,
 }
+DEFAULT_VOLUME_FACTORS = (0.94, 0.96, 0.98, 1.0, 1.02, 1.04, 1.06)
+
+
+def load_eos_reference_bundle(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    expected_schema: str,
+    expected_material: Mapping[str, str],
+    expected_volume_factors: Sequence[float] = DEFAULT_VOLUME_FACTORS,
+) -> dict[str, Any]:
+    """Load one hash-pinned material EOS reference bundle."""
+
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("EOS reference bundle hash mismatch")
+    payload = json.loads(raw)
+    if payload.get("schema_version") != expected_schema:
+        raise ValueError("unsupported EOS reference schema")
+    if payload.get("material") != dict(expected_material):
+        raise ValueError("EOS reference material identity mismatch")
+    if payload.get("protocol", {}).get("volume_factors") != list(expected_volume_factors):
+        raise ValueError("EOS reference volume protocol mismatch")
+    return payload
+
+
+def cubic_validation_lattice_constants(references: Mapping[str, Any]) -> list[float]:
+    """Return conventional cubic lattice constants from volume-scale factors."""
+
+    protocol = references["protocol"]
+    center = float(protocol["central_conventional_lattice_angstrom"])
+    return [
+        center * float(volume_factor) ** (1.0 / 3.0)
+        for volume_factor in protocol["volume_factors"]
+    ]
 
 
 def _relative_error(value: float, reference: float) -> float:
