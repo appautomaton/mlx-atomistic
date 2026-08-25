@@ -35,6 +35,7 @@ from mlx_atomistic.dft.grids import RealSpaceGrid, ReciprocalGrid
 from mlx_atomistic.dft.kpoints import (
     BandPath,
     BandStructureResult,
+    GammaCenteredGrid,
     KPoint,
     KPointMesh,
     MonkhorstPackGrid,
@@ -42,6 +43,8 @@ from mlx_atomistic.dft.kpoints import (
     TimeReversalOwnershipEntry,
     admit_time_reversal_bases,
     build_time_reversal_ownership,
+    cubic_reciprocal_symmetry_operations,
+    reduce_kpoint_mesh_by_symmetry,
     run_band_structure,
 )
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
@@ -175,6 +178,7 @@ __all__ = [
     "EigensolverConfig",
     "ExchangeCorrelationFunctional",
     "FermiDiracOccupations",
+    "GammaCenteredGrid",
     "FixedOccupations",
     "FoldedBandPath",
     "GeometryOptimizationConfig",
@@ -248,6 +252,7 @@ __all__ = [
     "center_center_energy",
     "center_center_forces",
     "build_time_reversal_ownership",
+    "cubic_reciprocal_symmetry_operations",
     "compare_reference_case",
     "density_from_orbitals",
     "dft_qm_scope_readiness_report",
@@ -287,6 +292,7 @@ __all__ = [
     "reciprocal_to_real",
     "read_gth",
     "read_upf",
+    "reduce_kpoint_mesh_by_symmetry",
     "run_band_structure",
     "run_periodic_band_structure",
     "run_periodic_scf",

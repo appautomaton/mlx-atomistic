@@ -10,10 +10,9 @@ reference engines remain validation surfaces.
 The retained periodic path provides PBE-PW92, reciprocal-space GTH operators,
 weighted k-points, block-Davidson eigensolves, fixed and Fermi-Dirac
 occupations, frozen-density bands, analytic fixed-cell forces, and atomic
-checkpoint/resume. Material-level verification remains narrow: Silicon and
-Carbon have accepted equation-of-state workloads, while MgO retains a declared
-force and transferability boundary. Metallic execution is covered, but a
-matched metallic accuracy reference is not yet closed.
+checkpoint/resume. Material-level verification remains narrow: Silicon,
+Carbon, and simple-metal Aluminum have accepted equation-of-state workloads,
+while MgO retains a declared force and transferability boundary.
 
 ## Program Boundary
 
@@ -33,7 +32,7 @@ only when its implementation and material-level evidence both pass.
 | Exchange-correlation | PBE-PW92 production envelope | Implemented; verified material set is narrow | Every material phase |
 | Pseudopotentials | Broad, fingerprinted GTH transferability | GTH periodic path exists; broad transferability is not closed | Phase 7 |
 | Crystal geometry | Ordinary full-rank periodic cells | DFT grids and Ewald path remain orthorhombic | Phase 3 |
-| Electronic states | Insulators, simple metals, and collinear magnets | Insulators verified; metals execute; periodic spin is absent | Phases 1 and 5 |
+| Electronic states | Insulators, simple metals, and collinear magnets | Insulators and one simple metal are verified; periodic spin is absent | Phases 1 and 5 |
 | Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
 | Mechanical observables | Analytic forces and validated stress | Forces exist with a retained MgO boundary; periodic stress is absent | Phase 4 |
 | Structural workflows | Fixed-cell ionic and variable-cell relaxation | Only the legacy teaching path relaxes ions | Phases 2 and 4 |
@@ -79,23 +78,26 @@ pseudopotential transferability expands across every phase
 
 ## Phase 1: Close Metallic Scientific Validation
 
-Status: active research; no product-code change starts before protocol lock.
+Status: complete. The source-bound Aluminum workload passes every locked gate.
 
-- Lock one Aluminum reference protocol with the same structure,
-  pseudopotential identity, Fermi-Dirac width, k-point mesh, cutoff, and
-  free-energy definition used locally.
+- Lock one Aluminum reference protocol with the same structure, functional,
+  pseudopotential identity, Fermi-Dirac width, and free-energy definition used
+  locally. Converge the representation-specific basis and k-point integration
+  rather than equating unlike CP2K Gaussian-grid and local plane-wave cutoffs.
 - Retain source fingerprints and parsed inputs so the comparison is
   reproducible without placing a reference engine on the MLX runtime path.
 - Validate electron count, chemical potential, occupations, free energy, and
   at least one material observable such as an equation-of-state curve.
 
-Exit gate: a source-bound metallic report passes declared numerical and
-scientific thresholds. The current Aluminum smoke remains execution evidence
-until this gate closes.
+The bounded scientific contract and delivery plan are recorded in
+[DFT Metallic Validation](./dft-metallic-validation.md).
+
+Exit gate: closed. The accepted profile and current-verified measurements are
+recorded in the linked evidence summary. Phase 2 is the next active phase.
 
 ## Phase 2: Add Periodic Fixed-Cell Ionic Relaxation
 
-Status: planned after Phase 1 scientific closure.
+Status: next; protocol research and specification are not yet locked.
 
 - Add a periodic optimizer that consumes converged analytic forces.
 - Reuse SCF density and compact eigenspaces between accepted ionic steps.

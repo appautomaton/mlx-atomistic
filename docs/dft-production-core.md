@@ -95,7 +95,7 @@ boundary.
 
 | Feature | Local Status | Reference Family |
 | --- | --- | --- |
-| Plane-wave SCF core | verified for fixed-occupation bulk-Si EOS; Fermi-Dirac path numerically validated | CP2K Quickstep, QE PWscf |
+| Plane-wave SCF core | verified for fixed-occupation bulk-Si EOS and one Fermi-Dirac fcc-Al EOS | CP2K Quickstep, QE PWscf |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
 | Geometry relaxation and finite-difference stress | proof-level | CP2K MOTION/GEO_OPT, QE relax |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
@@ -103,15 +103,11 @@ boundary.
 | PH/EPW/NEB/TDDFT/MPI/offload suite breadth | deferred | QE and CP2K production suites |
 | Importing, wrapping, building, or running CP2K/QE | anti-goal | external executables |
 
-Plane-wave SCF core is `verified` only for the bulk-silicon PBE equation of state
-against an all-electron (FLEUR/WIEN2k) reference (Lejaeghere Δ factor
-1.942 meV/atom); broader chemistry stays proof-level, and the separate
+Plane-wave SCF has source-bound equation-of-state validation for bulk Silicon
+and simple-metal fcc Aluminum. Aluminum uses a matching GTH family,
+Fermi-Dirac convention, converged weighted k-point mesh, and Helmholtz
+free-energy definition. Broader chemistry stays proof-level, and the separate
 MLX-versus-QE PWscf cross-engine parity is still diagnostic, not closed.
-Periodic Fermi-Dirac occupations remove the former fixed-occupation algorithmic
-blocker for metals and odd electron counts. They do not, by themselves,
-establish a material-level metallic accuracy claim; that requires a
-source-bound metal workload with matching pseudopotential, smearing convention,
-k-point mesh, and free-energy definition.
 
 `dft_qm_scope_readiness_report()` returns a shared readiness payload for these
 features. Deferred, anti-goal, and unknown features report blockers before any

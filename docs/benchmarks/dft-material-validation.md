@@ -14,6 +14,7 @@ calculation.
 | Diamond C, 8 atoms, PBE/GTH-q4, 40 Ha, 6×6×6, 7 volumes | `a₀ = 3.574441 Å`, `B₀ = 438.100 GPa`, Δ = `1.268 meV/atom` | All-electron PBE: lattice `0.075%` and bulk modulus `1.080%` relative error | Verified for the accepted 40 Ha workload. A 40→50 Ha central three-volume screen changed the curve by `0.438 meV/atom`; no full 50 Ha curve is required. |
 | Rock-salt MgO, 8 atoms, PBE, Mg-q2/O-q6, 70 Ha, 6×6×6, 7 volumes | `a₀ = 4.259503 Å`, `B₀ = 146.914 GPa`, Δ = `1.060 meV/atom` | All-electron PBE: lattice `0.123%` and bulk modulus `1.387%` relative error | Core EOS properties validated. The strict whole-report gate remains failed because `B₀′ = 3.39995` differs from `4.09093` by `16.89%`, above the locked `15%` threshold; this is retained as a likely Mg-q2 transferability limit. |
 | MgO periodic forces at the accepted EOS cell | 21 of 24 atom/axis comparisons pass `1e-4 Ha/bohr`; maximum deviation `2.246e-4 Ha/bohr` | Analytic force versus 48 reconverged ±0.01 bohr SCFs | Accepted with a known float32 total-energy precision limit. The three failures are O 6-x and O 7-y/z; the threshold was not weakened. |
+| fcc Al, 4 atoms, PBE/GTH-q3, Fermi-Dirac `0.00225 Ha`, 15 Ha, reduced 15×15×15, 11 bands, 7 volumes | `a₀ = 4.039885 Å`, `B₀ = 76.631 GPa`, `B₀′ = 4.58384`, Δ = `0.230 meV/atom` | All-electron PBE: lattice `0.024%`, bulk modulus `1.137%`, and `B₀′` `0.851%` relative error | Verified for this metallic EOS workload. The accepted mesh has 120 weighted representatives; the result does not establish broad Aluminum chemistry or metal transferability. |
 
 ## Evidence Boundary
 
@@ -23,15 +24,13 @@ semantics. Raw SCF, EOS, band, and force reports remain under gitignored
 `results/`. Quantum ESPRESSO and CP2K are reference families only and are not
 installed, imported, or executed by the MLX runtime or routine CI.
 
-These rows prove the listed fixed workloads. They do not establish metallic or
-spin-polarized chemistry, broad pseudopotential transferability, cell
-relaxation, or universal periodic DFT accuracy.
+These rows prove the listed fixed workloads. Aluminum closes one simple-metal
+case, but the rows do not establish broad metallic chemistry, spin-polarized
+chemistry, pseudopotential transferability, or cell relaxation. They do not
+establish universal periodic DFT accuracy.
 
-The periodic runtime now has a numerically validated Fermi-Dirac occupation and
-free-energy path, including weighted k-points, odd electron counts, checkpoints,
-and analytic-force occupation propagation. A bounded four-atom fcc Aluminum
-smoke test uses the CP2K `Al GTH-PBE-q3` parameters to exercise a real metallic
-band manifold. It is an execution test, not an accuracy row. The repository
-does not yet contain a source-bound metal energy reference that matches the
-local GTH pseudopotential and Fermi-Dirac protocol. Capability and material
-accuracy remain separate claims.
+The periodic runtime has a numerically validated Fermi-Dirac occupation and
+free-energy path, including weighted k-points, odd electron counts,
+checkpoints, and analytic-force occupation propagation. The Aluminum row adds
+a source-bound material validation for that path. Capability and broader
+material accuracy remain separate claims.
