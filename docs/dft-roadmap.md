@@ -23,18 +23,56 @@ must provide trustworthy energy, bands, forces, stress, ionic relaxation, cell
 relaxation, and restart behavior within an explicit pseudopotential and
 functional envelope.
 
+## Capability Coverage
+
+The general-core claim is bounded by the following matrix. A row is complete
+only when its implementation and material-level evidence both pass.
+
+| Capability | General-core commitment | Current boundary | Delivery |
+| --- | --- | --- | --- |
+| Exchange-correlation | PBE-PW92 production envelope | Implemented; verified material set is narrow | Every material phase |
+| Pseudopotentials | Broad, fingerprinted GTH transferability | GTH periodic path exists; broad transferability is not closed | Phase 7 |
+| Crystal geometry | Ordinary full-rank periodic cells | DFT grids and Ewald path remain orthorhombic | Phase 3 |
+| Electronic states | Insulators, simple metals, and collinear magnets | Insulators verified; metals execute; periodic spin is absent | Phases 1 and 5 |
+| Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
+| Mechanical observables | Analytic forces and validated stress | Forces exist with a retained MgO boundary; periodic stress is absent | Phase 4 |
+| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Only the legacy teaching path relaxes ions | Phases 2 and 4 |
+| Lattice dynamics | Bounded finite-displacement phonons | Absent | Phase 8 |
+| Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | Periodic SCF checkpointing exists; workflow-level state is incomplete | Every phase |
+| Runtime quality | Measured complete wall and peak memory on representative Apple Silicon workloads | Existing DFT controls cover a narrow workload set | Every phase |
+
+## Architecture Rules
+
+The following rules apply across all phases and prevent feature-specific
+subsystems from fragmenting the runtime:
+
+- Reuse the project-level `Cell` as the sole cell geometry type. General-cell
+  work extends DFT grids, reciprocal transforms, Ewald terms, and public system
+  construction; it does not introduce a second DFT cell abstraction.
+- Keep immutable calculation identity separate from mutable solver and workflow
+  state. Positions, cell, pseudopotentials, k-points, occupations, and
+  functional settings remain fingerprinted inputs.
+- Separate optimization mathematics from the electronic evaluator. L-BFGS,
+  step clipping, and line-search policy may be shared, while legacy and
+  periodic SCF adapters retain their own scientific state contracts.
+- Treat inner SCF continuation and outer workflows as different artifact
+  layers. Geometry, cell, and phonon workflows checkpoint accepted outer states
+  without weakening the existing SCF checkpoint identity.
+- Add periodic spin through an explicit channel dimension and shared
+  Hamiltonian machinery, not by copying the complete unpolarized controller.
+- Preserve the accepted fixed-occupation and orthorhombic paths as compatibility
+  oracles while new dimensions are introduced.
+
 The dependency order is:
 
 ```text
 metallic protocol lock -> metallic golden validation
 
-analytic forces -> fixed-cell ionic relaxation
-                         |
-                         v
-general cell geometry -> stress -> variable-cell relaxation -> phonons
-          |
-          v
-periodic collinear spin
+analytic forces -> fixed-cell ionic relaxation -> general cell geometry
+                                                   |-> stress -> variable-cell relaxation
+                                                   |-> periodic collinear spin
+                                                   |      `-> DOS and convergence workflows
+                                                   `-> phonons
 
 pseudopotential transferability expands across every phase
 ```
@@ -113,13 +151,32 @@ Exit gate: the unpolarized limit reproduces the existing path, total charge and
 magnetization are conserved, and at least one magnetic crystal passes a
 source-bound energy and moment comparison.
 
-## Phase 6: Expand Pseudopotential Transferability
+## Phase 6: Add Core Observables And Convergence Workflows
+
+Status: planned after periodic spin so scalar and spin-resolved outputs share
+one public contract.
+
+- Add total density of states for fixed and smeared calculations, including
+  spin-resolved output when spin is active.
+- Add a portable volumetric density export for charge and magnetization fields.
+- Generalize the existing material-specific cutoff and k-point checks into
+  reusable convergence workflows, including a smearing-width study for metals.
+- Keep projected density of states out of this phase until nonlocal projector
+  conventions have the required fidelity.
+
+Exit gate: integrated density of states reproduces the declared electron count,
+the insulating and metallic Fermi-level conventions are explicit, volumetric
+exports round-trip their cell and density normalization, and convergence
+reports retain exact source and runtime identities.
+
+## Phase 7: Expand Pseudopotential Transferability
 
 Status: evidence expands incrementally with every earlier phase; the final
 matrix closes after spin support.
 
-- Strengthen GTH and UPF convention fidelity instead of treating parser success
-  as scientific validation.
+- Strengthen periodic GTH convention fidelity instead of treating parser
+  success as scientific validation. Existing UPF support retains its separate
+  proof-level boundary.
 - Cover representative `s`, `p`, and `d`-block elements, ionic compounds,
   multiple oxidation environments, and both local and nonlocal force terms.
 - Bind every claim to an exact resource fingerprint and matching reference
@@ -128,7 +185,7 @@ matrix closes after spin support.
 Exit gate: a multi-material matrix passes locked energy, structural, and force
 thresholds without element-specific runtime branches.
 
-## Phase 7: Add Finite-Displacement Phonons
+## Phase 8: Add Finite-Displacement Phonons
 
 Status: blocked on stable forces, ionic relaxation, cell geometry, and restart.
 
@@ -142,6 +199,27 @@ Status: blocked on stable forces, ionic relaxation, cell geometry, and restart.
 Exit gate: displacement convergence, acoustic modes, restart equivalence, and
 reference frequencies pass declared thresholds.
 
+## Cross-Cutting Gates
+
+Every phase must satisfy the same delivery gates; a feature is not retained
+only because its public API exists:
+
+- Numerical: conservation laws, finite values, derivatives, restart
+  equivalence, and compatibility oracles pass locked tolerances.
+- Scientific: at least one source-bound material case passes without changing
+  thresholds after observing the result.
+- Identity: source inputs, pseudopotentials, protocols, runtime source, and
+  accepted workflow state have deterministic fingerprints.
+- Performance: complete-wall time and peak memory are measured on a
+  representative Apple Silicon workload; performance regressions are either
+  removed or explicitly accepted as a capability cost.
+- Portability: routine correctness remains covered by CPU continuous
+  integration, while Metal remains an optimization and parity instrument.
+- Product boundary: MLX remains the execution path; reference engines and
+  heavyweight chemistry packages do not become runtime dependencies.
+- Documentation: capability, evidence, and known boundaries are updated in the
+  canonical docs in the same change.
+
 ## General-Core Exit Criteria
 
 The project may describe the periodic runtime as a general core for common
@@ -152,7 +230,12 @@ solid-state DFT only when all of the following hold:
   goldens;
 - energy, bands, forces, stress, fixed-cell relaxation, and variable-cell
   relaxation form consistent workflows;
-- GTH or UPF claims are backed by a multi-material transferability matrix;
+- the GTH production envelope is backed by a multi-material transferability
+  matrix;
+- total density of states and reusable cutoff, k-point, and smearing
+  convergence reports are available;
+- bounded finite-displacement phonons pass displacement and reference
+  frequency gates;
 - checkpoint/restart preserves every supported scientific state;
 - complete-wall performance and peak memory remain measured on representative
   Apple Silicon workloads;
@@ -160,11 +243,28 @@ solid-state DFT only when all of the following hold:
 
 ## Deferred Beyond The General Core
 
-Non-collinear spin, spin-orbit coupling, hybrid functionals, time-dependent
-DFT, density-functional perturbation theory, electron-phonon workflows,
-reaction-path methods, distributed execution, and broad molecular DFT remain
-outside this roadmap. They require separate scientific programs rather than
-being appended to an active core feature.
+The following are named post-core programs, not hidden work inside the phases
+above:
+
+- functional breadth: DFT+U, nonlocal dispersion, meta-GGA, and hybrid
+  functionals;
+- relativistic and magnetic breadth: non-collinear spin and spin-orbit
+  coupling;
+- difficult electrostatics: charged-defect corrections, slab dipole
+  corrections, and isolated-boundary molecular electrostatics;
+- projected analysis: projected density of states, population analysis, and
+  projector-dependent bonding descriptors;
+- response physics: density-functional perturbation theory, dielectric and
+  optical response, and electron-phonon workflows;
+- reaction and excited-state workflows: nudged elastic band and time-dependent
+  DFT;
+- platform scale: crystallographic point-group reduction, distributed
+  execution, multi-device scheduling, and broad molecular DFT;
+- alternate periodic pseudopotential envelopes: production UPF support beyond
+  the required GTH general-core envelope.
+
+Each item requires its own roadmap or bounded extension after the general-core
+exit audit. None is an implied blocker for the claim defined here.
 
 ## Delivery Rule
 
