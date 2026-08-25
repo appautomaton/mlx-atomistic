@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pytest
 
+from mlx_atomistic.core import Cell
 from mlx_atomistic.dft import (
     DenseHamiltonianReference,
     DFTSystem,
@@ -51,6 +52,19 @@ def test_real_and_reciprocal_grid_geometry():
     assert reciprocal.g2.shape == grid.shape
     assert bool(np.array(reciprocal.zero_mask)[0, 0, 0])
     assert float(np.array(reciprocal.g2)[0, 0, 0]) == pytest.approx(0.0)
+
+
+def test_real_space_grid_rejects_nonorthogonal_cells_until_supported():
+    cell = Cell.triclinic(
+        (
+            (8.0, 0.0, 0.0),
+            (1.5, 7.5, 0.0),
+            (0.5, 1.0, 9.0),
+        )
+    )
+
+    with pytest.raises(ValueError, match="require an orthorhombic cell"):
+        RealSpaceGrid((4, 4, 4), cell)
 
 
 def test_fft_round_trip_preserves_real_field():

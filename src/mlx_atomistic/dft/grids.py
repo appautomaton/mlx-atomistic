@@ -34,6 +34,9 @@ class RealSpaceGrid:
     def __init__(self, shape: Sequence[int], cell: Cell | Sequence[float]):
         object.__setattr__(self, "shape", _shape_tuple(shape))
         parsed_cell = cell if isinstance(cell, Cell) else Cell.orthorhombic(cell)
+        if not parsed_cell.is_orthorhombic:
+            msg = "DFT real-space grids currently require an orthorhombic cell"
+            raise ValueError(msg)
         object.__setattr__(self, "cell", parsed_cell)
         lengths = np.array(parsed_cell.lengths, dtype=np.float64)
         if np.any(lengths <= 0.0):
