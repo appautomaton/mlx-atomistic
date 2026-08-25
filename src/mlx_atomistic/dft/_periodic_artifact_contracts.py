@@ -227,6 +227,14 @@ def _config_payload(config: PeriodicSCFConfig) -> dict[str, object]:
         "adaptive_eigensolver_tolerance": config.adaptive_eigensolver_tolerance,
         "initial_eigensolver_tolerance": config.initial_eigensolver_tolerance,
         "eigensolver_tolerance_scale": config.eigensolver_tolerance_scale,
+        "smearing": (
+            None
+            if config.smearing is None
+            else {
+                "method": "fermi-dirac",
+                "width_hartree": config.smearing.width_hartree,
+            }
+        ),
         "davidson": {
             "max_iterations": config.davidson.max_iterations,
             "tolerance": config.davidson.tolerance,
@@ -267,6 +275,7 @@ def _solver_identity(config_payload: Mapping[str, object]) -> dict[str, object]:
             "adaptive_eigensolver_tolerance": config_payload["adaptive_eigensolver_tolerance"],
             "initial_eigensolver_tolerance": config_payload["initial_eigensolver_tolerance"],
             "eigensolver_tolerance_scale": config_payload["eigensolver_tolerance_scale"],
+            "smearing": config_payload["smearing"],
         },
     }
 
@@ -454,7 +463,8 @@ def periodic_scf_calculation_contract(
         system: Periodic GTH system.
         cutoff_hartree: Plane-wave kinetic cutoff in Hartree.
         kpoint_mesh: Weighted reduced-coordinate k-point mesh.
-        n_bands: Occupied band count. Defaults to half the electron count.
+        n_bands: Computed band count. Fixed occupations default to half the
+            electron count; smearing requires additional empty bands.
         config: SCF controls. Defaults to ``PeriodicSCFConfig``.
         xc_functional: Exchange-correlation functional. Only the deterministic
             production PBE path is checkpointable.
@@ -506,4 +516,3 @@ def periodic_scf_calculation_contract(
 
 def _calculation_fingerprint(contract: Mapping[str, object]) -> str:
     return sha256_bytes(canonical_json_bytes(dict(contract)))
-

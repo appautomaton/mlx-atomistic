@@ -28,6 +28,7 @@ from mlx_atomistic.dft import (
     KPointMesh,
     PeriodicDavidsonConfig,
     PeriodicDFTSystem,
+    PeriodicFermiDiracSmearing,
     PeriodicSCFConfig,
     PeriodicSCFExecutionIdentity,
     PlaneWaveBasis,
@@ -116,6 +117,7 @@ def _execution_context(
     mesh,
     config,
     *,
+    n_bands=1,
     initial_density=None,
     initial_coefficients=None,
 ):
@@ -123,7 +125,7 @@ def _execution_context(
         system,
         cutoff_hartree=4.0,
         kpoint_mesh=mesh,
-        n_bands=1,
+        n_bands=n_bands,
         config=config,
     )
     contract = {
@@ -149,6 +151,7 @@ def _execution_context(
                     "initial_eigensolver_tolerance"
                 ],
                 "eigensolver_tolerance_scale": calculation["config"]["eigensolver_tolerance_scale"],
+                "smearing": calculation["config"]["smearing"],
             },
         },
         "initialization": periodic_scf_initialization_identity(
@@ -336,6 +339,72 @@ def test_resume_trajectory_equivalence_and_timing_admission(tmp_path, mixer, ada
         np.testing.assert_allclose(
             np.asarray(resumed_point.eigen.eigenvalues),
             np.asarray(uninterrupted_point.eigen.eigenvalues),
+            atol=2e-6,
+            rtol=0.0,
+        )
+
+
+def test_smeared_periodic_resume_preserves_occupations_and_free_energy(tmp_path):
+    system, mesh, base_config = _problem(mixer="linear")
+    config = replace(
+        base_config,
+        smearing=PeriodicFermiDiracSmearing(width_hartree=0.1),
+    )
+    context = _execution_context(system, mesh, config, n_bands=2)
+    checkpoint = tmp_path / "smearing-checkpoint"
+    partial = run_periodic_scf_checkpointed(
+        system,
+        cutoff_hartree=4.0,
+        kpoint_mesh=mesh,
+        n_bands=2,
+        config=config,
+        execution_context=context,
+        checkpoint_to=checkpoint,
+        checkpoint_iteration=2,
+    )
+    uninterrupted = run_periodic_scf(
+        system,
+        cutoff_hartree=4.0,
+        kpoint_mesh=mesh,
+        n_bands=2,
+        config=config,
+    )
+    resumed = run_periodic_scf_checkpointed(
+        system,
+        cutoff_hartree=4.0,
+        kpoint_mesh=mesh,
+        n_bands=2,
+        config=config,
+        execution_context=context,
+        resume_from=checkpoint,
+    )
+
+    assert partial.status == "checkpointed"
+    assert resumed.smearing_width_hartree == 0.1
+    assert resumed.chemical_potential == pytest.approx(
+        uninterrupted.chemical_potential,
+        abs=2e-6,
+    )
+    assert resumed.electronic_entropy == pytest.approx(
+        uninterrupted.electronic_entropy,
+        abs=2e-6,
+    )
+    assert resumed.total_energy == pytest.approx(
+        uninterrupted.total_energy,
+        abs=2e-6,
+    )
+    assert resumed.internal_energy == pytest.approx(
+        uninterrupted.internal_energy,
+        abs=2e-6,
+    )
+    for resumed_point, uninterrupted_point in zip(
+        resumed.kpoints,
+        uninterrupted.kpoints,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            resumed_point.occupations,
+            uninterrupted_point.occupations,
             atol=2e-6,
             rtol=0.0,
         )

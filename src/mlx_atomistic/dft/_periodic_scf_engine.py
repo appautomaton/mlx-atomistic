@@ -40,6 +40,10 @@ from mlx_atomistic.dft._periodic_models import (
     _time_reversed_compact_values,
     _TimeReversalContinuationSeed,
 )
+from mlx_atomistic.dft._periodic_occupations import (
+    _PeriodicOccupationResult,
+    _resolve_periodic_occupations,
+)
 from mlx_atomistic.dft._periodic_state import _PeriodicSCFContinuationState
 from mlx_atomistic.dft._runtime_observer import (
     RuntimeObserver,
@@ -280,6 +284,7 @@ def _publish_explicit_kpoints(
                 aggregated_weight=entry.aggregated_weight,
                 ownership_role=entry.role,
                 fallback_reason=entry.fallback_reason,
+                occupations=owner_result.occupations,
             )
         )
     return tuple(explicit)
@@ -294,7 +299,7 @@ class _PeriodicSCFSetup:
     config: PeriodicSCFConfig
     compact_policy: _CompactBatchPolicy
     xc: ExchangeCorrelationFunctional
-    occupied_bands: int
+    band_count: int
     observer: RuntimeObserver | None
     ownership: TimeReversalOwnership
     bases: tuple[PlaneWaveBasis, ...]
@@ -346,6 +351,7 @@ class _PeriodicSCFIterationResult:
     max_orbital_residual: float
     energy_delta: float | None
     energy_terms: dict[str, float]
+    occupations: _PeriodicOccupationResult
     all_eigen_converged: bool
     eigen_residuals_directly_validated: bool
 
@@ -387,11 +393,11 @@ class _PeriodicSCFController:
         scf_config = PeriodicSCFConfig() if config is None else config
         compact_policy = scf_config._compact_batch_policy()
         xc = ProductionPBEExchangeCorrelation() if xc_functional is None else xc_functional
-        occupied_bands = int(round(system.electron_count / 2.0)) if n_bands is None else n_bands
+        band_count = int(round(system.electron_count / 2.0)) if n_bands is None else n_bands
         cls._validate_request(
             system,
             kpoint_mesh=kpoint_mesh,
-            occupied_bands=occupied_bands,
+            band_count=band_count,
             initial_density=initial_density,
             initial_coefficients=initial_coefficients,
             resume_state=resume_state,
@@ -423,7 +429,7 @@ class _PeriodicSCFController:
                     ownership,
                     bases,
                     initial_coefficients,
-                    n_bands=occupied_bands,
+                    n_bands=band_count,
                 )
             else:
                 ownership = _periodic_resume._resume_ownership(
@@ -474,7 +480,7 @@ class _PeriodicSCFController:
                     resume_state,
                     bases=bases,
                     ownership=ownership,
-                    occupied_bands=occupied_bands,
+                    band_count=band_count,
                     grid=system.grid,
                     electron_count=system.electron_count,
                     mixer=mixer,
@@ -498,7 +504,7 @@ class _PeriodicSCFController:
             config=scf_config,
             compact_policy=compact_policy,
             xc=xc,
-            occupied_bands=occupied_bands,
+            band_count=band_count,
             observer=observer,
             ownership=ownership,
             bases=bases,
@@ -532,14 +538,22 @@ class _PeriodicSCFController:
         system: PeriodicDFTSystem,
         *,
         kpoint_mesh: KPointMesh,
-        occupied_bands: int,
+        band_count: int,
         initial_density: mx.array | None,
         initial_coefficients: Sequence[mx.array] | None,
         resume_state: _PeriodicSCFContinuationState | None,
         config: PeriodicSCFConfig,
     ) -> None:
-        if occupied_bands <= 0 or abs(2.0 * occupied_bands - system.electron_count) > 1e-8:
-            msg = "the bounded spin-unpolarized path requires two electrons per occupied band"
+        if type(band_count) is not int or band_count <= 0:
+            msg = "n_bands must be a positive non-bool integer"
+            raise ValueError(msg)
+        capacity = 2.0 * band_count
+        if config.smearing is None:
+            if abs(capacity - system.electron_count) > 1e-8:
+                msg = "fixed periodic occupations require two electrons per computed band"
+                raise ValueError(msg)
+        elif capacity <= system.electron_count:
+            msg = "Fermi-Dirac smearing requires at least one partially empty band"
             raise ValueError(msg)
         if any(point.coordinate_system != "reduced" for point in kpoint_mesh.points):
             msg = "periodic SCF requires reduced-coordinate k-points"
@@ -643,12 +657,31 @@ class _PeriodicSCFController:
             effective_snapshot,
         )
         with observed_phase(self.setup.observer, "density"):
+            smearing = self.setup.config.smearing
+            occupations = _resolve_periodic_occupations(
+                [np.asarray(result.eigen.eigenvalues) for result in owned_results],
+                [result.integration_weight for result in owned_results],
+                electron_count=self.setup.system.electron_count,
+                smearing_width_hartree=(
+                    None if smearing is None else smearing.width_hartree
+                ),
+            )
+            owned_results = tuple(
+                replace(result, occupations=values)
+                for result, values in zip(
+                    owned_results,
+                    occupations.occupations,
+                    strict=True,
+                )
+            )
             target_density = _density_from_kpoints(
                 owned_results,
-                occupation=2.0,
+                occupation=2.0 if smearing is None else None,
                 policy=self.setup.compact_policy,
                 observer=self.setup.observer,
-                orbital_densities=orbital_densities,
+                orbital_densities=(
+                    orbital_densities if smearing is None else None
+                ),
             )
             target_count = float(mx.sum(target_density) * self.setup.system.grid.dv)
             target_density = target_density * (self.setup.system.electron_count / target_count)
@@ -658,7 +691,13 @@ class _PeriodicSCFController:
                 self.setup.system.grid,
             )
         band_energy = sum(
-            result.integration_weight * 2.0 * float(mx.sum(result.eigen.eigenvalues))
+            result.integration_weight
+            * float(
+                np.dot(
+                    np.asarray(result.occupations, dtype=np.float64),
+                    np.asarray(result.eigen.eigenvalues, dtype=np.float64),
+                )
+            )
             for result in owned_results
         )
         hartree_energy = 0.5 * float(
@@ -668,9 +707,15 @@ class _PeriodicSCFController:
         density_xc = float(
             mx.sum(self.progress.density * xc_result.potential) * self.setup.system.grid.dv
         )
-        total_energy = (
+        internal_energy = (
             band_energy - hartree_energy + xc_energy - density_xc + self.setup.ewald_energy
         )
+        entropy_correction = -(
+            0.0
+            if smearing is None
+            else smearing.width_hartree * occupations.electronic_entropy
+        )
+        total_energy = internal_energy + entropy_correction
         energy_delta = (
             None
             if self.progress.previous_energy is None
@@ -684,6 +729,13 @@ class _PeriodicSCFController:
             "ion_ewald": self.setup.ewald_energy,
             "total": total_energy,
         }
+        if smearing is not None:
+            energy_terms.update(
+                {
+                    "internal_total": internal_energy,
+                    "entropy_correction": entropy_correction,
+                }
+            )
         return _PeriodicSCFIterationResult(
             owned_results=owned_results,
             target_density=target_density,
@@ -692,6 +744,7 @@ class _PeriodicSCFController:
             max_orbital_residual=max_orbital_residual,
             energy_delta=energy_delta,
             energy_terms=energy_terms,
+            occupations=occupations,
             all_eigen_converged=all(result.eigen.converged for result in owned_results),
             eigen_residuals_directly_validated=eigen_residuals_directly_validated,
         )
@@ -755,15 +808,18 @@ class _PeriodicSCFController:
             or self.progress.eigensolver_tolerance
             <= float(self.setup.config.davidson.tolerance)
         )
+        capture_orbital_density = (
+            require_direct_validation and self.setup.config.smearing is None
+        )
         requests = tuple(
             _DavidsonLaneRequest(
                 lane_id=self.setup.bases[point_index]._layout.lane_id,
                 operator=operators_by_index[point_index],
-                n_bands=self.setup.occupied_bands,
+                n_bands=self.setup.band_count,
                 config=iteration_davidson,
                 trial=_initial_trial(
                     self.setup.bases[point_index],
-                    self.setup.occupied_bands,
+                    self.setup.band_count,
                     self.progress.previous_states.get(point_index),
                 ),
                 observer=self.setup.observer,
@@ -773,7 +829,7 @@ class _PeriodicSCFController:
                     or iteration > self.progress.iteration_start
                 ),
                 require_direct_validation=require_direct_validation,
-                capture_orbital_density=require_direct_validation,
+                capture_orbital_density=capture_orbital_density,
             )
             for point_index in self.setup.owned_indices
         )
@@ -799,7 +855,7 @@ class _PeriodicSCFController:
             )
         owned_by_index: dict[int, PeriodicKPointResult] = {}
         orbital_density_by_index: dict[int, mx.array] | None = (
-            {} if require_direct_validation else None
+            {} if capture_orbital_density else None
         )
         max_orbital_residual = 0.0
         for point_index in self.setup.owned_indices:
@@ -949,6 +1005,17 @@ class _PeriodicSCFController:
                     if outcome.eigen_residuals_directly_validated
                     else "paired_subspace"
                 ),
+                "internal_energy_hartree": outcome.energy_terms.get(
+                    "internal_total",
+                    outcome.energy_terms["total"],
+                ),
+                "chemical_potential_hartree": outcome.occupations.chemical_potential,
+                "electronic_entropy": outcome.occupations.electronic_entropy,
+                "smearing_width_hartree": (
+                    None
+                    if self.setup.config.smearing is None
+                    else self.setup.config.smearing.width_hartree
+                ),
             }
         )
         observer = self.setup.observer
@@ -968,6 +1035,17 @@ class _PeriodicSCFController:
                     "direct_operator"
                     if outcome.eigen_residuals_directly_validated
                     else "paired_subspace"
+                ),
+                internal_energy_hartree=outcome.energy_terms.get(
+                    "internal_total",
+                    outcome.energy_terms["total"],
+                ),
+                chemical_potential_hartree=outcome.occupations.chemical_potential,
+                electronic_entropy=outcome.occupations.electronic_entropy,
+                smearing_width_hartree=(
+                    None
+                    if self.setup.config.smearing is None
+                    else self.setup.config.smearing.width_hartree
                 ),
             )
 
@@ -1119,6 +1197,7 @@ class _PeriodicSCFController:
             self.setup.observer,
         )
         electron_count = float(mx.sum(self.progress.density) * self.setup.system.grid.dv)
+        final_history = self.progress.history[-1]
         self._emit_completion(iteration)
         result_status = self._result_status()
         timing_admission_status = (
@@ -1148,6 +1227,23 @@ class _PeriodicSCFController:
             timing_admission_status=timing_admission_status,
             lineage=self.progress.lineage,
             system_fingerprint=self.setup.system.fingerprint,
+            internal_energy=float(
+                self.progress.energy_terms.get(
+                    "internal_total",
+                    self.progress.energy_terms["total"],
+                )
+            ),
+            chemical_potential=(
+                None
+                if final_history["chemical_potential_hartree"] is None
+                else float(final_history["chemical_potential_hartree"])
+            ),
+            electronic_entropy=float(final_history["electronic_entropy"]),
+            smearing_width_hartree=(
+                None
+                if self.setup.config.smearing is None
+                else self.setup.config.smearing.width_hartree
+            ),
             _owned_kpoints=self.progress.final_owned_results,
             _checkpoint_state=(
                 None if self.progress.converged else self.progress.final_checkpoint_state
