@@ -30,6 +30,7 @@ NARRATIVE_TARGETS = {
     "dft-numerics.md": "dft/dft-numerics.md",
     "dft-production-core.md": "dft/dft-production-core.md",
     "dft-pseudopotentials.md": "dft/dft-pseudopotentials.md",
+    "dft-roadmap.md": "dft/dft-roadmap.md",
     "dft-scf-core.md": "dft/dft-scf-core.md",
     "release.md": "project/release.md",
     "validation-and-performance.md": "project/validation-and-performance.md",
