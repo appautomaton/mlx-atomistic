@@ -57,6 +57,7 @@ UV_CACHE_DIR=/tmp/mlx-atomistic-uv-cache \
 - [Experimental Metal interaction engine](./metal-interaction-engine.md)
 - [DFT foundations](./dft-foundations.md)
 - [DFT production core](./dft-production-core.md)
+- [DFT roadmap](./dft-roadmap.md)
 - [Validation and performance](./validation-and-performance.md)
 - [Benchmarks](./benchmarks/README.md)
 - [Release checklist](./release.md)

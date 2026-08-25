@@ -117,6 +117,11 @@ k-point mesh, and free-energy definition.
 features. Deferred, anti-goal, and unknown features report blockers before any
 production-suite claim can be emitted.
 
+The ordered path from this bounded capability to a general solid-state core is
+maintained in the [DFT roadmap](./dft-roadmap.md). That roadmap separates
+scientific protocol research from implementation and defines the material-level
+exit gate for every new capability.
+
 ## Hot-Path Recommendation
 
 Hamiltonian application remains the largest periodic DFT phase, but retained
