@@ -80,16 +80,18 @@ def _mixer_payload(
     state: _MixerCheckpointState,
     payloads: dict[str, bytes],
     payload_roles: dict[str, str],
+    *,
+    prefix: str = "mixer",
 ) -> dict[str, object]:
     density_files = []
     residual_files = []
     for index, values in enumerate(state.densities):
-        path = f"mixer/density-{index:04d}.npy"
+        path = f"{prefix}/density-{index:04d}.npy"
         payloads[path] = _npy_bytes(values)
         payload_roles[path] = "diis_density_history"
         density_files.append(path)
     for index, values in enumerate(state.residuals):
-        path = f"mixer/residual-{index:04d}.npy"
+        path = f"{prefix}/residual-{index:04d}.npy"
         payloads[path] = _npy_bytes(values)
         payload_roles[path] = "diis_residual_history"
         residual_files.append(path)
@@ -137,6 +139,44 @@ def _publish_checkpoint_state(
         )
 
     mixer = _mixer_payload(state.mixer_state, payloads, payload_roles)
+    spin_payload: dict[str, object] | None = None
+    if state.spin_densities is not None:
+        if state.magnetization_mixer_state is None:
+            raise ValueError("spin checkpoint state has no magnetization mixer")
+        spin_density_files = ("spin/up-density.npy", "spin/down-density.npy")
+        for label, path, values in zip(
+            ("up", "down"),
+            spin_density_files,
+            state.spin_densities,
+            strict=True,
+        ):
+            payloads[path] = _npy_bytes(values)
+            payload_roles[path] = f"next_iteration_spin_{label}_density"
+        down_coefficient_map = state.down_coefficient_map
+        down_owned_lanes = []
+        for lane in state.down_owned_lanes:
+            owner_index = int(lane["owner_index"])
+            path = f"owned/down/{owner_index:04d}-coefficients.npy"
+            payloads[path] = _npy_bytes(down_coefficient_map[owner_index])
+            payload_roles[path] = "owned_spin_down_compact_coefficients"
+            down_owned_lanes.append(
+                {
+                    **dict(lane),
+                    "coefficient_file": path,
+                    "coefficient_dtype": "complex64",
+                    "coefficient_shape": list(down_coefficient_map[owner_index].shape),
+                }
+            )
+        spin_payload = {
+            "density_files": list(spin_density_files),
+            "down_owned_lanes": down_owned_lanes,
+            "magnetization_mixer": _mixer_payload(
+                state.magnetization_mixer_state,
+                payloads,
+                payload_roles,
+                prefix="spin/magnetization-mixer",
+            ),
+        }
     metadata: dict[str, object] = {
         "schema_version": PERIODIC_SCF_CHECKPOINT_SCHEMA,
         "status": "accepted_iteration",
@@ -150,6 +190,7 @@ def _publish_checkpoint_state(
         "owned_lanes": owned_lanes,
         "ownership": dict(state.ownership),
         "mixer": mixer,
+        "spin": spin_payload,
         "execution_identity": identity.to_dict(),
         "execution_contract": dict(identity.execution_contract),
         "calculation_contract": dict(calculation_contract),
@@ -497,6 +538,59 @@ def _validate_checkpoint_mixer(
     return mixer
 
 
+def _validate_checkpoint_spin(
+    metadata: Mapping[str, object],
+    calculation: Mapping[str, object],
+) -> dict[str, object] | None:
+    configured = _require_mapping(calculation.get("config"), "configured SCF controls")
+    configured_spin = configured.get("spin")
+    raw_spin = metadata.get("spin")
+    if configured_spin is None:
+        if raw_spin is not None:
+            raise ArtifactIntegrityError("unpolarized checkpoint contains spin state")
+        return None
+    if not isinstance(configured_spin, Mapping):
+        raise ArtifactIntegrityError("configured spin controls are malformed")
+    spin = _require_mapping(raw_spin, "spin checkpoint state")
+    density_files = _require_sequence(spin.get("density_files"), "spin density files")
+    down_owned_lanes = _require_sequence(
+        spin.get("down_owned_lanes"),
+        "spin-down owned lanes",
+    )
+    ownership = _require_mapping(metadata.get("ownership"), "ownership")
+    if len(density_files) != 2 or ownership.get("owned_count") != len(down_owned_lanes):
+        raise ArtifactIntegrityError("spin checkpoint channel inventory is inconsistent")
+    magnetization_mixer = _require_mapping(
+        spin.get("magnetization_mixer"),
+        "magnetization mixer",
+    )
+    density_history = _require_sequence(
+        magnetization_mixer.get("density_files"),
+        "magnetization mixer density files",
+    )
+    residual_history = _require_sequence(
+        magnetization_mixer.get("residual_files"),
+        "magnetization mixer residual files",
+    )
+    try:
+        valid_mixer = (
+            magnetization_mixer.get("name") == "linear"
+            and float(magnetization_mixer["beta"])
+            == float(configured_spin["magnetization_mixing_beta"])
+            and int(magnetization_mixer["history_size"]) == 0
+            and float(magnetization_mixer["regularization"]) == 0.0
+            and int(magnetization_mixer["stored"]) == 0
+            and not magnetization_mixer["last_coefficients"]
+            and not density_history
+            and not residual_history
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactIntegrityError("magnetization mixer metadata is invalid") from error
+    if not valid_mixer:
+        raise ArtifactIntegrityError("magnetization mixer differs from configured spin controls")
+    return spin
+
+
 def _mixer_matches_config(
     mixer: Mapping[str, object],
     configured: Mapping[str, object],
@@ -555,6 +649,7 @@ def _validate_checkpoint_payload_references(
     *,
     owned_lanes: Sequence[object],
     mixer: Mapping[str, object],
+    spin: Mapping[str, object] | None,
 ) -> None:
     declared_paths = _declared_payload_paths(manifest)
     if PERIODIC_SCF_CHECKPOINT_PAYLOAD not in declared_paths:
@@ -566,6 +661,31 @@ def _validate_checkpoint_payload_references(
     )
     references.extend(_require_sequence(mixer.get("density_files"), "mixer density files"))
     references.extend(_require_sequence(mixer.get("residual_files"), "mixer residual files"))
+    if spin is not None:
+        references.extend(_require_sequence(spin.get("density_files"), "spin density files"))
+        references.extend(
+            _require_mapping(lane, "spin-down owned lane").get("coefficient_file")
+            for lane in _require_sequence(
+                spin.get("down_owned_lanes"),
+                "spin-down owned lanes",
+            )
+        )
+        magnetization_mixer = _require_mapping(
+            spin.get("magnetization_mixer"),
+            "magnetization mixer",
+        )
+        references.extend(
+            _require_sequence(
+                magnetization_mixer.get("density_files"),
+                "magnetization mixer density files",
+            )
+        )
+        references.extend(
+            _require_sequence(
+                magnetization_mixer.get("residual_files"),
+                "magnetization mixer residual files",
+            )
+        )
     for reference in references:
         if not isinstance(reference, str) or reference not in declared_paths:
             msg = "periodic checkpoint references an undeclared payload"
@@ -597,6 +717,7 @@ def _validated_checkpoint_metadata(
     _validate_checkpoint_cursor(metadata)
     owned_lanes = _validate_checkpoint_owner_inventory(metadata)
     mixer = _validate_checkpoint_mixer(metadata, calculation)
+    spin = _validate_checkpoint_spin(metadata, calculation)
     _validate_checkpoint_status(metadata)
     _validate_checkpoint_payload_references(
         root,
@@ -604,6 +725,7 @@ def _validated_checkpoint_metadata(
         metadata,
         owned_lanes=owned_lanes,
         mixer=mixer,
+        spin=spin,
     )
     return root, dict(manifest), metadata
 
@@ -765,6 +887,89 @@ def _load_checkpoint_mixer_state(
         raise ArtifactIntegrityError(msg) from error
 
 
+def _load_checkpoint_spin_state(
+    root: Path,
+    metadata: Mapping[str, object],
+    *,
+    declared_paths: set[str],
+    grid_shape: tuple[int, int, int],
+) -> tuple[
+    tuple[mx.array, mx.array] | None,
+    tuple[dict[str, object], ...],
+    tuple[tuple[int, mx.array], ...],
+    _MixerCheckpointState | None,
+]:
+    raw_spin = metadata.get("spin")
+    if raw_spin is None:
+        return None, (), (), None
+    spin = _require_mapping(raw_spin, "spin checkpoint state")
+    density_files = _require_sequence(spin.get("density_files"), "spin density files")
+    densities = tuple(
+        _read_npy(root, path, declared_paths=declared_paths) for path in density_files
+    )
+    if len(densities) != 2 or any(
+        values.dtype != np.float32
+        or values.shape != grid_shape
+        or not np.all(np.isfinite(values))
+        or np.min(values) < 0.0
+        for values in densities
+    ):
+        raise ArtifactIntegrityError("spin checkpoint densities are invalid")
+    raw_lanes = _require_sequence(
+        spin.get("down_owned_lanes"),
+        "spin-down owned lanes",
+    )
+    down_lanes: list[dict[str, object]] = []
+    down_coefficients: list[tuple[int, mx.array]] = []
+    seen: set[int] = set()
+    for raw_lane in raw_lanes:
+        lane = _require_mapping(raw_lane, "spin-down owned lane")
+        try:
+            owner_index = int(lane["owner_index"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArtifactIntegrityError("spin-down owner index is invalid") from error
+        if owner_index in seen:
+            raise ArtifactIntegrityError("spin-down owner indices must be unique")
+        seen.add(owner_index)
+        values = _read_npy(
+            root,
+            lane.get("coefficient_file"),
+            declared_paths=declared_paths,
+        )
+        if (
+            values.dtype != np.complex64
+            or values.shape != tuple(lane.get("coefficient_shape", ()))
+            or lane.get("coefficient_dtype") != "complex64"
+            or not np.all(np.isfinite(values))
+        ):
+            raise ArtifactIntegrityError("spin-down coefficients are invalid")
+        down_lanes.append(
+            {
+                key: value
+                for key, value in lane.items()
+                if key
+                not in {
+                    "coefficient_file",
+                    "coefficient_dtype",
+                    "coefficient_shape",
+                }
+            }
+        )
+        down_coefficients.append((owner_index, mx.array(values)))
+    magnetization_mixer = _load_checkpoint_mixer_state(
+        root,
+        {"mixer": spin["magnetization_mixer"]},
+        declared_paths=declared_paths,
+        grid_shape=grid_shape,
+    )
+    return (
+        (mx.array(densities[0]), mx.array(densities[1])),
+        tuple(down_lanes),
+        tuple(down_coefficients),
+        magnetization_mixer,
+    )
+
+
 @dataclass(frozen=True)
 class _LoadedCheckpointScalars:
     completed_iteration: int
@@ -883,6 +1088,17 @@ def load_periodic_scf_checkpoint(
         declared_paths=declared_paths,
         grid_shape=system.grid.shape,
     )
+    (
+        spin_densities,
+        down_owned_lanes,
+        down_owned_coefficients,
+        magnetization_mixer_state,
+    ) = _load_checkpoint_spin_state(
+        root,
+        metadata,
+        declared_paths=declared_paths,
+        grid_shape=system.grid.shape,
+    )
     scalars = _load_checkpoint_scalars(metadata)
     state = _PeriodicSCFContinuationState(
         completed_iteration=scalars.completed_iteration,
@@ -895,6 +1111,10 @@ def load_periodic_scf_checkpoint(
         mixer_state=mixer_state,
         ownership=scalars.ownership,
         lineage=(*scalars.lineage, str(manifest["manifest_sha256"])),
+        spin_densities=spin_densities,
+        down_owned_coefficients=down_owned_coefficients,
+        down_owned_lanes=down_owned_lanes,
+        magnetization_mixer_state=magnetization_mixer_state,
     )
     return PeriodicSCFCheckpoint(
         root=root,

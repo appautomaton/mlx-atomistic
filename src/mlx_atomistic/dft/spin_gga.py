@@ -19,6 +19,8 @@ _PW92_UNPOLARIZED = (0.0310907, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294)
 _PW92_POLARIZED = (0.01554535, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517)
 _PW92_SPIN_STIFFNESS = (0.0168869, 0.11125, 10.357, 3.6231, 0.88026, 0.49671)
 _SPIN_INTERPOLATION_SECOND_DERIVATIVE = (8.0 / 9.0) / (2.0 ** (4.0 / 3.0) - 2.0)
+_POLARIZATION_EDGE = 1.0e-5
+_FLOAT32_SPIN_DENSITY_FLOOR = 1.0e-7
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,14 @@ def _spin_pbe_energy_density(
     )
 
     density = up + down
-    polarization = mx.clip((up - down) / density, -1.0 + 1.0e-7, 1.0 - 1.0e-7)
+    # Keep the float32 automatic-differentiation graph away from the singular
+    # derivative of (1 - |zeta|) ** (2 / 3) at complete polarization. This
+    # affects only numerically empty minority channels, not their total charge.
+    polarization = mx.clip(
+        (up - down) / density,
+        -1.0 + _POLARIZATION_EDGE,
+        1.0 - _POLARIZATION_EDGE,
+    )
     phi = 0.5 * (
         (1.0 + polarization) ** (2.0 / 3.0)
         + (1.0 - polarization) ** (2.0 / 3.0)
@@ -140,7 +149,7 @@ class ProductionSpinPBEExchangeCorrelation:
         down_density: mx.array,
         grid: RealSpaceGrid,
         *,
-        density_floor: float = 1.0e-12,
+        density_floor: float = _FLOAT32_SPIN_DENSITY_FLOOR,
     ) -> SpinXCResult:
         """Evaluate spin-PBE energy and both local potentials.
 
@@ -148,7 +157,9 @@ class ProductionSpinPBEExchangeCorrelation:
             up_density: Spin-up electron density on the real-space grid.
             down_density: Spin-down electron density on the real-space grid.
             grid: Periodic real-space integration grid.
-            density_floor: Positive per-channel numerical density floor.
+            density_floor: Positive per-channel numerical density floor. The
+                default keeps the float32 GGA derivative finite for a
+                numerically empty minority channel.
 
         Returns:
             Spin-resolved PBE energy density, total energy, and potentials.

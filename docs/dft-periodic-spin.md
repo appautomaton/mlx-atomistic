@@ -26,6 +26,11 @@ one of two electron-allocation modes:
   between them. This mode requires finite-temperature occupations so level
   crossings remain well defined.
 
+Unconstrained runs may supply an `initial_magnetization` seed. The seed only
+splits the initial channel densities; it does not constrain the converged
+moment. Fixed-magnetization runs reject a separate seed because their channel
+electron counts already define the initial and accepted moment.
+
 The result reports total density, the two spin densities, magnetization
 density, integrated magnetization, per-channel k-point states and electron
 counts, and either one shared or two fixed-channel chemical potentials. Total
@@ -77,6 +82,25 @@ copy of kinetic or pseudopotential code is allowed.
 The mixer acts on charge and magnetization channels, not on two unrelated
 densities. This makes the unpolarized subspace explicit and permits separate
 bounded damping of magnetic oscillations.
+
+The float32 spin-PBE graph applies a `1e-7 bohr^-3` per-channel numerical floor
+and a bounded polarization edge. These controls keep the functional derivative
+finite for a completely empty minority channel. Channel density construction,
+normalization, and reported electron counts still preserve an exactly empty
+channel when its occupation target is zero.
+
+## Implementation Status
+
+The shared controller, fixed and unconstrained occupation modes, charge and
+magnetization mixing, explicit channel results, non-magnetic equivalence, and
+atomic checkpoint/resume are implemented. Checkpoints persist total, spin-up,
+spin-down, compact orbital, charge-mixer, and magnetization-mixer state under
+the existing validated artifact envelope.
+
+The Phase 5 material exit gate remains open until one fingerprinted magnetic
+crystal protocol passes its locked numerical, energy, and moment comparisons.
+Deterministic Hydrogen gates prove controller semantics but are not material
+evidence.
 
 ## Acceptance Criteria
 

@@ -31,11 +31,13 @@ from mlx_atomistic.dft._periodic_density import _density_from_kpoints
 from mlx_atomistic.dft._periodic_execution import _detached_failure
 from mlx_atomistic.dft._periodic_hamiltonian import PeriodicKohnShamOperator
 from mlx_atomistic.dft._periodic_models import (
+    PeriodicCollinearSpinConfig,
     PeriodicDFTSystem,
     PeriodicEigenResult,
     PeriodicKPointResult,
     PeriodicSCFConfig,
     PeriodicSCFResult,
+    PeriodicSpinChannelResult,
     _is_finite_positive_control,
     _time_reversed_compact_values,
     _TimeReversalContinuationSeed,
@@ -43,6 +45,10 @@ from mlx_atomistic.dft._periodic_models import (
 from mlx_atomistic.dft._periodic_occupations import (
     _PeriodicOccupationResult,
     _resolve_periodic_occupations,
+)
+from mlx_atomistic.dft._periodic_spin_occupations import (
+    _PeriodicSpinOccupationResult,
+    _resolve_periodic_spin_occupations,
 )
 from mlx_atomistic.dft._periodic_state import _PeriodicSCFContinuationState
 from mlx_atomistic.dft._runtime_observer import (
@@ -69,6 +75,7 @@ from mlx_atomistic.dft.periodic_gth import (
 )
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import hartree_potential
+from mlx_atomistic.dft.spin_gga import ProductionSpinPBEExchangeCorrelation, SpinXCResult
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional, XCResult
 
 
@@ -125,6 +132,24 @@ def _scf_eigensolver_tolerance(
 def _density_residual(current: mx.array, target: mx.array, grid: RealSpaceGrid) -> float:
     delta = target - current
     return float(mx.sqrt(mx.sum(delta * delta) * grid.dv))
+
+
+def _default_periodic_band_count(
+    system: PeriodicDFTSystem,
+    config: PeriodicSCFConfig,
+) -> int:
+    """Return the smallest safe default band count for the active spin mode."""
+
+    spin = config.spin
+    if spin is None:
+        return int(round(system.electron_count / 2.0))
+    if spin.mode == "fixed_magnetization":
+        moment = float(spin.magnetization)
+        largest_channel = 0.5 * (system.electron_count + abs(moment))
+        count = int(np.ceil(largest_channel - 1.0e-12))
+    else:
+        count = int(np.ceil(system.electron_count / 2.0 - 1.0e-12))
+    return count + (1 if config.smearing is not None else 0)
 
 
 def _pack_initial_states(
@@ -298,15 +323,20 @@ class _PeriodicSCFSetup:
     kpoint_mesh: KPointMesh
     config: PeriodicSCFConfig
     compact_policy: _CompactBatchPolicy
-    xc: ExchangeCorrelationFunctional
+    xc: ExchangeCorrelationFunctional | None
+    spin_xc: ProductionSpinPBEExchangeCorrelation | None
+    spin: PeriodicCollinearSpinConfig | None
     band_count: int
     observer: RuntimeObserver | None
     ownership: TimeReversalOwnership
     bases: tuple[PlaneWaveBasis, ...]
+    spin_bases: tuple[tuple[PlaneWaveBasis, ...], ...]
     owned_indices: tuple[int, ...]
     nonlocal_operators: dict[int, PeriodicGTHNonlocalOperator]
+    spin_nonlocal_operators: tuple[dict[int, PeriodicGTHNonlocalOperator], ...]
     local_potential: mx.array
     mixer: LinearMixer | PulayDIISMixer
+    magnetization_mixer: LinearMixer | None
     ewald_energy: float
     resumed: bool
 
@@ -316,7 +346,12 @@ class _PeriodicSCFProgress:
     """Mutable accepted-iteration state owned by one SCF controller."""
 
     density: mx.array
+    spin_densities: tuple[mx.array, mx.array] | None
     previous_states: dict[int, _CompactLaneState | None]
+    spin_previous_states: tuple[
+        dict[int, _CompactLaneState | None],
+        dict[int, _CompactLaneState | None],
+    ] | None
     previous_energy: float | None
     history: list[dict[str, float | int | str | None]]
     energy_terms: dict[str, float]
@@ -324,6 +359,10 @@ class _PeriodicSCFProgress:
     lineage: tuple[str, ...]
     eigensolver_tolerance: float
     final_owned_results: tuple[PeriodicKPointResult, ...] = ()
+    final_spin_owned_results: tuple[
+        tuple[PeriodicKPointResult, ...],
+        tuple[PeriodicKPointResult, ...],
+    ] | None = None
     converged: bool = False
     stopped_for_checkpoint: bool = False
     final_checkpoint_state: _PeriodicSCFContinuationState | None = None
@@ -345,13 +384,20 @@ class _PeriodicSCFIterationResult:
     """One evaluated SCF iteration before convergence or mixing is accepted."""
 
     owned_results: tuple[PeriodicKPointResult, ...]
+    spin_owned_results: tuple[
+        tuple[PeriodicKPointResult, ...],
+        tuple[PeriodicKPointResult, ...],
+    ] | None
     target_density: mx.array
+    target_spin_densities: tuple[mx.array, mx.array] | None
     target_count: float
+    target_spin_counts: tuple[float, float] | None
     density_residual: float
+    magnetization_residual: float | None
     max_orbital_residual: float
     energy_delta: float | None
     energy_terms: dict[str, float]
-    occupations: _PeriodicOccupationResult
+    occupations: _PeriodicOccupationResult | _PeriodicSpinOccupationResult
     all_eigen_converged: bool
     eigen_residuals_directly_validated: bool
 
@@ -393,8 +439,19 @@ class _PeriodicSCFController:
     ) -> _PeriodicSCFController:
         scf_config = PeriodicSCFConfig() if config is None else config
         compact_policy = scf_config._compact_batch_policy()
-        xc = ProductionPBEExchangeCorrelation() if xc_functional is None else xc_functional
-        band_count = int(round(system.electron_count / 2.0)) if n_bands is None else n_bands
+        spin = scf_config.spin
+        if spin is not None and xc_functional is not None:
+            msg = "collinear spin does not accept an unpolarized xc_functional"
+            raise ValueError(msg)
+        xc = (
+            ProductionPBEExchangeCorrelation() if xc_functional is None else xc_functional
+        ) if spin is None else None
+        spin_xc = ProductionSpinPBEExchangeCorrelation() if spin is not None else None
+        band_count = (
+            _default_periodic_band_count(system, scf_config)
+            if n_bands is None
+            else n_bands
+        )
         cls._validate_request(
             system,
             kpoint_mesh=kpoint_mesh,
@@ -415,34 +472,64 @@ class _PeriodicSCFController:
             )
         with observed_phase(observer, "setup"):
             shared_reciprocal = ReciprocalGrid.from_real_space(system.grid)
-            bases = tuple(
-                PlaneWaveBasis.from_reduced_kpoint(
-                    system.grid,
-                    cutoff_hartree,
-                    point.vector,
-                    reciprocal_grid=shared_reciprocal,
-                    lane_label=f"kpoint:{point_index}",
-                    active_integer_g=(
-                        None
-                        if basis_integer_g is None
-                        else basis_integer_g[point_index]
-                    ),
+            def build_bases(channel_label: str | None) -> tuple[PlaneWaveBasis, ...]:
+                return tuple(
+                    PlaneWaveBasis.from_reduced_kpoint(
+                        system.grid,
+                        cutoff_hartree,
+                        point.vector,
+                        reciprocal_grid=shared_reciprocal,
+                        lane_label=(
+                            f"kpoint:{point_index}"
+                            if channel_label is None
+                            else f"spin:{channel_label}:kpoint:{point_index}"
+                        ),
+                        active_integer_g=(
+                            None
+                            if basis_integer_g is None
+                            else basis_integer_g[point_index]
+                        ),
+                    )
+                    for point_index, point in enumerate(kpoint_mesh.points)
                 )
-                for point_index, point in enumerate(kpoint_mesh.points)
-            )
+
+            if spin is None:
+                bases = build_bases(None)
+                spin_bases: tuple[tuple[PlaneWaveBasis, ...], ...] = ()
+            else:
+                spin_bases = (build_bases("up"), build_bases("down"))
+                bases = spin_bases[0]
             ownership = admit_time_reversal_bases(ownership, bases)
             if resume_state is None:
-                ownership, previous_states = _admit_initial_time_reversal(
-                    ownership,
-                    bases,
-                    initial_coefficients,
-                    n_bands=band_count,
-                )
+                if spin is None:
+                    ownership, previous_states = _admit_initial_time_reversal(
+                        ownership,
+                        bases,
+                        initial_coefficients,
+                        n_bands=band_count,
+                    )
+                    spin_previous_states = None
+                else:
+                    channel_states = []
+                    for channel_bases in spin_bases:
+                        channel_ownership, states = _admit_initial_time_reversal(
+                            ownership,
+                            channel_bases,
+                            initial_coefficients,
+                            n_bands=band_count,
+                        )
+                        if channel_ownership.to_dict() != ownership.to_dict():
+                            msg = "spin channels produced inconsistent time-reversal ownership"
+                            raise ValueError(msg)
+                        channel_states.append(states)
+                    spin_previous_states = (channel_states[0], channel_states[1])
+                    previous_states = channel_states[0]
             else:
                 ownership = _periodic_resume._resume_ownership(
                     ownership,
                     resume_state.ownership,
                 )
+                spin_previous_states = None
             owned_indices = ownership.owned_indices
             gamma_basis = PlaneWaveBasis(
                 system.grid,
@@ -459,6 +546,22 @@ class _PeriodicSCFController:
                 )
                 for point_index in owned_indices
             }
+            spin_nonlocal_operators = (
+                ()
+                if spin is None
+                else tuple(
+                    {
+                        point_index: PeriodicGTHNonlocalOperator(
+                            system.pseudopotentials,
+                            channel_bases[point_index],
+                            system.positions,
+                            cache=projector_cache,
+                        )
+                        for point_index in owned_indices
+                    }
+                    for channel_bases in spin_bases
+                )
+            )
             local_potential = gth_local_potential_grid(
                 system.pseudopotentials,
                 gamma_basis,
@@ -469,29 +572,65 @@ class _PeriodicSCFController:
                 if scf_config.mixer == "diis"
                 else LinearMixer(beta=scf_config.mixing_beta)
             )
+            magnetization_mixer = (
+                None
+                if spin is None
+                else LinearMixer(beta=spin.magnetization_mixing_beta)
+            )
             if resume_state is None:
                 density = cls._initial_density(system, initial_density)
+                spin_densities = cls._initial_spin_densities(system, density, spin)
                 previous_energy: float | None = None
                 history: list[dict[str, float | int | str | None]] = []
                 energy_terms: dict[str, float] = {}
                 iteration_start = 1
                 lineage: tuple[str, ...] = ()
             else:
-                (
-                    density,
-                    previous_states,
-                    restored_energy,
-                    history,
-                    energy_terms,
-                ) = _periodic_resume._restore_continuation_state(
-                    resume_state,
-                    bases=bases,
-                    ownership=ownership,
-                    band_count=band_count,
-                    grid=system.grid,
-                    electron_count=system.electron_count,
-                    mixer=mixer,
-                )
+                if spin is None:
+                    (
+                        density,
+                        previous_states,
+                        restored_energy,
+                        history,
+                        energy_terms,
+                    ) = _periodic_resume._restore_continuation_state(
+                        resume_state,
+                        bases=bases,
+                        ownership=ownership,
+                        band_count=band_count,
+                        grid=system.grid,
+                        electron_count=system.electron_count,
+                        mixer=mixer,
+                    )
+                    spin_densities = None
+                else:
+                    if magnetization_mixer is None:
+                        raise RuntimeError("spin resume requires a magnetization mixer")
+                    (
+                        density,
+                        restored_spin_states,
+                        spin_densities,
+                        restored_energy,
+                        history,
+                        energy_terms,
+                    ) = _periodic_resume._restore_spin_continuation_state(
+                        resume_state,
+                        up_bases=spin_bases[0],
+                        down_bases=spin_bases[1],
+                        ownership=ownership,
+                        band_count=band_count,
+                        grid=system.grid,
+                        electron_count=system.electron_count,
+                        expected_magnetization=(
+                            float(spin.magnetization)
+                            if spin.mode == "fixed_magnetization"
+                            else None
+                        ),
+                        mixer=mixer,
+                        magnetization_mixer=magnetization_mixer,
+                    )
+                    spin_previous_states = restored_spin_states
+                    previous_states = restored_spin_states[0]
                 previous_energy = restored_energy
                 iteration_start = resume_state.completed_iteration + 1
                 lineage = resume_state.lineage
@@ -511,20 +650,27 @@ class _PeriodicSCFController:
             config=scf_config,
             compact_policy=compact_policy,
             xc=xc,
+            spin_xc=spin_xc,
+            spin=spin,
             band_count=band_count,
             observer=observer,
             ownership=ownership,
             bases=bases,
+            spin_bases=spin_bases,
             owned_indices=owned_indices,
             nonlocal_operators=nonlocal_operators,
+            spin_nonlocal_operators=spin_nonlocal_operators,
             local_potential=local_potential,
             mixer=mixer,
+            magnetization_mixer=magnetization_mixer,
             ewald_energy=ewald,
             resumed=resume_state is not None,
         )
         progress = _PeriodicSCFProgress(
             density=density,
+            spin_densities=spin_densities,
             previous_states=previous_states,
+            spin_previous_states=spin_previous_states,
             previous_energy=previous_energy,
             history=history,
             energy_terms=energy_terms,
@@ -556,13 +702,42 @@ class _PeriodicSCFController:
             msg = "n_bands must be a positive non-bool integer"
             raise ValueError(msg)
         capacity = 2.0 * band_count
-        if config.smearing is None:
-            if abs(capacity - system.electron_count) > 1e-8:
-                msg = "fixed periodic occupations require two electrons per computed band"
+        spin = config.spin
+        if spin is None:
+            if config.smearing is None:
+                if abs(capacity - system.electron_count) > 1e-8:
+                    msg = "fixed periodic occupations require two electrons per computed band"
+                    raise ValueError(msg)
+            elif capacity <= system.electron_count:
+                msg = "Fermi-Dirac smearing requires at least one partially empty band"
                 raise ValueError(msg)
-        elif capacity <= system.electron_count:
-            msg = "Fermi-Dirac smearing requires at least one partially empty band"
-            raise ValueError(msg)
+        else:
+            if spin.initial_magnetization is not None and abs(
+                float(spin.initial_magnetization)
+            ) > system.electron_count:
+                msg = "initial magnetization must lie within the electron count"
+                raise ValueError(msg)
+            if spin.mode == "fixed_magnetization":
+                moment = float(spin.magnetization)
+                if abs(moment) > system.electron_count:
+                    msg = "fixed magnetization must lie within the electron count"
+                    raise ValueError(msg)
+                targets = (
+                    0.5 * (system.electron_count + moment),
+                    0.5 * (system.electron_count - moment),
+                )
+                if config.smearing is None and any(
+                    not np.isclose(target, round(target), atol=1.0e-10, rtol=0.0)
+                    for target in targets
+                ):
+                    msg = "fixed spin occupations require integer channel electron counts"
+                    raise ValueError(msg)
+                if any(target > band_count for target in targets):
+                    msg = "n_bands is smaller than a fixed spin-channel electron count"
+                    raise ValueError(msg)
+            elif capacity <= system.electron_count:
+                msg = "unconstrained spin requires partially empty two-channel capacity"
+                raise ValueError(msg)
         if any(point.coordinate_system != "reduced" for point in kpoint_mesh.points):
             msg = "periodic SCF requires reduced-coordinate k-points"
             raise ValueError(msg)
@@ -606,6 +781,25 @@ class _PeriodicSCFController:
             msg = "initial_density must integrate to a positive count"
             raise ValueError(msg)
         return density * (system.electron_count / count)
+
+    @staticmethod
+    def _initial_spin_densities(
+        system: PeriodicDFTSystem,
+        total_density: mx.array,
+        spin: PeriodicCollinearSpinConfig | None,
+    ) -> tuple[mx.array, mx.array] | None:
+        if spin is None:
+            return None
+        moment = (
+            float(spin.initial_magnetization or 0.0)
+            if spin.mode == "unconstrained"
+            else float(spin.magnetization)
+        )
+        up_fraction = 0.5 * (1.0 + moment / system.electron_count)
+        up = (total_density * up_fraction).astype(mx.float32)
+        down = (total_density - up).astype(mx.float32)
+        mx.eval(up, down)
+        return up, down
 
     @staticmethod
     def _emit_setup_completed(
@@ -661,6 +855,8 @@ class _PeriodicSCFController:
             )
 
     def _evaluate_iteration(self, iteration: int) -> _PeriodicSCFIterationResult:
+        if self.setup.spin is not None:
+            return self._evaluate_spin_iteration(iteration)
         hartree, xc_result, effective_snapshot = self._effective_potential()
         (
             owned_results,
@@ -753,9 +949,13 @@ class _PeriodicSCFController:
             )
         return _PeriodicSCFIterationResult(
             owned_results=owned_results,
+            spin_owned_results=None,
             target_density=target_density,
+            target_spin_densities=None,
             target_count=target_count,
+            target_spin_counts=None,
             density_residual=density_residual,
+            magnetization_residual=None,
             max_orbital_residual=max_orbital_residual,
             energy_delta=energy_delta,
             energy_terms=energy_terms,
@@ -764,9 +964,204 @@ class _PeriodicSCFController:
             eigen_residuals_directly_validated=eigen_residuals_directly_validated,
         )
 
+    def _evaluate_spin_iteration(self, iteration: int) -> _PeriodicSCFIterationResult:
+        hartree, xc_result, effective_snapshots = self._spin_effective_potentials()
+        solved = tuple(
+            self._solve_owned_kpoints(
+                iteration,
+                effective_snapshot,
+                channel_index=channel_index,
+            )
+            for channel_index, effective_snapshot in enumerate(effective_snapshots)
+        )
+        owned_by_channel = (solved[0][0], solved[1][0])
+        with observed_phase(self.setup.observer, "density"):
+            smearing = self.setup.config.smearing
+            spin = self.setup.spin
+            if spin is None:
+                raise RuntimeError("spin iteration requires a spin configuration")
+            occupations = _resolve_periodic_spin_occupations(
+                (
+                    tuple(
+                        np.asarray(result.eigen.eigenvalues)
+                        for result in owned_by_channel[0]
+                    ),
+                    tuple(
+                        np.asarray(result.eigen.eigenvalues)
+                        for result in owned_by_channel[1]
+                    ),
+                ),
+                tuple(result.integration_weight for result in owned_by_channel[0]),
+                electron_count=self.setup.system.electron_count,
+                smearing_width_hartree=(
+                    None if smearing is None else smearing.width_hartree
+                ),
+                magnetization=(
+                    float(spin.magnetization)
+                    if spin.mode == "fixed_magnetization"
+                    else None
+                ),
+            )
+            resolved_channels = tuple(
+                tuple(
+                    replace(result, occupations=values)
+                    for result, values in zip(results, channel_occupations, strict=True)
+                )
+                for results, channel_occupations in zip(
+                    owned_by_channel,
+                    occupations.occupations,
+                    strict=True,
+                )
+            )
+            target_channels = []
+            raw_counts = []
+            for channel_index, results in enumerate(resolved_channels):
+                target = _density_from_kpoints(
+                    results,
+                    occupation=None,
+                    policy=self.setup.compact_policy,
+                    observer=self.setup.observer,
+                    orbital_densities=None,
+                )
+                raw_count = float(mx.sum(target) * self.setup.system.grid.dv)
+                expected_count = occupations.electron_counts[channel_index]
+                if expected_count == 0.0:
+                    target = mx.zeros_like(target)
+                elif raw_count <= 0.0 or not np.isfinite(raw_count):
+                    raise ValueError("spin density construction produced an empty channel")
+                else:
+                    target = target * (expected_count / raw_count)
+                target_channels.append(target)
+                raw_counts.append(raw_count)
+            target_spin_densities = (target_channels[0], target_channels[1])
+            target_density = target_channels[0] + target_channels[1]
+            target_magnetization = target_channels[0] - target_channels[1]
+            current_spin = self.progress.spin_densities
+            if current_spin is None:
+                raise RuntimeError("spin iteration has no accepted channel densities")
+            current_magnetization = current_spin[0] - current_spin[1]
+            charge_residual = _density_residual(
+                self.progress.density,
+                target_density,
+                self.setup.system.grid,
+            )
+            magnetization_residual = _density_residual(
+                current_magnetization,
+                target_magnetization,
+                self.setup.system.grid,
+            )
+            density_residual = max(charge_residual, magnetization_residual)
+
+        band_energy = sum(
+            result.integration_weight
+            * float(
+                np.dot(
+                    np.asarray(result.occupations, dtype=np.float64),
+                    np.asarray(result.eigen.eigenvalues, dtype=np.float64),
+                )
+            )
+            for channel_results in resolved_channels
+            for result in channel_results
+        )
+        hartree_energy = 0.5 * float(
+            mx.sum(self.progress.density * hartree) * self.setup.system.grid.dv
+        )
+        xc_energy = float(xc_result.total_energy)
+        current_spin = self.progress.spin_densities
+        if current_spin is None:
+            raise RuntimeError("spin energy evaluation has no channel densities")
+        density_xc = float(
+            mx.sum(
+                current_spin[0] * xc_result.up_potential
+                + current_spin[1] * xc_result.down_potential
+            )
+            * self.setup.system.grid.dv
+        )
+        internal_energy = (
+            band_energy - hartree_energy + xc_energy - density_xc + self.setup.ewald_energy
+        )
+        entropy_correction = -(
+            0.0
+            if smearing is None
+            else smearing.width_hartree * occupations.electronic_entropy
+        )
+        total_energy = internal_energy + entropy_correction
+        energy_delta = (
+            None
+            if self.progress.previous_energy is None
+            else total_energy - self.progress.previous_energy
+        )
+        energy_terms = {
+            "band": band_energy,
+            "hartree": hartree_energy,
+            "xc": xc_energy,
+            "density_xc_potential": density_xc,
+            "ion_ewald": self.setup.ewald_energy,
+            "total": total_energy,
+        }
+        if smearing is not None:
+            energy_terms.update(
+                {
+                    "internal_total": internal_energy,
+                    "entropy_correction": entropy_correction,
+                }
+            )
+        all_results = resolved_channels[0] + resolved_channels[1]
+        return _PeriodicSCFIterationResult(
+            owned_results=(),
+            spin_owned_results=(resolved_channels[0], resolved_channels[1]),
+            target_density=target_density,
+            target_spin_densities=target_spin_densities,
+            target_count=sum(occupations.electron_counts),
+            target_spin_counts=occupations.electron_counts,
+            density_residual=density_residual,
+            magnetization_residual=magnetization_residual,
+            max_orbital_residual=max(solved[0][1], solved[1][1]),
+            energy_delta=energy_delta,
+            energy_terms=energy_terms,
+            occupations=occupations,
+            all_eigen_converged=all(result.eigen.converged for result in all_results),
+            eigen_residuals_directly_validated=solved[0][3] and solved[1][3],
+        )
+
+    def _spin_effective_potentials(
+        self,
+    ) -> tuple[mx.array, SpinXCResult, tuple[mx.array, mx.array]]:
+        start = perf_counter()
+        spin_densities = self.progress.spin_densities
+        spin_xc = self.setup.spin_xc
+        if spin_densities is None or spin_xc is None:
+            raise RuntimeError("spin effective potential requires two channel densities")
+        hartree = hartree_potential(self.progress.density, self.setup.system.grid)
+        xc_result = spin_xc.evaluate(
+            spin_densities[0],
+            spin_densities[1],
+            self.setup.system.grid,
+        )
+        snapshots = (
+            mx.array(self.setup.local_potential + hartree + xc_result.up_potential),
+            mx.array(self.setup.local_potential + hartree + xc_result.down_potential),
+        )
+        finite = (
+            mx.all(mx.isfinite(xc_result.energy_density))
+            & mx.all(mx.isfinite(xc_result.potentials))
+            & mx.isfinite(xc_result.total_energy)
+            & mx.all(mx.isfinite(snapshots[0]))
+            & mx.all(mx.isfinite(snapshots[1]))
+        )
+        mx.eval(snapshots[0], snapshots[1], finite)
+        self.progress.timings["effective_potential"] += (
+            perf_counter() - start
+        ) * 1000.0
+        if not bool(finite):
+            raise ValueError("spin SCF effective potential is non-finite")
+        return hartree, xc_result, snapshots
+
     def _effective_potential(self) -> tuple[mx.array, XCResult, mx.array]:
         start = perf_counter()
         hartree = hartree_potential(self.progress.density, self.setup.system.grid)
+        if self.setup.xc is None:
+            raise RuntimeError("unpolarized effective potential requires an XC functional")
         xc_result = self.setup.xc.evaluate(
             self.progress.density,
             self.setup.system.grid,
@@ -794,6 +1189,8 @@ class _PeriodicSCFController:
         self,
         iteration: int,
         effective_snapshot: mx.array,
+        *,
+        channel_index: int | None = None,
     ) -> tuple[
         tuple[PeriodicKPointResult, ...],
         float,
@@ -801,17 +1198,28 @@ class _PeriodicSCFController:
         bool,
     ]:
         start = perf_counter()
+        if channel_index is None:
+            bases = self.setup.bases
+            nonlocal_operators = self.setup.nonlocal_operators
+            previous_states = self.progress.previous_states
+        else:
+            bases = self.setup.spin_bases[channel_index]
+            nonlocal_operators = self.setup.spin_nonlocal_operators[channel_index]
+            spin_previous_states = self.progress.spin_previous_states
+            if spin_previous_states is None:
+                raise RuntimeError("spin eigensolve has no previous channel states")
+            previous_states = spin_previous_states[channel_index]
         operators_by_index = {
             point_index: PeriodicKohnShamOperator._from_shared_potential(
-                self.setup.bases[point_index],
+                bases[point_index],
                 effective_snapshot,
-                self.setup.nonlocal_operators[point_index],
+                nonlocal_operators[point_index],
                 self.setup.observer,
             )
             for point_index in self.setup.owned_indices
         }
         lane_to_index = {
-            self.setup.bases[point_index]._layout.lane_id: point_index
+            bases[point_index]._layout.lane_id: point_index
             for point_index in self.setup.owned_indices
         }
         iteration_davidson = replace(
@@ -824,22 +1232,24 @@ class _PeriodicSCFController:
             <= float(self.setup.config.davidson.tolerance)
         )
         capture_orbital_density = (
-            require_direct_validation and self.setup.config.smearing is None
+            require_direct_validation
+            and self.setup.config.smearing is None
+            and channel_index is None
         )
         requests = tuple(
             _DavidsonLaneRequest(
-                lane_id=self.setup.bases[point_index]._layout.lane_id,
+                lane_id=bases[point_index]._layout.lane_id,
                 operator=operators_by_index[point_index],
                 n_bands=self.setup.band_count,
                 config=iteration_davidson,
                 trial=_initial_trial(
-                    self.setup.bases[point_index],
+                    bases[point_index],
                     self.setup.band_count,
-                    self.progress.previous_states.get(point_index),
+                    previous_states.get(point_index),
                 ),
                 observer=self.setup.observer,
                 trial_is_orthonormal=(
-                    self.progress.previous_states.get(point_index) is None
+                    previous_states.get(point_index) is None
                     or self.setup.resumed
                     or iteration > self.progress.iteration_start
                 ),
@@ -874,7 +1284,7 @@ class _PeriodicSCFController:
         )
         max_orbital_residual = 0.0
         for point_index in self.setup.owned_indices:
-            basis = self.setup.bases[point_index]
+            basis = bases[point_index]
             entry = self.setup.ownership.entry_for(point_index)
             eigen = eigen_outcome.result_for(basis._layout.lane_id)
             if orbital_density_by_index is not None:
@@ -1001,38 +1411,56 @@ class _PeriodicSCFController:
         outcome: _PeriodicSCFIterationResult,
     ) -> None:
         self.progress.final_owned_results = outcome.owned_results
+        self.progress.final_spin_owned_results = outcome.spin_owned_results
         self.progress.density_residual = outcome.density_residual
         self.progress.energy_delta = outcome.energy_delta
         self.progress.energy_terms = outcome.energy_terms
-        self.progress.history.append(
-            {
-                "iteration": iteration,
-                "total_energy_hartree": outcome.energy_terms["total"],
-                "energy_delta_hartree": outcome.energy_delta,
-                "density_residual": outcome.density_residual,
-                "electron_count": outcome.target_count,
-                "max_orbital_residual": outcome.max_orbital_residual,
-                "eigensolver_tolerance": self.progress.eigensolver_tolerance,
-                "eigensolver_method": "davidson",
-                "all_kpoints_converged": str(outcome.all_eigen_converged).lower(),
-                "orbital_residual_source": (
-                    "direct_operator"
-                    if outcome.eigen_residuals_directly_validated
-                    else "paired_subspace"
-                ),
-                "internal_energy_hartree": outcome.energy_terms.get(
-                    "internal_total",
-                    outcome.energy_terms["total"],
-                ),
-                "chemical_potential_hartree": outcome.occupations.chemical_potential,
-                "electronic_entropy": outcome.occupations.electronic_entropy,
-                "smearing_width_hartree": (
-                    None
-                    if self.setup.config.smearing is None
-                    else self.setup.config.smearing.width_hartree
-                ),
-            }
-        )
+        if isinstance(outcome.occupations, _PeriodicSpinOccupationResult):
+            chemical_potential = outcome.occupations.shared_chemical_potential
+            spin_counts = outcome.occupations.electron_counts
+            spin_chemical_potentials = outcome.occupations.chemical_potentials
+        else:
+            chemical_potential = outcome.occupations.chemical_potential
+            spin_counts = (None, None)
+            spin_chemical_potentials = (None, None)
+        record: dict[str, float | int | str | None] = {
+            "iteration": iteration,
+            "total_energy_hartree": outcome.energy_terms["total"],
+            "energy_delta_hartree": outcome.energy_delta,
+            "density_residual": outcome.density_residual,
+            "magnetization_residual": outcome.magnetization_residual,
+            "electron_count": outcome.target_count,
+            "spin_up_electron_count": spin_counts[0],
+            "spin_down_electron_count": spin_counts[1],
+            "integrated_magnetization": (
+                None
+                if spin_counts[0] is None
+                else float(spin_counts[0]) - float(spin_counts[1])
+            ),
+            "max_orbital_residual": outcome.max_orbital_residual,
+            "eigensolver_tolerance": self.progress.eigensolver_tolerance,
+            "eigensolver_method": "davidson",
+            "all_kpoints_converged": str(outcome.all_eigen_converged).lower(),
+            "orbital_residual_source": (
+                "direct_operator"
+                if outcome.eigen_residuals_directly_validated
+                else "paired_subspace"
+            ),
+            "internal_energy_hartree": outcome.energy_terms.get(
+                "internal_total",
+                outcome.energy_terms["total"],
+            ),
+            "chemical_potential_hartree": chemical_potential,
+            "spin_up_chemical_potential_hartree": spin_chemical_potentials[0],
+            "spin_down_chemical_potential_hartree": spin_chemical_potentials[1],
+            "electronic_entropy": outcome.occupations.electronic_entropy,
+            "smearing_width_hartree": (
+                None
+                if self.setup.config.smearing is None
+                else self.setup.config.smearing.width_hartree
+            ),
+        }
+        self.progress.history.append(record)
         observer = self.setup.observer
         if observer is not None:
             observer.emit(
@@ -1055,7 +1483,10 @@ class _PeriodicSCFController:
                     "internal_total",
                     outcome.energy_terms["total"],
                 ),
-                chemical_potential_hartree=outcome.occupations.chemical_potential,
+                chemical_potential_hartree=chemical_potential,
+                spin_up_electron_count=spin_counts[0],
+                spin_down_electron_count=spin_counts[1],
+                magnetization_residual=outcome.magnetization_residual,
                 electronic_entropy=outcome.occupations.electronic_entropy,
                 smearing_width_hartree=(
                     None
@@ -1082,6 +1513,7 @@ class _PeriodicSCFController:
         if converged:
             self.progress.converged = True
             self.progress.density = outcome.target_density
+            self.progress.spin_densities = outcome.target_spin_densities
         return converged
 
     def _advance_unconverged(
@@ -1094,13 +1526,30 @@ class _PeriodicSCFController:
             outcome.density_residual,
             self.setup.system.electron_count,
         )
-        self._mix_density(outcome.target_density)
+        if outcome.target_spin_densities is None:
+            self._mix_density(outcome.target_density)
+        else:
+            self._mix_spin_densities(
+                outcome.target_density,
+                outcome.target_spin_densities,
+            )
         self.progress.previous_energy = outcome.energy_terms["total"]
-        self.progress.previous_states = {
-            result.explicit_index: result.eigen._compact_coefficients
-            for result in outcome.owned_results
-            if result.explicit_index is not None
-        }
+        if outcome.spin_owned_results is None:
+            self.progress.previous_states = {
+                result.explicit_index: result.eigen._compact_coefficients
+                for result in outcome.owned_results
+                if result.explicit_index is not None
+            }
+        else:
+            channel_states = tuple(
+                {
+                    result.explicit_index: result.eigen._compact_coefficients
+                    for result in results
+                    if result.explicit_index is not None
+                }
+                for results in outcome.spin_owned_results
+            )
+            self.progress.spin_previous_states = (channel_states[0], channel_states[1])
 
     def _mix_density(self, target_density: mx.array) -> None:
         with observed_phase(self.setup.observer, "mixing"):
@@ -1152,6 +1601,77 @@ class _PeriodicSCFController:
                     (4 + 2 * stored_history) * self.setup.system.grid.size * 4,
                 )
 
+    def _mix_spin_densities(
+        self,
+        target_density: mx.array,
+        target_spin_densities: tuple[mx.array, mx.array],
+    ) -> None:
+        current_spin = self.progress.spin_densities
+        magnetization_mixer = self.setup.magnetization_mixer
+        if current_spin is None or magnetization_mixer is None:
+            raise RuntimeError("spin mixing requires charge and magnetization state")
+        with observed_phase(self.setup.observer, "mixing"):
+            mixed_charge = self.setup.mixer.mix(self.progress.density, target_density)
+            mixed_magnetization = magnetization_mixer.mix(
+                current_spin[0] - current_spin[1],
+                target_spin_densities[0] - target_spin_densities[1],
+            )
+            charge_count = mx.sum(mixed_charge) * self.setup.system.grid.dv
+            finite = (
+                mx.all(mx.isfinite(mixed_charge))
+                & mx.all(mx.isfinite(mixed_magnetization))
+                & mx.isfinite(charge_count)
+            )
+            mx.eval(mixed_charge, mixed_magnetization, charge_count, finite)
+            if not bool(finite) or float(charge_count) <= 0.0:
+                raise ValueError("spin mixer produced a non-finite or empty charge density")
+            mixed_charge = mixed_charge * (
+                self.setup.system.electron_count / float(charge_count)
+            )
+            raw_up = mx.maximum(0.5 * (mixed_charge + mixed_magnetization), 0.0)
+            raw_down = mx.maximum(0.5 * (mixed_charge - mixed_magnetization), 0.0)
+            moment = float(
+                mx.sum(mixed_magnetization) * self.setup.system.grid.dv
+            )
+            spin = self.setup.spin
+            if spin is None:
+                raise RuntimeError("spin mixer has no spin configuration")
+            if spin.mode == "fixed_magnetization":
+                moment = float(spin.magnetization)
+            moment = float(
+                np.clip(moment, -self.setup.system.electron_count, self.setup.system.electron_count)
+            )
+            channel_counts = (
+                0.5 * (self.setup.system.electron_count + moment),
+                0.5 * (self.setup.system.electron_count - moment),
+            )
+
+            def normalize_channel(values: mx.array, expected_count: float) -> mx.array:
+                count = float(mx.sum(values) * self.setup.system.grid.dv)
+                if expected_count == 0.0:
+                    return mx.zeros_like(values)
+                if not np.isfinite(count) or count <= 0.0:
+                    raise ValueError("spin mixer produced an empty occupied channel")
+                return (values * (expected_count / count)).astype(mx.float32)
+
+            up = normalize_channel(raw_up, channel_counts[0])
+            down = normalize_channel(raw_down, channel_counts[1])
+            total = up + down
+            valid = (
+                mx.all(mx.isfinite(up))
+                & mx.all(mx.isfinite(down))
+                & (mx.min(up) >= 0.0)
+                & (mx.min(down) >= 0.0)
+            )
+            total_count = mx.sum(total) * self.setup.system.grid.dv
+            mx.eval(up, down, total, valid, total_count)
+            if not bool(valid) or abs(
+                float(total_count) - self.setup.system.electron_count
+            ) > 1.0e-4:
+                raise ValueError("spin mixer failed charge and positivity validation")
+            self.progress.spin_densities = (up, down)
+            self.progress.density = total
+
     def _checkpoint(self, iteration: int) -> bool:
         if self.checkpoint_callback is None or (
             self.checkpoint_iteration is not None and self.checkpoint_iteration != iteration
@@ -1167,16 +1687,24 @@ class _PeriodicSCFController:
             )
         try:
             with observed_phase(observer, "persistence"):
+                spin_owned = self.progress.final_spin_owned_results
                 checkpoint_state = _periodic_resume._continuation_state_from_boundary(
                     completed_iteration=iteration,
                     density=self.progress.density,
-                    owned_results=self.progress.final_owned_results,
+                    owned_results=(
+                        self.progress.final_owned_results
+                        if spin_owned is None
+                        else spin_owned[0]
+                    ),
                     previous_energy=float(self.progress.energy_terms["total"]),
                     energy_by_term=self.progress.energy_terms,
                     history=self.progress.history,
                     mixer=self.setup.mixer,
                     ownership=self.setup.ownership,
                     lineage=self.progress.lineage,
+                    spin_densities=self.progress.spin_densities,
+                    down_owned_results=() if spin_owned is None else spin_owned[1],
+                    magnetization_mixer=self.setup.magnetization_mixer,
                 )
                 self.progress.final_checkpoint_state = checkpoint_state
                 stop_after_checkpoint = bool(self.checkpoint_callback(checkpoint_state))
@@ -1200,17 +1728,66 @@ class _PeriodicSCFController:
         return stop_after_checkpoint
 
     def _finalize(self, iteration: int) -> PeriodicSCFResult:
-        final_owned_by_index = {
-            result.explicit_index: result
-            for result in self.progress.final_owned_results
-            if result.explicit_index is not None
-        }
-        final_results = _publish_explicit_kpoints(
-            self.setup.ownership,
-            self.setup.bases,
-            final_owned_by_index,
-            self.setup.observer,
-        )
+        if self.progress.final_spin_owned_results is None:
+            final_owned_by_index = {
+                result.explicit_index: result
+                for result in self.progress.final_owned_results
+                if result.explicit_index is not None
+            }
+            final_results = _publish_explicit_kpoints(
+                self.setup.ownership,
+                self.setup.bases,
+                final_owned_by_index,
+                self.setup.observer,
+            )
+            spin_channels: tuple[PeriodicSpinChannelResult, ...] = ()
+            magnetization_density = None
+            integrated_magnetization = None
+        else:
+            explicit_channels = tuple(
+                _publish_explicit_kpoints(
+                    self.setup.ownership,
+                    self.setup.spin_bases[channel_index],
+                    {
+                        result.explicit_index: result
+                        for result in owned_results
+                        if result.explicit_index is not None
+                    },
+                    self.setup.observer,
+                )
+                for channel_index, owned_results in enumerate(
+                    self.progress.final_spin_owned_results
+                )
+            )
+            final_results = ()
+            spin_densities = self.progress.spin_densities
+            if spin_densities is None:
+                raise RuntimeError("spin finalization has no channel densities")
+            channel_counts = tuple(
+                float(mx.sum(density) * self.setup.system.grid.dv)
+                for density in spin_densities
+            )
+            final_history = self.progress.history[-1]
+            channel_chemical_potentials = (
+                final_history["spin_up_chemical_potential_hartree"],
+                final_history["spin_down_chemical_potential_hartree"],
+            )
+            spin_channels = tuple(
+                PeriodicSpinChannelResult(
+                    label=label,
+                    electron_count=channel_counts[channel_index],
+                    density=spin_densities[channel_index],
+                    kpoints=explicit_channels[channel_index],
+                    chemical_potential=(
+                        None
+                        if channel_chemical_potentials[channel_index] is None
+                        else float(channel_chemical_potentials[channel_index])
+                    ),
+                )
+                for channel_index, label in enumerate(("up", "down"))
+            )
+            magnetization_density = spin_densities[0] - spin_densities[1]
+            integrated_magnetization = channel_counts[0] - channel_counts[1]
         electron_count = float(mx.sum(self.progress.density) * self.setup.system.grid.dv)
         final_history = self.progress.history[-1]
         self._emit_completion(iteration)
@@ -1259,7 +1836,14 @@ class _PeriodicSCFController:
                 if self.setup.config.smearing is None
                 else self.setup.config.smearing.width_hartree
             ),
-            _owned_kpoints=self.progress.final_owned_results,
+            spin_channels=spin_channels,
+            integrated_magnetization=integrated_magnetization,
+            magnetization_density=magnetization_density,
+            _owned_kpoints=(
+                self.progress.final_owned_results
+                if self.progress.final_spin_owned_results is None
+                else ()
+            ),
             _checkpoint_state=(
                 None if self.progress.converged else self.progress.final_checkpoint_state
             ),

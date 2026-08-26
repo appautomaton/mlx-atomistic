@@ -283,6 +283,54 @@ class PeriodicFermiDiracSmearing:
 
 
 @dataclass(frozen=True)
+class PeriodicCollinearSpinConfig:
+    """Controls for collinear spin-polarized periodic SCF.
+
+    Args:
+        mode: Electron-allocation mode. ``fixed_magnetization`` preserves a
+            caller-supplied total moment, while ``unconstrained`` resolves one
+            shared Fermi level across both spin channels.
+        magnetization: Fixed electron-count difference ``N_up - N_down``.
+            Required only for ``fixed_magnetization``.
+        initial_magnetization: Optional initial electron-count difference for
+            unconstrained SCF. It seeds symmetry breaking without constraining
+            the converged moment.
+        magnetization_mixing_beta: Linear damping applied to the signed
+            magnetization density after charge-density mixing.
+    """
+
+    mode: str = "fixed_magnetization"
+    magnetization: float | None = 0.0
+    initial_magnetization: float | None = None
+    magnetization_mixing_beta: float = 0.2
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"fixed_magnetization", "unconstrained"}:
+            msg = "spin mode must be 'fixed_magnetization' or 'unconstrained'"
+            raise ValueError(msg)
+        if self.mode == "fixed_magnetization":
+            if self.magnetization is None or not np.isfinite(float(self.magnetization)):
+                msg = "fixed_magnetization mode requires a finite magnetization"
+                raise ValueError(msg)
+            if self.initial_magnetization is not None:
+                msg = "fixed_magnetization mode does not accept a separate initial seed"
+                raise ValueError(msg)
+        elif self.magnetization is not None:
+            msg = "unconstrained spin mode does not accept a fixed magnetization"
+            raise ValueError(msg)
+        if self.initial_magnetization is not None and not np.isfinite(
+            float(self.initial_magnetization)
+        ):
+            msg = "initial_magnetization must be finite when supplied"
+            raise ValueError(msg)
+        if not _is_finite_positive_control(self.magnetization_mixing_beta) or (
+            float(self.magnetization_mixing_beta) > 1.0
+        ):
+            msg = "magnetization_mixing_beta must lie in (0, 1]"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
 class PeriodicSCFConfig:
     """Controls for weighted k-point self-consistent field iteration."""
 
@@ -302,6 +350,7 @@ class PeriodicSCFConfig:
     initial_eigensolver_tolerance: float = 1e-2
     eigensolver_tolerance_scale: float = 0.1
     smearing: PeriodicFermiDiracSmearing | None = None
+    spin: PeriodicCollinearSpinConfig | None = None
 
     def __post_init__(self) -> None:
         self._validate_iteration_controls()
@@ -312,6 +361,19 @@ class PeriodicSCFConfig:
         ):
             msg = "smearing must be PeriodicFermiDiracSmearing or None"
             raise TypeError(msg)
+        if self.spin is not None and not isinstance(
+            self.spin,
+            PeriodicCollinearSpinConfig,
+        ):
+            msg = "spin must be PeriodicCollinearSpinConfig or None"
+            raise TypeError(msg)
+        if (
+            self.spin is not None
+            and self.spin.mode == "unconstrained"
+            and self.smearing is None
+        ):
+            msg = "unconstrained collinear spin requires Fermi-Dirac smearing"
+            raise ValueError(msg)
         self._compact_batch_policy()
 
     def _validate_iteration_controls(self) -> None:
@@ -659,6 +721,27 @@ class _TimeReversalContinuationSeed:
 
 
 @dataclass(frozen=True)
+class PeriodicSpinChannelResult:
+    """One physical channel of a collinear periodic SCF result."""
+
+    label: str
+    electron_count: float
+    density: mx.array
+    kpoints: tuple[PeriodicKPointResult, ...]
+    chemical_potential: float | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe spin-channel summary."""
+
+        return {
+            "label": self.label,
+            "electron_count": self.electron_count,
+            "chemical_potential_hartree": self.chemical_potential,
+            "kpoints": [result.to_dict() for result in self.kpoints],
+        }
+
+
+@dataclass(frozen=True)
 class PeriodicSCFResult:
     """Result bundle for a weighted periodic plane-wave SCF calculation.
 
@@ -690,6 +773,13 @@ class PeriodicSCFResult:
     chemical_potential: float | None = None
     electronic_entropy: float = 0.0
     smearing_width_hartree: float | None = None
+    spin_channels: tuple[PeriodicSpinChannelResult, ...] = ()
+    integrated_magnetization: float | None = None
+    magnetization_density: mx.array | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _owned_kpoints: tuple[PeriodicKPointResult, ...] | None = field(
         default=None,
         repr=False,
@@ -762,6 +852,8 @@ class PeriodicSCFResult:
             "chemical_potential_hartree": self.chemical_potential,
             "electronic_entropy": self.electronic_entropy,
             "smearing_width_hartree": self.smearing_width_hartree,
+            "spin_channels": [channel.to_dict() for channel in self.spin_channels],
+            "integrated_magnetization": self.integrated_magnetization,
             "density_residual": self.density_residual,
             "energy_delta_hartree": self.energy_delta,
             "kpoints": [result.to_dict() for result in self.kpoints],

@@ -235,6 +235,16 @@ def _config_payload(config: PeriodicSCFConfig) -> dict[str, object]:
                 "width_hartree": config.smearing.width_hartree,
             }
         ),
+        "spin": (
+            None
+            if config.spin is None
+            else {
+                "mode": config.spin.mode,
+                "magnetization": config.spin.magnetization,
+                "initial_magnetization": config.spin.initial_magnetization,
+                "magnetization_mixing_beta": config.spin.magnetization_mixing_beta,
+            }
+        ),
         "davidson": {
             "max_iterations": config.davidson.max_iterations,
             "tolerance": config.davidson.tolerance,
@@ -276,6 +286,7 @@ def _solver_identity(config_payload: Mapping[str, object]) -> dict[str, object]:
             "initial_eigensolver_tolerance": config_payload["initial_eigensolver_tolerance"],
             "eigensolver_tolerance_scale": config_payload["eigensolver_tolerance_scale"],
             "smearing": config_payload["smearing"],
+            "spin": config_payload["spin"],
         },
     }
 

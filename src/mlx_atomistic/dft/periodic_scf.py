@@ -22,6 +22,9 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicBandStructureResult as PeriodicBandStructureResult,
 )
 from mlx_atomistic.dft._periodic_models import (
+    PeriodicCollinearSpinConfig as PeriodicCollinearSpinConfig,
+)
+from mlx_atomistic.dft._periodic_models import (
     PeriodicDavidsonConfig as PeriodicDavidsonConfig,
 )
 from mlx_atomistic.dft._periodic_models import PeriodicDFTSystem as PeriodicDFTSystem
@@ -39,6 +42,9 @@ from mlx_atomistic.dft._periodic_models import (
 )
 from mlx_atomistic.dft._periodic_models import PeriodicSCFConfig as PeriodicSCFConfig
 from mlx_atomistic.dft._periodic_models import PeriodicSCFResult as PeriodicSCFResult
+from mlx_atomistic.dft._periodic_models import (
+    PeriodicSpinChannelResult as PeriodicSpinChannelResult,
+)
 from mlx_atomistic.dft._periodic_models import (
     _eigensolve_provenance as _periodic_eigensolve_provenance,
 )
