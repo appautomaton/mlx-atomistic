@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from mlx_atomistic._artifact_identity import canonical_json_bytes, sha256_bytes
+from mlx_atomistic.benchmarks.dft_eos import summarize_eos_point_identities
 from mlx_atomistic.benchmarks.dft_mgo import load_mgo_workload
 from mlx_atomistic.benchmarks.dft_mgo_eos import (
     EOS_REPORT_SCHEMA,
@@ -89,7 +91,6 @@ PROFILE_SPECS: dict[str, dict[str, Any]] = {
         "fft_shape": [36, 36, 36],
         "kpoint_mesh": [4, 4, 4],
         "kpoint_centering": "gamma",
-        "symmetry_reduction": "full_cubic_point_group",
         "max_batch_transient_bytes": 512 * 1024**2,
     },
 }
@@ -113,6 +114,13 @@ def _implementation_fingerprint() -> str:
         "point_execution_source": inspect.getsource(run_mgo_eos_point),
     }
     return sha256_bytes(canonical_json_bytes(contract))
+
+
+@lru_cache(maxsize=1)
+def _runtime_fingerprint() -> str:
+    from mlx_atomistic.benchmarks.dft_runtime_contract import build_source_fingerprints
+
+    return str(build_source_fingerprints()["runtime_fingerprint"])
 
 
 def _system_geometry(
@@ -168,6 +176,7 @@ def _point_spec(
 ) -> dict[str, Any]:
     values = {
         "workload_fingerprint": workload_fingerprint,
+        "runtime_fingerprint": _runtime_fingerprint(),
         "eos_implementation_fingerprint": _implementation_fingerprint(),
         "reference_sha256": REFERENCE_SHA256,
         "profile": profile,
@@ -933,6 +942,7 @@ def run_mgo_eos_validation(
         "schema_version": EOS_REPORT_SCHEMA,
         **completion,
         "workload_fingerprint": manifest["workload_fingerprint"],
+        **summarize_eos_point_identities(rows),
         "accepted_workload": {
             "profile": profile6,
             "cutoff_hartree": accepted_cutoff,

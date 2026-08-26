@@ -188,6 +188,7 @@ def test_single_aluminum_point_persists_metallic_free_energy_evidence(tmp_path, 
     assert payload["result"]["fractional_occupation_count"] == 3
     assert payload["result"]["highest_band_occupation"] == 0.0
     assert payload["result"]["free_energy_identity_error_hartree"] < 1.0e-12
+    assert len(payload["point"]["runtime_fingerprint"]) == 64
     assert payload["host"]["low_power_mode"] == 1
     assert (tmp_path / "density.npy").is_file()
 

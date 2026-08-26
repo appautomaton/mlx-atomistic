@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from mlx_atomistic._artifact_identity import canonical_json_bytes, sha256_bytes
+from mlx_atomistic.benchmarks.dft_eos import summarize_eos_point_identities
 from mlx_atomistic.benchmarks.dft_silicon import ANGSTROM_TO_BOHR
 from mlx_atomistic.benchmarks.dft_silicon_eos import (
     EOS_REPORT_SCHEMA,
@@ -421,20 +422,7 @@ def build_silicon_eos_report(
         "admitted": passed and level == "admission",
         "blockers": blockers,
         "workload_fingerprint": manifest["workload_fingerprint"],
-        "runtime_fingerprints": sorted(
-            {
-                str(row["point"]["runtime_fingerprint"])
-                for row in point_reports
-                if row["point"].get("runtime_fingerprint") is not None
-            }
-        ),
-        "eos_implementation_fingerprints": sorted(
-            {
-                str(row["point"]["eos_implementation_fingerprint"])
-                for row in point_reports
-                if row["point"].get("eos_implementation_fingerprint") is not None
-            }
-        ),
+        **summarize_eos_point_identities(point_reports),
         "method_scope": {
             "claim": "eight-atom diamond-silicon PBE/GTH EOS with fixed occupations",
             "limitation": references["protocol"]["method_difference"],

@@ -18,6 +18,10 @@
         "occupation_modes": ["fixed"],
         "force_components": ["local", "nonlocal", "total"]
       },
+      "method_validation": {
+        "scope": "full_kpoint_mesh_with_time_reversal_only",
+        "passed": true
+      },
       "identity": {
         "pseudopotential_sha256": {
           "Si GTH-PBE-q4": "da66fe0c10d015229e7ad88ea2c4204e6db54c4b9d39e05434d1c08df292d571"
@@ -43,6 +47,10 @@
         "occupation_modes": ["fixed"],
         "force_components": []
       },
+      "method_validation": {
+        "scope": "full_kpoint_mesh_with_time_reversal_only",
+        "passed": true
+      },
       "identity": {
         "pseudopotential_sha256": {
           "C GTH-PBE-q4": "78e226aaa967b3c440cf427fa52d31552cab2dd4b8737abb69031b56cfba6e2a"
@@ -66,6 +74,10 @@
         "species_modes": ["homogeneous"],
         "occupation_modes": ["smeared"],
         "force_components": []
+      },
+      "method_validation": {
+        "scope": "matched_full_reduced_scf_energy_oracle",
+        "passed": true
       },
       "identity": {
         "pseudopotential_sha256": {
@@ -91,6 +103,10 @@
         "species_modes": ["mixed"],
         "occupation_modes": ["fixed"],
         "force_components": ["local", "nonlocal", "total"]
+      },
+      "method_validation": {
+        "scope": "full_kpoint_mesh_with_time_reversal_only",
+        "passed": true
       },
       "identity": {
         "pseudopotential_sha256": {
@@ -119,13 +135,21 @@
         "occupation_modes": ["smeared", "collinear_spin"],
         "force_components": []
       },
+      "method_validation": {
+        "scope": "matched_full_reduced_scf_energy_and_moment_oracle",
+        "passed": false,
+        "metrics": [
+          {"name": "symmetry_free_energy_abs_hartree_per_atom", "value": 0.0056217771680735495, "maximum": 0.00005},
+          {"name": "symmetry_moment_abs_bohr_magneton_per_atom", "value": 0.07976675033569336, "maximum": 0.02}
+        ]
+      },
       "identity": {
         "pseudopotential_sha256": {
           "Fe GTH-PBE-q16": "b01c203a4837b7becf1b2f76b188bf6365ec5aec216dccf1ed4fda6b9d65fdcb"
         },
         "reference_protocol_sha256": "2264f8473237a1ae2c9dda90cc0dfdd3a60721a2b399d05ba70b72f7893f3756",
-        "calculation_fingerprint": "cbe945e5181c7c8c714ebcda1418c7d0375be4e754cd0035f33809eb026105e1",
-        "runtime_fingerprint": "f6689ca2da1f631a3ae0ee3e9c2e0d8b607e2a9fea8b45cd2318b2072f74f587"
+        "calculation_fingerprint": "341deb710d732f76284e4c86d95b68fd2b1194acffa2b193fea5e17edce093d7",
+        "runtime_fingerprint": "1122998a773f7b26cce6375e77e78b973ca3c36df7a1be2085a74f0d45abb8d4"
       },
       "metrics": [
         {"name": "moment_abs_error_bohr_magneton_per_atom", "value": 0.0879516, "maximum": 0.35},
@@ -143,6 +167,10 @@
       "workload_fingerprint": "74453bf759a19229384de6bbd101c17921531c6d93d0e361e5366904a50d6cf1",
       "calculation_fingerprint": "b730197a66ddc090265abcbd54069e5f354465ebd02b98346b3b11bea97fa498",
       "implementation_fingerprint": "87837f9976860730d751639f9967700766913921b92b1cf087240c099179277e",
+      "method_validation": {
+        "scope": "point_group_reduced_scf_without_density_reconstruction_or_full_scf_oracle",
+        "passed": false
+      },
       "elapsed_wall_seconds": 40.98934508301318,
       "peak_temporary_bytes": 57201084,
       "metrics": [

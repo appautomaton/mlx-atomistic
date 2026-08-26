@@ -35,6 +35,25 @@ CONVERGENCE_THRESHOLDS = {
 DEFAULT_VOLUME_FACTORS = (0.94, 0.96, 0.98, 1.0, 1.02, 1.04, 1.06)
 
 
+def summarize_eos_point_identities(
+    point_reports: Sequence[Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    """Return the distinct runtime and EOS implementation identities."""
+
+    fields = ("runtime_fingerprint", "eos_implementation_fingerprint")
+    return {
+        f"{field}s": sorted(
+            {
+                str(point[field])
+                for report in point_reports
+                if isinstance((point := report.get("point")), Mapping)
+                and point.get(field) is not None
+            }
+        )
+        for field in fields
+    }
+
+
 def load_eos_reference_bundle(
     path: str | Path,
     *,

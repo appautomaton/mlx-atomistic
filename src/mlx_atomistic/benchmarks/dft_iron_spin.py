@@ -318,10 +318,13 @@ def prepare_iron_spin_workload(
         "validation": {
             "moment_convergence_abs_per_atom": 0.12,
             "free_energy_convergence_hartree_per_atom": 0.01,
+            "symmetry_moment_abs_per_atom": 0.02,
+            "symmetry_free_energy_abs_hartree_per_atom": 5.0e-5,
             "electron_count_abs_per_cell": 1.0e-4,
             "required_points": [
                 "smoke-spin",
                 "selected-spin",
+                "selected-spin-full",
                 "selected-unpolarized",
                 "cutoff-check-spin",
                 "kpoint-check-spin",
@@ -378,7 +381,16 @@ def load_iron_spin_workload(path: str | Path) -> tuple[dict[str, Any], Path]:
     return workload, resource
 
 
-def _kpoint_mesh(workload: Mapping[str, Any], size: int):
+def _kpoint_mesh(
+    workload: Mapping[str, Any],
+    size: int,
+    *,
+    mode: str = "reduced",
+) -> KPointMesh:
+    if mode == "full":
+        return _primitive_unfolded_mesh(size)
+    if mode != "reduced":
+        raise ValueError(f"unsupported Iron k-point mode: {mode}")
     payload = workload["kpoint_meshes"][str(size)]
     return KPointMesh(
         tuple(
@@ -448,6 +460,7 @@ def run_iron_spin_point(
     manifest_path: str | Path,
     profile: str,
     polarized: bool,
+    kpoint_mode: str = "reduced",
     out: str | Path,
 ) -> dict[str, object]:
     """Run one exact Iron spin or matched unpolarized validation point."""
@@ -473,7 +486,11 @@ def run_iron_spin_point(
     result = run_periodic_scf(
         system,
         cutoff_hartree=float(spec["cutoff_hartree"]),
-        kpoint_mesh=_kpoint_mesh(workload, int(spec["kpoint_size"])),
+        kpoint_mesh=_kpoint_mesh(
+            workload,
+            int(spec["kpoint_size"]),
+            mode=kpoint_mode,
+        ),
         n_bands=int(spec["n_bands"]),
         config=_scf_config(
             spec,
@@ -494,6 +511,7 @@ def run_iron_spin_point(
         "workload_fingerprint": workload["workload_fingerprint"],
         "profile": profile,
         "polarized": polarized,
+        "kpoint_mode": kpoint_mode,
         "settings": dict(spec),
         "result": {
             "converged": result.converged,
@@ -530,8 +548,13 @@ def run_iron_spin_point(
     return payload
 
 
-def _point_name(profile: str, polarized: bool) -> str:
-    return f"{profile}-{'spin' if polarized else 'unpolarized'}"
+def _point_name(
+    profile: str,
+    polarized: bool,
+    kpoint_mode: str = "reduced",
+) -> str:
+    base = f"{profile}-{'spin' if polarized else 'unpolarized'}"
+    return base if kpoint_mode == "reduced" else f"{base}-{kpoint_mode}"
 
 
 def _load_matching_point(
@@ -540,6 +563,7 @@ def _load_matching_point(
     workload: Mapping[str, Any],
     profile: str,
     polarized: bool,
+    kpoint_mode: str,
 ) -> dict[str, object] | None:
     if not path.is_file():
         return None
@@ -550,6 +574,7 @@ def _load_matching_point(
         or point.get("workload_fingerprint") != workload["workload_fingerprint"]
         or point.get("profile") != profile
         or point.get("polarized") is not polarized
+        or point.get("kpoint_mode") != kpoint_mode
         or point.get("settings") != workload["profiles"][profile]
         or material_protocol != _material_protocol_record()
     ):
@@ -567,11 +592,12 @@ def run_iron_spin_validation(
 
     workload, _ = load_iron_spin_workload(manifest_path)
     plan = (
-        ("smoke", True),
-        ("selected", True),
-        ("selected", False),
-        ("cutoff-check", True),
-        ("kpoint-check", True),
+        ("smoke", True, "reduced"),
+        ("selected", True, "reduced"),
+        ("selected", True, "full"),
+        ("selected", False, "reduced"),
+        ("cutoff-check", True, "reduced"),
+        ("kpoint-check", True, "reduced"),
     )
     if dry_run:
         return {
@@ -581,20 +607,22 @@ def run_iron_spin_validation(
         }
     root = Path(out)
     points: dict[str, dict[str, object]] = {}
-    for profile, polarized in plan:
-        name = _point_name(profile, polarized)
+    for profile, polarized, kpoint_mode in plan:
+        name = _point_name(profile, polarized, kpoint_mode)
         point_path = root / "points" / f"{name}.json"
         point = _load_matching_point(
             point_path,
             workload=workload,
             profile=profile,
             polarized=polarized,
+            kpoint_mode=kpoint_mode,
         )
         if point is None:
             point = run_iron_spin_point(
                 manifest_path=manifest_path,
                 profile=profile,
                 polarized=polarized,
+                kpoint_mode=kpoint_mode,
                 out=point_path,
             )
         points[name] = point
@@ -603,6 +631,7 @@ def run_iron_spin_validation(
     required = set(workload["validation"]["required_points"])
     complete = set(points) == required
     selected = points.get("selected-spin", {}).get("result", {})
+    selected_full = points.get("selected-spin-full", {}).get("result", {})
     unpolarized = points.get("selected-unpolarized", {}).get("result", {})
     cutoff = points.get("cutoff-check-spin", {}).get("result", {})
     kpoint = points.get("kpoint-check-spin", {}).get("result", {})
@@ -628,6 +657,27 @@ def run_iron_spin_validation(
             complete
             and float(selected["free_energy_hartree"])
             < float(unpolarized["free_energy_hartree"])
+        ),
+        "symmetry_moment": (
+            complete
+            and abs(
+                float(selected["moment_per_atom"])
+                - float(selected_full["moment_per_atom"])
+            )
+            <= float(workload["validation"]["symmetry_moment_abs_per_atom"])
+        ),
+        "symmetry_free_energy": (
+            complete
+            and abs(
+                float(selected["free_energy_hartree"])
+                - float(selected_full["free_energy_hartree"])
+            )
+            / ATOM_COUNT
+            <= float(
+                workload["validation"][
+                    "symmetry_free_energy_abs_hartree_per_atom"
+                ]
+            )
         ),
         "cutoff_moment_convergence": (
             complete
@@ -664,6 +714,27 @@ def run_iron_spin_validation(
         "verified": all(gates.values()),
         "workload_fingerprint": workload["workload_fingerprint"],
         "gates": gates,
+        "symmetry_oracle": {
+            "reduced_free_energy_hartree": selected.get("free_energy_hartree"),
+            "full_free_energy_hartree": selected_full.get("free_energy_hartree"),
+            "free_energy_abs_hartree_per_atom": (
+                None
+                if not complete
+                else abs(
+                    float(selected["free_energy_hartree"])
+                    - float(selected_full["free_energy_hartree"])
+                )
+                / ATOM_COUNT
+            ),
+            "moment_abs_per_atom": (
+                None
+                if not complete
+                else abs(
+                    float(selected["moment_per_atom"])
+                    - float(selected_full["moment_per_atom"])
+                )
+            ),
+        },
         "points": points,
     }
     _write_json(root / "report.json", report)

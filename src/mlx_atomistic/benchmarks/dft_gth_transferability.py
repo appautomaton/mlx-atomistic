@@ -13,7 +13,7 @@ import numpy as np
 from mlx_atomistic._artifact_identity import sha256_bytes
 
 CONTRACT_SCHEMA = "mlx-atomistic.dft-gth-transferability.v1"
-CONTRACT_SHA256 = "8ae5850b9a2853146651051b9b4f3255e2f62a6b4baa81c5a2936c1b551d34a4"
+CONTRACT_SHA256 = "1b6e5b5f8ab7997c70598de0810b8c31d6e94f660634bbf396d90c547447c147"
 
 
 def _contract_path() -> Path:
@@ -101,6 +101,26 @@ def _identity_result(identity: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _method_validation_result(validation: Mapping[str, Any]) -> dict[str, Any]:
+    scope = validation.get("scope")
+    passed = validation.get("passed")
+    if not isinstance(scope, str) or not scope:
+        raise ValueError("transferability method validation scope is invalid")
+    if not isinstance(passed, bool):
+        raise ValueError("transferability method validation verdict is invalid")
+    raw_metrics = validation.get("metrics", ())
+    if (
+        not isinstance(raw_metrics, Sequence)
+        or isinstance(raw_metrics, (str, bytes))
+        or any(not isinstance(metric, Mapping) for metric in raw_metrics)
+    ):
+        raise ValueError("transferability method validation metrics are invalid")
+    metrics = tuple(_metric_result(metric) for metric in raw_metrics)
+    if metrics and passed != all(metric["passed"] for metric in metrics):
+        raise ValueError("transferability method validation verdict disagrees with metrics")
+    return {"scope": scope, "passed": passed, "metrics": list(metrics)}
+
+
 def _coverage_result(
     requirements: Mapping[str, Any],
     cases: Sequence[Mapping[str, Any]],
@@ -163,6 +183,9 @@ def build_gth_transferability_report(
         }:
             raise ValueError(f"unsupported evidence label for {case_id}")
         identity = _identity_result(case.get("identity", {}))
+        method_validation = _method_validation_result(
+            case.get("method_validation", {})
+        )
         raw_metrics = case.get("metrics")
         if (
             not isinstance(raw_metrics, Sequence)
@@ -171,7 +194,11 @@ def build_gth_transferability_report(
         ):
             raise ValueError(f"transferability case {case_id} has no metrics")
         metrics = tuple(_metric_result(metric) for metric in raw_metrics)
-        science_passed = all(metric["passed"] for metric in metrics)
+        science_passed = method_validation["passed"] and all(
+            metric["passed"] for metric in metrics
+        )
+        if not method_validation["passed"]:
+            blockers.append(f"case:{case_id}:method_validation")
         if not science_passed:
             blockers.extend(
                 f"case:{case_id}:metric:{metric['name']}"
@@ -186,6 +213,7 @@ def build_gth_transferability_report(
                 "evidence_label": evidence_label,
                 "coverage": dict(case.get("coverage", {})),
                 "identity": identity,
+                "method_validation": method_validation,
                 "metrics": list(metrics),
                 "science_passed": science_passed,
             }
@@ -212,13 +240,23 @@ def build_gth_transferability_report(
         ):
             if not _is_sha256(candidate.get(identity_name)):
                 raise ValueError(f"candidate {candidate_id} {identity_name} is invalid")
+        method_validation = _method_validation_result(
+            candidate.get("method_validation", {})
+        )
         metrics = tuple(_metric_result(metric) for metric in candidate.get("metrics", ()))
-        passed = bool(metrics) and all(metric["passed"] for metric in metrics)
+        passed = (
+            method_validation["passed"]
+            and bool(metrics)
+            and all(metric["passed"] for metric in metrics)
+        )
         if not passed:
             blockers.append(f"candidate:{candidate_id}:not_admitted")
+        if not method_validation["passed"]:
+            blockers.append(f"candidate:{candidate_id}:method_validation")
         candidates.append(
             {
                 "candidate_id": candidate_id,
+                "method_validation": method_validation,
                 "metrics": list(metrics),
                 "passed": passed,
                 "elapsed_wall_seconds": float(candidate["elapsed_wall_seconds"]),

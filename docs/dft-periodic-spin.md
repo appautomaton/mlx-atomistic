@@ -150,5 +150,10 @@ fingerprint change and is not labeled current-verified.
 Deterministic functional and engine tests establish numerical semantics, not
 material accuracy. The material gate uses a fingerprinted GTH-PBE source,
 cell, k-point mesh, cutoff, smearing width, and magnetic reference. The verified
-claim is limited to the Fe q16 workload; the q8 failure remains evidence for
-Phase 7 rather than being hidden by the passing variant.
+numerical claim is limited to the Fe q16 workload; Phase 7 does not admit its
+point-group-reduced SCF as production transferability evidence. The current
+matched oracle differs from the full mesh by `0.005622 Ha/atom` in free energy
+and `0.07977` Bohr magnetons per atom in moment, failing the locked method gates.
+The full-mesh moment is `2.33818`, compared with the published `2.33` context.
+The q8 failure remains evidence for Phase 7 rather than being hidden by the q16
+numerical result.

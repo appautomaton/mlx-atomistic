@@ -35,6 +35,13 @@ evidence. A missing or malformed SHA-256 identity fails closed. A
 historical-frozen or project-derived result stays labeled as such and cannot be
 reported as current verification.
 
+Point-group k-point reduction has a separate method gate. Aggregating orbit
+weights is sufficient for invariant quadrature, but a self-consistent field
+calculation must also reconstruct every rotated orbital density. Until that
+runtime path exists, a reduced SCF is admitted only by a matched full-versus-
+reduced material oracle. Time-reversal ownership remains valid because paired
+states have the same real-space density.
+
 ## Scientific Gates
 
 Equation-of-state cases retain the shared locked thresholds in `dft_eos.py`.
@@ -89,20 +96,25 @@ The committed contract currently reports:
 - `coverage_complete = true` across the declared block, environment, species,
   occupation, and force axes;
 - `strict_science_passed = false` because the locked Mg-q2/O-q6 bulk-derivative
-  and total-force metrics remain outside their thresholds;
+  and total-force metrics remain outside their thresholds and the Fe q16
+  full-versus-reduced SCF oracle fails;
 - `identity_complete = false` because several older project-derived EOS
   summaries do not retain exact calculation and runtime fingerprints;
 - `production_envelope_verified = false`.
 
-The one permitted Mg-q10/O-q6 feasibility point used the two-atom primitive
-cell, a 36-cubed FFT grid, eight occupied bands, and cubic k-point symmetry. It
-reduced complete wall time from an interrupted conventional-cell run exceeding
-five minutes to `40.989 s`, with `57,201,084` peak temporary bytes. It was not
-admitted: after 80 SCF iterations its maximum orbital residual was
-`4.329e-6`, above the locked `2e-6` limit. No seven-point q10 EOS was run.
+The historical Mg-q10/O-q6 feasibility point used the two-atom primitive cell,
+a 36-cubed FFT grid, eight occupied bands, and point-group-reduced k-points. It
+took `40.989 s`, used `57,201,084` peak temporary bytes, and stopped after 80
+SCF iterations with a `4.329e-6` orbital residual above the locked `2e-6`
+limit. The point is also method-invalid for admission because it aggregated
+orbit weights without reconstructing rotated SCF densities. It remains in the
+matrix as rejected historical evidence; no seven-point q10 EOS was run.
 
-The primitive representation and reusable reciprocal-symmetry basis transform
-are retained because their deterministic geometry and quadrature gates pass.
-They improve future validation efficiency without adding a material branch to
-the product runtime. The failed q10 candidate remains in the matrix rather than
-being deleted or reclassified.
+The primitive geometry and reciprocal-basis transform remain valid. Future
+MgO candidates use a full mesh with time reversal only unless a matched
+full-versus-reduced SCF oracle passes. The same rule blocks the existing Fe q16
+transferability row: its current matched oracle found a `0.005622 Ha/atom`
+free-energy difference and a `0.07977` Bohr-magneton-per-atom moment difference,
+above the locked `5e-5 Ha/atom` and `0.02` gates. The full-mesh moment is
+`2.33818`, close to the published `2.33` context, but full-mesh cutoff,
+k-point, and magnetic-ordering checks have not been completed.
