@@ -26,17 +26,18 @@ def _shape_tuple(shape: Sequence[int]) -> tuple[int, int, int]:
 
 @dataclass(frozen=True)
 class RealSpaceGrid:
-    """Uniform orthorhombic real-space grid in atomic units."""
+    """Uniform fractional real-space grid in a periodic cell."""
 
     shape: tuple[int, int, int]
     cell: Cell
 
-    def __init__(self, shape: Sequence[int], cell: Cell | Sequence[float]):
+    def __init__(
+        self,
+        shape: Sequence[int],
+        cell: Cell | Sequence[float] | Sequence[Sequence[float]],
+    ):
         object.__setattr__(self, "shape", _shape_tuple(shape))
-        parsed_cell = cell if isinstance(cell, Cell) else Cell.orthorhombic(cell)
-        if not parsed_cell.is_orthorhombic:
-            msg = "DFT real-space grids currently require an orthorhombic cell"
-            raise ValueError(msg)
+        parsed_cell = cell if isinstance(cell, Cell) else Cell(cell)
         object.__setattr__(self, "cell", parsed_cell)
         lengths = np.array(parsed_cell.lengths, dtype=np.float64)
         if np.any(lengths <= 0.0):
@@ -63,7 +64,7 @@ class RealSpaceGrid:
 
     @property
     def spacing(self) -> mx.array:
-        """Grid spacing in atomic units."""
+        """Grid-vector step lengths in atomic units."""
 
         return self.cell.lengths / as_mx_array(self.shape)
 
@@ -71,7 +72,9 @@ class RealSpaceGrid:
     def volume(self) -> float:
         """Cell volume in bohr cubed."""
 
-        return float(np.prod(np.array(self.cell.lengths, dtype=np.float64)))
+        if self.cell.is_orthorhombic:
+            return float(np.prod(np.array(self.cell.lengths, dtype=np.float64)))
+        return float(np.linalg.det(np.asarray(self.cell.matrix, dtype=np.float64)))
 
     @property
     def dv(self) -> float:
@@ -82,13 +85,22 @@ class RealSpaceGrid:
     def coordinates(self) -> mx.array:
         """Return cell-centered Cartesian grid coordinates with shape ``(*shape, 3)``."""
 
-        lengths = np.array(self.cell.lengths, dtype=np.float64)
-        axes = [
-            (np.arange(count, dtype=np.float64) + 0.5) * length / count
-            for count, length in zip(self.shape, lengths, strict=True)
-        ]
-        mesh = np.meshgrid(*axes, indexing="ij")
-        return as_mx_array(np.stack(mesh, axis=-1).astype(np.float32))
+        if self.cell.is_orthorhombic:
+            lengths = np.array(self.cell.lengths, dtype=np.float64)
+            axes = [
+                (np.arange(count, dtype=np.float64) + 0.5) * length / count
+                for count, length in zip(self.shape, lengths, strict=True)
+            ]
+            mesh = np.meshgrid(*axes, indexing="ij")
+            coordinates = np.stack(mesh, axis=-1)
+        else:
+            axes = [
+                (np.arange(count, dtype=np.float64) + 0.5) / count
+                for count in self.shape
+            ]
+            fractional = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
+            coordinates = fractional @ np.asarray(self.cell.matrix, dtype=np.float64)
+        return as_mx_array(coordinates.astype(np.float32))
 
 
 def _fft_integer_g(shape: tuple[int, int, int]) -> mx.array:
@@ -126,6 +138,7 @@ class ReciprocalGrid:
     g2: mx.array
     zero_mask: mx.array
     integer_g: mx.array
+    basis_matrix: mx.array
     fingerprint: str
 
     def __init__(
@@ -135,6 +148,7 @@ class ReciprocalGrid:
         g2: mx.array,
         zero_mask: mx.array,
         integer_g: mx.array | None = None,
+        basis_matrix: mx.array | None = None,
         fingerprint: str | None = None,
     ) -> None:
         object.__setattr__(self, "real_grid", real_grid)
@@ -145,6 +159,18 @@ class ReciprocalGrid:
             self,
             "integer_g",
             _fft_integer_g(real_grid.shape) if integer_g is None else mx.array(integer_g),
+        )
+        reciprocal = (
+            2.0
+            * pi
+            * np.linalg.inv(np.asarray(real_grid.cell.matrix, dtype=np.float64)).T
+        )
+        object.__setattr__(
+            self,
+            "basis_matrix",
+            mx.array(reciprocal.astype(np.float32))
+            if basis_matrix is None
+            else mx.array(basis_matrix),
         )
         object.__setattr__(
             self,
@@ -166,21 +192,29 @@ class ReciprocalGrid:
         """
 
         integer_g = _fft_integer_g(grid.shape)
-        spacing = np.asarray(grid.spacing, dtype=np.float64)
-        reciprocal_axes = [
-            mx.array(
-                (2.0 * pi * np.fft.fftfreq(count, d=delta)).astype(np.float32)
+        basis_matrix = (
+            2.0
+            * pi
+            * np.linalg.inv(np.asarray(grid.cell.matrix, dtype=np.float64)).T
+        ).astype(np.float32)
+        if grid.cell.is_orthorhombic:
+            spacing = np.asarray(grid.spacing, dtype=np.float64)
+            reciprocal_axes = [
+                mx.array(
+                    (2.0 * pi * np.fft.fftfreq(count, d=delta)).astype(np.float32)
+                )
+                for count, delta in zip(grid.shape, spacing, strict=True)
+            ]
+            vectors = mx.stack(
+                [
+                    mx.broadcast_to(reciprocal_axes[0][:, None, None], grid.shape),
+                    mx.broadcast_to(reciprocal_axes[1][None, :, None], grid.shape),
+                    mx.broadcast_to(reciprocal_axes[2][None, None, :], grid.shape),
+                ],
+                axis=-1,
             )
-            for count, delta in zip(grid.shape, spacing, strict=True)
-        ]
-        vectors = mx.stack(
-            [
-                mx.broadcast_to(reciprocal_axes[0][:, None, None], grid.shape),
-                mx.broadcast_to(reciprocal_axes[1][None, :, None], grid.shape),
-                mx.broadcast_to(reciprocal_axes[2][None, None, :], grid.shape),
-            ],
-            axis=-1,
-        )
+        else:
+            vectors = integer_g.astype(mx.float32) @ mx.array(basis_matrix)
         g2 = mx.sum(vectors * vectors, axis=-1)
         return cls(
             real_grid=grid,
@@ -188,5 +222,6 @@ class ReciprocalGrid:
             g2=g2,
             zero_mask=g2 == 0.0,
             integer_g=integer_g,
+            basis_matrix=mx.array(basis_matrix),
             fingerprint=_reciprocal_fingerprint(grid),
         )

@@ -67,7 +67,7 @@ class PlaneWaveBasis:
     return full FFT grids, materializing them only at the call boundary.
 
     Args:
-        grid: Uniform orthorhombic real-space grid.
+        grid: Uniform fractional real-space grid.
         cutoff_hartree: Kinetic energy cutoff in Hartree.
         kpoint_cartesian: Bloch k-point in inverse bohr. Defaults to Gamma.
         reciprocal_grid: Optional shared reciprocal descriptor. Compatible
@@ -127,27 +127,35 @@ class PlaneWaveBasis:
         """Build a basis from fractional reciprocal coordinates.
 
         Args:
-            grid: Uniform orthorhombic real-space grid.
+            grid: Uniform fractional real-space grid.
             cutoff_hartree: Kinetic energy cutoff in Hartree.
             reduced_kpoint: Fractional coordinates along reciprocal cell axes.
             reciprocal_grid: Optional shared reciprocal descriptor.
             lane_label: Stable runtime lane label.
 
         Returns:
-            A basis whose Cartesian k-point is ``2*pi*k_i/L_i``.
+            A basis whose Cartesian k-point is the reduced row vector mapped
+            through the reciprocal cell matrix.
         """
 
         if len(reduced_kpoint) != 3:
             msg = "reduced_kpoint must have three components"
             raise ValueError(msg)
-        lengths = np.asarray(grid.lengths, dtype=np.float64)
         reduced = np.asarray(reduced_kpoint, dtype=np.float64)
-        cartesian = 2.0 * pi * reduced / lengths
+        reciprocal = (
+            _shared_reciprocal_grid(grid)
+            if reciprocal_grid is None
+            else reciprocal_grid
+        )
+        if grid.cell.is_orthorhombic:
+            cartesian = 2.0 * pi * reduced / np.asarray(grid.lengths, dtype=np.float64)
+        else:
+            cartesian = reduced @ np.asarray(reciprocal.basis_matrix, dtype=np.float64)
         return cls(
             grid,
             cutoff_hartree,
             cartesian,
-            reciprocal_grid=reciprocal_grid,
+            reciprocal_grid=reciprocal,
             lane_label=lane_label,
         )
 
@@ -450,11 +458,16 @@ class PlaneWaveBasis:
         """Return JSON-safe basis metadata.
 
         Returns:
-            Cutoff, k-point, FFT shape, active count, and normalization metadata.
+            Cutoff, cell, k-point, FFT shape, active count, and normalization
+            metadata.
         """
 
         return {
             "cutoff_hartree": self.cutoff_hartree,
+            "cell_matrix_bohr": np.asarray(
+                self.grid.cell.matrix,
+                dtype=np.float64,
+            ).tolist(),
             "kpoint_cartesian_bohr_inverse": list(self.kpoint_cartesian),
             "fft_shape": list(self.grid.shape),
             "active_count": self.active_count,

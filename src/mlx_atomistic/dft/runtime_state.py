@@ -59,6 +59,10 @@ def serialize_fixed_density_state(state: Mapping[str, Any]) -> dict[str, bytes]:
     basis = state["basis"]
     metadata = {
         "schema_version": "mlx-atomistic.dft-fixed-density-state.v1",
+        "cell_matrix_bohr": np.asarray(
+            basis.grid.cell.matrix,
+            dtype=np.float64,
+        ).tolist(),
         "grid_shape": list(basis.grid.shape),
         "cutoff_hartree": basis.cutoff_hartree,
         "kpoint_cartesian_bohr_inverse": list(basis.kpoint_cartesian),
@@ -131,6 +135,10 @@ def serialize_periodic_scf_state(result: Any) -> dict[str, bytes]:
 
     metadata = {
         "schema_version": "mlx-atomistic.periodic-scf-compact-state.v2",
+        "cell_matrix_bohr": np.asarray(
+            result.kpoints[0].basis.grid.cell.matrix,
+            dtype=np.float64,
+        ).tolist(),
         "grid_shape": list(result.density.shape),
         "status": result.status,
         "converged": result.converged,
