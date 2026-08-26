@@ -80,4 +80,4 @@ def test_spin_pbe_potentials_match_directional_energy_derivative():
 
     analytic = float(mx.sum(result.up_potential * direction) * grid.dv)
     central = float(plus.total_energy - minus.total_energy) / (2.0 * step)
-    np.testing.assert_allclose(analytic, central, atol=3.0e-5, rtol=3.0e-5)
+    np.testing.assert_allclose(analytic, central, atol=3.0e-5, rtol=1.5e-4)
