@@ -60,6 +60,7 @@ def test_iron_spin_workload_is_hash_guarded_and_has_a_bounded_plan(tmp_path):
     assert workload["system"]["electron_count"] == 8
     assert workload["physics"]["initial_magnetization_per_cell"] == 2.0
     assert workload["kpoint_meshes"]["2"]["full_point_count"] == 16
+    assert iron_spin._kpoint_mesh(workload, 2).point_group_symmetry_reduced is True
     assert workload["representation"]["radial_tail_ratio_at_cutoff"]["selected"] < 0.02
     assert workload["representation"]["radial_tail_ratio_at_cutoff"]["cutoff-check"] < 0.003
     assert plan["points"] == workload["validation"]["required_points"]

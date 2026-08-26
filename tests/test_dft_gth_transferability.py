@@ -23,9 +23,10 @@ def test_gth_transferability_matrix_separates_coverage_from_strict_science():
     assert "case:rocksalt-mgo-q2-q6:metric:force_max_abs_hartree_per_bohr" in report[
         "blockers"
     ]
-    assert "case:bcc-iron-q16:method_validation" in report["blockers"]
+    assert "case:bcc-iron-q16:method_validation" not in report["blockers"]
+    assert "case:bcc-iron-q16:identity_incomplete" in report["blockers"]
     iron = next(case for case in report["cases"] if case["case_id"] == "bcc-iron-q16")
-    assert iron["method_validation"]["metrics"][0]["passed"] is False
+    assert iron["method_validation"]["metrics"][0]["passed"] is True
 
 
 def test_gth_transferability_matrix_retains_failed_q10_candidate():

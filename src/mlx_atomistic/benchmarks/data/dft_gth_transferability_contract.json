@@ -127,7 +127,7 @@
     },
     {
       "case_id": "bcc-iron-q16",
-      "evidence_label": "current-verified",
+      "evidence_label": "project-derived",
       "coverage": {
         "periodic_blocks": ["d"],
         "environments": ["metallic", "magnetic"],
@@ -137,10 +137,10 @@
       },
       "method_validation": {
         "scope": "matched_full_reduced_scf_energy_and_moment_oracle",
-        "passed": false,
+        "passed": true,
         "metrics": [
-          {"name": "symmetry_free_energy_abs_hartree_per_atom", "value": 0.0056217771680735495, "maximum": 0.00005},
-          {"name": "symmetry_moment_abs_bohr_magneton_per_atom", "value": 0.07976675033569336, "maximum": 0.02}
+          {"name": "symmetry_free_energy_abs_hartree_per_atom", "value": 0.0000040504961020815244, "maximum": 0.00005},
+          {"name": "symmetry_moment_abs_bohr_magneton_per_atom", "value": 0.0025625228881835938, "maximum": 0.02}
         ]
       },
       "identity": {
@@ -148,11 +148,11 @@
           "Fe GTH-PBE-q16": "b01c203a4837b7becf1b2f76b188bf6365ec5aec216dccf1ed4fda6b9d65fdcb"
         },
         "reference_protocol_sha256": "2264f8473237a1ae2c9dda90cc0dfdd3a60721a2b399d05ba70b72f7893f3756",
-        "calculation_fingerprint": "341deb710d732f76284e4c86d95b68fd2b1194acffa2b193fea5e17edce093d7",
-        "runtime_fingerprint": "1122998a773f7b26cce6375e77e78b973ca3c36df7a1be2085a74f0d45abb8d4"
+        "calculation_fingerprint": null,
+        "runtime_fingerprint": null
       },
       "metrics": [
-        {"name": "moment_abs_error_bohr_magneton_per_atom", "value": 0.0879516, "maximum": 0.35},
+        {"name": "moment_abs_error_bohr_magneton_per_atom", "value": 0.010747356414794851, "maximum": 0.35},
         {"name": "magnetic_minus_unpolarized_hartree_per_atom", "value": -0.02382830265, "maximum": 0.0},
         {"name": "cutoff_moment_drift", "value": 0.000351, "maximum": 0.12},
         {"name": "kpoint_moment_drift", "value": 0.084764, "maximum": 0.12},

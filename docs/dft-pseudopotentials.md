@@ -55,10 +55,10 @@ does not by itself certify d-block material transferability. The bcc Iron
 PBE/GTH-q16 cutoff and k-point study now passes the Phase 5 material gate,
 while the matching q8 study retains a failed magnetic-moment gate. Phase 7
 now computes a multi-material coverage and science matrix rather than
-generalizing from q16. Coverage is complete, but the production GTH envelope
-remains unverified because locked MgO, older evidence-identity blockers, and a
-failed full-versus-reduced SCF oracle for the point-group-reduced Fe evidence
-are retained.
+generalizing from q16. The current Fe q16 full-versus-reduced SCF oracle passes
+after exact rotated-density reconstruction. Coverage is complete, but the
+production GTH envelope remains unverified because locked MgO residuals and
+older evidence-identity blockers are retained.
 
 ## Forces
 

@@ -81,6 +81,7 @@ def test_aluminum_workload_is_hash_guarded_and_persists_reduced_mesh(tmp_path, m
     assert manifest["physics"]["smearing_width_hartree"] == 0.00225
     assert manifest["reduced_kpoint_meshes"]["3"]["full_point_count"] == 27
     assert len(mesh.points) == 4
+    assert mesh.point_group_symmetry_reduced is True
     assert sum(point.weight for point in mesh.points) == pytest.approx(1.0)
 
     resource.write_text(resource.read_text() + "\n")

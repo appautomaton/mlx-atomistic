@@ -8,20 +8,17 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from mlx_atomistic._artifact_identity import canonical_json_bytes, sha256_bytes
 from mlx_atomistic.benchmarks.dft_aluminum_eos import load_aluminum_eos_references
 from mlx_atomistic.benchmarks.dft_silicon import parse_gth_entry
 from mlx_atomistic.dft import (
     GammaCenteredGrid,
-    KPoint,
     KPointMesh,
     cubic_reciprocal_symmetry_operations,
     reduce_kpoint_mesh_by_symmetry,
 )
 
-WORKLOAD_SCHEMA = "mlx-atomistic.dft-aluminum-workload.v1"
+WORKLOAD_SCHEMA = "mlx-atomistic.dft-aluminum-workload.v2"
 TARGET_ID = "fcc-aluminum-conventional-pbe-gth-q3"
 GTH_ELEMENT = "Al"
 GTH_NAME = "GTH-PBE-q3"
@@ -52,14 +49,14 @@ def _reduced_mesh_payload(size: int) -> dict[str, Any]:
         full,
         cubic_reciprocal_symmetry_operations(),
     )
+    mesh_payload = reduced.to_dict()
     return {
         "size": [size, size, size],
         "centering": "gamma",
         "full_point_count": len(full.points),
         "representative_point_count": len(reduced.points),
-        "points": [
-            {"vector": list(point.vector), "weight": point.weight} for point in reduced.points
-        ],
+        "points": mesh_payload["points"],
+        "point_group_symmetry": mesh_payload["point_group_symmetry"],
     }
 
 
@@ -208,9 +205,17 @@ def _validate_reduced_meshes(payload: Mapping[str, Any]) -> None:
         points = mesh.get("points", [])
         if mesh.get("representative_point_count") != len(points):
             raise ValueError("Aluminum workload representative count mismatch")
-        weight = sum(float(point["weight"]) for point in points)
-        if not np.isclose(weight, 1.0, atol=1.0e-12):
-            raise ValueError("Aluminum workload k-point weights are not normalized")
+        try:
+            restored = KPointMesh.from_dict(
+                {
+                    "points": points,
+                    "point_group_symmetry": mesh.get("point_group_symmetry"),
+                }
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("Aluminum workload k-point symmetry is invalid") from error
+        if len(restored.points) != len(points):
+            raise ValueError("Aluminum workload representative count mismatch")
 
 
 def load_aluminum_workload(path: str | Path) -> tuple[dict[str, Any], Path]:
@@ -250,15 +255,11 @@ def kpoint_mesh_from_workload(workload: Mapping[str, Any], size: int) -> KPointM
         payload = workload["reduced_kpoint_meshes"][str(int(size))]
     except KeyError as error:
         raise ValueError(f"Aluminum workload does not contain k-point mesh {size}") from error
-    return KPointMesh(
-        [
-            KPoint(
-                point["vector"],
-                weight=float(point["weight"]),
-                coordinate_system="reduced",
-            )
-            for point in payload["points"]
-        ]
+    return KPointMesh.from_dict(
+        {
+            "points": payload["points"],
+            "point_group_symmetry": payload["point_group_symmetry"],
+        }
     )
 
 

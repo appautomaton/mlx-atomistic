@@ -495,6 +495,7 @@ def periodic_scf_calculation_contract(
     if xc_functional is not None and type(xc_functional) is not (ProductionPBEExchangeCorrelation):
         msg = "periodic checkpointing supports only the stable production PBE path"
         raise ValueError(msg)
+    mesh_payload = kpoint_mesh.to_dict()
     return {
         "schema_version": _CALCULATION_CONTRACT_SCHEMA,
         "system": {
@@ -511,12 +512,13 @@ def periodic_scf_calculation_contract(
         "n_bands": int(bands),
         "kpoints": [
             {
-                "reduced_kpoint": list(point.vector),
-                "weight": point.weight,
-                "coordinate_system": point.coordinate_system,
+                "reduced_kpoint": list(point["vector"]),
+                "weight": point["weight"],
+                "coordinate_system": point["coordinate_system"],
             }
-            for point in kpoint_mesh.points
+            for point in mesh_payload["points"]
         ],
+        "point_group_symmetry": mesh_payload.get("point_group_symmetry"),
         "xc_functional": "production-pbe-v1",
         "config": _config_payload(scf_config),
         "precision": "complex64/float32",

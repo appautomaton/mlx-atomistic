@@ -763,6 +763,7 @@ class PeriodicSCFResult:
     history: tuple[dict[str, float | int | str | None], ...]
     timings: dict[str, float]
     time_reversal_ownership: TimeReversalOwnership | None = None
+    point_group_symmetry_reduced: bool = False
     batch_policy: dict[str, int | float | str | list[int]] = field(default_factory=dict)
     numerical_status: str = "not_evaluated"
     resume_integrity_status: str = "fresh"
@@ -864,6 +865,7 @@ class PeriodicSCFResult:
             "numerical_status": self.numerical_status,
             "resume_integrity_status": self.resume_integrity_status,
             "timing_admission_status": self.timing_admission_status,
+            "point_group_symmetry_reduced": self.point_group_symmetry_reduced,
             "lineage": list(self.lineage),
             "system_fingerprint": self.system_fingerprint,
             "dense_full_hamiltonian": False,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import permutations, product
 from typing import Any
 
@@ -621,12 +621,182 @@ class KPoint:
 
 
 @dataclass(frozen=True)
+class _KPointSymmetryOrbitMember:
+    full_index: int
+    reduced_kpoint: tuple[float, float, float]
+    original_weight: float
+    reciprocal_operation: tuple[tuple[int, int, int], ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "full_index": self.full_index,
+            "reduced_kpoint": list(self.reduced_kpoint),
+            "original_weight": self.original_weight,
+            "reciprocal_operation": [list(row) for row in self.reciprocal_operation],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> _KPointSymmetryOrbitMember:
+        if not isinstance(payload, Mapping):
+            raise ValueError("k-point symmetry orbit member is invalid")
+        raw_operation = payload.get("reciprocal_operation")
+        try:
+            operation = np.asarray(raw_operation, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("k-point symmetry reciprocal operation is invalid") from exc
+        if operation.shape != (3, 3) or not np.isfinite(operation).all():
+            raise ValueError("k-point symmetry reciprocal operation is invalid")
+        rounded = np.rint(operation)
+        if not np.array_equal(operation, rounded):
+            raise ValueError("k-point symmetry reciprocal operation must be integral")
+        raw_kpoint = payload.get("reduced_kpoint")
+        if (
+            not isinstance(raw_kpoint, Sequence)
+            or isinstance(raw_kpoint, (str, bytes))
+        ):
+            raise ValueError("k-point symmetry member coordinate is invalid")
+        full_index = payload.get("full_index")
+        if isinstance(full_index, bool) or not isinstance(full_index, int):
+            raise ValueError("k-point symmetry full index is invalid")
+        return cls(
+            full_index=full_index,
+            reduced_kpoint=tuple(float(value) for value in raw_kpoint),
+            original_weight=float(payload.get("original_weight", np.nan)),
+            reciprocal_operation=tuple(
+                tuple(int(value) for value in row) for row in rounded.astype(np.int64)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class _KPointSymmetryOrbit:
+    representative_full_index: int
+    members: tuple[_KPointSymmetryOrbitMember, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "representative_full_index": self.representative_full_index,
+            "members": [member.to_dict() for member in self.members],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> _KPointSymmetryOrbit:
+        if not isinstance(payload, Mapping):
+            raise ValueError("k-point symmetry orbit is invalid")
+        raw_members = payload.get("members")
+        if (
+            not isinstance(raw_members, Sequence)
+            or isinstance(raw_members, (str, bytes))
+            or not raw_members
+        ):
+            raise ValueError("k-point symmetry orbit members are invalid")
+        representative = payload.get("representative_full_index")
+        if isinstance(representative, bool) or not isinstance(representative, int):
+            raise ValueError("k-point symmetry representative index is invalid")
+        return cls(
+            representative_full_index=representative,
+            members=tuple(
+                _KPointSymmetryOrbitMember.from_dict(member)
+                for member in raw_members
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class _KPointSymmetryReduction:
+    full_point_count: int
+    orbits: tuple[_KPointSymmetryOrbit, ...]
+
+    def validate(self, points: Sequence[KPoint]) -> None:
+        if type(self.full_point_count) is not int or self.full_point_count <= 0:
+            raise ValueError("k-point symmetry full point count is invalid")
+        if len(self.orbits) != len(points):
+            raise ValueError("k-point symmetry orbits must match representatives")
+        observed_indices = []
+        total_weight = 0.0
+        for point, orbit in zip(points, self.orbits, strict=True):
+            if not orbit.members:
+                raise ValueError("k-point symmetry orbit cannot be empty")
+            if orbit.representative_full_index not in {
+                member.full_index for member in orbit.members
+            }:
+                raise ValueError("k-point symmetry representative is outside its orbit")
+            orbit_weight = 0.0
+            representative = np.asarray(point.vector, dtype=np.float64)
+            for member in orbit.members:
+                if (
+                    type(member.full_index) is not int
+                    or member.full_index < 0
+                    or member.full_index >= self.full_point_count
+                ):
+                    raise ValueError("k-point symmetry full index is invalid")
+                vector = np.asarray(member.reduced_kpoint, dtype=np.float64)
+                operation = np.asarray(member.reciprocal_operation, dtype=np.int64)
+                if vector.shape != (3,) or not np.isfinite(vector).all():
+                    raise ValueError("k-point symmetry member coordinate is invalid")
+                if operation.shape != (3, 3) or abs(
+                    int(round(float(np.linalg.det(operation))))
+                ) != 1:
+                    raise ValueError("k-point symmetry operation must be unimodular")
+                difference = operation @ representative - vector
+                difference -= np.rint(difference)
+                if float(np.max(np.abs(difference))) > 1.0e-10:
+                    raise ValueError("k-point symmetry operation does not map its member")
+                if not np.isfinite(member.original_weight) or member.original_weight <= 0.0:
+                    raise ValueError("k-point symmetry member weight is invalid")
+                observed_indices.append(member.full_index)
+                orbit_weight += member.original_weight
+            if not np.isclose(orbit_weight, point.weight, rtol=1.0e-12, atol=1.0e-15):
+                raise ValueError("k-point symmetry orbit weight does not match representative")
+            total_weight += orbit_weight
+        if sorted(observed_indices) != list(range(self.full_point_count)):
+            raise ValueError("k-point symmetry orbits do not partition the full mesh")
+        if not np.isclose(total_weight, 1.0, rtol=1.0e-12, atol=1.0e-15):
+            raise ValueError("k-point symmetry full-mesh weights are not normalized")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "full_point_count": self.full_point_count,
+            "orbits": [orbit.to_dict() for orbit in self.orbits],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> _KPointSymmetryReduction:
+        if not isinstance(payload, Mapping):
+            raise ValueError("k-point symmetry reduction payload is invalid")
+        raw_orbits = payload.get("orbits")
+        if (
+            not isinstance(raw_orbits, Sequence)
+            or isinstance(raw_orbits, (str, bytes))
+            or not raw_orbits
+        ):
+            raise ValueError("k-point symmetry reduction orbits are invalid")
+        full_point_count = payload.get("full_point_count")
+        if isinstance(full_point_count, bool) or not isinstance(full_point_count, int):
+            raise ValueError("k-point symmetry full point count is invalid")
+        return cls(
+            full_point_count=full_point_count,
+            orbits=tuple(_KPointSymmetryOrbit.from_dict(orbit) for orbit in raw_orbits),
+        )
+
+
+@dataclass(frozen=True)
 class KPointMesh:
-    """Weighted k-point mesh."""
+    """Weighted k-point mesh with optional point-group orbit metadata."""
 
     points: tuple[KPoint, ...]
+    _symmetry_reduction: _KPointSymmetryReduction | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
-    def __init__(self, points: Sequence[KPoint]):
+    def __init__(
+        self,
+        points: Sequence[KPoint],
+        *,
+        _symmetry_reduction: _KPointSymmetryReduction | None = None,
+    ):
         if not points:
             msg = "KPointMesh requires at least one point"
             raise ValueError(msg)
@@ -644,6 +814,15 @@ class KPointMesh:
             for point in points
         )
         object.__setattr__(self, "points", normalized)
+        if _symmetry_reduction is not None:
+            _symmetry_reduction.validate(normalized)
+        object.__setattr__(self, "_symmetry_reduction", _symmetry_reduction)
+
+    @property
+    def point_group_symmetry_reduced(self) -> bool:
+        """Return whether SCF density orbit reconstruction is required."""
+
+        return self._symmetry_reduction is not None
 
     @classmethod
     def gamma(cls) -> KPointMesh:
@@ -654,7 +833,53 @@ class KPointMesh:
     def to_dict(self) -> dict:
         """Return a JSON-safe representation."""
 
-        return {"points": [point.to_dict() for point in self.points]}
+        payload = {"points": [point.to_dict() for point in self.points]}
+        if self._symmetry_reduction is not None:
+            payload["point_group_symmetry"] = self._symmetry_reduction.to_dict()
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> KPointMesh:
+        """Rebuild a weighted mesh and its optional symmetry orbit metadata."""
+
+        raw_points = payload.get("points")
+        if (
+            not isinstance(raw_points, Sequence)
+            or isinstance(raw_points, (str, bytes))
+            or not raw_points
+        ):
+            raise ValueError("k-point mesh payload requires a non-empty point list")
+        points = []
+        for value in raw_points:
+            if not isinstance(value, Mapping):
+                raise ValueError("k-point mesh point payload is invalid")
+            raw_vector = value.get("vector")
+            if (
+                not isinstance(raw_vector, Sequence)
+                or isinstance(raw_vector, (str, bytes))
+            ):
+                raise ValueError("k-point mesh point vector is invalid")
+            raw_label = value.get("label")
+            if raw_label is not None and not isinstance(raw_label, str):
+                raise ValueError("k-point mesh point label is invalid")
+            raw_coordinate_system = value.get("coordinate_system", "reduced")
+            if not isinstance(raw_coordinate_system, str):
+                raise ValueError("k-point mesh coordinate system is invalid")
+            points.append(
+                KPoint(
+                    raw_vector,
+                    weight=float(value.get("weight", 1.0)),
+                    label=raw_label,
+                    coordinate_system=raw_coordinate_system,
+                )
+            )
+        raw_symmetry = payload.get("point_group_symmetry")
+        reduction = (
+            None
+            if raw_symmetry is None
+            else _KPointSymmetryReduction.from_dict(raw_symmetry)
+        )
+        return cls(points, _symmetry_reduction=reduction)
 
 
 @dataclass(frozen=True)
@@ -854,8 +1079,9 @@ def _reciprocal_symmetry_orbit(
     symmetry: Sequence[np.ndarray],
     *,
     atol: float,
-) -> set[int]:
-    orbit = {representative}
+) -> dict[int, np.ndarray]:
+    identity = np.eye(3, dtype=np.int64)
+    orbit = {representative: identity}
     pending = [representative]
     while pending:
         current = pending.pop()
@@ -871,7 +1097,7 @@ def _reciprocal_symmetry_orbit(
             if float(np.max(np.abs(difference))) > atol:
                 raise ValueError("reciprocal symmetry coordinate match exceeded tolerance")
             if match not in orbit:
-                orbit.add(match)
+                orbit[match] = operation @ orbit[current]
                 pending.append(match)
     return orbit
 
@@ -917,7 +1143,8 @@ def reduce_kpoint_mesh_by_symmetry(
     lookup = _reduced_mesh_lookup(vectors, atol=coordinate_atol)
 
     remaining = set(range(len(vectors)))
-    reduced = []
+    reduced: list[KPoint] = []
+    orbits: list[_KPointSymmetryOrbit] = []
     while remaining:
         representative = min(remaining)
         orbit = _reciprocal_symmetry_orbit(
@@ -948,7 +1175,28 @@ def reduce_kpoint_mesh_by_symmetry(
             )
         )
         remaining.difference_update(orbit)
-    return KPointMesh(reduced)
+        orbits.append(
+            _KPointSymmetryOrbit(
+                representative_full_index=representative,
+                members=tuple(
+                    _KPointSymmetryOrbitMember(
+                        full_index=index,
+                        reduced_kpoint=tuple(vectors[index]),
+                        original_weight=weights[index],
+                        reciprocal_operation=tuple(
+                            tuple(int(value) for value in row)
+                            for row in orbit[index]
+                        ),
+                    )
+                    for index in sorted(orbit)
+                ),
+            )
+        )
+    reduction = _KPointSymmetryReduction(
+        full_point_count=len(vectors),
+        orbits=tuple(orbits),
+    )
+    return KPointMesh(reduced, _symmetry_reduction=reduction)
 
 
 @dataclass(frozen=True)
