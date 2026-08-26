@@ -162,8 +162,8 @@ pressure drift is `2.17019e-7 Ha/bohr^3`, below the locked
 
 ## Phase 5: Add Periodic Collinear Spin
 
-Status: planned after the general cell contract to avoid duplicating a global
-geometry refactor across spin channels.
+Status: active. The scientific and architecture contract is recorded in
+[DFT Periodic Collinear Spin](./dft-periodic-spin.md).
 
 - Carry separate spin-up and spin-down densities, occupations, potentials, and
   convergence diagnostics through periodic SCF.

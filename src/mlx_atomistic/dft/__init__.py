@@ -173,6 +173,10 @@ from mlx_atomistic.dft.restart import (
     save_dense_scf_restart,
 )
 from mlx_atomistic.dft.scf import SCFConfig, SCFResult, run_scf
+from mlx_atomistic.dft.spin_gga import (
+    ProductionSpinPBEExchangeCorrelation,
+    SpinXCResult,
+)
 from mlx_atomistic.dft.stress import StressResult, finite_difference_stress
 from mlx_atomistic.dft.system import DFTSystem, center_center_energy, center_center_forces
 from mlx_atomistic.dft.xc import (
@@ -253,6 +257,7 @@ __all__ = [
     "PeriodicUnfoldedBandStructureResult",
     "PlaneWaveBasis",
     "ProductionPBEExchangeCorrelation",
+    "ProductionSpinPBEExchangeCorrelation",
     "ProjectorSet",
     "PulayDIISMixer",
     "PseudopotentialData",
@@ -267,6 +272,7 @@ __all__ = [
     "SCFForceConsistencyResult",
     "SCFResult",
     "SpinMode",
+    "SpinXCResult",
     "StressResult",
     "SubspaceDiagonalizer",
     "TimeReversalOwnership",
