@@ -30,6 +30,7 @@ from mlx_atomistic.dft import (
     RuntimeObserver,
     cubic_reciprocal_symmetry_operations,
     read_gth,
+    reciprocal_symmetry_operations_for_cell,
     reduce_kpoint_mesh_by_symmetry,
     run_periodic_scf,
 )
@@ -194,20 +195,10 @@ def _d_projector_tail_ratio(cutoff_hartree: float, radius: float) -> float:
 
 
 def _primitive_reciprocal_operations() -> tuple[tuple[tuple[int, ...], ...], ...]:
-    reciprocal = 2.0 * np.pi * np.linalg.inv(PRIMITIVE_CELL_MATRIX).T
-    cartesian_from_reduced = reciprocal.T
-    operations = []
-    for conventional in cubic_reciprocal_symmetry_operations():
-        transformed = (
-            np.linalg.inv(cartesian_from_reduced)
-            @ np.asarray(conventional, dtype=np.float64)
-            @ cartesian_from_reduced
-        )
-        rounded = np.rint(transformed).astype(np.int64)
-        if not np.allclose(transformed, rounded, atol=1.0e-12, rtol=0.0):
-            raise RuntimeError("bcc primitive reciprocal symmetry is not integral")
-        operations.append(tuple(tuple(int(value) for value in row) for row in rounded))
-    return tuple(dict.fromkeys(operations))
+    return reciprocal_symmetry_operations_for_cell(
+        PRIMITIVE_CELL_MATRIX,
+        cubic_reciprocal_symmetry_operations(),
+    )
 
 
 def _primitive_unfolded_mesh(size: int) -> KPointMesh:

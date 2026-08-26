@@ -207,8 +207,9 @@ material workload was rerun merely to exercise these analysis contracts.
 
 ## Phase 7: Expand Pseudopotential Transferability
 
-Status: evidence expands incrementally with every earlier phase; the final
-matrix closes after spin support.
+Status: implementation complete; scientific exit blocked. The fail-closed
+matrix and efficient material decision policy are defined in
+[Periodic GTH Transferability](./dft-gth-transferability.md).
 
 - Strengthen periodic GTH convention fidelity instead of treating parser
   success as scientific validation. Existing UPF support retains its separate
@@ -220,6 +221,12 @@ matrix closes after spin support.
 
 Exit gate: a multi-material matrix passes locked energy, structural, and force
 thresholds without element-specific runtime branches.
+
+Current exit result: coverage is complete, but the gate remains blocked by the
+locked MgO q2 bulk-derivative and total-force residuals and incomplete exact
+calculation/runtime identities for older project-derived EOS summaries. A
+bounded primitive-cell Mg q10 screen improved runtime representation but failed
+its locked orbital-residual gate, so no full q10 EOS was run.
 
 ## Phase 8: Add Finite-Displacement Phonons
 

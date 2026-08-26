@@ -10,6 +10,7 @@ from mlx_atomistic.dft import (
     MonkhorstPackGrid,
     build_time_reversal_ownership,
     cubic_reciprocal_symmetry_operations,
+    reciprocal_symmetry_operations_for_cell,
     reduce_kpoint_mesh_by_symmetry,
 )
 
@@ -42,6 +43,33 @@ def test_cubic_reduction_preserves_invariant_quadrature_and_time_reversal():
     assert reduced_value == pytest.approx(full_value, abs=2.0e-15)
     assert sum(point.weight for point in reduced.points) == pytest.approx(1.0)
     assert len(build_time_reversal_ownership(full).owned_indices) == 36
+
+
+def test_cubic_symmetries_transform_to_fcc_primitive_reciprocal_basis():
+    cell = np.asarray(
+        (
+            (0.0, 0.5, 0.5),
+            (0.5, 0.0, 0.5),
+            (0.5, 0.5, 0.0),
+        )
+    )
+    operations = reciprocal_symmetry_operations_for_cell(
+        cell,
+        cubic_reciprocal_symmetry_operations(),
+    )
+    reciprocal = 2.0 * np.pi * np.linalg.inv(cell).T
+    metric = reciprocal @ reciprocal.T
+    reduced = reduce_kpoint_mesh_by_symmetry(
+        GammaCenteredGrid((4, 4, 4)),
+        operations,
+    )
+
+    assert len(operations) == 48
+    assert len(reduced.points) < 32
+    assert sum(point.weight for point in reduced.points) == pytest.approx(1.0)
+    for operation in operations:
+        matrix = np.asarray(operation)
+        np.testing.assert_allclose(matrix.T @ metric @ matrix, metric, atol=2.0e-13)
 
 
 def test_symmetry_reduction_fails_closed_on_invalid_operations_and_meshes():

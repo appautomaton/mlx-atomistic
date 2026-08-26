@@ -25,6 +25,16 @@ MGO_FRACTIONAL_POSITIONS = (
     (0.0, 0.0, 0.5),
     (0.0, 0.5, 0.0),
 )
+MGO_PRIMITIVE_CELL_MATRIX = (
+    (0.0, 0.5, 0.5),
+    (0.5, 0.0, 0.5),
+    (0.5, 0.5, 0.0),
+)
+MGO_PRIMITIVE_SYMBOLS = ("Mg", "O")
+MGO_PRIMITIVE_FRACTIONAL_POSITIONS = (
+    (0.0, 0.0, 0.0),
+    (0.5, 0.5, 0.5),
+)
 RESOURCE_SPECS = {
     "mg_q2": {
         "element": "Mg",
@@ -70,6 +80,7 @@ def _unsigned_workload(
         "source_database_sha256": source_sha256,
         "system": {
             "name": "rocksalt-mgo-conventional-cubic",
+            "cell_representation": "conventional",
             "atom_count": 8,
             "symbols": list(MGO_SYMBOLS),
             "fractional_positions": [list(row) for row in MGO_FRACTIONAL_POSITIONS],
@@ -77,6 +88,24 @@ def _unsigned_workload(
             "q2_occupied_band_count": 16,
             "q10_electron_count": 64,
             "q10_occupied_band_count": 32,
+            "spin_mode": "unpolarized",
+            "occupancy_per_band": 2,
+        },
+        "primitive_system": {
+            "name": "rocksalt-mgo-fcc-primitive",
+            "cell_representation": "primitive",
+            "fractional_cell_matrix": [
+                list(row) for row in MGO_PRIMITIVE_CELL_MATRIX
+            ],
+            "atom_count": 2,
+            "symbols": list(MGO_PRIMITIVE_SYMBOLS),
+            "fractional_positions": [
+                list(row) for row in MGO_PRIMITIVE_FRACTIONAL_POSITIONS
+            ],
+            "q2_electron_count": 8,
+            "q2_occupied_band_count": 4,
+            "q10_electron_count": 16,
+            "q10_occupied_band_count": 8,
             "spin_mode": "unpolarized",
             "occupancy_per_band": 2,
         },
