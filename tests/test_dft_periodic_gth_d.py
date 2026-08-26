@@ -83,3 +83,43 @@ def test_periodic_d_projector_is_hermitian_and_cell_translation_invariant():
     assert left_right == pytest.approx(np.conjugate(right_left), abs=2.0e-5)
     assert shifted_energy == pytest.approx(first_energy, abs=2.0e-5)
     assert first.to_dict()["angular_projector_count_per_ion"] == 5
+
+
+def test_periodic_d_projector_force_matches_fixed_orbital_energy_derivative():
+    grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 4.0, (0.25, 0.125, -0.25))
+    position = np.asarray(((1.0, 2.0, 3.0),))
+    rng = np.random.default_rng(92)
+    orbital = basis.normalize(
+        mx.array(
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
+                np.complex64
+            )
+        )
+    )
+    operator = PeriodicGTHNonlocalOperator(_d_channel_gth(), basis, position)
+    observed = np.asarray(operator.forces(orbital, occupations=[1.0]))
+    reference = np.zeros_like(position)
+    displacement = 2.0e-3
+    for axis in range(3):
+        plus = position.copy()
+        minus = position.copy()
+        plus[0, axis] += displacement
+        minus[0, axis] -= displacement
+        energy_plus = float(
+            PeriodicGTHNonlocalOperator(
+                _d_channel_gth(),
+                basis,
+                plus,
+            ).energy(orbital, occupations=[1.0])
+        )
+        energy_minus = float(
+            PeriodicGTHNonlocalOperator(
+                _d_channel_gth(),
+                basis,
+                minus,
+            ).energy(orbital, occupations=[1.0])
+        )
+        reference[0, axis] = -(energy_plus - energy_minus) / (2.0 * displacement)
+
+    np.testing.assert_allclose(observed, reference, atol=8.0e-5, rtol=5.0e-4)

@@ -724,6 +724,71 @@ def cubic_reciprocal_symmetry_operations() -> tuple[tuple[tuple[int, ...], ...],
     return tuple(operations)
 
 
+def reciprocal_symmetry_operations_for_cell(
+    cell_matrix: Sequence[Sequence[float]],
+    cartesian_operations: Sequence[Sequence[Sequence[int | float]]],
+    *,
+    coordinate_atol: float = 1.0e-12,
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Express Cartesian reciprocal symmetries in one cell's reduced basis.
+
+    Args:
+        cell_matrix: Full-rank direct-cell row vectors.
+        cartesian_operations: Cartesian column-vector symmetry operations.
+        coordinate_atol: Absolute tolerance for integer reduced operations.
+
+    Returns:
+        Unique integer operations acting on reduced reciprocal coordinates.
+
+    Raises:
+        ValueError: If the cell, tolerance, operation, or transformed symmetry
+            is invalid for the requested cell basis.
+    """
+
+    direct = np.asarray(cell_matrix, dtype=np.float64)
+    if direct.shape != (3, 3) or not np.isfinite(direct).all():
+        raise ValueError("cell_matrix must be a finite 3 x 3 matrix")
+    determinant = float(np.linalg.det(direct))
+    if not np.isfinite(determinant) or determinant <= 0.0:
+        raise ValueError("cell_matrix must be right-handed and full-rank")
+    if not np.isfinite(coordinate_atol) or coordinate_atol <= 0.0:
+        raise ValueError("coordinate_atol must be finite and positive")
+    if not cartesian_operations:
+        raise ValueError("at least one Cartesian symmetry operation is required")
+    reciprocal = 2.0 * np.pi * np.linalg.inv(direct).T
+    cartesian_from_reduced = reciprocal.T
+    reduced_from_cartesian = np.linalg.inv(cartesian_from_reduced)
+    transformed_operations = []
+    for index, operation in enumerate(cartesian_operations):
+        cartesian = np.asarray(operation, dtype=np.float64)
+        if cartesian.shape != (3, 3) or not np.isfinite(cartesian).all():
+            raise ValueError(
+                f"Cartesian symmetry operation {index} must be a finite 3 x 3 matrix"
+            )
+        if not np.allclose(
+            cartesian.T @ cartesian,
+            np.eye(3),
+            atol=coordinate_atol,
+            rtol=0.0,
+        ):
+            raise ValueError(f"Cartesian symmetry operation {index} must be orthogonal")
+        transformed = reduced_from_cartesian @ cartesian @ cartesian_from_reduced
+        rounded = np.rint(transformed).astype(np.int64)
+        if not np.allclose(
+            transformed,
+            rounded,
+            atol=coordinate_atol,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                f"Cartesian symmetry operation {index} is not integral in the cell basis"
+            )
+        transformed_operations.append(
+            tuple(tuple(int(value) for value in row) for row in rounded)
+        )
+    return tuple(dict.fromkeys(transformed_operations))
+
+
 def _reduced_coordinate_key(
     vector: Sequence[float] | np.ndarray,
     *,

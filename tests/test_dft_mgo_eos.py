@@ -5,6 +5,8 @@ import pytest
 
 from mlx_atomistic.benchmarks.dft_mgo import (
     MGO_FRACTIONAL_POSITIONS,
+    MGO_PRIMITIVE_CELL_MATRIX,
+    MGO_PRIMITIVE_FRACTIONAL_POSITIONS,
     MGO_SYMBOLS,
     load_mgo_workload,
     prepare_mgo_workload,
@@ -20,7 +22,9 @@ from mlx_atomistic.benchmarks.dft_mgo_eos_runner import (
     POINT_TIMEOUT_SECONDS,
     PROFILE_SPECS,
     _completion_assessment,
+    _kpoint_mesh,
     _shape_comparison,
+    _system_geometry,
     run_mgo_eos_validation,
 )
 
@@ -114,6 +118,12 @@ def test_mgo_workload_extracts_all_species_and_is_hash_guarded(tmp_path):
     assert manifest["system"]["q2_occupied_band_count"] == 16
     assert manifest["system"]["q10_electron_count"] == 64
     assert manifest["system"]["q10_occupied_band_count"] == 32
+    assert manifest["primitive_system"]["atom_count"] == 2
+    assert manifest["primitive_system"]["q10_electron_count"] == 16
+    assert manifest["primitive_system"]["q10_occupied_band_count"] == 8
+    assert manifest["primitive_system"]["fractional_cell_matrix"] == [
+        list(row) for row in MGO_PRIMITIVE_CELL_MATRIX
+    ]
 
     resources["o_q6"].write_text(resources["o_q6"].read_text() + "\n")
     with pytest.raises(ValueError, match="hash mismatch"):
@@ -144,7 +154,26 @@ def test_mgo_validation_dry_run_exposes_bounded_decision_ladder(tmp_path):
         70.0,
         80.0,
     ]
-    assert len(PROFILE_SPECS) == 22
+    assert len(PROFILE_SPECS) == 23
+
+
+def test_mgo_q10_primitive_profile_preserves_geometry_and_reduces_kpoints():
+    lattice = 8.0
+    system = {
+        "cell_representation": "primitive",
+        "fractional_cell_matrix": [list(row) for row in MGO_PRIMITIVE_CELL_MATRIX],
+        "fractional_positions": [
+            list(row) for row in MGO_PRIMITIVE_FRACTIONAL_POSITIONS
+        ],
+    }
+    cell, positions = _system_geometry(system, lattice)
+    settings = PROFILE_SPECS["q10-primitive-c40-k4"]
+    mesh = _kpoint_mesh(settings, cell)
+
+    assert np.linalg.det(cell) == pytest.approx(lattice**3 / 4.0)
+    np.testing.assert_allclose(positions[1], (lattice / 2.0,) * 3)
+    assert len(mesh.points) < 32
+    assert sum(point.weight for point in mesh.points) == pytest.approx(1.0)
 
 
 def test_mgo_kpoint_shape_comparison_removes_total_energy_offset():

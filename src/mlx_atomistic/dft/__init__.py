@@ -44,6 +44,7 @@ from mlx_atomistic.dft.kpoints import (
     admit_time_reversal_bases,
     build_time_reversal_ownership,
     cubic_reciprocal_symmetry_operations,
+    reciprocal_symmetry_operations_for_cell,
     reduce_kpoint_mesh_by_symmetry,
     run_band_structure,
 )
@@ -361,6 +362,7 @@ __all__ = [
     "periodic_scf_initialization_identity",
     "publish_periodic_scf_checkpoint",
     "real_to_reciprocal",
+    "reciprocal_symmetry_operations_for_cell",
     "reciprocal_to_real",
     "read_gth",
     "read_periodic_density_volume",

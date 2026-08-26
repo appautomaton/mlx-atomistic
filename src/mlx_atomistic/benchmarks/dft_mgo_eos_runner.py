@@ -82,6 +82,16 @@ PROFILE_SPECS: dict[str, dict[str, Any]] = {
         "kpoint_mesh": [4, 4, 4],
         "max_batch_transient_bytes": 1024 * 1024**2,
     },
+    "q10-primitive-c40-k4": {
+        "pseudopotential_mode": "q10",
+        "cell_representation": "primitive",
+        "cutoff_hartree": 40.0,
+        "fft_shape": [36, 36, 36],
+        "kpoint_mesh": [4, 4, 4],
+        "kpoint_centering": "gamma",
+        "symmetry_reduction": "full_cubic_point_group",
+        "max_batch_transient_bytes": 512 * 1024**2,
+    },
 }
 
 
@@ -98,9 +108,55 @@ def _implementation_fingerprint() -> str:
         "point_schema": POINT_SCHEMA,
         "profiles": PROFILE_SPECS,
         "scf_config_source": inspect.getsource(_scf_config),
+        "system_geometry_source": inspect.getsource(_system_geometry),
+        "kpoint_mesh_source": inspect.getsource(_kpoint_mesh),
         "point_execution_source": inspect.getsource(run_mgo_eos_point),
     }
     return sha256_bytes(canonical_json_bytes(contract))
+
+
+def _system_geometry(
+    system: Mapping[str, Any],
+    lattice_bohr: float,
+) -> tuple[tuple[float, ...] | np.ndarray, np.ndarray]:
+    fractional = np.asarray(system["fractional_positions"], dtype=np.float64)
+    representation = str(system["cell_representation"])
+    if representation == "conventional":
+        return (lattice_bohr, lattice_bohr, lattice_bohr), fractional * lattice_bohr
+    if representation != "primitive":
+        raise ValueError(f"unsupported MgO cell representation: {representation}")
+    cell = np.asarray(system["fractional_cell_matrix"], dtype=np.float64) * lattice_bohr
+    if cell.shape != (3, 3):
+        raise ValueError("primitive MgO cell matrix must have shape (3, 3)")
+    return cell, fractional @ cell
+
+
+def _kpoint_mesh(settings: Mapping[str, Any], cell: Any) -> Any:
+    from mlx_atomistic.dft import (
+        GammaCenteredGrid,
+        MonkhorstPackGrid,
+        cubic_reciprocal_symmetry_operations,
+        reciprocal_symmetry_operations_for_cell,
+        reduce_kpoint_mesh_by_symmetry,
+    )
+
+    centering = str(settings.get("kpoint_centering", "monkhorst_pack"))
+    if centering == "gamma":
+        full = GammaCenteredGrid(tuple(settings["kpoint_mesh"]))
+    elif centering == "monkhorst_pack":
+        full = MonkhorstPackGrid(tuple(settings["kpoint_mesh"]))
+    else:
+        raise ValueError(f"unsupported MgO k-point centering: {centering}")
+    reduction = settings.get("symmetry_reduction")
+    if reduction is None:
+        return full
+    if reduction != "full_cubic_point_group":
+        raise ValueError(f"unsupported MgO k-point reduction: {reduction}")
+    operations = reciprocal_symmetry_operations_for_cell(
+        np.asarray(cell, dtype=np.float64),
+        cubic_reciprocal_symmetry_operations(),
+    )
+    return reduce_kpoint_mesh_by_symmetry(full, operations)
 
 
 def _point_spec(
@@ -169,12 +225,7 @@ def run_mgo_eos_point(
 
     import mlx.core as mx
 
-    from mlx_atomistic.dft import (
-        MonkhorstPackGrid,
-        PeriodicDFTSystem,
-        read_gth,
-        run_periodic_scf,
-    )
+    from mlx_atomistic.dft import PeriodicDFTSystem, read_gth, run_periodic_scf
     from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 
     if profile not in PROFILE_SPECS:
@@ -183,7 +234,12 @@ def run_mgo_eos_point(
         raise ValueError("MgO EOS volume_index must lie in [0, 6]")
     manifest, resources = load_mgo_workload(manifest_path)
     settings = PROFILE_SPECS[profile]
-    system_values = manifest["system"]
+    representation = str(settings.get("cell_representation", "conventional"))
+    system_values = manifest[
+        "primitive_system" if representation == "primitive" else "system"
+    ]
+    if system_values.get("cell_representation") != representation:
+        raise ValueError("MgO profile and workload cell representations differ")
     mode = str(settings["pseudopotential_mode"])
     magnesium_id = "mg_q2" if mode == "q2" else "mg_q10"
     magnesium = read_gth(
@@ -192,7 +248,11 @@ def run_mgo_eos_point(
         name="GTH-PBE-q2" if mode == "q2" else "GTH-PBE-q10",
     )
     oxygen = read_gth(resources["o_q6"], element="O", name="GTH-PBE-q6")
-    pseudopotentials = (magnesium,) * 4 + (oxygen,) * 4
+    species = {"Mg": magnesium, "O": oxygen}
+    try:
+        pseudopotentials = tuple(species[symbol] for symbol in system_values["symbols"])
+    except KeyError as error:
+        raise ValueError(f"unsupported MgO workload symbol: {error.args[0]}") from error
     electron_key = f"{mode}_electron_count"
     band_key = f"{mode}_occupied_band_count"
 
@@ -213,11 +273,11 @@ def run_mgo_eos_point(
     )
     lattice_angstrom = float(spec["lattice_constant_angstrom"])
     lattice_bohr = lattice_angstrom * ANGSTROM_TO_BOHR
-    fractional = np.asarray(system_values["fractional_positions"], dtype=np.float64)
+    cell, positions = _system_geometry(system_values, lattice_bohr)
     system = PeriodicDFTSystem(
-        (lattice_bohr, lattice_bohr, lattice_bohr),
+        cell,
         settings["fft_shape"],
-        fractional * lattice_bohr,
+        positions,
         electron_count=float(system_values[electron_key]),
         pseudopotentials=pseudopotentials,
     )
@@ -226,7 +286,7 @@ def run_mgo_eos_point(
     result = run_periodic_scf(
         system,
         cutoff_hartree=float(settings["cutoff_hartree"]),
-        kpoint_mesh=MonkhorstPackGrid(tuple(settings["kpoint_mesh"])),
+        kpoint_mesh=_kpoint_mesh(settings, cell),
         n_bands=int(system_values[band_key]),
         config=_scf_config(
             manifest,
@@ -271,6 +331,12 @@ def run_mgo_eos_point(
         "method": {
             "functional": manifest["physics"]["exchange_correlation"],
             "pseudopotential_mode": mode,
+            "cell_representation": representation,
+            "kpoint_sampling": (
+                "full_mesh"
+                if settings.get("symmetry_reduction") is None
+                else str(settings["symmetry_reduction"])
+            ),
             "pseudopotentials": manifest["physics"][
                 (
                     "accepted_pseudopotentials"

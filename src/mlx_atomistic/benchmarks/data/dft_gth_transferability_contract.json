@@ -1,0 +1,154 @@
+{
+  "schema_version": "mlx-atomistic.dft-gth-transferability.v1",
+  "coverage_requirements": {
+    "periodic_blocks": ["s", "p", "d"],
+    "environments": ["covalent", "metallic", "ionic", "magnetic"],
+    "species_modes": ["homogeneous", "mixed"],
+    "occupation_modes": ["fixed", "smeared", "collinear_spin"],
+    "force_components": ["local", "nonlocal", "total"]
+  },
+  "cases": [
+    {
+      "case_id": "diamond-silicon-q4",
+      "evidence_label": "project-derived",
+      "coverage": {
+        "periodic_blocks": ["p"],
+        "environments": ["covalent"],
+        "species_modes": ["homogeneous"],
+        "occupation_modes": ["fixed"],
+        "force_components": ["local", "nonlocal", "total"]
+      },
+      "identity": {
+        "pseudopotential_sha256": {
+          "Si GTH-PBE-q4": "da66fe0c10d015229e7ad88ea2c4204e6db54c4b9d39e05434d1c08df292d571"
+        },
+        "reference_protocol_sha256": "3cbf727f17d31ab7859acfc32d0bc313b5c02f7e870cd97411aa695c5986d53a",
+        "calculation_fingerprint": null,
+        "runtime_fingerprint": null
+      },
+      "metrics": [
+        {"name": "delta_mev_per_atom", "value": 1.942, "maximum": 3.0},
+        {"name": "lattice_relative", "value": 0.00166, "maximum": 0.005},
+        {"name": "bulk_modulus_relative", "value": 0.00232, "maximum": 0.1},
+        {"name": "bulk_derivative_relative", "value": 0.00153, "maximum": 0.15}
+      ]
+    },
+    {
+      "case_id": "diamond-carbon-q4",
+      "evidence_label": "project-derived",
+      "coverage": {
+        "periodic_blocks": ["p"],
+        "environments": ["covalent"],
+        "species_modes": ["homogeneous"],
+        "occupation_modes": ["fixed"],
+        "force_components": []
+      },
+      "identity": {
+        "pseudopotential_sha256": {
+          "C GTH-PBE-q4": "78e226aaa967b3c440cf427fa52d31552cab2dd4b8737abb69031b56cfba6e2a"
+        },
+        "reference_protocol_sha256": "8414886566bf47ed231d285293a586e0a7a6ee9f45cff44ce5944e1f502f76c6",
+        "calculation_fingerprint": null,
+        "runtime_fingerprint": null
+      },
+      "metrics": [
+        {"name": "delta_mev_per_atom", "value": 1.268, "maximum": 3.0},
+        {"name": "lattice_relative", "value": 0.00075, "maximum": 0.005},
+        {"name": "bulk_modulus_relative", "value": 0.0108, "maximum": 0.1}
+      ]
+    },
+    {
+      "case_id": "fcc-aluminum-q3",
+      "evidence_label": "project-derived",
+      "coverage": {
+        "periodic_blocks": ["p"],
+        "environments": ["metallic"],
+        "species_modes": ["homogeneous"],
+        "occupation_modes": ["smeared"],
+        "force_components": []
+      },
+      "identity": {
+        "pseudopotential_sha256": {
+          "Al GTH-PBE-q3": "06adc20c53ad6ff2eb7e1111c4b2437bd70ad520cdd6e5735dbb9cd09c1d381d"
+        },
+        "reference_protocol_sha256": "eebfe487557fcff52b1934ced8924844c307e0cfe30c739987e36734890a6788",
+        "calculation_fingerprint": "471b63703856b6b7ab5efe1369a2840dbff61d3340181cbfb385e17afad57f73",
+        "runtime_fingerprint": null
+      },
+      "metrics": [
+        {"name": "delta_mev_per_atom", "value": 0.22958746456278042, "maximum": 3.0},
+        {"name": "lattice_relative", "value": 0.00024152888409563096, "maximum": 0.005},
+        {"name": "bulk_modulus_relative", "value": 0.011368639861485518, "maximum": 0.1},
+        {"name": "bulk_derivative_relative", "value": 0.008508662077139715, "maximum": 0.15}
+      ]
+    },
+    {
+      "case_id": "rocksalt-mgo-q2-q6",
+      "evidence_label": "project-derived",
+      "coverage": {
+        "periodic_blocks": ["s", "p"],
+        "environments": ["ionic"],
+        "species_modes": ["mixed"],
+        "occupation_modes": ["fixed"],
+        "force_components": ["local", "nonlocal", "total"]
+      },
+      "identity": {
+        "pseudopotential_sha256": {
+          "Mg GTH-PBE-q2": "06b249c7c0940f4c03ac96d8a790be2cdebf82de6925e6b5d27cd22a4725dda6",
+          "O GTH-PBE-q6": "b1807a81468a4fae0b9ac298c63a550d8b95fbd126e9477c990436e6abe71333"
+        },
+        "reference_protocol_sha256": "ad4e262690181b6f009e5683eadb8402ee47c73acee32ca96873c95cf1c3e5ea",
+        "calculation_fingerprint": null,
+        "runtime_fingerprint": null
+      },
+      "metrics": [
+        {"name": "delta_mev_per_atom", "value": 1.060, "maximum": 3.0},
+        {"name": "lattice_relative", "value": 0.00123, "maximum": 0.005},
+        {"name": "bulk_modulus_relative", "value": 0.01387, "maximum": 0.1},
+        {"name": "bulk_derivative_relative", "value": 0.1689, "maximum": 0.15},
+        {"name": "force_max_abs_hartree_per_bohr", "value": 0.0002246, "maximum": 0.0001}
+      ]
+    },
+    {
+      "case_id": "bcc-iron-q16",
+      "evidence_label": "current-verified",
+      "coverage": {
+        "periodic_blocks": ["d"],
+        "environments": ["metallic", "magnetic"],
+        "species_modes": ["homogeneous"],
+        "occupation_modes": ["smeared", "collinear_spin"],
+        "force_components": []
+      },
+      "identity": {
+        "pseudopotential_sha256": {
+          "Fe GTH-PBE-q16": "b01c203a4837b7becf1b2f76b188bf6365ec5aec216dccf1ed4fda6b9d65fdcb"
+        },
+        "reference_protocol_sha256": "2264f8473237a1ae2c9dda90cc0dfdd3a60721a2b399d05ba70b72f7893f3756",
+        "calculation_fingerprint": "cbe945e5181c7c8c714ebcda1418c7d0375be4e754cd0035f33809eb026105e1",
+        "runtime_fingerprint": "f6689ca2da1f631a3ae0ee3e9c2e0d8b607e2a9fea8b45cd2318b2072f74f587"
+      },
+      "metrics": [
+        {"name": "moment_abs_error_bohr_magneton_per_atom", "value": 0.0879516, "maximum": 0.35},
+        {"name": "magnetic_minus_unpolarized_hartree_per_atom", "value": -0.02382830265, "maximum": 0.0},
+        {"name": "cutoff_moment_drift", "value": 0.000351, "maximum": 0.12},
+        {"name": "kpoint_moment_drift", "value": 0.084764, "maximum": 0.12},
+        {"name": "cutoff_free_energy_drift_hartree", "value": 0.000136428, "maximum": 0.01},
+        {"name": "kpoint_free_energy_drift_hartree", "value": 0.000812471, "maximum": 0.01}
+      ]
+    }
+  ],
+  "candidates": [
+    {
+      "candidate_id": "rocksalt-mgo-primitive-q10-q6-c40-k4",
+      "workload_fingerprint": "74453bf759a19229384de6bbd101c17921531c6d93d0e361e5366904a50d6cf1",
+      "calculation_fingerprint": "b730197a66ddc090265abcbd54069e5f354465ebd02b98346b3b11bea97fa498",
+      "implementation_fingerprint": "87837f9976860730d751639f9967700766913921b92b1cf087240c099179277e",
+      "elapsed_wall_seconds": 40.98934508301318,
+      "peak_temporary_bytes": 57201084,
+      "metrics": [
+        {"name": "orbital_residual", "value": 0.000004329048806539504, "maximum": 0.000002},
+        {"name": "scf_iterations", "value": 80.0, "maximum": 79.0}
+      ]
+    }
+  ]
+}
