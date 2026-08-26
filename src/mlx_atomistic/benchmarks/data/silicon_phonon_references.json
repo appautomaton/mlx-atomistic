@@ -1,0 +1,39 @@
+{
+  "schema_version": "mlx-atomistic.silicon-gamma-phonon-references.v1",
+  "material": {
+    "name": "diamond-silicon",
+    "mode": "Gamma optical triplet"
+  },
+  "reference": {
+    "role": "published-method context",
+    "source": "Quantum ESPRESSO DFPT phonon tutorial by Paolo Giannozzi",
+    "source_url": "https://www.fisica.uniud.it/~giannozz/QE-Tutorial/handson_phon.html",
+    "optical_frequency_cm1": 516.174502,
+    "raw_acoustic_frequency_cm1": 2.504951,
+    "method_difference": "The tutorial uses Quantum ESPRESSO density-functional perturbation theory and a different pseudopotential protocol. The local validation uses finite displacements, PBE-PW92, and Si GTH-PBE-q4, so the reference is a bounded frequency context rather than exact protocol parity."
+  },
+  "local_protocol": {
+    "lattice_constant_angstrom": 5.460859,
+    "mass_amu": 28.0855,
+    "cutoff_hartree": 25.0,
+    "fft_shape": [32, 32, 32],
+    "gamma_centered_kpoint_mesh": [4, 4, 4],
+    "displacements_bohr": [0.02, 0.01],
+    "symmetry_independent_displacements_per_step": 2
+  },
+  "thresholds": {
+    "reference_optical_mean_abs_cm1": 60.0,
+    "optical_triplet_spread_cm1": 5.0,
+    "acoustic_max_abs_cm1": 10.0,
+    "displacement_frequency_drift_cm1": 5.0,
+    "displacement_eigenvalue_drift_au": 1e-7,
+    "reciprocity_hartree_per_bohr2": 0.0005,
+    "sum_rule_hartree_per_bohr2": 0.0005
+  },
+  "boundary": {
+    "q_point": "Gamma only",
+    "asr_imposed": false,
+    "non_analytic_correction": false,
+    "reference_engine_on_runtime_path": false
+  }
+}
