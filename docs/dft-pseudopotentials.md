@@ -47,6 +47,13 @@ The derivative of this local form is used for fixed-density ion-force checks.
 GTH nonlocal channel metadata is parsed and applied by the same separable
 operator path when projector metadata is present.
 
+The periodic plane-wave GTH path implements normalized real spherical
+harmonics through `l=2`, including the five d-channel projectors in the
+Quantum ESPRESSO ordering. Analytic harmonic identities, Hermiticity, and cell
+translation invariance are deterministic gates. This implementation support
+does not by itself certify d-block material transferability; the Iron cutoff
+and k-point study remains part of the Phase 5 and Phase 7 evidence program.
+
 ## Forces
 
 For ion-backed systems, reported forces include:

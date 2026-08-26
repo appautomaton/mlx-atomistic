@@ -261,7 +261,22 @@ def _real_spherical_harmonics(
             -coefficient * vectors[..., 1] / safe,
         )
         return tuple(mx.where(q > 1e-14, value, 0.0) for value in values)
-    msg = f"periodic GTH spherical harmonics currently support l<=1, received {l_value}"
+    if l_value == 2:
+        x = vectors[..., 0]
+        y = vectors[..., 1]
+        z = vectors[..., 2]
+        radius_squared = safe * safe
+        values = (
+            sqrt(5.0 / (16.0 * pi))
+            * (3.0 * z * z - radius_squared)
+            / radius_squared,
+            -sqrt(15.0 / (4.0 * pi)) * x * z / radius_squared,
+            -sqrt(15.0 / (4.0 * pi)) * y * z / radius_squared,
+            sqrt(15.0 / (16.0 * pi)) * (x * x - y * y) / radius_squared,
+            sqrt(15.0 / (4.0 * pi)) * x * y / radius_squared,
+        )
+        return tuple(mx.where(q > 1e-14, value, 0.0) for value in values)
+    msg = f"periodic GTH spherical harmonics currently support l<=2, received {l_value}"
     raise ValueError(msg)
 
 
