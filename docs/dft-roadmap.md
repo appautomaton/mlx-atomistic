@@ -184,8 +184,8 @@ q8 variant remains a documented transferability failure.
 
 ## Phase 6: Add Core Observables And Convergence Workflows
 
-Status: planned after periodic spin so scalar and spin-resolved outputs share
-one public contract.
+Status: closed. The shared scientific and artifact contract is recorded in
+[DFT Core Observables And Convergence](./dft-core-observables.md).
 
 - Add total density of states for fixed and smeared calculations, including
   spin-resolved output when spin is active.
@@ -199,6 +199,11 @@ Exit gate: integrated density of states reproduces the declared electron count,
 the insulating and metallic Fermi-level conventions are explicit, volumetric
 exports round-trip their cell and density normalization, and convergence
 reports retain exact source and runtime identities.
+
+Exit evidence: deterministic scalar and spin-resolved DOS integration,
+full-rank charge and magnetization volume round-trips, strict malformed-artifact
+rejection, and shared cutoff, k-point, and smearing comparison tests pass. No
+material workload was rerun merely to exercise these analysis contracts.
 
 ## Phase 7: Expand Pseudopotential Transferability
 

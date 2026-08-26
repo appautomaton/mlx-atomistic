@@ -51,6 +51,15 @@ from mlx_atomistic.dft._periodic_models import (
 from mlx_atomistic.dft._periodic_scf_engine import _run_periodic_scf_controlled
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import BandPath, KPointMesh
+from mlx_atomistic.dft.periodic_observables import (
+    PeriodicDOSChannel as PeriodicDOSChannel,
+)
+from mlx_atomistic.dft.periodic_observables import (
+    PeriodicDOSResult as PeriodicDOSResult,
+)
+from mlx_atomistic.dft.periodic_observables import (
+    periodic_density_of_states as periodic_density_of_states,
+)
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
 
 
