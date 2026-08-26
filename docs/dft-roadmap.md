@@ -230,7 +230,9 @@ its locked orbital-residual gate, so no full q10 EOS was run.
 
 ## Phase 8: Add Finite-Displacement Phonons
 
-Status: blocked on stable forces, ionic relaxation, cell geometry, and restart.
+Status: closed. The bounded Gamma-point numerical, symmetry, and restart
+contract is defined in
+[Finite-Displacement Phonons](./dft-finite-displacement-phonons.md).
 
 - Build force-constant matrices from symmetry-independent finite
   displacements only after force, relaxation, cell, and restart contracts are
@@ -241,6 +243,12 @@ Status: blocked on stable forces, ionic relaxation, cell geometry, and restart.
 
 Exit gate: displacement convergence, acoustic modes, restart equivalence, and
 reference frequencies pass declared thresholds.
+
+Exit evidence: the source-bound two-atom diamond-Silicon PBE/GTH-q4 workload
+passes raw reciprocity and ASR diagnostics, three acoustic translation modes,
+the optical-triplet reference boundary, `0.02 -> 0.01 bohr` displacement
+convergence, exact partial-sample restart, complete-wall, and logical-memory
+gates. Eight SCFs were required; no ASR correction was imposed.
 
 ## Cross-Cutting Gates
 
