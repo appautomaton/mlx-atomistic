@@ -20,6 +20,7 @@ from mlx_atomistic.dft._periodic_davidson_planner import (
     _plan_compact_submissions,
     _stable_compact_capacity_groups,
 )
+from mlx_atomistic.dft._periodic_density_symmetry import _DensitySymmetryPlan
 from mlx_atomistic.dft._periodic_execution import _detached_failure
 from mlx_atomistic.dft._periodic_models import PeriodicKPointResult
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver, add_observed_work
@@ -77,6 +78,7 @@ class _PeriodicDensityBuilder:
     grid_shape: tuple[int, int, int]
     states: tuple[_CompactLaneState, ...]
     orbital_densities: tuple[mx.array, ...] | None
+    symmetry_plan: _DensitySymmetryPlan | None
     density: mx.array
 
     @classmethod
@@ -88,6 +90,7 @@ class _PeriodicDensityBuilder:
         policy: _CompactBatchPolicy,
         observer: RuntimeObserver | None,
         orbital_densities: Sequence[mx.array] | None,
+        symmetry_plan: _DensitySymmetryPlan | None,
     ) -> _PeriodicDensityBuilder:
         owned_results = tuple(results)
         grid_shape, states = _validated_density_states(owned_results)
@@ -102,6 +105,11 @@ class _PeriodicDensityBuilder:
             occupation=occupation,
             orbital_densities=cached_densities,
         )
+        cls._validate_symmetry_plan(
+            owned_results,
+            grid_shape=grid_shape,
+            symmetry_plan=symmetry_plan,
+        )
         return cls(
             results=owned_results,
             occupation=occupation,
@@ -110,8 +118,29 @@ class _PeriodicDensityBuilder:
             grid_shape=grid_shape,
             states=states,
             orbital_densities=cached_densities,
+            symmetry_plan=symmetry_plan,
             density=mx.zeros(grid_shape, dtype=mx.float32),
         )
+
+    @staticmethod
+    def _validate_symmetry_plan(
+        results: Sequence[PeriodicKPointResult],
+        *,
+        grid_shape: tuple[int, int, int],
+        symmetry_plan: _DensitySymmetryPlan | None,
+    ) -> None:
+        if symmetry_plan is None:
+            return
+        if symmetry_plan.grid_shape != grid_shape:
+            raise ValueError("symmetry density plan differs from the k-point grid")
+        for result in results:
+            explicit_index = result.explicit_index
+            if explicit_index is None or not 0 <= explicit_index < len(
+                symmetry_plan.terms_by_explicit_index
+            ):
+                raise ValueError("symmetry density plan requires explicit k-point indices")
+            if not symmetry_plan.terms_by_explicit_index[explicit_index]:
+                raise ValueError("symmetry density results must contain only owner k-points")
 
     @staticmethod
     def _validate_occupations(
@@ -182,7 +211,12 @@ class _PeriodicDensityBuilder:
             plan = _plan_compact_submissions(
                 capacity_states,
                 policy=self.policy,
-                batch_byte_estimator=self._batch_bytes,
+                batch_byte_estimator=lambda planned_indices,
+                batch,
+                capacity_indices=capacity_indices: self._batch_bytes(
+                    tuple(capacity_indices[index] for index in planned_indices),
+                    batch,
+                ),
                 capacity=capacity,
             )
             if plan.failures:
@@ -194,15 +228,31 @@ class _PeriodicDensityBuilder:
 
     def _batch_bytes(
         self,
-        _indices: tuple[int, ...],
+        indices: tuple[int, ...],
         batch: _CompactBatch,
     ) -> int:
         if self.orbital_densities is None:
-            return _density_batch_bytes(batch)
-        return _cached_density_batch_bytes(
-            lane_capacity=batch.lane_capacity,
-            grid_size=batch.grid_size,
+            return _density_batch_bytes(batch) + self._symmetry_expansion_bytes(indices)
+        return (
+            _cached_density_batch_bytes(
+                lane_capacity=batch.lane_capacity,
+                grid_size=batch.grid_size,
+            )
+            + self._symmetry_expansion_bytes(indices)
         )
+
+    def _symmetry_expansion_bytes(self, indices: Sequence[int]) -> int:
+        if self.symmetry_plan is None:
+            return 0
+        term_count = sum(
+            len(
+                self.symmetry_plan.terms_by_explicit_index[
+                    self.results[index].explicit_index
+                ]
+            )
+            for index in indices
+        )
+        return (term_count + len(indices)) * int(np.prod(self.grid_shape)) * 4
 
     def _accumulate_submission(
         self,
@@ -219,7 +269,9 @@ class _PeriodicDensityBuilder:
             vector_capacity=capacity.vectors,
             active_capacity=capacity.active,
         )
-        estimated_transient_bytes = _density_batch_bytes(batch)
+        estimated_transient_bytes = (
+            _density_batch_bytes(batch) + self._symmetry_expansion_bytes(indices)
+        )
         if estimated_transient_bytes > self.policy.max_transient_bytes:
             msg = "density batch exceeds the complete transient byte budget"
             raise ValueError(msg)
@@ -240,7 +292,7 @@ class _PeriodicDensityBuilder:
                 orbital_density,
                 axis=1,
             )
-        self.density = self.density + mx.sum(weighted_density, axis=0)
+        self._accumulate_lane_densities(indices, weighted_density)
         mx.eval(self.density)
         self._record_submission(batch, estimated_transient_bytes)
 
@@ -269,10 +321,8 @@ class _PeriodicDensityBuilder:
                 axis=0,
             )
         weights = self._padded_weights(indices, capacity.lanes)
-        self.density = self.density + mx.sum(
-            weights[:, None, None, None] * densities,
-            axis=0,
-        )
+        weighted_density = weights[:, None, None, None] * densities
+        self._accumulate_lane_densities(indices, weighted_density)
         mx.eval(self.density)
         if self.observer is not None:
             self.observer.record_peak_memory(
@@ -280,7 +330,8 @@ class _PeriodicDensityBuilder:
                 _cached_density_batch_bytes(
                     lane_capacity=capacity.lanes,
                     grid_size=int(np.prod(self.grid_shape)),
-                ),
+                )
+                + self._symmetry_expansion_bytes(indices),
             )
 
     def _padded_weights(
@@ -290,6 +341,11 @@ class _PeriodicDensityBuilder:
         *,
         vector_capacity: int | None = None,
     ) -> mx.array:
+        def integration_weight(index: int) -> float:
+            if self.symmetry_plan is not None:
+                return 1.0
+            return self.results[index].integration_weight
+
         if self.occupation is None:
             if vector_capacity is None:
                 msg = "band-resolved density weights require a vector capacity"
@@ -301,13 +357,12 @@ class _PeriodicDensityBuilder:
                     msg = "resolved periodic occupations are unavailable"
                     raise RuntimeError(msg)
                 weights[lane, : len(occupations)] = (
-                    self.results[index].integration_weight
-                    * np.asarray(occupations, dtype=np.float32)
+                    integration_weight(index) * np.asarray(occupations, dtype=np.float32)
                 )
             return mx.array(weights)
         weights = mx.array(
             np.asarray(
-                [self.results[index].integration_weight * self.occupation for index in indices],
+                [integration_weight(index) * self.occupation for index in indices],
                 dtype=np.float32,
             )
         )
@@ -315,6 +370,23 @@ class _PeriodicDensityBuilder:
         if padding:
             weights = mx.concatenate([weights, mx.zeros((padding,), dtype=mx.float32)])
         return weights
+
+    def _accumulate_lane_densities(
+        self,
+        indices: tuple[int, ...],
+        lane_densities: mx.array,
+    ) -> None:
+        if self.symmetry_plan is None:
+            self.density = self.density + mx.sum(lane_densities, axis=0)
+            return
+        expanded = tuple(
+            self.symmetry_plan.expand(
+                self.results[index].explicit_index,
+                lane_densities[lane],
+            )
+            for lane, index in enumerate(indices)
+        )
+        self.density = self.density + sum(expanded[1:], expanded[0])
 
     def _record_submission(
         self,
@@ -348,6 +420,7 @@ def _density_from_kpoints(
     policy: _CompactBatchPolicy = _DEFAULT_COMPACT_BATCH_POLICY,
     observer: RuntimeObserver | None = None,
     orbital_densities: Sequence[mx.array] | None = None,
+    symmetry_plan: _DensitySymmetryPlan | None = None,
 ) -> mx.array:
     return _PeriodicDensityBuilder.create(
         results,
@@ -355,4 +428,5 @@ def _density_from_kpoints(
         policy=policy,
         observer=observer,
         orbital_densities=orbital_densities,
+        symmetry_plan=symmetry_plan,
     ).build()

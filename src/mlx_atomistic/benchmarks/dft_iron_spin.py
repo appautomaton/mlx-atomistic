@@ -35,7 +35,7 @@ from mlx_atomistic.dft import (
     run_periodic_scf,
 )
 
-WORKLOAD_SCHEMA = "mlx-atomistic.dft-iron-spin-workload.v1"
+WORKLOAD_SCHEMA = "mlx-atomistic.dft-iron-spin-workload.v2"
 POINT_SCHEMA = "mlx-atomistic.dft-iron-spin-point.v1"
 REPORT_SCHEMA = "mlx-atomistic.dft-iron-spin-validation.v1"
 TARGET_ID = "bcc-iron-primitive-pbe-gth-q8-collinear"
@@ -226,14 +226,13 @@ def _mesh_payload(size: int) -> dict[str, object]:
         full,
         _primitive_reciprocal_operations(),
     )
+    mesh_payload = reduced.to_dict()
     return {
         "size": [size, size, size],
         "sampling_identity": "exact index-2 conventional-cell unfolding",
         "full_point_count": len(full.points),
-        "points": [
-            {"vector": list(point.vector), "weight": point.weight}
-            for point in reduced.points
-        ],
+        "points": mesh_payload["points"],
+        "point_group_symmetry": mesh_payload["point_group_symmetry"],
     }
 
 
@@ -378,6 +377,24 @@ def load_iron_spin_workload(path: str | Path) -> tuple[dict[str, Any], Path]:
         or sha256_bytes(resource.read_bytes()) != workload["resource"]["sha256"]
     ):
         raise ValueError("Iron spin workload resource is missing or mismatched")
+    meshes = workload.get("kpoint_meshes")
+    if not isinstance(meshes, Mapping) or not meshes:
+        raise ValueError("Iron spin workload k-point meshes are missing")
+    try:
+        for size, payload in meshes.items():
+            if not isinstance(payload, Mapping) or int(size) <= 0:
+                raise ValueError
+            restored = KPointMesh.from_dict(
+                {
+                    "points": payload["points"],
+                    "point_group_symmetry": payload["point_group_symmetry"],
+                }
+            )
+            symmetry = restored.to_dict()["point_group_symmetry"]
+            if symmetry["full_point_count"] != payload["full_point_count"]:
+                raise ValueError
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Iron spin workload k-point symmetry is invalid") from error
     return workload, resource
 
 
@@ -392,11 +409,11 @@ def _kpoint_mesh(
     if mode != "reduced":
         raise ValueError(f"unsupported Iron k-point mode: {mode}")
     payload = workload["kpoint_meshes"][str(size)]
-    return KPointMesh(
-        tuple(
-            KPoint(point["vector"], weight=point["weight"], coordinate_system="reduced")
-            for point in payload["points"]
-        )
+    return KPointMesh.from_dict(
+        {
+            "points": payload["points"],
+            "point_group_symmetry": payload["point_group_symmetry"],
+        }
     )
 
 

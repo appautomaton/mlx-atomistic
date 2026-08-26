@@ -230,10 +230,11 @@ thresholds without element-specific runtime branches.
 
 Current exit result: coverage is complete, but the gate remains blocked by the
 locked MgO q2 bulk-derivative and total-force residuals and incomplete exact
-calculation/runtime identities for older project-derived EOS summaries. The Fe
-q16 full-versus-reduced SCF oracle fails its locked free-energy and moment
-gates. The primitive Mg q10 screen failed its orbital-residual gate and is
-method-invalid for SCF density reconstruction, so no full q10 EOS was run.
+calculation/runtime identities for older project-derived summaries. The current
+Fe q16 full-versus-reduced SCF oracle passes after rotated-density
+reconstruction, but its broader legacy evidence still lacks refreshed v2
+identities. The primitive Mg q10 screen failed its orbital-residual gate and
+was produced before SCF density reconstruction, so no full q10 EOS was run.
 
 ## Phase 8: Add Finite-Displacement Phonons
 
@@ -303,10 +304,11 @@ Current exit audit: every criterion above is implemented and has bounded
 evidence except the broad GTH production envelope. Phase 7 has complete
 coverage, but its strict matrix remains failed by the locked MgO q2
 bulk-derivative and total-force residuals, the rejected q10 candidate, and
-missing exact calculation/runtime identities in older EOS summaries. The Fe
-q16 row additionally fails its current full-versus-reduced SCF method oracle.
-The project therefore must not yet claim the general core defined here. No
-Phase 6 or Phase 8 implementation gap remains hidden behind that blocker.
+missing exact calculation/runtime identities in older summaries. The Fe q16
+point-group method oracle now passes, but that does not erase the remaining
+identity and MgO blockers. The project therefore must not yet claim the general
+core defined here. No Phase 6 or Phase 8 implementation gap remains hidden
+behind that blocker.
 
 ## Deferred Beyond The General Core
 

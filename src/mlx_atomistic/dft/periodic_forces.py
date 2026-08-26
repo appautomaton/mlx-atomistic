@@ -84,6 +84,9 @@ def _validated_periodic_force_state(
     if not result.converged:
         msg = "periodic forces require a converged SCF result"
         raise ValueError(msg)
+    if result.point_group_symmetry_reduced:
+        msg = "periodic forces do not yet reconstruct point-group symmetry orbits"
+        raise ValueError(msg)
     if result.system_fingerprint != system.fingerprint:
         msg = "SCF result does not match the periodic force system"
         raise ValueError(msg)

@@ -94,10 +94,12 @@ contract and add two composable utilities:
 2. deterministic reduction by caller-supplied reciprocal-space symmetry
    operations.
 
-The reducer must validate finite reduced coordinates, integer unimodular
+The reducer validates finite reduced coordinates, integer unimodular
 operations, mesh closure, unique transformed matches, and equal weights within
-each orbit. It aggregates orbit weights and never infers that a symmetry is
-valid for a Hamiltonian.
+each orbit. It retains the full orbit mapping used by SCF density
+reconstruction and never infers that a symmetry is valid for a Hamiltonian.
+Workload schema v2 persists that mapping so reloading a mesh cannot silently
+degrade it to scalar weight aggregation.
 
 For conventional fcc Aluminum, the 48 signed permutation operations of the
 cubic point group reduce the source-density `27 x 27 x 27` Gamma-centered mesh

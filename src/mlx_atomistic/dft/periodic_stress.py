@@ -263,6 +263,10 @@ def _validate_scf_state(
 ) -> None:
     if not isinstance(result, PeriodicSCFResult):
         raise TypeError(f"{label} must be PeriodicSCFResult")
+    if result.point_group_symmetry_reduced:
+        raise ValueError(
+            f"{label} uses point-group symmetry reduction, which stress does not support"
+        )
     if (
         not result.converged
         or not np.isfinite(result.total_energy)
@@ -322,6 +326,8 @@ def periodic_analytic_stress(
         raise TypeError("system must be PeriodicDFTSystem")
     if not isinstance(kpoint_mesh, KPointMesh):
         raise TypeError("kpoint_mesh must be KPointMesh")
+    if kpoint_mesh.point_group_symmetry_reduced:
+        raise ValueError("analytic stress does not support point-group-reduced k-point meshes")
     if (
         isinstance(cutoff_hartree, (bool, np.bool_))
         or not np.isfinite(cutoff_hartree)
@@ -422,6 +428,10 @@ def periodic_finite_difference_stress(
         raise TypeError("system must be PeriodicDFTSystem")
     if not isinstance(kpoint_mesh, KPointMesh):
         raise TypeError("kpoint_mesh must be KPointMesh")
+    if kpoint_mesh.point_group_symmetry_reduced:
+        raise ValueError(
+            "finite-difference stress does not support point-group-reduced k-point meshes"
+        )
     if (
         isinstance(cutoff_hartree, (bool, np.bool_))
         or not np.isfinite(cutoff_hartree)

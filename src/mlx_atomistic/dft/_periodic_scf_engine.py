@@ -28,6 +28,10 @@ from mlx_atomistic.dft._periodic_davidson_scheduler import (
     _DavidsonScheduler,
 )
 from mlx_atomistic.dft._periodic_density import _density_from_kpoints
+from mlx_atomistic.dft._periodic_density_symmetry import (
+    _build_density_symmetry_plan,
+    _DensitySymmetryPlan,
+)
 from mlx_atomistic.dft._periodic_execution import _detached_failure
 from mlx_atomistic.dft._periodic_hamiltonian import PeriodicKohnShamOperator
 from mlx_atomistic.dft._periodic_models import (
@@ -329,6 +333,7 @@ class _PeriodicSCFSetup:
     band_count: int
     observer: RuntimeObserver | None
     ownership: TimeReversalOwnership
+    density_symmetry_plan: _DensitySymmetryPlan | None
     bases: tuple[PlaneWaveBasis, ...]
     spin_bases: tuple[tuple[PlaneWaveBasis, ...], ...]
     owned_indices: tuple[int, ...]
@@ -530,6 +535,11 @@ class _PeriodicSCFController:
                     resume_state.ownership,
                 )
                 spin_previous_states = None
+            density_symmetry_plan = _build_density_symmetry_plan(
+                kpoint_mesh,
+                ownership,
+                system.grid.shape,
+            )
             owned_indices = ownership.owned_indices
             gamma_basis = PlaneWaveBasis(
                 system.grid,
@@ -655,6 +665,7 @@ class _PeriodicSCFController:
             band_count=band_count,
             observer=observer,
             ownership=ownership,
+            density_symmetry_plan=density_symmetry_plan,
             bases=bases,
             spin_bases=spin_bases,
             owned_indices=owned_indices,
@@ -809,7 +820,15 @@ class _PeriodicSCFController:
         observer = setup.observer
         if observer is None:
             return
-        observer.record_memory("shared_full_grid_bytes", setup.system.grid.size * 4 * 4)
+        symmetry_bytes = (
+            0
+            if setup.density_symmetry_plan is None
+            else setup.density_symmetry_plan.persistent_bytes
+        )
+        observer.record_memory(
+            "shared_full_grid_bytes",
+            setup.system.grid.size * 4 * 4 + symmetry_bytes,
+        )
         observer.record_memory("persistent_projector_bytes", 0)
         observer.emit(
             "setup",
@@ -894,6 +913,7 @@ class _PeriodicSCFController:
                 orbital_densities=(
                     orbital_densities if smearing is None else None
                 ),
+                symmetry_plan=self.setup.density_symmetry_plan,
             )
             target_count = float(mx.sum(target_density) * self.setup.system.grid.dv)
             target_density = target_density * (self.setup.system.electron_count / target_count)
@@ -1023,6 +1043,7 @@ class _PeriodicSCFController:
                     policy=self.setup.compact_policy,
                     observer=self.setup.observer,
                     orbital_densities=None,
+                    symmetry_plan=self.setup.density_symmetry_plan,
                 )
                 raw_count = float(mx.sum(target) * self.setup.system.grid.dv)
                 expected_count = occupations.electron_counts[channel_index]
@@ -1815,6 +1836,9 @@ class _PeriodicSCFController:
             timings=self.progress.timings,
             batch_policy=self.setup.config.batch_policy(),
             time_reversal_ownership=self.setup.ownership,
+            point_group_symmetry_reduced=(
+                self.setup.density_symmetry_plan is not None
+            ),
             numerical_status=result_status,
             resume_integrity_status="validated" if self.setup.resumed else "fresh",
             timing_admission_status=timing_admission_status,

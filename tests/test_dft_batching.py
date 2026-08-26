@@ -22,6 +22,8 @@ from mlx_atomistic.dft import (
     RealSpaceGrid,
     ReciprocalGrid,
     XCResult,
+    build_time_reversal_ownership,
+    reduce_kpoint_mesh_by_symmetry,
     run_periodic_scf,
 )
 from mlx_atomistic.dft._compact import _CompactBatch, _CompactBatchPolicy
@@ -36,6 +38,7 @@ from mlx_atomistic.dft._periodic_davidson_planner import (
 )
 from mlx_atomistic.dft._periodic_davidson_scheduler import _DavidsonScheduler
 from mlx_atomistic.dft._periodic_density import _density_from_kpoints
+from mlx_atomistic.dft._periodic_density_symmetry import _build_density_symmetry_plan
 from mlx_atomistic.dft._periodic_scf_engine import (
     _next_scf_eigensolver_tolerance,
     _scf_eigensolver_tolerance,
@@ -802,9 +805,63 @@ def test_density_batch_one_and_many_have_the_same_ordered_sum():
         observer=cached_observer,
         orbital_densities=orbital_densities,
     )
+    mesh = KPointMesh(
+        tuple(
+            KPoint(
+                result.reduced_kpoint,
+                weight=result.weight,
+                coordinate_system="reduced",
+            )
+            for result in results
+        )
+    )
+    reduced_mesh = reduce_kpoint_mesh_by_symmetry(
+        mesh,
+        (((1, 0, 0), (0, 1, 0), (0, 0, 1)),),
+    )
+    symmetry_plan = _build_density_symmetry_plan(
+        reduced_mesh,
+        build_time_reversal_ownership(reduced_mesh),
+        first.grid.shape,
+    )
+    indexed_results = tuple(
+        replace(result, explicit_index=index) for index, result in enumerate(results)
+    )
+    symmetry_direct = _density_from_kpoints(
+        indexed_results,
+        occupation=2.0,
+        policy=_CompactBatchPolicy(batch_cap=2),
+        symmetry_plan=symmetry_plan,
+    )
+    symmetry_cached = _density_from_kpoints(
+        indexed_results,
+        occupation=2.0,
+        policy=_CompactBatchPolicy(batch_cap=2),
+        orbital_densities=orbital_densities,
+        symmetry_plan=symmetry_plan,
+    )
+    resolved_results = tuple(
+        replace(result, occupations=(1.0, 0.5)) for result in results
+    )
+    indexed_resolved_results = tuple(
+        replace(result, explicit_index=index)
+        for index, result in enumerate(resolved_results)
+    )
+    resolved = _density_from_kpoints(
+        resolved_results,
+        policy=_CompactBatchPolicy(batch_cap=2),
+    )
+    symmetry_resolved = _density_from_kpoints(
+        indexed_resolved_results,
+        policy=_CompactBatchPolicy(batch_cap=2),
+        symmetry_plan=symmetry_plan,
+    )
 
     np.testing.assert_allclose(np.asarray(batched), np.asarray(singleton), atol=3e-6)
     np.testing.assert_allclose(np.asarray(cached), np.asarray(batched), atol=3e-6)
+    np.testing.assert_allclose(np.asarray(symmetry_direct), np.asarray(batched), atol=3e-6)
+    np.testing.assert_allclose(np.asarray(symmetry_cached), np.asarray(batched), atol=3e-6)
+    np.testing.assert_allclose(np.asarray(symmetry_resolved), np.asarray(resolved), atol=3e-6)
     singleton_work = singleton_observer.snapshot()["work_counters"]
     batched_work = batched_observer.snapshot()["work_counters"]
     assert singleton_work["fft_submissions"] == 2
