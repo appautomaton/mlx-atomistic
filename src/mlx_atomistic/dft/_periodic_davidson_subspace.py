@@ -302,7 +302,7 @@ def _ritz_candidate_with_direct_action(
     candidate: _DavidsonRitzPair,
     applied: _CompactLaneState,
 ) -> _DavidsonRitzCandidate:
-    """Build lazy Ritz data whose residual uses the exact scheduled H(X)."""
+    """Build lazy Ritz data from the exact scheduled H(X)."""
 
     _require_layout(applied, candidate.vectors.layout)
     if applied.kind != "hamiltonian_action":
@@ -311,13 +311,23 @@ def _ritz_candidate_with_direct_action(
     if applied.vector_count != candidate.vectors.vector_count:
         msg = "Davidson direct validation width does not match its Ritz vectors"
         raise ValueError(msg)
+    # The scheduled H(X) is authoritative. Refreshing each Rayleigh quotient
+    # removes the residual component parallel to its vector without another
+    # Hamiltonian application or changing the orthogonal convergence error.
+    vector_norms = mx.real(
+        mx.sum(mx.conjugate(candidate.vectors.values) * candidate.vectors.values, axis=1)
+    )
+    eigenvalues = mx.real(
+        mx.sum(mx.conjugate(candidate.vectors.values) * applied.values, axis=1)
+        / vector_norms
+    )
     residual_stack, residuals, max_residual, finite = _ritz_residual_arrays(
-        candidate.eigenvalues,
+        eigenvalues,
         candidate.vectors,
         applied,
     )
     return _DavidsonRitzCandidate(
-        eigenvalues=candidate.eigenvalues,
+        eigenvalues=eigenvalues,
         vectors=candidate.vectors,
         applied=applied,
         residual_stack=residual_stack,

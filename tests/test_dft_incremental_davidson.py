@@ -136,6 +136,46 @@ def test_returned_residuals_are_direct_even_when_iteration_limit_is_reached():
     assert final_event["residual_source"] == "direct_operator"
 
 
+def test_direct_validation_refines_the_rayleigh_quotient_without_another_hpsi():
+    basis, _operator = _problem(lane_label="direct-residual:rayleigh-refinement")
+    vector_values = np.zeros((1, basis.active_count), dtype=np.complex64)
+    vector_values[0, 0] = 1.0
+    vectors = basis._state_from_compact(mx.array(vector_values))
+    cached_applied = basis._state_from_compact(
+        mx.array(1.9 * vector_values),
+        kind="hamiltonian_action",
+    )
+    candidate = periodic_davidson_subspace._DavidsonRitzPair(
+        eigenvalues=mx.array((1.9,), dtype=mx.float32),
+        vectors=vectors,
+        applied=cached_applied,
+        residual_stack=mx.zeros_like(vectors.values),
+        residuals=mx.zeros((1,), dtype=mx.float32),
+        max_residual=0.0,
+        transform=mx.ones((1, 1), dtype=mx.complex64),
+    )
+    direct_values = np.zeros_like(vector_values)
+    direct_values[0, 0] = 2.0
+    direct_values[0, 1] = 3.0e-4
+    direct_applied = basis._state_from_compact(
+        mx.array(direct_values),
+        kind="hamiltonian_action",
+    )
+
+    refined = periodic_davidson_subspace._ritz_pair_with_direct_action(
+        candidate,
+        direct_applied,
+    )
+
+    assert float(refined.eigenvalues[0]) == pytest.approx(2.0, abs=1.0e-7)
+    assert float(refined.residuals[0]) == pytest.approx(3.0e-4, abs=1.0e-7)
+    np.testing.assert_allclose(
+        np.asarray(refined.residual_stack[0, 0]),
+        0.0,
+        atol=1.0e-7,
+    )
+
+
 def test_direct_residual_rejects_injected_cached_drift_and_continues(
     monkeypatch,
 ):
