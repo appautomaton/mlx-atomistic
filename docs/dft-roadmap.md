@@ -21,6 +21,12 @@ fixed and unconstrained occupations, symmetry-breaking initial seeds, and
 spin-aware checkpoint/resume. Its deterministic numerical gates and the
 source-bound bcc Iron PBE/GTH-q16 material golden pass. Fe q8 retains a declared
 magnetic transferability failure.
+Scalar and spin-resolved total density of states, portable charge and
+magnetization volumes, and reusable cutoff/k-point/smearing comparisons now
+share source-bound result contracts. A bounded finite-displacement Gamma-point
+phonon core adds explicit displacement symmetry, raw reciprocity and ASR
+diagnostics, no-pickle partial-sample restart, and a verified two-atom Silicon
+material gate.
 Real and reciprocal grids, k-points, Ewald terms, GTH operators, forces, and
 state identity share one full-rank periodic cell matrix contract.
 Material-level verification remains narrow: Silicon, Carbon, and simple-metal
@@ -44,14 +50,14 @@ only when its implementation and material-level evidence both pass.
 | Capability | General-core commitment | Current boundary | Delivery |
 | --- | --- | --- | --- |
 | Exchange-correlation | PBE-PW92 production envelope | Implemented; verified material set is narrow | Every material phase |
-| Pseudopotentials | Broad, fingerprinted GTH transferability | GTH periodic path exists; broad transferability is not closed | Phase 7 |
+| Pseudopotentials | Broad, fingerprinted GTH transferability | s/p/d and chemistry coverage is complete; strict MgO and historical identity gates remain blocked | Phase 7 |
 | Crystal geometry | Ordinary full-rank periodic cells | Implemented; one source-bound hexagonal Silicon case and bounded low-symmetry oracles are verified | Phase 3 |
 | Electronic states | Insulators, simple metals, and collinear magnets | One simple metal and one collinear bcc Iron q16 workload are verified | Phases 1 and 5 |
-| Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
+| Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Implemented; scalar/spin DOS, portable density volumes, and reusable convergence reports pass deterministic gates | Phase 6 |
 | Mechanical observables | Analytic forces and validated stress | Forces retain an MgO boundary; analytic periodic stress is verified for the bounded 2H-Si workflow | Phase 4 |
 | Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell and one 2H-Si variable-cell trajectory are verified; broad transferability remains open | Phases 2 and 4 |
-| Lattice dynamics | Bounded finite-displacement phonons | Absent | Phase 8 |
-| Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | Periodic SCF, fixed-cell ionic, and accepted-cell outer checkpoints exist | Every phase |
+| Lattice dynamics | Bounded finite-displacement phonons | Gamma-point core and source-bound Silicon gate are verified; dispersion and non-analytic response are deferred | Phase 8 |
+| Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | SCF, ionic, cell, spin, density-volume, and phonon-sample artifacts have fail-closed identities | Every phase |
 | Runtime quality | Measured complete wall and peak memory on representative Apple Silicon workloads | Existing DFT controls cover a narrow workload set | Every phase |
 
 ## Architecture Rules
@@ -292,6 +298,14 @@ solid-state DFT only when all of the following hold:
   Apple Silicon workloads;
 - unsupported physics fails closed and remains documented.
 
+Current exit audit: every criterion above is implemented and has bounded
+evidence except the broad GTH production envelope. Phase 7 has complete
+coverage, but its strict matrix remains failed by the locked MgO q2
+bulk-derivative and total-force residuals, the rejected q10 candidate, and
+missing exact calculation/runtime identities in older EOS summaries. The
+project therefore must not yet claim the general core defined here. No Phase 6
+or Phase 8 implementation gap remains hidden behind that blocker.
+
 ## Deferred Beyond The General Core
 
 The following are named post-core programs, not hidden work inside the phases
@@ -309,7 +323,7 @@ above:
   optical response, and electron-phonon workflows;
 - reaction and excited-state workflows: nudged elastic band and time-dependent
   DFT;
-- platform scale: crystallographic point-group reduction, distributed
+- platform scale: automatic crystallographic symmetry discovery, distributed
   execution, multi-device scheduling, and broad molecular DFT;
 - alternate periodic pseudopotential envelopes: production UPF support beyond
   the required GTH general-core envelope.
@@ -321,5 +335,5 @@ exit audit. None is an implied blocker for the claim defined here.
 
 Each phase begins with source and protocol research. Implementation starts only
 after inputs, numerical semantics, acceptance thresholds, and evidence labels
-are locked. Automaton may track one bounded implementation phase after that
-lock; it does not own this program-level scientific roadmap.
+are locked. A task tracker may record bounded implementation progress; it does
+not own program-level scientific decisions or weaken exit gates.
