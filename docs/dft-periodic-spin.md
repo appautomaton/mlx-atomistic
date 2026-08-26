@@ -1,0 +1,112 @@
+# DFT Periodic Collinear Spin
+
+This document is the scientific and engineering contract for Phase 5 of the
+[DFT roadmap](./dft-roadmap.md). It extends the existing periodic PBE/GTH
+runtime with collinear spin without creating a second SCF controller.
+
+## Objective
+
+Support common collinear-magnetic solids with explicit spin-up and spin-down
+densities, potentials, occupations, and diagnostics. Preserve the current
+unpolarized trajectory byte-for-byte at the public contract boundary wherever
+floating execution order is unchanged.
+
+Non-collinear magnetism, spin-orbit coupling, constrained local moments,
+DFT+U, and magnetic forces or stress are separate phases.
+
+## Public Contract
+
+`PeriodicSCFConfig` retains `unpolarized` as its default. Collinear runs select
+one of two electron-allocation modes:
+
+- `fixed_magnetization`: the caller supplies total magnetization
+  `M = N_up - N_down`; `N_up = (N + M) / 2` and
+  `N_down = (N - M) / 2` remain fixed throughout SCF.
+- `unconstrained`: both channels share one Fermi level and electrons may move
+  between them. This mode requires finite-temperature occupations so level
+  crossings remain well defined.
+
+The result reports total density, the two spin densities, magnetization
+density, integrated magnetization, per-channel k-point states and electron
+counts, and either one shared or two fixed-channel chemical potentials. Total
+charge and the requested fixed magnetization are hard convergence gates.
+
+## Exchange-Correlation Functional
+
+The production functional is spin-PBE with the Perdew-Wang 1992 uniform-gas
+baseline. Exchange uses exact spin scaling:
+
+```text
+E_x[n_up, n_down] = 1/2 E_x^PBE[2 n_up] + 1/2 E_x^PBE[2 n_down]
+```
+
+Correlation uses PW92 spin interpolation for the local baseline and the PBE
+spin-scaling factor
+
+```text
+zeta = (n_up - n_down) / (n_up + n_down)
+phi = ((1 + zeta)^(2/3) + (1 - zeta)^(2/3)) / 2
+```
+
+in the PBE gradient correction. The two local potentials are obtained from one
+MLX automatic-differentiation graph. At `n_up = n_down`, total energy, total
+density, and both channel potentials must reproduce the existing unpolarized
+PBE path within locked float32 tolerances.
+
+## Runtime Architecture
+
+The physical channel dimension belongs above the existing k-point scheduler:
+
+```text
+shared cell / GTH / Hartree(total density)
+                    |
+          spin-PBE potentials [up, down]
+                    |
+       existing k-point + Davidson machinery
+             /                     \
+       up channel               down channel
+             \                     /
+         occupation and density reduction
+```
+
+Cell geometry, plane-wave bases, local GTH, nonlocal GTH, Ewald energy,
+k-point symmetry, compact batching, and Davidson code remain shared. Each spin
+channel receives `V_local + V_H[n_up+n_down] + V_xc,spin`; no spin-specific
+copy of kinetic or pseudopotential code is allowed.
+
+The mixer acts on charge and magnetization channels, not on two unrelated
+densities. This makes the unpolarized subspace explicit and permits separate
+bounded damping of magnetic oscillations.
+
+## Acceptance Criteria
+
+- spin-PBE energy and both potentials pass finite-difference derivatives;
+- equal spin densities reproduce unpolarized PBE energy and potential;
+- channel exchange is invariant under swapping up and down;
+- fixed and unconstrained occupations conserve total electron count;
+- fixed magnetization conserves `N_up - N_down` at every accepted iteration;
+- zero-magnetization periodic SCF reproduces the existing unpolarized result;
+- checkpoint/resume reproduces both spin densities and channel occupations;
+- one source-bound magnetic crystal passes energy, moment, and numerical
+  convergence gates without running a reference engine on the MLX path;
+- complete wall time and peak memory are measured once after the protocol is
+  locked.
+
+## Delivery Order
+
+1. Implement spin-PBE and spin-resolved occupation oracles.
+2. Add immutable spin configuration and result contracts.
+3. Lift periodic effective-potential, eigensolve, density, and mixing stages to
+   a shared two-channel controller.
+4. Add checkpoint identity and exact resume.
+5. Close non-magnetic equivalence and bounded magnetic numerical gates.
+6. Lock and run one source-bound magnetic material validation.
+7. Synchronize capability documentation and merge only after CI passes.
+
+## Evidence Boundary
+
+Deterministic functional and engine tests establish numerical semantics, not
+material accuracy. The material gate will use a fingerprinted GTH-PBE source,
+cell, k-point mesh, cutoff, smearing width, and magnetic reference. The final
+claim remains limited to that workload until Phase 7 broadens pseudopotential
+transferability.
