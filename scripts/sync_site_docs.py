@@ -35,6 +35,7 @@ NARRATIVE_TARGETS = {
     "dft-pseudopotentials.md": "dft/dft-pseudopotentials.md",
     "dft-roadmap.md": "dft/dft-roadmap.md",
     "dft-scf-core.md": "dft/dft-scf-core.md",
+    "dft-stress-variable-cell.md": "dft/dft-stress-variable-cell.md",
     "release.md": "project/release.md",
     "validation-and-performance.md": "project/validation-and-performance.md",
 }

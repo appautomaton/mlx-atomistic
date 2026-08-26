@@ -204,6 +204,43 @@ class PeriodicDFTSystem:
             pseudopotentials=self.pseudopotentials,
         )
 
+    def with_cell(
+        self,
+        cell: Cell | Sequence[float] | Sequence[Sequence[float]],
+        *,
+        scale_positions: bool = True,
+    ) -> PeriodicDFTSystem:
+        """Return the system in a replacement periodic cell.
+
+        Args:
+            cell: Replacement right-handed periodic cell in bohr.
+            scale_positions: Preserve fractional positions when true; otherwise
+                preserve Cartesian positions.
+
+        Returns:
+            A new periodic system with fixed FFT shape, pseudopotentials, and
+            electron count.
+
+        Raises:
+            ValueError: If ``scale_positions`` is not boolean.
+        """
+
+        if type(scale_positions) is not bool:
+            raise ValueError("scale_positions must be bool")
+        replacement = cell if isinstance(cell, Cell) else Cell(cell)
+        positions = np.asarray(self.positions, dtype=np.float64)
+        if scale_positions:
+            direct = np.asarray(self.grid.cell.matrix, dtype=np.float64)
+            fractional = positions @ np.linalg.inv(direct)
+            positions = fractional @ np.asarray(replacement.matrix, dtype=np.float64)
+        return PeriodicDFTSystem(
+            replacement,
+            self.grid.shape,
+            positions,
+            electron_count=self.electron_count,
+            pseudopotentials=self.pseudopotentials,
+        )
+
 
 @dataclass(frozen=True)
 class PeriodicDavidsonConfig:

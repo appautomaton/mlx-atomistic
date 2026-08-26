@@ -7,7 +7,8 @@ periodic `PeriodicDFTSystem`/`run_periodic_scf` surface supplies the
 materials-workload path: PBE-PW92, reciprocal-space GTH operators,
 Monkhorst-Pack integration, block-Davidson/Rayleigh-Ritz solves,
 fixed or Fermi-Dirac occupations, frozen-density band paths, and periodic
-forces across ordinary fixed full-rank cells.
+forces across ordinary fixed full-rank cells. A proof-level periodic stress and
+variable-cell surface is present but is not material-verified.
 
 The periodic implementation has verified results for specific workloads, but
 is not broadly chemically certified. Capability claims are tied to the
@@ -76,13 +77,14 @@ non-self-consistently along a high-symmetry path.
 
 ## Stress, Relaxation, And Restart
 
-Finite-difference stress estimates diagonal orthorhombic stress by changing
-cell lengths and rerunning SCF. The legacy `optimize_geometry` workflow remains
-a teaching and consistency surface. The periodic `optimize_periodic_geometry`
-workflow consumes only converged periodic SCF forces, continues accepted
-electronic state, applies a fail-closed Armijo line search, and can publish an
-atomic accepted-step outer checkpoint. Both workflows keep the cell fixed and
-reject variable-cell or coupled ion/cell modes.
+The legacy finite-difference stress remains an orthorhombic teaching surface.
+The periodic stress oracle transports one converged variational state across
+full-rank cells, reevaluates every energy term on a fixed integer-G topology,
+and requires primary and doubled strain derivatives to agree. The periodic
+`optimize_periodic_geometry` workflow handles fixed-cell ions. The separate
+`optimize_periodic_cell` workflow composes cell-only or ion/cell steps with an
+enthalpy Armijo line search and an atomic accepted-cell checkpoint. Both outer
+workflows reuse accepted electronic state and reject failed trials.
 
 The periodic workflow is current-verified for one displaced eight-atom Silicon
 crystal. It converged in seven accepted steps to a maximum force of
@@ -94,7 +96,9 @@ The same workflow is current-verified in one four-atom hexagonal 2H-Silicon
 cell. It converged in three accepted steps to a maximum force of
 `1.715e-5 Ha/bohr`. Full-rank geometry is implemented across grids, reciprocal
 bases, Ewald, GTH operators, forces, fingerprints, and state metadata. Stress
-and variable-cell optimization remain absent.
+and variable-cell control now pass deterministic oracles, but the source-bound
+material gate remains failed because the finite-basis stress is not smooth
+across strain scales. No variable-cell material result is verified.
 
 Dense SCF restart files store density, orbitals, ion positions, cell lengths, spin metadata, and Γ k-point metadata for small-system continuation workflows.
 
@@ -114,7 +118,8 @@ boundary.
 | Full-rank fixed periodic cells | verified for one bounded 2H-Si relaxation and low-symmetry numerical oracles | CP2K cell matrix, QE CELL_PARAMETERS |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
 | Fixed-cell periodic geometry relaxation | verified for bounded orthorhombic and hexagonal Si workloads | CP2K MOTION/GEO_OPT, QE relax |
-| Finite-difference stress | proof-level | CP2K stress, QE stress |
+| Frozen-variational periodic stress | proof-level; deterministic gates pass, 2H-Si material gate fails closed | CP2K stress, QE stress |
+| Variable-cell relaxation and restart | proof-level; deterministic cell-only, coupled, and resume gates pass | CP2K CELL_OPT, QE vc-relax |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
 | QM/MM force-environment orchestration | deferred | CP2K FORCE_EVAL/QMMM |
 | PH/EPW/NEB/TDDFT/MPI/offload suite breadth | deferred | QE and CP2K production suites |

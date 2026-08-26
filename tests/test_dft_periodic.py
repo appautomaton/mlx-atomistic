@@ -91,6 +91,33 @@ def test_nonorthogonal_reduced_kpoint_and_system_updates_preserve_cell_matrix():
     assert moved.fingerprint != system.fingerprint
 
 
+def test_plane_wave_basis_transports_exact_integer_topology_across_cell_strain():
+    matrix = _skew_cell_matrix()
+    grid = RealSpaceGrid((8, 8, 8), matrix)
+    reduced = (0.25, -0.125, 0.375)
+    source = PlaneWaveBasis.from_reduced_kpoint(grid, 3.0, reduced)
+    strained = RealSpaceGrid((8, 8, 8), matrix @ np.diag((1.02, 0.99, 1.01)))
+    transported = PlaneWaveBasis.from_reduced_kpoint(
+        strained,
+        3.0,
+        reduced,
+        active_integer_g=np.asarray(source.active_integer_g),
+    )
+
+    np.testing.assert_array_equal(
+        transported.active_integer_g,
+        source.active_integer_g,
+    )
+    assert transported.active_count == source.active_count
+    with pytest.raises(ValueError, match="not representable"):
+        PlaneWaveBasis.from_reduced_kpoint(
+            strained,
+            3.0,
+            reduced,
+            active_integer_g=((5, 0, 0),),
+        )
+
+
 def test_plane_wave_round_trip_preserves_masked_coefficients_and_norm():
     grid = RealSpaceGrid((8, 8, 8), (8.0, 8.0, 8.0))
     basis = PlaneWaveBasis(grid, 3.0)

@@ -73,6 +73,8 @@ class PlaneWaveBasis:
         reciprocal_grid: Optional shared reciprocal descriptor. Compatible
             bases created for one SCF calculation should share this object.
         lane_label: Stable label used to distinguish equal-basis runtime lanes.
+        active_integer_g: Optional exact integer-G topology transported from a
+            compatible basis on the same FFT shape.
     """
 
     grid: RealSpaceGrid
@@ -88,6 +90,7 @@ class PlaneWaveBasis:
         *,
         reciprocal_grid: ReciprocalGrid | None = None,
         lane_label: str = "lane:0",
+        active_integer_g: Sequence[Sequence[int]] | np.ndarray | None = None,
     ):
         if len(kpoint_cartesian) != 3:
             msg = "kpoint_cartesian must have three components"
@@ -108,6 +111,7 @@ class PlaneWaveBasis:
             cutoff_hartree,
             kpoint_cartesian,
             lane_label=lane_label,
+            active_integer_g=active_integer_g,
         )
         object.__setattr__(self, "grid", grid)
         object.__setattr__(self, "cutoff_hartree", float(cutoff_hartree))
@@ -123,6 +127,7 @@ class PlaneWaveBasis:
         *,
         reciprocal_grid: ReciprocalGrid | None = None,
         lane_label: str = "lane:0",
+        active_integer_g: Sequence[Sequence[int]] | np.ndarray | None = None,
     ) -> PlaneWaveBasis:
         """Build a basis from fractional reciprocal coordinates.
 
@@ -132,6 +137,8 @@ class PlaneWaveBasis:
             reduced_kpoint: Fractional coordinates along reciprocal cell axes.
             reciprocal_grid: Optional shared reciprocal descriptor.
             lane_label: Stable runtime lane label.
+            active_integer_g: Optional exact integer-G topology transported
+                from a compatible basis on the same FFT shape.
 
         Returns:
             A basis whose Cartesian k-point is the reduced row vector mapped
@@ -157,6 +164,7 @@ class PlaneWaveBasis:
             cartesian,
             reciprocal_grid=reciprocal,
             lane_label=lane_label,
+            active_integer_g=active_integer_g,
         )
 
     @property

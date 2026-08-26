@@ -87,6 +87,12 @@ from mlx_atomistic.dft.optimization import (
     optimize_geometry,
     save_geometry_optimization,
 )
+from mlx_atomistic.dft.periodic_cell_optimization import (
+    PeriodicCellOptimizationConfig,
+    PeriodicCellOptimizationResult,
+    PeriodicCellOptimizationStep,
+    optimize_periodic_cell,
+)
 from mlx_atomistic.dft.periodic_electrostatics import (
     periodic_ewald_energy,
     periodic_ewald_forces,
@@ -122,6 +128,12 @@ from mlx_atomistic.dft.periodic_scf import (
     run_periodic_band_structure,
     run_periodic_scf,
     solve_periodic_eigenproblem,
+)
+from mlx_atomistic.dft.periodic_stress import (
+    PeriodicStressConfig,
+    PeriodicStressResult,
+    PeriodicStressSample,
+    periodic_finite_difference_stress,
 )
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import (
@@ -213,6 +225,9 @@ __all__ = [
     "PERIODIC_SCF_CHECKPOINT_SCHEMA",
     "PERIODIC_SCF_COMMAND_KIND",
     "PeriodicDFTSystem",
+    "PeriodicCellOptimizationConfig",
+    "PeriodicCellOptimizationResult",
+    "PeriodicCellOptimizationStep",
     "PeriodicBandPointResult",
     "PeriodicBandStructureResult",
     "PeriodicDavidsonConfig",
@@ -230,6 +245,9 @@ __all__ = [
     "PeriodicSCFCheckpoint",
     "PeriodicSCFExecutionIdentity",
     "PeriodicSCFResult",
+    "PeriodicStressConfig",
+    "PeriodicStressResult",
+    "PeriodicStressSample",
     "PeriodicUnfoldedBandStructureResult",
     "PlaneWaveBasis",
     "ProductionPBEExchangeCorrelation",
@@ -287,11 +305,13 @@ __all__ = [
     "nonlocal_pseudopotential_energy",
     "normalize_orbitals",
     "optimize_geometry",
+    "optimize_periodic_cell",
     "optimize_periodic_geometry",
     "orbital_residuals",
     "orthonormality_error",
     "periodic_ewald_energy",
     "periodic_ewald_forces",
+    "periodic_finite_difference_stress",
     "periodic_gth_local_forces",
     "periodic_scf_calculation_contract",
     "periodic_scf_execution_settings",

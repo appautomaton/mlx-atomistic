@@ -156,8 +156,9 @@ class _CompactBasisLayout:
         kpoint_cartesian: Sequence[float],
         *,
         lane_label: str,
+        active_integer_g: Sequence[Sequence[int]] | np.ndarray | None = None,
     ) -> _CompactBasisLayout:
-        """Build a canonical compact layout from shared reciprocal metadata."""
+        """Build a cutoff-selected or explicitly transported compact layout."""
 
         if cutoff_hartree <= 0.0:
             msg = "cutoff_hartree must be positive"
@@ -169,9 +170,35 @@ class _CompactBasisLayout:
         reciprocal_flat = mx.reshape(reciprocal.vectors, (-1, 3))
         shifted = reciprocal_flat + mx.array(kpoint.astype(np.float32))[None, :]
         kinetic = 0.5 * mx.sum(shifted * shifted, axis=1)
-        active_indices, active_count = _ascending_true_indices(
-            kinetic <= float(cutoff_hartree) + 1e-12
-        )
+        if active_integer_g is None:
+            active_indices, active_count = _ascending_true_indices(
+                kinetic <= float(cutoff_hartree) + 1e-12
+            )
+        else:
+            requested = np.asarray(active_integer_g, dtype=np.int32)
+            shape = np.asarray(reciprocal.real_grid.shape, dtype=np.int32)
+            if requested.ndim != 2 or requested.shape[1:] != (3,) or not requested.size:
+                msg = "active_integer_g must have shape (n, 3) with n > 0"
+                raise ValueError(msg)
+            coordinates = np.mod(requested, shape[None, :]).astype(np.int32)
+            recovered = np.where(
+                coordinates <= (shape[None, :] - 1) // 2,
+                coordinates,
+                coordinates - shape[None, :],
+            ).astype(np.int32)
+            if not np.array_equal(recovered, requested):
+                msg = "active_integer_g is not representable on the FFT grid"
+                raise ValueError(msg)
+            flat = np.ravel_multi_index(
+                coordinates.T,
+                reciprocal.real_grid.shape,
+            ).astype(np.int32)
+            if np.unique(flat).size != flat.size:
+                msg = "active_integer_g must contain unique reciprocal vectors"
+                raise ValueError(msg)
+            active = np.sort(flat)
+            active_indices = mx.array(active)
+            active_count = int(active.size)
         if active_count == 0:
             msg = "plane-wave cutoff admits no reciprocal coefficients"
             raise ValueError(msg)
