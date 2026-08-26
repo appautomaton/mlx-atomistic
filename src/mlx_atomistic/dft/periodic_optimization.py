@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -36,7 +36,10 @@ from mlx_atomistic.dft._periodic_optimization_state import (
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.kpoints import KPointMesh
 from mlx_atomistic.dft.periodic_forces import PeriodicForceResult, periodic_scf_forces
-from mlx_atomistic.dft.periodic_scf import run_periodic_scf
+from mlx_atomistic.dft.periodic_scf import (
+    _run_periodic_scf_fixed_topology,
+    run_periodic_scf,
+)
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
 
 PeriodicGeometryOptimizer = Literal["lbfgs", "steepest_descent"]
@@ -342,21 +345,29 @@ def _evaluate_geometry(
     xc_functional: ExchangeCorrelationFunctional | None,
     initial_density: object | None,
     initial_coefficients: object | None,
+    basis_integer_g: Sequence[np.ndarray] | None,
     observer: RuntimeObserver | None,
 ) -> _PeriodicEvaluation:
     started = perf_counter()
     try:
-        result = run_periodic_scf(
-            system,
-            cutoff_hartree=cutoff_hartree,
-            kpoint_mesh=kpoint_mesh,
-            n_bands=n_bands,
-            config=scf_config,
-            xc_functional=xc_functional,
-            initial_density=initial_density,
-            initial_coefficients=initial_coefficients,
-            observer=observer,
-        )
+        scf_kwargs = {
+            "cutoff_hartree": cutoff_hartree,
+            "kpoint_mesh": kpoint_mesh,
+            "n_bands": n_bands,
+            "config": scf_config,
+            "xc_functional": xc_functional,
+            "initial_density": initial_density,
+            "initial_coefficients": initial_coefficients,
+            "observer": observer,
+        }
+        if basis_integer_g is None:
+            result = run_periodic_scf(system, **scf_kwargs)
+        else:
+            result = _run_periodic_scf_fixed_topology(
+                system,
+                basis_integer_g=basis_integer_g,
+                **scf_kwargs,
+            )
     except (FloatingPointError, RuntimeError, ValueError) as error:
         raise _EvaluationFailure(f"periodic SCF failed: {error}") from error
     scf_wall_ms = (perf_counter() - started) * 1000.0
@@ -416,6 +427,8 @@ class _PeriodicGeometryController:
     convergence_reason: str
     checkpoint_manifest: dict[str, object] | None
     resume_density: mx.array | None
+    resume_coefficients: Sequence[mx.array] | None
+    basis_integer_g: Sequence[np.ndarray] | None
 
     @classmethod
     def create(
@@ -429,6 +442,9 @@ class _PeriodicGeometryController:
         scf_config: PeriodicSCFConfig,
         xc_functional: ExchangeCorrelationFunctional | None,
         observer: RuntimeObserver | None,
+        initial_density: mx.array | None,
+        initial_coefficients: Sequence[mx.array] | None,
+        basis_integer_g: Sequence[np.ndarray] | None,
         checkpoint_to: str | Path | None,
         checkpoint_step: int | None,
         resume_from: str | Path | None,
@@ -445,6 +461,14 @@ class _PeriodicGeometryController:
         )
         if (checkpoint_to is None) != (checkpoint_step is None):
             raise ValueError("checkpoint_to and checkpoint_step must be supplied together")
+        if (
+            initial_density is not None or initial_coefficients is not None
+        ) and resume_from is not None:
+            raise ValueError("initial electronic state and resume_from are mutually exclusive")
+        if (
+            initial_density is not None or initial_coefficients is not None
+        ) and not config.reuse_scf_state:
+            raise ValueError("initial electronic state requires reuse_scf_state=True")
         if checkpoint_step is not None and (
             type(checkpoint_step) is not int
             or checkpoint_step <= 0
@@ -458,7 +482,8 @@ class _PeriodicGeometryController:
         scf_evaluations = 0
         line_search_evaluations = 0
         lineage: tuple[str, ...] = ()
-        resume_density = None
+        resume_density = None if initial_density is None else mx.array(initial_density)
+        resume_coefficients = initial_coefficients
         if resume_from is not None:
             state = _load_periodic_geometry_checkpoint(
                 resume_from,
@@ -476,6 +501,7 @@ class _PeriodicGeometryController:
             line_search_evaluations = state.line_search_evaluations
             lineage = state.lineage
             resume_density = state.density
+            resume_coefficients = None
         return cls(
             initial_system=system,
             cutoff_hartree=float(cutoff_hartree),
@@ -504,6 +530,8 @@ class _PeriodicGeometryController:
             convergence_reason="max_steps",
             checkpoint_manifest=None,
             resume_density=resume_density,
+            resume_coefficients=resume_coefficients,
+            basis_integer_g=basis_integer_g,
         )
 
     def run(self) -> PeriodicGeometryOptimizationResult:
@@ -554,7 +582,9 @@ class _PeriodicGeometryController:
             self.current = self._evaluate(
                 system,
                 density=(self.resume_density if self.config.reuse_scf_state else None),
-                coefficients=None,
+                coefficients=(
+                    self.resume_coefficients if self.config.reuse_scf_state else None
+                ),
             )
         except _EvaluationFailure as error:
             self._stop("scf_failed", str(error))
@@ -582,6 +612,7 @@ class _PeriodicGeometryController:
             xc_functional=self.xc_functional,
             initial_density=density,
             initial_coefficients=coefficients,
+            basis_integer_g=self.basis_integer_g,
             observer=self.observer,
         )
 
@@ -759,6 +790,8 @@ def optimize_periodic_geometry(
     scf_config: PeriodicSCFConfig | None = None,
     xc_functional: ExchangeCorrelationFunctional | None = None,
     observer: RuntimeObserver | None = None,
+    initial_density: mx.array | None = None,
+    initial_coefficients: Sequence[mx.array] | None = None,
     checkpoint_to: str | Path | None = None,
     checkpoint_step: int | None = None,
     resume_from: str | Path | None = None,
@@ -775,6 +808,8 @@ def optimize_periodic_geometry(
         scf_config: Exact periodic SCF controls.
         xc_functional: Exchange-correlation functional. Defaults to production PBE.
         observer: Optional shared runtime observer.
+        initial_density: Optional density seed for the initial periodic SCF.
+        initial_coefficients: Optional k-point orbital seeds for the initial SCF.
         checkpoint_to: Previously absent accepted-step checkpoint destination.
         checkpoint_step: Accepted step at which to publish and stop.
         resume_from: Explicit accepted-step checkpoint to resume.
@@ -810,8 +845,46 @@ def optimize_periodic_geometry(
         scf_config=resolved_scf,
         xc_functional=xc_functional,
         observer=observer,
+        initial_density=initial_density,
+        initial_coefficients=initial_coefficients,
+        basis_integer_g=None,
         checkpoint_to=checkpoint_to,
         checkpoint_step=checkpoint_step,
         resume_from=resume_from,
         provenance=provenance,
+    ).run()
+
+
+def _optimize_periodic_geometry_fixed_topology(
+    system: PeriodicDFTSystem,
+    *,
+    cutoff_hartree: float,
+    kpoint_mesh: KPointMesh,
+    n_bands: int | None,
+    config: PeriodicGeometryOptimizationConfig,
+    scf_config: PeriodicSCFConfig,
+    xc_functional: ExchangeCorrelationFunctional | None,
+    observer: RuntimeObserver | None,
+    initial_density: mx.array | None,
+    initial_coefficients: Sequence[mx.array] | None,
+    basis_integer_g: Sequence[np.ndarray],
+) -> PeriodicGeometryOptimizationResult:
+    """Compose fixed-cell ionic relaxation inside one cell-trajectory basis."""
+
+    return _PeriodicGeometryController.create(
+        system,
+        cutoff_hartree=cutoff_hartree,
+        kpoint_mesh=kpoint_mesh,
+        n_bands=n_bands,
+        config=config,
+        scf_config=scf_config,
+        xc_functional=xc_functional,
+        observer=observer,
+        initial_density=initial_density,
+        initial_coefficients=initial_coefficients,
+        basis_integer_g=basis_integer_g,
+        checkpoint_to=None,
+        checkpoint_step=None,
+        resume_from=None,
+        provenance=None,
     ).run()

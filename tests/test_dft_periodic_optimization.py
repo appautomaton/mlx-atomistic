@@ -192,6 +192,38 @@ def test_periodic_relaxation_rejects_an_unconverged_initial_scf(monkeypatch):
     assert len(calls) == 1
 
 
+def test_periodic_relaxation_accepts_explicit_initial_electronic_state(monkeypatch):
+    calls, _results = _mock_harmonic(monkeypatch)
+    density = mx.full(_system().grid.shape, 0.25)
+    coefficients = (mx.ones((1, *_system().grid.shape), dtype=mx.complex64),)
+
+    result = optimize_periodic_geometry(
+        _system(),
+        cutoff_hartree=1.0,
+        kpoint_mesh=_mesh(),
+        n_bands=1,
+        config=_config(max_steps=1),
+        scf_config=PeriodicSCFConfig(max_iterations=4),
+        initial_density=density,
+        initial_coefficients=coefficients,
+    )
+
+    assert result.status in {"converged", "max_steps"}
+    assert calls[0]["initial_density"] is not None
+    assert calls[0]["initial_coefficients"] is coefficients
+    np.testing.assert_array_equal(calls[0]["initial_density"], density)
+    with pytest.raises(ValueError, match="reuse_scf_state"):
+        optimize_periodic_geometry(
+            _system(),
+            cutoff_hartree=1.0,
+            kpoint_mesh=_mesh(),
+            n_bands=1,
+            config=_config(reuse_scf_state=False),
+            initial_density=density,
+            initial_coefficients=coefficients,
+        )
+
+
 def test_periodic_relaxation_checkpoint_resume_matches_uninterrupted(
     tmp_path,
     monkeypatch,

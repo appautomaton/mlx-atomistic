@@ -384,6 +384,7 @@ class _PeriodicSCFController:
         xc_functional: ExchangeCorrelationFunctional | None,
         initial_density: mx.array | None,
         initial_coefficients: Sequence[mx.array] | None,
+        basis_integer_g: Sequence[np.ndarray] | None,
         observer: RuntimeObserver | None,
         projector_cache: _GTHProjectorCache,
         resume_state: _PeriodicSCFContinuationState | None,
@@ -400,6 +401,7 @@ class _PeriodicSCFController:
             band_count=band_count,
             initial_density=initial_density,
             initial_coefficients=initial_coefficients,
+            basis_integer_g=basis_integer_g,
             resume_state=resume_state,
             config=scf_config,
         )
@@ -420,6 +422,11 @@ class _PeriodicSCFController:
                     point.vector,
                     reciprocal_grid=shared_reciprocal,
                     lane_label=f"kpoint:{point_index}",
+                    active_integer_g=(
+                        None
+                        if basis_integer_g is None
+                        else basis_integer_g[point_index]
+                    ),
                 )
                 for point_index, point in enumerate(kpoint_mesh.points)
             )
@@ -541,6 +548,7 @@ class _PeriodicSCFController:
         band_count: int,
         initial_density: mx.array | None,
         initial_coefficients: Sequence[mx.array] | None,
+        basis_integer_g: Sequence[np.ndarray] | None,
         resume_state: _PeriodicSCFContinuationState | None,
         config: PeriodicSCFConfig,
     ) -> None:
@@ -563,8 +571,15 @@ class _PeriodicSCFController:
         ):
             msg = "initial_coefficients length must match the k-point mesh"
             raise ValueError(msg)
+        if basis_integer_g is not None and len(basis_integer_g) != len(
+            kpoint_mesh.points
+        ):
+            msg = "basis_integer_g length must match the k-point mesh"
+            raise ValueError(msg)
         if resume_state is not None and (
-            initial_density is not None or initial_coefficients is not None
+            initial_density is not None
+            or initial_coefficients is not None
+            or basis_integer_g is not None
         ):
             msg = "periodic resume state is mutually exclusive with public initial guesses"
             raise ValueError(msg)
@@ -1290,6 +1305,7 @@ def _run_periodic_scf_with_projector_cache(
     xc_functional: ExchangeCorrelationFunctional | None = None,
     initial_density: mx.array | None = None,
     initial_coefficients: Sequence[mx.array] | None = None,
+    basis_integer_g: Sequence[np.ndarray] | None = None,
     observer: RuntimeObserver | None = None,
     projector_cache: _GTHProjectorCache,
     resume_state: _PeriodicSCFContinuationState | None = None,
@@ -1307,6 +1323,7 @@ def _run_periodic_scf_with_projector_cache(
         xc_functional=xc_functional,
         initial_density=initial_density,
         initial_coefficients=initial_coefficients,
+        basis_integer_g=basis_integer_g,
         observer=observer,
         projector_cache=projector_cache,
         resume_state=resume_state,
@@ -1325,6 +1342,7 @@ def _run_periodic_scf_controlled(
     xc_functional: ExchangeCorrelationFunctional | None = None,
     initial_density: mx.array | None = None,
     initial_coefficients: Sequence[mx.array] | None = None,
+    basis_integer_g: Sequence[np.ndarray] | None = None,
     observer: RuntimeObserver | None = None,
     resume_state: _PeriodicSCFContinuationState | None = None,
     checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None = None,
@@ -1340,6 +1358,7 @@ def _run_periodic_scf_controlled(
             xc_functional=xc_functional,
             initial_density=initial_density,
             initial_coefficients=initial_coefficients,
+            basis_integer_g=basis_integer_g,
             observer=observer,
             projector_cache=projector_cache,
             resume_state=resume_state,

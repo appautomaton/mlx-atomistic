@@ -98,6 +98,35 @@ def run_periodic_scf(
     )
 
 
+def _run_periodic_scf_fixed_topology(
+    system: PeriodicDFTSystem,
+    *,
+    cutoff_hartree: float,
+    kpoint_mesh: KPointMesh,
+    basis_integer_g: Sequence[object],
+    n_bands: int | None = None,
+    config: PeriodicSCFConfig | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
+    initial_density: mx.array | None = None,
+    initial_coefficients: Sequence[mx.array] | None = None,
+    observer: RuntimeObserver | None = None,
+) -> PeriodicSCFResult:
+    """Run an internal SCF with an exact transported integer-G topology."""
+
+    return _run_periodic_scf_controlled(
+        system,
+        cutoff_hartree=cutoff_hartree,
+        kpoint_mesh=kpoint_mesh,
+        n_bands=n_bands,
+        config=config,
+        xc_functional=xc_functional,
+        initial_density=initial_density,
+        initial_coefficients=initial_coefficients,
+        basis_integer_g=basis_integer_g,
+        observer=observer,
+    )
+
+
 def run_periodic_band_structure(
     system: PeriodicDFTSystem,
     source: PeriodicSCFResult | PeriodicFrozenDensity,
