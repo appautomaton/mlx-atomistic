@@ -96,6 +96,7 @@ from mlx_atomistic.dft.periodic_cell_optimization import (
 from mlx_atomistic.dft.periodic_electrostatics import (
     periodic_ewald_energy,
     periodic_ewald_forces,
+    periodic_ewald_stress,
 )
 from mlx_atomistic.dft.periodic_forces import (
     PeriodicForceResult,
@@ -133,6 +134,7 @@ from mlx_atomistic.dft.periodic_stress import (
     PeriodicStressConfig,
     PeriodicStressResult,
     PeriodicStressSample,
+    periodic_analytic_stress,
     periodic_finite_difference_stress,
 )
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
@@ -311,6 +313,8 @@ __all__ = [
     "orthonormality_error",
     "periodic_ewald_energy",
     "periodic_ewald_forces",
+    "periodic_ewald_stress",
+    "periodic_analytic_stress",
     "periodic_finite_difference_stress",
     "periodic_gth_local_forces",
     "periodic_scf_calculation_contract",

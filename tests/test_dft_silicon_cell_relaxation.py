@@ -7,6 +7,8 @@ from mlx_atomistic.benchmarks.dft_hexagonal_silicon import (
 )
 from mlx_atomistic.benchmarks.dft_silicon_cell_relaxation import (
     INITIAL_LINEAR_SCALE,
+    PULAY_CHECK_CUTOFF_HARTREE,
+    PULAY_PRESSURE_DELTA_TOLERANCE_HARTREE_PER_BOHR3,
     STRESS_TOLERANCE_HARTREE_PER_BOHR3,
     _cell_config,
     _initial_geometry,
@@ -34,3 +36,8 @@ def test_silicon_cell_protocol_locks_topology_and_convergence_controls():
     assert config.stress_config.require_fixed_basis_topology
     assert config.stress_config.strain_step == 1.0e-3
     assert config.stress_config.electronic_response == "frozen_variational"
+    assert PULAY_CHECK_CUTOFF_HARTREE > 25.0
+    assert (
+        PULAY_PRESSURE_DELTA_TOLERANCE_HARTREE_PER_BOHR3
+        == STRESS_TOLERANCE_HARTREE_PER_BOHR3
+    )

@@ -104,7 +104,7 @@ def _mock_elastic_runtime(monkeypatch, *, target_length: float = 6.0):
 
     monkeypatch.setattr(module, "run_periodic_scf", run_scf)
     monkeypatch.setattr(module, "_run_periodic_scf_fixed_topology", run_scf)
-    monkeypatch.setattr(module, "periodic_finite_difference_stress", stress)
+    monkeypatch.setattr(module, "periodic_analytic_stress", stress)
     return calls, results, make_scf
 
 
@@ -286,7 +286,7 @@ def test_initial_stress_failure_is_not_mislabeled_as_scf_failure(monkeypatch):
     def fail_stress(*_args, **_kwargs):
         raise ValueError("non-smooth frozen derivative")
 
-    monkeypatch.setattr(module, "periodic_finite_difference_stress", fail_stress)
+    monkeypatch.setattr(module, "periodic_analytic_stress", fail_stress)
     result = optimize_periodic_cell(
         _system(),
         cutoff_hartree=2.0,

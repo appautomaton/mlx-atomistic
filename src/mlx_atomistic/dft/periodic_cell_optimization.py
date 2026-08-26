@@ -44,7 +44,7 @@ from mlx_atomistic.dft.periodic_scf import (
 )
 from mlx_atomistic.dft.periodic_stress import (
     PeriodicStressResult,
-    periodic_finite_difference_stress,
+    periodic_analytic_stress,
 )
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
@@ -379,7 +379,7 @@ class _PeriodicCellController:
         if scf is None or not scf.converged or scf.system_fingerprint != system.fingerprint:
             raise _CellOptimizationFailure("cell state SCF is unconverged or mismatched")
         try:
-            stress = periodic_finite_difference_stress(
+            stress = periodic_analytic_stress(
                 system,
                 cutoff_hartree=self.cutoff_hartree,
                 kpoint_mesh=self.kpoint_mesh,

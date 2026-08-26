@@ -102,16 +102,30 @@ class PBEExchangeCorrelation:
 
     name: str = "pbe-pz81-gga-alpha"
 
-    def _energy_density(self, rho: mx.array, grid: RealSpaceGrid, density_floor: float) -> mx.array:
+    def _energy_density_from_gradient(
+        self,
+        rho: mx.array,
+        gradient: mx.array,
+        density_floor: float,
+    ) -> mx.array:
         rho = mx.maximum(rho, density_floor)
-        gradient = density_gradient(rho, grid)
         sigma = mx.sum(gradient * gradient, axis=0)
         eps_c_unif = (
-            LDACorrelationPZ81().evaluate(rho, grid, density_floor=density_floor).energy_density
+            LDACorrelationPZ81()
+            .evaluate(rho, density_floor=density_floor)
+            .energy_density
             / rho
         )
         return _pbe_exchange_energy_density(rho, sigma) + _pbe_correlation_energy_density(
             rho, sigma, eps_c_unif
+        )
+
+    def _energy_density(self, rho: mx.array, grid: RealSpaceGrid, density_floor: float) -> mx.array:
+        safe = mx.maximum(rho, density_floor)
+        return self._energy_density_from_gradient(
+            safe,
+            density_gradient(safe, grid),
+            density_floor,
         )
 
     def evaluate(
@@ -155,9 +169,13 @@ class ProductionPBEExchangeCorrelation:
 
     name: str = "pbe-pw92-gga"
 
-    def _energy_density(self, rho: mx.array, grid: RealSpaceGrid, density_floor: float) -> mx.array:
+    def _energy_density_from_gradient(
+        self,
+        rho: mx.array,
+        gradient: mx.array,
+        density_floor: float,
+    ) -> mx.array:
         rho = mx.maximum(rho, density_floor)
-        gradient = density_gradient(rho, grid)
         sigma = mx.sum(gradient * gradient, axis=0)
         eps_c_unif = LDACorrelationPW92().correlation_per_particle(
             rho,
@@ -167,6 +185,14 @@ class ProductionPBEExchangeCorrelation:
             rho,
             sigma,
             eps_c_unif,
+        )
+
+    def _energy_density(self, rho: mx.array, grid: RealSpaceGrid, density_floor: float) -> mx.array:
+        safe = mx.maximum(rho, density_floor)
+        return self._energy_density_from_gradient(
+            safe,
+            density_gradient(safe, grid),
+            density_floor,
         )
 
     def evaluate(

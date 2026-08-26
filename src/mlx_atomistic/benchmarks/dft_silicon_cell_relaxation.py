@@ -35,7 +35,9 @@ from mlx_atomistic.dft import (
     PeriodicStressConfig,
     RuntimeObserver,
     optimize_periodic_cell,
+    periodic_analytic_stress,
     read_gth,
+    run_periodic_scf,
 )
 
 REPORT_SCHEMA = "mlx-atomistic.silicon-periodic-cell-relaxation.v1"
@@ -43,6 +45,8 @@ INITIAL_LINEAR_SCALE = 0.995
 MAX_LATTICE_RELATIVE_ERROR = 3.0e-3
 MAX_FRACTIONAL_POSITION_ERROR = 2.0e-6
 STRESS_TOLERANCE_HARTREE_PER_BOHR3 = 5.0e-6
+PULAY_CHECK_CUTOFF_HARTREE = 35.0
+PULAY_PRESSURE_DELTA_TOLERANCE_HARTREE_PER_BOHR3 = 5.0e-6
 
 
 def _write_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -123,6 +127,7 @@ def run_silicon_cell_relaxation(
         "accepted_cell_matrix_bohr": accepted_cell.tolist(),
         "initial_linear_scale": INITIAL_LINEAR_SCALE,
         "cutoff_hartree": CUTOFF_HARTREE,
+        "pulay_check_cutoff_hartree": PULAY_CHECK_CUTOFF_HARTREE,
         "fft_shape": list(FFT_SHAPE),
         "kpoint_mesh": list(KPOINT_MESH),
         "band_count": BAND_COUNT,
@@ -160,8 +165,6 @@ def run_silicon_cell_relaxation(
         resume_from=resume_from,
         provenance={"point_fingerprint": point["point_fingerprint"]},
     )
-    mx.synchronize()
-    elapsed = perf_counter() - started
 
     final_cell = np.asarray(optimization.final_system.grid.cell.matrix, dtype=np.float64)
     final_positions = np.asarray(optimization.final_system.positions, dtype=np.float64)
@@ -176,6 +179,65 @@ def run_silicon_cell_relaxation(
     lattice_relative_error = abs(final_linear_scale - 1.0)
     fractional_error = float(np.max(np.abs(fractional_delta)))
     final_stress = optimization.final_stress
+    pulay_check: dict[str, Any]
+    if optimization.converged and optimization.final_scf is not None and final_stress is not None:
+        pulay_started = perf_counter()
+        high_cutoff_scf = run_periodic_scf(
+            optimization.final_system,
+            cutoff_hartree=PULAY_CHECK_CUTOFF_HARTREE,
+            kpoint_mesh=MonkhorstPackGrid(KPOINT_MESH),
+            n_bands=BAND_COUNT,
+            config=scf_config,
+            initial_density=optimization.final_scf.density,
+            observer=observer,
+        )
+        if high_cutoff_scf.converged:
+            high_cutoff_stress = periodic_analytic_stress(
+                optimization.final_system,
+                cutoff_hartree=PULAY_CHECK_CUTOFF_HARTREE,
+                kpoint_mesh=MonkhorstPackGrid(KPOINT_MESH),
+                n_bands=BAND_COUNT,
+                config=config.stress_config,
+                scf_config=scf_config,
+                observer=observer,
+                base_result=high_cutoff_scf,
+            )
+            pressure_delta = abs(high_cutoff_stress.pressure - final_stress.pressure)
+            mx.synchronize()
+            pulay_check = {
+                "status": "passed"
+                if pressure_delta
+                <= PULAY_PRESSURE_DELTA_TOLERANCE_HARTREE_PER_BOHR3
+                else "failed",
+                "production_cutoff_hartree": CUTOFF_HARTREE,
+                "higher_cutoff_hartree": PULAY_CHECK_CUTOFF_HARTREE,
+                "production_pressure_hartree_per_bohr3": final_stress.pressure,
+                "higher_cutoff_pressure_hartree_per_bohr3": (
+                    high_cutoff_stress.pressure
+                ),
+                "pressure_delta_hartree_per_bohr3": pressure_delta,
+                "maximum_pressure_delta_hartree_per_bohr3": (
+                    PULAY_PRESSURE_DELTA_TOLERANCE_HARTREE_PER_BOHR3
+                ),
+                "higher_cutoff_scf_iterations": high_cutoff_scf.iterations,
+                "complete_wall_seconds": perf_counter() - pulay_started,
+            }
+        else:
+            pulay_check = {
+                "status": "failed",
+                "reason": f"higher-cutoff SCF ended with {high_cutoff_scf.status}",
+                "production_cutoff_hartree": CUTOFF_HARTREE,
+                "higher_cutoff_hartree": PULAY_CHECK_CUTOFF_HARTREE,
+            }
+    else:
+        pulay_check = {
+            "status": "not_run",
+            "reason": "production cell relaxation did not converge",
+            "production_cutoff_hartree": CUTOFF_HARTREE,
+            "higher_cutoff_hartree": PULAY_CHECK_CUTOFF_HARTREE,
+        }
+    mx.synchronize()
+    elapsed = perf_counter() - started
     gates = {
         "optimization_converged": optimization.converged,
         "scf_converged": bool(
@@ -192,6 +254,7 @@ def run_silicon_cell_relaxation(
             optimization.steps
             and all(step.enthalpy <= step.armijo_limit for step in optimization.steps)
         ),
+        "pulay_convergence": pulay_check["status"] == "passed",
     }
     payload = {
         "schema_version": REPORT_SCHEMA,
@@ -210,6 +273,9 @@ def run_silicon_cell_relaxation(
                 "maximum_pressure_hartree_per_bohr3": (
                     STRESS_TOLERANCE_HARTREE_PER_BOHR3
                 ),
+                "maximum_pulay_pressure_delta_hartree_per_bohr3": (
+                    PULAY_PRESSURE_DELTA_TOLERANCE_HARTREE_PER_BOHR3
+                ),
             },
         },
         "checks": {
@@ -219,6 +285,7 @@ def run_silicon_cell_relaxation(
             "maximum_fractional_position_error": fractional_error,
         },
         "optimization": optimization.to_dict(),
+        "pulay_check": pulay_check,
         "runtime": {
             "complete_wall_seconds": elapsed,
             "observation": observer.snapshot(),

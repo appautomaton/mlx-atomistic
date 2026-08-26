@@ -7,8 +7,9 @@ periodic `PeriodicDFTSystem`/`run_periodic_scf` surface supplies the
 materials-workload path: PBE-PW92, reciprocal-space GTH operators,
 Monkhorst-Pack integration, block-Davidson/Rayleigh-Ritz solves,
 fixed or Fermi-Dirac occupations, frozen-density band paths, and periodic
-forces across ordinary fixed full-rank cells. A proof-level periodic stress and
-variable-cell surface is present but is not material-verified.
+forces across ordinary fixed full-rank cells. Analytic periodic stress and a
+restartable variable-cell surface are verified for one bounded 2H-Silicon
+workflow.
 
 The periodic implementation has verified results for specific workloads, but
 is not broadly chemically certified. Capability claims are tied to the
@@ -96,9 +97,12 @@ The same workflow is current-verified in one four-atom hexagonal 2H-Silicon
 cell. It converged in three accepted steps to a maximum force of
 `1.715e-5 Ha/bohr`. Full-rank geometry is implemented across grids, reciprocal
 bases, Ewald, GTH operators, forces, fingerprints, and state metadata. Stress
-and variable-cell control now pass deterministic oracles, but the source-bound
-material gate remains failed because the finite-basis stress is not smooth
-across strain scales. No variable-cell material result is verified.
+and variable-cell control pass deterministic oracles. A source-bound cell
+trajectory from `0.995` of the accepted scale converged after one accepted step
+at scale `0.9981142`, with final pressure `2.66553e-6 Ha/bohr³`. A fresh 35 Ha
+stress differed from the 25 Ha result by only `2.17019e-7 Ha/bohr³`, closing
+the locked Pulay gate. This is a bounded 2H-Silicon result, not broad material
+certification.
 
 Dense SCF restart files store density, orbitals, ion positions, cell lengths, spin metadata, and Γ k-point metadata for small-system continuation workflows.
 
@@ -118,8 +122,8 @@ boundary.
 | Full-rank fixed periodic cells | verified for one bounded 2H-Si relaxation and low-symmetry numerical oracles | CP2K cell matrix, QE CELL_PARAMETERS |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
 | Fixed-cell periodic geometry relaxation | verified for bounded orthorhombic and hexagonal Si workloads | CP2K MOTION/GEO_OPT, QE relax |
-| Frozen-variational periodic stress | proof-level; deterministic gates pass, 2H-Si material gate fails closed | CP2K stress, QE stress |
-| Variable-cell relaxation and restart | proof-level; deterministic cell-only, coupled, and resume gates pass | CP2K CELL_OPT, QE vc-relax |
+| Analytic periodic stress | verified for deterministic derivatives and one cutoff-converged 2H-Si material path | CP2K stress, QE stress |
+| Variable-cell relaxation and restart | verified for one bounded 2H-Si cell-only path; deterministic coupled and resume gates pass | CP2K CELL_OPT, QE vc-relax |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
 | QM/MM force-environment orchestration | deferred | CP2K FORCE_EVAL/QMMM |
 | PH/EPW/NEB/TDDFT/MPI/offload suite breadth | deferred | QE and CP2K production suites |
