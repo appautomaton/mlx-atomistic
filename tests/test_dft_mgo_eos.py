@@ -145,6 +145,7 @@ def test_mgo_validation_dry_run_exposes_bounded_decision_ladder(tmp_path):
     assert plan["point_timeout_seconds"] == POINT_TIMEOUT_SECONDS
     assert plan["maximum_point_count"] == 35
     assert plan["initial_smoke_point"]["profile"] == "smoke-q2"
+    assert len(plan["initial_smoke_point"]["runtime_fingerprint"]) == 64
     assert [point["cutoff_hartree"] for point in plan["cutoff_screen_points"]] == [
         25.0,
         30.0,
@@ -157,7 +158,7 @@ def test_mgo_validation_dry_run_exposes_bounded_decision_ladder(tmp_path):
     assert len(PROFILE_SPECS) == 23
 
 
-def test_mgo_q10_primitive_profile_preserves_geometry_and_reduces_kpoints():
+def test_mgo_q10_primitive_profile_preserves_geometry_without_unsafe_reduction():
     lattice = 8.0
     system = {
         "cell_representation": "primitive",
@@ -172,7 +173,8 @@ def test_mgo_q10_primitive_profile_preserves_geometry_and_reduces_kpoints():
 
     assert np.linalg.det(cell) == pytest.approx(lattice**3 / 4.0)
     np.testing.assert_allclose(positions[1], (lattice / 2.0,) * 3)
-    assert len(mesh.points) < 32
+    assert settings.get("symmetry_reduction") is None
+    assert len(mesh.points) == 64
     assert sum(point.weight for point in mesh.points) == pytest.approx(1.0)
 
 

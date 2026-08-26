@@ -77,7 +77,7 @@ def test_iron_spin_validation_aggregates_locked_gates_without_extra_points(
         out=tmp_path / "workload",
     )
 
-    def fake_point(*, profile, polarized, out, manifest_path):
+    def fake_point(*, profile, polarized, kpoint_mode, out, manifest_path):
         workload, _ = load_iron_spin_workload(manifest_path)
         moments = {
             "smoke": 2.2,
@@ -86,11 +86,14 @@ def test_iron_spin_validation_aggregates_locked_gates_without_extra_points(
             "kpoint-check": 2.28,
         }
         energy = -20.0 if polarized else -19.8
+        if kpoint_mode == "full":
+            energy += 1.0e-5
         payload = {
             "schema_version": iron_spin.POINT_SCHEMA,
             "workload_fingerprint": workload["workload_fingerprint"],
             "profile": profile,
             "polarized": polarized,
+            "kpoint_mode": kpoint_mode,
             "settings": workload["profiles"][profile],
             "source_fingerprints": {
                 "material_protocol": iron_spin._material_protocol_record(),
@@ -114,7 +117,10 @@ def test_iron_spin_validation_aggregates_locked_gates_without_extra_points(
     assert report["verified"] is True
     assert report["status"] == "verified"
     assert all(report["gates"].values())
-    assert len(report["points"]) == 5
+    assert len(report["points"]) == 6
+    assert report["symmetry_oracle"]["free_energy_abs_hartree_per_atom"] == (
+        pytest.approx(1.0e-5)
+    )
 
     monkeypatch.setattr(
         iron_spin,
@@ -140,6 +146,7 @@ def test_q16_workload_locks_its_separate_electron_and_cutoff_contract(tmp_path):
     assert workload["system"]["electron_count"] == 16
     assert workload["physics"]["initial_magnetization_per_cell"] == 2.2
     assert workload["profiles"]["selected"]["cutoff_hartree"] == 150.0
+    assert workload["validation"]["symmetry_moment_abs_per_atom"] == 0.02
     assert workload["representation"]["radial_tail_ratio_at_cutoff"]["selected"] < 0.02
 
 
@@ -160,3 +167,9 @@ def test_bcc_primitive_symmetry_preserves_metric_and_exact_unfolded_weights():
     mesh = iron_spin._primitive_unfolded_mesh(3)
     assert len(mesh.points) == 54
     assert sum(point.weight for point in mesh.points) == pytest.approx(1.0, abs=1.0e-14)
+
+    prepared_mesh = {
+        "kpoint_meshes": {"3": iron_spin._mesh_payload(3)},
+    }
+    assert len(iron_spin._kpoint_mesh(prepared_mesh, 3, mode="full").points) == 54
+    assert len(iron_spin._kpoint_mesh(prepared_mesh, 3, mode="reduced").points) < 54

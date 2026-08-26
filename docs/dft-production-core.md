@@ -46,6 +46,12 @@ eigensolves always retain direct validation.
 
 ## Spin, Occupations, k-Points, And Bands
 
+Time-reversal k-point ownership is SCF-safe because paired states contribute
+the same real-space density. General point-group orbit weights are only a
+quadrature reduction until the runtime reconstructs rotated orbital densities;
+material workflows must use a full mesh or pass a matched full-versus-reduced
+SCF oracle.
+
 The new spin layer is collinear only:
 
 - `unpolarized`: one total density `ρ(r)`.

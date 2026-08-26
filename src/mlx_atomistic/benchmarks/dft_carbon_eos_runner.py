@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -25,6 +26,7 @@ from mlx_atomistic.benchmarks.dft_carbon_eos import (
     reference_fit,
     validation_lattice_constants,
 )
+from mlx_atomistic.benchmarks.dft_eos import summarize_eos_point_identities
 from mlx_atomistic.benchmarks.dft_silicon import ANGSTROM_TO_BOHR
 
 POINT_SCHEMA = "mlx-atomistic.carbon-eos-point.v1"
@@ -95,6 +97,13 @@ def _implementation_fingerprint() -> str:
     return sha256_bytes(canonical_json_bytes(contract))
 
 
+@lru_cache(maxsize=1)
+def _runtime_fingerprint() -> str:
+    from mlx_atomistic.benchmarks.dft_runtime_contract import build_source_fingerprints
+
+    return str(build_source_fingerprints()["runtime_fingerprint"])
+
+
 def _point_spec(
     *,
     workload_fingerprint: str,
@@ -106,6 +115,7 @@ def _point_spec(
     settings = PROFILE_SPECS[profile]
     values = {
         "workload_fingerprint": workload_fingerprint,
+        "runtime_fingerprint": _runtime_fingerprint(),
         "eos_implementation_fingerprint": _implementation_fingerprint(),
         "reference_sha256": REFERENCE_SHA256,
         "profile": profile,
@@ -375,7 +385,11 @@ def _load_matching_point(path: Path, expected: Mapping[str, Any]) -> dict[str, A
     if point.get("point_fingerprint") == expected["point_fingerprint"]:
         return payload
     identity_keys = set(expected).difference(
-        {"eos_implementation_fingerprint", "point_fingerprint"}
+        {
+            "eos_implementation_fingerprint",
+            "point_fingerprint",
+            "runtime_fingerprint",
+        }
     )
     legacy_matches = (
         point.get("eos_implementation_fingerprint")
@@ -635,6 +649,7 @@ def _final_report(
         "scientifically_verified": scientific_verified,
         "blockers": blockers,
         "workload_fingerprint": manifest["workload_fingerprint"],
+        **summarize_eos_point_identities(rows),
         "screened_cutoff_pair": list(cutoff_pair),
         "accepted_workload": {
             "profile": selected_profile,

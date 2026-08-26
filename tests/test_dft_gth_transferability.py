@@ -23,6 +23,9 @@ def test_gth_transferability_matrix_separates_coverage_from_strict_science():
     assert "case:rocksalt-mgo-q2-q6:metric:force_max_abs_hartree_per_bohr" in report[
         "blockers"
     ]
+    assert "case:bcc-iron-q16:method_validation" in report["blockers"]
+    iron = next(case for case in report["cases"] if case["case_id"] == "bcc-iron-q16")
+    assert iron["method_validation"]["metrics"][0]["passed"] is False
 
 
 def test_gth_transferability_matrix_retains_failed_q10_candidate():
@@ -31,6 +34,7 @@ def test_gth_transferability_matrix_retains_failed_q10_candidate():
 
     assert candidate["candidate_id"] == "rocksalt-mgo-primitive-q10-q6-c40-k4"
     assert candidate["passed"] is False
+    assert candidate["method_validation"]["passed"] is False
     assert candidate["elapsed_wall_seconds"] == pytest.approx(40.98934508301318)
     assert candidate["peak_temporary_bytes"] == 57_201_084
 
@@ -49,3 +53,8 @@ def test_gth_transferability_matrix_fails_closed_on_missing_coverage_or_identity
     invalid["cases"][0]["identity"]["reference_protocol_sha256"] = "invalid"
     with pytest.raises(ValueError, match="reference protocol identity"):
         build_gth_transferability_report(invalid)
+
+    missing_method = copy.deepcopy(contract)
+    del missing_method["cases"][0]["method_validation"]
+    with pytest.raises(ValueError, match="method validation scope"):
+        build_gth_transferability_report(missing_method)

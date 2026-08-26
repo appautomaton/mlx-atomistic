@@ -30,6 +30,7 @@ from mlx_atomistic.benchmarks.dft_carbon_eos_runner import (
     run_carbon_eos_point,
     run_carbon_eos_validation,
 )
+from mlx_atomistic.benchmarks.dft_eos import summarize_eos_point_identities
 
 
 def _gth_source(path):
@@ -130,6 +131,7 @@ def test_carbon_validation_dry_run_exposes_fail_early_bounds(tmp_path):
         "cutoff40",
     }
     assert max(point["timeout_seconds"] for point in plan["initial_screen_points"]) <= 180
+    assert len(plan["initial_screen_points"][0]["runtime_fingerprint"]) == 64
     assert set(PROFILE_SPECS) == {
         "cutoff30",
         "cutoff40",
@@ -220,6 +222,7 @@ def test_single_carbon_point_persists_compact_numerical_evidence(tmp_path, monke
     assert payload["numerical_passed"] is True
     assert payload["result"]["maximum_orbital_residual"] == pytest.approx(8.0e-7)
     assert payload["result"]["representative_kpoint_count"] == 1
+    assert len(payload["point"]["runtime_fingerprint"]) == 64
     assert "events" not in payload["result"]["observation"]
     assert (tmp_path / "density.npy").is_file()
 
@@ -276,5 +279,30 @@ def test_report_accepts_central_cutoff_evidence_without_full_upper_curve():
     assert report["status"] == "passed"
     assert report["scientifically_verified"] is True
     assert report["admitted"] is True
+    assert report["runtime_fingerprints"] == []
+    assert report["eos_implementation_fingerprints"] == []
     assert report["selected_cutoff_profile"] == "cutoff40"
     assert report["accepted_workload"]["full_upper_cutoff_curve_required"] is False
+
+
+def test_eos_identity_summary_deduplicates_and_retains_incomplete_history():
+    reports = [
+        {
+            "point": {
+                "runtime_fingerprint": "b" * 64,
+                "eos_implementation_fingerprint": "d" * 64,
+            }
+        },
+        {
+            "point": {
+                "runtime_fingerprint": "a" * 64,
+                "eos_implementation_fingerprint": "d" * 64,
+            }
+        },
+        {"point": {"eos_implementation_fingerprint": "c" * 64}},
+    ]
+
+    assert summarize_eos_point_identities(reports) == {
+        "runtime_fingerprints": ["a" * 64, "b" * 64],
+        "eos_implementation_fingerprints": ["c" * 64, "d" * 64],
+    }

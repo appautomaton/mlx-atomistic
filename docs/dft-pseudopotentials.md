@@ -56,8 +56,9 @@ PBE/GTH-q16 cutoff and k-point study now passes the Phase 5 material gate,
 while the matching q8 study retains a failed magnetic-moment gate. Phase 7
 now computes a multi-material coverage and science matrix rather than
 generalizing from q16. Coverage is complete, but the production GTH envelope
-remains unverified because locked MgO and older evidence-identity blockers are
-retained.
+remains unverified because locked MgO, older evidence-identity blockers, and a
+failed full-versus-reduced SCF oracle for the point-group-reduced Fe evidence
+are retained.
 
 ## Forces
 

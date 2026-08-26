@@ -31,6 +31,7 @@ from mlx_atomistic.benchmarks.dft_aluminum_eos import (
     reference_fit,
     validation_lattice_constants,
 )
+from mlx_atomistic.benchmarks.dft_eos import summarize_eos_point_identities
 from mlx_atomistic.benchmarks.dft_silicon import ANGSTROM_TO_BOHR
 
 POINT_SCHEMA = "mlx-atomistic.aluminum-eos-point.v1"
@@ -1059,6 +1060,7 @@ def run_aluminum_eos_validation(
         "scientifically_verified": admitted and scientific.get("verified") is True,
         "blockers": blockers,
         "workload_fingerprint": manifest["workload_fingerprint"],
+        **summarize_eos_point_identities([*rows, *capacity_rows]),
         "accepted_workload": {
             "profile": selected_profile,
             "cutoff_hartree": selected_cutoff,
