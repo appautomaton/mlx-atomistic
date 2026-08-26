@@ -91,6 +91,16 @@ PROFILE_SPECS: dict[str, dict[str, Any]] = {
         "fft_shape": [36, 36, 36],
         "kpoint_mesh": [4, 4, 4],
         "kpoint_centering": "gamma",
+        "symmetry_reduction": "full_cubic_point_group",
+        "max_batch_transient_bytes": 512 * 1024**2,
+    },
+    "q10-primitive-c40-k4-full": {
+        "pseudopotential_mode": "q10",
+        "cell_representation": "primitive",
+        "cutoff_hartree": 40.0,
+        "fft_shape": [36, 36, 36],
+        "kpoint_mesh": [4, 4, 4],
+        "kpoint_centering": "gamma",
         "max_batch_transient_bytes": 512 * 1024**2,
     },
 }
@@ -346,6 +356,9 @@ def run_mgo_eos_point(
                 if settings.get("symmetry_reduction") is None
                 else str(settings["symmetry_reduction"])
             ),
+            "point_group_density_reconstruction": (
+                result.point_group_symmetry_reduced
+            ),
             "pseudopotentials": manifest["physics"][
                 (
                     "accepted_pseudopotentials"
@@ -372,6 +385,7 @@ def run_mgo_eos_point(
             "energy_delta_hartree": (
                 None if result.energy_delta is None else float(result.energy_delta)
             ),
+            "final_iteration": dict(result.history[-1]),
             "explicit_kpoint_count": len(result.kpoints),
             "representative_kpoint_count": len(result.owned_kpoints),
             "elapsed_wall_seconds": elapsed,

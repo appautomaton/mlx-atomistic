@@ -233,8 +233,9 @@ locked MgO q2 bulk-derivative and total-force residuals and incomplete exact
 calculation/runtime identities for older project-derived summaries. The current
 Fe q16 full-versus-reduced SCF oracle passes after rotated-density
 reconstruction, but its broader legacy evidence still lacks refreshed v2
-identities. The primitive Mg q10 screen failed its orbital-residual gate and
-was produced before SCF density reconstruction, so no full q10 EOS was run.
+identities. The current density-reconstructed primitive Mg q10 screen still
+fails its locked orbital-residual gate after both cold and density-seeded runs,
+so the matched full oracle and full q10 EOS were not run.
 
 ## Phase 8: Add Finite-Displacement Phonons
 
