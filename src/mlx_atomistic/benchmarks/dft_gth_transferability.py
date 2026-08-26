@@ -13,7 +13,7 @@ import numpy as np
 from mlx_atomistic._artifact_identity import sha256_bytes
 
 CONTRACT_SCHEMA = "mlx-atomistic.dft-gth-transferability.v1"
-CONTRACT_SHA256 = "69135f16adf21778f4ebd03f745e5c422b9fd1140b7f57730fd683007020ad04"
+CONTRACT_SHA256 = "c15a37644395e304f7deb19c112ca10dd3d6d0e00e552fb9166ff7fe74cf1ebe"
 
 
 def _contract_path() -> Path:

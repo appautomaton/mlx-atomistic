@@ -36,10 +36,10 @@ def test_gth_transferability_matrix_retains_failed_q10_candidate():
     assert candidate["candidate_id"] == "rocksalt-mgo-primitive-q10-q6-c40-k4"
     assert candidate["passed"] is False
     assert candidate["method_validation"]["passed"] is False
-    assert candidate["elapsed_wall_seconds"] == pytest.approx(44.37065308401361)
+    assert candidate["elapsed_wall_seconds"] == pytest.approx(42.78015033295378)
     assert candidate["peak_temporary_bytes"] == 63_770_520
     assert candidate["metrics"][0]["value"] == pytest.approx(
-        4.598673513100948e-6
+        3.0125518151180586e-6
     )
 
 

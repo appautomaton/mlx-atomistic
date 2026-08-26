@@ -165,16 +165,16 @@
     {
       "candidate_id": "rocksalt-mgo-primitive-q10-q6-c40-k4",
       "workload_fingerprint": "74453bf759a19229384de6bbd101c17921531c6d93d0e361e5366904a50d6cf1",
-      "calculation_fingerprint": "5b319f4ef41b4c8df0c0113839ccd18738e8993da5ca6b0745ff6118c100f622",
+      "calculation_fingerprint": "952418646c7969ae2a4f3b80992a71b0cb5a088baea2787cfd68194d36bd3b68",
       "implementation_fingerprint": "9c8821f1379d18e9b481ace45a2e1bf8f9c57aca4a0d5ce01cb912f159dea1fb",
       "method_validation": {
         "scope": "point_group_density_reconstruction_seeded_continuation_full_oracle_skipped_after_numerical_failure",
         "passed": false
       },
-      "elapsed_wall_seconds": 44.37065308401361,
+      "elapsed_wall_seconds": 42.78015033295378,
       "peak_temporary_bytes": 63770520,
       "metrics": [
-        {"name": "orbital_residual", "value": 0.000004598673513100948, "maximum": 0.000002},
+        {"name": "orbital_residual", "value": 0.0000030125518151180586, "maximum": 0.000002},
         {"name": "scf_iterations", "value": 80.0, "maximum": 79.0}
       ]
     }

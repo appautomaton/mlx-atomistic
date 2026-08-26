@@ -107,10 +107,12 @@ The current Mg-q10/O-q6 feasibility point used the two-atom primitive cell, a
 36-cubed FFT grid, eight occupied bands, and point-group density reconstruction.
 It took `39.892 s`, used `63,770,520` peak temporary bytes, and stopped after 80
 SCF iterations with a `3.5695e-6` direct orbital residual above the locked
-`2e-6` limit. Density and energy gates passed. A continuation seeded from that
-final density also reached 80 iterations and a `4.5987e-6` direct residual, so
-warm density does not remove the Davidson convergence floor. The fail-early
-policy therefore skipped the matched full-mesh oracle and seven-point q10 EOS.
+`2e-6` limit. A continuation seeded from that final density and using direct
+Rayleigh-quotient refinement improved the residual to `3.0126e-6` without an
+extra Hamiltonian application, but it also reached 80 iterations and remained
+outside the gate. The remaining blocker is orthogonal subspace convergence,
+not stale projected eigenvalues. The fail-early policy therefore skipped the
+matched full-mesh oracle and seven-point q10 EOS.
 
 The primitive geometry and reciprocal-basis transform remain valid. A future
 MgO candidate may use a v2 point-group mesh only after a matched full-versus-
