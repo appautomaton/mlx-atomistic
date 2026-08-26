@@ -103,14 +103,14 @@ The committed contract currently reports:
   summaries do not retain exact calculation and runtime fingerprints;
 - `production_envelope_verified = false`.
 
-The historical Mg-q10/O-q6 feasibility point used the two-atom primitive cell,
-a 36-cubed FFT grid, eight occupied bands, and point-group-reduced k-points. It
-took `40.989 s`, used `57,201,084` peak temporary bytes, and stopped after 80
-SCF iterations with a `4.329e-6` orbital residual above the locked `2e-6`
-limit. The point is also method-invalid historical evidence because the runtime
-used for that run aggregated orbit weights without reconstructing rotated SCF
-densities. The current runtime fixes that method, but the q10 point has not been
-rerun and no seven-point q10 EOS was run.
+The current Mg-q10/O-q6 feasibility point used the two-atom primitive cell, a
+36-cubed FFT grid, eight occupied bands, and point-group density reconstruction.
+It took `39.892 s`, used `63,770,520` peak temporary bytes, and stopped after 80
+SCF iterations with a `3.5695e-6` direct orbital residual above the locked
+`2e-6` limit. Density and energy gates passed. A continuation seeded from that
+final density also reached 80 iterations and a `4.5987e-6` direct residual, so
+warm density does not remove the Davidson convergence floor. The fail-early
+policy therefore skipped the matched full-mesh oracle and seven-point q10 EOS.
 
 The primitive geometry and reciprocal-basis transform remain valid. A future
 MgO candidate may use a v2 point-group mesh only after a matched full-versus-

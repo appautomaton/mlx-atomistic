@@ -155,10 +155,10 @@ def test_mgo_validation_dry_run_exposes_bounded_decision_ladder(tmp_path):
         70.0,
         80.0,
     ]
-    assert len(PROFILE_SPECS) == 23
+    assert len(PROFILE_SPECS) == 24
 
 
-def test_mgo_q10_primitive_profile_preserves_geometry_without_unsafe_reduction():
+def test_mgo_q10_primitive_profiles_preserve_geometry_and_oracle_pair():
     lattice = 8.0
     system = {
         "cell_representation": "primitive",
@@ -168,14 +168,21 @@ def test_mgo_q10_primitive_profile_preserves_geometry_without_unsafe_reduction()
         ],
     }
     cell, positions = _system_geometry(system, lattice)
-    settings = PROFILE_SPECS["q10-primitive-c40-k4"]
-    mesh = _kpoint_mesh(settings, cell)
+    reduced_settings = PROFILE_SPECS["q10-primitive-c40-k4"]
+    full_settings = PROFILE_SPECS["q10-primitive-c40-k4-full"]
+    reduced = _kpoint_mesh(reduced_settings, cell)
+    full = _kpoint_mesh(full_settings, cell)
 
     assert np.linalg.det(cell) == pytest.approx(lattice**3 / 4.0)
     np.testing.assert_allclose(positions[1], (lattice / 2.0,) * 3)
-    assert settings.get("symmetry_reduction") is None
-    assert len(mesh.points) == 64
-    assert sum(point.weight for point in mesh.points) == pytest.approx(1.0)
+    assert reduced_settings["symmetry_reduction"] == "full_cubic_point_group"
+    assert full_settings.get("symmetry_reduction") is None
+    assert reduced.point_group_symmetry_reduced is True
+    assert full.point_group_symmetry_reduced is False
+    assert len(reduced.points) == 8
+    assert len(full.points) == 64
+    assert sum(point.weight for point in reduced.points) == pytest.approx(1.0)
+    assert sum(point.weight for point in full.points) == pytest.approx(1.0)
 
 
 def test_mgo_kpoint_shape_comparison_removes_total_energy_offset():
