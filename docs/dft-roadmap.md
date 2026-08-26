@@ -10,9 +10,12 @@ reference engines remain validation surfaces.
 The retained periodic path provides PBE-PW92, reciprocal-space GTH operators,
 weighted k-points, block-Davidson eigensolves, fixed and Fermi-Dirac
 occupations, frozen-density bands, analytic fixed-cell forces, and atomic
-checkpoint/resume. Material-level verification remains narrow: Silicon,
-Carbon, and simple-metal Aluminum have accepted equation-of-state workloads,
-while MgO retains a declared force and transferability boundary.
+SCF checkpoint/resume. A fail-closed fixed-cell periodic ionic optimizer adds
+accepted-state electronic continuation and a separate atomic outer checkpoint.
+Material-level verification remains narrow: Silicon, Carbon, and simple-metal
+Aluminum have accepted equation-of-state workloads, Silicon has one accepted
+fixed-cell relaxation, and MgO retains a declared force and transferability
+boundary.
 
 ## Program Boundary
 
@@ -35,9 +38,9 @@ only when its implementation and material-level evidence both pass.
 | Electronic states | Insulators, simple metals, and collinear magnets | Insulators and one simple metal are verified; periodic spin is absent | Phases 1 and 5 |
 | Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
 | Mechanical observables | Analytic forces and validated stress | Forces exist with a retained MgO boundary; periodic stress is absent | Phase 4 |
-| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Only the legacy teaching path relaxes ions | Phases 2 and 4 |
+| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell periodic relaxation is verified for one bounded Silicon workload; variable-cell relaxation is absent | Phases 2 and 4 |
 | Lattice dynamics | Bounded finite-displacement phonons | Absent | Phase 8 |
-| Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | Periodic SCF checkpointing exists; workflow-level state is incomplete | Every phase |
+| Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | Periodic SCF and fixed-cell outer checkpoints exist; later workflow state remains incomplete | Every phase |
 | Runtime quality | Measured complete wall and peak memory on representative Apple Silicon workloads | Existing DFT controls cover a narrow workload set | Every phase |
 
 ## Architecture Rules
@@ -93,11 +96,13 @@ The bounded scientific contract and delivery plan are recorded in
 [DFT Metallic Validation](./dft-metallic-validation.md).
 
 Exit gate: closed. The accepted profile and current-verified measurements are
-recorded in the linked evidence summary. Phase 2 is the next active phase.
+recorded in the linked evidence summary.
 
 ## Phase 2: Add Periodic Fixed-Cell Ionic Relaxation
 
-Status: next; protocol research and specification are not yet locked.
+Status: complete. The scientific contract and current-verified Silicon result
+are recorded in
+[DFT Periodic Fixed-Cell Relaxation](./dft-periodic-relaxation.md).
 
 - Add a periodic optimizer that consumes converged analytic forces.
 - Reuse SCF density and compact eigenspaces between accepted ionic steps.
@@ -106,13 +111,15 @@ Status: next; protocol research and specification are not yet locked.
 - Fail closed on unconverged SCF states, non-finite forces, and unsupported cell
   modes.
 
-Exit gate: force and displacement convergence are reproducible across restart,
-energy decreases according to the optimizer contract, and at least one
-source-bound crystal relaxation agrees with a reference geometry.
+Exit gate: closed. The source-bound Silicon relaxation passes the locked force,
+displacement, energy, and reference-geometry gates. Deterministic CPU coverage
+locks restart equivalence, and the Metal workload verifies atomic outer
+checkpoint publication.
 
 ## Phase 3: Generalize Periodic Cell Geometry
 
-Status: planned after the fixed-cell relaxation contract is stable.
+Status: next. Protocol research and the full-rank cell contract are not yet
+locked.
 
 - Replace orthorhombic-only assumptions with one full-rank `3 x 3` cell matrix
   contract across real and reciprocal grids, plane-wave bases, k-points,

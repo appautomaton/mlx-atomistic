@@ -101,6 +101,12 @@ from mlx_atomistic.dft.periodic_gth import (
     gth_local_reciprocal_coefficients,
     periodic_gth_local_forces,
 )
+from mlx_atomistic.dft.periodic_optimization import (
+    PeriodicGeometryOptimizationConfig,
+    PeriodicGeometryOptimizationResult,
+    PeriodicGeometryOptimizationStep,
+    optimize_periodic_geometry,
+)
 from mlx_atomistic.dft.periodic_scf import (
     PeriodicBandPointResult,
     PeriodicBandStructureResult,
@@ -214,6 +220,9 @@ __all__ = [
     "PeriodicFermiDiracSmearing",
     "PeriodicForceResult",
     "PeriodicFrozenDensity",
+    "PeriodicGeometryOptimizationConfig",
+    "PeriodicGeometryOptimizationResult",
+    "PeriodicGeometryOptimizationStep",
     "PeriodicGTHNonlocalOperator",
     "PeriodicKPointResult",
     "PeriodicKohnShamOperator",
@@ -278,6 +287,7 @@ __all__ = [
     "nonlocal_pseudopotential_energy",
     "normalize_orbitals",
     "optimize_geometry",
+    "optimize_periodic_geometry",
     "orbital_residuals",
     "orthonormality_error",
     "periodic_ewald_energy",

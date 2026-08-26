@@ -96,6 +96,8 @@ class PeriodicDFTSystem:
         if positions_np.ndim != 2 or positions_np.shape[1] != 3 or positions_np.shape[0] == 0:
             msg = "positions must have shape (n_ions, 3)"
             raise ValueError(msg)
+        if not np.isfinite(positions_np).all():
+            raise ValueError("positions must contain only finite values")
         if (pseudopotential is None) == (pseudopotentials is None):
             msg = "provide exactly one of pseudopotential or pseudopotentials"
             raise ValueError(msg)
@@ -177,6 +179,28 @@ class PeriodicDFTSystem:
             digest.update(_pseudopotential_fingerprint(value).encode("ascii"))
             digest.update(b"\0")
         return digest.hexdigest()
+
+    def with_positions(
+        self,
+        positions: Sequence[Sequence[float]],
+    ) -> PeriodicDFTSystem:
+        """Return the same fixed-cell Hamiltonian identity at new ion positions.
+
+        Args:
+            positions: Replacement Cartesian ion positions in bohr.
+
+        Returns:
+            A new periodic system preserving cell, grid, pseudopotentials, and
+            electron count.
+        """
+
+        return PeriodicDFTSystem(
+            np.asarray(self.grid.lengths, dtype=np.float64),
+            self.grid.shape,
+            positions,
+            electron_count=self.electron_count,
+            pseudopotentials=self.pseudopotentials,
+        )
 
 
 @dataclass(frozen=True)

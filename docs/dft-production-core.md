@@ -77,9 +77,18 @@ non-self-consistently along a high-symmetry path.
 ## Stress, Relaxation, And Restart
 
 Finite-difference stress estimates diagonal orthorhombic stress by changing
-cell lengths and rerunning SCF. Geometry optimization supports fixed-cell ion
-relaxation only. `GeometryOptimizationConfig` rejects variable-cell and coupled
-ion/cell modes instead of silently accepting settings the optimizer cannot use.
+cell lengths and rerunning SCF. The legacy `optimize_geometry` workflow remains
+a teaching and consistency surface. The periodic `optimize_periodic_geometry`
+workflow consumes only converged periodic SCF forces, continues accepted
+electronic state, applies a fail-closed Armijo line search, and can publish an
+atomic accepted-step outer checkpoint. Both workflows keep the cell fixed and
+reject variable-cell or coupled ion/cell modes.
+
+The periodic workflow is current-verified for one displaced eight-atom Silicon
+crystal. It converged in seven accepted steps to a maximum force of
+`8.832e-5 Ha/bohr` and a translation-aligned ideal-geometry error of
+`0.000312 A`. This is a bounded fixed-cell result, not variable-cell or broad
+materials certification.
 
 Dense SCF restart files store density, orbitals, ion positions, cell lengths, spin metadata, and Γ k-point metadata for small-system continuation workflows.
 
@@ -97,7 +106,8 @@ boundary.
 | --- | --- | --- |
 | Plane-wave SCF core | verified for fixed-occupation bulk-Si EOS and one Fermi-Dirac fcc-Al EOS | CP2K Quickstep, QE PWscf |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
-| Geometry relaxation and finite-difference stress | proof-level | CP2K MOTION/GEO_OPT, QE relax |
+| Fixed-cell periodic geometry relaxation | verified for one bounded bulk-Si workload | CP2K MOTION/GEO_OPT, QE relax |
+| Finite-difference stress | proof-level | CP2K stress, QE stress |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
 | QM/MM force-environment orchestration | deferred | CP2K FORCE_EVAL/QMMM |
 | PH/EPW/NEB/TDDFT/MPI/offload suite breadth | deferred | QE and CP2K production suites |

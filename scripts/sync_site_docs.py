@@ -28,6 +28,7 @@ NARRATIVE_TARGETS = {
     "real-mm-core.md": "mm/real-mm-core.md",
     "dft-geometry-optimization.md": "dft/dft-geometry-optimization.md",
     "dft-metallic-validation.md": "dft/dft-metallic-validation.md",
+    "dft-periodic-relaxation.md": "dft/dft-periodic-relaxation.md",
     "dft-numerics.md": "dft/dft-numerics.md",
     "dft-production-core.md": "dft/dft-production-core.md",
     "dft-pseudopotentials.md": "dft/dft-pseudopotentials.md",
