@@ -156,13 +156,19 @@ def get_dft_qm_scope_report() -> DFTQMScopeReport:
             ),
             DFTQMScopeEntry(
                 feature="geometry_and_stress",
-                status="proof-level",
-                local_surface=("optimize_geometry", "finite_difference_stress"),
+                status="verified",
+                local_surface=(
+                    "optimize_periodic_geometry",
+                    "periodic_analytic_stress",
+                    "optimize_periodic_cell",
+                ),
                 reference_families=("CP2K MOTION/GEO_OPT", "Quantum ESPRESSO relax"),
                 rationale=(
-                    "Geometry and diagonal stress workflows exist for small local "
-                    "fixtures; cell, constraints, and production relaxation breadth "
-                    "remain limited."
+                    "Fixed-cell periodic relaxation and analytic stress are verified "
+                    "for bounded Silicon workloads. One 2H-Silicon variable-cell "
+                    "trajectory passes its lattice, pressure, and 25-to-35-Hartree "
+                    "Pulay gates; broader material and coupled-workflow "
+                    "transferability remain limited."
                 ),
             ),
             DFTQMScopeEntry(

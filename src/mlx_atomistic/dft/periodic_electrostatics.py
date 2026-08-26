@@ -197,6 +197,62 @@ def _ewald_analytic_forces(parameters: _EwaldParameters) -> np.ndarray:
     return _add_ewald_reciprocal_forces(parameters, forces)
 
 
+def _ewald_analytic_stress(parameters: _EwaldParameters) -> np.ndarray:
+    stress = np.zeros((3, 3), dtype=np.float64)
+    for ion_index, first in enumerate(parameters.centers):
+        for other_index, second in enumerate(parameters.centers):
+            for image in product(*parameters.real_ranges):
+                displacement = first - second + _ewald_translation(parameters, image)
+                distance = float(np.linalg.norm(displacement))
+                if distance <= 1e-14 or distance > parameters.real_cutoff:
+                    continue
+                coefficient = (
+                    erfc(parameters.eta * distance) / distance**3
+                    + 2.0
+                    * parameters.eta
+                    / sqrt(pi)
+                    * np.exp(-((parameters.eta * distance) ** 2))
+                    / distance**2
+                )
+                stress += (
+                    0.5
+                    * parameters.charge[ion_index]
+                    * parameters.charge[other_index]
+                    * coefficient
+                    * np.outer(displacement, displacement)
+                    / parameters.volume
+                )
+    reciprocal_diagonal = 0.0
+    for vector, g2 in _ewald_reciprocal_vectors(parameters):
+        structure = np.sum(
+            parameters.charge * np.exp(-1j * (parameters.centers @ vector))
+        )
+        energy = (
+            2.0
+            * pi
+            / parameters.volume
+            * np.exp(-g2 / (4.0 * parameters.eta * parameters.eta))
+            * float(abs(structure) ** 2)
+            / g2
+        )
+        reciprocal_diagonal += energy / parameters.volume
+        stress -= (
+            2.0
+            * energy
+            / parameters.volume
+            * (1.0 / (4.0 * parameters.eta * parameters.eta) + 1.0 / g2)
+            * np.outer(vector, vector)
+        )
+    stress += reciprocal_diagonal * np.eye(3)
+    background = -(
+        pi
+        * float(np.sum(parameters.charge)) ** 2
+        / (2.0 * parameters.eta**2 * parameters.volume)
+    )
+    stress += background / parameters.volume * np.eye(3)
+    return 0.5 * (stress + stress.T)
+
+
 def _ewald_finite_difference_forces(
     charges: Sequence[float],
     centers: np.ndarray,
@@ -322,3 +378,34 @@ def periodic_ewald_forces(
         tolerance=tolerance,
     )
     return _ewald_analytic_forces(parameters)
+
+
+def periodic_ewald_stress(
+    charges: Sequence[float],
+    positions: Sequence[Sequence[float]],
+    cell_lengths: Cell | Sequence[float] | Sequence[Sequence[float]],
+    *,
+    eta: float | None = None,
+    tolerance: float = 1e-10,
+) -> np.ndarray:
+    """Return compression-positive periodic Ewald stress.
+
+    Args:
+        charges: Point charges in atomic units.
+        positions: Cartesian positions in bohr.
+        cell_lengths: Periodic cell in bohr.
+        eta: Optional Ewald splitting parameter in inverse bohr.
+        tolerance: Real/reciprocal truncation target.
+
+    Returns:
+        Symmetric stress tensor in Hartree/bohr cubed.
+    """
+
+    parameters = _validated_ewald_parameters(
+        np.asarray(charges, dtype=np.float64),
+        _positions(positions),
+        cell_lengths,
+        eta=eta,
+        tolerance=tolerance,
+    )
+    return _ewald_analytic_stress(parameters)

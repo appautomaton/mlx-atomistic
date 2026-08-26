@@ -27,6 +27,7 @@ from mlx_atomistic.dft import (
     gth_local_reciprocal_coefficients,
     periodic_ewald_energy,
     periodic_ewald_forces,
+    periodic_ewald_stress,
     periodic_gth_local_forces,
     periodic_scf_calculation_contract,
     read_gth,
@@ -567,6 +568,83 @@ def test_nonorthogonal_ewald_translation_and_force_consistency():
     np.testing.assert_allclose(equivalent_forces, forces, atol=2e-8)
     np.testing.assert_allclose(forces, finite_difference, atol=3e-8, rtol=3e-7)
     np.testing.assert_allclose(np.sum(forces, axis=0), 0.0, atol=2e-8)
+
+
+def test_nonorthogonal_ewald_stress_matches_cell_derivative():
+    charges = [1.0, -1.0]
+    matrix = _skew_cell_matrix()
+    positions = np.asarray(((0.15, 0.2, 0.25), (0.62, 0.55, 0.48))) @ matrix
+    volume = float(np.linalg.det(matrix))
+    eta = 0.7
+    step = 2.0e-3
+    observed = periodic_ewald_stress(
+        charges,
+        positions,
+        Cell.triclinic(matrix),
+        eta=eta,
+        tolerance=1.0e-10,
+    )
+    reference = np.zeros((3, 3), dtype=np.float64)
+    for first, second in ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)):
+        strain = np.zeros((3, 3), dtype=np.float64)
+        strain[first, second] = 1.0 if first == second else 0.5
+        strain[second, first] = 1.0 if first == second else 0.5
+        plus = np.eye(3) + step * strain
+        minus = np.eye(3) - step * strain
+        energy_plus = periodic_ewald_energy(
+            charges,
+            positions @ plus,
+            Cell.triclinic(matrix @ plus),
+            eta=eta,
+            tolerance=1.0e-10,
+        )
+        energy_minus = periodic_ewald_energy(
+            charges,
+            positions @ minus,
+            Cell.triclinic(matrix @ minus),
+            eta=eta,
+            tolerance=1.0e-10,
+        )
+        value = -(energy_plus - energy_minus) / (2.0 * step * volume)
+        reference[first, second] = value
+        reference[second, first] = value
+
+    np.testing.assert_allclose(observed, reference, atol=2.0e-8, rtol=2.0e-7)
+
+
+def test_ewald_stress_includes_charged_background_derivative():
+    charges = [2.0]
+    matrix = np.diag((6.0, 6.0, 6.0))
+    positions = np.asarray(((0.2, 0.3, 0.4),)) @ matrix
+    volume = float(np.linalg.det(matrix))
+    eta = 0.7
+    step = 2.0e-3
+    observed = periodic_ewald_stress(
+        charges,
+        positions,
+        Cell.triclinic(matrix),
+        eta=eta,
+        tolerance=1.0e-10,
+    )
+    plus = (1.0 + step) * np.eye(3)
+    minus = (1.0 - step) * np.eye(3)
+    energy_plus = periodic_ewald_energy(
+        charges,
+        positions @ plus,
+        Cell.triclinic(matrix @ plus),
+        eta=eta,
+        tolerance=1.0e-10,
+    )
+    energy_minus = periodic_ewald_energy(
+        charges,
+        positions @ minus,
+        Cell.triclinic(matrix @ minus),
+        eta=eta,
+        tolerance=1.0e-10,
+    )
+    pressure = -(energy_plus - energy_minus) / (6.0 * step * volume)
+
+    np.testing.assert_allclose(observed, pressure * np.eye(3), atol=2.0e-8)
 
 
 def test_nonorthogonal_gth_operators_preserve_lattice_translation():

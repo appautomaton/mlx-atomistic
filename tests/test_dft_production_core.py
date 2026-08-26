@@ -279,9 +279,9 @@ def test_dft_qm_scope_report_classifies_cp2k_qe_boundaries():
     assert "silicon" in pwscf_rationale.lower()
     assert "all-electron" in pwscf_rationale
     assert "diagnostic" in pwscf_rationale
-    # Regression guard: only plane_wave_scf moved off proof-level.
     assert entries["pseudopotentials"]["status"] == "proof-level"
-    assert entries["geometry_and_stress"]["status"] == "proof-level"
+    assert entries["geometry_and_stress"]["status"] == "verified"
+    assert "2H-Silicon" in entries["geometry_and_stress"]["rationale"]
     assert entries["static_reference_comparison"]["status"] == "supported"
     assert entries["qmmm_orchestration"]["status"] == "deferred"
     assert entries["external_runtime_execution"]["status"] == "anti-goal"

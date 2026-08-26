@@ -17,6 +17,7 @@ from mlx_atomistic.dft import (
     PeriodicStressConfig,
     PseudopotentialData,
     PseudopotentialFormat,
+    periodic_analytic_stress,
     periodic_finite_difference_stress,
 )
 
@@ -315,18 +316,35 @@ def test_periodic_stress_config_fails_closed():
 
 @pytest.mark.slow
 def test_frozen_variational_stress_uses_one_real_base_scf():
+    from mlx_atomistic.dft._periodic_analytic_stress import (
+        _PeriodicAnalyticStressGraph,
+    )
+    from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
+
+    system = _small_silicon_system()
+    mesh = _mesh()
+    scf_config = PeriodicSCFConfig(
+        max_iterations=30,
+        density_tolerance=2.0e-4,
+        energy_tolerance=2.0e-5,
+        orbital_tolerance=2.0e-4,
+    )
     report = periodic_finite_difference_stress(
-        _small_silicon_system(),
+        system,
         cutoff_hartree=2.0,
-        kpoint_mesh=_mesh(),
+        kpoint_mesh=mesh,
         n_bands=2,
         config=PeriodicStressConfig(mode="isotropic"),
-        scf_config=PeriodicSCFConfig(
-            max_iterations=30,
-            density_tolerance=2.0e-4,
-            energy_tolerance=2.0e-5,
-            orbital_tolerance=2.0e-4,
-        ),
+        scf_config=scf_config,
+    )
+    analytic = periodic_analytic_stress(
+        system,
+        cutoff_hartree=2.0,
+        kpoint_mesh=mesh,
+        n_bands=2,
+        config=PeriodicStressConfig(mode="isotropic"),
+        scf_config=scf_config,
+        base_result=report.base_scf,
     )
 
     assert np.isfinite(report.pressure)
@@ -334,3 +352,55 @@ def test_frozen_variational_stress_uses_one_real_base_scf():
     assert report.base_variational_energy_error is not None
     assert report.base_variational_energy_error <= report.config.variational_energy_tolerance
     assert all(sample.scf_iterations is None for sample in report.samples)
+    assert analytic.method == "analytic"
+    assert analytic.scf_evaluations == 0
+    assert analytic.base_variational_energy_error is not None
+    assert analytic.base_variational_energy_error <= analytic.config.variational_energy_tolerance
+    assert analytic.pressure == pytest.approx(report.pressure, abs=2.0e-6)
+    assert set(analytic.base_energy_by_term) == {
+        "kinetic",
+        "local_gth",
+        "nonlocal_gth",
+        "hartree",
+        "xc",
+        "ion_ewald",
+        "entropy_correction",
+        "stationary_reference_correction",
+        "total",
+    }
+
+    graph = _PeriodicAnalyticStressGraph(
+        system,
+        report.base_scf,
+        ProductionPBEExchangeCorrelation(),
+    )
+    zero = mx.zeros((3, 3), dtype=mx.float32)
+    step = 2.0e-3
+    shear = mx.zeros((3, 3), dtype=mx.float32)
+    shear = shear.at[0, 1].add(0.5)
+    shear = shear.at[1, 0].add(0.5)
+    derivatives = [
+        mx.grad(
+            lambda strain, component=index: graph.energy_terms(strain)[component]
+        )(zero)
+        for index in range(len(graph.energy_terms(zero)))
+    ]
+    mx.eval(*derivatives)
+    for direction in (mx.eye(3, dtype=mx.float32), shear):
+        plus = graph.energy_terms(step * direction)
+        minus = graph.energy_terms(-step * direction)
+        mx.eval(*plus, *minus)
+        for derivative, plus_term, minus_term in zip(
+            derivatives,
+            plus,
+            minus,
+            strict=True,
+        ):
+            analytic_directional = float(mx.sum(derivative * direction))
+            central_directional = (
+                float(plus_term) - float(minus_term)
+            ) / (2.0 * step)
+            assert analytic_directional == pytest.approx(
+                central_directional,
+                abs=2.0e-4,
+            )

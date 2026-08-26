@@ -53,7 +53,7 @@ class PeriodicCellOptimizationConfig:
         line_search_min_step: Smallest line-search scale.
         max_line_search_iterations: Maximum cell trials per step.
         armijo_constant: Generalized-enthalpy sufficient-decrease coefficient.
-        stress_config: Numerical stress mode and strain controls.
+        stress_config: Stress tensor mode and analytic admission controls.
         ionic_config: Bounded fixed-cell ionic controls for coupled relaxation.
     """
 

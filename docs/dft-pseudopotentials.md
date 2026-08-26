@@ -65,9 +65,10 @@ production DFT force accuracy.
 
 - Nonlocal projectors are a proof-level Hermitian separable operator path, not a
   chemically certified reproduction of every UPF/GTH convention.
-- Fixed-cell geometry optimization, spin/k-point diagnostics, and
-  finite-difference stress exist as prototype surfaces; production materials validation
-  and cell relaxation remain out of scope.
+- This pseudopotential milestone does not certify geometry or stress. The
+  current periodic runtime separately provides verified fixed-cell Silicon
+  relaxation and one bounded analytic-stress/variable-cell 2H-Silicon path;
+  broader pseudopotential transferability remains open.
 - Vendor checkouts remain reference material only; the package does not import
   Quantum ESPRESSO or CP2K code.
 

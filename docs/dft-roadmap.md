@@ -12,9 +12,10 @@ weighted k-points, block-Davidson eigensolves, fixed and Fermi-Dirac
 occupations, frozen-density bands, analytic fixed-cell forces, and atomic
 SCF checkpoint/resume. A fail-closed fixed-cell periodic ionic optimizer adds
 accepted-state electronic continuation and a separate atomic outer checkpoint.
-Proof-level periodic stress and variable-cell controllers now add fixed
-integer-G trajectories, frozen-variational derivatives, multiscale admission,
-and accepted-cell checkpoints; their material gate remains open.
+Periodic analytic stress and variable-cell controllers now add fixed integer-G
+trajectories, differentiable frozen-energy derivatives, cutoff-convergence
+admission, and accepted-cell checkpoints. Their bounded 2H-Silicon material
+gate is closed.
 Real and reciprocal grids, k-points, Ewald terms, GTH operators, forces, and
 state identity share one full-rank periodic cell matrix contract.
 Material-level verification remains narrow: Silicon, Carbon, and simple-metal
@@ -42,8 +43,8 @@ only when its implementation and material-level evidence both pass.
 | Crystal geometry | Ordinary full-rank periodic cells | Implemented; one source-bound hexagonal Silicon case and bounded low-symmetry oracles are verified | Phase 3 |
 | Electronic states | Insulators, simple metals, and collinear magnets | Insulators and one simple metal are verified; periodic spin is absent | Phases 1 and 5 |
 | Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
-| Mechanical observables | Analytic forces and validated stress | Forces exist with a retained MgO boundary; periodic stress passes deterministic oracles but fails the current 2H-Si material smoothness gate | Phase 4 |
-| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell periodic relaxation is verified; variable-cell control and restart exist but have no accepted material trajectory | Phases 2 and 4 |
+| Mechanical observables | Analytic forces and validated stress | Forces retain an MgO boundary; analytic periodic stress is verified for the bounded 2H-Si workflow | Phase 4 |
+| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell and one 2H-Si variable-cell trajectory are verified; broad transferability remains open | Phases 2 and 4 |
 | Lattice dynamics | Bounded finite-displacement phonons | Absent | Phase 8 |
 | Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | Periodic SCF, fixed-cell ionic, and accepted-cell outer checkpoints exist | Every phase |
 | Runtime quality | Measured complete wall and peak memory on representative Apple Silicon workloads | Existing DFT controls cover a narrow workload set | Every phase |
@@ -141,7 +142,7 @@ orthorhombic compatibility tests remain unchanged.
 
 ## Phase 4: Add Stress And Variable-Cell Relaxation
 
-Status: active, exit gate open. The sign, free-energy, frozen-variational,
+Status: complete, exit gate closed. The sign, free-energy, frozen-variational,
 optimization, restart, and evidence contracts are locked in
 [DFT Stress And Variable-Cell Relaxation](./dft-stress-variable-cell.md).
 
@@ -151,12 +152,13 @@ optimization, restart, and evidence contracts are locked in
   in optimization.
 - Add bounded cell-only and coupled ion/cell relaxation with restartable state.
 
-Exit gate: stress passes numerical derivatives for insulating and smeared
-systems, and relaxed cells reproduce declared reference lattice observables.
-The deterministic gates pass, but the current source-bound 2H-Silicon workload
-fails closed before its first cell step because stress at the primary and
-doubled strain differs by `6.72416e-4 Ha/bohr^3`. Analytic or otherwise
-Pulay-aware stress is required before this phase can close.
+Exit gate: closed. Electronic stress terms pass isotropic and shear numerical
+derivatives, the float64 analytic Ewald tensor passes a full-rank cell
+derivative, and deterministic cell-only, coupled, and checkpoint workflows
+pass. The source-bound 2H-Silicon trajectory converges from `0.995` to
+`0.9981142` of the accepted scale with `0.1886%` lattice error. Its 25-to-35 Ha
+pressure drift is `2.17019e-7 Ha/bohr^3`, below the locked
+`5e-6 Ha/bohr^3` Pulay gate.
 
 ## Phase 5: Add Periodic Collinear Spin
 

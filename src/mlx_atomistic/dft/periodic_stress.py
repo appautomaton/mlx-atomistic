@@ -8,6 +8,9 @@ from typing import Literal
 
 import numpy as np
 
+from mlx_atomistic.dft._periodic_analytic_stress import (
+    _evaluate_periodic_analytic_stress,
+)
 from mlx_atomistic.dft._periodic_frozen_energy import (
     _evaluate_periodic_frozen_energy,
 )
@@ -17,6 +20,7 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicSCFResult,
 )
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
+from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.kpoints import KPointMesh
 from mlx_atomistic.dft.periodic_scf import (
     _run_periodic_scf_fixed_topology,
@@ -41,20 +45,21 @@ _STRAIN_COMPONENTS = (
 
 @dataclass(frozen=True)
 class PeriodicStressConfig:
-    """Controls for periodic numerical stress.
+    """Shared controls for analytic stress and its numerical oracle.
 
     Args:
         mode: `isotropic`, `diagonal`, or complete `symmetric` stress.
-        strain_step: Dimensionless central-difference strain.
-        electronic_response: `frozen_variational` or diagnostic `reconverged`.
+        strain_step: Dimensionless central-difference oracle strain.
+        electronic_response: Oracle response: `frozen_variational` or
+            diagnostic `reconverged`.
         variational_energy_tolerance: Maximum base frozen-functional mismatch
             in Hartree.
-        stress_consistency_tolerance: Maximum stress disagreement between
-            primary and doubled frozen-variational strain steps.
-        reuse_scf_state: Seed diagnostic reconverged SCFs from the converged
+        stress_consistency_tolerance: Maximum oracle stress disagreement
+            between primary and doubled frozen-variational strain steps.
+        reuse_scf_state: Seed diagnostic reconverged oracle SCFs from the converged
             base density and compact orbitals.
-        require_fixed_basis_topology: Transport the base integer-G topology to
-            every strained SCF instead of reselecting at the cutoff.
+        require_fixed_basis_topology: Transport the base integer-G topology in
+            every oracle branch instead of reselecting at the cutoff.
     """
 
     mode: PeriodicStressMode = "symmetric"
@@ -158,7 +163,7 @@ class PeriodicStressSample:
 
 @dataclass(frozen=True)
 class PeriodicStressResult:
-    """Compression-positive stress from converged periodic free energies."""
+    """Compression-positive stress from a converged periodic free energy."""
 
     stress: np.ndarray
     pressure: float
@@ -171,6 +176,8 @@ class PeriodicStressResult:
     effective_strain_steps: dict[str, float] = field(default_factory=dict)
     base_variational_energy_error: float | None = None
     stress_consistency_errors: dict[str, float] = field(default_factory=dict)
+    method: Literal["analytic", "finite_difference"] = "finite_difference"
+    base_energy_by_term: dict[str, float] = field(default_factory=dict)
 
     @property
     def stress_gpa(self) -> np.ndarray:
@@ -201,6 +208,8 @@ class PeriodicStressResult:
                 if self.base_scf.smearing_width_hartree is not None
                 else "total_energy"
             ),
+            "method": self.method,
+            "base_energy_by_term_hartree": dict(self.base_energy_by_term),
             "config": self.config.to_dict(),
             "elapsed_ms": self.elapsed_ms,
             "scf_evaluations": self.scf_evaluations,
@@ -272,6 +281,107 @@ def _topology_matches(
     return len(reference) == len(observed) and all(
         np.array_equal(left, right)
         for left, right in zip(reference, observed, strict=True)
+    )
+
+
+def periodic_analytic_stress(
+    system: PeriodicDFTSystem,
+    *,
+    cutoff_hartree: float,
+    kpoint_mesh: KPointMesh,
+    n_bands: int | None = None,
+    config: PeriodicStressConfig | None = None,
+    scf_config: PeriodicSCFConfig | None = None,
+    xc_functional: ExchangeCorrelationFunctional | None = None,
+    observer: RuntimeObserver | None = None,
+    base_result: PeriodicSCFResult | None = None,
+) -> PeriodicStressResult:
+    """Evaluate compression-positive periodic stress by energy differentiation.
+
+    Args:
+        system: Periodic GTH system at the current cell.
+        cutoff_hartree: Fixed plane-wave kinetic cutoff in Hartree.
+        kpoint_mesh: Fixed reduced-coordinate k-point mesh.
+        n_bands: Fixed computed band count.
+        config: Tensor mode and analytic admission tolerances.
+        scf_config: Exact periodic SCF controls.
+        xc_functional: MLX PBE exchange-correlation functional.
+        observer: Optional shared runtime observer.
+        base_result: Optional converged SCF state for the exact base system.
+
+    Returns:
+        Analytic compression-positive stress and its converged base state.
+
+    Raises:
+        TypeError: If public inputs have unsupported types.
+        ValueError: If state identity, energy reconciliation, or functional
+            support fails.
+    """
+
+    if not isinstance(system, PeriodicDFTSystem):
+        raise TypeError("system must be PeriodicDFTSystem")
+    if not isinstance(kpoint_mesh, KPointMesh):
+        raise TypeError("kpoint_mesh must be KPointMesh")
+    if (
+        isinstance(cutoff_hartree, (bool, np.bool_))
+        or not np.isfinite(cutoff_hartree)
+        or cutoff_hartree <= 0.0
+    ):
+        raise ValueError("cutoff_hartree must be finite and positive")
+    resolved = PeriodicStressConfig() if config is None else config
+    resolved_scf = PeriodicSCFConfig() if scf_config is None else scf_config
+    if not isinstance(resolved, PeriodicStressConfig):
+        raise TypeError("config must be PeriodicStressConfig")
+    if not isinstance(resolved_scf, PeriodicSCFConfig):
+        raise TypeError("scf_config must be PeriodicSCFConfig")
+    functional = (
+        ProductionPBEExchangeCorrelation()
+        if xc_functional is None
+        else xc_functional
+    )
+    started = perf_counter()
+    scf_evaluations = 0
+    if base_result is None:
+        base_result = run_periodic_scf(
+            system,
+            cutoff_hartree=cutoff_hartree,
+            kpoint_mesh=kpoint_mesh,
+            n_bands=n_bands,
+            config=resolved_scf,
+            xc_functional=functional,
+            observer=observer,
+        )
+        scf_evaluations = 1
+    _validate_scf_state(system, base_result, label="base_result")
+    frozen_reference = _evaluate_periodic_frozen_energy(
+        system,
+        base_result,
+        cutoff_hartree=cutoff_hartree,
+        kpoint_mesh=kpoint_mesh,
+        config=resolved_scf,
+        xc_functional=functional,
+        observer=observer,
+    )
+    evaluation = _evaluate_periodic_analytic_stress(
+        system,
+        base_result,
+        xc_functional=functional,
+        mode=resolved.mode,
+        variational_energy_tolerance=resolved.variational_energy_tolerance,
+        reference_energy=frozen_reference.total_energy,
+    )
+    return PeriodicStressResult(
+        stress=evaluation.stress,
+        pressure=evaluation.pressure,
+        base_scf=base_result,
+        samples=(),
+        config=resolved,
+        elapsed_ms=(perf_counter() - started) * 1000.0,
+        scf_evaluations=scf_evaluations,
+        continuation_density_uses=0,
+        base_variational_energy_error=evaluation.base_energy_error,
+        method="analytic",
+        base_energy_by_term=evaluation.energy_by_term,
     )
 
 
@@ -546,4 +656,6 @@ def periodic_finite_difference_stress(
         effective_strain_steps=effective_steps,
         base_variational_energy_error=base_variational_error,
         stress_consistency_errors=consistency_errors,
+        method="finite_difference",
+        base_energy_by_term=dict(base_result.energy_by_term),
     )

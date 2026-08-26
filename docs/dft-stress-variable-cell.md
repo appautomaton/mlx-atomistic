@@ -83,6 +83,50 @@ analytic implementation may replace its cost only after every energy
 contribution agrees with the oracle, including kinetic, Hartree, PBE gradient,
 local and nonlocal GTH, Ewald, occupation, and finite-cutoff effects.
 
+## Analytic Stress Contract
+
+The production path differentiates the frozen stationary energy functional
+with respect to one symmetric Cartesian strain tensor. The strain is an MLX
+value, while the FFT shape, active integer-G sets, reduced k-points,
+occupations, pseudopotentials, and Ewald summation topology remain fixed. For a
+deformation `F = I + epsilon`, the differentiable geometry is
+
+```text
+A' = A F
+G' = G F^-T
+V' = V det(F)
+rho'(s) = rho(s) / det(F)
+```
+
+This produces the electronic first derivative directly from the existing
+energy definitions. It does not subtract nearby float32 total energies. The
+MLX graph contains kinetic, local GTH, nonlocal GTH, Hartree, and PBE
+exchange-correlation including its density-gradient response. The ion-ion
+Ewald tensor is evaluated analytically with float64 real and reciprocal sums
+and added once. The converged electronic coefficients and occupations are held
+fixed because their first-order response vanishes at a stationary free-energy
+solution.
+
+The graph rebuilds its density from the retained compact orbitals rather than
+mixing those orbitals with the final SCF input density. Its zero-strain energy
+is anchored to the admitted frozen-functional value by a strain-independent
+correction. That correction is reported and fails closed above
+`1e-3 Ha/electron`; it cannot alter stress.
+
+The analytic graph must reproduce the base SCF energy within the existing
+variational tolerance before its derivative is admitted. Every electronic term
+is tested against stable isotropic and shear central differences on a smooth
+bounded system; the float64 Ewald tensor has its own full-rank cell derivative
+gate. The total tensor must agree with the retained frozen oracle wherever that
+oracle passes its multiscale gate. Unsupported exchange-correlation functionals
+fail closed rather than silently omitting their cell derivative.
+
+Fixed integer-G differentiation removes cutoff-crossing discontinuities, but
+it does not claim that a finite plane-wave cutoff is complete. Material
+admission therefore compares analytic stress at the locked production cutoff
+and a higher cutoff. A trajectory is not verified when this Pulay convergence
+check exceeds its declared tolerance.
+
 ## Current Evidence
 
 Deterministic CPU tests recover analytic diagonal and shear tensors, preserve
@@ -90,21 +134,26 @@ translation and equivalent-cell invariance, reject topology and multiscale
 drift, converge cell-only and coupled elastic models, and reproduce
 uninterrupted results across an accepted-cell checkpoint.
 
-The source-bound 2H-Silicon material gate is not closed. The current frozen
-runtime fingerprint is
-`56569bd7df2386bd7fc4fc11cf25ac6e1590f1c217d75b7c5b416d18517c2698`.
-On Apple M5 Max, AC power, and normal power mode, the `0.995`-scaled initial
-cell converged one base SCF, then rejected stress because primary and doubled
-strain values differed by `6.72416e-4 Ha/bohr³`. The run stopped with
-`stress_failed`, zero accepted cell steps, and `11.956 s` complete wall time.
-Its workload fingerprint is
-`bdc34b61b3d6bd362d39a1b975cd8e014d3b940142fa094bfe75894227c24e00`.
+The source-bound 2H-Silicon material gate is closed. On Apple M5 Max, AC power,
+and normal power mode, the cell started at `0.995` of the accepted scale,
+accepted one cell step, and converged at scale `0.9981142`. The final pressure
+was `2.66553e-6 Ha/bohr³`, the source-lattice relative error was `0.1886%`, and
+cell relaxation took `22.707 s`. The complete validation, including the
+higher-cutoff check, took `30.956 s`.
 
-This is current-verified negative evidence. It demonstrates that the controller
-fails closed, not that material stress or variable-cell relaxation is
-verified. The next implementation boundary is analytic or otherwise
-Pulay-aware stress that agrees with this oracle on smooth deterministic cases
-and passes a source-bound material trajectory.
+The final 25 Ha stress was compared with a fresh 35 Ha SCF and analytic stress
+on the same cell. The higher-cutoff pressure was
+`2.88255e-6 Ha/bohr³`; their `2.17019e-7 Ha/bohr³` difference passed the locked
+`5e-6 Ha/bohr³` Pulay gate in `8.248 s`. The final frozen-functional error was
+`4.64563e-7 Ha`, and the reported stationary correction was
+`0.00581397 Ha`, or `3.63373e-4 Ha/electron`.
+
+The current runtime, workload, and implementation fingerprints are
+`3f70bd6eb973feabf80ab8ba949975c1e73199528e0237791f3be601496f6f60`,
+`44353da8e872b4d270bd9e2ad9b15662b14570a733da58cd16491de2d982d205`, and
+`a96880a3ee3a73ee0516a5f7d972a8eb6922db751fec70bbf7fbcd450633e3b2`.
+This verifies the locked 2H-Silicon path, not broad stress or cell-relaxation
+transferability.
 
 ## Variable-Cell Workflow
 
@@ -185,6 +234,11 @@ complete regression suite.
 5. Add atomic outer checkpoint/resume.
 6. Close targeted numerical gates and the source-bound Silicon validation.
 7. Update capability docs and merge only after repository CI passes.
+
+The analytic closure follows the same contract in four bounded slices: build
+one differentiable frozen energy graph, validate every term, make the cell
+controller consume the admitted derivative, then rerun the source-bound
+material and higher-cutoff Pulay gates once.
 
 ## Out Of Scope
 
