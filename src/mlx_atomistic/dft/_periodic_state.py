@@ -23,9 +23,19 @@ class _PeriodicSCFContinuationState:
     mixer_state: _MixerCheckpointState
     ownership: dict[str, object]
     lineage: tuple[str, ...] = ()
+    spin_densities: tuple[mx.array, mx.array] | None = None
+    down_owned_coefficients: tuple[tuple[int, mx.array], ...] = ()
+    down_owned_lanes: tuple[dict[str, object], ...] = ()
+    magnetization_mixer_state: _MixerCheckpointState | None = None
 
     @property
     def coefficient_map(self) -> dict[int, mx.array]:
         """Return the owned coefficient snapshots keyed by explicit k-point index."""
 
         return dict(self.owned_coefficients)
+
+    @property
+    def down_coefficient_map(self) -> dict[int, mx.array]:
+        """Return spin-down coefficient snapshots keyed by k-point index."""
+
+        return dict(self.down_owned_coefficients)

@@ -26,6 +26,7 @@ from mlx_atomistic.dft import (
     GTHProjectorChannel,
     KPoint,
     KPointMesh,
+    PeriodicCollinearSpinConfig,
     PeriodicDavidsonConfig,
     PeriodicDFTSystem,
     PeriodicFermiDiracSmearing,
@@ -152,6 +153,7 @@ def _execution_context(
                 ],
                 "eigensolver_tolerance_scale": calculation["config"]["eigensolver_tolerance_scale"],
                 "smearing": calculation["config"]["smearing"],
+                "spin": calculation["config"]["spin"],
             },
         },
         "initialization": periodic_scf_initialization_identity(
@@ -340,6 +342,66 @@ def test_resume_trajectory_equivalence_and_timing_admission(tmp_path, mixer, ada
             np.asarray(resumed_point.eigen.eigenvalues),
             np.asarray(uninterrupted_point.eigen.eigenvalues),
             atol=2e-6,
+            rtol=0.0,
+        )
+
+
+def test_collinear_spin_checkpoint_resume_preserves_both_channels(tmp_path):
+    system, mesh, base_config = _problem(mixer="linear")
+    config = replace(
+        base_config,
+        spin=PeriodicCollinearSpinConfig(
+            mode="fixed_magnetization",
+            magnetization=0.0,
+        ),
+    )
+    context = _execution_context(system, mesh, config)
+    checkpoint = tmp_path / "spin-checkpoint"
+    partial = run_periodic_scf_checkpointed(
+        system,
+        cutoff_hartree=4.0,
+        kpoint_mesh=mesh,
+        n_bands=1,
+        config=config,
+        execution_context=context,
+        checkpoint_to=checkpoint,
+        checkpoint_iteration=2,
+    )
+    uninterrupted = run_periodic_scf(
+        system,
+        cutoff_hartree=4.0,
+        kpoint_mesh=mesh,
+        n_bands=1,
+        config=config,
+    )
+    resumed = run_periodic_scf_checkpointed(
+        system,
+        cutoff_hartree=4.0,
+        kpoint_mesh=mesh,
+        n_bands=1,
+        config=config,
+        execution_context=context,
+        resume_from=checkpoint,
+    )
+
+    assert partial.status == "checkpointed"
+    assert resumed.resume_integrity_status == "validated"
+    assert resumed.total_energy == pytest.approx(uninterrupted.total_energy, abs=2.0e-6)
+    assert resumed.integrated_magnetization == pytest.approx(0.0, abs=2.0e-6)
+    assert len(resumed.spin_channels) == len(uninterrupted.spin_channels) == 2
+    for resumed_channel, uninterrupted_channel in zip(
+        resumed.spin_channels,
+        uninterrupted.spin_channels,
+        strict=True,
+    ):
+        assert resumed_channel.electron_count == pytest.approx(
+            uninterrupted_channel.electron_count,
+            abs=2.0e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(resumed_channel.density),
+            np.asarray(uninterrupted_channel.density),
+            atol=2.0e-6,
             rtol=0.0,
         )
 

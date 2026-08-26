@@ -18,6 +18,7 @@ calculation.
 | Rock-salt MgO, 8 atoms, PBE, Mg-q2/O-q6, 70 Ha, 6×6×6, 7 volumes | `a₀ = 4.259503 Å`, `B₀ = 146.914 GPa`, Δ = `1.060 meV/atom` | All-electron PBE: lattice `0.123%` and bulk modulus `1.387%` relative error | Core EOS properties validated. The strict whole-report gate remains failed because `B₀′ = 3.39995` differs from `4.09093` by `16.89%`, above the locked `15%` threshold; this is retained as a likely Mg-q2 transferability limit. |
 | MgO periodic forces at the accepted EOS cell | 21 of 24 atom/axis comparisons pass `1e-4 Ha/bohr`; maximum deviation `2.246e-4 Ha/bohr` | Analytic force versus 48 reconverged ±0.01 bohr SCFs | Accepted with a known float32 total-energy precision limit. The three failures are O 6-x and O 7-y/z; the threshold was not weakened. |
 | fcc Al, 4 atoms, PBE/GTH-q3, Fermi-Dirac `0.00225 Ha`, 15 Ha, reduced 15×15×15, 11 bands, 7 volumes | `a₀ = 4.039885 Å`, `B₀ = 76.631 GPa`, `B₀′ = 4.58384`, Δ = `0.230 meV/atom` | All-electron PBE: lattice `0.024%`, bulk modulus `1.137%`, and `B₀′` `0.851%` relative error | Verified for this metallic EOS workload. The accepted mesh has 120 weighted representatives; the result does not establish broad Aluminum chemistry or metal transferability. |
+| bcc Fe primitive cell, spin-PBE/GTH-q16, Fermi-Dirac `0.01 Ha`, 150 Ha, exact unfolded 4×4×4, 10 bands | Unconstrained moment `2.41795 μB/atom`; the magnetic state is `0.023828 Ha/atom` below matched unpolarized Fe. The selected point took `10.727 s` in battery low-power mode. | Published PBE context `2.33 μB/atom`; 6×6×6 gave `2.33319`. The 200 Ha and 6×6×6 free-energy drifts were `0.000136` and `0.000812 Ha/atom`. | Current-verified on Apple M5 Max. All numerical, energy, moment, cutoff, k-point, checkpoint, and logical-memory gates pass. Historical-frozen Fe q8 evidence converged near `2.98 μB/atom` and remains a declared transferability failure. This verifies q16 bcc Fe, not broad d-block chemistry. |
 
 ## Evidence Boundary
 
@@ -28,8 +29,9 @@ semantics. Raw SCF, EOS, band, and force reports remain under gitignored
 installed, imported, or executed by the MLX runtime or routine CI.
 
 These rows prove the listed fixed workloads. Aluminum closes one simple-metal
-case, but the rows do not establish broad metallic chemistry, spin-polarized
-chemistry or pseudopotential transferability. The 2H-Si row closes one bounded
+case and Iron closes one collinear-magnetic q16 case, but the rows do not
+establish broad metallic, magnetic, or pseudopotential transferability. The
+retained Fe q8 failure makes that boundary explicit. The 2H-Si row closes one bounded
 variable-cell path; it does not establish universal periodic DFT accuracy or
 broad cell-relaxation transferability.
 

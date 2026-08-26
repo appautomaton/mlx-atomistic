@@ -16,6 +16,11 @@ Periodic analytic stress and variable-cell controllers now add fixed integer-G
 trajectories, differentiable frozen-energy derivatives, cutoff-convergence
 admission, and accepted-cell checkpoints. Their bounded 2H-Silicon material
 gate is closed.
+Periodic collinear spin now has a shared two-channel SCF controller, spin-PBE,
+fixed and unconstrained occupations, symmetry-breaking initial seeds, and
+spin-aware checkpoint/resume. Its deterministic numerical gates and the
+source-bound bcc Iron PBE/GTH-q16 material golden pass. Fe q8 retains a declared
+magnetic transferability failure.
 Real and reciprocal grids, k-points, Ewald terms, GTH operators, forces, and
 state identity share one full-rank periodic cell matrix contract.
 Material-level verification remains narrow: Silicon, Carbon, and simple-metal
@@ -41,7 +46,7 @@ only when its implementation and material-level evidence both pass.
 | Exchange-correlation | PBE-PW92 production envelope | Implemented; verified material set is narrow | Every material phase |
 | Pseudopotentials | Broad, fingerprinted GTH transferability | GTH periodic path exists; broad transferability is not closed | Phase 7 |
 | Crystal geometry | Ordinary full-rank periodic cells | Implemented; one source-bound hexagonal Silicon case and bounded low-symmetry oracles are verified | Phase 3 |
-| Electronic states | Insulators, simple metals, and collinear magnets | Insulators and one simple metal are verified; periodic spin is absent | Phases 1 and 5 |
+| Electronic states | Insulators, simple metals, and collinear magnets | One simple metal and one collinear bcc Iron q16 workload are verified | Phases 1 and 5 |
 | Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
 | Mechanical observables | Analytic forces and validated stress | Forces retain an MgO boundary; analytic periodic stress is verified for the bounded 2H-Si workflow | Phase 4 |
 | Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell and one 2H-Si variable-cell trajectory are verified; broad transferability remains open | Phases 2 and 4 |
@@ -162,7 +167,7 @@ pressure drift is `2.17019e-7 Ha/bohr^3`, below the locked
 
 ## Phase 5: Add Periodic Collinear Spin
 
-Status: active. The scientific and architecture contract is recorded in
+Status: complete. The scientific and architecture contract is recorded in
 [DFT Periodic Collinear Spin](./dft-periodic-spin.md).
 
 - Carry separate spin-up and spin-down densities, occupations, potentials, and
@@ -171,9 +176,11 @@ Status: active. The scientific and architecture contract is recorded in
   electron-count contracts.
 - Add non-magnetic equivalence and magnetic material golden cases.
 
-Exit gate: the unpolarized limit reproduces the existing path, total charge and
-magnetization are conserved, and at least one magnetic crystal passes a
-source-bound energy and moment comparison.
+Exit gate: closed. The unpolarized limit, charge and fixed-moment conservation,
+shared-Fermi-level occupations, checkpoint equivalence, and Quantum ESPRESSO
+PW92 spin oracle pass. The bcc Iron PBE/GTH-q16 workload passes energy ordering,
+published moment, cutoff, k-point, complete-wall, and logical-memory gates. The
+q8 variant remains a documented transferability failure.
 
 ## Phase 6: Add Core Observables And Convergence Workflows
 

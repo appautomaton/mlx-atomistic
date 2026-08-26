@@ -26,6 +26,11 @@ one of two electron-allocation modes:
   between them. This mode requires finite-temperature occupations so level
   crossings remain well defined.
 
+Unconstrained runs may supply an `initial_magnetization` seed. The seed only
+splits the initial channel densities; it does not constrain the converged
+moment. Fixed-magnetization runs reject a separate seed because their channel
+electron counts already define the initial and accepted moment.
+
 The result reports total density, the two spin densities, magnetization
 density, integrated magnetization, per-channel k-point states and electron
 counts, and either one shared or two fixed-channel chemical potentials. Total
@@ -78,6 +83,43 @@ The mixer acts on charge and magnetization channels, not on two unrelated
 densities. This makes the unpolarized subspace explicit and permits separate
 bounded damping of magnetic oscillations.
 
+The float32 spin-PBE graph applies a `1e-7 bohr^-3` per-channel numerical floor
+and a bounded polarization edge. These controls keep the functional derivative
+finite for a completely empty minority channel. Channel density construction,
+normalization, and reported electron counts still preserve an exactly empty
+channel when its occupation target is zero.
+
+## Implementation Status
+
+The shared controller, fixed and unconstrained occupation modes, charge and
+magnetization mixing, explicit channel results, non-magnetic equivalence, and
+atomic checkpoint/resume are implemented. Checkpoints persist total, spin-up,
+spin-down, compact orbital, charge-mixer, and magnetization-mixer state under
+the existing validated artifact envelope.
+
+The Phase 5 material exit gate is closed by the fingerprinted bcc Iron
+PBE/GTH-q16 workload. Its one-atom primitive cell uses exact index-2 unfolding
+of conventional-cell k-points, Fermi-Dirac width `0.01 Ha`, a 150 Ha selected
+cutoff, and an unconstrained initial moment of `2.2` electrons.
+
+The selected 4x4x4 calculation converged to `2.41795` Bohr magnetons per atom;
+the 6x6x6 check gave `2.33319`, against the locked published PBE context value
+of `2.33`. The 200 Ha cutoff check changed the moment by `0.00035` and free
+energy by `0.000136 Ha/atom`; the k-point check changed them by `0.08476` and
+`0.000812 Ha/atom`. The magnetic state is `0.023828 Ha/atom` below the matched
+unpolarized state.
+
+The selected point took `10.727 s` on an Apple M5 Max in battery low-power
+mode. Runtime accounting reported `110.32 MB` peak temporary storage,
+`15.66 MB` persistent compact coefficients, and `10.18 MB` persistent
+projectors. These are logical runtime counters, not process resident memory.
+
+Historical-frozen Fe GTH-PBE-q8 evidence remains an explicit transferability
+failure: after cutoff and k-point convergence it retained about `2.98` Bohr
+magnetons per atom, outside the locked `2.33 +/- 0.40` material gate. The
+threshold was not weakened; the q8 evidence predates a telemetry-only runtime
+fingerprint change and is not labeled current-verified.
+
 ## Acceptance Criteria
 
 - spin-PBE energy and both potentials pass finite-difference derivatives;
@@ -106,7 +148,7 @@ bounded damping of magnetic oscillations.
 ## Evidence Boundary
 
 Deterministic functional and engine tests establish numerical semantics, not
-material accuracy. The material gate will use a fingerprinted GTH-PBE source,
-cell, k-point mesh, cutoff, smearing width, and magnetic reference. The final
-claim remains limited to that workload until Phase 7 broadens pseudopotential
-transferability.
+material accuracy. The material gate uses a fingerprinted GTH-PBE source,
+cell, k-point mesh, cutoff, smearing width, and magnetic reference. The verified
+claim is limited to the Fe q16 workload; the q8 failure remains evidence for
+Phase 7 rather than being hidden by the passing variant.

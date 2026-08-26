@@ -34,7 +34,50 @@ def _continuation_state_from_boundary(
     mixer: LinearMixer | PulayDIISMixer,
     ownership: TimeReversalOwnership,
     lineage: tuple[str, ...],
+    spin_densities: tuple[mx.array, mx.array] | None = None,
+    down_owned_results: Sequence[PeriodicKPointResult] = (),
+    magnetization_mixer: LinearMixer | None = None,
 ) -> _PeriodicSCFContinuationState:
+    owned_coefficients, owned_lanes = _capture_owned_results(owned_results)
+    if spin_densities is None:
+        down_owned_coefficients: tuple[tuple[int, mx.array], ...] = ()
+        down_owned_lanes: tuple[dict[str, object], ...] = ()
+        magnetization_mixer_state = None
+    else:
+        if magnetization_mixer is None:
+            raise RuntimeError("spin checkpoint requires a magnetization mixer")
+        down_owned_coefficients, down_owned_lanes = _capture_owned_results(
+            down_owned_results
+        )
+        magnetization_mixer_state = magnetization_mixer._checkpoint_state()
+    return _PeriodicSCFContinuationState(
+        completed_iteration=completed_iteration,
+        density=_owned_device_copy(density, dtype=mx.float32),
+        owned_coefficients=owned_coefficients,
+        owned_lanes=owned_lanes,
+        previous_energy=float(previous_energy),
+        energy_by_term=dict(energy_by_term),
+        history=tuple(dict(row) for row in history),
+        mixer_state=mixer._checkpoint_state(),
+        ownership=ownership.to_dict(),
+        lineage=lineage,
+        spin_densities=(
+            None
+            if spin_densities is None
+            else (
+                _owned_device_copy(spin_densities[0], dtype=mx.float32),
+                _owned_device_copy(spin_densities[1], dtype=mx.float32),
+            )
+        ),
+        down_owned_coefficients=down_owned_coefficients,
+        down_owned_lanes=down_owned_lanes,
+        magnetization_mixer_state=magnetization_mixer_state,
+    )
+
+
+def _capture_owned_results(
+    owned_results: Sequence[PeriodicKPointResult],
+) -> tuple[tuple[tuple[int, mx.array], ...], tuple[dict[str, object], ...]]:
     owned_coefficients: list[tuple[int, mx.array]] = []
     owned_lanes: list[dict[str, object]] = []
     for result in owned_results:
@@ -61,18 +104,7 @@ def _continuation_state_from_boundary(
                 "lane_id": result.basis.lane_id,
             }
         )
-    return _PeriodicSCFContinuationState(
-        completed_iteration=completed_iteration,
-        density=_owned_device_copy(density, dtype=mx.float32),
-        owned_coefficients=tuple(owned_coefficients),
-        owned_lanes=tuple(owned_lanes),
-        previous_energy=float(previous_energy),
-        energy_by_term=dict(energy_by_term),
-        history=tuple(dict(row) for row in history),
-        mixer_state=mixer._checkpoint_state(),
-        ownership=ownership.to_dict(),
-        lineage=lineage,
-    )
+    return tuple(owned_coefficients), tuple(owned_lanes)
 
 
 def _resume_ownership(
@@ -238,6 +270,52 @@ def _restore_owner_states(
     return previous_states
 
 
+def _restore_down_owner_states(
+    state: _PeriodicSCFContinuationState,
+    *,
+    bases: Sequence[PlaneWaveBasis],
+    ownership: TimeReversalOwnership,
+    band_count: int,
+) -> dict[int, _CompactLaneState]:
+    coefficient_map = state.down_coefficient_map
+    if len(coefficient_map) != len(state.down_owned_coefficients) or set(
+        coefficient_map
+    ) != set(ownership.owned_indices):
+        raise ValueError("periodic spin resume down-channel inventory is inconsistent")
+    lane_map = {
+        int(lane["owner_index"]): lane
+        for lane in state.down_owned_lanes
+        if isinstance(lane, dict) and "owner_index" in lane
+    }
+    if len(lane_map) != len(state.down_owned_lanes) or set(lane_map) != set(
+        ownership.owned_indices
+    ):
+        raise ValueError("periodic spin resume down-channel lanes are inconsistent")
+    previous_states: dict[int, _CompactLaneState] = {}
+    finite_checks: list[mx.array] = []
+    for owner_index in ownership.owned_indices:
+        basis = bases[owner_index]
+        if lane_map[owner_index] != _expected_lane_identity(
+            owner_index,
+            basis,
+            ownership,
+        ):
+            raise ValueError("periodic spin resume down-channel lane identity differs")
+        values = mx.array(coefficient_map[owner_index])
+        if values.dtype != mx.complex64 or values.shape != (
+            band_count,
+            basis.active_count,
+        ):
+            raise ValueError("periodic spin resume down coefficients are incompatible")
+        copied = _owned_device_copy(values, dtype=mx.complex64)
+        finite_checks.append(mx.all(mx.isfinite(copied)))
+        previous_states[owner_index] = basis._state_from_compact(copied)
+    mx.eval(*finite_checks)
+    if not all(bool(finite) for finite in finite_checks):
+        raise ValueError("periodic spin resume down coefficients must be finite")
+    return previous_states
+
+
 def _restore_continuation_state(
     state: _PeriodicSCFContinuationState,
     *,
@@ -269,4 +347,85 @@ def _restore_continuation_state(
         float(state.previous_energy),
         [dict(row) for row in state.history],
         dict(state.energy_by_term),
+    )
+
+
+def _restore_spin_continuation_state(
+    state: _PeriodicSCFContinuationState,
+    *,
+    up_bases: Sequence[PlaneWaveBasis],
+    down_bases: Sequence[PlaneWaveBasis],
+    ownership: TimeReversalOwnership,
+    band_count: int,
+    grid: RealSpaceGrid,
+    electron_count: float,
+    expected_magnetization: float | None,
+    mixer: LinearMixer | PulayDIISMixer,
+    magnetization_mixer: LinearMixer,
+) -> tuple[
+    mx.array,
+    tuple[dict[int, _CompactLaneState], dict[int, _CompactLaneState]],
+    tuple[mx.array, mx.array],
+    float,
+    list[dict[str, float | int | str | None]],
+    dict[str, float],
+]:
+    density, up_states, previous_energy, history, energy_terms = (
+        _restore_continuation_state(
+            state,
+            bases=up_bases,
+            ownership=ownership,
+            band_count=band_count,
+            grid=grid,
+            electron_count=electron_count,
+            mixer=mixer,
+        )
+    )
+    if state.spin_densities is None or state.magnetization_mixer_state is None:
+        raise ValueError("periodic spin resume payload is incomplete")
+    spin_densities = tuple(
+        _owned_device_copy(values, dtype=mx.float32) for values in state.spin_densities
+    )
+    if any(values.shape != grid.shape for values in spin_densities):
+        raise ValueError("periodic spin resume densities have incompatible shapes")
+    up, down = spin_densities
+    finite = (
+        mx.all(mx.isfinite(up))
+        & mx.all(mx.isfinite(down))
+        & (mx.min(up) >= 0.0)
+        & (mx.min(down) >= 0.0)
+    )
+    total_error = mx.max(mx.abs((up + down) - density))
+    up_count = mx.sum(up) * grid.dv
+    down_count = mx.sum(down) * grid.dv
+    mx.eval(finite, total_error, up_count, down_count)
+    observed_total = float(up_count + down_count)
+    observed_moment = float(up_count - down_count)
+    if (
+        not bool(finite)
+        or float(total_error) > 2.0e-6
+        or abs(observed_total - electron_count) > 1.0e-4
+        or (
+            expected_magnetization is not None
+            and abs(observed_moment - expected_magnetization) > 1.0e-4
+        )
+    ):
+        raise ValueError("periodic spin resume densities violate charge or moment")
+    down_states = _restore_down_owner_states(
+        state,
+        bases=down_bases,
+        ownership=ownership,
+        band_count=band_count,
+    )
+    magnetization_mixer._restore_checkpoint_state(
+        state.magnetization_mixer_state,
+        expected_shape=grid.shape,
+    )
+    return (
+        density,
+        (up_states, down_states),
+        (up, down),
+        previous_energy,
+        history,
+        energy_terms,
     )
