@@ -1,6 +1,11 @@
-# DFT Geometry Optimization
+# Legacy DFT Geometry Optimization
 
-Milestone 5 adds a fixed-cell relaxation workflow for the current DFT stack. It optimizes only ion-center positions and keeps the orthorhombic cell fixed. Forces come from `run_scf(...).forces`, so the workflow is only as physical as the local pseudopotential force model underneath it.
+Milestone 5 added the legacy fixed-cell teaching workflow documented here. It
+optimizes only ion-center positions and keeps the orthorhombic cell fixed.
+Forces come from `run_scf(...).forces`, so the workflow is only as physical as
+the local pseudopotential force model underneath it. The fail-closed materials
+workflow is documented separately in
+[DFT Periodic Fixed-Cell Relaxation](./dft-periodic-relaxation.md).
 
 This is a workflow and consistency milestone. It is not a claim that the current DFT layer is chemically validated production DFT.
 
@@ -82,7 +87,7 @@ uv run python -m mlx_atomistic.benchmarks.dft_geometry --json
 
 ## Current Scientific Boundary
 
-This milestone is still a proof-level fixed-cell relaxation workflow, not a
+This legacy milestone remains a proof-level fixed-cell relaxation workflow, not a
 chemically certified production materials optimizer. Spin/k-point diagnostics,
 nonlocal projectors, finite-difference stress, and geometry optimization exist as
 prototype surfaces; production validation and cell relaxation remain out of scope.
