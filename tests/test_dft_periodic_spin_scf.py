@@ -14,6 +14,7 @@ from mlx_atomistic.dft import (
     PeriodicSCFConfig,
     PseudopotentialData,
     PseudopotentialFormat,
+    RuntimeObserver,
     run_periodic_scf,
 )
 
@@ -84,12 +85,14 @@ def test_zero_magnetization_spin_scf_reproduces_unpolarized_limit():
         n_bands=1,
         config=_bounded_config(),
     )
+    observer = RuntimeObserver(detail_events=False)
     polarized = run_periodic_scf(
         system,
         cutoff_hartree=2.5,
         kpoint_mesh=_gamma_mesh(),
         n_bands=1,
         config=_bounded_config(spin=PeriodicCollinearSpinConfig()),
+        observer=observer,
     )
 
     assert unpolarized.converged
@@ -104,6 +107,14 @@ def test_zero_magnetization_spin_scf_reproduces_unpolarized_limit():
         atol=3.0e-4,
     )
     assert polarized.to_dict()["spin_channels"][0]["label"] == "up"
+    observation = observer.snapshot()
+    assert observation["memory"]["persistent_coefficient_bytes"] > 0
+    setup = next(
+        event
+        for event in observation["events"]
+        if event["event"] == "setup" and event["status"] == "completed"
+    )
+    assert setup["spin_channel_count"] == 2
 
 
 def test_fixed_spin_scf_preserves_charge_and_requested_magnetization():

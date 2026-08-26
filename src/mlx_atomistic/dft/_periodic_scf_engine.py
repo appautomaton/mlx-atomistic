@@ -820,6 +820,7 @@ class _PeriodicSCFController:
             representative_count=len(setup.ownership.representative_indices),
             fallback_reasons=setup.ownership.fallback_reasons,
             batch_policy=setup.config.batch_policy(),
+            spin_channel_count=2 if setup.spin is not None else 1,
             resumed=setup.resumed,
             iteration_start=progress.iteration_start,
         )
@@ -1853,9 +1854,15 @@ class _PeriodicSCFController:
         observer = self.setup.observer
         if observer is None:
             return
+        owned_results = self.progress.final_owned_results
+        if self.progress.final_spin_owned_results is not None:
+            owned_results = (
+                self.progress.final_spin_owned_results[0]
+                + self.progress.final_spin_owned_results[1]
+            )
         coefficient_bytes = sum(
             int(np.prod(result.eigen._compact_coefficients.values.shape)) * 8
-            for result in self.progress.final_owned_results
+            for result in owned_results
             if isinstance(result.eigen._compact_coefficients, _CompactLaneState)
         )
         observer.record_memory("persistent_coefficient_bytes", coefficient_bytes)
