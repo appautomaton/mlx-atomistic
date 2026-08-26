@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 import numpy as np
 
+from mlx_atomistic.core import Cell
 from mlx_atomistic.dft._compact import (
     _CompactBatch,
     _CompactBatchPolicy,
@@ -64,10 +65,11 @@ def _time_reversed_compact_values(
 
 @dataclass(frozen=True)
 class PeriodicDFTSystem:
-    """Orthorhombic periodic DFT system with per-ion GTH pseudopotentials.
+    """Periodic DFT system with per-ion GTH pseudopotentials.
 
     Args:
-        cell_lengths: Orthorhombic cell lengths in bohr.
+        cell_lengths: A periodic `Cell`, three orthorhombic lengths, or a full
+            row-vector cell matrix in bohr.
         grid_shape: FFT grid shape.
         positions: Ionic Cartesian positions in bohr.
         pseudopotential: Shared GTH pseudopotential for every ion. Mutually
@@ -84,7 +86,7 @@ class PeriodicDFTSystem:
 
     def __init__(
         self,
-        cell_lengths: Sequence[float],
+        cell_lengths: Cell | Sequence[float] | Sequence[Sequence[float]],
         grid_shape: Sequence[int],
         positions: Sequence[Sequence[float]],
         pseudopotential: PseudopotentialData | None = None,
@@ -195,7 +197,7 @@ class PeriodicDFTSystem:
         """
 
         return PeriodicDFTSystem(
-            np.asarray(self.grid.lengths, dtype=np.float64),
+            self.grid.cell,
             self.grid.shape,
             positions,
             electron_count=self.electron_count,

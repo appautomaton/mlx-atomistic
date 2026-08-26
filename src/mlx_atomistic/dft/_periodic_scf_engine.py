@@ -491,7 +491,7 @@ class _PeriodicSCFController:
             ewald = periodic_ewald_energy(
                 system.charges,
                 system.positions,
-                np.asarray(system.grid.lengths),
+                system.grid.cell,
             )
             eigensolver_tolerance = _scf_eigensolver_tolerance(
                 scf_config,

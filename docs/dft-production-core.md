@@ -7,7 +7,7 @@ periodic `PeriodicDFTSystem`/`run_periodic_scf` surface supplies the
 materials-workload path: PBE-PW92, reciprocal-space GTH operators,
 Monkhorst-Pack integration, block-Davidson/Rayleigh-Ritz solves,
 fixed or Fermi-Dirac occupations, frozen-density band paths, and periodic
-forces.
+forces across ordinary fixed full-rank cells.
 
 The periodic implementation has verified results for specific workloads, but
 is not broadly chemically certified. Capability claims are tied to the
@@ -90,6 +90,12 @@ crystal. It converged in seven accepted steps to a maximum force of
 `0.000312 A`. This is a bounded fixed-cell result, not variable-cell or broad
 materials certification.
 
+The same workflow is current-verified in one four-atom hexagonal 2H-Silicon
+cell. It converged in three accepted steps to a maximum force of
+`1.715e-5 Ha/bohr`. Full-rank geometry is implemented across grids, reciprocal
+bases, Ewald, GTH operators, forces, fingerprints, and state metadata. Stress
+and variable-cell optimization remain absent.
+
 Dense SCF restart files store density, orbitals, ion positions, cell lengths, spin metadata, and Γ k-point metadata for small-system continuation workflows.
 
 ## Reference Validation
@@ -105,8 +111,9 @@ boundary.
 | Feature | Local Status | Reference Family |
 | --- | --- | --- |
 | Plane-wave SCF core | verified for fixed-occupation bulk-Si EOS and one Fermi-Dirac fcc-Al EOS | CP2K Quickstep, QE PWscf |
+| Full-rank fixed periodic cells | verified for one bounded 2H-Si relaxation and low-symmetry numerical oracles | CP2K cell matrix, QE CELL_PARAMETERS |
 | UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
-| Fixed-cell periodic geometry relaxation | verified for one bounded bulk-Si workload | CP2K MOTION/GEO_OPT, QE relax |
+| Fixed-cell periodic geometry relaxation | verified for bounded orthorhombic and hexagonal Si workloads | CP2K MOTION/GEO_OPT, QE relax |
 | Finite-difference stress | proof-level | CP2K stress, QE stress |
 | Static reference comparison | supported | static CP2K/QE fixture summaries |
 | QM/MM force-environment orchestration | deferred | CP2K FORCE_EVAL/QMMM |

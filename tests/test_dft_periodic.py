@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from math import pi
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_atomistic.core import Cell
 from mlx_atomistic.dft import (
     DiracExchange,
     GTHProjectorChannel,
@@ -26,11 +28,23 @@ from mlx_atomistic.dft import (
     periodic_ewald_energy,
     periodic_ewald_forces,
     periodic_gth_local_forces,
+    periodic_scf_calculation_contract,
     read_gth,
     run_periodic_scf,
     solve_periodic_eigenproblem,
 )
 from mlx_atomistic.dft.kpoints import KPoint, KPointMesh
+from mlx_atomistic.dft.runtime_state import serialize_periodic_scf_state
+
+
+def _skew_cell_matrix() -> np.ndarray:
+    return np.asarray(
+        (
+            (6.0, 0.0, 0.0),
+            (1.0, 5.5, 0.0),
+            (0.4, 0.7, 6.2),
+        )
+    )
 
 
 def test_runtime_observer_is_available_from_public_dft_api():
@@ -48,11 +62,33 @@ def test_plane_wave_basis_mask_and_metadata_are_deterministic():
     assert basis.active_count == expected
     assert basis.to_dict() == {
         "cutoff_hartree": 2.0,
+        "cell_matrix_bohr": [
+            [8.0, 0.0, 0.0],
+            [0.0, 8.0, 0.0],
+            [0.0, 0.0, 8.0],
+        ],
         "kpoint_cartesian_bohr_inverse": [pi / 16.0, 0.0, 0.0],
         "fft_shape": [8, 8, 8],
         "active_count": expected,
         "normalization": "unit-coefficients__real-integral-unit",
     }
+
+
+def test_nonorthogonal_reduced_kpoint_and_system_updates_preserve_cell_matrix():
+    matrix = _skew_cell_matrix()
+    cell = Cell.triclinic(matrix)
+    grid = RealSpaceGrid((6, 6, 6), cell)
+    reduced = np.asarray((0.25, -0.125, 0.375))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 3.0, reduced)
+    expected = reduced @ (2.0 * pi * np.linalg.inv(matrix).T)
+    positions = np.asarray(((0.2, 0.3, 0.4),)) @ matrix
+    system = PeriodicDFTSystem(cell, grid.shape, positions, _silicon_gth())
+    moved = system.with_positions(positions + np.asarray((0.01, -0.02, 0.03)))
+
+    np.testing.assert_allclose(basis.kpoint_cartesian, expected, atol=2e-8)
+    np.testing.assert_array_equal(system.grid.cell.matrix, cell.matrix)
+    np.testing.assert_array_equal(moved.grid.cell.matrix, cell.matrix)
+    assert moved.fingerprint != system.fingerprint
 
 
 def test_plane_wave_round_trip_preserves_masked_coefficients_and_norm():
@@ -460,6 +496,148 @@ def test_periodic_ewald_energy_translation_scaling_and_force_consistency():
     np.testing.assert_allclose(np.sum(forces, axis=0), 0.0, atol=2e-8)
     assert forces[0, 0] == pytest.approx(forces[0, 1], rel=2e-6)
     assert forces[0, 0] == pytest.approx(forces[0, 2], rel=2e-6)
+
+
+def test_nonorthogonal_ewald_translation_and_force_consistency():
+    charges = [1.0, -1.0]
+    matrix = _skew_cell_matrix()
+    cell = Cell.triclinic(matrix)
+    equivalent_cell = Cell.triclinic(
+        np.asarray(((1, 1, 0), (0, 1, 0), (0, 0, 1))) @ matrix
+    )
+    positions = np.asarray(((0.15, 0.2, 0.25), (0.62, 0.55, 0.48))) @ matrix
+    energy = periodic_ewald_energy(charges, positions, cell, tolerance=1e-8)
+    equivalent_energy = periodic_ewald_energy(
+        charges,
+        positions,
+        equivalent_cell,
+        tolerance=1e-8,
+    )
+    translated = periodic_ewald_energy(
+        charges,
+        positions + matrix[1],
+        cell,
+        tolerance=1e-8,
+    )
+    forces = periodic_ewald_forces(charges, positions, cell, tolerance=1e-8)
+    equivalent_forces = periodic_ewald_forces(
+        charges,
+        positions,
+        equivalent_cell,
+        tolerance=1e-8,
+    )
+    finite_difference = periodic_ewald_forces(
+        charges,
+        positions,
+        cell,
+        displacement=2e-4,
+        tolerance=1e-8,
+        method="finite_difference",
+    )
+
+    assert translated == pytest.approx(energy, abs=2e-9)
+    assert equivalent_energy == pytest.approx(energy, abs=2e-8)
+    np.testing.assert_allclose(equivalent_forces, forces, atol=2e-8)
+    np.testing.assert_allclose(forces, finite_difference, atol=3e-8, rtol=3e-7)
+    np.testing.assert_allclose(np.sum(forces, axis=0), 0.0, atol=2e-8)
+
+
+def test_nonorthogonal_gth_operators_preserve_lattice_translation():
+    matrix = _skew_cell_matrix()
+    grid = RealSpaceGrid((6, 6, 6), Cell.triclinic(matrix))
+    basis = PlaneWaveBasis.from_reduced_kpoint(grid, 3.0, (0.25, 0.125, -0.25))
+    positions = np.asarray(((0.15, 0.2, 0.25), (0.62, 0.55, 0.48))) @ matrix
+    shifted_positions = positions + matrix[1]
+    coordinates = np.asarray(grid.coordinates())
+    reciprocal = np.asarray(basis.reciprocal_grid.basis_matrix)
+    density = (
+        0.02
+        + 0.004 * np.cos(coordinates @ reciprocal[0])
+        + 0.003 * np.sin(coordinates @ reciprocal[1])
+    ).astype(np.float32)
+    local = np.asarray(gth_local_potential_grid(_silicon_gth(), basis, positions))
+    shifted_local = np.asarray(
+        gth_local_potential_grid(_silicon_gth(), basis, shifted_positions)
+    )
+    local_forces = np.asarray(
+        periodic_gth_local_forces(mx.array(density), _silicon_gth(), basis, positions)
+    )
+    rng = np.random.default_rng(203)
+    orbital = basis.normalize(
+        mx.array(
+            (rng.normal(size=grid.shape) + 1j * rng.normal(size=grid.shape)).astype(
+                np.complex64
+            )
+        )
+    )
+    operator = PeriodicGTHNonlocalOperator(_silicon_gth(), basis, positions)
+    shifted_operator = PeriodicGTHNonlocalOperator(
+        _silicon_gth(),
+        basis,
+        shifted_positions,
+    )
+    energy = float(operator.energy(orbital, occupations=[2.0]))
+    shifted_energy = float(shifted_operator.energy(orbital, occupations=[2.0]))
+    nonlocal_forces = np.asarray(operator.forces(orbital, occupations=[2.0]))
+    shifted_nonlocal_forces = np.asarray(
+        shifted_operator.forces(orbital, occupations=[2.0])
+    )
+
+    assert np.isfinite(local).all()
+    assert np.isfinite(local_forces).all()
+    assert np.isfinite(nonlocal_forces).all()
+    np.testing.assert_allclose(shifted_local, local, atol=2e-6)
+    assert shifted_energy == pytest.approx(energy, abs=2e-5)
+    np.testing.assert_allclose(shifted_nonlocal_forces, nonlocal_forces, atol=2e-5)
+
+
+def test_nonorthogonal_periodic_scf_and_state_metadata_preserve_cell_matrix():
+    matrix = _skew_cell_matrix()
+    positions = np.asarray(((0.25, 0.25, 0.25),)) @ matrix
+    system = PeriodicDFTSystem(
+        Cell.triclinic(matrix),
+        (6, 6, 6),
+        positions,
+        _silicon_gth(),
+    )
+    mesh = KPointMesh(
+        (KPoint((0.0, 0.0, 0.0), weight=1.0, coordinate_system="reduced"),)
+    )
+    config = PeriodicSCFConfig(
+        max_iterations=2,
+        min_iterations=2,
+        density_tolerance=1e-8,
+        energy_tolerance=1e-8,
+        orbital_tolerance=5e-3,
+        mixing_beta=0.5,
+        mixer="linear",
+        davidson=PeriodicDavidsonConfig(
+            max_iterations=16,
+            tolerance=5e-3,
+            max_subspace_size=12,
+        ),
+    )
+    contract = periodic_scf_calculation_contract(
+        system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=mesh,
+        n_bands=2,
+        config=config,
+    )
+    result = run_periodic_scf(
+        system,
+        cutoff_hartree=2.5,
+        kpoint_mesh=mesh,
+        n_bands=2,
+        config=config,
+    )
+    metadata = json.loads(serialize_periodic_scf_state(result)["metadata.json"])
+
+    assert result.status in {"converged", "max_iterations"}
+    assert np.isfinite(result.total_energy)
+    np.testing.assert_allclose(contract["system"]["cell_matrix_bohr"], matrix)
+    np.testing.assert_allclose(metadata["cell_matrix_bohr"], matrix)
+    np.testing.assert_allclose(result.kpoints[0].basis.to_dict()["cell_matrix_bohr"], matrix)
 
 
 def test_periodic_davidson_matches_diagonal_kinetic_local_oracle():

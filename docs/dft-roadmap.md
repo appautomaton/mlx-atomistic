@@ -12,10 +12,12 @@ weighted k-points, block-Davidson eigensolves, fixed and Fermi-Dirac
 occupations, frozen-density bands, analytic fixed-cell forces, and atomic
 SCF checkpoint/resume. A fail-closed fixed-cell periodic ionic optimizer adds
 accepted-state electronic continuation and a separate atomic outer checkpoint.
+Real and reciprocal grids, k-points, Ewald terms, GTH operators, forces, and
+state identity share one full-rank periodic cell matrix contract.
 Material-level verification remains narrow: Silicon, Carbon, and simple-metal
 Aluminum have accepted equation-of-state workloads, Silicon has one accepted
-fixed-cell relaxation, and MgO retains a declared force and transferability
-boundary.
+orthorhombic relaxation and one accepted hexagonal relaxation, and MgO retains
+a declared force and transferability boundary.
 
 ## Program Boundary
 
@@ -34,11 +36,11 @@ only when its implementation and material-level evidence both pass.
 | --- | --- | --- | --- |
 | Exchange-correlation | PBE-PW92 production envelope | Implemented; verified material set is narrow | Every material phase |
 | Pseudopotentials | Broad, fingerprinted GTH transferability | GTH periodic path exists; broad transferability is not closed | Phase 7 |
-| Crystal geometry | Ordinary full-rank periodic cells | DFT grids and Ewald path remain orthorhombic | Phase 3 |
+| Crystal geometry | Ordinary full-rank periodic cells | Implemented; one source-bound hexagonal Silicon case and bounded low-symmetry oracles are verified | Phase 3 |
 | Electronic states | Insulators, simple metals, and collinear magnets | Insulators and one simple metal are verified; periodic spin is absent | Phases 1 and 5 |
 | Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Energy, density, occupations, and bands exist | Phase 6 |
 | Mechanical observables | Analytic forces and validated stress | Forces exist with a retained MgO boundary; periodic stress is absent | Phase 4 |
-| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell periodic relaxation is verified for one bounded Silicon workload; variable-cell relaxation is absent | Phases 2 and 4 |
+| Structural workflows | Fixed-cell ionic and variable-cell relaxation | Fixed-cell periodic relaxation is verified in orthorhombic and hexagonal Silicon cells; variable-cell relaxation is absent | Phases 2 and 4 |
 | Lattice dynamics | Bounded finite-displacement phonons | Absent | Phase 8 |
 | Reproducibility | Source-bound inputs, convergence studies, restart, and explicit evidence labels | Periodic SCF and fixed-cell outer checkpoints exist; later workflow state remains incomplete | Every phase |
 | Runtime quality | Measured complete wall and peak memory on representative Apple Silicon workloads | Existing DFT controls cover a narrow workload set | Every phase |
@@ -118,8 +120,9 @@ checkpoint publication.
 
 ## Phase 3: Generalize Periodic Cell Geometry
 
-Status: next. Protocol research and the full-rank cell contract are not yet
-locked.
+Status: complete. The matrix convention, compatibility boundary, implementation
+and current-verified evidence are recorded in
+[DFT General Periodic Cell Geometry](./dft-general-cell-geometry.md).
 
 - Replace orthorhombic-only assumptions with one full-rank `3 x 3` cell matrix
   contract across real and reciprocal grids, plane-wave bases, k-points,
@@ -128,13 +131,15 @@ locked.
   compatibility case.
 - Add representative cubic, hexagonal, and low-symmetry cells.
 
-Exit gate: cell-coordinate transforms, reciprocal identities, energies, and
-forces pass analytic or finite-difference checks, and accepted orthorhombic
-goldens do not regress.
+Exit gate: closed. Cell-coordinate transforms, reciprocal identities, Ewald and
+GTH invariances, analytic force derivatives, SCF state identity, and the
+source-bound 2H-Silicon relaxation pass their locked gates. Existing
+orthorhombic compatibility tests remain unchanged.
 
 ## Phase 4: Add Stress And Variable-Cell Relaxation
 
-Status: blocked on Phase 3 cell geometry.
+Status: next. Phase 3 provides the required full-rank cell foundation; the
+stress convention and finite-difference protocol are not yet locked.
 
 - Establish a reliable periodic stress tensor with an explicit sign, unit, and
   free-energy convention.

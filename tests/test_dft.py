@@ -54,17 +54,55 @@ def test_real_and_reciprocal_grid_geometry():
     assert float(np.array(reciprocal.g2)[0, 0, 0]) == pytest.approx(0.0)
 
 
-def test_real_space_grid_rejects_nonorthogonal_cells_until_supported():
-    cell = Cell.triclinic(
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        (
+            (6.0, 0.0, 0.0),
+            (-3.0, 3.0 * np.sqrt(3.0), 0.0),
+            (0.0, 0.0, 9.0),
+        ),
         (
             (8.0, 0.0, 0.0),
             (1.5, 7.5, 0.0),
             (0.5, 1.0, 9.0),
-        )
+        ),
+    ],
+    ids=("hexagonal", "low-symmetry"),
+)
+def test_real_and_reciprocal_grids_support_nonorthogonal_cells(matrix):
+    cell = Cell.triclinic(matrix)
+
+    grid = RealSpaceGrid((4, 4, 4), cell)
+    reciprocal = ReciprocalGrid.from_real_space(grid)
+    direct = np.asarray(cell.matrix, dtype=np.float64)
+    reciprocal_basis = np.asarray(reciprocal.basis_matrix, dtype=np.float64)
+    expected_first = np.asarray((0.125, 0.125, 0.125)) @ direct
+
+    assert grid.volume == pytest.approx(np.linalg.det(direct))
+    np.testing.assert_allclose(
+        np.asarray(grid.coordinates())[0, 0, 0],
+        expected_first,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        direct @ reciprocal_basis.T,
+        2.0 * np.pi * np.eye(3),
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(reciprocal.vectors)[1, 0, 0],
+        reciprocal_basis[0],
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        np.asarray(reciprocal.vectors)[0, 1, 0],
+        reciprocal_basis[1],
+        atol=1e-7,
     )
 
-    with pytest.raises(ValueError, match="require an orthorhombic cell"):
-        RealSpaceGrid((4, 4, 4), cell)
+    with pytest.raises(ValueError, match="legacy DFTSystem requires"):
+        DFTSystem.one_center(cell=cell)
 
 
 def test_fft_round_trip_preserves_real_field():

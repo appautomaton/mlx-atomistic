@@ -140,6 +140,8 @@ class DFTSystem:
         ions: IonCollection | None = None,
     ):
         parsed_cell = cell if isinstance(cell, Cell) else Cell.orthorhombic(cell)
+        if not parsed_cell.is_orthorhombic:
+            raise ValueError("legacy DFTSystem requires an orthorhombic cell")
         shape = _validated_grid_shape(grid_shape)
         pseudopotential, electron_count_value = _resolved_pseudopotential(
             ions=ions,

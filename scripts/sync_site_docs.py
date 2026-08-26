@@ -27,6 +27,7 @@ NARRATIVE_TARGETS = {
     "production-md.md": "mm/production-md.md",
     "real-mm-core.md": "mm/real-mm-core.md",
     "dft-geometry-optimization.md": "dft/dft-geometry-optimization.md",
+    "dft-general-cell-geometry.md": "dft/dft-general-cell-geometry.md",
     "dft-metallic-validation.md": "dft/dft-metallic-validation.md",
     "dft-periodic-relaxation.md": "dft/dft-periodic-relaxation.md",
     "dft-numerics.md": "dft/dft-numerics.md",

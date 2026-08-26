@@ -250,7 +250,7 @@ def periodic_scf_forces(
         periodic_ewald_forces(
             system.charges,
             system.positions,
-            system.grid.lengths,
+            system.grid.cell,
             tolerance=ewald_tolerance,
             method="analytic",
         ).astype(np.float32)
