@@ -35,6 +35,7 @@ POINT_TIMEOUT_SECONDS = 1800.0
 SCREEN_INDICES = (2, 3, 4)
 FULL_INDICES = tuple(range(7))
 KPOINT_SHAPE_THRESHOLD_MEV_PER_ATOM = 1.0
+POINT_GROUP_ENERGY_THRESHOLD_HARTREE_PER_ATOM = 5.0e-5
 _FFT_SHAPES = {
     25: 40,
     30: 44,
@@ -76,6 +77,14 @@ PROFILE_SPECS: dict[str, dict[str, Any]] = {
         }
         for cutoff in _FFT_SHAPES
         if cutoff != 25
+    },
+    "q2-c70-k6-point-group": {
+        "pseudopotential_mode": "q2",
+        "cutoff_hartree": 70.0,
+        "fft_shape": [68, 68, 68],
+        "kpoint_mesh": [6, 6, 6],
+        "symmetry_reduction": "full_cubic_point_group",
+        "max_batch_transient_bytes": 1536 * 1024**2,
     },
     "q10-feasibility": {
         "pseudopotential_mode": "q10",
@@ -150,6 +159,7 @@ def _system_geometry(
 
 
 def _kpoint_mesh(settings: Mapping[str, Any], cell: Any) -> Any:
+    from mlx_atomistic.core import Cell
     from mlx_atomistic.dft import (
         GammaCenteredGrid,
         MonkhorstPackGrid,
@@ -171,7 +181,7 @@ def _kpoint_mesh(settings: Mapping[str, Any], cell: Any) -> Any:
     if reduction != "full_cubic_point_group":
         raise ValueError(f"unsupported MgO k-point reduction: {reduction}")
     operations = reciprocal_symmetry_operations_for_cell(
-        np.asarray(cell, dtype=np.float64),
+        np.asarray(Cell(cell).matrix, dtype=np.float64),
         cubic_reciprocal_symmetry_operations(),
     )
     return reduce_kpoint_mesh_by_symmetry(full, operations)
@@ -574,6 +584,43 @@ def _shape_comparison(
     }
 
 
+def _point_group_energy_oracle(
+    full: Mapping[str, Any],
+    reduced: Mapping[str, Any],
+    *,
+    atom_count: int,
+) -> dict[str, Any]:
+    if atom_count <= 0:
+        raise ValueError("point-group oracle atom_count must be positive")
+    if not all(report.get("numerical_passed") is True for report in (full, reduced)):
+        return {
+            "status": "blocked",
+            "blocker": "point_group_oracle_numerical_failure",
+            "passed": False,
+        }
+    difference = abs(
+        float(reduced["result"]["total_energy_hartree"])
+        - float(full["result"]["total_energy_hartree"])
+    ) / atom_count
+    if not np.isfinite(difference):
+        return {
+            "status": "blocked",
+            "blocker": "point_group_oracle_energy_not_finite",
+            "passed": False,
+        }
+    passed = difference <= POINT_GROUP_ENERGY_THRESHOLD_HARTREE_PER_ATOM
+    return {
+        "status": "ok" if passed else "failed",
+        "passed": passed,
+        "metrics": {"energy_abs_hartree_per_atom": difference},
+        "thresholds": {
+            "energy_abs_hartree_per_atom": (
+                POINT_GROUP_ENERGY_THRESHOLD_HARTREE_PER_ATOM
+            )
+        },
+    }
+
+
 def _existing_rows(output: Path) -> list[dict[str, Any]]:
     rows = []
     for path in sorted((output / "points").glob("*/v*/report.json")):
@@ -740,7 +787,7 @@ def run_mgo_eos_validation(
             "status": "planned",
             "memory_limit_bytes": MEMORY_LIMIT_BYTES,
             "point_timeout_seconds": POINT_TIMEOUT_SECONDS,
-            "maximum_point_count": 35,
+            "maximum_point_count": 36,
             "initial_smoke_point": _plan_spec(manifest, "smoke-q2", 3),
             "cutoff_screen_points": [
                 _plan_spec(manifest, profile, 3) for profile in cutoff_profiles
@@ -753,6 +800,10 @@ def run_mgo_eos_validation(
                     "4x4x4 energy shapes"
                 ),
                 "compare 4x4x4 and 6x6x6 three-volume energy shapes",
+                (
+                    "admit point-group reduction against the accepted full "
+                    "6x6x6 central point when a reduced profile is available"
+                ),
                 "complete only the accepted 6x6x6 seven-point curve",
                 "compare the fit with ACWF all-electron and CP2K/GTH references",
             ],
@@ -924,12 +975,48 @@ def run_mgo_eos_validation(
             detail={"blocker": "six_cubed_kpoint_shape_not_converged", **kpoint},
         )
 
-    density_path = output / "points" / profile6 / "v3" / "density.npy"
-    if not density_path.is_file():
+    full_density_path = output / "points" / profile6 / "v3" / "density.npy"
+    if not full_density_path.is_file():
         return _failure_report(
             output,
             rows=rows,
             detail={"blocker": "accepted_equilibrium_density_missing"},
+        )
+    curve_profile = profile6
+    point_group_oracle: dict[str, Any] | None = None
+    reduced_profile = f"{profile6}-point-group"
+    if reduced_profile in PROFILE_SPECS:
+        method_failure = _execute_point(
+            manifest_file=manifest_file,
+            manifest=manifest,
+            output=output,
+            rows=rows,
+            profile=reduced_profile,
+            index=3,
+            initial_density_path=full_density_path,
+        )
+        if method_failure is None:
+            full_center = _ordered_rows(rows, profile6, (3,))[0]
+            reduced_center = _ordered_rows(rows, reduced_profile, (3,))[0]
+            point_group_oracle = _point_group_energy_oracle(
+                full_center,
+                reduced_center,
+                atom_count=int(manifest["system"]["atom_count"]),
+            )
+            if point_group_oracle["passed"] is True:
+                curve_profile = reduced_profile
+        else:
+            point_group_oracle = {
+                "status": "blocked",
+                "passed": False,
+                **method_failure,
+            }
+    density_path = output / "points" / curve_profile / "v3" / "density.npy"
+    if not density_path.is_file():
+        return _failure_report(
+            output,
+            rows=rows,
+            detail={"blocker": "accepted_curve_density_missing"},
         )
     for index in FULL_INDICES:
         failure = _execute_point(
@@ -937,13 +1024,13 @@ def run_mgo_eos_validation(
             manifest=manifest,
             output=output,
             rows=rows,
-            profile=profile6,
+            profile=curve_profile,
             index=index,
             initial_density_path=None if index == 3 else density_path,
         )
         if failure is not None:
             return _failure_report(output, rows=rows, detail=failure)
-    full_rows = _ordered_rows(rows, profile6, FULL_INDICES)
+    full_rows = _ordered_rows(rows, curve_profile, FULL_INDICES)
     selected_fit = fit_cubic_mgo_eos(
         [float(row["point"]["lattice_constant_angstrom"]) for row in full_rows],
         [float(row["result"]["total_energy_hartree"]) for row in full_rows],
@@ -958,10 +1045,11 @@ def run_mgo_eos_validation(
         "workload_fingerprint": manifest["workload_fingerprint"],
         **summarize_eos_point_identities(rows),
         "accepted_workload": {
-            "profile": profile6,
+            "profile": curve_profile,
             "cutoff_hartree": accepted_cutoff,
             "fft_shape": PROFILE_SPECS[profile6]["fft_shape"],
             "kpoint_mesh": [6, 6, 6],
+            "point_group_symmetry_reduced": curve_profile != profile6,
             "pseudopotentials": manifest["physics"][
                 "accepted_pseudopotentials"
             ],
@@ -970,6 +1058,7 @@ def run_mgo_eos_validation(
         "selected_fit": selected_fit,
         "cutoff_screen": cutoff_evidence,
         "kpoint_screen": kpoint,
+        "point_group_oracle": point_group_oracle,
         "scientific_comparison": scientific,
         "reference_bundle": {
             "sha256": REFERENCE_SHA256,

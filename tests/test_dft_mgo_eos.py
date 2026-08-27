@@ -23,6 +23,7 @@ from mlx_atomistic.benchmarks.dft_mgo_eos_runner import (
     PROFILE_SPECS,
     _completion_assessment,
     _kpoint_mesh,
+    _point_group_energy_oracle,
     _shape_comparison,
     _system_geometry,
     run_mgo_eos_validation,
@@ -143,7 +144,7 @@ def test_mgo_validation_dry_run_exposes_bounded_decision_ladder(tmp_path):
     assert plan["status"] == "planned"
     assert plan["memory_limit_bytes"] == MEMORY_LIMIT_BYTES
     assert plan["point_timeout_seconds"] == POINT_TIMEOUT_SECONDS
-    assert plan["maximum_point_count"] == 35
+    assert plan["maximum_point_count"] == 36
     assert plan["initial_smoke_point"]["profile"] == "smoke-q2"
     assert len(plan["initial_smoke_point"]["runtime_fingerprint"]) == 64
     assert [point["cutoff_hartree"] for point in plan["cutoff_screen_points"]] == [
@@ -155,7 +156,7 @@ def test_mgo_validation_dry_run_exposes_bounded_decision_ladder(tmp_path):
         70.0,
         80.0,
     ]
-    assert len(PROFILE_SPECS) == 24
+    assert len(PROFILE_SPECS) == 25
 
 
 def test_mgo_q10_primitive_profiles_preserve_geometry_and_oracle_pair():
@@ -183,6 +184,69 @@ def test_mgo_q10_primitive_profiles_preserve_geometry_and_oracle_pair():
     assert len(full.points) == 64
     assert sum(point.weight for point in reduced.points) == pytest.approx(1.0)
     assert sum(point.weight for point in full.points) == pytest.approx(1.0)
+
+
+def test_mgo_conventional_point_group_profile_changes_only_symmetry():
+    full = PROFILE_SPECS["q2-c70-k6"]
+    reduced = PROFILE_SPECS["q2-c70-k6-point-group"]
+
+    assert reduced == {
+        **full,
+        "symmetry_reduction": "full_cubic_point_group",
+    }
+    mesh = _kpoint_mesh(
+        {**reduced, "kpoint_mesh": [2, 2, 2]},
+        (8.0, 8.0, 8.0),
+    )
+    assert mesh.point_group_symmetry_reduced is True
+    assert len(mesh.points) < 2**3
+    assert sum(point.weight for point in mesh.points) == pytest.approx(1.0)
+
+
+def test_mgo_point_group_oracle_uses_the_established_energy_gate():
+    full = {
+        "numerical_passed": True,
+        "result": {"total_energy_hartree": -68.0},
+    }
+    passing = {
+        "numerical_passed": True,
+        "result": {"total_energy_hartree": -68.0 + 8 * 4.0e-5},
+    }
+    failing = {
+        "numerical_passed": True,
+        "result": {"total_energy_hartree": -68.0 + 8 * 6.0e-5},
+    }
+
+    assert _point_group_energy_oracle(full, passing, atom_count=8)["passed"] is True
+    assert _point_group_energy_oracle(full, failing, atom_count=8)["passed"] is False
+
+
+def test_mgo_point_group_oracle_fails_closed():
+    valid = {
+        "numerical_passed": True,
+        "result": {"total_energy_hartree": -68.0},
+    }
+    numerical_failure = {
+        "numerical_passed": False,
+        "result": {"total_energy_hartree": -68.0},
+    }
+    nonfinite = {
+        "numerical_passed": True,
+        "result": {"total_energy_hartree": np.nan},
+    }
+
+    blocked = _point_group_energy_oracle(valid, numerical_failure, atom_count=8)
+    assert blocked["status"] == "blocked"
+    assert blocked["blocker"] == "point_group_oracle_numerical_failure"
+    assert blocked["passed"] is False
+
+    blocked = _point_group_energy_oracle(valid, nonfinite, atom_count=8)
+    assert blocked["status"] == "blocked"
+    assert blocked["blocker"] == "point_group_oracle_energy_not_finite"
+    assert blocked["passed"] is False
+
+    with pytest.raises(ValueError, match="atom_count must be positive"):
+        _point_group_energy_oracle(valid, valid, atom_count=0)
 
 
 def test_mgo_kpoint_shape_comparison_removes_total_energy_offset():
