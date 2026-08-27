@@ -235,7 +235,10 @@ Fe q16 full-versus-reduced SCF oracle passes after rotated-density
 reconstruction, but its broader legacy evidence still lacks refreshed v2
 identities. The current density-reconstructed primitive Mg q10 screen still
 fails its locked orbital-residual gate after both cold and density-seeded runs,
-so the matched full oracle and full q10 EOS were not run.
+so the matched full oracle and full q10 EOS were not run. A bounded CP2K 2026.1
+UZH q2 alternative passed its conventional-cell reduced/full method oracle but
+was rejected because its seven-point bulk-derivative error was `18.09%`, above
+the unchanged `15%` gate.
 
 ## Phase 8: Add Finite-Displacement Phonons
 
@@ -305,7 +308,8 @@ Current exit audit: every criterion above is implemented and has bounded
 evidence except the broad GTH production envelope. Phase 7 has complete
 coverage, but its strict matrix remains failed by the locked MgO q2
 bulk-derivative and total-force residuals, the rejected q10 candidate, and
-missing exact calculation/runtime identities in older summaries. The Fe q16
+the rejected UZH q2 alternative, plus missing exact calculation/runtime
+identities in older summaries. The Fe q16
 point-group method oracle now passes, but that does not erase the remaining
 identity and MgO blockers. The project therefore must not yet claim the general
 core defined here. No Phase 6 or Phase 8 implementation gap remains hidden

@@ -123,3 +123,15 @@ gates. The full-mesh moment is `2.33818`, close to the published `2.33` context.
 The row remains project-derived because its older cutoff, k-point, and magnetic-
 ordering evidence has not yet been regenerated with complete v2 calculation
 and runtime identities.
+
+A separate historical-frozen screen evaluated the CP2K 2026.1 UZH PBE
+Mg-q2/O-q6 resources, which CP2K recommends as a matched UZH protocol for new
+GPW inputs. The source-bound local workload fingerprint was
+`7990b1e9302d23dfab55059dac0242f80418c31bae406bb4f7627cbc9aba492b`.
+At the established 70 Ha and 6-by-6-by-6 conventional-cell representation,
+point-group reconstruction reproduced the matched full central energy within
+`6.90e-10 Ha/cell` and reduced wall from `105.081` to `8.840 s`. The seven-point
+curve gave `a₀ = 4.252650 Å`, `B₀ = 146.708 GPa`, `B₀′ = 3.35102`, and Δ
+`0.461 meV/atom`. Its bulk-derivative relative error was `18.09%`, above the
+unchanged `15%` gate and worse than the standard q2 result. The UZH candidate
+is therefore rejected, and its force ladder was not run.
