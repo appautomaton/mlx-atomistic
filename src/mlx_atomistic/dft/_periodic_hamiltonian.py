@@ -15,12 +15,15 @@ from mlx_atomistic.dft._compact import (
     _CompactLaneState,
 )
 from mlx_atomistic.dft._periodic_execution import _detached_failure, _materialize
+from mlx_atomistic.dft._periodic_pseudopotential_runtime import (
+    _PERIODIC_NONLOCAL_TYPES,
+    _PeriodicNonlocalOperator,
+)
 from mlx_atomistic.dft._runtime_observer import (
     RuntimeObserver,
     add_observed_work,
     observed_phase,
 )
-from mlx_atomistic.dft.periodic_gth import PeriodicGTHNonlocalOperator
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 
 
@@ -96,15 +99,18 @@ def _estimated_batch_transient_bytes(
     if not all(operator._effective_local_potential is first_potential for operator in operators):
         estimate += lane_count * batch.grid_size * 8
 
-    grouped_gth: dict[str, list[int]] = defaultdict(list)
+    grouped_nonlocal: dict[tuple[type, str], list[int]] = defaultdict(list)
     for index, operator in enumerate(operators):
         nonlocal_operator = operator.nonlocal_operator
-        if isinstance(nonlocal_operator, PeriodicGTHNonlocalOperator):
-            grouped_gth[nonlocal_operator._context_identity].append(index)
+        if isinstance(nonlocal_operator, _PERIODIC_NONLOCAL_TYPES):
+            grouped_nonlocal[
+                (type(nonlocal_operator), nonlocal_operator._context_identity)
+            ].append(index)
         elif nonlocal_operator is not None:
             estimate += padded_complex_bytes // lane_count
-    for indices in grouped_gth.values():
-        estimate += PeriodicGTHNonlocalOperator._estimated_batch_transient_bytes(
+    for indices in grouped_nonlocal.values():
+        nonlocal_type = type(operators[indices[0]].nonlocal_operator)
+        estimate += nonlocal_type._estimated_batch_transient_bytes(
             [operators[index].nonlocal_operator for index in indices],
             batch,
         )
@@ -209,7 +215,7 @@ class _CompactHamiltonianExecutor:
                 self.projector_metrics[lane_index] = _empty_projector_metrics()
                 if operator.nonlocal_operator is not None and not isinstance(
                     operator.nonlocal_operator,
-                    PeriodicGTHNonlocalOperator,
+                    _PERIODIC_NONLOCAL_TYPES,
                 ):
                     action, metrics = operator.nonlocal_operator._apply_compact(
                         state,
@@ -235,7 +241,7 @@ class _CompactHamiltonianExecutor:
         if self.estimated_transient_bytes > self.policy.max_transient_bytes:
             msg = "compact Hpsi batch exceeds the complete transient byte budget"
             raise ValueError(msg)
-        self._apply_gth_projectors()
+        self._apply_separable_projectors()
         self._assemble_actions(ready_states)
 
     def _prepare_batch(self, ready_states: Sequence[_CompactLaneState]) -> _CompactBatch:
@@ -260,40 +266,46 @@ class _CompactHamiltonianExecutor:
             return prepared
         return _CompactBatch.from_states(ready_states, policy=self.policy)
 
-    def _apply_gth_projectors(self) -> None:
-        grouped_gth: dict[str, list[int]] = defaultdict(list)
+    def _apply_separable_projectors(self) -> None:
+        grouped_nonlocal: dict[tuple[type, str], list[int]] = defaultdict(list)
         for lane_index in self.ready_indices:
             nonlocal_operator = self.operators[lane_index].nonlocal_operator
-            if isinstance(nonlocal_operator, PeriodicGTHNonlocalOperator):
-                grouped_gth[nonlocal_operator._context_identity].append(lane_index)
-        for gth_indices in grouped_gth.values():
-            gth_states = [self.coefficients[index] for index in gth_indices]
-            if gth_indices == self.ready_indices:
-                gth_batch = self.batch
+            if isinstance(nonlocal_operator, _PERIODIC_NONLOCAL_TYPES):
+                grouped_nonlocal[
+                    (type(nonlocal_operator), nonlocal_operator._context_identity)
+                ].append(lane_index)
+        for lane_indices in grouped_nonlocal.values():
+            states = [self.coefficients[index] for index in lane_indices]
+            if lane_indices == self.ready_indices:
+                nonlocal_batch = self.batch
             else:
-                gth_batch = _CompactBatch.from_states(gth_states, policy=self.policy)
+                nonlocal_batch = _CompactBatch.from_states(states, policy=self.policy)
+            nonlocal_type = type(self.operators[lane_indices[0]].nonlocal_operator)
             try:
-                gth_actions, gth_metrics = PeriodicGTHNonlocalOperator._apply_compact_batch(
-                    [self.operators[index].nonlocal_operator for index in gth_indices],
-                    gth_states,
-                    batch=gth_batch,
+                actions, metrics_by_lane = nonlocal_type._apply_compact_batch(
+                    [self.operators[index].nonlocal_operator for index in lane_indices],
+                    states,
+                    batch=nonlocal_batch,
                     # The combined Hpsi result is materialized below; evaluating
                     # this contribution alone would add a redundant device barrier.
                     evaluate=False,
                 )
             except Exception:
-                self._apply_gth_projectors_individually(gth_indices)
+                self._apply_separable_projectors_individually(lane_indices)
             else:
                 for lane_index, action, metrics in zip(
-                    gth_indices,
-                    gth_actions,
-                    gth_metrics,
+                    lane_indices,
+                    actions,
+                    metrics_by_lane,
                     strict=True,
                 ):
                     self.projector_actions[lane_index] = action
                     self.projector_metrics[lane_index] = metrics
 
-    def _apply_gth_projectors_individually(self, lane_indices: Sequence[int]) -> None:
+    def _apply_separable_projectors_individually(
+        self,
+        lane_indices: Sequence[int],
+    ) -> None:
         for lane_index in lane_indices:
             nonlocal_operator = self.operators[lane_index].nonlocal_operator
             try:
@@ -540,14 +552,14 @@ class PeriodicKohnShamOperator:
 
     basis: PlaneWaveBasis
     _effective_local_potential: mx.array = field(repr=False)
-    nonlocal_operator: PeriodicGTHNonlocalOperator | None = None
+    nonlocal_operator: _PeriodicNonlocalOperator | None = None
     observer: RuntimeObserver | None = None
 
     def __init__(
         self,
         basis: PlaneWaveBasis,
         effective_local_potential: mx.array,
-        nonlocal_operator: PeriodicGTHNonlocalOperator | None = None,
+        nonlocal_operator: _PeriodicNonlocalOperator | None = None,
         observer: RuntimeObserver | None = None,
     ) -> None:
         potential_snapshot = mx.array(effective_local_potential)
@@ -564,7 +576,7 @@ class PeriodicKohnShamOperator:
         cls,
         basis: PlaneWaveBasis,
         potential_snapshot: mx.array,
-        nonlocal_operator: PeriodicGTHNonlocalOperator | None = None,
+        nonlocal_operator: _PeriodicNonlocalOperator | None = None,
         observer: RuntimeObserver | None = None,
     ) -> PeriodicKohnShamOperator:
         """Bind a private SCF operator to one already evaluated potential."""
@@ -591,8 +603,11 @@ class PeriodicKohnShamOperator:
         nonlocal_operator = self.nonlocal_operator
         if nonlocal_operator is None:
             return None
-        if isinstance(nonlocal_operator, PeriodicGTHNonlocalOperator):
-            return ("gth", nonlocal_operator._context_identity)
+        if isinstance(nonlocal_operator, _PERIODIC_NONLOCAL_TYPES):
+            return (
+                str(nonlocal_operator.pseudopotentials[0].format),
+                nonlocal_operator._context_identity,
+            )
         return ("custom", id(nonlocal_operator))
 
     def apply(

@@ -65,18 +65,18 @@ def _time_reversed_compact_values(
 
 @dataclass(frozen=True)
 class PeriodicDFTSystem:
-    """Periodic DFT system with per-ion GTH pseudopotentials.
+    """Periodic DFT system with ordered per-ion pseudopotentials.
 
     Args:
         cell_lengths: A periodic `Cell`, three orthorhombic lengths, or a full
             row-vector cell matrix in bohr.
         grid_shape: FFT grid shape.
         positions: Ionic Cartesian positions in bohr.
-        pseudopotential: Shared GTH pseudopotential for every ion. Mutually
+        pseudopotential: Shared pseudopotential for every ion. Mutually
             exclusive with ``pseudopotentials``.
         electron_count: Total valence electron count. Defaults to the neutral
             pseudopotential charge sum.
-        pseudopotentials: Ordered one-per-ion GTH pseudopotentials.
+        pseudopotentials: Ordered one-per-ion pseudopotentials.
     """
 
     grid: RealSpaceGrid

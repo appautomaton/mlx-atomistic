@@ -201,6 +201,10 @@ class PseudopotentialData:
             and self.metadata.get("core_correction") is False
             and bool(self.nonlocal_projectors)
             and bool(self.nonlocal_coupling_matrix)
+            and all(
+                0 <= projector.angular_momentum <= 2
+                for projector in self.nonlocal_projectors
+            )
         )
 
     def local_potential(self, radius: np.ndarray) -> np.ndarray:

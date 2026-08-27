@@ -19,6 +19,9 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicSCFConfig,
     _eigensolve_provenance,
 )
+from mlx_atomistic.dft._pseudopotential_identity import (
+    _pseudopotential_fingerprint,
+)
 from mlx_atomistic.dft.kpoints import KPointMesh
 from mlx_atomistic.dft.pseudopotentials import (
     PseudopotentialData,
@@ -391,25 +394,60 @@ def _validate_initialization_binding(
 def _single_pseudopotential_payload(
     pseudo: PseudopotentialData,
 ) -> dict[str, object]:
-    """Return one canonical periodic GTH pseudopotential payload."""
+    """Return one canonical periodic pseudopotential payload."""
 
-    if pseudo.format != PseudopotentialFormat.GTH:
-        msg = "periodic SCF checkpoints require a GTH pseudopotential"
-        raise ValueError(msg)
-    return {
+    common = {
         "element": pseudo.element,
         "format": pseudo.format.value,
         "valence_charge": pseudo.valence_charge,
-        "gth_rloc": pseudo.gth_rloc,
-        "gth_coefficients": list(pseudo.gth_coefficients),
-        "gth_channels": [
+    }
+    if pseudo.format == PseudopotentialFormat.GTH:
+        return {
+            **common,
+            "gth_rloc": pseudo.gth_rloc,
+            "gth_coefficients": list(pseudo.gth_coefficients),
+            "gth_channels": [
+                {
+                    "angular_momentum": channel.angular_momentum,
+                    "radius": channel.radius,
+                    "coupling_matrix": [list(row) for row in channel.coupling_matrix],
+                }
+                for channel in pseudo.gth_channels
+            ],
+        }
+    if not pseudo.periodic_upf_compatible:
+        raise ValueError(
+            "periodic SCF checkpoints require executable scalar norm-conserving UPF"
+        )
+    local_grid = pseudo.local_grid
+    if local_grid is None:
+        raise ValueError("periodic UPF checkpoint identity requires a local grid")
+    metadata = pseudo.metadata or {}
+    return {
+        **common,
+        "content_sha256": _pseudopotential_fingerprint(pseudo),
+        "local_radial_sample_count": local_grid.size,
+        "nonlocal_projectors": [
             {
-                "angular_momentum": channel.angular_momentum,
-                "radius": channel.radius,
-                "coupling_matrix": [list(row) for row in channel.coupling_matrix],
+                "angular_momentum": projector.angular_momentum,
+                "radial_sample_count": len(projector.values),
+                "cutoff_radius": projector.cutoff_radius,
             }
-            for channel in pseudo.gth_channels
+            for projector in pseudo.nonlocal_projectors
         ],
+        "dij_dimension": len(pseudo.nonlocal_coupling_matrix),
+        "physics": {
+            name: metadata.get(name)
+            for name in (
+                "pseudo_type",
+                "relativistic",
+                "functional",
+                "is_ultrasoft",
+                "is_paw",
+                "has_so",
+                "core_correction",
+            )
+        },
     }
 
 
@@ -471,7 +509,7 @@ def periodic_scf_calculation_contract(
     """Build the path-independent calculation contract used by checkpoints.
 
     Args:
-        system: Periodic GTH system.
+        system: Periodic system with an executable pseudopotential format.
         cutoff_hartree: Plane-wave kinetic cutoff in Hartree.
         kpoint_mesh: Weighted reduced-coordinate k-point mesh.
         n_bands: Computed band count. Fixed occupations default to half the

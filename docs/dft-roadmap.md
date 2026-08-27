@@ -29,6 +29,11 @@ diagnostics, no-pickle partial-sample restart, and a verified two-atom Silicon
 material gate.
 Real and reciprocal grids, k-points, Ewald terms, GTH operators, forces, and
 state identity share one full-rank periodic cell matrix contract.
+Scalar norm-conserving UPF now has a separate periodic local/nonlocal path
+through SCF, bands, analytic fixed-cell forces, and content-bound checkpoints.
+Its current evidence is source-oracle and execution-smoke level, not material
+certification; ultrasoft, PAW, spin-orbit, nonlinear-core-correction, and UPF
+analytic-stress physics remain outside the admitted boundary.
 Material-level verification remains narrow: Silicon, Carbon, and simple-metal
 Aluminum have accepted equation-of-state workloads, Silicon has one accepted
 orthorhombic relaxation and one accepted hexagonal relaxation, and MgO retains
@@ -50,7 +55,7 @@ only when its implementation and material-level evidence both pass.
 | Capability | General-core commitment | Current boundary | Delivery |
 | --- | --- | --- | --- |
 | Exchange-correlation | PBE-PW92 production envelope | Implemented; verified material set is narrow | Every material phase |
-| Pseudopotentials | Broad, fingerprinted GTH transferability | s/p/d and chemistry coverage is complete; strict MgO and historical identity gates remain blocked | Phase 7 |
+| Pseudopotentials | Broad, fingerprinted GTH transferability | Scalar norm-conserving periodic UPF is implemented but not materially certified; GTH s/p/d coverage is complete while strict MgO and historical identity gates remain blocked | Phase 7 |
 | Crystal geometry | Ordinary full-rank periodic cells | Implemented; one source-bound hexagonal Silicon case and bounded low-symmetry oracles are verified | Phase 3 |
 | Electronic states | Insulators, simple metals, and collinear magnets | One simple metal and one collinear bcc Iron q16 workload are verified | Phases 1 and 5 |
 | Electronic observables | Energy, density, occupations, bands, total DOS, and Fermi level | Implemented; scalar/spin DOS, portable density volumes, and reusable convergence reports pass deterministic gates | Phase 6 |
@@ -218,8 +223,8 @@ matrix and efficient material decision policy are defined in
 [Periodic GTH Transferability](./dft-gth-transferability.md).
 
 - Strengthen periodic GTH convention fidelity instead of treating parser
-  success as scientific validation. Existing UPF support retains its separate
-  proof-level boundary.
+  success as scientific validation. Scalar norm-conserving periodic UPF retains
+  a separate implemented but scientifically proof-level boundary.
 - Cover representative `s`, `p`, and `d`-block elements, ionic compounds,
   multiple oxidation environments, and both local and nonlocal force terms.
 - Bind every claim to an exact resource fingerprint and matching reference
@@ -336,10 +341,10 @@ above:
   DFT;
 - platform scale: automatic crystallographic symmetry discovery, distributed
   execution, multi-device scheduling, and broad molecular DFT;
-- alternate periodic pseudopotential envelopes: production UPF nonlocal and SCF
-  admission beyond the required GTH general-core envelope. The retained radial,
-  full-`PP_DIJ`, fingerprint, and periodic-local foundation does not yet
-  constitute that envelope.
+- broader periodic pseudopotential envelopes: ultrasoft augmentation, PAW,
+  spin-orbit coupling, nonlinear core correction, analytic UPF stress, and
+  material-level transferability beyond the implemented scalar
+  norm-conserving boundary.
 
 Each item requires its own roadmap or bounded extension after the general-core
 exit audit. None is an implied blocker for the claim defined here.

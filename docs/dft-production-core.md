@@ -4,7 +4,8 @@ The DFT package contains two intentionally different surfaces. The legacy
 `DFTSystem`/`run_scf` surface supplies tiny Γ-point teaching, dense-reference,
 spin, occupation, finite-difference stress, and restart diagnostics. The
 periodic `PeriodicDFTSystem`/`run_periodic_scf` surface supplies the
-materials-workload path: PBE-PW92, reciprocal-space GTH operators,
+materials-workload path: PBE-PW92, reciprocal-space GTH and scalar
+norm-conserving UPF operators,
 Monkhorst-Pack integration, block-Davidson/Rayleigh-Ritz solves,
 fixed or Fermi-Dirac occupations, frozen-density band paths, and periodic
 forces across ordinary fixed full-rank cells. Analytic periodic stress and a
@@ -24,11 +25,14 @@ real-space separable forms. The operator applies:
 V̂_NL ψ = Σᵢ |βᵢ⟩ Dᵢ ⟨βᵢ|ψ⟩
 ```
 
-The UPF parser now preserves radial quadrature and the complete `PP_DIJ` matrix
+The UPF parser preserves radial quadrature and the complete `PP_DIJ` matrix
 after Ry-to-Hartree conversion, while the legacy proof operator still consumes
-only its diagonal. A source-matched compensated periodic local transform is
-available, but periodic UPF nonlocal SCF remains unimplemented. The production
-periodic GTH path retains its separate analytic operators.
+only its diagonal. The periodic scalar norm-conserving path implements the
+source-matched local transform, compact nonlocal SCF and bands, analytic
+fixed-cell forces, and content-bound checkpoints. Ultrasoft augmentation, PAW,
+spin-orbit terms, nonlinear core correction, and UPF analytic stress fail
+closed. The production periodic GTH path retains its separate analytic radial
+operators.
 
 SCF applies nonlocal projectors by default when available. `SCFConfig(apply_nonlocal=False)` keeps the old local-only path available for debugging and comparison.
 
@@ -86,7 +90,7 @@ occupations, so a converged smeared result yields the stationary free-energy
 force.
 
 Both paths use reduced-coordinate Monkhorst-Pack meshes and `0.5|G + k|²`,
-including Bloch-phase local and nonlocal GTH evaluation.
+including Bloch-phase local and nonlocal pseudopotential evaluation.
 `run_periodic_band_structure` reuses a converged SCF density and solves
 non-self-consistently along a high-symmetry path.
 
@@ -134,7 +138,7 @@ boundary.
 | --- | --- | --- |
 | Plane-wave SCF core | verified for fixed-occupation bulk-Si EOS and one Fermi-Dirac fcc-Al EOS | CP2K Quickstep, QE PWscf |
 | Full-rank fixed periodic cells | verified for one bounded 2H-Si relaxation and low-symmetry numerical oracles | CP2K cell matrix, QE CELL_PARAMETERS |
-| UPF/GTH pseudopotentials and nonlocal projectors | proof-level | QE UPF, CP2K GTH |
+| UPF/GTH pseudopotentials and nonlocal projectors | GTH material evidence remains blocked; scalar norm-conserving UPF has source-bound execution and numerical gates but no material certification | QE UPF, CP2K GTH |
 | Fixed-cell periodic geometry relaxation | verified for bounded orthorhombic and hexagonal Si workloads | CP2K MOTION/GEO_OPT, QE relax |
 | Analytic periodic stress | verified for deterministic derivatives and one cutoff-converged 2H-Si material path | CP2K stress, QE stress |
 | Variable-cell relaxation and restart | verified for one bounded 2H-Si cell-only path; deterministic coupled and resume gates pass | CP2K CELL_OPT, QE vc-relax |
