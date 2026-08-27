@@ -16,12 +16,13 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicKPointResult,
     PeriodicSCFResult,
 )
-from mlx_atomistic.dft.periodic_electrostatics import periodic_ewald_forces
-from mlx_atomistic.dft.periodic_gth import (
-    PeriodicGTHNonlocalOperator,
-    _GTHProjectorCache,
-    periodic_gth_local_forces,
+from mlx_atomistic.dft._periodic_pseudopotential_runtime import (
+    _periodic_local_forces,
+    _periodic_nonlocal_operator,
+    _periodic_pseudopotential_format,
 )
+from mlx_atomistic.dft.periodic_electrostatics import periodic_ewald_forces
+from mlx_atomistic.dft.periodic_gth import _ProjectorCache
 
 _FORCE_KPOINT_MATERIALIZATION_BATCH_SIZE = 8
 
@@ -32,8 +33,8 @@ class PeriodicForceResult:
 
     Args:
         forces: Total ionic forces in Hartree/bohr.
-        local: Local GTH electron-ion contribution.
-        nonlocal_force: Nonlocal GTH projector contribution.
+        local: Local pseudopotential electron-ion contribution.
+        nonlocal_force: Nonlocal pseudopotential projector contribution.
         ion_ewald: Periodic ion-ion Ewald contribution.
         timings: Wall-clock phase timings in milliseconds.
         provenance: Method and stationarity metadata.
@@ -63,11 +64,17 @@ class PeriodicForceResult:
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe force decomposition."""
 
+        pseudopotential_format = self.provenance.get(
+            "pseudopotential_format",
+            "gth",
+        )
         return {
             "forces_hartree_per_bohr": np.asarray(self.forces).tolist(),
             "force_by_term_hartree_per_bohr": {
-                "local_gth": np.asarray(self.local).tolist(),
-                "nonlocal_gth": np.asarray(self.nonlocal_force).tolist(),
+                f"local_{pseudopotential_format}": np.asarray(self.local).tolist(),
+                f"nonlocal_{pseudopotential_format}": np.asarray(
+                    self.nonlocal_force
+                ).tolist(),
                 "ion_ewald": np.asarray(self.ion_ewald).tolist(),
             },
             "max_force_hartree_per_bohr": self.max_force,
@@ -134,7 +141,7 @@ def _periodic_nonlocal_forces(
     system: PeriodicDFTSystem,
     owned: Sequence[PeriodicKPointResult],
     *,
-    projector_cache: _GTHProjectorCache,
+    projector_cache: _ProjectorCache,
 ) -> mx.array:
     force = mx.zeros((system.ion_count, 3), dtype=mx.float32)
     for point_index, point in enumerate(owned, start=1):
@@ -142,7 +149,7 @@ def _periodic_nonlocal_forces(
         if not isinstance(compact, _CompactLaneState):
             msg = "periodic forces require compact occupied k-point states"
             raise ValueError(msg)
-        operator = PeriodicGTHNonlocalOperator(
+        operator = _periodic_nonlocal_operator(
             system.pseudopotentials,
             point.basis,
             system.positions,
@@ -196,7 +203,8 @@ def periodic_scf_forces(
     """Evaluate fixed-cell periodic forces from a converged SCF result.
 
     The local and nonlocal electron-ion terms use analytic derivatives of the
-    GTH phase factors. The ion-ion term uses the analytic Ewald derivative.
+    pseudopotential phase factors. The ion-ion term uses the analytic Ewald
+    derivative.
     There is no ionic Pulay term because the fixed-cell plane-wave basis does
     not depend on ion positions. Finite-temperature results use their resolved
     occupations, yielding the stationary electronic free-energy force.
@@ -230,9 +238,12 @@ def periodic_scf_forces(
         "total": 0.0,
     }
     total_start = perf_counter()
-    with _bounded_dft_allocator(), _GTHProjectorCache() as projector_cache:
+    pseudopotential_format = _periodic_pseudopotential_format(
+        system.pseudopotentials
+    ).value
+    with _bounded_dft_allocator(), _ProjectorCache() as projector_cache:
         phase_start = perf_counter()
-        local = periodic_gth_local_forces(
+        local = _periodic_local_forces(
             density,
             system.pseudopotentials,
             owned[0].basis,
@@ -270,8 +281,13 @@ def periodic_scf_forces(
         ion_ewald=ion_ewald,
         timings=timings,
         provenance={
-            "local_gth": "analytic_reciprocal_density_phase_derivative",
-            "nonlocal_gth": "analytic_projector_phase_derivative",
+            "pseudopotential_format": pseudopotential_format,
+            f"local_{pseudopotential_format}": (
+                "analytic_reciprocal_density_phase_derivative"
+            ),
+            f"nonlocal_{pseudopotential_format}": (
+                "analytic_projector_phase_derivative"
+            ),
             "ion_ewald": "analytic_ewald_derivative",
             "pulay": "zero_for_fixed_cell_plane_wave_basis",
             "stationarity": "converged_scf_required",

@@ -50,6 +50,12 @@ from mlx_atomistic.dft._periodic_occupations import (
     _PeriodicOccupationResult,
     _resolve_periodic_occupations,
 )
+from mlx_atomistic.dft._periodic_pseudopotential_runtime import (
+    _periodic_local_potential_grid,
+    _periodic_nonlocal_operator,
+    _periodic_pseudopotential_format,
+    _PeriodicNonlocalOperator,
+)
 from mlx_atomistic.dft._periodic_spin_occupations import (
     _PeriodicSpinOccupationResult,
     _resolve_periodic_spin_occupations,
@@ -72,11 +78,7 @@ from mlx_atomistic.dft.kpoints import (
 )
 from mlx_atomistic.dft.mixing import LinearMixer, PulayDIISMixer
 from mlx_atomistic.dft.periodic_electrostatics import periodic_ewald_energy
-from mlx_atomistic.dft.periodic_gth import (
-    PeriodicGTHNonlocalOperator,
-    _GTHProjectorCache,
-    gth_local_potential_grid,
-)
+from mlx_atomistic.dft.periodic_gth import _ProjectorCache
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import hartree_potential
 from mlx_atomistic.dft.spin_gga import ProductionSpinPBEExchangeCorrelation, SpinXCResult
@@ -337,8 +339,8 @@ class _PeriodicSCFSetup:
     bases: tuple[PlaneWaveBasis, ...]
     spin_bases: tuple[tuple[PlaneWaveBasis, ...], ...]
     owned_indices: tuple[int, ...]
-    nonlocal_operators: dict[int, PeriodicGTHNonlocalOperator]
-    spin_nonlocal_operators: tuple[dict[int, PeriodicGTHNonlocalOperator], ...]
+    nonlocal_operators: dict[int, _PeriodicNonlocalOperator]
+    spin_nonlocal_operators: tuple[dict[int, _PeriodicNonlocalOperator], ...]
     local_potential: mx.array
     mixer: LinearMixer | PulayDIISMixer
     magnetization_mixer: LinearMixer | None
@@ -437,7 +439,7 @@ class _PeriodicSCFController:
         initial_coefficients: Sequence[mx.array] | None,
         basis_integer_g: Sequence[np.ndarray] | None,
         observer: RuntimeObserver | None,
-        projector_cache: _GTHProjectorCache,
+        projector_cache: _ProjectorCache,
         resume_state: _PeriodicSCFContinuationState | None,
         checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None,
         checkpoint_iteration: int | None,
@@ -548,7 +550,7 @@ class _PeriodicSCFController:
                 lane_label="gamma-local-potential",
             )
             nonlocal_operators = {
-                point_index: PeriodicGTHNonlocalOperator(
+                point_index: _periodic_nonlocal_operator(
                     system.pseudopotentials,
                     bases[point_index],
                     system.positions,
@@ -561,7 +563,7 @@ class _PeriodicSCFController:
                 if spin is None
                 else tuple(
                     {
-                        point_index: PeriodicGTHNonlocalOperator(
+                        point_index: _periodic_nonlocal_operator(
                             system.pseudopotentials,
                             channel_bases[point_index],
                             system.positions,
@@ -572,7 +574,7 @@ class _PeriodicSCFController:
                     for channel_bases in spin_bases
                 )
             )
-            local_potential = gth_local_potential_grid(
+            local_potential = _periodic_local_potential_grid(
                 system.pseudopotentials,
                 gamma_basis,
                 system.positions,
@@ -709,6 +711,7 @@ class _PeriodicSCFController:
         resume_state: _PeriodicSCFContinuationState | None,
         config: PeriodicSCFConfig,
     ) -> None:
+        _periodic_pseudopotential_format(system.pseudopotentials)
         if type(band_count) is not int or band_count <= 0:
             msg = "n_bands must be a positive non-bool integer"
             raise ValueError(msg)
@@ -1922,7 +1925,7 @@ def _run_periodic_scf_with_projector_cache(
     initial_coefficients: Sequence[mx.array] | None = None,
     basis_integer_g: Sequence[np.ndarray] | None = None,
     observer: RuntimeObserver | None = None,
-    projector_cache: _GTHProjectorCache,
+    projector_cache: _ProjectorCache,
     resume_state: _PeriodicSCFContinuationState | None = None,
     checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None = None,
     checkpoint_iteration: int | None = None,
@@ -1963,7 +1966,7 @@ def _run_periodic_scf_controlled(
     checkpoint_callback: Callable[[_PeriodicSCFContinuationState], bool] | None = None,
     checkpoint_iteration: int | None = None,
 ) -> PeriodicSCFResult:
-    with _bounded_dft_allocator(), _GTHProjectorCache() as projector_cache:
+    with _bounded_dft_allocator(), _ProjectorCache() as projector_cache:
         return _run_periodic_scf_with_projector_cache(
             system,
             cutoff_hartree=cutoff_hartree,

@@ -19,6 +19,9 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicSCFConfig,
     PeriodicSCFResult,
 )
+from mlx_atomistic.dft._periodic_pseudopotential_runtime import (
+    _periodic_pseudopotential_format,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.kpoints import KPointMesh
@@ -26,6 +29,7 @@ from mlx_atomistic.dft.periodic_scf import (
     _run_periodic_scf_fixed_topology,
     run_periodic_scf,
 )
+from mlx_atomistic.dft.pseudopotentials import PseudopotentialFormat
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
 
 HARTREE_PER_BOHR3_TO_GPA = 29421.02648438959
@@ -326,6 +330,11 @@ def periodic_analytic_stress(
         raise TypeError("system must be PeriodicDFTSystem")
     if not isinstance(kpoint_mesh, KPointMesh):
         raise TypeError("kpoint_mesh must be KPointMesh")
+    if (
+        _periodic_pseudopotential_format(system.pseudopotentials)
+        != PseudopotentialFormat.GTH
+    ):
+        raise ValueError("analytic periodic stress currently requires GTH input")
     if kpoint_mesh.point_group_symmetry_reduced:
         raise ValueError("analytic stress does not support point-group-reduced k-point meshes")
     if (
@@ -428,6 +437,11 @@ def periodic_finite_difference_stress(
         raise TypeError("system must be PeriodicDFTSystem")
     if not isinstance(kpoint_mesh, KPointMesh):
         raise TypeError("kpoint_mesh must be KPointMesh")
+    if (
+        _periodic_pseudopotential_format(system.pseudopotentials)
+        != PseudopotentialFormat.GTH
+    ):
+        raise ValueError("periodic stress currently requires GTH input")
     if kpoint_mesh.point_group_symmetry_reduced:
         raise ValueError(
             "finite-difference stress does not support point-group-reduced k-point meshes"

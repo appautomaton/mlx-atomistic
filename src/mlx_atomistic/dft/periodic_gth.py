@@ -277,14 +277,14 @@ class _ProjectorCacheEntry:
     byte_count: int
 
 
-class _GTHProjectorCache:
-    """Bounded context-owned LRU cache for compact GTH projector groups."""
+class _ProjectorCache:
+    """Bounded context-owned LRU cache for compact nonlocal projectors."""
 
     DEFAULT_BUDGET_BYTES = 256 * 1024 * 1024
 
     def __init__(self, byte_budget: int = DEFAULT_BUDGET_BYTES):
         if byte_budget <= 0:
-            msg = "GTH projector cache byte budget must be positive"
+            msg = "projector cache byte budget must be positive"
             raise ValueError(msg)
         self.byte_budget = int(byte_budget)
         self._entries: OrderedDict[tuple[object, ...], _ProjectorCacheEntry] = OrderedDict()
@@ -329,7 +329,7 @@ class _GTHProjectorCache:
         """Bind the cache to one geometry/cell/pseudopotential context."""
 
         if self._closed:
-            msg = "closed GTH projector cache cannot be rebound"
+            msg = "closed projector cache cannot be rebound"
             raise RuntimeError(msg)
         if self._context_identity is None:
             self._context_identity = context_identity
@@ -338,11 +338,11 @@ class _GTHProjectorCache:
             self._context_identity = context_identity
             self._invalidations += 1
 
-    def __enter__(self) -> _GTHProjectorCache:
+    def __enter__(self) -> _ProjectorCache:
         """Enter this cache's deterministic lifetime boundary."""
 
         if self._closed:
-            msg = "closed GTH projector cache cannot be entered"
+            msg = "closed projector cache cannot be entered"
             raise RuntimeError(msg)
         return self
 
@@ -355,7 +355,7 @@ class _GTHProjectorCache:
         """Return and refresh one cached projector group."""
 
         if self._closed:
-            msg = "closed GTH projector cache cannot be read"
+            msg = "closed projector cache cannot be read"
             raise RuntimeError(msg)
         entry = self._entries.get(key)
         if entry is None:
@@ -373,7 +373,7 @@ class _GTHProjectorCache:
         """Insert one group without evicting inputs of the active lazy action."""
 
         if self._closed:
-            msg = "closed GTH projector cache cannot be written"
+            msg = "closed projector cache cannot be written"
             raise RuntimeError(msg)
         payload = mx.array(values)
         byte_count = int(np.prod(payload.shape)) * 8
@@ -420,6 +420,11 @@ class _GTHProjectorCache:
         self._closed = True
 
 
+# Preserve the old private name for existing internal callers and downstream
+# diagnostics while the shared periodic runtime adopts the format-neutral name.
+_GTHProjectorCache = _ProjectorCache
+
+
 def _projector_context_identity(
     pseudopotentials: Sequence[PseudopotentialData],
     basis: PlaneWaveBasis,
@@ -464,11 +469,13 @@ class PeriodicGTHNonlocalOperator:
     pseudopotentials: tuple[PseudopotentialData, ...]
     basis: PlaneWaveBasis
     positions: np.ndarray
-    _cache: _GTHProjectorCache
+    _cache: _ProjectorCache
     _context_identity: str
     _owns_cache: bool
     _flattened_coupling: mx.array
     _projector_count: int
+    _projector_group_count: int
+    _harmonic_width: int
 
     def __init__(
         self,
@@ -476,15 +483,15 @@ class PeriodicGTHNonlocalOperator:
         basis: PlaneWaveBasis,
         positions: Sequence[Sequence[float]],
         *,
-        cache: _GTHProjectorCache | None = None,
-        cache_budget_bytes: int = _GTHProjectorCache.DEFAULT_BUDGET_BYTES,
+        cache: _ProjectorCache | None = None,
+        cache_budget_bytes: int = _ProjectorCache.DEFAULT_BUDGET_BYTES,
     ):
         centers = _positions(positions)
         per_ion = _per_ion_pseudopotentials(pseudopotential, int(centers.shape[0]))
         if any(not value.gth_channels for value in per_ion):
             msg = "every GTH pseudopotential must have complete nonlocal channels"
             raise ValueError(msg)
-        projector_cache = _GTHProjectorCache(cache_budget_bytes) if cache is None else cache
+        projector_cache = _ProjectorCache(cache_budget_bytes) if cache is None else cache
         context_identity = _projector_context_identity(
             per_ion,
             basis,
@@ -500,6 +507,27 @@ class PeriodicGTHNonlocalOperator:
         object.__setattr__(self, "_owns_cache", cache is None)
         object.__setattr__(self, "_flattened_coupling", flattened_coupling)
         object.__setattr__(self, "_projector_count", projector_count)
+        object.__setattr__(
+            self,
+            "_projector_group_count",
+            sum(
+                2 * channel.angular_momentum + 1
+                for pseudo in per_ion
+                for channel in pseudo.gth_channels
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_harmonic_width",
+            sum(
+                2 * angular_momentum + 1
+                for angular_momentum in {
+                    channel.angular_momentum
+                    for pseudo in per_ion
+                    for channel in pseudo.gth_channels
+                }
+            ),
+        )
 
     def _projector_group(
         self,
@@ -560,27 +588,20 @@ class PeriodicGTHNonlocalOperator:
         operators: Sequence[PeriodicGTHNonlocalOperator],
         batch: _CompactBatch,
     ) -> int:
-        """Return a conservative logical workspace bound for batched GTH."""
+        """Return a conservative workspace bound for separable projectors."""
 
         if not operators:
             return 0
         logical_lane_count = len(operators)
         if logical_lane_count > batch.lane_capacity:
-            msg = "GTH operator count exceeds the compact capacity"
+            msg = "nonlocal operator count exceeds the compact capacity"
             raise ValueError(msg)
         lane_count = batch.lane_capacity
         vector_count = batch.vector_count
         bucket_size = batch.bucket_size
         output_bytes = lane_count * vector_count * bucket_size * 8
         reference = operators[0]
-        harmonic_width = sum(
-            2 * angular_momentum + 1
-            for angular_momentum in {
-                channel.angular_momentum
-                for pseudopotential in reference.pseudopotentials
-                for channel in pseudopotential.gth_channels
-            }
-        )
+        harmonic_width = reference._harmonic_width
         estimate = lane_count * bucket_size * (1 + harmonic_width) * 4
         projector_bytes = lane_count * reference._projector_count * bucket_size * 8
         overlap_bytes = lane_count * reference._projector_count * vector_count * 8
@@ -616,20 +637,20 @@ class PeriodicGTHNonlocalOperator:
         PeriodicGTHNonlocalOperator,
         list[tuple[PeriodicGTHNonlocalOperator, mx.array]],
         list[dict[str, int]],
-        dict[int, tuple[_GTHProjectorCache, set[tuple[object, ...]]]],
+        dict[int, tuple[_ProjectorCache, set[tuple[object, ...]]]],
     ]:
         if not operators or len(operators) != len(coefficients):
-            msg = "GTH batches require matching non-empty operator lanes"
+            msg = "nonlocal batches require matching non-empty operator lanes"
             raise ValueError(msg)
         if batch.lane_count != len(operators):
-            msg = "GTH batch lane count does not match its operators"
+            msg = "nonlocal batch lane count does not match its operators"
             raise ValueError(msg)
         reference = operators[0]
         lane_data: list[tuple[PeriodicGTHNonlocalOperator, mx.array]] = []
         metrics: list[dict[str, int]] = []
         protected_by_cache: dict[
             int,
-            tuple[_GTHProjectorCache, set[tuple[object, ...]]],
+            tuple[_ProjectorCache, set[tuple[object, ...]]],
         ] = {}
         for operator, state, layout in zip(
             operators,
@@ -638,18 +659,18 @@ class PeriodicGTHNonlocalOperator:
             strict=True,
         ):
             if operator._context_identity != reference._context_identity:
-                msg = "GTH batch operators must share one physical context"
+                msg = "nonlocal batch operators must share one physical context"
                 raise ValueError(msg)
             if layout is not state.layout:
-                msg = "GTH batch layout does not match its coefficient lane"
+                msg = "nonlocal batch layout does not match its coefficient lane"
                 raise ValueError(msg)
             operator._cache.bind(operator._context_identity)
             operator.basis._validate_state(state)
             if state.kind != "coefficients":
-                msg = "GTH input must be coefficient state"
+                msg = "nonlocal input must be coefficient state"
                 raise ValueError(msg)
             if state.vector_count > batch.vector_count:
-                msg = "GTH batch coefficient width exceeds its capacity"
+                msg = "nonlocal batch coefficient width exceeds its capacity"
                 raise ValueError(msg)
             lane_data.append((operator, operator.basis._layout._active_shifted_vectors))
             metrics.append(PeriodicGTHNonlocalOperator._initial_batch_metrics(state))
@@ -703,7 +724,7 @@ class PeriodicGTHNonlocalOperator:
         group_count: int,
         protected_by_cache: dict[
             int,
-            tuple[_GTHProjectorCache, set[tuple[object, ...]]],
+            tuple[_ProjectorCache, set[tuple[object, ...]]],
         ],
         metrics: dict[str, int],
     ) -> mx.array:
@@ -729,7 +750,7 @@ class PeriodicGTHNonlocalOperator:
             metrics["projector_cache_hits"] = group_count
             protected_keys.add(key)
         if int(beta.shape[0]) != projector_count:
-            msg = "flattened GTH projector count is inconsistent"
+            msg = "flattened nonlocal projector count is inconsistent"
             raise RuntimeError(msg)
         padding = batch.bucket_size - operator.basis.active_count
         if padding:
@@ -820,7 +841,7 @@ class PeriodicGTHNonlocalOperator:
         batch: _CompactBatch,
         evaluate: bool = True,
     ) -> tuple[tuple[_CompactLaneState, ...], tuple[dict[str, int], ...]]:
-        """Apply GTH projectors with one padded k-lane matrix path."""
+        """Apply separable projectors with one padded k-lane matrix path."""
 
         (
             reference,
@@ -832,11 +853,7 @@ class PeriodicGTHNonlocalOperator:
             coefficients,
             batch,
         )
-        group_count = sum(
-            2 * channel.angular_momentum + 1
-            for pseudopotential in reference.pseudopotentials
-            for channel in pseudopotential.gth_channels
-        )
+        group_count = reference._projector_group_count
         flattened_projectors = [
             PeriodicGTHNonlocalOperator._projectors_for_batch_lane(
                 operator,

@@ -1,8 +1,8 @@
 # DFT Pseudopotentials
 
 The DFT layer includes an ion-model surface while keeping the engine small and
-inspectable. The code supports parsed UPF and GTH pseudopotential inputs for
-local-potential SCF plus proof-level nonlocal projector application.
+inspectable. The legacy teaching runtime and the periodic plane-wave runtime
+share parsed UPF and GTH data but retain separate execution boundaries.
 
 ## What Is Implemented
 
@@ -34,17 +34,28 @@ The legacy teaching path interpolates the local potential onto its real-space
 grid. Its proof-level nonlocal operator still consumes only the diagonal
 couplings and is not a production UPF implementation.
 
-The periodic layer now has a separate local-only UPF foundation. It follows
+The periodic layer implements a scalar norm-conserving UPF path. It follows
 Quantum ESPRESSO's compensated radial transform: subtract `erf(r) / r` before
 quadrature, restore the analytic reciprocal-space Coulomb tail, and use the
 finite `G=0` alpha term. Literal source oracles and a numerical GTH-equivalence
-test cover the transform and fixed-cell local force. Periodic SCF does not yet
-admit UPF nonlocal projectors.
+test cover the transform and fixed-cell local force. The compact nonlocal
+operator preserves the complete symmetric `PP_DIJ`, evaluates radial
+projectors with normalized real harmonics through `l=2`, and reuses the same
+bounded k-point batch backend as periodic GTH. Periodic SCF, frozen-density
+bands, analytic fixed-cell forces, and checkpoint identity dispatch through
+that format-neutral runtime boundary.
 
-The future periodic boundary is fail-closed. Only scalar norm-conserving input
+The periodic boundary is fail-closed. Only scalar norm-conserving input
 without ultrasoft augmentation, PAW, spin-orbit terms, or nonlinear core
 correction is currently eligible. Parsing an unsupported file preserves its
-identity; it does not make that physics executable.
+identity; it does not make that physics executable. Analytic stress and
+variable-cell workflows also remain GTH-only.
+
+UPF setup deduplicates identical `|G+k|` magnitudes and batches radial
+transforms by angular channel and radial grid. This removes repeated spherical
+Bessel evaluation without moving any SCF hot-path work off the device. A
+source-bound Quantum ESPRESSO Si ONCV input passes the periodic SCF smoke gate;
+that execution check is not material-accuracy certification.
 
 ## GTH
 
@@ -81,17 +92,18 @@ For ion-backed systems, reported forces include:
 F_total = F_local electron-ion + F_center-center + F_nonlocal correction
 ```
 
-The nonlocal term is a fixed-orbital finite-difference correction and is reported
-through `force_provenance["nonlocal_finite_difference"]`. The force validation
-in this milestone checks fixed-density local forces and SCF total-energy finite
-differences. This is a consistency check for the current model, not a claim of
-production DFT force accuracy.
+The legacy nonlocal term is a fixed-orbital finite-difference correction. The
+periodic GTH and scalar norm-conserving UPF paths instead use analytic
+projector-phase derivatives at a converged fixed-cell SCF state. These
+consistency gates do not by themselves establish broad material accuracy.
 
 ## Current Limits
 
-- The legacy UPF nonlocal operator remains proof-level. Full `PP_DIJ` and radial
-  semantics are preserved, but compact periodic nonlocal execution is not yet
-  connected to SCF.
+- The legacy UPF nonlocal operator remains proof-level and diagonal-only. The
+  separate periodic implementation consumes full `PP_DIJ` but is scientifically
+  verified only at source-oracle and execution-smoke level.
+- Ultrasoft, PAW, spin-orbit, nonlinear-core-correction, and UPF analytic-stress
+  terms are not implemented.
 - This pseudopotential milestone does not certify geometry or stress. The
   current periodic runtime separately provides verified fixed-cell Silicon
   relaxation and one bounded analytic-stress/variable-cell 2H-Silicon path;

@@ -181,6 +181,7 @@ from mlx_atomistic.dft.periodic_stress import (
     periodic_finite_difference_stress,
 )
 from mlx_atomistic.dft.periodic_upf import (
+    PeriodicUPFNonlocalOperator,
     periodic_upf_local_forces,
     upf_local_potential_grid,
     upf_local_reciprocal_coefficients,
@@ -325,6 +326,7 @@ __all__ = [
     "PeriodicStressResult",
     "PeriodicStressSample",
     "PeriodicUnfoldedBandStructureResult",
+    "PeriodicUPFNonlocalOperator",
     "PlaneWaveBasis",
     "ProductionPBEExchangeCorrelation",
     "ProductionSpinPBEExchangeCorrelation",

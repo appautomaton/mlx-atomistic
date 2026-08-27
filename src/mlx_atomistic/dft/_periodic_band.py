@@ -21,15 +21,15 @@ from mlx_atomistic.dft._periodic_models import (
     PeriodicFrozenDensity,
     PeriodicSCFResult,
 )
+from mlx_atomistic.dft._periodic_pseudopotential_runtime import (
+    _periodic_local_potential_grid,
+    _periodic_nonlocal_operator,
+)
 from mlx_atomistic.dft._runtime_observer import RuntimeObserver
 from mlx_atomistic.dft.gga import ProductionPBEExchangeCorrelation
 from mlx_atomistic.dft.grids import ReciprocalGrid
 from mlx_atomistic.dft.kpoints import BandPath, KPoint
-from mlx_atomistic.dft.periodic_gth import (
-    PeriodicGTHNonlocalOperator,
-    _GTHProjectorCache,
-    gth_local_potential_grid,
-)
+from mlx_atomistic.dft.periodic_gth import _ProjectorCache
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import hartree_potential
 from mlx_atomistic.dft.xc import ExchangeCorrelationFunctional
@@ -258,7 +258,7 @@ class _PeriodicBandController:
 
     def run(self) -> PeriodicBandStructureResult:
         total_start = perf_counter()
-        with _bounded_dft_allocator(), _GTHProjectorCache() as projector_cache:
+        with _bounded_dft_allocator(), _ProjectorCache() as projector_cache:
             reciprocal, effective_potential = self._build_effective_potential()
             points: list[PeriodicBandPointResult] = []
             solved_points: dict[
@@ -297,7 +297,7 @@ class _PeriodicBandController:
             reciprocal_grid=reciprocal,
             lane_label="band:local-potential",
         )
-        local_potential = gth_local_potential_grid(
+        local_potential = _periodic_local_potential_grid(
             request.system.pseudopotentials,
             gamma_basis,
             request.system.positions,
@@ -325,7 +325,7 @@ class _PeriodicBandController:
         *,
         reciprocal: ReciprocalGrid,
         effective_potential: mx.array,
-        projector_cache: _GTHProjectorCache,
+        projector_cache: _ProjectorCache,
     ) -> PeriodicBandPointResult:
         request = self.request
         basis = PlaneWaveBasis.from_reduced_kpoint(
@@ -341,7 +341,7 @@ class _PeriodicBandController:
                 f"basis size {basis.active_count} at path point {point_index}"
             )
             raise ValueError(msg)
-        nonlocal_operator = PeriodicGTHNonlocalOperator(
+        nonlocal_operator = _periodic_nonlocal_operator(
             request.system.pseudopotentials,
             basis,
             request.system.positions,

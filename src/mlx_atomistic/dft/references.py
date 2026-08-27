@@ -147,11 +147,18 @@ def get_dft_qm_scope_report() -> DFTQMScopeReport:
             DFTQMScopeEntry(
                 feature="pseudopotentials",
                 status="proof-level",
-                local_surface=("read_upf", "read_gth", "NonlocalPseudopotentialOperator"),
+                local_surface=(
+                    "read_upf",
+                    "read_gth",
+                    "NonlocalPseudopotentialOperator",
+                    "PeriodicUPFNonlocalOperator",
+                ),
                 reference_families=("Quantum ESPRESSO UPF", "CP2K GTH"),
                 rationale=(
-                    "UPF and GTH parsing plus nonlocal projector application are "
-                    "covered by fixtures, with format-convention limits documented."
+                    "GTH and scalar norm-conserving UPF parsing, periodic local and "
+                    "nonlocal application, fixed-cell forces, and identity gates are "
+                    "covered. UPF material transferability and augmentation physics "
+                    "remain unverified."
                 ),
             ),
             DFTQMScopeEntry(
