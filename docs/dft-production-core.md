@@ -17,13 +17,18 @@ is not broadly chemically certified. Capability claims are tied to the
 
 ## Nonlocal Pseudopotentials
 
-UPF and GTH nonlocal metadata is converted into normalized real-space separable projectors. The operator applies:
+The legacy UPF and GTH metadata path converts projectors into normalized
+real-space separable forms. The operator applies:
 
 ```text
 V̂_NL ψ = Σᵢ |βᵢ⟩ Dᵢ ⟨βᵢ|ψ⟩
 ```
 
-For UPF, diagonal `PP_DIJ` values are used as projector couplings after Ry-to-Hartree conversion. For GTH, parsed projector coefficients seed the coupling. This gives a Hermitian validation path, but it is not yet a full chemically faithful reproduction of every format convention.
+The UPF parser now preserves radial quadrature and the complete `PP_DIJ` matrix
+after Ry-to-Hartree conversion, while the legacy proof operator still consumes
+only its diagonal. A source-matched compensated periodic local transform is
+available, but periodic UPF nonlocal SCF remains unimplemented. The production
+periodic GTH path retains its separate analytic operators.
 
 SCF applies nonlocal projectors by default when available. `SCFConfig(apply_nonlocal=False)` keeps the old local-only path available for debugging and comparison.
 

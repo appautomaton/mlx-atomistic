@@ -238,7 +238,9 @@ fails its locked orbital-residual gate after both cold and density-seeded runs,
 so the matched full oracle and full q10 EOS were not run. A bounded CP2K 2026.1
 UZH q2 alternative passed its conventional-cell reduced/full method oracle but
 was rejected because its seven-point bulk-derivative error was `18.09%`, above
-the unchanged `15%` gate.
+the unchanged `15%` gate. Its prepared UZH q10 alternative was also rejected
+at the primitive central feasibility point with a `5.4187e-6` direct orbital
+residual above the unchanged `2e-6` gate.
 
 ## Phase 8: Add Finite-Displacement Phonons
 
@@ -308,7 +310,7 @@ Current exit audit: every criterion above is implemented and has bounded
 evidence except the broad GTH production envelope. Phase 7 has complete
 coverage, but its strict matrix remains failed by the locked MgO q2
 bulk-derivative and total-force residuals, the rejected q10 candidate, and
-the rejected UZH q2 alternative, plus missing exact calculation/runtime
+the rejected UZH q2/q10 alternatives, plus missing exact calculation/runtime
 identities in older summaries. The Fe q16
 point-group method oracle now passes, but that does not erase the remaining
 identity and MgO blockers. The project therefore must not yet claim the general
@@ -334,8 +336,10 @@ above:
   DFT;
 - platform scale: automatic crystallographic symmetry discovery, distributed
   execution, multi-device scheduling, and broad molecular DFT;
-- alternate periodic pseudopotential envelopes: production UPF support beyond
-  the required GTH general-core envelope.
+- alternate periodic pseudopotential envelopes: production UPF nonlocal and SCF
+  admission beyond the required GTH general-core envelope. The retained radial,
+  full-`PP_DIJ`, fingerprint, and periodic-local foundation does not yet
+  constitute that envelope.
 
 Each item requires its own roadmap or bounded extension after the general-core
 exit audit. None is an implied blocker for the claim defined here.
