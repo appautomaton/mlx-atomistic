@@ -12,6 +12,11 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_atomistic.dft._compact import _CompactBatch, _CompactLaneState
+from mlx_atomistic.dft._periodic_pseudopotential import (
+    _periodic_positions,
+    _periodic_pseudopotentials,
+    _periodic_structure_factor,
+)
 from mlx_atomistic.dft._pseudopotential_identity import _pseudopotential_fingerprint
 from mlx_atomistic.dft.periodic_electrostatics import (
     periodic_ewald_energy as periodic_ewald_energy,
@@ -23,6 +28,7 @@ from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.pseudopotentials import (
     GTHProjectorChannel,
     PseudopotentialData,
+    PseudopotentialFormat,
 )
 
 _GTH_OVERLAP_CHUNK_SIZE = 1024
@@ -43,33 +49,18 @@ def _per_ion_pseudopotentials(
 ) -> tuple[PseudopotentialData, ...]:
     """Return one validated GTH pseudopotential per ion."""
 
-    if isinstance(pseudopotential, PseudopotentialData):
-        values = (pseudopotential,) * ion_count
-    else:
-        values = tuple(pseudopotential)
-        if len(values) != ion_count:
-            msg = "pseudopotentials length must match the ion count"
-            raise ValueError(msg)
-    if any(not isinstance(value, PseudopotentialData) for value in values):
-        msg = "pseudopotentials must contain PseudopotentialData values"
-        raise TypeError(msg)
+    values = _periodic_pseudopotentials(
+        pseudopotential,
+        ion_count,
+        expected_format=PseudopotentialFormat.GTH,
+    )
     for value in values:
         _validated_gth(value)
     return values
 
 
-def _positions(positions: Sequence[Sequence[float]]) -> np.ndarray:
-    values = np.array(positions, dtype=np.float64, copy=True)
-    if values.ndim != 2 or values.shape[1] != 3 or values.shape[0] == 0:
-        msg = "positions must have shape (n_ions, 3)"
-        raise ValueError(msg)
-    values.setflags(write=False)
-    return values
-
-
-def _structure_factor(vectors: np.ndarray, positions: np.ndarray) -> np.ndarray:
-    phase = np.einsum("...d,id->i...", vectors, positions, optimize=True)
-    return np.sum(np.exp(-1j * phase), axis=0)
+_positions = _periodic_positions
+_structure_factor = _periodic_structure_factor
 
 
 def gth_local_reciprocal_coefficients(

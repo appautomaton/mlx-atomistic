@@ -25,13 +25,26 @@ local-potential SCF plus proof-level nonlocal projector application.
 sources. The current path uses:
 
 - `PP_HEADER` for element and valence charge.
-- `PP_MESH/PP_R` for radial samples.
+- `PP_MESH/PP_R` and `PP_RAB` for radial samples and quadrature weights.
 - `PP_LOCAL` for the local potential.
 - `PP_BETA.*` tags for nonlocal projector metadata.
+- The complete symmetric `PP_DIJ` matrix, converted from Rydberg to Hartree.
 
-The local UPF potential is interpolated onto the periodic real-space grid. UPF
-nonlocal projectors are parsed and applied by the ion-aware operator when
-`SCFConfig(apply_nonlocal=True)` is active.
+The legacy teaching path interpolates the local potential onto its real-space
+grid. Its proof-level nonlocal operator still consumes only the diagonal
+couplings and is not a production UPF implementation.
+
+The periodic layer now has a separate local-only UPF foundation. It follows
+Quantum ESPRESSO's compensated radial transform: subtract `erf(r) / r` before
+quadrature, restore the analytic reciprocal-space Coulomb tail, and use the
+finite `G=0` alpha term. Literal source oracles and a numerical GTH-equivalence
+test cover the transform and fixed-cell local force. Periodic SCF does not yet
+admit UPF nonlocal projectors.
+
+The future periodic boundary is fail-closed. Only scalar norm-conserving input
+without ultrasoft augmentation, PAW, spin-orbit terms, or nonlinear core
+correction is currently eligible. Parsing an unsupported file preserves its
+identity; it does not make that physics executable.
 
 ## GTH
 
@@ -76,8 +89,9 @@ production DFT force accuracy.
 
 ## Current Limits
 
-- Nonlocal projectors are a proof-level Hermitian separable operator path, not a
-  chemically certified reproduction of every UPF/GTH convention.
+- The legacy UPF nonlocal operator remains proof-level. Full `PP_DIJ` and radial
+  semantics are preserved, but compact periodic nonlocal execution is not yet
+  connected to SCF.
 - This pseudopotential milestone does not certify geometry or stress. The
   current periodic runtime separately provides verified fixed-cell Silicon
   relaxation and one bounded analytic-stress/variable-cell 2H-Silicon path;

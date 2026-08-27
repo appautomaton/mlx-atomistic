@@ -180,6 +180,11 @@ from mlx_atomistic.dft.periodic_stress import (
     periodic_analytic_stress,
     periodic_finite_difference_stress,
 )
+from mlx_atomistic.dft.periodic_upf import (
+    periodic_upf_local_forces,
+    upf_local_potential_grid,
+    upf_local_reciprocal_coefficients,
+)
 from mlx_atomistic.dft.plane_wave import PlaneWaveBasis
 from mlx_atomistic.dft.potentials import (
     LocalGaussianPseudopotential,
@@ -398,6 +403,7 @@ __all__ = [
     "periodic_scf_calculation_contract",
     "periodic_scf_execution_settings",
     "periodic_scf_forces",
+    "periodic_upf_local_forces",
     "periodic_scf_initialization_identity",
     "publish_periodic_scf_checkpoint",
     "plan_periodic_phonon_displacements",
@@ -420,6 +426,8 @@ __all__ = [
     "solve_periodic_eigenproblem",
     "spin_density_from_orbitals",
     "unfold_periodic_band_structure",
+    "upf_local_potential_grid",
+    "upf_local_reciprocal_coefficients",
     "write_periodic_density_volume",
     "write_periodic_phonon_samples",
 ]

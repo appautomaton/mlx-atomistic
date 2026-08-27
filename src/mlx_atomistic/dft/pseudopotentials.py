@@ -26,12 +26,19 @@ class PseudopotentialFormat(StrEnum):
 
 @dataclass(frozen=True)
 class RadialGrid:
-    """Radial samples for a local pseudopotential channel."""
+    """Radial samples and optional quadrature weights."""
 
     radii: np.ndarray
     values: np.ndarray
+    integration_weights: np.ndarray | None
 
-    def __init__(self, radii: Sequence[float], values: Sequence[float]):
+    def __init__(
+        self,
+        radii: Sequence[float],
+        values: Sequence[float],
+        *,
+        integration_weights: Sequence[float] | None = None,
+    ):
         radii_np = np.asarray(radii, dtype=np.float64)
         values_np = np.asarray(values, dtype=np.float64)
         if radii_np.ndim != 1 or values_np.ndim != 1:
@@ -43,11 +50,24 @@ class RadialGrid:
         if len(radii_np) < 2:
             msg = "radial grid requires at least two samples"
             raise ValueError(msg)
+        if not np.isfinite(radii_np).all() or not np.isfinite(values_np).all():
+            msg = "radial grid samples must be finite"
+            raise ValueError(msg)
         if np.any(np.diff(radii_np) <= 0.0):
             msg = "radial grid radii must be strictly increasing"
             raise ValueError(msg)
+        weights_np = None
+        if integration_weights is not None:
+            weights_np = np.asarray(integration_weights, dtype=np.float64)
+            if weights_np.ndim != 1 or weights_np.shape != radii_np.shape:
+                msg = "radial integration weights must match the radial grid"
+                raise ValueError(msg)
+            if not np.isfinite(weights_np).all() or np.any(weights_np <= 0.0):
+                msg = "radial integration weights must be finite and positive"
+                raise ValueError(msg)
         object.__setattr__(self, "radii", radii_np)
         object.__setattr__(self, "values", values_np)
+        object.__setattr__(self, "integration_weights", weights_np)
 
     @property
     def size(self) -> int:
@@ -156,6 +176,7 @@ class PseudopotentialData:
     gth_coefficients: tuple[float, ...] = ()
     gth_channels: tuple[GTHProjectorChannel, ...] = ()
     nonlocal_projectors: tuple[NonlocalProjectorData, ...] = ()
+    nonlocal_coupling_matrix: tuple[tuple[float, ...], ...] = ()
     metadata: dict[str, str | int | float | bool] | None = None
 
     @property
@@ -163,6 +184,24 @@ class PseudopotentialData:
         """Whether the source file contained nonlocal projector metadata."""
 
         return bool(self.gth_channels or self.nonlocal_projectors)
+
+    @property
+    def periodic_upf_compatible(self) -> bool:
+        """Whether this UPF is within the scalar norm-conserving core boundary."""
+
+        if self.format != PseudopotentialFormat.UPF or self.metadata is None:
+            return False
+        relativistic = str(self.metadata.get("relativistic", "")).strip().lower()
+        return (
+            str(self.metadata.get("pseudo_type", "")).strip().upper() == "NC"
+            and relativistic in {"", "no", "none", "scalar", "scalar-relativistic"}
+            and self.metadata.get("is_ultrasoft") is False
+            and self.metadata.get("is_paw") is False
+            and self.metadata.get("has_so") is False
+            and self.metadata.get("core_correction") is False
+            and bool(self.nonlocal_projectors)
+            and bool(self.nonlocal_coupling_matrix)
+        )
 
     def local_potential(self, radius: np.ndarray) -> np.ndarray:
         """Evaluate the local potential in Hartree on radii in bohr."""
@@ -360,62 +399,114 @@ def read_upf(path: str | Path) -> PseudopotentialData:
     element = _required_str(header.attrib.get("element"), "UPF element")
     valence = float(_required_str(header.attrib.get("z_valence"), "UPF z_valence"))
     radii_node = root.find("./PP_MESH/PP_R")
+    weights_node = root.find("./PP_MESH/PP_RAB")
     local_node = root.find("PP_LOCAL")
-    if radii_node is None or local_node is None:
-        msg = "UPF file is missing PP_R or PP_LOCAL"
+    if radii_node is None or weights_node is None or local_node is None:
+        msg = "UPF file is missing PP_R, PP_RAB, or PP_LOCAL"
         raise ValueError(msg)
     radii = _numbers(radii_node.text)
+    integration_weights = _numbers(weights_node.text)
     # QE UPF local potentials are conventionally stored in Ry; convert to Hartree.
     local = 0.5 * _numbers(local_node.text)
-    if radii.shape != local.shape:
-        msg = "UPF PP_R and PP_LOCAL sizes do not match"
+    if radii.shape != local.shape or radii.shape != integration_weights.shape:
+        msg = "UPF PP_R, PP_RAB, and PP_LOCAL sizes do not match"
         raise ValueError(msg)
-    radial_grid = RadialGrid(radii, local)
-    projectors = []
+    radial_grid = RadialGrid(
+        radii,
+        local,
+        integration_weights=integration_weights,
+    )
+    indexed_projectors: list[tuple[int, NonlocalProjectorData]] = []
     for node in root.iter():
         if not node.tag.startswith("PP_BETA"):
             continue
         angular = int(
             _required_str(node.attrib.get("angular_momentum"), "PP_BETA angular_momentum")
         )
-        values = tuple(float(item) for item in _numbers(node.text))
+        values_array = _numbers(node.text)
+        if not 2 <= values_array.size <= radial_grid.size:
+            raise ValueError("UPF PP_BETA size must lie within the radial grid")
+        values = tuple(float(item) for item in values_array)
+        index = int(node.attrib.get("index", len(indexed_projectors) + 1))
         metadata = {
-            "index": int(node.attrib.get("index", len(projectors) + 1)),
+            "index": index,
             "source": "upf",
         }
         cutoff = node.attrib.get("cutoff_radius")
-        projectors.append(
-            NonlocalProjectorData(
-                angular_momentum=angular,
-                values=values,
-                radial_grid=radial_grid,
-                cutoff_radius=None if cutoff is None else float(cutoff),
-                metadata=metadata,
+        projector_grid = (
+            radial_grid
+            if values_array.size == radial_grid.size
+            else RadialGrid(
+                radial_grid.radii[: values_array.size],
+                radial_grid.values[: values_array.size],
+                integration_weights=integration_weights[: values_array.size],
             )
         )
-    dij_node = root.find("./PP_NONLOCAL/PP_DIJ")
-    if dij_node is not None and projectors:
+        indexed_projectors.append(
+            (
+                index,
+                NonlocalProjectorData(
+                    angular_momentum=angular,
+                    values=values,
+                    radial_grid=projector_grid,
+                    cutoff_radius=None if cutoff is None else float(cutoff),
+                    metadata=metadata,
+                ),
+            )
+        )
+    indexed_projectors.sort(key=lambda item: item[0])
+    if [index for index, _projector in indexed_projectors] != list(
+        range(1, len(indexed_projectors) + 1)
+    ):
+        raise ValueError("UPF PP_BETA indices must be unique and contiguous")
+    projectors = [projector for _index, projector in indexed_projectors]
+    coupling_matrix: tuple[tuple[float, ...], ...] = ()
+    if projectors:
+        dij_node = root.find("./PP_NONLOCAL/PP_DIJ")
+        if dij_node is None:
+            raise ValueError("UPF nonlocal projectors require PP_DIJ")
         dij = 0.5 * _numbers(dij_node.text)
-        size = int(round(np.sqrt(float(dij.size))))
-        if size * size == dij.size and size >= len(projectors):
-            matrix = dij.reshape((size, size))
-            projectors = [
-                replace(
-                    projector,
-                    coupling=float(matrix[index, index]),
-                    coefficients=(float(matrix[index, index]),),
-                    metadata={
-                        **({} if projector.metadata is None else projector.metadata),
-                        "dij_diagonal_hartree": float(matrix[index, index]),
-                    },
-                )
-                for index, projector in enumerate(projectors)
-            ]
+        count = len(projectors)
+        if dij.size != count * count:
+            raise ValueError("UPF PP_DIJ size must match the projector count")
+        matrix = dij.reshape((count, count))
+        if not np.isfinite(matrix).all() or not np.allclose(
+            matrix,
+            matrix.T,
+            atol=1.0e-12,
+            rtol=0.0,
+        ):
+            raise ValueError("UPF PP_DIJ must be finite and symmetric")
+        coupling_matrix = tuple(
+            tuple(float(value) for value in row)
+            for row in matrix
+        )
+        projectors = [
+            replace(
+                projector,
+                coupling=float(matrix[index, index]),
+                coefficients=tuple(float(value) for value in matrix[index]),
+                metadata={
+                    **({} if projector.metadata is None else projector.metadata),
+                    "radial_representation": "r_beta",
+                    "dij_diagonal_hartree": float(matrix[index, index]),
+                },
+            )
+            for index, projector in enumerate(projectors)
+        ]
     metadata: dict[str, str | int | float | bool] = {
         "source_path": str(path),
         "version": root.attrib.get("version", ""),
         "pseudo_type": header.attrib.get("pseudo_type", ""),
+        "relativistic": header.attrib.get("relativistic", ""),
         "functional": header.attrib.get("functional", ""),
+        "is_ultrasoft": _upf_bool(header.attrib.get("is_ultrasoft"), default=False),
+        "is_paw": _upf_bool(header.attrib.get("is_paw"), default=False),
+        "has_so": _upf_bool(header.attrib.get("has_so"), default=False),
+        "core_correction": _upf_bool(
+            header.attrib.get("core_correction"),
+            default=False,
+        ),
         "nonlocal_applied": False,
     }
     return PseudopotentialData(
@@ -424,6 +515,7 @@ def read_upf(path: str | Path) -> PseudopotentialData:
         valence_charge=valence,
         local_grid=radial_grid,
         nonlocal_projectors=tuple(projectors),
+        nonlocal_coupling_matrix=coupling_matrix,
         metadata=metadata,
     )
 
@@ -741,6 +833,19 @@ def _required_str(value: str | None, name: str) -> str:
         msg = f"{name} is required"
         raise ValueError(msg)
     return value.strip()
+
+
+def _upf_bool(value: str | None, *, default: bool) -> bool:
+    """Parse one UPF logical attribute without accepting ambiguous values."""
+
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"t", "true", ".true.", "1"}:
+        return True
+    if normalized in {"f", "false", ".false.", "0"}:
+        return False
+    raise ValueError(f"invalid UPF logical value: {value!r}")
 
 
 def _element_from_filename(path: Path) -> str:

@@ -177,6 +177,22 @@
         {"name": "orbital_residual", "value": 0.0000030125518151180586, "maximum": 0.000002},
         {"name": "scf_iterations", "value": 80.0, "maximum": 79.0}
       ]
+    },
+    {
+      "candidate_id": "rocksalt-mgo-uzh-primitive-q10-q6-c40-k4",
+      "workload_fingerprint": "7990b1e9302d23dfab55059dac0242f80418c31bae406bb4f7627cbc9aba492b",
+      "calculation_fingerprint": "531b8cafa99d0f1adc3e83d150a7bfa4162ddc386384850144ae7892c0b9463a",
+      "implementation_fingerprint": "d22eaaad6c87a9476cc5a9a8dd1d21397a7363426db86ebd51a6fe70314c9d66",
+      "method_validation": {
+        "scope": "point_group_density_reconstruction_cold_full_oracle_skipped_after_numerical_failure",
+        "passed": false
+      },
+      "elapsed_wall_seconds": 39.28628162480891,
+      "peak_temporary_bytes": 63770520,
+      "metrics": [
+        {"name": "orbital_residual", "value": 0.000005418748514784966, "maximum": 0.000002},
+        {"name": "scf_iterations", "value": 80.0, "maximum": 79.0}
+      ]
     }
   ]
 }

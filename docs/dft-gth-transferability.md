@@ -135,3 +135,10 @@ curve gave `a₀ = 4.252650 Å`, `B₀ = 146.708 GPa`, `B₀′ = 3.35102`, and 
 `0.461 meV/atom`. Its bulk-derivative relative error was `18.09%`, above the
 unchanged `15%` gate and worse than the standard q2 result. The UZH candidate
 is therefore rejected, and its force ladder was not run.
+
+The matching UZH Mg-q10/O-q6 primitive central feasibility point was also
+rejected before a full-mesh oracle. It reached 80 SCF iterations in `39.286 s`
+with a `5.4187e-6` direct orbital residual, above the unchanged `2e-6` gate.
+Its density and energy criteria passed, so neither a full mesh nor an EOS curve
+was run. This closes the prepared UZH q10 candidate without weakening the
+eigensolver requirement.

@@ -31,7 +31,11 @@ def test_gth_transferability_matrix_separates_coverage_from_strict_science():
 
 def test_gth_transferability_matrix_retains_failed_q10_candidate():
     report = build_gth_transferability_report()
-    candidate = report["candidates"][0]
+    candidates = {
+        candidate["candidate_id"]: candidate
+        for candidate in report["candidates"]
+    }
+    candidate = candidates["rocksalt-mgo-primitive-q10-q6-c40-k4"]
 
     assert candidate["candidate_id"] == "rocksalt-mgo-primitive-q10-q6-c40-k4"
     assert candidate["passed"] is False
@@ -40,6 +44,15 @@ def test_gth_transferability_matrix_retains_failed_q10_candidate():
     assert candidate["peak_temporary_bytes"] == 63_770_520
     assert candidate["metrics"][0]["value"] == pytest.approx(
         3.0125518151180586e-6
+    )
+
+    uzh = candidates["rocksalt-mgo-uzh-primitive-q10-q6-c40-k4"]
+    assert uzh["passed"] is False
+    assert uzh["method_validation"]["passed"] is False
+    assert uzh["elapsed_wall_seconds"] == pytest.approx(39.28628162480891)
+    assert uzh["peak_temporary_bytes"] == 63_770_520
+    assert uzh["metrics"][0]["value"] == pytest.approx(
+        5.418748514784966e-6
     )
 
 
