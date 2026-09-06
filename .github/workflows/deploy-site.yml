@@ -10,6 +10,7 @@ on:
       - "src/**"
       - "scripts/gen_api_docs.py"
       - "scripts/sync_site_docs.py"
+      - "scripts/check_site_links.py"
       - "pyproject.toml"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
@@ -46,6 +47,10 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: uv run --no-project --python 3.13.12 python scripts/sync_site_docs.py
 
+      - name: Check documentation link regressions
+        working-directory: ${{ github.workspace }}
+        run: uv run --no-project --python 3.13.12 python -m unittest discover -s tests -p test_site_docs.py
+
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
@@ -58,6 +63,10 @@ jobs:
 
       - name: Build site
         run: npm run build
+
+      - name: Check published links
+        working-directory: ${{ github.workspace }}
+        run: uv run --no-project --python 3.13.12 python scripts/check_site_links.py
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

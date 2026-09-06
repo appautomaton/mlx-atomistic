@@ -30,3 +30,14 @@ npm run preview  # preview the build
 `.github/workflows/deploy-site.yml` generates narrative and API pages, builds,
 and deploys to GitHub Pages. Narrative pages are not edited here: update
 `../docs/`, then run `scripts/sync_site_docs.py`.
+
+Links between narrative pages are emitted as published `/mlx-atomistic/.../`
+URLs, including directory indexes and fragments. Links to repository-only
+files continue to point at GitHub. After building, run this from the repository
+root to catch internal destinations missing from the output:
+
+```bash
+uv run --no-project --python 3.13.12 python scripts/check_site_links.py
+```
+
+The deployment workflow runs this check before uploading the site.
