@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import sys
@@ -44,6 +43,7 @@ GENERATED_DIRS = ("foundations", "mm", "dft", "benchmarks", "project")
 RELATIVE_LINK_RE = re.compile(r"(?P<prefix>\]\()(?P<target>(?![/#])[^)\s]+)(?P<suffix>\))")
 HTTP_PREFIXES = ("http://", "https://", "mailto:")
 GITHUB_BLOB = "https://github.com/appautomaton/mlx-atomistic/blob/main"
+SITE_BASE = "/mlx-atomistic"
 
 
 def _published_sources() -> dict[Path, Path]:
@@ -85,10 +85,12 @@ def _site_link(
     resolved = (source.parent / path_text).resolve()
     published_target = published.get(resolved)
     if published_target is not None:
-        relative = Path(os.path.relpath(published_target, start=site_target.parent)).as_posix()
-        if not relative.startswith("."):
-            relative = f"./{relative}"
-        return f"{relative}{marker}{fragment}"
+        # Starlight publishes directory URLs, not the generated Markdown files.
+        # Root-relative URLs also avoid resolving a sibling beneath this page.
+        route = published_target.with_suffix("")
+        if route.name == "index":
+            route = route.parent
+        return f"{SITE_BASE}/{route.as_posix()}/{marker}{fragment}"
     try:
         repository_path = resolved.relative_to(ROOT)
     except ValueError:
