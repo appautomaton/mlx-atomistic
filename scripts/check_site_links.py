@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
-SITE = "https://appautomaton.renocrypt.com/mlx-atomistic/"
+SITE = "https://appautomaton.com/mlx-atomistic/"
 
 
 class LinkParser(HTMLParser):
