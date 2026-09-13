@@ -125,6 +125,11 @@ and the API pages are generated from package docstrings by
 [`scripts/gen_api_docs.py`](scripts/gen_api_docs.py). Generated pages under
 `site/src/content/docs/` are build artifacts and are never edited by hand.
 
+The public site is published from `sites/mlx-atomistic/public/` in
+[`appautomaton/appautomaton.github.io`](https://github.com/appautomaton/appautomaton.github.io).
+The source and generators remain here; follow [the site refresh guide](site/README.md)
+to validate and submit a new documentation build to the central repository.
+
 ## Runtime boundary
 
 `mlx_atomistic` is the product runtime. Low-level MD kernels accept Lennard-Jones

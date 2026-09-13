@@ -102,8 +102,13 @@ The docs site under `site/` is fully generated from two canonical sources.
 Narrative and benchmarks come from `docs/` through
 `scripts/sync_site_docs.py`. The API reference comes from package docstrings
 through `scripts/gen_api_docs.py`, a static Griffe parse with no import and no
-MLX. Both output trees are git-ignored and rebuilt on deploy. The site build
+MLX. Both output trees are git-ignored and rebuilt for each content refresh. The site build
 also emits `llms.txt` and `llms-full.txt` for agentic consumption.
+
+Public delivery belongs to `appautomaton/appautomaton.github.io` at
+`sites/mlx-atomistic/public/`. Keep canonical documentation, docstrings, and
+generator inputs here. Follow `site/README.md` to submit a complete validated
+build to the central publisher; do not re-enable a project Pages deployment.
 
 Never hand-edit generated site pages. Edit `docs/` for narrative, or edit
 docstrings for API reference, and let the relevant generator rebuild them.
