@@ -4,7 +4,7 @@ Astro + Starlight site for https://appautomaton.com/mlx-atomistic.
 
 ## Local dev
 
-Use Node 24, matching the Pages workflow.
+Use Node 24 for reproducible site builds.
 
 ```bash
 cd site
@@ -25,11 +25,20 @@ npm run preview  # preview the build
 - `src/content/docs/` — generated from canonical `../docs/` plus package docstrings
 - `astro.config.mjs` — site config, sidebar, base path
 
-## Deploy
+## Central publication
 
-`.github/workflows/deploy-site.yml` generates narrative and API pages, builds,
-and deploys to GitHub Pages. Narrative pages are not edited here: update
-`../docs/`, then run `scripts/sync_site_docs.py`.
+The public website is published by `appautomaton/appautomaton.github.io` from
+`sites/mlx-atomistic/public/`. This repository retains the canonical technical
+documentation, package docstrings, generators, and Astro inputs so that future
+documentation updates remain reproducible. It no longer deploys GitHub Pages.
+
+Update `../docs/` or package docstrings, run both generators, and build using
+the commands above. Validate the generated output, then replace the complete
+central `sites/mlx-atomistic/public/` tree with this build's `site/dist/` in a
+reviewed central PR. Copy the full Pagefind index together with its entry and
+metadata files; never mix files from different builds. Existing central
+baseline hashes describe the historical import, so document intentional later
+content changes rather than silently replacing that baseline.
 
 Links between narrative pages are emitted as published `/mlx-atomistic/.../`
 URLs, including directory indexes and fragments. Links to repository-only
@@ -40,4 +49,6 @@ root to catch internal destinations missing from the output:
 uv run --no-project --python 3.13.12 python scripts/check_site_links.py
 ```
 
-The deployment workflow runs this check before uploading the site.
+Run this check before proposing a central content refresh. Central CI validates
+the assembled artifact before publishing; runtime changes alone do not update
+the published documentation snapshot.
