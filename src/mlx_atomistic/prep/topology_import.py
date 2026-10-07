@@ -2292,6 +2292,51 @@ def _amber_has_periodic_box(topology: AmberPrmtop) -> bool:
     )
 
 
+AMBER_RESTART_FIELD_WIDTH = 12
+
+
+def _parse_amber_float(token: str) -> float:
+    return float(token.replace("D", "E").replace("d", "e"))
+
+
+def _is_amber_float(token: str) -> bool:
+    try:
+        _parse_amber_float(token)
+    except ValueError:
+        return False
+    return True
+
+
+def _split_amber_restart_line(line: str) -> list[str]:
+    """Split one AMBER restart/inpcrd data line into its numeric fields.
+
+    The format is fixed-width ``6F12.7``, so a value that needs all twelve
+    columns leaves no space before the value after it: the pair
+    ``-9.3590097`` and ``-102.7707192`` is written ``-9.3590097-102.7707192``
+    and whitespace splitting reads it as a single unparseable token.
+
+    Whitespace splitting is attempted first so that free-format files behave
+    exactly as before; the fixed-width read is used only when whitespace
+    splitting yields something that is not a number.
+    """
+    body = line.rstrip()
+    if not body:
+        return []
+    tokens = body.split()
+    if all(_is_amber_float(token) for token in tokens):
+        return tokens
+    if len(body) % AMBER_RESTART_FIELD_WIDTH == 0:
+        fields = [
+            body[start : start + AMBER_RESTART_FIELD_WIDTH].strip()
+            for start in range(0, len(body), AMBER_RESTART_FIELD_WIDTH)
+        ]
+        if fields and all(_is_amber_float(field) for field in fields):
+            return fields
+    # Neither reading works; return the whitespace tokens so the caller's
+    # ValueError path reports the malformed file as it always has.
+    return tokens
+
+
 def _read_amber_restart(
     path: Path,
     *,
@@ -2310,9 +2355,9 @@ def _read_amber_restart(
     try:
         atom_count = int(header[0])
         values = [
-            float(value.replace("D", "E").replace("d", "e"))
+            _parse_amber_float(value)
             for line in lines[2:]
-            for value in line.split()
+            for value in _split_amber_restart_line(line)
         ]
     except ValueError as exc:
         msg = "unsupported_terms:amber_malformed_topology"
